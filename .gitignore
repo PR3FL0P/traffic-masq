@@ -1,0 +1,13 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Editor and OS metadata
+.idea/
+.vscode/
+.DS_Store

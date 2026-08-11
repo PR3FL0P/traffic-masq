@@ -1,0 +1,622 @@
+use anyhow::Result;
+use crossterm::event::KeyCode;
+use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
+
+use crate::api::client::ApiClient;
+use crate::api::model::{InterfaceEditRequest, Request, Response};
+use crate::config::InterfaceRole;
+
+use super::layout::panel;
+use super::logs::LogLevel;
+use super::theme;
+use super::{current_unix_time, format_addresses, Screen, TuiApp};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InterfaceEditorField {
+    Cidr,
+    Role,
+    Managed,
+    AllowManagementChange,
+    Save,
+}
+
+const INTERFACE_EDITOR_FIELDS: [InterfaceEditorField; 5] = [
+    InterfaceEditorField::Cidr,
+    InterfaceEditorField::Role,
+    InterfaceEditorField::Managed,
+    InterfaceEditorField::AllowManagementChange,
+    InterfaceEditorField::Save,
+];
+
+#[derive(Debug, Clone)]
+pub(crate) struct InterfaceEditor {
+    pub(crate) interface: String,
+    pub(crate) field: InterfaceEditorField,
+    pub(crate) cidr: String,
+    pub(crate) role: InterfaceRole,
+    pub(crate) managed: bool,
+    pub(crate) allow_management_change: bool,
+}
+
+impl InterfaceEditor {
+    pub(crate) fn edit_request(&self) -> Result<InterfaceEditRequest> {
+        if !self.cidr.trim().is_empty() {
+            let _: ipnet::Ipv4Net = self.cidr.trim().parse()?;
+        }
+        Ok(InterfaceEditRequest {
+            cidr: self.cidr.trim().to_string(),
+            role: self.role,
+            managed: self.managed,
+            allow_management_change: self.allow_management_change,
+        })
+    }
+}
+
+pub(crate) fn render_interface_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
+    let block = panel("Interfaces");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    app.ui.list_area = Some(inner);
+    app.ui.list_row_height = 1;
+    app.ui.list_count = app.dashboard.interfaces.len();
+    app.ui.list_scroll_offset = 0;
+
+    let lines = app
+        .dashboard
+        .interfaces
+        .iter()
+        .enumerate()
+        .map(|(index, status)| {
+            let selected = index == app.selected_interface;
+            let marker = if selected { "▶" } else { " " };
+            let addresses = format_addresses(status);
+            let style = if selected {
+                Style::default()
+                    .fg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let status_span = if status.interface.is_up {
+                Span::styled("up  ", Style::default().fg(theme::GOOD))
+            } else {
+                Span::styled("down", Style::default().fg(theme::MUTED))
+            };
+            Line::from(vec![
+                Span::styled(format!("{marker} {:<12}", status.interface.name), style),
+                status_span,
+                Span::raw("  "),
+                Span::styled(addresses, Style::default().fg(theme::MUTED)),
+            ])
+        })
+        .collect::<Vec<_>>();
+
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
+    let Some(editor) = &app.editor else {
+        return;
+    };
+
+    let row = |label: &str, value: String, field: InterfaceEditorField| {
+        let active = editor.field == field;
+        let marker = if active { "▶ " } else { "  " };
+        let style = if active {
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        Line::styled(format!("{marker}{label}: {value}"), style)
+    };
+    let action_row = |label: &str, field: InterfaceEditorField| {
+        let active = editor.field == field;
+        let marker = if active { "▶ " } else { "  " };
+        let style = if active {
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::ACCENT)
+        };
+        Line::styled(format!("{marker}{label}"), style)
+    };
+
+    let mut lines = vec![
+        Line::from(format!("Interface: {}", editor.interface)),
+        row(
+            "IPv4 CIDR",
+            format!("{}_", editor.cidr),
+            InterfaceEditorField::Cidr,
+        ),
+    ];
+    if !editor.cidr.trim().is_empty() && editor.cidr.trim().parse::<ipnet::Ipv4Net>().is_err() {
+        lines.push(Line::styled(
+            "  Invalid CIDR — expected address/prefix, e.g. 192.168.1.10/24",
+            Style::default().fg(theme::BAD),
+        ));
+    }
+    lines.extend([
+        row(
+            "Role",
+            format!("{:?}", editor.role),
+            InterfaceEditorField::Role,
+        ),
+        row(
+            "Managed",
+            editor.managed.to_string(),
+            InterfaceEditorField::Managed,
+        ),
+        row(
+            "Allow management change",
+            editor.allow_management_change.to_string(),
+            InterfaceEditorField::AllowManagementChange,
+        ),
+    ]);
+    if editor.role == InterfaceRole::Management {
+        lines.push(Line::styled(
+            "WARNING: management interface change can disconnect the device",
+            Style::default().fg(theme::BAD).add_modifier(Modifier::BOLD),
+        ));
+    }
+    lines.push(Line::styled(
+        "j/k or arrows: move | Enter/Space: activate | type digits, '.', '/' to edit CIDR (e.g. 192.168.1.10/24)",
+        Style::default().fg(theme::MUTED),
+    ));
+    lines.push(Line::from(""));
+
+    const SAVE_LABEL: &str = "Save (dry-run preview)";
+    let button_row_index = lines.len() as u16;
+    lines.push(action_row(SAVE_LABEL, InterfaceEditorField::Save));
+
+    let block = panel("Interface editor");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    app.ui.buttons.push((
+        Rect {
+            x: inner.x,
+            y: inner.y + button_row_index,
+            width: SAVE_LABEL.len() as u16,
+            height: 1,
+        },
+        0,
+    ));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+const PREVIEW_APPLY_LABEL: &str = "Apply";
+
+pub(crate) fn render_preview(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
+    let Some(plan) = &app.preview else {
+        return;
+    };
+    let delete = if plan.delete_ipv4.is_empty() {
+        "none".to_string()
+    } else {
+        plan.delete_ipv4
+            .iter()
+            .map(|address| format!("{}/{}", address.address, address.prefix_len))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let add = plan
+        .add_ipv4
+        .as_ref()
+        .map(|address| format!("{}/{}", address.address, address.prefix_len))
+        .unwrap_or_else(|| "none".to_string());
+    let mut lines = vec![
+        Line::from(format!("Interface: {}", plan.interface)),
+        Line::from(format!("Delete IPv4: {delete}")),
+        Line::from(format!("Add IPv4: {add}")),
+        Line::from(format!("Set link up: {}", plan.set_link_up)),
+        Line::from(format!("Management change: {}", plan.management_change)),
+        Line::from(format!("DHCP action: {:?}", plan.dhcp_action)),
+        Line::styled(
+            "Applying starts an automatic rollback timer.",
+            Style::default().fg(theme::WARN),
+        ),
+        Line::from(""),
+    ];
+
+    let block = panel("Dry-run preview");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    app.ui.buttons.push((
+        Rect {
+            x: inner.x,
+            y: inner.y + lines.len() as u16,
+            width: PREVIEW_APPLY_LABEL.len() as u16,
+            height: 1,
+        },
+        0,
+    ));
+    lines.push(Line::styled(
+        PREVIEW_APPLY_LABEL,
+        Style::default()
+            .fg(theme::SELECTED_FG)
+            .bg(theme::SELECTED_BG)
+            .add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+const PENDING_COMMIT_LABEL: &str = "Commit";
+const PENDING_ROLLBACK_LABEL: &str = "Rollback";
+
+pub(crate) fn render_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
+    let Some(change) = &app.pending else {
+        return;
+    };
+    let seconds = change.expires_at_unix.saturating_sub(current_unix_time());
+    let mut lines = vec![
+        Line::from(format!("Interface: {}", change.interface)),
+        Line::from(format!("Token: {}", change.token)),
+        Line::styled(
+            format!("Automatic rollback in: {seconds}s"),
+            Style::default().fg(if seconds <= 10 {
+                theme::BAD
+            } else {
+                theme::WARN
+            }),
+        ),
+        Line::styled(
+            "Commit only after verifying connectivity.",
+            Style::default().fg(theme::MUTED),
+        ),
+        Line::from(""),
+    ];
+
+    let block = panel("Pending change");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    app.ui.buttons.push((
+        Rect {
+            x: inner.x,
+            y: inner.y + lines.len() as u16,
+            width: PENDING_COMMIT_LABEL.len() as u16,
+            height: 1,
+        },
+        0,
+    ));
+    lines.push(Line::styled(
+        PENDING_COMMIT_LABEL,
+        Style::default()
+            .fg(theme::ACCENT)
+            .add_modifier(Modifier::BOLD),
+    ));
+    app.ui.buttons.push((
+        Rect {
+            x: inner.x,
+            y: inner.y + lines.len() as u16,
+            width: PENDING_ROLLBACK_LABEL.len() as u16,
+            height: 1,
+        },
+        1,
+    ));
+    lines.push(Line::styled(
+        PENDING_ROLLBACK_LABEL,
+        Style::default()
+            .fg(theme::ACCENT)
+            .add_modifier(Modifier::BOLD),
+    ));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+pub(crate) fn focus_action(app: &mut TuiApp, _slot: usize) {
+    if let Some(editor) = app.editor.as_mut() {
+        editor.field = InterfaceEditorField::Save;
+    }
+}
+
+pub(crate) async fn handle_interface_list_key(
+    app: &mut TuiApp,
+    key: KeyCode,
+    client: &ApiClient,
+    direct: bool,
+) {
+    match key {
+        KeyCode::Esc => app.screen = Screen::Dashboard,
+        KeyCode::Up => {
+            app.selected_interface = app.selected_interface.saturating_sub(1);
+        }
+        KeyCode::Down if app.selected_interface + 1 < app.dashboard.interfaces.len() => {
+            app.selected_interface += 1;
+        }
+        KeyCode::Home => app.selected_interface = 0,
+        KeyCode::End => {
+            app.selected_interface = app.dashboard.interfaces.len().saturating_sub(1);
+        }
+        KeyCode::Enter if !direct => open_editor(app, client).await,
+        KeyCode::Enter => {
+            app.push_message(LogLevel::Warn, "Direct mode is read-only");
+        }
+        _ => {}
+    }
+}
+
+pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
+    let Some(status) = app.dashboard.interfaces.get(app.selected_interface) else {
+        return;
+    };
+    let name = status.interface.name.clone();
+
+    match client
+        .request(&Request::GetInterfaceConfig {
+            interface: name.clone(),
+        })
+        .await
+    {
+        Ok(Response::InterfaceConfig {
+            config,
+            allow_management_change,
+            ..
+        }) => {
+            let cidr = config
+                .as_ref()
+                .and_then(|interface| interface.ipv4)
+                .map(|network| network.to_string())
+                .or_else(|| {
+                    status
+                        .ipv4_addresses
+                        .first()
+                        .map(|address| format!("{}/{}", address.address, address.prefix_len))
+                })
+                .unwrap_or_default();
+
+            app.editor = Some(InterfaceEditor {
+                interface: name,
+                field: InterfaceEditorField::Cidr,
+                cidr,
+                role: config
+                    .as_ref()
+                    .map_or(InterfaceRole::Output, |interface| interface.role),
+                managed: config.as_ref().is_none_or(|interface| interface.managed),
+                allow_management_change,
+            });
+            app.preview = None;
+            app.screen = Screen::InterfaceEditor;
+        }
+        Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
+        Ok(response) => app.push_message(
+            LogLevel::Error,
+            format!("Unexpected response while loading interface config: {response:?}"),
+        ),
+        Err(error) => app.push_message(
+            LogLevel::Error,
+            format!("Failed to load interface config: {error}"),
+        ),
+    }
+}
+
+pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
+    let Some(editor) = app.editor.as_mut() else {
+        app.screen = Screen::InterfaceList;
+        return;
+    };
+
+    match key {
+        KeyCode::Esc => app.screen = Screen::InterfaceList,
+        KeyCode::Up => editor.field = previous_editor_field(editor.field),
+        KeyCode::Down => editor.field = next_editor_field(editor.field),
+        KeyCode::Enter => match editor.field {
+            InterfaceEditorField::Cidr => {}
+            InterfaceEditorField::Role => editor.role = next_role(editor.role),
+            InterfaceEditorField::Managed => editor.managed = !editor.managed,
+            InterfaceEditorField::AllowManagementChange => {
+                editor.allow_management_change = !editor.allow_management_change;
+            }
+            InterfaceEditorField::Save => submit_dry_run(app, client).await,
+        },
+        KeyCode::Backspace if editor.field == InterfaceEditorField::Cidr => {
+            editor.cidr.pop();
+        }
+        KeyCode::Char(character)
+            if editor.field == InterfaceEditorField::Cidr
+                && (character.is_ascii_digit() || matches!(character, '.' | '/')) =>
+        {
+            editor.cidr.push(character);
+        }
+        _ => {}
+    }
+}
+
+fn previous_editor_field(field: InterfaceEditorField) -> InterfaceEditorField {
+    let index = INTERFACE_EDITOR_FIELDS
+        .iter()
+        .position(|candidate| *candidate == field)
+        .unwrap_or(0);
+    INTERFACE_EDITOR_FIELDS[index.saturating_sub(1)]
+}
+
+fn next_editor_field(field: InterfaceEditorField) -> InterfaceEditorField {
+    let index = INTERFACE_EDITOR_FIELDS
+        .iter()
+        .position(|candidate| *candidate == field)
+        .unwrap_or(0);
+    INTERFACE_EDITOR_FIELDS[(index + 1).min(INTERFACE_EDITOR_FIELDS.len() - 1)]
+}
+
+pub(crate) async fn submit_dry_run(app: &mut TuiApp, client: &ApiClient) {
+    let Some(editor) = &app.editor else {
+        return;
+    };
+    let interface = editor.interface.clone();
+    let edit = match editor.edit_request() {
+        Ok(edit) => edit,
+        Err(error) => {
+            app.push_message(LogLevel::Warn, format!("Invalid interface edit: {error}"));
+            return;
+        }
+    };
+    match client
+        .request(&Request::DryRunInterfaceEdit { interface, edit })
+        .await
+    {
+        Ok(Response::InterfacePlan { plan }) => {
+            app.preview = Some(plan);
+            app.screen = Screen::Preview;
+        }
+        Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
+        Ok(response) => app.push_message(
+            LogLevel::Error,
+            format!("Unexpected response: {response:?}"),
+        ),
+        Err(error) => app.push_message(LogLevel::Error, error.to_string()),
+    }
+}
+
+pub(crate) async fn handle_preview_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
+    match key {
+        KeyCode::Esc => app.screen = Screen::InterfaceEditor,
+        KeyCode::Enter => apply_preview(app, client).await,
+        _ => {}
+    }
+}
+
+async fn apply_preview(app: &mut TuiApp, client: &ApiClient) {
+    let Some(editor) = &app.editor else {
+        app.screen = Screen::InterfaceList;
+        return;
+    };
+    let edit = match editor.edit_request() {
+        Ok(edit) => edit,
+        Err(error) => {
+            app.push_message(LogLevel::Error, error.to_string());
+            return;
+        }
+    };
+
+    match client
+        .request(&Request::ApplyInterfaceEdit {
+            interface: editor.interface.clone(),
+            edit,
+        })
+        .await
+    {
+        Ok(Response::NetworkChangePending { change }) => {
+            app.pending = Some(change);
+            app.screen = Screen::PendingChange;
+        }
+        Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
+        Ok(response) => app.push_message(
+            LogLevel::Error,
+            format!("Unexpected response: {response:?}"),
+        ),
+        Err(error) => app.push_message(LogLevel::Error, error.to_string()),
+    }
+}
+
+pub(crate) async fn handle_pending_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
+    match key {
+        KeyCode::Enter => finish_pending(app, client, true).await,
+        KeyCode::Esc => finish_pending(app, client, false).await,
+        _ => {}
+    }
+}
+
+async fn finish_pending(app: &mut TuiApp, client: &ApiClient, commit: bool) {
+    let Some(change) = &app.pending else {
+        app.screen = Screen::Dashboard;
+        return;
+    };
+    let request = if commit {
+        Request::CommitNetworkChange {
+            token: change.token.clone(),
+        }
+    } else {
+        Request::RollbackNetworkChange {
+            token: change.token.clone(),
+        }
+    };
+
+    match client.request(&request).await {
+        Ok(Response::NetworkChangeCommitted { .. }) if commit => {
+            app.push_message(LogLevel::Info, "Network change committed");
+            app.pending = None;
+            app.screen = Screen::Dashboard;
+        }
+        Ok(Response::NetworkChangeRolledBack { .. }) if !commit => {
+            app.push_message(LogLevel::Info, "Network change rolled back");
+            app.pending = None;
+            app.screen = Screen::Dashboard;
+        }
+        Ok(Response::Error { message }) => {
+            app.push_message(LogLevel::Error, message);
+            app.pending = None;
+            app.screen = Screen::Dashboard;
+        }
+        Ok(response) => app.push_message(
+            LogLevel::Error,
+            format!("Unexpected response: {response:?}"),
+        ),
+        Err(error) => app.push_message(LogLevel::Error, error.to_string()),
+    }
+}
+
+fn next_role(role: InterfaceRole) -> InterfaceRole {
+    match role {
+        InterfaceRole::Management => InterfaceRole::Input,
+        InterfaceRole::Input => InterfaceRole::Output,
+        InterfaceRole::Output => InterfaceRole::Disabled,
+        InterfaceRole::Disabled => InterfaceRole::Management,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interface_editor_field_reaches_save_and_clamps_at_both_ends() {
+        assert_eq!(
+            next_editor_field(InterfaceEditorField::Cidr),
+            InterfaceEditorField::Role
+        );
+        assert_eq!(
+            next_editor_field(InterfaceEditorField::Role),
+            InterfaceEditorField::Managed
+        );
+        assert_eq!(
+            next_editor_field(InterfaceEditorField::Managed),
+            InterfaceEditorField::AllowManagementChange
+        );
+        assert_eq!(
+            next_editor_field(InterfaceEditorField::AllowManagementChange),
+            InterfaceEditorField::Save
+        );
+        assert_eq!(
+            next_editor_field(InterfaceEditorField::Save),
+            InterfaceEditorField::Save
+        );
+
+        assert_eq!(
+            previous_editor_field(InterfaceEditorField::Save),
+            InterfaceEditorField::AllowManagementChange
+        );
+        assert_eq!(
+            previous_editor_field(InterfaceEditorField::Cidr),
+            InterfaceEditorField::Cidr
+        );
+    }
+
+    #[test]
+    fn next_role_cycles_through_all_four_variants_without_repeating() {
+        let start = InterfaceRole::Management;
+        let mut role = start;
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(role);
+            role = next_role(role);
+        }
+        assert_eq!(role, start, "cycle must return to the starting role");
+        seen.sort_by_key(|role| format!("{role:?}"));
+        seen.dedup();
+        assert_eq!(seen.len(), 4, "all four roles must be distinct");
+    }
+}

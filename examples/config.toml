@@ -1,0 +1,78 @@
+# Safe example for a router with an externally configured uplink (wan0), a
+# management interface (eth0), and a managed LAN (wlan0). Replace interface
+# names and addresses before use.
+
+[runtime]
+state_dir = "/var/lib/traffic-masq"
+log_dir = "/var/log/traffic-masq"
+socket_path = "/run/traffic-masq/traffic-masqd.sock"
+pid_path = "/run/traffic-masq/traffic-masqd.pid"
+shutdown_policy = "preserve_interfaces"
+
+[network.interfaces.eth0]
+role = "management"
+managed = false
+
+[network.interfaces.wan0]
+role = "input"
+managed = false
+
+[network.interfaces.wlan0]
+role = "output"
+managed = true
+ipv4 = "192.168.50.1/24"
+
+[network.interfaces.wlan0.dhcp]
+pool_start = "192.168.50.100"
+pool_end = "192.168.50.200"
+router = "192.168.50.1"
+dns_servers = ["1.1.1.1", "9.9.9.9"]
+lease_seconds = 86400
+
+[router]
+enabled = true
+uplink = { interface = "wan0", mode = "external" }
+owned_routes = []
+allow_default_route_change = false
+
+[dhcp]
+leases_dir = "/var/lib/traffic-masq/dhcp/leases"
+default_lease_seconds = 86400
+
+[wifi]
+enabled = false
+hostapd_binary = "/usr/sbin/hostapd"
+runtime_dir = "/run/traffic-masq/hostapd"
+restart_backoff_seconds = 5
+
+# Enabling Wi-Fi client mode only establishes layer-2 association. It does NOT
+# give this interface an IP address; configure DHCP client ownership separately.
+[wifi_client]
+enabled = false
+wpa_supplicant_binary = "/usr/sbin/wpa_supplicant"
+runtime_dir = "/run/traffic-masq/wpa_supplicant"
+restart_backoff_seconds = 5
+
+[vpn]
+enabled = false
+wireguard_config_dir = "/var/lib/traffic-masq/vpn/wireguard"
+
+[vpn.policy]
+default_mode = "direct"
+protected_subnets = "all_managed_output_subnets"
+
+[security]
+rollback_timeout_seconds = 60
+
+[api.tcp]
+enabled = false
+listen = "127.0.0.1:8443"
+
+[auth]
+database_path = "/var/lib/traffic-masq/auth.sqlite3"
+session_idle_seconds = 1800
+session_absolute_seconds = 28800
+argon2_memory_kib = 32768
+argon2_iterations = 3
+argon2_parallelism = 1
+max_concurrent_logins = 2

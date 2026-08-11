@@ -1,0 +1,273 @@
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+
+use super::theme;
+use super::{section_of, Screen, Section, TuiApp, SECTIONS};
+
+pub(crate) fn panel(title: &str) -> Block<'static> {
+    Block::default()
+        .title(Span::styled(
+            format!(" {title} "),
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::BORDER))
+}
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct UiLayout {
+    pub(crate) tabs: [Rect; SECTIONS.len()],
+    pub(crate) list_area: Option<Rect>,
+    pub(crate) list_row_height: u16,
+    pub(crate) list_count: usize,
+
+    pub(crate) list_scroll_offset: usize,
+
+    pub(crate) buttons: Vec<(Rect, usize)>,
+}
+
+pub(crate) fn point_in_rect(point: (u16, u16), rect: Rect) -> bool {
+    let (x, y) = point;
+    x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+}
+
+pub(crate) fn section_at(tabs: &[Rect], point: (u16, u16)) -> Option<Section> {
+    tabs.iter()
+        .zip(SECTIONS.iter())
+        .find(|(rect, _)| point_in_rect(point, **rect))
+        .map(|(_, section)| *section)
+}
+
+pub(crate) fn render_header(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    app: &mut TuiApp,
+    direct: bool,
+) {
+    let mode_label = if direct {
+        "direct/recovery mode"
+    } else {
+        "daemon"
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::BORDER))
+        .title(Line::from(vec![
+            Span::styled(
+                " traffic-masq ",
+                Style::default()
+                    .fg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("[{mode_label}] "),
+                Style::default().fg(theme::MUTED),
+            ),
+        ]));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let segments = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(vec![
+            Constraint::Ratio(1, SECTIONS.len() as u32);
+            SECTIONS.len()
+        ])
+        .split(inner);
+    app.ui.tabs = segments
+        .as_ref()
+        .try_into()
+        .expect("tab bar always splits into SECTIONS.len() segments");
+
+    let active = section_of(app.screen);
+    for (index, section) in SECTIONS.iter().enumerate() {
+        let selected = *section == active;
+        let style = if selected {
+            Style::default()
+                .fg(theme::SELECTED_FG)
+                .bg(theme::SELECTED_BG)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::TEXT)
+        };
+        let label = format!(" {} ", section.title());
+        frame.render_widget(
+            Paragraph::new(label)
+                .style(style)
+                .alignment(Alignment::Center),
+            segments[index],
+        );
+    }
+}
+
+pub(crate) fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &TuiApp) {
+    let mut spans = Vec::new();
+    for (index, (key, description)) in screen_help_pairs(app.screen).into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled("  ", Style::default().fg(theme::MUTED)));
+        }
+        spans.push(Span::styled(
+            key,
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(":", Style::default().fg(theme::MUTED)));
+        spans.push(Span::styled(description, Style::default().fg(theme::TEXT)));
+    }
+    spans.push(Span::styled(
+        "   🖱 mouse enabled",
+        Style::default().fg(theme::MUTED),
+    ));
+
+    let message_line = if let Some(text) = app.message.as_deref() {
+        let color = app
+            .logs
+            .back()
+            .map(|entry| entry.level.color())
+            .unwrap_or(theme::WARN);
+        Line::styled(text, Style::default().fg(color))
+    } else if let Some(text) = app.dashboard.error.as_deref() {
+        Line::styled(text, Style::default().fg(theme::WARN))
+    } else {
+        Line::styled("Ready", Style::default().fg(theme::GOOD))
+    };
+
+    frame.render_widget(
+        Paragraph::new(vec![Line::from(spans), message_line]).block(panel("Status")),
+        area,
+    );
+}
+
+fn screen_help_pairs(screen: Screen) -> Vec<(&'static str, &'static str)> {
+    match screen {
+        Screen::Dashboard => vec![
+            ("↑/↓", "move"),
+            ("←/→", "section"),
+            ("Enter", "open"),
+            ("Esc", "quit"),
+        ],
+        Screen::Wifi => vec![
+            ("↑/↓", "move"),
+            ("←/→", "section"),
+            ("Enter", "activate"),
+            ("Esc", "back"),
+        ],
+        Screen::WifiEditor | Screen::WifiProfileEditor => vec![
+            ("↑/↓", "move"),
+            ("Enter", "activate"),
+            ("type", "edit value"),
+            ("Esc", "back"),
+        ],
+        Screen::WifiScan => vec![
+            ("↑/↓", "network"),
+            ("Enter", "create profile"),
+            ("Esc", "back"),
+        ],
+        Screen::WifiProfiles => vec![("↑/↓", "move"), ("Enter", "activate"), ("Esc", "back")],
+        Screen::InterfaceList
+        | Screen::DhcpInterfaceList
+        | Screen::DhcpClient
+        | Screen::Router
+        | Screen::Vpn => vec![
+            ("↑/↓", "move"),
+            ("←/→", "section"),
+            ("Enter", "select"),
+            ("Esc", "back"),
+        ],
+        Screen::Access
+        | Screen::InterfaceEditor
+        | Screen::DhcpEditor
+        | Screen::VpnPolicy
+        | Screen::Settings => vec![
+            ("↑/↓", "move"),
+            ("Enter", "activate"),
+            ("type", "edit value"),
+            ("Esc", "back"),
+        ],
+        Screen::VpnImport | Screen::SettingsPassword => vec![
+            ("↑/↓", "field"),
+            ("type", "value"),
+            ("Enter", "submit"),
+            ("Esc", "cancel"),
+        ],
+        Screen::DhcpLeases => vec![
+            ("↑/↓", "scroll"),
+            ("PgUp/PgDn", "page"),
+            ("Enter", "refresh"),
+            ("Esc", "back"),
+        ],
+        Screen::Preview | Screen::RouterPlan => vec![("Enter", "apply"), ("Esc", "back")],
+        Screen::RouterProvisioning => vec![
+            ("↑/↓", "field"),
+            ("←/→", "choose"),
+            ("Enter", "continue"),
+            ("Esc", "cancel"),
+        ],
+        Screen::RouterProvisioningNetworks => {
+            vec![("↑/↓", "network"), ("Enter", "select"), ("Esc", "back")]
+        }
+        Screen::RouterProvisioningConfirm => {
+            vec![("Tab", "advanced"), ("Enter", "apply"), ("Esc", "back")]
+        }
+        Screen::PendingChange | Screen::RouterPending => {
+            vec![("Enter", "commit"), ("Esc", "rollback")]
+        }
+        Screen::RouterProvisioningPending => {
+            vec![("Enter", "commit"), ("Esc", "rollback")]
+        }
+        Screen::Log => vec![
+            ("↑/↓", "scroll"),
+            ("PgUp/PgDn", "page"),
+            ("←/→", "section"),
+            ("Enter", "activate"),
+            ("Esc", "back"),
+        ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn point_in_rect_matches_inclusive_top_left_exclusive_bottom_right() {
+        let rect = Rect::new(2, 3, 4, 5);
+        assert!(point_in_rect((2, 3), rect));
+        assert!(point_in_rect((5, 7), rect));
+        assert!(!point_in_rect((6, 3), rect));
+        assert!(!point_in_rect((2, 8), rect));
+        assert!(!point_in_rect((1, 3), rect));
+    }
+
+    #[test]
+    fn section_at_finds_the_tab_containing_the_click_point() {
+        let tabs = [
+            Rect::new(0, 0, 8, 1),
+            Rect::new(8, 0, 8, 1),
+            Rect::new(16, 0, 8, 1),
+            Rect::new(24, 0, 8, 1),
+            Rect::new(32, 0, 8, 1),
+            Rect::new(40, 0, 8, 1),
+            Rect::new(48, 0, 8, 1),
+            Rect::new(56, 0, 8, 1),
+            Rect::new(64, 0, 8, 1),
+        ];
+        assert_eq!(section_at(&tabs, (3, 0)), Some(Section::Dashboard));
+        assert_eq!(section_at(&tabs, (11, 0)), Some(Section::Interfaces));
+        assert_eq!(section_at(&tabs, (19, 0)), Some(Section::Dhcp));
+        assert_eq!(section_at(&tabs, (27, 0)), Some(Section::DhcpClient));
+        assert_eq!(section_at(&tabs, (35, 0)), Some(Section::Router));
+        assert_eq!(section_at(&tabs, (43, 0)), Some(Section::Vpn));
+        assert_eq!(section_at(&tabs, (51, 0)), Some(Section::Wifi));
+        assert_eq!(section_at(&tabs, (59, 0)), Some(Section::Settings));
+        assert_eq!(section_at(&tabs, (67, 0)), Some(Section::Log));
+        assert_eq!(section_at(&tabs, (73, 0)), None);
+    }
+}

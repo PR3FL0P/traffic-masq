@@ -1,0 +1,348 @@
+use std::fmt;
+use std::path::Path;
+use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use thiserror::Error;
+use tokio::net::UnixDatagram;
+use tokio::sync::{broadcast, oneshot};
+use tokio::task::JoinHandle;
+
+pub(crate) const MAX_CTRL_MESSAGE_BYTES: usize = 4096;
+
+const EVENT_CHANNEL_CAPACITY: usize = 64;
+
+const DETACH_TIMEOUT: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MacAddr([u8; 6]);
+
+impl MacAddr {
+    pub const fn new(octets: [u8; 6]) -> Self {
+        Self(octets)
+    }
+
+    pub const fn octets(&self) -> [u8; 6] {
+        self.0
+    }
+}
+
+impl fmt::Display for MacAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let [a, b, c, d, e, g] = self.0;
+        write!(f, "{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{g:02x}")
+    }
+}
+
+impl Serialize for MacAddr {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for MacAddr {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(D::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("invalid MAC address {0:?}")]
+pub struct MacAddrParseError(String);
+
+impl FromStr for MacAddr {
+    type Err = MacAddrParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let mut octets = [0u8; 6];
+        let mut groups = value.split(':');
+        for octet in &mut octets {
+            let group = groups
+                .next()
+                .ok_or_else(|| MacAddrParseError(value.to_string()))?;
+            if group.len() != 2 {
+                return Err(MacAddrParseError(value.to_string()));
+            }
+            *octet =
+                u8::from_str_radix(group, 16).map_err(|_| MacAddrParseError(value.to_string()))?;
+        }
+        if groups.next().is_some() {
+            return Err(MacAddrParseError(value.to_string()));
+        }
+        Ok(Self(octets))
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum CtrlError {
+    #[error("I/O error on control socket: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("control request timed out after {0:?}")]
+    Timeout(Duration),
+
+    #[error("the control interface rejected the request")]
+    Failed,
+
+    #[error("the control interface does not recognise the command {0:?}")]
+    UnknownCommand(String),
+
+    #[error("malformed control reply: {0:?}")]
+    MalformedReply(String),
+
+    #[error(transparent)]
+    InvalidMacAddr(#[from] MacAddrParseError),
+}
+
+async fn control_request(
+    socket: &UnixDatagram,
+    timeout: Duration,
+    command: &str,
+) -> Result<String, CtrlError> {
+    socket.send(command.as_bytes()).await?;
+    let mut buffer = vec![0u8; MAX_CTRL_MESSAGE_BYTES];
+    let read = tokio::time::timeout(timeout, socket.recv(&mut buffer))
+        .await
+        .map_err(|_| CtrlError::Timeout(timeout))??;
+    let reply = String::from_utf8_lossy(&buffer[..read]).into_owned();
+    if reply.trim_end() == "FAIL" {
+        return Err(CtrlError::Failed);
+    }
+    if reply.starts_with("UNKNOWN COMMAND") {
+        return Err(CtrlError::UnknownCommand(command.to_string()));
+    }
+    Ok(reply)
+}
+
+pub(crate) fn expect_ok(command: &str, reply: &str) -> Result<(), CtrlError> {
+    if reply.trim_end() == "OK" {
+        Ok(())
+    } else {
+        Err(CtrlError::MalformedReply(format!("{command} -> {reply:?}")))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn bind_client_socket() -> std::io::Result<std::os::unix::net::UnixDatagram> {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixDatagram as StdUnixDatagram};
+
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let name = format!("traffic-masq-wifi-ctrl-{}-{sequence}", std::process::id());
+    let address = SocketAddr::from_abstract_name(name.as_bytes())?;
+    let socket = StdUnixDatagram::bind_addr(&address)?;
+    socket.set_nonblocking(true)?;
+    Ok(socket)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bind_client_socket() -> std::io::Result<std::os::unix::net::UnixDatagram> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "ctrl_iface control sockets use Linux's abstract socket namespace",
+    ))
+}
+
+fn bind_and_connect(ctrl_path: &Path) -> Result<UnixDatagram, CtrlError> {
+    let socket = UnixDatagram::from_std(bind_client_socket()?)?;
+    socket.connect(ctrl_path)?;
+    Ok(socket)
+}
+
+pub(crate) struct CtrlSocket {
+    socket: UnixDatagram,
+    timeout: Duration,
+}
+
+impl CtrlSocket {
+    pub(crate) async fn connect(ctrl_path: &Path, timeout: Duration) -> Result<Self, CtrlError> {
+        Ok(Self {
+            socket: bind_and_connect(ctrl_path)?,
+            timeout,
+        })
+    }
+
+    pub(crate) async fn request(&self, command: &str) -> Result<String, CtrlError> {
+        control_request(&self.socket, self.timeout, command).await
+    }
+}
+
+pub(crate) fn parse_kv_lines(reply: &str) -> std::collections::BTreeMap<String, String> {
+    reply
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+pub(crate) fn indexed_field<'a>(
+    raw: &'a std::collections::BTreeMap<String, String>,
+    key: &str,
+) -> Option<&'a str> {
+    raw.get(&format!("{key}[0]"))
+        .or_else(|| raw.get(key))
+        .map(String::as_str)
+}
+
+pub(crate) fn strip_priority_prefix(line: &str) -> &str {
+    let Some(rest) = line.strip_prefix('<') else {
+        return line;
+    };
+    let Some(end) = rest.find('>') else {
+        return line;
+    };
+    if rest[..end].bytes().all(|byte| byte.is_ascii_digit()) && !rest[..end].is_empty() {
+        &rest[end + 1..]
+    } else {
+        line
+    }
+}
+
+pub(crate) struct EventClient<E> {
+    cancel: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<()>>,
+    _event: std::marker::PhantomData<E>,
+}
+
+impl<E> EventClient<E> {
+    pub(crate) async fn attach<F>(
+        ctrl_path: &Path,
+        timeout: Duration,
+        parse: F,
+    ) -> Result<(Self, broadcast::Receiver<E>), CtrlError>
+    where
+        F: Fn(&str) -> E + Send + 'static,
+        E: Clone + Send + 'static,
+    {
+        let socket = bind_and_connect(ctrl_path)?;
+        let reply = control_request(&socket, timeout, "ATTACH").await?;
+        expect_ok("ATTACH", &reply)?;
+
+        let (sender, receiver) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let task = tokio::spawn(event_loop(socket, sender, cancel_rx, parse));
+
+        Ok((
+            Self {
+                cancel: Some(cancel_tx),
+                task: Some(task),
+                _event: std::marker::PhantomData,
+            },
+            receiver,
+        ))
+    }
+
+    pub(crate) async fn close(mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+impl<E> Drop for EventClient<E> {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+    }
+}
+
+async fn event_loop<E, F>(
+    socket: UnixDatagram,
+    sender: broadcast::Sender<E>,
+    mut cancel: oneshot::Receiver<()>,
+    parse: F,
+) where
+    F: Fn(&str) -> E,
+    E: Clone,
+{
+    let mut buffer = vec![0u8; MAX_CTRL_MESSAGE_BYTES];
+    loop {
+        tokio::select! {
+            _ = &mut cancel => {
+                let _ = tokio::time::timeout(DETACH_TIMEOUT, socket.send(b"DETACH")).await;
+                return;
+            }
+            result = socket.recv(&mut buffer) => {
+                let Ok(read) = result else { return };
+                let raw = String::from_utf8_lossy(&buffer[..read]).into_owned();
+
+
+                let _ = sender.send(parse(&raw));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_and_parses_a_mac_address() {
+        let mac = MacAddr::new([0x02, 0x00, 0x0a, 0x1b, 0xff, 0x01]);
+        assert_eq!(mac.to_string(), "02:00:0a:1b:ff:01");
+        assert_eq!("02:00:0a:1b:ff:01".parse(), Ok(mac));
+    }
+
+    #[test]
+    fn rejects_malformed_mac_addresses() {
+        for bad in [
+            "",
+            "not-a-mac",
+            "02:00:0a:1b:ff",
+            "02:00:0a:1b:ff:01:02",
+            "gg:00:0a:1b:ff:01",
+        ] {
+            assert!(
+                bad.parse::<MacAddr>().is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn strips_a_well_formed_priority_prefix() {
+        assert_eq!(
+            strip_priority_prefix("<3>AP-STA-CONNECTED"),
+            "AP-STA-CONNECTED"
+        );
+        assert_eq!(strip_priority_prefix("AP-ENABLED"), "AP-ENABLED");
+    }
+
+    #[test]
+    fn leaves_a_malformed_priority_prefix_in_the_body() {
+        assert_eq!(
+            strip_priority_prefix("<not-a-number>AP-ENABLED"),
+            "<not-a-number>AP-ENABLED"
+        );
+        assert_eq!(strip_priority_prefix("<>AP-ENABLED"), "<>AP-ENABLED");
+    }
+
+    #[test]
+    fn parses_key_value_lines_ignoring_ones_without_an_equals_sign() {
+        let parsed = parse_kv_lines("state=ENABLED\nfreeform line\nchannel=6\n");
+        assert_eq!(parsed.get("state"), Some(&"ENABLED".to_string()));
+        assert_eq!(parsed.get("channel"), Some(&"6".to_string()));
+        assert_eq!(parsed.len(), 2);
+    }
+
+    #[test]
+    fn indexed_field_prefers_the_indexed_form_and_falls_back_to_bare() {
+        let mut raw = std::collections::BTreeMap::new();
+        raw.insert("ssid[0]".to_string(), "indexed".to_string());
+        raw.insert("other".to_string(), "bare".to_string());
+        assert_eq!(indexed_field(&raw, "ssid"), Some("indexed"));
+        assert_eq!(indexed_field(&raw, "other"), Some("bare"));
+        assert_eq!(indexed_field(&raw, "missing"), None);
+    }
+}
