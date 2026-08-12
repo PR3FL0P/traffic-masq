@@ -294,6 +294,7 @@ fn sort_routes(routes: &mut [Ipv4RouteInfo]) {
 
 #[cfg(test)]
 mod tests {
+    use crate::netlink::AddressOwnership;
     use std::net::Ipv4Addr;
 
     use async_trait::async_trait;
@@ -345,6 +346,7 @@ mod tests {
             _interface: &str,
             _address: Ipv4Addr,
             _prefix_len: u8,
+            _ownership: AddressOwnership,
         ) -> Result<()> {
             Ok(())
         }

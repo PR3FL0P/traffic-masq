@@ -40,10 +40,17 @@ pub(crate) struct InterfaceEditor {
     pub(crate) managed: bool,
     pub(crate) allow_management_change: bool,
     pub(crate) has_default_route: bool,
+    pub(crate) original_managed: bool,
+    pub(crate) original_cidr: String,
 }
 
 impl InterfaceEditor {
     pub(crate) fn edit_request(&self) -> Result<InterfaceEditRequest> {
+        if !self.managed && self.cidr.trim() != self.original_cidr.trim() {
+            anyhow::bail!(
+                "cannot change IP while the interface is unmanaged; enable Managed first"
+            );
+        }
         if !self.cidr.trim().is_empty() {
             let _: ipnet::Ipv4Net = self.cidr.trim().parse()?;
         }
@@ -57,7 +64,11 @@ impl InterfaceEditor {
             );
         }
         Ok(InterfaceEditRequest {
-            cidr: self.cidr.trim().to_string(),
+            cidr: if self.managed {
+                self.cidr.trim().to_string()
+            } else {
+                String::new()
+            },
             role: self.role,
             managed: self.managed,
             allow_management_change: self.allow_management_change,
@@ -189,6 +200,18 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         };
         lines.push(Line::styled(message, Style::default().fg(color)));
     }
+    if !editor.managed && editor.cidr.trim() != editor.original_cidr.trim() {
+        lines.push(Line::styled(
+            "Cannot change IP while the interface is unmanaged; enable Managed first",
+            Style::default().fg(theme::BAD),
+        ));
+    }
+    if editor.original_managed && !editor.managed {
+        lines.push(Line::styled(
+            "Saving will remove traffic-masq-owned settings and stop managing this interface",
+            Style::default().fg(theme::WARN),
+        ));
+    }
     lines.push(Line::styled(
         "j/k or arrows: move | Enter/Space: activate | type digits, '.', '/' to edit CIDR (e.g. 192.168.1.10/24)",
         Style::default().fg(theme::MUTED),
@@ -211,10 +234,21 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         },
         0,
     ));
+    app.ui.buttons.push((
+        Rect {
+            x: inner.x,
+            y: inner.y + lines.len() as u16 + 1,
+            width: PREVIEW_CANCEL_LABEL.len() as u16 + 2,
+            height: 1,
+        },
+        1,
+    ));
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
 const PREVIEW_APPLY_LABEL: &str = "Apply";
+const PREVIEW_RELEASE_LABEL: &str = "Remove settings and stop managing";
+const PREVIEW_CANCEL_LABEL: &str = "Cancel";
 
 pub(crate) fn render_preview(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
     let Some(plan) = &app.preview else {
@@ -234,13 +268,23 @@ pub(crate) fn render_preview(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
         .as_ref()
         .map(|address| format!("{}/{}", address.address, address.prefix_len))
         .unwrap_or_else(|| "none".to_string());
+    let retag = plan
+        .retag_ipv4
+        .as_ref()
+        .map(|address| format!("{}/{}", address.address, address.prefix_len))
+        .unwrap_or_else(|| "none".to_string());
     let mut lines = vec![
         Line::from(format!("Interface: {}", plan.interface)),
         Line::from(format!("Delete IPv4: {delete}")),
+        Line::from(format!("Claim existing IPv4: {retag}")),
         Line::from(format!("Add IPv4: {add}")),
         Line::from(format!("Set link up: {}", plan.set_link_up)),
         Line::from(format!("Management change: {}", plan.management_change)),
         Line::from(format!("DHCP action: {:?}", plan.dhcp_action)),
+        Line::from(format!(
+            "Stop managing interface: {}",
+            plan.releasing_management
+        )),
         Line::styled(
             "Applying starts an automatic rollback timer.",
             Style::default().fg(theme::WARN),
@@ -251,21 +295,37 @@ pub(crate) fn render_preview(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
     let block = panel("Dry-run preview");
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let apply_label = if plan.releasing_management {
+        PREVIEW_RELEASE_LABEL
+    } else {
+        PREVIEW_APPLY_LABEL
+    };
     app.ui.buttons.push((
         Rect {
             x: inner.x,
             y: inner.y + lines.len() as u16,
-            width: PREVIEW_APPLY_LABEL.len() as u16,
+            width: apply_label.len() as u16 + 2,
             height: 1,
         },
         0,
     ));
+    let choice = |label: &str, selected: bool| {
+        let marker = if selected { "▶ " } else { "  " };
+        let style = if selected {
+            Style::default()
+                .fg(theme::SELECTED_FG)
+                .bg(theme::SELECTED_BG)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        Line::styled(format!("{marker}{label}"), style)
+    };
+    lines.push(choice(apply_label, app.preview_apply_selected));
+    lines.push(choice(PREVIEW_CANCEL_LABEL, !app.preview_apply_selected));
     lines.push(Line::styled(
-        PREVIEW_APPLY_LABEL,
-        Style::default()
-            .fg(theme::SELECTED_FG)
-            .bg(theme::SELECTED_BG)
-            .add_modifier(Modifier::BOLD),
+        "Up/Down: select | Enter: confirm | Esc: cancel",
+        Style::default().fg(theme::MUTED),
     ));
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -393,6 +453,8 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
                 })
                 .unwrap_or_default();
 
+            let original_managed = config.as_ref().is_some_and(|interface| interface.managed);
+            let original_cidr = cidr.clone();
             app.editor = Some(InterfaceEditor {
                 interface: name,
                 field: InterfaceEditorField::Cidr,
@@ -403,6 +465,8 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
                 managed: config.as_ref().is_none_or(|interface| interface.managed),
                 allow_management_change,
                 has_default_route: status.has_default_route,
+                original_managed,
+                original_cidr,
             });
             app.preview = None;
             app.screen = Screen::InterfaceEditor;
@@ -485,6 +549,7 @@ pub(crate) async fn submit_dry_run(app: &mut TuiApp, client: &ApiClient) {
     {
         Ok(Response::InterfacePlan { plan }) => {
             app.preview = Some(plan);
+            app.preview_apply_selected = true;
             app.screen = Screen::Preview;
         }
         Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
@@ -499,9 +564,17 @@ pub(crate) async fn submit_dry_run(app: &mut TuiApp, client: &ApiClient) {
 pub(crate) async fn handle_preview_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
     match key {
         KeyCode::Esc => app.screen = Screen::InterfaceEditor,
-        KeyCode::Enter => apply_preview(app, client).await,
+        KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
+            app.preview_apply_selected = !app.preview_apply_selected;
+        }
+        KeyCode::Enter if app.preview_apply_selected => apply_preview(app, client).await,
+        KeyCode::Enter => app.screen = Screen::InterfaceEditor,
         _ => {}
     }
+}
+
+pub(crate) fn focus_preview_action(app: &mut TuiApp, slot: usize) {
+    app.preview_apply_selected = slot == 0;
 }
 
 async fn apply_preview(app: &mut TuiApp, client: &ApiClient) {
@@ -606,6 +679,8 @@ mod tests {
             managed: true,
             allow_management_change,
             has_default_route: true,
+            original_managed: true,
+            original_cidr: "192.168.1.10/24".into(),
         }
     }
 
@@ -618,6 +693,19 @@ mod tests {
     #[test]
     fn managed_output_on_default_route_is_allowed_after_confirmation() {
         assert!(default_route_editor(true).edit_request().is_ok());
+    }
+
+    #[test]
+    fn unmanaged_interface_rejects_ip_edits_with_a_clear_error() {
+        let mut editor = default_route_editor(false);
+        editor.original_managed = false;
+        editor.managed = false;
+        editor.cidr = "192.168.1.11/24".into();
+        let error = editor.edit_request().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "cannot change IP while the interface is unmanaged; enable Managed first"
+        );
     }
 
     #[test]

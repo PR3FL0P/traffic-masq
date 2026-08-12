@@ -962,6 +962,7 @@ fn validate_active_interface(
 
 #[cfg(test)]
 mod tests {
+    use crate::netlink::AddressOwnership;
     use std::collections::VecDeque;
     use std::net::Ipv4Addr;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1031,6 +1032,7 @@ mod tests {
             _interface: &str,
             _address: Ipv4Addr,
             _prefix_len: u8,
+            _ownership: AddressOwnership,
         ) -> Result<()> {
             unreachable!("not used")
         }

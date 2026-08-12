@@ -1,4 +1,5 @@
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -10,6 +11,7 @@ use netlink_packet_route::{
     rule::{RuleAction, RuleAttribute, RuleMessage},
     AddressFamily,
 };
+use netlink_packet_utils::nla::{DefaultNla, Nla};
 use rtnetlink::{new_connection, Handle, IpVersion};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
@@ -62,11 +64,83 @@ pub struct Ipv4AddressInfo {
     pub interface_index: u32,
     pub address: Ipv4Addr,
     pub prefix_len: u8,
+    #[serde(default)]
+    pub protocol: Option<u8>,
 }
+
+impl Ipv4AddressInfo {
+    pub fn owner(&self) -> AddressOwner {
+        AddressOwner::from_protocol(self.protocol)
+    }
+}
+
+pub const TRAFFIC_MASQ_ADDRESS_PROTOCOL: u8 = 201;
+pub const TRAFFIC_MASQ_DHCP_ADDRESS_PROTOCOL: u8 = 202;
+const IFA_PROTO: u16 = 11;
 
 pub const TRAFFIC_MASQ_ROUTE_PROTOCOL: u8 = 201;
 
 pub const TRAFFIC_MASQ_DHCP_ROUTE_PROTOCOL: u8 = 202;
+
+/// The ownership traffic-masq claims for an address it is about to install.
+///
+/// Every write path has to name one, so an address can never be created
+/// without a deliberate decision about who owns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AddressOwnership {
+    /// A statically configured traffic-masq address.
+    Static,
+    /// An address held by the traffic-masq DHCP client on behalf of a lease.
+    DhcpClient,
+    /// An address traffic-masq installs but does not claim, e.g. when
+    /// restoring state that belonged to something else.
+    Untagged,
+}
+
+impl AddressOwnership {
+    pub fn protocol(self) -> Option<u8> {
+        match self {
+            Self::Static => Some(TRAFFIC_MASQ_ADDRESS_PROTOCOL),
+            Self::DhcpClient => Some(TRAFFIC_MASQ_DHCP_ADDRESS_PROTOCOL),
+            Self::Untagged => None,
+        }
+    }
+}
+
+/// What the kernel reports about an address that already exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressOwner {
+    TrafficMasqStatic,
+    TrafficMasqDhcp,
+    /// No `IFA_PROTO` at all: either predates ownership tagging or belongs to
+    /// a daemon that does not tag. Indistinguishable, deliberately.
+    Untagged,
+    /// Tagged by something that is not us.
+    Foreign(u8),
+}
+
+impl AddressOwner {
+    pub fn from_protocol(protocol: Option<u8>) -> Self {
+        match protocol {
+            None | Some(0) => Self::Untagged,
+            Some(TRAFFIC_MASQ_ADDRESS_PROTOCOL) => Self::TrafficMasqStatic,
+            Some(TRAFFIC_MASQ_DHCP_ADDRESS_PROTOCOL) => Self::TrafficMasqDhcp,
+            Some(other) => Self::Foreign(other),
+        }
+    }
+
+    /// The ownership to restore this address with. A foreign tag is never
+    /// replayed: userspace claiming e.g. `IFAPROT_KERNEL_RA` would lie to
+    /// every other daemon that filters on it.
+    pub fn restore_as(self) -> AddressOwnership {
+        match self {
+            Self::TrafficMasqStatic => AddressOwnership::Static,
+            Self::TrafficMasqDhcp => AddressOwnership::DhcpClient,
+            Self::Untagged | Self::Foreign(_) => AddressOwnership::Untagged,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ipv4RouteSpec {
@@ -166,6 +240,15 @@ impl Ipv4RuleSpec {
 
 #[async_trait]
 pub trait NetworkProvider: Send + Sync {
+    /// Whether address ownership tags can be trusted on this provider.
+    ///
+    /// Implementations must report observed truth, not intent: a provider that
+    /// has seen the kernel drop `IFA_PROTO` is expected to start returning
+    /// `false` so the planner and the ownership guards agree with reality.
+    fn supports_ipv4_address_protocol(&self) -> bool {
+        false
+    }
+
     async fn list_interfaces(&self) -> Result<Vec<NetworkInterface>>;
 
     async fn hardware_address(&self, _interface: &str) -> Result<Vec<u8>> {
@@ -175,12 +258,28 @@ pub trait NetworkProvider: Send + Sync {
     async fn list_ipv4_addresses(&self, interface: &str) -> Result<Vec<Ipv4AddressInfo>>;
     async fn set_link_up(&self, name: &str) -> Result<()>;
     async fn set_link_down(&self, name: &str) -> Result<()>;
+    /// Install an address. There is deliberately no default implementation and
+    /// no untagged variant of this method: a provider that cannot honour
+    /// `ownership` must say so by failing, never by silently dropping the tag.
     async fn add_ipv4_address(
         &self,
         interface: &str,
         address: Ipv4Addr,
         prefix_len: u8,
+        ownership: AddressOwnership,
     ) -> Result<()>;
+
+    /// Re-tag an address that already exists, without taking it off the link.
+    async fn set_ipv4_address_ownership(
+        &self,
+        _interface: &str,
+        _address: Ipv4Addr,
+        _prefix_len: u8,
+        _ownership: AddressOwnership,
+    ) -> Result<()> {
+        anyhow::bail!("IPv4 address ownership tagging is not supported by this network provider")
+    }
+
     async fn delete_ipv4_address(
         &self,
         interface: &str,
@@ -231,10 +330,21 @@ pub trait NetworkProvider: Send + Sync {
     }
 }
 
+/// `IFA_PROTO` support has not been observed yet; assume it works and let the
+/// first tagged write settle the question.
+const ADDRESS_PROTOCOL_UNKNOWN: u8 = 0;
+const ADDRESS_PROTOCOL_SUPPORTED: u8 = 1;
+const ADDRESS_PROTOCOL_UNSUPPORTED: u8 = 2;
+
 #[derive(Debug)]
 pub struct RtnetlinkNetworkProvider {
     handle: Handle,
     _connection_task: JoinHandle<()>,
+    /// Observed `IFA_PROTO` support, resolved by reading back the first
+    /// address we tag. `IFA_PROTO` needs Linux 5.18; older kernels parse
+    /// `RTM_NEWADDR` liberally and ignore the attribute without an error, so
+    /// asking the kernel is the only way to know.
+    address_protocol_support: AtomicU8,
 }
 
 impl RtnetlinkNetworkProvider {
@@ -244,7 +354,59 @@ impl RtnetlinkNetworkProvider {
         Ok(Self {
             handle,
             _connection_task: connection_task,
+            address_protocol_support: AtomicU8::new(ADDRESS_PROTOCOL_UNKNOWN),
         })
+    }
+
+    /// Confirm that a tag we just wrote actually landed, once per process.
+    ///
+    /// A dropped tag does not fail the operation: the address itself is on the
+    /// link and healthy, only ownership tracking is degraded. Recording that
+    /// keeps `supports_ipv4_address_protocol` honest, which is what the
+    /// unmanage guard relies on.
+    async fn confirm_address_protocol(
+        &self,
+        interface: &str,
+        address: Ipv4Addr,
+        prefix_len: u8,
+        expected: u8,
+    ) -> Result<()> {
+        if self.address_protocol_support.load(Ordering::Relaxed) != ADDRESS_PROTOCOL_UNKNOWN {
+            return Ok(());
+        }
+
+        let observed = self
+            .list_ipv4_addresses(interface)
+            .await?
+            .into_iter()
+            .find(|item| item.address == address && item.prefix_len == prefix_len)
+            .and_then(|item| item.protocol);
+
+        if observed == Some(expected) {
+            self.address_protocol_support
+                .store(ADDRESS_PROTOCOL_SUPPORTED, Ordering::Relaxed);
+        } else {
+            self.address_protocol_support
+                .store(ADDRESS_PROTOCOL_UNSUPPORTED, Ordering::Relaxed);
+            tracing::warn!(
+                interface = %interface,
+                address = %address,
+                prefix_len,
+                expected,
+                ?observed,
+                "kernel did not store the IPv4 address ownership tag (IFA_PROTO needs Linux 5.18); \
+                 traffic-masq cannot verify address ownership and will refuse to stop managing \
+                 interfaces it cannot prove it configured"
+            );
+        }
+        Ok(())
+    }
+
+    /// Build the `IFA_PROTO` attribute, or nothing for an untagged address.
+    fn ownership_attribute(ownership: AddressOwnership) -> Option<AddressAttribute> {
+        ownership
+            .protocol()
+            .map(|protocol| AddressAttribute::Other(DefaultNla::new(IFA_PROTO, vec![protocol])))
     }
 
     async fn link_index(&self, name: &str) -> Result<u32> {
@@ -410,6 +572,12 @@ fn parse_ipv4_rule(message: &RuleMessage) -> Result<Option<Ipv4RuleInfo>> {
 
 #[async_trait]
 impl NetworkProvider for RtnetlinkNetworkProvider {
+    fn supports_ipv4_address_protocol(&self) -> bool {
+        // Optimistic until proven otherwise: the first tagged write reads the
+        // address back and flips this to `false` if the kernel dropped the tag.
+        self.address_protocol_support.load(Ordering::Relaxed) != ADDRESS_PROTOCOL_UNSUPPORTED
+    }
+
     async fn hardware_address(&self, interface: &str) -> Result<Vec<u8>> {
         let mut links = self
             .handle
@@ -483,12 +651,21 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
 
         while let Some(message) = addresses.try_next().await? {
             let mut ipv4 = None;
+            let mut protocol = None;
             for attr in &message.attributes {
-                if let AddressAttribute::Local(IpAddr::V4(address))
-                | AddressAttribute::Address(IpAddr::V4(address)) = attr
-                {
-                    ipv4 = Some(*address);
-                    break;
+                match attr {
+                    AddressAttribute::Local(IpAddr::V4(address))
+                    | AddressAttribute::Address(IpAddr::V4(address)) => {
+                        ipv4.get_or_insert(*address);
+                    }
+                    AddressAttribute::Other(other)
+                        if other.kind() == IFA_PROTO && other.value_len() == 1 =>
+                    {
+                        let mut value = [0u8; 1];
+                        other.emit_value(&mut value);
+                        protocol = Some(value[0]);
+                    }
+                    _ => {}
                 }
             }
 
@@ -497,6 +674,7 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
                     interface_index: message.header.index,
                     address,
                     prefix_len: message.header.prefix_len,
+                    protocol,
                 });
             }
         }
@@ -521,13 +699,71 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
         interface: &str,
         address: Ipv4Addr,
         prefix_len: u8,
+        ownership: AddressOwnership,
     ) -> Result<()> {
         let index = self.link_index(interface).await?;
-        self.handle
+        let mut request = self
+            .handle
             .address()
-            .add(index, IpAddr::V4(address), prefix_len)
-            .execute()
-            .await?;
+            .add(index, IpAddr::V4(address), prefix_len);
+        if let Some(attribute) = Self::ownership_attribute(ownership) {
+            request.message_mut().attributes.push(attribute);
+        }
+        request.execute().await?;
+
+        if let Some(protocol) = ownership.protocol() {
+            self.confirm_address_protocol(interface, address, prefix_len, protocol)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn set_ipv4_address_ownership(
+        &self,
+        interface: &str,
+        address: Ipv4Addr,
+        prefix_len: u8,
+        ownership: AddressOwnership,
+    ) -> Result<()> {
+        let existing = self.address_message(interface, address, prefix_len).await?;
+        let mut request = self
+            .handle
+            .address()
+            .add(existing.header.index, IpAddr::V4(address), prefix_len)
+            .replace();
+
+        {
+            let message = request.message_mut();
+            // Keep the flags and scope the address already carries; dropping
+            // e.g. IFA_F_NOPREFIXROUTE while re-tagging would change routing.
+            message.header = existing.header.clone();
+            // IFA_CACHEINFO is deliberately not replayed: resending stale
+            // lifetimes would age the address. Everything else the request
+            // needs (Address/Local/Broadcast) is already built by `add`.
+            message
+                .attributes
+                .extend(
+                    existing
+                        .attributes
+                        .iter()
+                        .filter_map(|attribute| match attribute {
+                            AddressAttribute::Label(_) | AddressAttribute::Flags(_) => {
+                                Some(attribute.clone())
+                            }
+                            _ => None,
+                        }),
+                );
+            if let Some(attribute) = Self::ownership_attribute(ownership) {
+                message.attributes.push(attribute);
+            }
+        }
+
+        request.execute().await?;
+
+        if let Some(protocol) = ownership.protocol() {
+            self.confirm_address_protocol(interface, address, prefix_len, protocol)
+                .await?;
+        }
         Ok(())
     }
 
@@ -906,6 +1142,7 @@ mod tests {
             _interface: &str,
             _address: Ipv4Addr,
             _prefix_len: u8,
+            _ownership: AddressOwnership,
         ) -> Result<()> {
             Ok(())
         }

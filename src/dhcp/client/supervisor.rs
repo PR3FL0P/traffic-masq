@@ -909,6 +909,7 @@ fn current_unix_time() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use crate::netlink::{AddressOwnership, TRAFFIC_MASQ_DHCP_ADDRESS_PROTOCOL};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use tempfile::TempDir;
@@ -988,11 +989,13 @@ mod tests {
             _interface: &str,
             address: Ipv4Addr,
             prefix_len: u8,
+            ownership: AddressOwnership,
         ) -> Result<()> {
             self.addresses.lock().await.push(Ipv4AddressInfo {
                 interface_index: 7,
                 address,
                 prefix_len,
+                protocol: ownership.protocol(),
             });
             Ok(())
         }
@@ -1326,8 +1329,11 @@ mod tests {
                 .expect("addresses"),
             vec![Ipv4AddressInfo {
                 interface_index: 7,
+                // A DHCP-held address is tagged as such, so it is
+                // distinguishable from a hand-configured one.
                 address: Ipv4Addr::new(192, 0, 2, 42),
                 prefix_len: 24,
+                protocol: Some(TRAFFIC_MASQ_DHCP_ADDRESS_PROTOCOL),
             }]
         );
 
@@ -1608,6 +1614,7 @@ mod tests {
             interface_index: 7,
             address: Ipv4Addr::new(192, 0, 2, 42),
             prefix_len: 24,
+            protocol: None,
         });
         let launcher = Arc::new(FakeLauncher::default());
         let supervisor = supervisor_with(&state_dir, network.clone(), launcher.clone()).await;

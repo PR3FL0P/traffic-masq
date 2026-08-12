@@ -108,10 +108,34 @@ impl NetworkTransactionManager {
         current_role: Option<InterfaceRole>,
         allow_management_change: bool,
     ) -> Result<InterfaceChangePlan> {
+        self.dry_run_transition(
+            interface,
+            config,
+            None,
+            current_role,
+            allow_management_change,
+        )
+        .await
+    }
+
+    pub async fn dry_run_transition(
+        &self,
+        interface: &str,
+        config: &InterfaceConfig,
+        previous_config: Option<&InterfaceConfig>,
+        current_role: Option<InterfaceRole>,
+        allow_management_change: bool,
+    ) -> Result<InterfaceChangePlan> {
         let mut plan = self
             .inner
             .interface_manager
-            .plan_interface(interface, config, current_role, allow_management_change)
+            .plan_interface_transition(
+                interface,
+                config,
+                previous_config,
+                current_role,
+                allow_management_change,
+            )
             .await?;
         if let Some(dhcp) = &self.inner.dhcp {
             let current = dhcp.spec(interface).await;
@@ -135,6 +159,24 @@ impl NetworkTransactionManager {
         &self,
         interface: &str,
         config: &InterfaceConfig,
+        current_role: Option<InterfaceRole>,
+        allow_management_change: bool,
+    ) -> Result<PendingNetworkChange> {
+        self.apply_transition(
+            interface,
+            config,
+            None,
+            current_role,
+            allow_management_change,
+        )
+        .await
+    }
+
+    pub async fn apply_transition(
+        &self,
+        interface: &str,
+        config: &InterfaceConfig,
+        previous_config: Option<&InterfaceConfig>,
         current_role: Option<InterfaceRole>,
         allow_management_change: bool,
     ) -> Result<PendingNetworkChange> {
@@ -168,7 +210,13 @@ impl NetworkTransactionManager {
         if let Err(error) = self
             .inner
             .interface_manager
-            .apply_interface(interface, config, current_role, allow_management_change)
+            .apply_interface_transition(
+                interface,
+                config,
+                previous_config,
+                current_role,
+                allow_management_change,
+            )
             .await
         {
             self.restore_dhcp(previous_dhcp.clone()).await?;
@@ -396,6 +444,7 @@ fn current_unix_time() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use crate::netlink::AddressOwnership;
     use std::net::Ipv4Addr;
 
     use anyhow::Result;
@@ -438,11 +487,13 @@ mod tests {
             _interface: &str,
             address: Ipv4Addr,
             prefix_len: u8,
+            ownership: AddressOwnership,
         ) -> Result<()> {
             self.addresses.lock().await.push(Ipv4AddressInfo {
                 interface_index: 1,
                 address,
                 prefix_len,
+                protocol: ownership.protocol(),
             });
             Ok(())
         }
@@ -467,6 +518,7 @@ mod tests {
             interface_index: 1,
             address: Ipv4Addr::new(192, 168, 1, 10),
             prefix_len: 24,
+            protocol: None,
         };
         let provider = Arc::new(FakeNetwork {
             interface: Mutex::new(NetworkInterface {
@@ -519,6 +571,7 @@ mod tests {
             interface_index: 1,
             address: Ipv4Addr::new(192, 168, 1, 10),
             prefix_len: 24,
+            protocol: None,
         };
         let provider = Arc::new(FakeNetwork {
             interface: Mutex::new(NetworkInterface {

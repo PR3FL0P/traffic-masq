@@ -390,6 +390,7 @@ fn rule_spec_from_info(info: &Ipv4RuleInfo) -> Ipv4RuleSpec {
 
 #[cfg(test)]
 mod tests {
+    use crate::netlink::AddressOwnership;
     use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
 
@@ -568,6 +569,7 @@ mod tests {
             _interface: &str,
             _address: std::net::Ipv4Addr,
             _prefix_len: u8,
+            _ownership: AddressOwnership,
         ) -> Result<()> {
             Ok(())
         }

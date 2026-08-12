@@ -7,7 +7,10 @@ use crate::{
         },
         store::{DhcpClientLeaseStore, LeaseStoreError},
     },
-    netlink::{Ipv4RouteInfo, Ipv4RouteSpec, NetworkProvider, TRAFFIC_MASQ_DHCP_ROUTE_PROTOCOL},
+    netlink::{
+        AddressOwnership, Ipv4RouteInfo, Ipv4RouteSpec, NetworkProvider,
+        TRAFFIC_MASQ_DHCP_ROUTE_PROTOCOL,
+    },
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -124,7 +127,12 @@ impl DhcpClientOwnershipApplier {
         let mutation = async {
             if !address_present {
                 self.network
-                    .add_ipv4_address(&lease.interface, lease.address, lease.prefix_len)
+                    .add_ipv4_address(
+                        &lease.interface,
+                        lease.address,
+                        lease.prefix_len,
+                        AddressOwnership::DhcpClient,
+                    )
                     .await
                     .map_err(OwnershipError::Network)?;
                 added_address = true;
@@ -474,11 +482,13 @@ mod tests {
             _interface: &str,
             address: Ipv4Addr,
             prefix_len: u8,
+            ownership: AddressOwnership,
         ) -> Result<()> {
             self.addresses.lock().unwrap().push(Ipv4AddressInfo {
                 interface_index: *self.index.lock().unwrap(),
                 address,
                 prefix_len,
+                protocol: ownership.protocol(),
             });
             Ok(())
         }
@@ -573,6 +583,7 @@ mod tests {
             interface_index: 2,
             address: Ipv4Addr::new(198, 51, 100, 9),
             prefix_len: 27,
+            protocol: None,
         });
         let (_dir, store, applier) = fixture(network.clone());
         let bound = applier.apply(lease()).await.unwrap();
@@ -585,7 +596,8 @@ mod tests {
             &[Ipv4AddressInfo {
                 interface_index: 2,
                 address: Ipv4Addr::new(198, 51, 100, 9),
-                prefix_len: 27
+                prefix_len: 27,
+                protocol: None,
             }]
         );
         assert!(network.routes.lock().unwrap().is_empty());
@@ -599,6 +611,7 @@ mod tests {
                 interface_index: 2,
                 address: lease().address,
                 prefix_len,
+                protocol: None,
             });
             let (_dir, _store, applier) = fixture(network.clone());
             let error = applier.apply(lease()).await.unwrap_err();
@@ -648,11 +661,13 @@ mod tests {
                 interface_index: 2,
                 address: record.address,
                 prefix_len: 24,
+                protocol: None,
             },
             Ipv4AddressInfo {
                 interface_index: 2,
                 address: record.address,
                 prefix_len: 25,
+                protocol: None,
             },
         ]);
         let owned = &record.owned_routes[0];

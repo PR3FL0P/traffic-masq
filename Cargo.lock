@@ -2701,6 +2701,7 @@ dependencies = [
  "netlink-packet-core 0.8.1",
  "netlink-packet-generic",
  "netlink-packet-route",
+ "netlink-packet-utils",
  "netlink-packet-wireguard",
  "nix 0.29.0",
  "pbkdf2",

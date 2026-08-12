@@ -857,10 +857,12 @@ mod tests {
             interfaces: vec![InterfaceChangePlan {
                 interface: "lan0".into(),
                 delete_ipv4: Vec::new(),
+                retag_ipv4: None,
                 add_ipv4: None,
                 set_link_up: false,
                 management_change: false,
                 dhcp_action: DhcpChangeAction::Unchanged,
+                releasing_management: false,
             }],
             uplink_wifi: Vec::new(),
             output_wifi: Vec::new(),

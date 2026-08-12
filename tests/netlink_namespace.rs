@@ -4,7 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use traffic_masq::netlink::{
-    Ipv4RouteSpec, NetworkProvider, RtnetlinkNetworkProvider, TRAFFIC_MASQ_ROUTE_PROTOCOL,
+    AddressOwner, AddressOwnership, Ipv4RouteSpec, NetworkProvider, RtnetlinkNetworkProvider,
+    TRAFFIC_MASQ_ROUTE_PROTOCOL,
 };
 
 struct NetnsFixture {
@@ -77,7 +78,7 @@ async fn rtnetlink_can_manage_ipv4_on_veth() -> Result<()> {
     let host_index = host.index;
 
     provider
-        .add_ipv4_address(&fixture.host_if, test_ip, 24)
+        .add_ipv4_address(&fixture.host_if, test_ip, 24, AddressOwnership::Static)
         .await?;
 
     let addresses = provider.list_ipv4_addresses(&fixture.host_if).await?;
@@ -126,6 +127,86 @@ async fn rtnetlink_can_manage_ipv4_on_veth() -> Result<()> {
         "test IPv4 address should be absent after delete_ipv4_address"
     );
 
+    provider.set_link_down(&fixture.host_if).await?;
+    Ok(())
+}
+
+/// The one assumption the whole ownership model rests on: that the kernel
+/// actually stores and returns `IFA_PROTO`. Fakes cannot answer this.
+#[tokio::test]
+#[ignore = "requires root, iproute2 and Linux 5.18+; run explicitly on a disposable Linux test host"]
+async fn rtnetlink_round_trips_ipv4_address_ownership() -> Result<()> {
+    let fixture = NetnsFixture::new()?;
+    let provider = RtnetlinkNetworkProvider::connect()?;
+    let test_ip = Ipv4Addr::new(192, 0, 2, 20);
+
+    provider.set_link_up(&fixture.host_if).await?;
+    provider
+        .add_ipv4_address(&fixture.host_if, test_ip, 24, AddressOwnership::Static)
+        .await?;
+
+    let tagged = provider
+        .list_ipv4_addresses(&fixture.host_if)
+        .await?
+        .into_iter()
+        .find(|addr| addr.address == test_ip)
+        .context("tagged address should be present")?;
+    assert_eq!(
+        tagged.owner(),
+        AddressOwner::TrafficMasqStatic,
+        "kernel must return the IFA_PROTO ownership tag it was given"
+    );
+    assert!(
+        provider.supports_ipv4_address_protocol(),
+        "a confirmed round-trip must leave ownership support enabled"
+    );
+
+    provider
+        .delete_ipv4_address(&fixture.host_if, test_ip, 24)
+        .await?;
+    provider.set_link_down(&fixture.host_if).await?;
+    Ok(())
+}
+
+/// Claiming an existing address must not take it off the link, and must not
+/// disturb the address itself.
+#[tokio::test]
+#[ignore = "requires root, iproute2 and Linux 5.18+; run explicitly on a disposable Linux test host"]
+async fn rtnetlink_retags_existing_address_in_place() -> Result<()> {
+    let fixture = NetnsFixture::new()?;
+    let provider = RtnetlinkNetworkProvider::connect()?;
+    let test_ip = Ipv4Addr::new(192, 0, 2, 30);
+
+    provider.set_link_up(&fixture.host_if).await?;
+    provider
+        .add_ipv4_address(&fixture.host_if, test_ip, 24, AddressOwnership::Untagged)
+        .await?;
+
+    let before = provider
+        .list_ipv4_addresses(&fixture.host_if)
+        .await?
+        .into_iter()
+        .find(|addr| addr.address == test_ip)
+        .context("untagged address should be present")?;
+    assert_eq!(before.owner(), AddressOwner::Untagged);
+
+    provider
+        .set_ipv4_address_ownership(&fixture.host_if, test_ip, 24, AddressOwnership::Static)
+        .await?;
+
+    let after = provider
+        .list_ipv4_addresses(&fixture.host_if)
+        .await?
+        .into_iter()
+        .find(|addr| addr.address == test_ip)
+        .context("address must stay on the link while being claimed")?;
+    assert_eq!(after.owner(), AddressOwner::TrafficMasqStatic);
+    assert_eq!(after.prefix_len, before.prefix_len);
+    assert_eq!(after.interface_index, before.interface_index);
+
+    provider
+        .delete_ipv4_address(&fixture.host_if, test_ip, 24)
+        .await?;
     provider.set_link_down(&fixture.host_if).await?;
     Ok(())
 }

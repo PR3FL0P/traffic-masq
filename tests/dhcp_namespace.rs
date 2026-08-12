@@ -10,7 +10,7 @@ use tempfile::tempdir;
 use tokio::time::sleep;
 use traffic_masq::config::AppConfig;
 use traffic_masq::dhcp::supervisor::{DhcpServiceSpec, DhcpSupervisor};
-use traffic_masq::netlink::{NetworkProvider, RtnetlinkNetworkProvider};
+use traffic_masq::netlink::{AddressOwnership, NetworkProvider, RtnetlinkNetworkProvider};
 use traffic_masq::state::overrides::RuntimeOverrides;
 
 static NAMESPACE_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -194,7 +194,7 @@ async fn configure_server(
 ) -> Result<()> {
     network.set_link_up(&fixture.host_if).await?;
     network
-        .add_ipv4_address(&fixture.host_if, server_ip, 24)
+        .add_ipv4_address(&fixture.host_if, server_ip, 24, AddressOwnership::Static)
         .await?;
     supervisor
         .configure(DhcpServiceSpec {

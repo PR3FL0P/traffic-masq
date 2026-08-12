@@ -862,6 +862,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::netlink::AddressOwnership;
     use std::collections::HashMap;
     use std::net::Ipv4Addr;
     use std::sync::Arc;
@@ -946,6 +947,7 @@ mod tests {
             interface: &str,
             address: Ipv4Addr,
             prefix_len: u8,
+            ownership: AddressOwnership,
         ) -> Result<()> {
             let interface_index = self
                 .interfaces
@@ -962,6 +964,7 @@ mod tests {
                     interface_index,
                     address,
                     prefix_len,
+                    protocol: ownership.protocol(),
                 });
             Ok(())
         }
@@ -1232,6 +1235,7 @@ mod tests {
                 interface_index: 3,
                 address: Ipv4Addr::new(10, 0, 0, 1),
                 prefix_len: 24,
+                protocol: None,
             }],
         );
         let desired = RouterDesired::from_effective_config(&config).expect("desired");

@@ -1147,6 +1147,7 @@ async fn rollback_interfaces(manager: &InterfaceManager, snapshots: &[InterfaceS
 
 #[cfg(test)]
 mod tests {
+    use crate::netlink::AddressOwnership;
     use std::collections::HashMap;
     use std::net::Ipv4Addr;
 
@@ -1249,6 +1250,7 @@ mod tests {
             interface: &str,
             address: Ipv4Addr,
             prefix_len: u8,
+            ownership: AddressOwnership,
         ) -> Result<()> {
             let interface_index = self
                 .interfaces
@@ -1267,6 +1269,7 @@ mod tests {
                     interface_index,
                     address,
                     prefix_len,
+                    protocol: ownership.protocol(),
                 });
             }
             Ok(())
@@ -1698,6 +1701,7 @@ mod tests {
                 interface_index: 7,
                 address: Ipv4Addr::new(192, 168, 77, 1),
                 prefix_len: 24,
+                protocol: None,
             }],
             desired,
         ));
@@ -1711,6 +1715,7 @@ mod tests {
                 interface_index: 7,
                 address: Ipv4Addr::new(192, 168, 77, 1),
                 prefix_len: 24,
+                protocol: None,
             }],
             desired,
         ));
@@ -1721,6 +1726,7 @@ mod tests {
                 interface_index: 7,
                 address: Ipv4Addr::new(192, 168, 88, 1),
                 prefix_len: 24,
+                protocol: None,
             }],
             desired,
         ));
@@ -1792,6 +1798,7 @@ mod tests {
                 interface_index: 7,
                 address: Ipv4Addr::new(192, 168, 77, 1),
                 prefix_len: 24,
+                protocol: None,
             }]
         );
         assert_eq!(dhcp.configure_calls.lock().await.len(), 1);
@@ -1880,6 +1887,7 @@ mod tests {
             interface_index: 9,
             address: Ipv4Addr::new(192, 0, 2, 42),
             prefix_len: 24,
+            protocol: None,
         };
         network
             .add_interface_with_state("wan0", 9, true, vec![dynamic.clone()])

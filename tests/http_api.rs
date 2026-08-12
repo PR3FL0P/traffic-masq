@@ -40,7 +40,7 @@ use traffic_masq::dhcp::supervisor::{DhcpServiceSpec, DhcpSupervisor};
 use traffic_masq::firewall::{
     OwnedFirewallIntegrity, RouterDataplanePlan, RouterDataplaneSnapshot,
 };
-use traffic_masq::netlink::{Ipv4AddressInfo, NetworkInterface, NetworkProvider};
+use traffic_masq::netlink::{AddressOwnership, Ipv4AddressInfo, NetworkInterface, NetworkProvider};
 use traffic_masq::state::overrides::RuntimeOverrideManager;
 use traffic_masq::wifi::{HostapdSupervisor, WifiApSpec, WifiClientSpec, WifiClientSupervisor};
 
@@ -65,6 +65,7 @@ impl NetworkProvider for FakeNetwork {
             interface_index: 7,
             address: Ipv4Addr::new(192, 168, 99, 1),
             prefix_len: 24,
+            protocol: None,
         }])
     }
 
@@ -81,6 +82,7 @@ impl NetworkProvider for FakeNetwork {
         _interface: &str,
         _address: Ipv4Addr,
         _prefix_len: u8,
+        _ownership: AddressOwnership,
     ) -> Result<()> {
         Ok(())
     }
@@ -568,10 +570,12 @@ impl RouterSubsystems for FakeRouterSubsystems {
         Ok(vec![InterfaceChangePlan {
             interface: "lan0".into(),
             delete_ipv4: Vec::new(),
+            retag_ipv4: None,
             add_ipv4: None,
             set_link_up: false,
             management_change: false,
             dhcp_action: DhcpChangeAction::Unchanged,
+            releasing_management: false,
         }])
     }
 
@@ -1449,6 +1453,7 @@ impl NetworkProvider for FakePolicyNetwork {
         _interface: &str,
         _address: Ipv4Addr,
         _prefix_len: u8,
+        _ownership: AddressOwnership,
     ) -> Result<()> {
         Ok(())
     }
@@ -1708,6 +1713,7 @@ impl NetworkProvider for ProvisioningNetwork {
                 interface_index: 1,
                 address: Ipv4Addr::new(192, 168, 1, 20),
                 prefix_len: 24,
+                protocol: None,
             }]
         } else {
             Vec::new()
@@ -1722,7 +1728,13 @@ impl NetworkProvider for ProvisioningNetwork {
         Ok(())
     }
 
-    async fn add_ipv4_address(&self, _: &str, _: Ipv4Addr, _: u8) -> Result<()> {
+    async fn add_ipv4_address(
+        &self,
+        _: &str,
+        _: Ipv4Addr,
+        _: u8,
+        _: AddressOwnership,
+    ) -> Result<()> {
         Ok(())
     }
 

@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{InterfaceConfig, InterfaceRole, NetworkConfig};
-use crate::netlink::{Ipv4AddressInfo, NetworkProvider};
+use crate::netlink::{AddressOwner, AddressOwnership, Ipv4AddressInfo, NetworkProvider};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterfaceSnapshot {
@@ -27,10 +27,16 @@ pub enum DhcpChangeAction {
 pub struct InterfaceChangePlan {
     pub interface: String,
     pub delete_ipv4: Vec<Ipv4AddressInfo>,
+    /// The desired address is already on the link but carries no ownership
+    /// tag: claim it in place rather than dropping and re-adding it.
+    #[serde(default)]
+    pub retag_ipv4: Option<Ipv4AddressInfo>,
     pub add_ipv4: Option<Ipv4AddressInfo>,
     pub set_link_up: bool,
     pub management_change: bool,
     pub dhcp_action: DhcpChangeAction,
+    #[serde(default)]
+    pub releasing_management: bool,
 }
 
 pub fn is_management_change(
@@ -154,6 +160,29 @@ impl InterfaceManager {
         current_role: Option<InterfaceRole>,
         allow_management_change: bool,
     ) -> Result<InterfaceChangePlan> {
+        self.plan_interface_transition(name, config, None, current_role, allow_management_change)
+            .await
+    }
+
+    pub async fn plan_interface_transition(
+        &self,
+        name: &str,
+        config: &InterfaceConfig,
+        previous_config: Option<&InterfaceConfig>,
+        current_role: Option<InterfaceRole>,
+        allow_management_change: bool,
+    ) -> Result<InterfaceChangePlan> {
+        if !config.managed
+            && (config.ipv4.is_some()
+                || config.dhcp.is_some()
+                || config.dhcp_client.is_some()
+                || config.wifi.is_some()
+                || config.wifi_client.is_some())
+        {
+            bail!(
+                "unmanaged interface {name} cannot contain traffic-masq settings; enable Managed to edit them"
+            );
+        }
         config.validate(name)?;
 
         let management_change = is_management_change(config.role, current_role);
@@ -162,13 +191,48 @@ impl InterfaceManager {
         }
 
         if !config.managed {
+            let releasing_management = previous_config.is_some_and(|previous| previous.managed);
+            let delete_ipv4 = if releasing_management {
+                let previous_ipv4 = previous_config.and_then(|previous| previous.ipv4);
+                if previous_ipv4.is_some() && !self.provider.supports_ipv4_address_protocol() {
+                    bail!(
+                        "cannot safely stop managing {name}: this network provider cannot verify IPv4 address ownership"
+                    );
+                }
+                let observed = self.provider.list_ipv4_addresses(name).await?;
+                if let Some(previous_ipv4) = previous_ipv4 {
+                    if let Some(address) = observed.iter().find(|address| {
+                        ipnet::Ipv4Net::new(address.address, address.prefix_len).ok()
+                            == Some(previous_ipv4)
+                            && address.owner() != AddressOwner::TrafficMasqStatic
+                    }) {
+                        bail!(
+                            "cannot safely stop managing {name}: configured address {}/{} has no traffic-masq ownership tag (observed protocol {:?}); re-apply the managed configuration before trying again",
+                            address.address,
+                            address.prefix_len,
+                            address.protocol
+                        );
+                    }
+                }
+                // Only our own static addresses. DHCP-owned ones are torn down
+                // by the DHCP client supervisor's disable path; deleting them
+                // here as well would race with it.
+                observed
+                    .into_iter()
+                    .filter(|address| address.owner() == AddressOwner::TrafficMasqStatic)
+                    .collect()
+            } else {
+                Vec::new()
+            };
             return Ok(InterfaceChangePlan {
                 interface: name.to_string(),
-                delete_ipv4: Vec::new(),
+                delete_ipv4,
+                retag_ipv4: None,
                 add_ipv4: None,
                 set_link_up: false,
                 management_change,
                 dhcp_action: DhcpChangeAction::Unchanged,
+                releasing_management,
             });
         }
 
@@ -176,10 +240,12 @@ impl InterfaceManager {
             return Ok(InterfaceChangePlan {
                 interface: name.to_string(),
                 delete_ipv4: Vec::new(),
+                retag_ipv4: None,
                 add_ipv4: None,
                 set_link_up: true,
                 management_change,
                 dhcp_action: DhcpChangeAction::Unchanged,
+                releasing_management: false,
             });
         }
 
@@ -187,29 +253,55 @@ impl InterfaceManager {
         let desired = config
             .ipv4
             .map(|network| (network.addr(), network.prefix_len()));
+        let can_tag = self.provider.supports_ipv4_address_protocol();
+        let ownership = if can_tag {
+            AddressOwnership::Static
+        } else {
+            AddressOwnership::Untagged
+        };
+
         let delete_ipv4 = current
             .iter()
             .filter(|address| desired != Some((address.address, address.prefix_len)))
             .cloned()
             .collect();
-        let add_ipv4 = desired.and_then(|(address, prefix_len)| {
-            let already_present = current
+
+        let existing_desired = desired.and_then(|(address, prefix_len)| {
+            current
                 .iter()
-                .any(|current| current.address == address && current.prefix_len == prefix_len);
-            (!already_present).then_some(Ipv4AddressInfo {
-                interface_index: current.first().map_or(0, |address| address.interface_index),
-                address,
-                prefix_len,
-            })
+                .find(|item| item.address == address && item.prefix_len == prefix_len)
         });
+
+        // The desired address is already on the link but is not ours yet:
+        // claim it in place. Deleting and re-adding it would drop the address
+        // on every unrelated edit, which on a management interface is a blip
+        // the user never asked for.
+        let retag_ipv4 = existing_desired
+            .filter(|address| can_tag && address.owner() != AddressOwner::TrafficMasqStatic)
+            .map(|address| Ipv4AddressInfo {
+                protocol: ownership.protocol(),
+                ..address.clone()
+            });
+
+        let add_ipv4 =
+            desired
+                .filter(|_| existing_desired.is_none())
+                .map(|(address, prefix_len)| Ipv4AddressInfo {
+                    interface_index: current.first().map_or(0, |address| address.interface_index),
+                    address,
+                    prefix_len,
+                    protocol: ownership.protocol(),
+                });
 
         Ok(InterfaceChangePlan {
             interface: name.to_string(),
             delete_ipv4,
+            retag_ipv4,
             add_ipv4,
             set_link_up: true,
             management_change,
             dhcp_action: DhcpChangeAction::Unchanged,
+            releasing_management: false,
         })
     }
 
@@ -234,9 +326,27 @@ impl InterfaceManager {
         current_role: Option<InterfaceRole>,
         allow_management_change: bool,
     ) -> Result<()> {
+        self.apply_interface_transition(name, config, None, current_role, allow_management_change)
+            .await
+    }
+
+    pub async fn apply_interface_transition(
+        &self,
+        name: &str,
+        config: &InterfaceConfig,
+        previous_config: Option<&InterfaceConfig>,
+        current_role: Option<InterfaceRole>,
+        allow_management_change: bool,
+    ) -> Result<()> {
         let snapshot = self.snapshot(name).await?;
         if let Err(error) = self
-            .apply_interface_unchecked(name, config, current_role, allow_management_change)
+            .apply_interface_unchecked(
+                name,
+                config,
+                previous_config,
+                current_role,
+                allow_management_change,
+            )
             .await
         {
             return match self.rollback(&snapshot).await {
@@ -255,11 +365,18 @@ impl InterfaceManager {
         &self,
         name: &str,
         config: &InterfaceConfig,
+        previous_config: Option<&InterfaceConfig>,
         current_role: Option<InterfaceRole>,
         allow_management_change: bool,
     ) -> Result<()> {
         let plan = self
-            .plan_interface(name, config, current_role, allow_management_change)
+            .plan_interface_transition(
+                name,
+                config,
+                previous_config,
+                current_role,
+                allow_management_change,
+            )
             .await?;
         self.apply_plan(&plan).await
     }
@@ -271,9 +388,25 @@ impl InterfaceManager {
                 .await?;
         }
 
+        if let Some(address) = &plan.retag_ipv4 {
+            self.provider
+                .set_ipv4_address_ownership(
+                    &plan.interface,
+                    address.address,
+                    address.prefix_len,
+                    address.owner().restore_as(),
+                )
+                .await?;
+        }
+
         if let Some(address) = &plan.add_ipv4 {
             self.provider
-                .add_ipv4_address(&plan.interface, address.address, address.prefix_len)
+                .add_ipv4_address(
+                    &plan.interface,
+                    address.address,
+                    address.prefix_len,
+                    address.owner().restore_as(),
+                )
                 .await?;
         }
 
@@ -285,11 +418,16 @@ impl InterfaceManager {
 
     pub async fn rollback(&self, snapshot: &InterfaceSnapshot) -> Result<()> {
         let current = self.provider.list_ipv4_addresses(&snapshot.name).await?;
+        let can_tag = self.provider.supports_ipv4_address_protocol();
+        let same_address = |left: &Ipv4AddressInfo, right: &Ipv4AddressInfo| {
+            left.address == right.address && left.prefix_len == right.prefix_len
+        };
 
         for address in &current {
-            let existed_before = snapshot.ipv4_addresses.iter().any(|previous| {
-                previous.address == address.address && previous.prefix_len == address.prefix_len
-            });
+            let existed_before = snapshot
+                .ipv4_addresses
+                .iter()
+                .any(|previous| same_address(previous, address));
             if !existed_before {
                 self.provider
                     .delete_ipv4_address(&snapshot.name, address.address, address.prefix_len)
@@ -298,13 +436,31 @@ impl InterfaceManager {
         }
 
         for address in &snapshot.ipv4_addresses {
-            let still_present = current.iter().any(|current| {
-                current.address == address.address && current.prefix_len == address.prefix_len
-            });
-            if !still_present {
-                self.provider
-                    .add_ipv4_address(&snapshot.name, address.address, address.prefix_len)
-                    .await?;
+            // Ownership is restored as it was, except that a foreign tag is
+            // never replayed: see `AddressOwner::restore_as`.
+            let ownership = address.owner().restore_as();
+            match current.iter().find(|item| same_address(item, address)) {
+                Some(present) if present.protocol != address.protocol && can_tag => {
+                    self.provider
+                        .set_ipv4_address_ownership(
+                            &snapshot.name,
+                            address.address,
+                            address.prefix_len,
+                            ownership,
+                        )
+                        .await?;
+                }
+                Some(_) => {}
+                None => {
+                    self.provider
+                        .add_ipv4_address(
+                            &snapshot.name,
+                            address.address,
+                            address.prefix_len,
+                            ownership,
+                        )
+                        .await?;
+                }
             }
         }
 
@@ -328,7 +484,9 @@ mod tests {
     use tokio::sync::Mutex;
 
     use crate::config::InterfaceConfig;
-    use crate::netlink::NetworkInterface;
+    use crate::netlink::{
+        NetworkInterface, TRAFFIC_MASQ_ADDRESS_PROTOCOL, TRAFFIC_MASQ_DHCP_ADDRESS_PROTOCOL,
+    };
 
     use super::*;
 
@@ -360,6 +518,10 @@ mod tests {
 
     #[async_trait]
     impl NetworkProvider for FakeNetworkProvider {
+        fn supports_ipv4_address_protocol(&self) -> bool {
+            true
+        }
+
         async fn list_interfaces(&self) -> Result<Vec<NetworkInterface>> {
             Ok(self.interfaces.lock().await.values().cloned().collect())
         }
@@ -399,6 +561,7 @@ mod tests {
             interface: &str,
             address: Ipv4Addr,
             prefix_len: u8,
+            ownership: AddressOwnership,
         ) -> Result<()> {
             self.addresses
                 .lock()
@@ -409,7 +572,27 @@ mod tests {
                     interface_index: 1,
                     address,
                     prefix_len,
+                    protocol: ownership.protocol(),
                 });
+            Ok(())
+        }
+
+        async fn set_ipv4_address_ownership(
+            &self,
+            interface: &str,
+            address: Ipv4Addr,
+            prefix_len: u8,
+            ownership: AddressOwnership,
+        ) -> Result<()> {
+            let mut addresses = self.addresses.lock().await;
+            let entry = addresses.entry(interface.to_string()).or_default();
+            let existing = entry
+                .iter_mut()
+                .find(|item| item.address == address && item.prefix_len == prefix_len)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("address {address}/{prefix_len} not found on {interface}")
+                })?;
+            existing.protocol = ownership.protocol();
             Ok(())
         }
 
@@ -439,6 +622,234 @@ mod tests {
             wifi: None,
             wifi_client: None,
         }
+    }
+
+    fn address_with_protocol(address: &str, protocol: Option<u8>) -> Ipv4AddressInfo {
+        let network = address.parse::<Ipv4Net>().expect("network");
+        Ipv4AddressInfo {
+            interface_index: 1,
+            address: network.addr(),
+            prefix_len: network.prefix_len(),
+            protocol,
+        }
+    }
+
+    #[tokio::test]
+    async fn releasing_management_deletes_only_tagged_addresses() {
+        let provider = Arc::new(FakeNetworkProvider::default());
+        let owned = address_with_protocol("192.168.50.1/24", Some(TRAFFIC_MASQ_ADDRESS_PROTOCOL));
+        let foreign = address_with_protocol("192.168.1.20/24", None);
+        provider
+            .add_interface("eth0", true, vec![owned.clone(), foreign])
+            .await;
+        let manager = InterfaceManager::new(provider);
+        let previous = config(InterfaceRole::Output, "192.168.50.1/24");
+        let mut target = previous.clone();
+        target.managed = false;
+        target.ipv4 = None;
+
+        let plan = manager
+            .plan_interface_transition(
+                "eth0",
+                &target,
+                Some(&previous),
+                Some(InterfaceRole::Output),
+                false,
+            )
+            .await
+            .expect("release plan");
+
+        assert!(plan.releasing_management);
+        assert_eq!(plan.delete_ipv4, vec![owned]);
+        assert!(plan.add_ipv4.is_none());
+        assert!(!plan.set_link_up);
+    }
+
+    #[tokio::test]
+    async fn releasing_management_refuses_an_untagged_legacy_address() {
+        let provider = Arc::new(FakeNetworkProvider::default());
+        provider
+            .add_interface(
+                "eth0",
+                true,
+                vec![address_with_protocol("192.168.50.1/24", None)],
+            )
+            .await;
+        let manager = InterfaceManager::new(provider);
+        let previous = config(InterfaceRole::Output, "192.168.50.1/24");
+        let mut target = previous.clone();
+        target.managed = false;
+        target.ipv4 = None;
+
+        let error = manager
+            .plan_interface_transition(
+                "eth0",
+                &target,
+                Some(&previous),
+                Some(InterfaceRole::Output),
+                false,
+            )
+            .await
+            .expect_err("untagged address must not be claimed");
+        assert!(error.to_string().contains("ownership tag"));
+    }
+
+    #[tokio::test]
+    async fn applying_a_retag_honours_the_ownership_the_plan_carries() {
+        let provider = Arc::new(FakeNetworkProvider::default());
+        provider
+            .add_interface(
+                "eth0",
+                true,
+                vec![address_with_protocol("192.168.50.1/24", None)],
+            )
+            .await;
+        let manager = InterfaceManager::new(provider.clone());
+
+        // Not a plan the planner currently produces, which is the point: apply
+        // must read the tag out of the plan instead of assuming Static.
+        let plan = InterfaceChangePlan {
+            interface: "eth0".to_string(),
+            delete_ipv4: Vec::new(),
+            retag_ipv4: Some(address_with_protocol(
+                "192.168.50.1/24",
+                Some(TRAFFIC_MASQ_DHCP_ADDRESS_PROTOCOL),
+            )),
+            add_ipv4: None,
+            set_link_up: false,
+            management_change: false,
+            dhcp_action: DhcpChangeAction::Unchanged,
+            releasing_management: false,
+        };
+        manager.apply_plan(&plan).await.expect("apply plan");
+
+        let addresses = provider
+            .list_ipv4_addresses("eth0")
+            .await
+            .expect("addresses");
+        assert_eq!(
+            addresses,
+            vec![address_with_protocol(
+                "192.168.50.1/24",
+                Some(TRAFFIC_MASQ_DHCP_ADDRESS_PROTOCOL)
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_address_is_claimed_in_place_on_every_path() {
+        let provider = Arc::new(FakeNetworkProvider::default());
+        provider
+            .add_interface(
+                "eth0",
+                true,
+                vec![address_with_protocol("192.168.50.1/24", None)],
+            )
+            .await;
+        let manager = InterfaceManager::new(provider);
+        let desired = config(InterfaceRole::Output, "192.168.50.1/24");
+
+        // The startup/reconcile path and the transactional path must agree:
+        // both claim the untagged address rather than one of them adopting it
+        // silently and the other tearing it down.
+        let startup = manager
+            .plan_interface("eth0", &desired, Some(InterfaceRole::Output), false)
+            .await
+            .expect("startup plan");
+        let explicit = manager
+            .plan_interface_transition(
+                "eth0",
+                &desired,
+                Some(&desired),
+                Some(InterfaceRole::Output),
+                false,
+            )
+            .await
+            .expect("explicit plan");
+
+        for plan in [&startup, &explicit] {
+            assert!(
+                plan.delete_ipv4.is_empty(),
+                "claiming an address must not take it off the link"
+            );
+            assert!(plan.add_ipv4.is_none());
+            assert_eq!(
+                plan.retag_ipv4
+                    .as_ref()
+                    .and_then(|address| address.protocol),
+                Some(TRAFFIC_MASQ_ADDRESS_PROTOCOL)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn claiming_a_legacy_address_keeps_it_on_the_link() {
+        let provider = Arc::new(FakeNetworkProvider::default());
+        provider
+            .add_interface(
+                "eth0",
+                true,
+                vec![address_with_protocol("192.168.50.1/24", None)],
+            )
+            .await;
+        let manager = InterfaceManager::new(provider.clone());
+        let desired = config(InterfaceRole::Output, "192.168.50.1/24");
+
+        manager
+            .apply_interface_transition(
+                "eth0",
+                &desired,
+                Some(&desired),
+                Some(InterfaceRole::Output),
+                false,
+            )
+            .await
+            .expect("apply");
+
+        let addresses = provider
+            .list_ipv4_addresses("eth0")
+            .await
+            .expect("addresses");
+        assert_eq!(
+            addresses,
+            vec![address_with_protocol(
+                "192.168.50.1/24",
+                Some(TRAFFIC_MASQ_ADDRESS_PROTOCOL)
+            )],
+            "the address must be the same one, now tagged — not a replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_edit_leaves_an_owned_address_untouched() {
+        let provider = Arc::new(FakeNetworkProvider::default());
+        provider
+            .add_interface(
+                "eth0",
+                true,
+                vec![address_with_protocol(
+                    "192.168.50.1/24",
+                    Some(TRAFFIC_MASQ_ADDRESS_PROTOCOL),
+                )],
+            )
+            .await;
+        let manager = InterfaceManager::new(provider);
+        let desired = config(InterfaceRole::Output, "192.168.50.1/24");
+
+        let plan = manager
+            .plan_interface_transition(
+                "eth0",
+                &desired,
+                Some(&desired),
+                Some(InterfaceRole::Output),
+                false,
+            )
+            .await
+            .expect("plan");
+
+        assert!(plan.delete_ipv4.is_empty());
+        assert!(plan.add_ipv4.is_none());
+        assert!(plan.retag_ipv4.is_none());
     }
 
     #[tokio::test]
@@ -514,6 +925,7 @@ mod tests {
             interface_index: 1,
             address: Ipv4Addr::new(192, 0, 2, 42),
             prefix_len: 24,
+            protocol: None,
         };
         provider
             .add_interface("wan0", false, vec![dynamic.clone()])
@@ -560,6 +972,7 @@ mod tests {
                     interface_index: 1,
                     address: Ipv4Addr::new(198, 51, 100, 9),
                     prefix_len: 24,
+                    protocol: None,
                 }],
             )
             .await;
@@ -587,6 +1000,7 @@ mod tests {
             interface_index: 1,
             address: Ipv4Addr::new(192, 168, 1, 10),
             prefix_len: 24,
+            protocol: None,
         };
         provider
             .add_interface("usb0", false, vec![original.clone()])

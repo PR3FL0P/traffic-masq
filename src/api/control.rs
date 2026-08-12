@@ -374,14 +374,15 @@ impl ControlService {
                 config,
                 allow_management_change,
             } => {
-                let current_role = match self.current_interface_role(&interface).await {
-                    Ok(role) => role,
+                let current = match self.overrides.effective_interface(&interface).await {
+                    Ok(current) => current,
                     Err(error) => {
                         return Response::Error {
                             message: error.to_string(),
                         }
                     }
                 };
+                let current_role = current.as_ref().map(|config| config.role);
                 if let Err(error) = self
                     .validate_default_route_management(&interface, &config, allow_management_change)
                     .await
@@ -392,7 +393,13 @@ impl ControlService {
                 }
                 match self
                     .transactions
-                    .dry_run(&interface, &config, current_role, allow_management_change)
+                    .dry_run_transition(
+                        &interface,
+                        &config,
+                        current.as_ref(),
+                        current_role,
+                        allow_management_change,
+                    )
                     .await
                 {
                     Ok(plan) => Response::InterfacePlan { plan },
@@ -411,7 +418,7 @@ impl ControlService {
                     }
                 };
                 let current_role = current.as_ref().map(|config| config.role);
-                match interface_edit_request_to_config(edit, current) {
+                match interface_edit_request_to_config(edit, current.as_ref()) {
                     Ok((config, allow_management_change)) => {
                         if let Err(error) = self
                             .validate_default_route_management(
@@ -427,7 +434,13 @@ impl ControlService {
                         }
                         match self
                             .transactions
-                            .dry_run(&interface, &config, current_role, allow_management_change)
+                            .dry_run_transition(
+                                &interface,
+                                &config,
+                                current.as_ref(),
+                                current_role,
+                                allow_management_change,
+                            )
                             .await
                         {
                             Ok(plan) => Response::InterfacePlan { plan },
@@ -446,14 +459,15 @@ impl ControlService {
                 config,
                 allow_management_change,
             } => {
-                let current_role = match self.current_interface_role(&interface).await {
-                    Ok(role) => role,
+                let current = match self.overrides.effective_interface(&interface).await {
+                    Ok(current) => current,
                     Err(error) => {
                         return Response::Error {
                             message: error.to_string(),
                         }
                     }
                 };
+                let current_role = current.as_ref().map(|config| config.role);
                 if let Err(error) = self
                     .validate_default_route_management(&interface, &config, allow_management_change)
                     .await
@@ -464,7 +478,13 @@ impl ControlService {
                 }
                 match self
                     .transactions
-                    .apply(&interface, &config, current_role, allow_management_change)
+                    .apply_transition(
+                        &interface,
+                        &config,
+                        current.as_ref(),
+                        current_role,
+                        allow_management_change,
+                    )
                     .await
                 {
                     Ok(change) => Response::NetworkChangePending { change },
@@ -483,7 +503,7 @@ impl ControlService {
                     }
                 };
                 let current_role = current.as_ref().map(|config| config.role);
-                match interface_edit_request_to_config(edit, current) {
+                match interface_edit_request_to_config(edit, current.as_ref()) {
                     Ok((config, allow_management_change)) => {
                         if let Err(error) = self
                             .validate_default_route_management(
@@ -499,7 +519,13 @@ impl ControlService {
                         }
                         match self
                             .transactions
-                            .apply(&interface, &config, current_role, allow_management_change)
+                            .apply_transition(
+                                &interface,
+                                &config,
+                                current.as_ref(),
+                                current_role,
+                                allow_management_change,
+                            )
                             .await
                         {
                             Ok(change) => Response::NetworkChangePending { change },
@@ -624,14 +650,6 @@ impl ControlService {
                 self.disable_wifi_client(interface).await
             }
         }
-    }
-
-    async fn current_interface_role(&self, interface: &str) -> Result<Option<InterfaceRole>> {
-        Ok(self
-            .overrides
-            .effective_interface(interface)
-            .await?
-            .map(|config| config.role))
     }
 
     async fn validate_default_route_management(
@@ -2942,8 +2960,11 @@ fn wifi_edit_request_to_config(settings: WifiEditRequest) -> WifiApConfig {
 
 fn interface_edit_request_to_config(
     edit: InterfaceEditRequest,
-    existing: Option<InterfaceConfig>,
+    existing: Option<&InterfaceConfig>,
 ) -> Result<(InterfaceConfig, bool)> {
+    if !edit.managed && !edit.cidr.trim().is_empty() {
+        anyhow::bail!("cannot change IP while the interface is unmanaged; enable Managed first");
+    }
     let ipv4 = if edit.cidr.trim().is_empty() {
         None
     } else {
@@ -2954,7 +2975,10 @@ fn interface_edit_request_to_config(
             role: edit.role,
             managed: edit.managed,
             ipv4,
-            dhcp: existing.and_then(|config| config.dhcp),
+            dhcp: edit
+                .managed
+                .then(|| existing.and_then(|config| config.dhcp.clone()))
+                .flatten(),
             dhcp_client: None,
             wifi: None,
             wifi_client: None,
@@ -3308,6 +3332,7 @@ async fn interface_statuses(network: &dyn NetworkProvider) -> Result<Vec<Interfa
 
 #[cfg(test)]
 mod tests {
+    use crate::netlink::AddressOwnership;
     use std::net::Ipv4Addr;
 
     use anyhow::Result;
@@ -3367,6 +3392,7 @@ mod tests {
             _interface: &str,
             _address: Ipv4Addr,
             _prefix_len: u8,
+            _ownership: AddressOwnership,
         ) -> Result<()> {
             Ok(())
         }
@@ -3386,6 +3412,7 @@ mod tests {
             interface_index: 1,
             address: Ipv4Addr::from(address),
             prefix_len,
+            protocol: None,
         }
     }
 
@@ -3419,7 +3446,7 @@ mod tests {
         };
 
         let (config, allow_management_change) =
-            interface_edit_request_to_config(edit, Some(existing)).expect("edit must convert");
+            interface_edit_request_to_config(edit, Some(&existing)).expect("edit must convert");
 
         assert_eq!(
             config.ipv4,
@@ -3517,10 +3544,12 @@ mod tests {
             Ok(vec![InterfaceChangePlan {
                 interface: "lan0".into(),
                 delete_ipv4: Vec::new(),
+                retag_ipv4: None,
                 add_ipv4: None,
                 set_link_up: false,
                 management_change: false,
                 dhcp_action: DhcpChangeAction::Unchanged,
+                releasing_management: false,
             }])
         }
         async fn plan_routes(&self, _: &RouterDesired) -> Result<RoutePlan> {
@@ -4521,6 +4550,7 @@ mod tests {
             _interface: &str,
             _address: Ipv4Addr,
             _prefix_len: u8,
+            _ownership: AddressOwnership,
         ) -> Result<()> {
             Ok(())
         }
@@ -6533,6 +6563,7 @@ mod tests {
                     interface_index: self.interfaces.len() as u32,
                     address: Ipv4Addr::from(address),
                     prefix_len,
+                    protocol: None,
                 }],
             );
             self
@@ -6557,7 +6588,13 @@ mod tests {
             Ok(())
         }
 
-        async fn add_ipv4_address(&self, _: &str, _: Ipv4Addr, _: u8) -> Result<()> {
+        async fn add_ipv4_address(
+            &self,
+            _: &str,
+            _: Ipv4Addr,
+            _: u8,
+            _: AddressOwnership,
+        ) -> Result<()> {
             Ok(())
         }
 
