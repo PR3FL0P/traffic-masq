@@ -704,6 +704,7 @@ async fn handle_key(
         Screen::Dashboard
             | Screen::InterfaceList
             | Screen::DhcpInterfaceList
+            | Screen::DhcpClient
             | Screen::Router
             | Screen::Vpn
             | Screen::Wifi

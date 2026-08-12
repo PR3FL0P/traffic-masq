@@ -122,7 +122,7 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Tu
         spans.push(Span::styled(description, Style::default().fg(theme::TEXT)));
     }
     spans.push(Span::styled(
-        "   🖱 mouse enabled",
+        "   mouse enabled",
         Style::default().fg(theme::MUTED),
     ));
 
