@@ -45,8 +45,14 @@ target/release/traffic-masqd
 sudo ./packaging/install.sh
 ```
 
-The installation script copies the binaries and project documentation. It does
-not install a system service.
+The installer creates the `traffic-masq` access group, adds the user invoking
+`sudo`, creates `/etc/traffic-masq/config.toml` when absent, and configures the
+daemon socket for that group. Sign out and back in once after the first install
+so the new group membership takes effect.
+
+The installation script installs the binaries and documentation and prepares
+local group access to the daemon socket. It does not install a system service
+or start the daemon automatically.
 
 ## Configuration
 

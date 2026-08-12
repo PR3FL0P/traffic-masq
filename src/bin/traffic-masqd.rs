@@ -24,20 +24,37 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run the daemon in the foreground
+    ///
+    /// Keeps the process attached to the current terminal. Logs and startup
+    /// errors remain visible, and Ctrl+C stops the daemon. This mode is best
+    /// suited to development and diagnostics.
     Run,
 
+    /// Start the daemon as a background process
+    ///
+    /// Detaches the daemon from the terminal, writes its PID under /run, and
+    /// sends logs to the configured log directory. Use `traffic-masqd status`
+    /// to inspect it and `traffic-masqd stop` to stop it.
     Start {
-        #[arg(long, default_value_t = 10)]
+        #[arg(
+            long,
+            default_value_t = 10,
+            help = "Seconds to wait for the background daemon to become ready"
+        )]
         timeout_seconds: u64,
     },
 
+    /// Stop the background daemon and wait for it to exit
     Stop {
         #[arg(long, default_value_t = 30)]
         timeout_seconds: u64,
     },
 
+    /// Show whether the daemon is running and responding
     Status,
 
+    /// Read daemon log output
     Logs {
         #[arg(short = 'n', long, default_value_t = 100)]
         lines: usize,
@@ -45,11 +62,13 @@ enum Command {
         follow: bool,
     },
 
+    /// Manage daemon authentication
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
     },
 
+    /// Inspect, validate, or initialize daemon configuration
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
@@ -58,17 +77,22 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
+    /// Set or reset the shared device password while the daemon is stopped
     SetPassword,
 }
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
+    /// Print the selected configuration file path
     Path,
 
+    /// Print the effective configuration
     Show,
 
+    /// Validate the selected configuration
     Validate,
 
+    /// Create a safe initial configuration file
     Init {
         #[arg(long)]
         path: Option<PathBuf>,
