@@ -39,6 +39,33 @@ pub struct InterfaceChangePlan {
     pub releasing_management: bool,
 }
 
+/// Render an address the way the action log needs it: the ownership tag is the
+/// whole point, so it is never omitted.
+fn describe_address(address: &Ipv4AddressInfo) -> String {
+    match address.protocol {
+        Some(protocol) => format!(
+            "{}/{} proto={protocol}",
+            address.address, address.prefix_len
+        ),
+        None => format!("{}/{} untagged", address.address, address.prefix_len),
+    }
+}
+
+fn describe_optional_address(address: Option<&Ipv4AddressInfo>) -> String {
+    address.map_or_else(|| "none".to_string(), describe_address)
+}
+
+fn describe_addresses(addresses: &[Ipv4AddressInfo]) -> String {
+    if addresses.is_empty() {
+        return "none".to_string();
+    }
+    addresses
+        .iter()
+        .map(describe_address)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub fn is_management_change(
     target_role: InterfaceRole,
     current_role: Option<InterfaceRole>,
@@ -164,7 +191,61 @@ impl InterfaceManager {
             .await
     }
 
+    /// Plan a change and record the decision.
+    ///
+    /// Every outcome is logged, including refusals, because "nothing happened"
+    /// and "the plan was empty" and "planning was rejected" look identical from
+    /// the outside and have completely different causes.
     pub async fn plan_interface_transition(
+        &self,
+        name: &str,
+        config: &InterfaceConfig,
+        previous_config: Option<&InterfaceConfig>,
+        current_role: Option<InterfaceRole>,
+        allow_management_change: bool,
+    ) -> Result<InterfaceChangePlan> {
+        let previous_managed = previous_config.map(|previous| previous.managed);
+        let result = self
+            .plan_interface_transition_inner(
+                name,
+                config,
+                previous_config,
+                current_role,
+                allow_management_change,
+            )
+            .await;
+
+        match &result {
+            Ok(plan) => tracing::info!(
+                interface = %name,
+                managed = config.managed,
+                ?previous_managed,
+                role = ?config.role,
+                ?current_role,
+                allow_management_change,
+                releasing_management = plan.releasing_management,
+                delete = %describe_addresses(&plan.delete_ipv4),
+                retag = %describe_optional_address(plan.retag_ipv4.as_ref()),
+                add = %describe_optional_address(plan.add_ipv4.as_ref()),
+                set_link_up = plan.set_link_up,
+                "planned interface change"
+            ),
+            Err(error) => tracing::warn!(
+                interface = %name,
+                managed = config.managed,
+                ?previous_managed,
+                role = ?config.role,
+                ?current_role,
+                allow_management_change,
+                %error,
+                "interface change refused while planning"
+            ),
+        }
+
+        result
+    }
+
+    async fn plan_interface_transition_inner(
         &self,
         name: &str,
         config: &InterfaceConfig,
@@ -192,7 +273,7 @@ impl InterfaceManager {
 
         if !config.managed {
             let releasing_management = previous_config.is_some_and(|previous| previous.managed);
-            let delete_ipv4 = if releasing_management {
+            let delete_ipv4 = {
                 let previous_ipv4 = previous_config.and_then(|previous| previous.ipv4);
                 if previous_ipv4.is_some() && !self.provider.supports_ipv4_address_protocol() {
                     bail!(
@@ -200,6 +281,13 @@ impl InterfaceManager {
                     );
                 }
                 let observed = self.provider.list_ipv4_addresses(name).await?;
+                tracing::info!(
+                    interface = %name,
+                    observed = %describe_addresses(&observed),
+                    ?previous_ipv4,
+                    releasing_management,
+                    "observed IPv4 addresses while planning an unmanaged interface"
+                );
                 if let Some(previous_ipv4) = previous_ipv4 {
                     if let Some(address) = observed.iter().find(|address| {
                         ipnet::Ipv4Net::new(address.address, address.prefix_len).ok()
@@ -214,15 +302,19 @@ impl InterfaceManager {
                         );
                     }
                 }
-                // Only our own static addresses. DHCP-owned ones are torn down
-                // by the DHCP client supervisor's disable path; deleting them
-                // here as well would race with it.
+                // Cleanup is a state, not an edge. An address tagged as ours has
+                // no business sitting on an interface we do not manage, however
+                // many apply cycles ago we stopped managing it — otherwise a
+                // leftover becomes unremovable once the managed -> unmanaged
+                // transition has been spent.
+                //
+                // Only our own static addresses: DHCP-owned ones are torn down
+                // by the DHCP client supervisor's disable path, and deleting
+                // them here as well would race with it.
                 observed
                     .into_iter()
                     .filter(|address| address.owner() == AddressOwner::TrafficMasqStatic)
                     .collect()
-            } else {
-                Vec::new()
             };
             return Ok(InterfaceChangePlan {
                 interface: name.to_string(),
@@ -254,6 +346,13 @@ impl InterfaceManager {
             .ipv4
             .map(|network| (network.addr(), network.prefix_len()));
         let can_tag = self.provider.supports_ipv4_address_protocol();
+        tracing::info!(
+            interface = %name,
+            observed = %describe_addresses(&current),
+            ?desired,
+            ownership_tagging_available = can_tag,
+            "observed IPv4 addresses while planning a managed interface"
+        );
         let ownership = if can_tag {
             AddressOwnership::Static
         } else {
@@ -382,13 +481,31 @@ impl InterfaceManager {
     }
 
     pub async fn apply_plan(&self, plan: &InterfaceChangePlan) -> Result<()> {
+        if plan.delete_ipv4.is_empty() && plan.retag_ipv4.is_none() && plan.add_ipv4.is_none() {
+            tracing::info!(
+                interface = %plan.interface,
+                releasing_management = plan.releasing_management,
+                "applying interface plan: no IPv4 address changes to make"
+            );
+        }
+
         for address in &plan.delete_ipv4 {
+            tracing::info!(
+                interface = %plan.interface,
+                address = %describe_address(address),
+                "applying interface plan: deleting IPv4 address"
+            );
             self.provider
                 .delete_ipv4_address(&plan.interface, address.address, address.prefix_len)
                 .await?;
         }
 
         if let Some(address) = &plan.retag_ipv4 {
+            tracing::info!(
+                interface = %plan.interface,
+                address = %describe_address(address),
+                "applying interface plan: claiming existing IPv4 address in place"
+            );
             self.provider
                 .set_ipv4_address_ownership(
                     &plan.interface,
@@ -400,6 +517,11 @@ impl InterfaceManager {
         }
 
         if let Some(address) = &plan.add_ipv4 {
+            tracing::info!(
+                interface = %plan.interface,
+                address = %describe_address(address),
+                "applying interface plan: adding IPv4 address"
+            );
             self.provider
                 .add_ipv4_address(
                     &plan.interface,
@@ -423,12 +545,25 @@ impl InterfaceManager {
             left.address == right.address && left.prefix_len == right.prefix_len
         };
 
+        tracing::info!(
+            interface = %snapshot.name,
+            observed = %describe_addresses(&current),
+            snapshot = %describe_addresses(&snapshot.ipv4_addresses),
+            was_up = snapshot.was_up,
+            "rolling back interface to its snapshot"
+        );
+
         for address in &current {
             let existed_before = snapshot
                 .ipv4_addresses
                 .iter()
                 .any(|previous| same_address(previous, address));
             if !existed_before {
+                tracing::info!(
+                    interface = %snapshot.name,
+                    address = %describe_address(address),
+                    "rollback: deleting IPv4 address that was not in the snapshot"
+                );
                 self.provider
                     .delete_ipv4_address(&snapshot.name, address.address, address.prefix_len)
                     .await?;
@@ -441,6 +576,12 @@ impl InterfaceManager {
             let ownership = address.owner().restore_as();
             match current.iter().find(|item| same_address(item, address)) {
                 Some(present) if present.protocol != address.protocol && can_tag => {
+                    tracing::info!(
+                        interface = %snapshot.name,
+                        address = %describe_address(address),
+                        observed = %describe_address(present),
+                        "rollback: restoring the ownership tag of an existing IPv4 address"
+                    );
                     self.provider
                         .set_ipv4_address_ownership(
                             &snapshot.name,
@@ -452,6 +593,11 @@ impl InterfaceManager {
                 }
                 Some(_) => {}
                 None => {
+                    tracing::info!(
+                        interface = %snapshot.name,
+                        address = %describe_address(address),
+                        "rollback: re-adding an IPv4 address from the snapshot"
+                    );
                     self.provider
                         .add_ipv4_address(
                             &snapshot.name,
@@ -692,6 +838,47 @@ mod tests {
             .await
             .expect_err("untagged address must not be claimed");
         assert!(error.to_string().contains("ownership tag"));
+    }
+
+    #[tokio::test]
+    async fn a_leftover_owned_address_is_cleaned_up_after_the_release_transition() {
+        let provider = Arc::new(FakeNetworkProvider::default());
+        let owned = address_with_protocol("192.168.50.1/24", Some(TRAFFIC_MASQ_ADDRESS_PROTOCOL));
+        let foreign = address_with_protocol("192.168.1.20/24", None);
+        provider
+            .add_interface("eth0", true, vec![owned.clone(), foreign])
+            .await;
+        let manager = InterfaceManager::new(provider);
+
+        // Both sides already unmanaged: the managed -> unmanaged edge is long
+        // gone, but our address is still sitting on the link.
+        let unmanaged = InterfaceConfig {
+            role: InterfaceRole::Output,
+            managed: false,
+            ipv4: None,
+            dhcp: None,
+            dhcp_client: None,
+            wifi: None,
+            wifi_client: None,
+        };
+
+        let plan = manager
+            .plan_interface_transition(
+                "eth0",
+                &unmanaged,
+                Some(&unmanaged),
+                Some(InterfaceRole::Output),
+                false,
+            )
+            .await
+            .expect("plan");
+
+        assert!(!plan.releasing_management);
+        assert_eq!(
+            plan.delete_ipv4,
+            vec![owned],
+            "a leftover traffic-masq address must stay removable, and a foreign one untouched"
+        );
     }
 
     #[tokio::test]

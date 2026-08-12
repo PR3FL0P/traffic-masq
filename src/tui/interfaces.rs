@@ -42,14 +42,29 @@ pub(crate) struct InterfaceEditor {
     pub(crate) has_default_route: bool,
     pub(crate) original_managed: bool,
     pub(crate) original_cidr: String,
+    pub(crate) original_role: InterfaceRole,
 }
 
 impl InterfaceEditor {
     pub(crate) fn edit_request(&self) -> Result<InterfaceEditRequest> {
-        if !self.managed && self.cidr.trim() != self.original_cidr.trim() {
-            anyhow::bail!(
-                "cannot change IP while the interface is unmanaged; enable Managed first"
-            );
+        // An unmanaged interface carries no traffic-masq settings at all, so
+        // refuse every settings edit while Managed is off — naming the fields,
+        // because "save did nothing" is the confusing part. Toggling Managed
+        // itself stays allowed: that is how you start and stop managing.
+        if !self.managed {
+            let mut changed = Vec::new();
+            if self.cidr.trim() != self.original_cidr.trim() {
+                changed.push("IP");
+            }
+            if self.role != self.original_role {
+                changed.push("role");
+            }
+            if !changed.is_empty() {
+                anyhow::bail!(
+                    "cannot change {} while the interface is unmanaged; enable Managed first",
+                    changed.join(" and ")
+                );
+            }
         }
         if !self.cidr.trim().is_empty() {
             let _: ipnet::Ipv4Net = self.cidr.trim().parse()?;
@@ -455,18 +470,20 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
 
             let original_managed = config.as_ref().is_some_and(|interface| interface.managed);
             let original_cidr = cidr.clone();
+            let original_role = config
+                .as_ref()
+                .map_or(InterfaceRole::Output, |interface| interface.role);
             app.editor = Some(InterfaceEditor {
                 interface: name,
                 field: InterfaceEditorField::Cidr,
                 cidr,
-                role: config
-                    .as_ref()
-                    .map_or(InterfaceRole::Output, |interface| interface.role),
+                role: original_role,
                 managed: config.as_ref().is_none_or(|interface| interface.managed),
                 allow_management_change,
                 has_default_route: status.has_default_route,
                 original_managed,
                 original_cidr,
+                original_role,
             });
             app.preview = None;
             app.screen = Screen::InterfaceEditor;
@@ -681,7 +698,15 @@ mod tests {
             has_default_route: true,
             original_managed: true,
             original_cidr: "192.168.1.10/24".into(),
+            original_role: InterfaceRole::Output,
         }
+    }
+
+    fn unmanaged_editor() -> InterfaceEditor {
+        let mut editor = default_route_editor(false);
+        editor.original_managed = false;
+        editor.managed = false;
+        editor
     }
 
     #[test]
@@ -697,15 +722,52 @@ mod tests {
 
     #[test]
     fn unmanaged_interface_rejects_ip_edits_with_a_clear_error() {
-        let mut editor = default_route_editor(false);
-        editor.original_managed = false;
-        editor.managed = false;
+        let mut editor = unmanaged_editor();
         editor.cidr = "192.168.1.11/24".into();
         let error = editor.edit_request().unwrap_err();
         assert_eq!(
             error.to_string(),
             "cannot change IP while the interface is unmanaged; enable Managed first"
         );
+    }
+
+    #[test]
+    fn unmanaged_interface_rejects_role_edits_with_a_clear_error() {
+        let mut editor = unmanaged_editor();
+        editor.role = InterfaceRole::Input;
+        let error = editor.edit_request().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "cannot change role while the interface is unmanaged; enable Managed first"
+        );
+    }
+
+    #[test]
+    fn unmanaged_interface_names_every_field_it_refuses_to_change() {
+        let mut editor = unmanaged_editor();
+        editor.cidr = "192.168.1.11/24".into();
+        editor.role = InterfaceRole::Input;
+        let error = editor.edit_request().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "cannot change IP and role while the interface is unmanaged; enable Managed first"
+        );
+    }
+
+    #[test]
+    fn an_unmanaged_interface_can_still_be_saved_untouched() {
+        // This is how a leftover traffic-masq address gets cleaned up, so it
+        // must not be swallowed by the settings guard.
+        assert!(unmanaged_editor().edit_request().is_ok());
+    }
+
+    #[test]
+    fn turning_management_on_is_not_a_settings_edit() {
+        let mut editor = unmanaged_editor();
+        editor.managed = true;
+        editor.allow_management_change = true;
+        editor.cidr = "192.168.1.11/24".into();
+        assert!(editor.edit_request().is_ok());
     }
 
     #[test]

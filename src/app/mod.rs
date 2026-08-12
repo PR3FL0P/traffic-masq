@@ -23,6 +23,7 @@ use crate::core::route::{RouteManager, RouteSnapshot};
 use crate::core::router::{RouterDesired, RouterManager};
 use crate::core::router_subsystems::ProductionRouterSubsystems;
 use crate::core::router_transaction::RouterTransactionCoordinator;
+use crate::core::transaction::NetworkTransactionManager;
 use crate::core::vpn_policy_manager::{VpnPolicyDesired, VpnPolicyManager};
 use crate::dhcp::client::{DhcpClientSpec, DhcpClientSupervisor};
 use crate::dhcp::supervisor::{DhcpServiceSpec, DhcpSupervisor};
@@ -503,6 +504,7 @@ async fn reconcile_dhcp_client<L: DhcpClientRuntimeReconciler>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn reconcile_network_runtime_once<
     D: DhcpRuntimeReconciler,
     W: WifiRuntimeReconciler,
@@ -516,6 +518,7 @@ async fn reconcile_network_runtime_once<
     wifi: Option<&W>,
     wifi_client: Option<&C>,
     dhcp_client: Option<&L>,
+    pending_interfaces: &BTreeSet<String>,
 ) -> Result<()> {
     if let Err(error) = dhcp.ensure_runtime_alive().await {
         tracing::warn!(%error, "failed to restart the shared DHCP runtime");
@@ -543,6 +546,19 @@ async fn reconcile_network_runtime_once<
         .collect();
 
     for (name, config) in &effective.network.interfaces {
+        // A change that has been applied to the kernel but not yet confirmed
+        // owns this interface until it is committed or rolled back. During that
+        // window the kernel deliberately holds the new state while the override
+        // still describes the old one, so reconciling would simply undo the
+        // user's change — within a second, and without leaving a trace.
+        if pending_interfaces.contains(name) {
+            tracing::debug!(
+                interface = %name,
+                "skipping runtime reconcile: an applied network change is awaiting confirmation"
+            );
+            continue;
+        }
+
         if let Some(dhcp_client) = dhcp_client {
             let link_ready = if config.wifi_client.is_some() {
                 match wifi_client {
@@ -670,6 +686,7 @@ fn spawn_runtime_network_reconcile(
     wifi: Option<HostapdSupervisor>,
     wifi_client: Option<WifiClientSupervisor>,
     dhcp_client: DhcpClientSupervisor,
+    transactions: NetworkTransactionManager,
     mut shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -682,7 +699,13 @@ fn spawn_runtime_network_reconcile(
                     if shutdown_requested(&shutdown) {
                         break;
                     }
-                    if let Err(error) = reconcile_network_runtime_once(&config, &overrides, network.clone(), &dhcp, wifi.as_ref(), wifi_client.as_ref(), Some(&dhcp_client)).await {
+                    let pending_interfaces: BTreeSet<String> = transactions
+                        .pending()
+                        .await
+                        .into_iter()
+                        .map(|change| change.interface)
+                        .collect();
+                    if let Err(error) = reconcile_network_runtime_once(&config, &overrides, network.clone(), &dhcp, wifi.as_ref(), wifi_client.as_ref(), Some(&dhcp_client), &pending_interfaces).await {
                         tracing::warn!(%error, "runtime interface/DHCP reconcile pass failed");
                     }
                 }
@@ -1032,6 +1055,7 @@ pub async fn run_daemon(config: AppConfig) -> Result<()> {
             wifi_supervisor.clone(),
             wifi_client_supervisor.clone(),
             dhcp_client.clone(),
+            transactions.clone(),
             shutdown.clone(),
         );
 
@@ -1779,6 +1803,7 @@ mod tests {
             Some(&wifi),
             None::<&FakeWifiReconciler>,
             None::<&FakeDhcpClientReconciler>,
+            &BTreeSet::new(),
         )
         .await
         .expect("reconcile");
@@ -1810,6 +1835,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_reconcile_leaves_an_interface_with_an_unconfirmed_change_alone() {
+        let config = hotplug_reconcile_config();
+        let state_dir = tempdir().expect("state dir");
+        let overrides = RuntimeOverrideManager::load(state_dir.path(), &config)
+            .await
+            .expect("overrides");
+        let network = Arc::new(FakeNetworkProvider::default());
+        // The state a just-applied, not-yet-committed change leaves behind: the
+        // address is gone from the kernel while the override still says the
+        // interface is managed and configured.
+        network
+            .add_interface_with_state("lan0", 7, true, Vec::new())
+            .await;
+        let dhcp = FakeDhcpReconciler::default();
+        let wifi = FakeWifiReconciler::default();
+
+        let pending = BTreeSet::from(["lan0".to_string()]);
+        reconcile_network_runtime_once(
+            &config,
+            &overrides,
+            network.clone(),
+            &dhcp,
+            Some(&wifi),
+            None::<&FakeWifiReconciler>,
+            None::<&FakeDhcpClientReconciler>,
+            &pending,
+        )
+        .await
+        .expect("reconcile");
+
+        assert!(
+            network
+                .list_ipv4_addresses("lan0")
+                .await
+                .expect("addresses")
+                .is_empty(),
+            "reconcile must not undo a change that is still awaiting confirmation"
+        );
+        assert!(dhcp.configure_calls.lock().await.is_empty());
+        assert!(dhcp.disable_calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn reconcile_skips_wifi_liveness_when_wifi_is_disabled() {
         let config = hotplug_reconcile_config();
         let state_dir = tempdir().expect("state dir");
@@ -1827,6 +1895,7 @@ mod tests {
             None::<&FakeWifiReconciler>,
             None::<&FakeWifiReconciler>,
             None::<&FakeDhcpClientReconciler>,
+            &BTreeSet::new(),
         )
         .await
         .expect("reconcile");
@@ -1851,6 +1920,7 @@ mod tests {
             None::<&FakeWifiReconciler>,
             Some(&wifi_client),
             None::<&FakeDhcpClientReconciler>,
+            &BTreeSet::new(),
         )
         .await
         .expect("reconcile");
@@ -1904,6 +1974,7 @@ mod tests {
                 None::<&FakeWifiReconciler>,
                 None::<&FakeWifiReconciler>,
                 Some(&dhcp_client),
+                &BTreeSet::new(),
             )
             .await
             .expect("reconcile");
@@ -1975,6 +2046,7 @@ mod tests {
             None::<&FakeWifiReconciler>,
             Some(&wifi_client),
             Some(&dhcp_client),
+            &BTreeSet::new(),
         )
         .await
         .expect("disconnected reconcile");
@@ -2002,6 +2074,7 @@ mod tests {
             None::<&FakeWifiReconciler>,
             Some(&wifi_client),
             Some(&dhcp_client),
+            &BTreeSet::new(),
         )
         .await
         .expect("completed reconcile");
@@ -2067,6 +2140,7 @@ mod tests {
             None::<&FakeWifiReconciler>,
             None::<&FakeWifiReconciler>,
             Some(&dhcp_client),
+            &BTreeSet::new(),
         )
         .await
         .expect("reconcile");
@@ -2104,6 +2178,7 @@ mod tests {
             None::<&HostapdSupervisor>,
             None::<&WifiClientSupervisor>,
             None::<&FakeDhcpClientReconciler>,
+            &BTreeSet::new(),
         )
         .await
         .expect("reconcile");

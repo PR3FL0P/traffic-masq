@@ -266,6 +266,14 @@ impl NetworkTransactionManager {
             },
         );
 
+        tracing::info!(
+            interface = %interface,
+            token = %info.token,
+            rollback_timeout_seconds,
+            managed = config.managed,
+            "network change applied to the kernel; awaiting commit before the rollback timer fires"
+        );
+
         self.spawn_rollback_timer(info.token.clone());
         Ok(info)
     }
@@ -292,7 +300,7 @@ impl NetworkTransactionManager {
             )
         };
 
-        persist(interface, target, allow_management_change).await?;
+        persist(interface.clone(), target, allow_management_change).await?;
 
         let pending = self
             .inner
@@ -301,6 +309,12 @@ impl NetworkTransactionManager {
             .await
             .remove(token)
             .expect("pending transaction cannot change while operation lock is held");
+
+        tracing::info!(
+            interface = %interface,
+            %token,
+            "network change committed; the new configuration is now persisted"
+        );
         Ok(pending.info)
     }
 
@@ -314,6 +328,11 @@ impl NetworkTransactionManager {
             .get(token)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("pending network change not found: {token}"))?;
+        tracing::info!(
+            interface = %pending.info.interface,
+            %token,
+            "network change is being rolled back; the previous state will be restored"
+        );
         self.rollback_applied_service(&pending.snapshot, pending.previous_dhcp.clone())
             .await?;
         self.inner.pending.lock().await.remove(token);
