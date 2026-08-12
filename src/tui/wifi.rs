@@ -1378,6 +1378,7 @@ mod tests {
                 is_wireless: true,
             },
             ipv4_addresses: vec![],
+            has_default_route: false,
         };
         assert_eq!(build_rows(&[status], &[], &[])[0].role, WifiRole::Unknown);
         assert_eq!(

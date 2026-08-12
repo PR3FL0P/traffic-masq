@@ -39,12 +39,22 @@ pub(crate) struct InterfaceEditor {
     pub(crate) role: InterfaceRole,
     pub(crate) managed: bool,
     pub(crate) allow_management_change: bool,
+    pub(crate) has_default_route: bool,
 }
 
 impl InterfaceEditor {
     pub(crate) fn edit_request(&self) -> Result<InterfaceEditRequest> {
         if !self.cidr.trim().is_empty() {
             let _: ipnet::Ipv4Net = self.cidr.trim().parse()?;
+        }
+        if self.has_default_route
+            && self.role == InterfaceRole::Output
+            && self.managed
+            && !self.allow_management_change
+        {
+            anyhow::bail!(
+                "this interface carries the default route; enable 'Allow management change' to confirm the connectivity risk"
+            );
         }
         Ok(InterfaceEditRequest {
             cidr: self.cidr.trim().to_string(),
@@ -164,6 +174,20 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
             "WARNING: management interface change can disconnect the device",
             Style::default().fg(theme::BAD).add_modifier(Modifier::BOLD),
         ));
+    }
+    if editor.has_default_route && editor.role == InterfaceRole::Output && editor.managed {
+        let (message, color) = if editor.allow_management_change {
+            (
+                "Default-route interface: disruptive management explicitly confirmed",
+                theme::WARN,
+            )
+        } else {
+            (
+                "Cannot save: this interface carries the default route; enable Allow management change to confirm",
+                theme::BAD,
+            )
+        };
+        lines.push(Line::styled(message, Style::default().fg(color)));
     }
     lines.push(Line::styled(
         "j/k or arrows: move | Enter/Space: activate | type digits, '.', '/' to edit CIDR (e.g. 192.168.1.10/24)",
@@ -378,6 +402,7 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
                     .map_or(InterfaceRole::Output, |interface| interface.role),
                 managed: config.as_ref().is_none_or(|interface| interface.managed),
                 allow_management_change,
+                has_default_route: status.has_default_route,
             });
             app.preview = None;
             app.screen = Screen::InterfaceEditor;
@@ -571,6 +596,29 @@ fn next_role(role: InterfaceRole) -> InterfaceRole {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn default_route_editor(allow_management_change: bool) -> InterfaceEditor {
+        InterfaceEditor {
+            interface: "wlan0".into(),
+            field: InterfaceEditorField::Save,
+            cidr: "192.168.1.10/24".into(),
+            role: InterfaceRole::Output,
+            managed: true,
+            allow_management_change,
+            has_default_route: true,
+        }
+    }
+
+    #[test]
+    fn managed_output_on_default_route_requires_explicit_confirmation() {
+        let error = default_route_editor(false).edit_request().unwrap_err();
+        assert!(error.to_string().contains("default route"));
+    }
+
+    #[test]
+    fn managed_output_on_default_route_is_allowed_after_confirmation() {
+        assert!(default_route_editor(true).edit_request().is_ok());
+    }
 
     #[test]
     fn interface_editor_field_reaches_save_and_clamps_at_both_ends() {

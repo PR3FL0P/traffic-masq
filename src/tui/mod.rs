@@ -3,7 +3,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton, MouseEvent,
     MouseEventKind,
@@ -271,7 +271,7 @@ pub async fn change_device_password(socket_path: PathBuf) -> Result<()> {
     client
         .request(&Request::Ping)
         .await
-        .map_err(|error| anyhow::anyhow!("traffic-masqd is unavailable: {error}"))?;
+        .context("traffic-masqd is unavailable")?;
     if !client.auth_initialized().await? {
         anyhow::bail!(
             "device password is not initialized; start the TUI as root for first-time setup"
@@ -313,7 +313,7 @@ pub async fn run_tui(socket_path: PathBuf, direct: bool) -> Result<()> {
         client
             .request(&Request::Ping)
             .await
-            .map_err(|error| anyhow::anyhow!("traffic-masqd is unavailable: {error}"))?;
+            .context("traffic-masqd is unavailable")?;
         if client.auth_initialized().await? {
             let mut password = rpassword::prompt_password("Device password: ")?;
             let login_result = client.login(&password).await;
@@ -900,10 +900,15 @@ async fn load_direct_dashboard(network: Option<&RtnetlinkNetworkProvider>) -> Da
         }
     };
 
+    let routes = network.list_ipv4_routes().await.unwrap_or_default();
     let mut statuses = Vec::new();
     for interface in interfaces {
         match network.list_ipv4_addresses(&interface.name).await {
             Ok(ipv4_addresses) => statuses.push(InterfaceStatus {
+                has_default_route: routes.iter().any(|route| {
+                    route.destination.prefix_len() == 0
+                        && route.output_interface_index == Some(interface.index)
+                }),
                 interface,
                 ipv4_addresses,
             }),

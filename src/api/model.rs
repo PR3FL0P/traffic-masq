@@ -1086,4 +1086,6 @@ pub enum Response {
 pub struct InterfaceStatus {
     pub interface: NetworkInterface,
     pub ipv4_addresses: Vec<Ipv4AddressInfo>,
+    #[serde(default)]
+    pub has_default_route: bool,
 }
