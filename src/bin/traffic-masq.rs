@@ -1,7 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
-use traffic_masq::config::ResolvedConfig;
 use traffic_masq::tui::{change_device_password, run_tui};
+
+const DEFAULT_SOCKET_PATH: &str = "/run/traffic-masq/traffic-masqd.sock";
 
 #[derive(Debug, Parser)]
 #[command(name = "traffic-masq", about = "traffic-masq TUI client")]
@@ -20,22 +21,20 @@ struct Args {
     )]
     change_password: bool,
 
-    #[arg(long)]
-    config: Option<std::path::PathBuf>,
+    #[arg(
+        long,
+        default_value = DEFAULT_SOCKET_PATH,
+        help = "Unix socket exposed by traffic-masqd"
+    )]
+    socket: std::path::PathBuf,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let resolved = ResolvedConfig::load(args.config)?;
-    if resolved.source.is_built_in() {
-        eprintln!(
-            "No configuration file found; using safe built-in defaults (no interfaces are managed)."
-        );
-    }
     if args.change_password {
-        change_device_password(resolved.config).await
+        change_device_password(args.socket).await
     } else {
-        run_tui(resolved.config, args.direct).await
+        run_tui(args.socket, args.direct).await
     }
 }

@@ -734,6 +734,7 @@ fn stage_color(stage: ProvisioningStage) -> ratatui::style::Color {
     match stage {
         ProvisioningStage::Ready => theme::GOOD,
         ProvisioningStage::AwaitingConfirmation => theme::WARN,
+        ProvisioningStage::Unconfigured => theme::WARN,
         ProvisioningStage::Inactive
         | ProvisioningStage::Degraded
         | ProvisioningStage::RollbackFailed => theme::BAD,

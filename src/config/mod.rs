@@ -607,9 +607,13 @@ impl RouterConfig {
 
     fn validate(&self, network: &NetworkConfig) -> Result<()> {
         if self.enabled {
-            let uplink = self.uplink.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("router.uplink is required when router mode is enabled")
-            })?;
+            // An enabled router without an uplink is a valid control-plane state:
+            // the daemon can start and the user can complete setup through the
+            // provisioning API.  A complete uplink remains mandatory before a
+            // router candidate can be activated.
+            let Some(uplink) = self.uplink.as_ref() else {
+                return Ok(());
+            };
             validate_interface_name(&uplink.interface)
                 .map_err(|error| anyhow::anyhow!("router uplink: {error}"))?;
             let interface = network.interfaces.get(&uplink.interface).ok_or_else(|| {
@@ -1349,14 +1353,12 @@ mod tests {
     }
 
     #[test]
-    fn enabled_router_rejects_missing_uplink() {
+    fn enabled_router_without_uplink_is_valid_but_unconfigured() {
         let mut config = valid_router_config();
         config.router.uplink = None;
-        assert!(config
+        config
             .validate()
-            .expect_err("uplink is required")
-            .to_string()
-            .contains("router.uplink is required"));
+            .expect("an enabled router may await interactive provisioning");
     }
 
     #[test]

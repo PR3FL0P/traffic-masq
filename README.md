@@ -135,7 +135,7 @@ traffic-masqd [--config <path>] <command>
 ## Client commands
 
 ```text
-traffic-masq [--config <path>] [--direct | --change-password]
+traffic-masq [--socket <path>] [--direct | --change-password]
 ```
 
 | Option | Function |

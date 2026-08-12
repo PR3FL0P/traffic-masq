@@ -184,6 +184,13 @@ impl RouterCandidate {
         committed: &RuntimeOverrides,
         proposal: &RouterIntentProposal,
     ) -> Result<Self> {
+        if let RouterOverrideChange::Set(router) = &proposal.router {
+            if router.enabled && router.uplink.is_none() {
+                bail!(
+                    "router.uplink is required before an enabled router candidate can be activated"
+                );
+            }
+        }
         let committed_effective = committed.effective_config(base)?;
         reject_unconfirmed_management_change(&committed_effective, proposal)?;
 
@@ -405,6 +412,21 @@ mod tests {
             candidate.document().dhcp.get("lan1"),
             Some(DhcpOverride::Configured { .. })
         ));
+    }
+
+    #[test]
+    fn rejects_activating_an_unconfigured_router_candidate() {
+        let mut router = enabled_router();
+        router.uplink = None;
+
+        let error = RouterCandidate::build(
+            &base_config(),
+            &committed(),
+            &RouterIntentProposal::new().set_router(router),
+        )
+        .expect_err("activation must require a complete router intent");
+
+        assert!(error.to_string().contains("router.uplink is required"));
     }
 
     #[test]

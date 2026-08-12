@@ -8,7 +8,6 @@ use ratatui::widgets::Paragraph;
 
 use crate::api::client::ApiClient;
 use crate::api::model::{DhcpEditRequest, Request, Response};
-use crate::config::AppConfig;
 use crate::dhcp::lease::DhcpLease;
 
 use super::layout::panel;
@@ -303,7 +302,6 @@ pub(crate) async fn handle_dhcp_interface_list_key(
     app: &mut TuiApp,
     key: KeyCode,
     client: &ApiClient,
-    config: &AppConfig,
 ) {
     match key {
         KeyCode::Esc => app.screen = Screen::Dashboard,
@@ -318,7 +316,7 @@ pub(crate) async fn handle_dhcp_interface_list_key(
             app.selected_interface = app.dashboard.interfaces.len().saturating_sub(1);
         }
 
-        KeyCode::Enter => open_dhcp_editor(app, client, config).await,
+        KeyCode::Enter => open_dhcp_editor(app, client).await,
         _ => {}
     }
 }
@@ -351,7 +349,7 @@ fn suggest_pool(address: Ipv4Addr, prefix_len: u8) -> Option<(Ipv4Addr, Ipv4Addr
     Some((Ipv4Addr::from(first_host), Ipv4Addr::from(last_host)))
 }
 
-pub(crate) async fn open_dhcp_editor(app: &mut TuiApp, client: &ApiClient, config: &AppConfig) {
+pub(crate) async fn open_dhcp_editor(app: &mut TuiApp, client: &ApiClient) {
     let Some(status) = app.dashboard.interfaces.get(app.selected_interface) else {
         return;
     };
@@ -401,7 +399,7 @@ pub(crate) async fn open_dhcp_editor(app: &mut TuiApp, client: &ApiClient, confi
                 pool_end,
                 router,
                 dns_servers: "8.8.8.8".to_string(),
-                lease_seconds: config.dhcp.default_lease_seconds.to_string(),
+                lease_seconds: "86400".to_string(),
             });
             app.screen = Screen::DhcpEditor;
         }

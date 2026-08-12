@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::io;
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -20,7 +21,6 @@ use zeroize::Zeroize;
 
 use crate::api::client::ApiClient;
 use crate::api::model::{DhcpClientStatusView, InterfaceStatus, Request, Response};
-use crate::config::AppConfig;
 use crate::core::interface::InterfaceChangePlan;
 use crate::core::transaction::PendingNetworkChange;
 use crate::netlink::{NetworkProvider, RtnetlinkNetworkProvider};
@@ -266,8 +266,8 @@ impl TuiApp {
     }
 }
 
-pub async fn change_device_password(config: AppConfig) -> Result<()> {
-    let client = ApiClient::new(config.runtime.socket_path);
+pub async fn change_device_password(socket_path: PathBuf) -> Result<()> {
+    let client = ApiClient::new(socket_path);
     client
         .request(&Request::Ping)
         .await
@@ -307,8 +307,8 @@ pub async fn change_device_password(config: AppConfig) -> Result<()> {
     Ok(())
 }
 
-pub async fn run_tui(config: AppConfig, direct: bool) -> Result<()> {
-    let client = ApiClient::new(config.runtime.socket_path.clone());
+pub async fn run_tui(socket_path: PathBuf, direct: bool) -> Result<()> {
+    let client = ApiClient::new(socket_path);
     if !direct {
         client
             .request(&Request::Ping)
@@ -344,7 +344,7 @@ pub async fn run_tui(config: AppConfig, direct: bool) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, &config, &client, direct).await;
+    let result = run_loop(&mut terminal, &client, direct).await;
 
     disable_raw_mode()?;
     execute!(
@@ -364,7 +364,6 @@ pub async fn run_tui(config: AppConfig, direct: bool) -> Result<()> {
 
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    config: &AppConfig,
     client: &ApiClient,
     direct: bool,
 ) -> Result<()> {
@@ -373,10 +372,7 @@ async fn run_loop(
     } else {
         None
     };
-    let mut app = TuiApp {
-        router_rollback_timeout_seconds: config.security.rollback_timeout_seconds,
-        ..TuiApp::default()
-    };
+    let mut app = TuiApp::default();
 
     while !app.should_quit {
         app.dashboard = if direct {
@@ -421,10 +417,10 @@ async fn run_loop(
         if event::poll(Duration::from_millis(250))? {
             match event::read()? {
                 Event::Key(key) => {
-                    handle_key(&mut app, key.code, config, client, direct).await;
+                    handle_key(&mut app, key.code, client, direct).await;
                 }
                 Event::Mouse(mouse) => {
-                    handle_mouse(&mut app, mouse, config, client, direct).await;
+                    handle_mouse(&mut app, mouse, client, direct).await;
                 }
                 _ => {}
             }
@@ -511,13 +507,7 @@ async fn navigate_to_section(app: &mut TuiApp, section: Section, client: &ApiCli
     }
 }
 
-async fn handle_mouse(
-    app: &mut TuiApp,
-    mouse: MouseEvent,
-    config: &AppConfig,
-    client: &ApiClient,
-    direct: bool,
-) {
+async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, direct: bool) {
     let point = (mouse.column, mouse.row);
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
@@ -532,7 +522,7 @@ async fn handle_mouse(
                 .find(|(rect, _)| layout::point_in_rect(point, *rect))
             {
                 focus_action_slot(app, slot);
-                handle_key(app, KeyCode::Enter, config, client, direct).await;
+                handle_key(app, KeyCode::Enter, client, direct).await;
                 return;
             }
             if let Some(area) = app.ui.list_area {
@@ -690,13 +680,7 @@ fn focus_action_slot(app: &mut TuiApp, slot: usize) {
     }
 }
 
-async fn handle_key(
-    app: &mut TuiApp,
-    key: KeyCode,
-    config: &AppConfig,
-    client: &ApiClient,
-    direct: bool,
-) {
+async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: bool) {
     app.message = None;
 
     if matches!(
@@ -733,9 +717,7 @@ async fn handle_key(
             interfaces::handle_interface_list_key(app, key, client, direct).await
         }
         Screen::InterfaceEditor => interfaces::handle_editor_key(app, key, client).await,
-        Screen::DhcpInterfaceList => {
-            dhcp::handle_dhcp_interface_list_key(app, key, client, config).await
-        }
+        Screen::DhcpInterfaceList => dhcp::handle_dhcp_interface_list_key(app, key, client).await,
         Screen::DhcpEditor => dhcp::handle_dhcp_editor_key(app, key, client).await,
         Screen::DhcpLeases => dhcp::handle_dhcp_leases_key(app, key, client).await,
         Screen::DhcpClient => dhcp_client::handle_key(app, key, client).await,

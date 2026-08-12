@@ -924,7 +924,10 @@ pub async fn run_daemon(config: AppConfig) -> Result<()> {
         return Ok(());
     }
 
-    let router_coordinator = if desired.enabled {
+    // The coordinator is part of the control plane.  Keep it available while
+    // the router awaits initial provisioning, even though there is no active
+    // data-plane intent yet.
+    let router_coordinator = if effective_config.router.enabled {
         match production_router_coordinator(
             &desired,
             dhcp.clone(),

@@ -2087,6 +2087,7 @@ impl ControlService {
                 return provisioning_error(RouterProvisioningErrorDetail::Other { message })
             }
         };
+        let unconfigured = effective.router.enabled && effective.router.uplink.is_none();
         let desired = match RouterDesired::from_effective_config(&effective) {
             Ok(desired) => desired,
             Err(error) => {
@@ -2107,6 +2108,7 @@ impl ControlService {
         let stage = match coordinator {
             CoordinatorStatus::RollbackFailed => ProvisioningStage::RollbackFailed,
             CoordinatorStatus::Pending => ProvisioningStage::AwaitingConfirmation,
+            CoordinatorStatus::Idle if unconfigured => ProvisioningStage::Unconfigured,
             CoordinatorStatus::Idle if !desired.enabled => ProvisioningStage::Inactive,
             CoordinatorStatus::Idle if ready => ProvisioningStage::Ready,
             CoordinatorStatus::Idle => ProvisioningStage::Degraded,
@@ -3761,6 +3763,24 @@ mod tests {
                     detail: RouterErrorDetail::RouterDisabled
                 }
             ));
+        }
+    }
+
+    #[tokio::test]
+    async fn enabled_router_without_uplink_reports_unconfigured_provisioning_state() {
+        let mut config = router_base_config_with_router_enabled();
+        config.router.uplink = None;
+        let (service, _directory) =
+            router_service_with_config(Arc::new(FakeRouterSubsystems::default()), config).await;
+
+        match service.dispatch(Request::RouterProvisioningStatus).await {
+            Response::RouterProvisioningStatus { status } => {
+                assert_eq!(status.stage, ProvisioningStage::Unconfigured);
+                assert!(!status.enabled);
+                assert!(!status.ready);
+                assert_eq!(status.coordinator, CoordinatorStatus::Idle);
+            }
+            other => panic!("expected unconfigured provisioning status, got {other:?}"),
         }
     }
 

@@ -43,7 +43,10 @@ impl RouterDesired {
         let mut dhcp = DhcpSupervisor::service_specs(config)?;
         dhcp.sort_by(|left, right| left.interface.cmp(&right.interface));
 
-        if !config.router.enabled {
+        // `enabled` without an uplink means the router capability is available,
+        // but no data-plane intent has been provisioned yet.  Treat it exactly
+        // like an inactive data plane until provisioning commits a full intent.
+        if !config.router.enabled || config.router.uplink.is_none() {
             return Ok(Self {
                 enabled: false,
                 uplink_wifi: None,
@@ -61,7 +64,7 @@ impl RouterDesired {
             .router
             .uplink
             .as_ref()
-            .expect("validated enabled router has an uplink");
+            .expect("configured enabled router has an uplink");
         let uplink_config = config
             .network
             .interfaces
@@ -779,6 +782,19 @@ mod tests {
         assert_eq!(desired.dhcp.len(), 2);
         assert!(desired.routes.is_empty());
         assert!(!desired.allow_default_route_change);
+        assert_eq!(desired.dataplane, RouterDataplaneTarget::Disabled);
+    }
+
+    #[test]
+    fn unconfigured_router_does_not_claim_routes_or_dataplane() {
+        let mut config = enabled_config();
+        config.router.uplink = None;
+
+        let desired = RouterDesired::from_effective_config(&config).expect("desired");
+
+        assert!(!desired.enabled);
+        assert!(desired.interfaces.is_empty());
+        assert!(desired.routes.is_empty());
         assert_eq!(desired.dataplane, RouterDataplaneTarget::Disabled);
     }
 
