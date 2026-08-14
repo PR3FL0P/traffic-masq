@@ -61,7 +61,18 @@ use crate::wifi::{
 
 #[derive(Clone)]
 pub struct ControlService {
+    /// The configuration that is actually running, as it was when the daemon
+    /// started. Reported as "active" so the UI can tell the user which settings
+    /// need a restart to take effect.
     config: AppConfig,
+    /// The on-disk configuration that runtime overrides are merged onto.
+    ///
+    /// Deliberately *not* `config`: merging overrides onto an already-merged
+    /// config makes removing an override a no-op, because the removed value is
+    /// still baked into the base. The runtime reconcile loop merges onto the
+    /// file config, so anything else here would make the two disagree about
+    /// what the effective configuration is.
+    base_config: AppConfig,
     network: Arc<dyn NetworkProvider>,
     transactions: NetworkTransactionManager,
     dhcp: DhcpSupervisor,
@@ -114,6 +125,7 @@ impl ControlService {
             WifiClientProfileStore::new(config.runtime.state_dir.join("wifi/client-profiles"));
 
         Self {
+            base_config: config.clone(),
             config,
             network,
             transactions,
@@ -131,6 +143,15 @@ impl ControlService {
             wifi_client_profiles,
             wifi_client_mutations: Arc::new(Mutex::new(())),
         }
+    }
+
+    /// Set the on-disk configuration that runtime overrides are merged onto.
+    ///
+    /// Without this the service merges onto whatever it was constructed with,
+    /// which for the daemon is the already-merged startup configuration.
+    pub fn with_base_config(mut self, base_config: AppConfig) -> Self {
+        self.base_config = base_config;
+        self
     }
 
     pub fn with_router_coordinator(mut self, coordinator: RouterTransactionCoordinator) -> Self {
@@ -301,7 +322,7 @@ impl ControlService {
                 dhcp_config,
                 &self.overrides,
                 self.network.as_ref(),
-                self.config.dhcp.default_lease_seconds,
+                self.base_config.dhcp.default_lease_seconds,
             )
             .await
             {
@@ -327,7 +348,7 @@ impl ControlService {
                 dhcp_edit_request_to_config(settings),
                 &self.overrides,
                 self.network.as_ref(),
-                self.config.dhcp.default_lease_seconds,
+                self.base_config.dhcp.default_lease_seconds,
             )
             .await
             {
@@ -361,7 +382,8 @@ impl ControlService {
                     };
                 }
 
-                let store = LeaseStore::for_interface(&self.config.dhcp.leases_dir, &interface);
+                let store =
+                    LeaseStore::for_interface(&self.base_config.dhcp.leases_dir, &interface);
                 match store.load().await {
                     Ok(leases) => Response::Leases { interface, leases },
                     Err(error) => Response::Error {
@@ -691,7 +713,7 @@ impl ControlService {
 
     async fn interface_config_response(&self, interface: String) -> Result<Response> {
         let snapshot = self.overrides.snapshot().await;
-        let effective = snapshot.effective_config(&self.config)?;
+        let effective = snapshot.effective_config(&self.base_config)?;
         let config = effective.network.interfaces.get(&interface).cloned();
         let allow_management_change = snapshot
             .interfaces
@@ -955,6 +977,14 @@ impl ControlService {
         let Some(wifi) = &self.wifi else {
             return wifi_disabled();
         };
+        // The supervisor exists even when the daemon started with
+        // `wifi.enabled = false`, so the binary has not necessarily been checked
+        // yet. Check it here rather than letting the first spawn fail obscurely.
+        if let Err(error) = wifi.preflight_binary().await {
+            return wifi_error(WifiErrorDetail::Other {
+                message: error.to_string(),
+            });
+        }
         let effective = match self.effective_config().await {
             Ok(effective) => effective,
             Err(message) => return wifi_error(WifiErrorDetail::Other { message }),
@@ -1101,7 +1131,7 @@ impl ControlService {
             let result = match DhcpServiceSpec::from_interface_config(
                 &interface,
                 &dhcp_interface,
-                self.config.dhcp.default_lease_seconds,
+                self.base_config.dhcp.default_lease_seconds,
             ) {
                 Ok(Some(spec)) => {
                     configure_dhcp_persisted(&self.dhcp, &self.overrides, spec.clone())
@@ -1496,6 +1526,13 @@ impl ControlService {
         let Some(wifi_client) = &self.wifi_client else {
             return wifi_client_disabled();
         };
+        // See `configure_wifi`: the supervisor is built unconditionally, so the
+        // binary is verified at the point of use.
+        if let Err(error) = wifi_client.preflight_binary().await {
+            return wifi_client_error(WifiClientErrorDetail::Other {
+                message: error.to_string(),
+            });
+        }
         let effective = match self.effective_config().await {
             Ok(effective) => effective,
             Err(message) => return wifi_client_error(WifiClientErrorDetail::Other { message }),
@@ -1871,7 +1908,7 @@ impl ControlService {
         self.overrides
             .snapshot()
             .await
-            .effective_config(&self.config)
+            .effective_config(&self.base_config)
             .map_err(|error| error.to_string())
     }
 
@@ -2348,6 +2385,8 @@ impl ControlService {
 
         Ok(RouterProvisioningContext {
             effective_config,
+            wifi_runtime_available: self.wifi.is_some(),
+            wifi_client_runtime_available: self.wifi_client.is_some(),
             interfaces,
             known_networks,
             runtime_ap_secrets,
@@ -2395,7 +2434,7 @@ impl ControlService {
     async fn current_router_desired(&self) -> Result<RouterDesired, Response> {
         let snapshot = self.overrides.snapshot().await;
         let effective = snapshot
-            .effective_config(&self.config)
+            .effective_config(&self.base_config)
             .map_err(classify_router_error)?;
         RouterDesired::from_effective_config(&effective).map_err(classify_router_error)
     }
@@ -3674,6 +3713,75 @@ mod tests {
             clear_router: false,
             set_interfaces: Default::default(),
             remove_interfaces: Vec::new(),
+        }
+    }
+
+    /// Removing a runtime override has to fall back to the file configuration.
+    /// It only does so if overrides are merged onto the file config: merging
+    /// onto the already-merged startup config leaves the removed value baked in,
+    /// and makes the service disagree with the runtime reconcile loop, which
+    /// merges onto the file config.
+    #[tokio::test]
+    async fn removing_an_interface_override_falls_back_to_the_file_configuration() {
+        let directory = tempdir().expect("tempdir");
+        let base = router_base_config();
+        let overrides = RuntimeOverrideManager::load(directory.path(), &base)
+            .await
+            .expect("overrides");
+
+        let overridden = InterfaceConfig {
+            role: InterfaceRole::Output,
+            managed: true,
+            ipv4: Some("10.9.9.1/24".parse().unwrap()),
+            dhcp: None,
+            dhcp_client: None,
+            wifi: None,
+            wifi_client: None,
+        };
+        overrides
+            .set_interface("lan0".to_string(), overridden, false)
+            .await
+            .expect("set override");
+
+        // Constructed the way the daemon does it: the effective configuration
+        // for what is running, the file configuration as the merge base.
+        let effective = overrides
+            .snapshot()
+            .await
+            .effective_config(&base)
+            .expect("effective");
+        let dhcp = DhcpSupervisor::start(&effective, &overrides.snapshot().await)
+            .await
+            .expect("dhcp supervisor");
+        let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
+            addresses: Vec::new(),
+        });
+        let service = ControlService::new(effective, network, dhcp, overrides.clone())
+            .with_base_config(base.clone());
+
+        let candidate = overrides
+            .build_candidate(&RouterIntentProposal::new().remove_interface("lan0"))
+            .await
+            .expect("candidate");
+        overrides
+            .commit_candidate(&candidate)
+            .await
+            .expect("commit removal");
+
+        match service
+            .dispatch(Request::GetInterfaceConfig {
+                interface: "lan0".to_string(),
+            })
+            .await
+        {
+            Response::InterfaceConfig { config, .. } => {
+                let config = config.expect("lan0 is still in the file configuration");
+                assert_eq!(
+                    config.ipv4, base.network.interfaces["lan0"].ipv4,
+                    "after the override is removed the file value must be reported"
+                );
+            }
+            response => panic!("unexpected response: {response:?}"),
         }
     }
 

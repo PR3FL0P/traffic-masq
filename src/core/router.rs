@@ -266,6 +266,14 @@ pub trait RouterSubsystems: Send + Sync {
         Ok(None)
     }
 
+    /// Narrow ownership to exactly these interfaces.
+    ///
+    /// Called once a transaction settles, so the owned set tracks the intent
+    /// that is actually in force instead of accumulating every interface that
+    /// was ever part of one. Doing nothing is correct for a subsystem that
+    /// keeps no such record.
+    async fn retain_router_interfaces(&self, _interfaces: &[String]) {}
+
     async fn snapshot_for(&self, _desired: &RouterDesired) -> Result<RouterSnapshot> {
         Ok(RouterSnapshot {
             interfaces: self.snapshot_interfaces().await?,
@@ -468,6 +476,10 @@ impl RouterManager {
 
     pub async fn snapshot_for(&self, desired: &RouterDesired) -> Result<RouterSnapshot> {
         self.subsystems.snapshot_for(desired).await
+    }
+
+    pub async fn retain_router_interfaces(&self, interfaces: &[String]) {
+        self.subsystems.retain_router_interfaces(interfaces).await;
     }
 
     pub async fn apply(&self, plan: &RouterPlan) -> Result<()> {

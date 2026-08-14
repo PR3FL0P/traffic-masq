@@ -93,6 +93,12 @@ pub struct ProvisioningKnownNetwork {
 #[derive(Debug, Clone)]
 pub struct RouterProvisioningContext {
     pub effective_config: AppConfig,
+    /// Whether an access-point runtime is available to carry out the intent.
+    /// Replaces reading `wifi.enabled`, which is a startup hint rather than a
+    /// statement about what the daemon can currently do.
+    pub wifi_runtime_available: bool,
+    /// Whether a station runtime is available. See `wifi_runtime_available`.
+    pub wifi_client_runtime_available: bool,
     pub interfaces: BTreeMap<String, ProvisioningInterfaceObservation>,
     pub known_networks: Vec<ProvisioningKnownNetwork>,
 
@@ -202,10 +208,13 @@ pub fn derive_router_provisioning(
         }
     }
 
-    if !context.effective_config.wifi.enabled {
+    // Availability of the runtime, not the `enabled` flag in the file. The flag
+    // is a startup hint; refusing to provision because of it made Wi-Fi a
+    // boot-time decision, which is exactly what this check should not be.
+    if !context.wifi_runtime_available {
         return Err(RouterProvisioningError::GlobalServiceDisabled { service: "wifi" });
     }
-    if !context.effective_config.wifi_client.enabled {
+    if !context.wifi_client_runtime_available {
         return Err(RouterProvisioningError::GlobalServiceDisabled {
             service: "wifi_client",
         });
@@ -428,6 +437,8 @@ mod tests {
         config.wifi_client.enabled = true;
         RouterProvisioningContext {
             effective_config: config,
+            wifi_runtime_available: true,
+            wifi_client_runtime_available: true,
             interfaces: BTreeMap::from([
                 (
                     "wlan-up".to_owned(),
@@ -475,6 +486,36 @@ mod tests {
             downstream: ProvisioningDownstreamOverrides::default(),
             allow_management_change: false,
         }
+    }
+
+    /// Provisioning is gated on whether the daemon can actually drive Wi-Fi,
+    /// not on the `enabled` flag in the file — otherwise a box that started
+    /// with Wi-Fi off could never be provisioned as a router without a restart.
+    #[test]
+    fn provisioning_is_gated_on_the_runtime_not_on_the_config_flag() {
+        let mut context = context();
+        context.effective_config.wifi.enabled = false;
+        context.effective_config.wifi_client.enabled = false;
+        assert!(
+            derive_router_provisioning(&desired(), &context).is_ok(),
+            "the startup hint must not block provisioning"
+        );
+
+        let mut without_ap = context.clone();
+        without_ap.wifi_runtime_available = false;
+        assert_eq!(
+            derive_router_provisioning(&desired(), &without_ap),
+            Err(RouterProvisioningError::GlobalServiceDisabled { service: "wifi" })
+        );
+
+        let mut without_sta = context;
+        without_sta.wifi_client_runtime_available = false;
+        assert_eq!(
+            derive_router_provisioning(&desired(), &without_sta),
+            Err(RouterProvisioningError::GlobalServiceDisabled {
+                service: "wifi_client"
+            })
+        );
     }
 
     #[test]

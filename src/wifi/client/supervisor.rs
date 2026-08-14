@@ -447,6 +447,25 @@ impl WifiClientSupervisor {
         Ok(Some(task.spec))
     }
 
+    /// Check that the configured wpa_supplicant binary is runnable.
+    ///
+    /// See [`crate::wifi::HostapdSupervisor::preflight_binary`]: the supervisor
+    /// is built unconditionally, so a client configured at runtime needs the
+    /// same diagnosis of a missing binary that startup gives.
+    pub async fn preflight_binary(&self) -> Result<(), ClientSupervisorError> {
+        tokio::process::Command::new(&self.inner.wpa_supplicant_binary)
+            .arg("-v")
+            .output()
+            .await
+            .map_err(|error| {
+                ClientSupervisorError::Configuration(anyhow::anyhow!(
+                    "wpa_supplicant binary {} is not runnable ({error}) — install wpa_supplicant or fix wifi_client.wpa_supplicant_binary",
+                    self.inner.wpa_supplicant_binary.display()
+                ))
+            })?;
+        Ok(())
+    }
+
     pub async fn status(&self, interface: &str) -> Option<WifiClientStatus> {
         let task = self.inner.tasks.lock().await.get(interface).cloned()?;
         let ctrl_path = self.ctrl_path(interface);

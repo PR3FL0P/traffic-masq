@@ -250,10 +250,13 @@ fn production_router_coordinator(
         router_interfaces,
         Arc::new(dhcp_client),
     );
+    // Wi-Fi runtimes are attached when they exist. A missing runtime is not
+    // fatal here: the intent this coordinator will be asked to apply is not
+    // known yet, and refusing now would judge it by the intent that happened to
+    // exist at boot. `plan_uplink_wifi` / `plan_output_wifi` already reject a
+    // Wi-Fi intent without a runtime, at the point where the intent is real.
     if let (Some(wifi_client), Some(wifi)) = (wifi_client, wifi) {
         subsystems = subsystems.with_wifi_runtimes(Arc::new(wifi_client), Arc::new(wifi));
-    } else if desired.uplink_wifi.is_some() || !desired.output_wifi.is_empty() {
-        anyhow::bail!("router Wi-Fi intent requires both STA and AP runtimes");
     }
     let manager = RouterManager::new(Arc::new(subsystems));
     Ok(RouterTransactionCoordinator::new(
@@ -737,10 +740,17 @@ async fn build_wifi_supervisor(
     effective_config: &AppConfig,
     override_snapshot: &RuntimeOverrides,
 ) -> Result<Option<HostapdSupervisor>> {
-    if !effective_config.wifi.enabled {
-        return Ok(None);
+    // Built regardless of `wifi.enabled`: constructing the supervisor has no
+    // side effects, and gating it made enabling Wi-Fi a boot-time decision —
+    // with no supervisor every Wi-Fi request answers "disabled", which is the
+    // state you are in when you want to turn it on.
+    //
+    // `enabled` survives as a startup hint: if this box declares that it uses
+    // Wi-Fi, a missing binary is still reported immediately rather than at the
+    // first attempt to configure an access point.
+    if effective_config.wifi.enabled {
+        preflight_hostapd_binary(&effective_config.wifi.hostapd_binary).await?;
     }
-    preflight_hostapd_binary(&effective_config.wifi.hostapd_binary).await?;
     let supervisor = HostapdSupervisor::start(effective_config, override_snapshot).await?;
     Ok(Some(supervisor))
 }
@@ -763,10 +773,11 @@ async fn build_wifi_client_supervisor(
     effective_config: &AppConfig,
     override_snapshot: &RuntimeOverrides,
 ) -> Result<Option<WifiClientSupervisor>> {
-    if !effective_config.wifi_client.enabled {
-        return Ok(None);
+    // Same reasoning as `build_wifi_supervisor`.
+    if effective_config.wifi_client.enabled {
+        preflight_wpa_supplicant_binary(&effective_config.wifi_client.wpa_supplicant_binary)
+            .await?;
     }
-    preflight_wpa_supplicant_binary(&effective_config.wifi_client.wpa_supplicant_binary).await?;
     let supervisor = WifiClientSupervisor::start(effective_config, override_snapshot).await?;
     Ok(Some(supervisor))
 }
@@ -947,34 +958,33 @@ pub async fn run_daemon(config: AppConfig) -> Result<()> {
         return Ok(());
     }
 
-    // The coordinator is part of the control plane.  Keep it available while
-    // the router awaits initial provisioning, even though there is no active
-    // data-plane intent yet.
-    let router_coordinator = if effective_config.router.enabled {
-        match production_router_coordinator(
-            &desired,
-            dhcp.clone(),
-            dhcp_client.clone(),
-            wifi_client_supervisor.clone(),
-            wifi_supervisor.clone(),
-            overrides.clone(),
-            Duration::from_secs(config.security.rollback_timeout_seconds),
-        ) {
-            Ok(coordinator) => Some(coordinator),
-            Err(error) => {
-                if let Some(state) = &router_state {
-                    rollback_router_dataplane(state).await;
-                }
-                dhcp_client
-                    .shutdown(ShutdownPolicy::RestoreInterfaces)
-                    .await;
-                dhcp.shutdown().await;
-                rollback_interfaces(&interface_manager, &startup_baselines).await;
-                return Err(error);
+    // The coordinator is part of the control plane, so it is built regardless
+    // of whether the router carries an intent right now. Gating it on
+    // `router.enabled` made enabling the router a boot-time decision: with no
+    // coordinator every router request answers RouterDisabled, which is exactly
+    // the state you are in when you want to provision one. Building it is pure
+    // wiring — it opens a netlink socket and touches no data plane.
+    let router_coordinator = match production_router_coordinator(
+        &desired,
+        dhcp.clone(),
+        dhcp_client.clone(),
+        wifi_client_supervisor.clone(),
+        wifi_supervisor.clone(),
+        overrides.clone(),
+        Duration::from_secs(config.security.rollback_timeout_seconds),
+    ) {
+        Ok(coordinator) => Some(coordinator),
+        Err(error) => {
+            if let Some(state) = &router_state {
+                rollback_router_dataplane(state).await;
             }
+            dhcp_client
+                .shutdown(ShutdownPolicy::RestoreInterfaces)
+                .await;
+            dhcp.shutdown().await;
+            rollback_interfaces(&interface_manager, &startup_baselines).await;
+            return Err(error);
         }
-    } else {
-        None
     };
 
     let vpn_manager = match build_vpn_manager(&effective_config).await {
@@ -1001,13 +1011,19 @@ pub async fn run_daemon(config: AppConfig) -> Result<()> {
     )
     .await;
 
+    // The service is constructed with the effective configuration, because the
+    // runtime values it derives (rollback timeout, state directory) have to be
+    // the ones actually in force. The merge base is the file config, so that
+    // removing an override takes effect and so that the service and the runtime
+    // reconcile loop agree on what the effective configuration is.
     let mut control = ControlService::new_with_baselines(
         effective_config.clone(),
         network_provider.clone(),
         dhcp.clone(),
         overrides.clone(),
         startup_baselines,
-    );
+    )
+    .with_base_config(config.clone());
     if let Some(coordinator) = router_coordinator {
         control = control.with_router_coordinator(coordinator);
     }
@@ -2501,17 +2517,53 @@ mod tests {
         );
     }
 
+    /// `wifi.enabled = false` must not decide, for the lifetime of the process,
+    /// that Wi-Fi can never be turned on. The supervisor is built anyway; the
+    /// flag only decides whether a missing binary is reported at startup.
     #[tokio::test]
-    async fn build_wifi_supervisor_is_none_when_wifi_is_disabled() {
+    async fn wifi_supervisor_is_built_even_when_wifi_is_disabled_at_startup() {
         let mut config = AppConfig::default();
         config.wifi.enabled = false;
-
         config.wifi.hostapd_binary = std::path::PathBuf::from("/definitely/not/a/real/hostapd");
         let overrides = RuntimeOverrides::default();
 
         let supervisor = build_wifi_supervisor(&config, &overrides)
             .await
-            .expect("disabled wifi must not fail");
-        assert!(supervisor.is_none());
+            .expect("a missing binary must not fail startup while Wi-Fi is off")
+            .expect("the supervisor must exist so Wi-Fi can be enabled at runtime");
+
+        // The check the flag used to gate now happens where the intent is real.
+        assert!(
+            supervisor.preflight_binary().await.is_err(),
+            "a missing hostapd must still be diagnosed, just later"
+        );
+    }
+
+    /// The startup hint half of the same rule: a box that declares it uses
+    /// Wi-Fi still finds out about a missing binary immediately.
+    #[tokio::test]
+    async fn a_missing_hostapd_still_fails_startup_when_wifi_is_enabled() {
+        let mut config = AppConfig::default();
+        config.wifi.enabled = true;
+        config.wifi.hostapd_binary = std::path::PathBuf::from("/definitely/not/a/real/hostapd");
+        let overrides = RuntimeOverrides::default();
+
+        assert!(build_wifi_supervisor(&config, &overrides).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn wifi_client_supervisor_is_built_even_when_disabled_at_startup() {
+        let mut config = AppConfig::default();
+        config.wifi_client.enabled = false;
+        config.wifi_client.wpa_supplicant_binary =
+            std::path::PathBuf::from("/definitely/not/a/real/wpa_supplicant");
+        let overrides = RuntimeOverrides::default();
+
+        let supervisor = build_wifi_client_supervisor(&config, &overrides)
+            .await
+            .expect("a missing binary must not fail startup while the client is off")
+            .expect("the supervisor must exist so the client can be enabled at runtime");
+
+        assert!(supervisor.preflight_binary().await.is_err());
     }
 }

@@ -344,7 +344,7 @@ async fn open_router_plan(app: &mut TuiApp, client: &ApiClient) {
     } else if !app.router.enabled {
         app.push_message(
             LogLevel::Warn,
-            "Router is disabled in config ([router].enabled = false); nothing to plan",
+            "Router has no committed intent yet, so there is nothing to plan; use Provision to set one up",
         );
     }
 }
@@ -646,7 +646,7 @@ fn format_forwarding_status(dataplane: &crate::firewall::RouterDataplanePlan) ->
 fn describe_router_error(detail: &RouterErrorDetail) -> String {
     match detail {
         RouterErrorDetail::RouterDisabled => {
-            "Router is disabled (router.enabled is false in the committed config)".to_string()
+            "Router has no committed intent yet; use Provision to set one up".to_string()
         }
         RouterErrorDetail::TransactionPending => {
             "Another router transaction is already pending; commit or roll it back first"

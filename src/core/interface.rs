@@ -93,18 +93,32 @@ impl InterfaceManager {
     }
 
     pub async fn snapshot(&self, name: &str) -> Result<InterfaceSnapshot> {
+        self.snapshot_if_present(name)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("interface not found: {name}"))
+    }
+
+    /// Snapshot an interface, or report that it is simply not there.
+    ///
+    /// Callers that snapshot a *set* of interfaces need to tell "this one is
+    /// gone" apart from "the snapshot failed": a removable interface
+    /// disappearing is ordinary and must not take the whole operation down,
+    /// while a netlink failure still has to surface.
+    pub async fn snapshot_if_present(&self, name: &str) -> Result<Option<InterfaceSnapshot>> {
         let interfaces = self.provider.list_interfaces().await?;
-        let interface = interfaces
+        let Some(interface) = interfaces
             .into_iter()
             .find(|interface| interface.name == name)
-            .ok_or_else(|| anyhow::anyhow!("interface not found: {name}"))?;
+        else {
+            return Ok(None);
+        };
         let ipv4_addresses = self.provider.list_ipv4_addresses(name).await?;
 
-        Ok(InterfaceSnapshot {
+        Ok(Some(InterfaceSnapshot {
             name: name.to_string(),
             was_up: interface.is_up,
             ipv4_addresses,
-        })
+        }))
     }
 
     pub async fn apply_network(
@@ -838,6 +852,26 @@ mod tests {
             .await
             .expect_err("untagged address must not be claimed");
         assert!(error.to_string().contains("ownership tag"));
+    }
+
+    #[tokio::test]
+    async fn snapshotting_reports_a_missing_interface_instead_of_failing() {
+        let provider = Arc::new(FakeNetworkProvider::default());
+        provider.add_interface("eth0", true, Vec::new()).await;
+        let manager = InterfaceManager::new(provider);
+
+        assert!(manager
+            .snapshot_if_present("eth0")
+            .await
+            .expect("present interface")
+            .is_some());
+        assert!(manager
+            .snapshot_if_present("usb0")
+            .await
+            .expect("a missing interface is not an error")
+            .is_none());
+        // The strict variant keeps its contract for callers that need one.
+        assert!(manager.snapshot("usb0").await.is_err());
     }
 
     #[tokio::test]

@@ -206,6 +206,20 @@ impl RouterTransactionCoordinator {
             .overrides
             .commit_candidate(&pending.candidate)
             .await?;
+
+        // Ownership now matches the intent that is in force. Interfaces this
+        // intent dropped were torn down as part of the apply, so holding onto
+        // them would only make the set grow with every provisioning that ever
+        // happened. Narrowing after the commit succeeds, never before.
+        let owned: Vec<String> = pending
+            .candidate
+            .desired()
+            .interfaces
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        self.inner.manager.retain_router_interfaces(&owned).await;
+
         *state = CoordinatorState::Idle;
         Ok(revision)
     }
@@ -248,6 +262,18 @@ impl RouterTransactionCoordinator {
 
         let failures = self.inner.manager.rollback_to(&snapshot).await;
         if failures.is_empty() {
+            // The snapshot names what was actually on the machine when the
+            // transaction started, so this at least drops hardware that has
+            // since vanished. It is not an exact revert of ownership: the
+            // aborted intent's interfaces stay owned until the next commit
+            // narrows them, which is the harmless direction to err in.
+            let owned: Vec<String> = snapshot
+                .interfaces
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect();
+            self.inner.manager.retain_router_interfaces(&owned).await;
+
             **state = CoordinatorState::Idle;
             if trigger == RollbackTrigger::Timeout {
                 tracing::warn!("router transaction automatically rolled back after timeout");

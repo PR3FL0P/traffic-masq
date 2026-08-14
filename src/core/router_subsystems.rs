@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::RwLock;
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
@@ -115,7 +116,7 @@ where
     routes: RouteManager,
     dhcp: DhcpSupervisor,
     dataplane: RouterDataplaneManager<P, E>,
-    router_interfaces: Vec<String>,
+    router_interfaces: RwLock<Vec<String>>,
     dhcp_client: Option<Arc<dyn RouterDhcpClientRuntime>>,
     access_points: Option<Arc<dyn RouterApRuntime>>,
     stations: Option<Arc<dyn RouterStaRuntime>>,
@@ -137,7 +138,7 @@ where
             routes,
             dhcp,
             dataplane,
-            router_interfaces,
+            router_interfaces: RwLock::new(router_interfaces),
             dhcp_client: None,
             access_points: None,
             stations: None,
@@ -157,7 +158,7 @@ where
             routes,
             dhcp,
             dataplane,
-            router_interfaces,
+            router_interfaces: RwLock::new(router_interfaces),
             dhcp_client: Some(dhcp_client),
             access_points: None,
             stations: None,
@@ -170,8 +171,41 @@ where
     P: RouterDataplaneProvider,
     E: RouterDataplaneEventSink,
 {
-    fn scoped_names(&self, desired: &RouterDesired) -> Vec<String> {
-        let mut names = self.router_interfaces.clone();
+    /// The interfaces this router installation currently owns.
+    ///
+    /// This follows the committed intent instead of being frozen at
+    /// construction: a daemon that started without a router intent owns
+    /// nothing, and would otherwise snapshot nothing when one is provisioned —
+    /// leaving the change with nothing to roll back to.
+    async fn owned_interfaces(&self) -> Vec<String> {
+        self.router_interfaces.read().await.clone()
+    }
+
+    /// Narrow ownership to exactly `interfaces`.
+    ///
+    /// The counterpart to [`Self::adopt`]: ownership widens when an intent is
+    /// applied and narrows again once it settles, so an interface that has
+    /// dropped out of the intent stops being tracked instead of lingering.
+    async fn retain(&self, interfaces: &[String]) {
+        let mut owned = self.router_interfaces.write().await;
+        *owned = interfaces.to_vec();
+        owned.sort();
+        owned.dedup();
+    }
+
+    /// Take ownership of everything an intent is about to touch.
+    ///
+    /// Called before snapshots are taken, so an interface the new intent
+    /// introduces is captured too, not just the ones already owned.
+    async fn adopt(&self, desired: &RouterDesired) {
+        let mut owned = self.router_interfaces.write().await;
+        owned.extend(desired.interfaces.iter().map(|entry| entry.name.clone()));
+        owned.sort();
+        owned.dedup();
+    }
+
+    async fn scoped_names(&self, desired: &RouterDesired) -> Vec<String> {
+        let mut names = self.owned_interfaces().await;
         names.extend(desired.interfaces.iter().map(|entry| entry.name.clone()));
         names.sort();
         names.dedup();
@@ -190,7 +224,7 @@ where
             routes,
             dhcp,
             dataplane,
-            router_interfaces,
+            router_interfaces: RwLock::new(router_interfaces),
             dhcp_client: None,
             access_points: None,
             stations: None,
@@ -214,6 +248,10 @@ where
     P: RouterDataplaneProvider + Send + Sync,
     E: RouterDataplaneEventSink + Send + Sync,
 {
+    async fn retain_router_interfaces(&self, interfaces: &[String]) {
+        self.retain(interfaces).await;
+    }
+
     async fn plan_interfaces(&self, desired: &RouterDesired) -> Result<Vec<InterfaceChangePlan>> {
         let mut plans = Vec::with_capacity(desired.interfaces.len());
         for entry in &desired.interfaces {
@@ -236,7 +274,7 @@ where
             }
             return Ok(Vec::new());
         };
-        let mut names = self.router_interfaces.clone();
+        let mut names = self.owned_interfaces().await;
         if let Some(spec) = &desired.uplink_wifi {
             if !names.contains(&spec.interface) {
                 names.push(spec.interface.clone());
@@ -279,7 +317,7 @@ where
             .iter()
             .map(|spec| (spec.interface.as_str(), spec))
             .collect();
-        let mut names = self.router_interfaces.clone();
+        let mut names = self.owned_interfaces().await;
         names.extend(targets.keys().map(|name| (*name).to_owned()));
         names.sort();
         names.dedup();
@@ -315,7 +353,8 @@ where
             .map(|spec| (spec.interface.as_str(), spec))
             .collect();
         let mut interfaces: Vec<&str> = desired_by_interface.keys().copied().collect();
-        for name in &self.router_interfaces {
+        let owned = self.owned_interfaces().await;
+        for name in &owned {
             if !interfaces.contains(&name.as_str()) {
                 interfaces.push(name.as_str());
             }
@@ -345,9 +384,16 @@ where
     }
 
     async fn snapshot_interfaces(&self) -> Result<Vec<InterfaceSnapshot>> {
-        let mut snapshots = Vec::with_capacity(self.router_interfaces.len());
-        for name in &self.router_interfaces {
-            snapshots.push(self.interfaces.snapshot(name).await?);
+        let owned = self.owned_interfaces().await;
+        let mut snapshots = Vec::with_capacity(owned.len());
+        for name in &owned {
+            match self.interfaces.snapshot_if_present(name).await? {
+                Some(snapshot) => snapshots.push(snapshot),
+                None => tracing::warn!(
+                    interface = %name,
+                    "router-owned interface is not present; snapshotting the rest"
+                ),
+            }
         }
         Ok(snapshots)
     }
@@ -356,8 +402,9 @@ where
         let Some(runtime) = &self.stations else {
             return Ok(Vec::new());
         };
-        let mut snapshots = Vec::with_capacity(self.router_interfaces.len());
-        for name in &self.router_interfaces {
+        let owned = self.owned_interfaces().await;
+        let mut snapshots = Vec::with_capacity(owned.len());
+        for name in &owned {
             snapshots.push(WifiSnapshot {
                 interface: name.clone(),
                 spec: runtime.status(name).await.map(|(spec, _)| spec),
@@ -370,8 +417,9 @@ where
         let Some(runtime) = &self.access_points else {
             return Ok(Vec::new());
         };
-        let mut snapshots = Vec::with_capacity(self.router_interfaces.len());
-        for name in &self.router_interfaces {
+        let owned = self.owned_interfaces().await;
+        let mut snapshots = Vec::with_capacity(owned.len());
+        for name in &owned {
             snapshots.push(WifiSnapshot {
                 interface: name.clone(),
                 spec: runtime.status(name).await.map(|(spec, _)| spec),
@@ -386,7 +434,7 @@ where
 
     async fn snapshot_dhcp(&self) -> Result<Vec<DhcpServiceSpec>> {
         let mut specs = Vec::new();
-        for name in &self.router_interfaces {
+        for name in &self.owned_interfaces().await {
             if let Some(spec) = self.dhcp.spec(name).await {
                 specs.push(spec);
             }
@@ -402,7 +450,7 @@ where
         let Some(runtime) = &self.dhcp_client else {
             return Ok(None);
         };
-        for name in &self.router_interfaces {
+        for name in &self.owned_interfaces().await {
             if let Some(status) = runtime.status(name).await {
                 return Ok(Some(status.spec));
             }
@@ -414,10 +462,21 @@ where
         &self,
         desired: &RouterDesired,
     ) -> Result<crate::core::router::RouterSnapshot> {
-        let names = self.scoped_names(desired);
+        self.adopt(desired).await;
+        let names = self.scoped_names(desired).await;
         let mut interfaces = Vec::with_capacity(names.len());
         for name in &names {
-            interfaces.push(self.interfaces.snapshot(name).await?);
+            // An interface that is gone has nothing to restore, so skipping it
+            // is the whole of the correct behaviour. Failing instead would let
+            // one unplugged adapter block every router transaction — including
+            // the one that would remove it from the intent.
+            match self.interfaces.snapshot_if_present(name).await? {
+                Some(snapshot) => interfaces.push(snapshot),
+                None => tracing::warn!(
+                    interface = %name,
+                    "router-scoped interface is not present; it will not be part of the rollback snapshot"
+                ),
+            }
         }
 
         let mut uplink_wifi = Vec::with_capacity(names.len());
@@ -556,7 +615,7 @@ where
         match desired {
             Some(spec) => runtime.configure(spec.clone()).await,
             None => {
-                for name in &self.router_interfaces {
+                for name in &self.owned_interfaces().await {
                     if runtime.status(name).await.is_some() {
                         runtime.disable(name).await?;
                     }
@@ -644,7 +703,7 @@ where
             .map(|spec| (spec.interface.as_str(), spec))
             .collect();
         let mut errors = Vec::new();
-        for name in &self.router_interfaces {
+        for name in &self.owned_interfaces().await {
             let result = match previous.get(name.as_str()) {
                 Some(spec) => self.dhcp.configure((*spec).clone()).await,
                 None => self.dhcp.disable(name).await.map(|_| ()),
@@ -669,7 +728,7 @@ where
             .iter()
             .map(|spec| (spec.interface.as_str(), spec))
             .collect();
-        let mut names = self.router_interfaces.clone();
+        let mut names = self.owned_interfaces().await;
         names.extend(snapshot.iter().map(|spec| spec.interface.clone()));
         names.extend(previously_absent.iter().cloned());
         names.sort();
@@ -1143,6 +1202,120 @@ mod tests {
         );
         let _ = network_config;
         (subsystems, provider)
+    }
+
+    /// A daemon that started without a router intent owns no interfaces. Taking
+    /// ownership has to happen when the intent arrives, otherwise the router
+    /// could never be provisioned at runtime with anything to roll back to.
+    #[tokio::test]
+    async fn a_router_provisioned_at_runtime_takes_ownership_of_its_interfaces() {
+        let mut config = enabled_config();
+        config.network.interfaces.insert(
+            "lan0".to_string(),
+            dhcp_less_output_interface("192.168.10.1/24"),
+        );
+        let (mut subsystems, provider) = subsystems_for(&config).await;
+        // Start from "router disabled at boot": nothing is owned yet.
+        subsystems.router_interfaces = RwLock::new(Vec::new());
+        let _ = &provider;
+        assert!(subsystems.owned_interfaces().await.is_empty());
+
+        let desired = RouterDesired::from_effective_config(&config).expect("desired");
+        let snapshot = subsystems.snapshot_for(&desired).await.expect("snapshot");
+
+        assert!(
+            !snapshot.interfaces.is_empty(),
+            "a runtime-provisioned router must capture the interfaces it is about to touch"
+        );
+        let owned = subsystems.owned_interfaces().await;
+        for entry in &desired.interfaces {
+            assert!(
+                owned.contains(&entry.name),
+                "interface {} should be owned after the intent was snapshotted",
+                entry.name
+            );
+        }
+    }
+
+    /// Ownership widens when an intent is applied and narrows when it settles,
+    /// so it tracks the intent in force rather than every intent that ever was.
+    #[tokio::test]
+    async fn ownership_narrows_to_the_intent_that_settled() {
+        let mut config = enabled_config();
+        config.network.interfaces.insert(
+            "lan0".to_string(),
+            dhcp_less_output_interface("192.168.10.1/24"),
+        );
+        let (mut subsystems, _provider) = subsystems_for(&config).await;
+        subsystems.router_interfaces = RwLock::new(vec!["old0".to_string(), "wan0".to_string()]);
+
+        let desired = RouterDesired::from_effective_config(&config).expect("desired");
+        subsystems.snapshot_for(&desired).await.expect("snapshot");
+
+        // While the transaction is in flight the old interface is still owned,
+        // because a rollback may still need to restore it.
+        assert!(subsystems
+            .owned_interfaces()
+            .await
+            .contains(&"old0".to_string()));
+
+        let settled: Vec<String> = desired
+            .interfaces
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+        subsystems.retain_router_interfaces(&settled).await;
+
+        // Ownership is kept sorted, so compare as sets rather than sequences.
+        let owned = subsystems.owned_interfaces().await;
+        let mut expected = settled.clone();
+        expected.sort();
+        assert_eq!(owned, expected);
+        assert!(
+            !owned.contains(&"old0".to_string()),
+            "an interface the settled intent does not cover must be released"
+        );
+    }
+
+    /// A removable adapter can vanish at any moment. When it does, it must not
+    /// take every router transaction down with it — including the one that
+    /// would drop it from the intent.
+    #[tokio::test]
+    async fn a_vanished_interface_does_not_block_router_transactions() {
+        let mut config = enabled_config();
+        config.network.interfaces.insert(
+            "lan0".to_string(),
+            dhcp_less_output_interface("192.168.10.1/24"),
+        );
+        let (mut subsystems, _provider) = subsystems_for(&config).await;
+        // usb0 was part of a previous intent and has since been unplugged: it
+        // is still owned, but the kernel knows nothing about it.
+        subsystems.router_interfaces = RwLock::new(vec![
+            "lan0".to_string(),
+            "usb0".to_string(),
+            "wan0".to_string(),
+        ]);
+
+        let desired = RouterDesired::from_effective_config(&config).expect("desired");
+
+        let snapshot = subsystems
+            .snapshot_for(&desired)
+            .await
+            .expect("a missing interface must not fail the snapshot");
+        assert!(
+            snapshot.interfaces.iter().any(|entry| entry.name == "wan0"),
+            "interfaces that are present must still be captured"
+        );
+        assert!(
+            snapshot.interfaces.iter().all(|entry| entry.name != "usb0"),
+            "an absent interface has nothing to restore and must be skipped"
+        );
+
+        let owned = subsystems
+            .snapshot_interfaces()
+            .await
+            .expect("snapshot_interfaces must tolerate a missing interface too");
+        assert!(owned.iter().all(|entry| entry.name != "usb0"));
     }
 
     #[tokio::test]
