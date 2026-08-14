@@ -33,6 +33,11 @@ hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "server", "service", "tokio"] }
 ipnet = { version = "2", features = ["serde"] }
 netlink-packet-core = "0.8"
+# rtnetlink 0.14 speaks netlink-packet-core 0.7, while the genetlink stack used by
+# the WireGuard provider speaks 0.8. Both are genuinely in use, so the rtnetlink
+# one is aliased rather than one of them being forced onto the wrong version.
+netlink-packet-core-rtnetlink = { package = "netlink-packet-core", version = "0.7" }
+netlink-sys = "0.8"
 netlink-packet-generic = "0.4"
 netlink-packet-route = "0.19"
 netlink-packet-utils = "0.5"

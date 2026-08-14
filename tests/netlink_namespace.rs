@@ -211,6 +211,43 @@ async fn rtnetlink_retags_existing_address_in_place() -> Result<()> {
     Ok(())
 }
 
+/// The event source is the reason the daemon can stop polling, so the thing
+/// worth proving is that a change made by *someone else* actually arrives.
+/// Subscription succeeding is checked by unit tests; delivery needs a change,
+/// and making one needs root.
+#[tokio::test]
+#[ignore = "requires root and iproute2; run explicitly on a disposable Linux test host"]
+async fn kernel_address_changes_are_delivered_as_events() -> Result<()> {
+    let fixture = NetnsFixture::new()?;
+    let mut events = traffic_masq::netlink::events::subscribe_to_kernel_changes()?;
+    let test_ip = Ipv4Addr::new(192, 0, 2, 40);
+
+    // Deliberately not through our own provider: the point is noticing changes
+    // this daemon did not make.
+    run_ip([
+        "addr",
+        "add",
+        &format!("{test_ip}/24"),
+        "dev",
+        fixture.host_if.as_str(),
+    ])?;
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+        .await
+        .context("no kernel event arrived within 5s; the subscription is not delivering")?
+        .context("the event stream closed")?;
+    assert_eq!(event, traffic_masq::netlink::events::KernelEvent::Changed);
+
+    run_ip([
+        "addr",
+        "del",
+        &format!("{test_ip}/24"),
+        "dev",
+        fixture.host_if.as_str(),
+    ])?;
+    Ok(())
+}
+
 fn require_root_or_skip() -> Result<()> {
     let output = Command::new("id")
         .arg("-u")

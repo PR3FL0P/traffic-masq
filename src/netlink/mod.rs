@@ -1,3 +1,5 @@
+pub mod events;
+
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicU8, Ordering};
 
