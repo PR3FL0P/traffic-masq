@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::config::{
     ApiConfig, AppConfig, InterfaceConfig, NetworkConfig, RouterConfig, SecurityConfig,
@@ -319,6 +319,12 @@ pub struct RuntimeOverrideManager {
     store: RuntimeOverrideStore,
     base: AppConfig,
     state: Arc<Mutex<RuntimeOverrides>>,
+    /// Fires whenever the overrides change.
+    ///
+    /// The desired state just moved, so whoever converges the machine towards
+    /// it has to look again. Without this the only way to notice would be to
+    /// ask on a timer, which is the latency this daemon is trying not to have.
+    changed: Arc<Notify>,
 }
 
 impl RuntimeOverrideManager {
@@ -355,6 +361,7 @@ impl RuntimeOverrideManager {
             store,
             base: base.clone(),
             state: Arc::new(Mutex::new(state)),
+            changed: Arc::new(Notify::new()),
         })
     }
 
@@ -433,7 +440,20 @@ impl RuntimeOverrideManager {
             .context("runtime override revision overflow")?;
         self.store.save(&candidate).await?;
         *state = candidate;
+        // Every mutation funnels through here, so this is the one place that
+        // has to announce that the desired state moved.
+        self.changed.notify_waiters();
         Ok(())
+    }
+
+    /// Wait until the overrides change.
+    ///
+    /// Uses `notify_waiters`, so a change that happens while nobody is waiting
+    /// is not buffered. That is the correct semantics for a converger: it reads
+    /// the current state when it runs, so it only needs to know that *something*
+    /// moved since it last looked, and it looks once before it starts waiting.
+    pub async fn changed(&self) {
+        self.changed.notified().await;
     }
 
     pub async fn set_dhcp(&self, interface: String, value: DhcpOverride) -> Result<()> {
@@ -609,6 +629,40 @@ mod tests {
 
     fn base_config() -> AppConfig {
         AppConfig::default()
+    }
+
+    /// The converger has no timer any more, so a change that does not announce
+    /// itself is a change that never gets applied.
+    #[tokio::test]
+    async fn writing_an_override_wakes_whoever_is_waiting_for_a_change() {
+        let directory = tempdir().expect("tempdir");
+        let base = base_config();
+        let manager = RuntimeOverrideManager::load(directory.path(), &base)
+            .await
+            .expect("overrides");
+
+        let waiter = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.changed().await })
+        };
+        // Let the waiter reach the wait before the change happens: `changed`
+        // deliberately does not buffer, because the converger reads current
+        // state and only needs to know that something moved.
+        tokio::task::yield_now().await;
+
+        manager
+            .set_interface(
+                "lan0".to_string(),
+                interface_config("192.168.30.1/24"),
+                false,
+            )
+            .await
+            .expect("set interface");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("an override write must wake the converger")
+            .expect("waiter task");
     }
 
     fn interface_config(address: &str) -> InterfaceConfig {
