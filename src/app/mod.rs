@@ -1,7 +1,7 @@
 mod process;
 pub mod service;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,7 +10,7 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use ipnet::Ipv4Net;
 use tokio::signal;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior};
 
@@ -33,9 +33,11 @@ use crate::firewall::{
     RouterDataplaneManager, RouterDataplaneProvider, RouterDataplaneSnapshot,
 };
 use crate::logging::init_logging;
+use crate::netlink::events::KernelEvent;
 use crate::netlink::{
     Ipv4AddressInfo, NetworkInterface, NetworkProvider, RtnetlinkNetworkProvider,
 };
+use crate::state::desired::DesiredNetworkState;
 use crate::state::overrides::{RuntimeOverrideManager, RuntimeOverrides};
 use crate::vpn::manager::OWNED_INTERFACE_NAME;
 use crate::vpn::{
@@ -52,7 +54,7 @@ type ProductionDataplaneProvider = LinuxRouterDataplaneProvider<
     RtnetlinkNetworkProvider,
 >;
 
-const RUNTIME_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
+const PROCESS_LIVENESS_INTERVAL: Duration = Duration::from_secs(1);
 
 const SESSION_REAP_INTERVAL: Duration = Duration::from_secs(900);
 
@@ -514,32 +516,17 @@ async fn reconcile_network_runtime_once<
     C: WifiRuntimeReconciler,
     L: DhcpClientRuntimeReconciler,
 >(
-    base_config: &AppConfig,
-    overrides: &RuntimeOverrideManager,
+    desired: &DesiredNetworkState,
     network: Arc<dyn NetworkProvider>,
     dhcp: &D,
-    wifi: Option<&W>,
+    _wifi: Option<&W>,
     wifi_client: Option<&C>,
     dhcp_client: Option<&L>,
     pending_interfaces: &BTreeSet<String>,
-) -> Result<()> {
-    if let Err(error) = dhcp.ensure_runtime_alive().await {
-        tracing::warn!(%error, "failed to restart the shared DHCP runtime");
-    }
-    if let Some(wifi) = wifi {
-        if let Err(error) = wifi.ensure_alive().await {
-            tracing::warn!(%error, "failed to check Wi-Fi access point liveness");
-        }
-    }
-    if let Some(wifi_client) = wifi_client {
-        if let Err(error) = wifi_client.ensure_alive().await {
-            tracing::warn!(%error, "failed to check Wi-Fi client liveness");
-        }
-    }
-
-    let snapshot = overrides.snapshot().await;
-    let effective = snapshot.effective_config(base_config)?;
-    let management_allowlist = management_allowlist(&snapshot);
+) -> Result<BTreeMap<String, String>> {
+    let effective = desired.effective().await?;
+    let management_allowlist = desired.management_allowlist().await;
+    let mut failures: BTreeMap<String, String> = BTreeMap::new();
     let interface_manager = InterfaceManager::new(network.clone());
     let observed_interfaces: HashMap<_, _> = network
         .list_interfaces()
@@ -576,7 +563,7 @@ async fn reconcile_network_runtime_once<
         let desired_dhcp = match DhcpServiceSpec::from_interface_config(
             name,
             config,
-            base_config.dhcp.default_lease_seconds,
+            effective.dhcp.default_lease_seconds,
         ) {
             Ok(spec) => spec,
             Err(error) => {
@@ -610,7 +597,8 @@ async fn reconcile_network_runtime_once<
                     .apply_interface(name, config, Some(config.role), allow_management_change)
                     .await
                 {
-                    tracing::warn!(interface = %name, %error, "failed to reapply managed interface during runtime reconcile");
+                    tracing::warn!(interface = %name, %error, "failed to converge managed interface");
+                    failures.insert(name.clone(), error.to_string());
                     continue;
                 }
             }
@@ -648,7 +636,7 @@ async fn reconcile_network_runtime_once<
         }
     }
 
-    Ok(())
+    Ok(failures)
 }
 
 fn spawn_session_reaper(auth: AuthService, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
@@ -680,20 +668,137 @@ fn spawn_session_reaper(auth: AuthService, mut shutdown: watch::Receiver<bool>) 
     })
 }
 
+/// Converge the machine towards the desired state, driven by events.
+///
+/// There is no periodic pass. The three things that can make the machine and
+/// the desired state disagree all announce themselves:
+///
+/// - the desired state moved (an override was written),
+/// - the kernel state moved (anyone touched a link, address or route),
+/// - notifications were dropped, so an unknown amount of the above happened.
+///
+/// Polling for these would add up to a second of latency to every change the
+/// daemon makes itself, and would spend the rest of its time asking a question
+/// whose answer is almost always "nothing".
 #[allow(clippy::too_many_arguments)]
 fn spawn_runtime_network_reconcile(
-    config: AppConfig,
-    overrides: RuntimeOverrideManager,
+    desired: DesiredNetworkState,
     network: Arc<dyn NetworkProvider>,
     dhcp: DhcpSupervisor,
     wifi: Option<HostapdSupervisor>,
     wifi_client: Option<WifiClientSupervisor>,
     dhcp_client: DhcpClientSupervisor,
     transactions: NetworkTransactionManager,
+    mut kernel_events: mpsc::UnboundedReceiver<KernelEvent>,
     mut shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut interval = time::interval(RUNTIME_RECONCILE_INTERVAL);
+        loop {
+            if shutdown_requested(&shutdown) {
+                break;
+            }
+
+            // Converge first, wait second: the daemon has to reach the desired
+            // state at startup without something having to happen first.
+            let pending_interfaces: BTreeSet<String> = transactions
+                .pending()
+                .await
+                .into_iter()
+                .map(|change| change.interface)
+                .collect();
+            // Read the version before the pass, publish it after: the report
+            // then says which proposals this pass had actually seen, so a
+            // caller cannot mistake an older pass for an answer about its own
+            // change.
+            let version = desired.version();
+            let failures = match reconcile_network_runtime_once(
+                &desired,
+                network.clone(),
+                &dhcp,
+                wifi.as_ref(),
+                wifi_client.as_ref(),
+                Some(&dhcp_client),
+                &pending_interfaces,
+            )
+            .await
+            {
+                Ok(failures) => failures,
+                Err(error) => {
+                    tracing::warn!(%error, "runtime interface reconcile pass failed");
+                    BTreeMap::new()
+                }
+            };
+            desired.report_pass(version, failures);
+
+            tokio::select! {
+                event = kernel_events.recv() => match event {
+                    Some(_) => {
+                        // A single `ip addr add` is several netlink messages, and
+                        // the daemon's own writes are echoed back to it. Collapse
+                        // whatever queued up into the one pass that follows —
+                        // convergence re-reads everything anyway.
+                        while kernel_events.try_recv().is_ok() {}
+                    }
+                    None => {
+                        tracing::error!(
+                            "kernel change notifications stopped; nothing can be converged any more"
+                        );
+                        break;
+                    }
+                },
+                () = desired.changed() => {}
+                changed = shutdown.changed() => match changed {
+                    Ok(()) if shutdown_requested(&shutdown) => break,
+                    Ok(()) => {}
+                    Err(_) => break,
+                }
+            }
+        }
+    })
+}
+
+/// One pass of "is everything we spawned still running".
+///
+/// Split from the task that drives it so it can be exercised against fakes.
+async fn check_process_liveness<D, W, C>(dhcp: &D, wifi: Option<&W>, wifi_client: Option<&C>)
+where
+    D: DhcpRuntimeReconciler,
+    W: WifiRuntimeReconciler,
+    C: WifiRuntimeReconciler,
+{
+    if let Err(error) = dhcp.ensure_runtime_alive().await {
+        tracing::warn!(%error, "failed to restart the shared DHCP runtime");
+    }
+    if let Some(wifi) = wifi {
+        if let Err(error) = wifi.ensure_alive().await {
+            tracing::warn!(%error, "failed to check Wi-Fi access point liveness");
+        }
+    }
+    if let Some(wifi_client) = wifi_client {
+        if let Err(error) = wifi_client.ensure_alive().await {
+            tracing::warn!(%error, "failed to check Wi-Fi client liveness");
+        }
+    }
+}
+
+/// Restart supervised processes that have died.
+///
+/// Separate from convergence, and still periodic, because process death is the
+/// one drift the kernel does not announce to us: `SupervisedProcess` is built
+/// around PIDs so that a restarted daemon can adopt processes it did not spawn,
+/// and a PID gives nothing to await on. Making this event-driven needs
+/// `pidfd_open`, which is its own piece of work — see the architecture plan.
+///
+/// Kept at its previous cadence so restart latency does not change; it no
+/// longer delays network convergence, which is what the interval used to gate.
+fn spawn_process_liveness_checks(
+    dhcp: DhcpSupervisor,
+    wifi: Option<HostapdSupervisor>,
+    wifi_client: Option<WifiClientSupervisor>,
+    mut shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = time::interval(PROCESS_LIVENESS_INTERVAL);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
@@ -702,15 +807,7 @@ fn spawn_runtime_network_reconcile(
                     if shutdown_requested(&shutdown) {
                         break;
                     }
-                    let pending_interfaces: BTreeSet<String> = transactions
-                        .pending()
-                        .await
-                        .into_iter()
-                        .map(|change| change.interface)
-                        .collect();
-                    if let Err(error) = reconcile_network_runtime_once(&config, &overrides, network.clone(), &dhcp, wifi.as_ref(), wifi_client.as_ref(), Some(&dhcp_client), &pending_interfaces).await {
-                        tracing::warn!(%error, "runtime interface/DHCP reconcile pass failed");
-                    }
+                    check_process_liveness(&dhcp, wifi.as_ref(), wifi_client.as_ref()).await;
                 }
                 changed = shutdown.changed() => match changed {
                     Ok(()) if shutdown_requested(&shutdown) => break,
@@ -1060,10 +1157,15 @@ pub async fn run_daemon(config: AppConfig) -> Result<()> {
         "traffic-masqd ready"
     );
 
+    // Subscribed before the converger starts, and fatal if it fails: without
+    // kernel notifications nothing would ever be converged, and a daemon that
+    // silently stops reconciling is worse than one that refuses to start.
+    let kernel_events = crate::netlink::events::subscribe_to_kernel_changes()
+        .context("failed to subscribe to kernel network change notifications")?;
+
     let reconcile_task =
         spawn_runtime_network_reconcile(
-            config.clone(),
-            overrides.clone(),
+            DesiredNetworkState::new(config.clone(), overrides.clone()),
             Arc::new(RtnetlinkNetworkProvider::connect().context(
                 "failed to open rtnetlink connection for runtime interface/DHCP reconcile",
             )?),
@@ -1072,12 +1174,21 @@ pub async fn run_daemon(config: AppConfig) -> Result<()> {
             wifi_client_supervisor.clone(),
             dhcp_client.clone(),
             transactions.clone(),
+            kernel_events,
             shutdown.clone(),
         );
+    let liveness_task = spawn_process_liveness_checks(
+        dhcp.clone(),
+        wifi_supervisor.clone(),
+        wifi_client_supervisor.clone(),
+        shutdown.clone(),
+    );
 
     let api_result = server.run(shutdown.clone()).await;
     reconcile_task.abort();
     let _ = reconcile_task.await;
+    liveness_task.abort();
+    let _ = liveness_task.await;
     session_reaper.abort();
     let _ = session_reaper.await;
     let graceful_signal = shutdown_requested(&shutdown);
@@ -1812,8 +1923,7 @@ mod tests {
         let wifi = FakeWifiReconciler::default();
 
         reconcile_network_runtime_once(
-            &config,
-            &overrides,
+            &DesiredNetworkState::new(config.clone(), overrides.clone()),
             network.clone(),
             &dhcp,
             Some(&wifi),
@@ -1844,10 +1954,12 @@ mod tests {
         );
         assert_eq!(dhcp.configure_calls.lock().await.len(), 1);
         assert!(dhcp.disable_calls.lock().await.is_empty());
-
-        assert_eq!(*dhcp.runtime_liveness_checks.lock().await, 1);
-
-        assert_eq!(*wifi.liveness_checks.lock().await, 1);
+        assert_eq!(
+            *dhcp.runtime_liveness_checks.lock().await,
+            0,
+            "convergence must not poll for process liveness; that is a separate concern"
+        );
+        assert_eq!(*wifi.liveness_checks.lock().await, 0);
     }
 
     #[tokio::test]
@@ -1869,8 +1981,7 @@ mod tests {
 
         let pending = BTreeSet::from(["lan0".to_string()]);
         reconcile_network_runtime_once(
-            &config,
-            &overrides,
+            &DesiredNetworkState::new(config.clone(), overrides.clone()),
             network.clone(),
             &dhcp,
             Some(&wifi),
@@ -1904,8 +2015,7 @@ mod tests {
         let dhcp = FakeDhcpReconciler::default();
 
         reconcile_network_runtime_once(
-            &config,
-            &overrides,
+            &DesiredNetworkState::new(config.clone(), overrides.clone()),
             network,
             &dhcp,
             None::<&FakeWifiReconciler>,
@@ -1918,29 +2028,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_checks_the_wifi_client_independently_of_the_access_point() {
-        let config = hotplug_reconcile_config();
-        let state_dir = tempdir().expect("state dir");
-        let overrides = RuntimeOverrideManager::load(state_dir.path(), &config)
-            .await
-            .expect("overrides");
-        let network = Arc::new(FakeNetworkProvider::default());
+    async fn liveness_checks_the_wifi_client_independently_of_the_access_point() {
         let dhcp = FakeDhcpReconciler::default();
         let wifi_client = FakeWifiReconciler::default();
 
-        reconcile_network_runtime_once(
-            &config,
-            &overrides,
-            network,
-            &dhcp,
-            None::<&FakeWifiReconciler>,
-            Some(&wifi_client),
-            None::<&FakeDhcpClientReconciler>,
-            &BTreeSet::new(),
-        )
-        .await
-        .expect("reconcile");
+        check_process_liveness(&dhcp, None::<&FakeWifiReconciler>, Some(&wifi_client)).await;
 
+        assert_eq!(*wifi_client.liveness_checks.lock().await, 1);
+        assert_eq!(*dhcp.runtime_liveness_checks.lock().await, 1);
+    }
+
+    #[tokio::test]
+    async fn liveness_covers_every_supervised_runtime() {
+        let dhcp = FakeDhcpReconciler::default();
+        let wifi = FakeWifiReconciler::default();
+        let wifi_client = FakeWifiReconciler::default();
+
+        check_process_liveness(&dhcp, Some(&wifi), Some(&wifi_client)).await;
+
+        assert_eq!(*dhcp.runtime_liveness_checks.lock().await, 1);
+        assert_eq!(*wifi.liveness_checks.lock().await, 1);
         assert_eq!(*wifi_client.liveness_checks.lock().await, 1);
     }
 
@@ -1983,8 +2090,7 @@ mod tests {
 
         for _ in 0..3 {
             reconcile_network_runtime_once(
-                &config,
-                &overrides,
+                &DesiredNetworkState::new(config.clone(), overrides.clone()),
                 network.clone(),
                 &dhcp,
                 None::<&FakeWifiReconciler>,
@@ -2055,8 +2161,7 @@ mod tests {
         let dhcp_client = FakeDhcpClientReconciler::default();
 
         reconcile_network_runtime_once(
-            &config,
-            &overrides,
+            &DesiredNetworkState::new(config.clone(), overrides.clone()),
             network.clone(),
             &dhcp,
             None::<&FakeWifiReconciler>,
@@ -2083,8 +2188,7 @@ mod tests {
             .await
             .insert("wan0".to_string(), true);
         reconcile_network_runtime_once(
-            &config,
-            &overrides,
+            &DesiredNetworkState::new(config.clone(), overrides.clone()),
             network,
             &dhcp,
             None::<&FakeWifiReconciler>,
@@ -2149,8 +2253,7 @@ mod tests {
         );
 
         reconcile_network_runtime_once(
-            &config,
-            &overrides,
+            &DesiredNetworkState::new(config.clone(), overrides.clone()),
             network,
             &dhcp,
             None::<&FakeWifiReconciler>,
@@ -2187,8 +2290,7 @@ mod tests {
         let network = Arc::new(FakeNetworkProvider::default());
 
         reconcile_network_runtime_once(
-            &config,
-            &overrides,
+            &DesiredNetworkState::new(config.clone(), overrides.clone()),
             network,
             &dhcp,
             None::<&HostapdSupervisor>,
