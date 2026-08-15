@@ -8,11 +8,38 @@ use super::{
     validate_interface_name, value_contains_key, value_contains_token, NftExecutor, NFT_FAMILY,
     NFT_METADATA_HEX_CHUNK_LEN,
 };
-use crate::core::vpn_policy::{VPN_POLICY_FWMARK, VPN_POLICY_FWMASK};
 
 const NFT_VPN_TABLE: &str = "traffic_masq_vpn";
 const NFT_VPN_TABLE_COMMENT: &str = "traffic-masq:vpn:v1";
 const NFT_VPN_METADATA_COMMENT_PREFIX: &str = "traffic-masq:vpn:v1:part:";
+
+/// The mark traffic-masq sets on packets it has decided must leave via the VPN,
+/// and the mask that isolates it from marks other software owns.
+///
+/// These live here, with the nftables backend that writes them, rather than
+/// with the policy that decides when to apply them: a firewall mark is a
+/// property of the dataplane. Keeping them in `core::vpn_policy` made the
+/// domain layer and its driver mutually dependent for the sake of two integers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FirewallMark(u32);
+
+impl FirewallMark {
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FirewallMarkMask(u32);
+
+impl FirewallMarkMask {
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+pub const VPN_POLICY_FWMARK: FirewallMark = FirewallMark(0x5400_0000);
+pub const VPN_POLICY_FWMASK: FirewallMarkMask = FirewallMarkMask(0xff00_0000);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpnPolicyFirewallDesired {
@@ -477,6 +504,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::{nft_ruleset, FakeNftExecutor};
     use super::*;
+
 
     fn desired() -> VpnPolicyFirewallDesired {
         VpnPolicyFirewallDesired {

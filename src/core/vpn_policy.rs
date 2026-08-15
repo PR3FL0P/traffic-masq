@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Result};
 
+use crate::firewall::vpn::{FirewallMark, FirewallMarkMask, VPN_POLICY_FWMARK, VPN_POLICY_FWMASK};
 use crate::netlink::{
     Ipv4RouteInfo, Ipv4RouteSpec, Ipv4RuleInfo, Ipv4RuleSpec, NetworkProvider,
     TRAFFIC_MASQ_ROUTE_PROTOCOL,
@@ -12,9 +13,6 @@ pub const VPN_POLICY_ROUTE_TABLE_ID: PolicyRouteTableId = PolicyRouteTableId(30_
 pub const VPN_POLICY_RULE_PRIORITY_START: PolicyRulePriority = PolicyRulePriority(10_100);
 
 pub const VPN_POLICY_RULE_PRIORITY_END: PolicyRulePriority = PolicyRulePriority(10_199);
-
-pub const VPN_POLICY_FWMARK: FirewallMark = FirewallMark(0x5400_0000);
-pub const VPN_POLICY_FWMASK: FirewallMarkMask = FirewallMarkMask(0xff00_0000);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PolicyRouteTableId(u32);
@@ -29,24 +27,6 @@ impl PolicyRouteTableId {
 pub struct PolicyRulePriority(u32);
 
 impl PolicyRulePriority {
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct FirewallMark(u32);
-
-impl FirewallMark {
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct FirewallMarkMask(u32);
-
-impl FirewallMarkMask {
     pub const fn get(self) -> u32 {
         self.0
     }
@@ -463,7 +443,7 @@ mod tests {
 
     use async_trait::async_trait;
 
-    use crate::netlink::{Ipv4AddressInfo, NetworkInterface};
+use crate::netlink::{Ipv4AddressInfo, NetworkInterface};
 
     use super::*;
 

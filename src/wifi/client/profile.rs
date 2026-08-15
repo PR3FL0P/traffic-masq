@@ -1,9 +1,7 @@
 use std::fs::{self, File};
-use std::io::{ErrorKind, Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::io::{ErrorKind, Read};
 use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nix::errno::Errno;
@@ -13,12 +11,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+use crate::atomic_file::{self, PrivateDirError, PRIVATE_DIR_MODE, PRIVATE_FILE_MODE};
 use crate::config::{InterfaceConfig, InterfaceRole, WifiClientConfig, WifiClientSecurity};
 use crate::wifi::{PassphraseError, WifiPassphrase};
 
 const PROFILE_VERSION: u32 = 1;
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
 #[derive(Debug, Error)]
 pub enum WifiClientProfileError {
     #[error("invalid Wi-Fi client profile id: expected 1-64 ASCII characters from [A-Za-z0-9_-]")]
@@ -58,6 +55,16 @@ impl WifiClientProfileInput {
     pub fn validate(&self) -> Result<(), WifiClientProfileError> {
         validate_id(&self.id)?;
         validate_fields(&self.ssid, &self.country_code, self.security)
+    }
+}
+
+impl From<PrivateDirError> for WifiClientProfileError {
+    fn from(error: PrivateDirError) -> Self {
+        match error {
+            PrivateDirError::Symlink(path) => Self::SymlinkRejected(path),
+            PrivateDirError::NotADirectory(path) => Self::UnsafeDirectory(path),
+            PrivateDirError::Io(error) => Self::Io(error),
+        }
     }
 }
 
@@ -341,18 +348,7 @@ fn validate_secret_for_security(
 }
 
 fn ensure_directory(path: &Path) -> Result<(), WifiClientProfileError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(WifiClientProfileError::SymlinkRejected(path.to_path_buf()))
-        }
-        Ok(metadata) if !metadata.is_dir() => {
-            return Err(WifiClientProfileError::UnsafeDirectory(path.to_path_buf()))
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == ErrorKind::NotFound => fs::create_dir_all(path)?,
-        Err(error) => return Err(error.into()),
-    }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    atomic_file::ensure_private_dir(path, PRIVATE_DIR_MODE)?;
     Ok(())
 }
 
@@ -419,58 +415,12 @@ fn open_read(path: &Path) -> Result<File, WifiClientProfileError> {
 
 fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), WifiClientProfileError> {
     reject_existing_target(path, false)?;
-    let (temporary, mut file) = create_temp(path)?;
-    let result = (|| -> std::io::Result<()> {
-        file.write_all(contents)?;
-        file.sync_all()?;
-        drop(file);
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
-
-        reject_target_io(path)?;
-        fs::rename(&temporary, path)?;
-        sync_directory(path.parent().expect("profile target has parent"))
-    })();
-    if let Err(error) = result {
-        let _ = fs::remove_file(&temporary);
-        return Err(error.into());
-    }
+    atomic_file::replace(path, contents, PRIVATE_FILE_MODE)?;
     Ok(())
 }
 
-fn reject_target_io(path: &Path) -> std::io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(std::io::Error::other(
-            "refusing to replace symlinked profile target",
-        )),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-fn create_temp(path: &Path) -> Result<(PathBuf, File), WifiClientProfileError> {
-    let name = path
-        .file_name()
-        .and_then(|v| v.to_str())
-        .unwrap_or("profile");
-    for _ in 0..100 {
-        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary =
-            path.with_file_name(format!(".{name}.tmp-{}-{sequence}", std::process::id()));
-        let flags =
-            OFlag::O_CREAT | OFlag::O_WRONLY | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
-        match open(&temporary, flags, Mode::S_IRUSR | Mode::S_IWUSR) {
-            Ok(fd) => {
-                return Ok((temporary, unsafe { File::from_raw_fd(fd) }));
-            }
-            Err(Errno::EEXIST) => continue,
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Err(WifiClientProfileError::Io(std::io::Error::new(
-        ErrorKind::AlreadyExists,
-        "failed to allocate a unique profile temporary file",
-    )))
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    File::open(path)?.sync_all()
 }
 
 fn remove_regular(path: &Path, required: bool) -> Result<(), WifiClientProfileError> {
@@ -486,10 +436,6 @@ fn remove_regular(path: &Path, required: bool) -> Result<(), WifiClientProfileEr
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
-}
-
-fn sync_directory(path: &Path) -> std::io::Result<()> {
-    File::open(path)?.sync_all()
 }
 
 fn unix_timestamp() -> Result<i64, WifiClientProfileError> {

@@ -1,5 +1,6 @@
 pub mod api;
 pub mod app;
+pub mod atomic_file;
 pub mod auth;
 pub mod config;
 pub mod core;

@@ -2,9 +2,9 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use tokio::fs::{self, File};
-use tokio::io::AsyncWriteExt;
+use tokio::fs;
 
+use crate::atomic_file::{self, PRIVATE_FILE_MODE};
 use crate::dhcp::lease::DhcpLease;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,49 +46,13 @@ impl LeaseStore {
             .await
             .with_context(|| format!("failed to create lease directory {}", parent.display()))?;
 
-        let content = serde_json::to_vec_pretty(leases)?;
-        let temporary = temporary_path(&self.path);
-        let mut file = File::create(&temporary).await.with_context(|| {
-            format!(
-                "failed to create temporary lease file {}",
-                temporary.display()
-            )
-        })?;
-        file.write_all(&content).await?;
-        file.write_all(b"\n").await?;
-        file.flush().await?;
-        file.sync_all().await?;
-        drop(file);
+        let mut content = serde_json::to_vec_pretty(leases)?;
+        content.push(b'\n');
 
-        fs::rename(&temporary, &self.path).await.with_context(|| {
-            format!(
-                "failed to atomically replace lease file {} with {}",
-                self.path.display(),
-                temporary.display()
-            )
-        })?;
-
-        sync_directory(parent).await?;
-
-        Ok(())
+        atomic_file::replace_async(&self.path, &content, PRIVATE_FILE_MODE)
+            .await
+            .with_context(|| format!("failed to replace lease file {}", self.path.display()))
     }
-}
-
-async fn sync_directory(path: &Path) -> Result<()> {
-    File::open(path)
-        .await
-        .with_context(|| format!("failed to open lease directory {}", path.display()))?
-        .sync_all()
-        .await
-        .with_context(|| format!("failed to sync lease directory {}", path.display()))
-}
-
-fn temporary_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("leases.json");
-    path.with_file_name(format!(".{file_name}.tmp-{}", std::process::id()))
 }
 
 #[cfg(test)]

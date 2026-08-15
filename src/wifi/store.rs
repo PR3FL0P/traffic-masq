@@ -1,9 +1,8 @@
 use std::fs::{self, File};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::FromRawFd;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use nix::errno::Errno;
 use nix::fcntl::{open, OFlag};
@@ -11,6 +10,7 @@ use nix::sys::stat::Mode;
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+use crate::atomic_file::{self, PrivateDirError, PRIVATE_DIR_MODE, PRIVATE_FILE_MODE};
 use crate::config::validate_interface_name;
 use crate::wifi::secret::{PassphraseError, WifiPassphrase};
 use crate::wifi::WifiApSpec;
@@ -39,6 +39,16 @@ pub enum PassphraseStoreError {
     Passphrase(#[from] PassphraseError),
 }
 
+impl From<PrivateDirError> for PassphraseStoreError {
+    fn from(error: PrivateDirError) -> Self {
+        match error {
+            PrivateDirError::Symlink(path) => Self::SymlinkRejected(path),
+            PrivateDirError::NotADirectory(path) => Self::UnsafeDirectory(path),
+            PrivateDirError::Io(error) => Self::Io(error),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PassphraseStore {
     directory: PathBuf,
@@ -56,25 +66,7 @@ impl PassphraseStore {
     }
 
     fn ensure_directory(&self) -> Result<PathBuf, PassphraseStoreError> {
-        match fs::symlink_metadata(&self.directory) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(PassphraseStoreError::SymlinkRejected(
-                    self.directory.clone(),
-                ));
-            }
-            Ok(metadata) if !metadata.is_dir() => {
-                return Err(PassphraseStoreError::UnsafeDirectory(
-                    self.directory.clone(),
-                ));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                fs::create_dir_all(&self.directory)?;
-                fs::set_permissions(&self.directory, fs::Permissions::from_mode(0o700))?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-
+        atomic_file::ensure_private_dir(&self.directory, PRIVATE_DIR_MODE)?;
         Ok(fs::canonicalize(&self.directory)?)
     }
 
@@ -103,19 +95,7 @@ impl PassphraseStore {
         let canonical_dir = self.ensure_directory()?;
         let target = self.safe_target(&canonical_dir, interface)?;
 
-        let (temp_path, mut temp_file) = create_temp_file(&target)?;
-        let write_result = (|| -> std::io::Result<()> {
-            temp_file.write_all(passphrase.expose().as_bytes())?;
-            temp_file.sync_all()
-        })();
-        drop(temp_file);
-        if let Err(error) = write_result {
-            let _ = fs::remove_file(&temp_path);
-            return Err(error.into());
-        }
-
-        fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600))?;
-        fs::rename(&temp_path, &target)?;
+        atomic_file::replace(&target, passphrase.expose().as_bytes(), PRIVATE_FILE_MODE)?;
         Ok(())
     }
 
@@ -156,34 +136,6 @@ impl PassphraseStore {
     }
 }
 
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-fn create_temp_file(path: &Path) -> Result<(PathBuf, File), PassphraseStoreError> {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("psk");
-    for _ in 0..100 {
-        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temp_path = path.with_file_name(format!(
-            ".{file_name}.tmp-{}-{sequence}",
-            std::process::id()
-        ));
-        let flags =
-            OFlag::O_CREAT | OFlag::O_WRONLY | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
-        let mode = Mode::S_IRUSR | Mode::S_IWUSR;
-        match open(&temp_path, flags, mode) {
-            Ok(fd) => return Ok((temp_path, unsafe { File::from_raw_fd(fd) })),
-            Err(Errno::EEXIST) => continue,
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Err(PassphraseStoreError::Io(std::io::Error::new(
-        ErrorKind::AlreadyExists,
-        "failed to allocate a unique temporary passphrase file",
-    )))
-}
-
 #[derive(Debug, Error)]
 pub enum ResolvePassphraseError {
     #[error(transparent)]
@@ -208,7 +160,6 @@ pub enum ResolvePassphraseError {
     #[error(transparent)]
     Passphrase(#[from] PassphraseError),
 }
-
 pub fn resolve_passphrase(
     spec: &WifiApSpec,
     store: &PassphraseStore,

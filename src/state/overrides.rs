@@ -1,15 +1,14 @@
 use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use tokio::fs::{self, File, OpenOptions};
-use tokio::io::AsyncWriteExt;
+use tokio::fs;
 use tokio::sync::{Mutex, Notify};
 
+use crate::atomic_file::{self, PRIVATE_FILE_MODE};
 use crate::config::{
     ApiConfig, AppConfig, InterfaceConfig, NetworkConfig, RouterConfig, SecurityConfig,
     VpnPolicyMode,
@@ -291,26 +290,14 @@ impl RuntimeOverrideStore {
         })?;
         fs::create_dir_all(parent).await?;
 
-        let content = serde_json::to_vec_pretty(overrides)?;
-        let (temporary, mut file) = create_temporary_file(&self.path).await?;
-        let save_result = async {
-            file.write_all(&content).await?;
-            file.write_all(b"\n").await?;
-            file.flush().await?;
-            file.sync_all().await?;
-            drop(file);
-            fs::rename(&temporary, &self.path)
-                .await
-                .with_context(|| format!("failed to atomically replace {}", self.path.display()))?;
-            sync_parent_directory(parent).await?;
-            Ok::<_, anyhow::Error>(())
-        }
-        .await;
+        let mut content = serde_json::to_vec_pretty(overrides)?;
+        content.push(b'\n');
 
-        if save_result.is_err() {
-            let _ = fs::remove_file(&temporary).await;
-        }
-        save_result
+        atomic_file::replace_async(&self.path, &content, PRIVATE_FILE_MODE)
+            .await
+            .with_context(|| {
+                format!("failed to atomically replace {}", self.path.display())
+            })
     }
 }
 
@@ -560,56 +547,6 @@ fn validate_candidate(candidate: &RuntimeOverrides, base: &AppConfig) -> Result<
             bail!("persisted vpn traffic policy mode \"vpn\" requires router.enabled = true");
         }
     }
-    Ok(())
-}
-
-static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-async fn create_temporary_file(path: &Path) -> Result<(PathBuf, File)> {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("runtime-overrides.json");
-    for _ in 0..100 {
-        let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary = path.with_file_name(format!(
-            ".{file_name}.tmp-{}-{sequence}",
-            std::process::id()
-        ));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            options.mode(0o600);
-        }
-        match options.open(&temporary).await {
-            Ok(file) => return Ok((temporary, file)),
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!(
-                        "failed to create temporary state file {}",
-                        temporary.display()
-                    )
-                });
-            }
-        }
-    }
-    bail!("failed to allocate a unique temporary runtime override file")
-}
-
-#[cfg(unix)]
-async fn sync_parent_directory(parent: &Path) -> Result<()> {
-    File::open(parent)
-        .await
-        .with_context(|| format!("failed to open state directory {}", parent.display()))?
-        .sync_all()
-        .await
-        .with_context(|| format!("failed to sync state directory {}", parent.display()))
-}
-
-#[cfg(not(unix))]
-async fn sync_parent_directory(_parent: &Path) -> Result<()> {
     Ok(())
 }
 

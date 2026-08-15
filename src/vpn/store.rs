@@ -1,6 +1,6 @@
 use std::fs::{self, File};
-use std::io::{ErrorKind, Read, Write};
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::io::{ErrorKind, Read};
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -10,6 +10,7 @@ use nix::fcntl::{open, OFlag};
 use nix::sys::stat::Mode;
 use thiserror::Error;
 
+use crate::atomic_file::{self, PrivateDirError, PRIVATE_DIR_MODE, PRIVATE_FILE_MODE};
 use crate::vpn::wireguard::{
     validate_wireguard_profile_name, ProfileError, WireGuardDriver, WireGuardProfile,
 };
@@ -38,6 +39,16 @@ pub enum StoreError {
     Errno(#[from] Errno),
 }
 
+impl From<PrivateDirError> for StoreError {
+    fn from(error: PrivateDirError) -> Self {
+        match error {
+            PrivateDirError::Symlink(path) => Self::SymlinkRejected(path),
+            PrivateDirError::NotADirectory(path) => Self::UnsafeDirectory(path),
+            PrivateDirError::Io(error) => Self::Io(error),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireGuardProfileSummary {
     pub name: String,
@@ -62,23 +73,8 @@ impl WireGuardProfileStore {
     }
 
     fn ensure_directory(&self) -> Result<PathBuf, StoreError> {
-        match fs::symlink_metadata(&self.directory) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(StoreError::SymlinkRejected(self.directory.clone()));
-            }
-            Ok(metadata) if !metadata.is_dir() => {
-                return Err(StoreError::UnsafeDirectory(self.directory.clone()));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                fs::create_dir_all(&self.directory)?;
-                fs::set_permissions(&self.directory, fs::Permissions::from_mode(0o700))?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-
-        let canonical = fs::canonicalize(&self.directory)?;
-        Ok(canonical)
+        atomic_file::ensure_private_dir(&self.directory, PRIVATE_DIR_MODE)?;
+        Ok(fs::canonicalize(&self.directory)?)
     }
 
     fn safe_target(&self, canonical_dir: &Path, name: &str) -> Result<PathBuf, StoreError> {
@@ -101,27 +97,19 @@ impl WireGuardProfileStore {
         let canonical_dir = self.ensure_directory()?;
         let target = self.safe_target(&canonical_dir, name)?;
 
+        // Checked here, before delegating, so a planted symlink is reported as
+        // `SymlinkRejected` with its path rather than as the generic I/O
+        // refusal `atomic_file` raises.
         if let Ok(metadata) = fs::symlink_metadata(&target) {
             if metadata.file_type().is_symlink() {
                 return Err(StoreError::SymlinkRejected(target));
             }
         }
 
-        let flags = OFlag::O_CREAT
-            | OFlag::O_WRONLY
-            | OFlag::O_TRUNC
-            | OFlag::O_NOFOLLOW
-            | OFlag::O_CLOEXEC;
-        let mode = Mode::S_IRUSR | Mode::S_IWUSR;
-        let raw_fd = open(&target, flags, mode)?;
-
-        let mut file = unsafe { File::from_raw_fd(raw_fd) };
-
-        file.write_all(raw)?;
-        file.sync_all()?;
-        drop(file);
-
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o600))?;
+        // Atomic, where this used to open the target with O_TRUNC: a crash
+        // mid-import left a truncated profile that would fail to parse on the
+        // next read.
+        atomic_file::replace(&target, raw, PRIVATE_FILE_MODE)?;
 
         Ok(profile)
     }

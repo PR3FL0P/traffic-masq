@@ -1,19 +1,15 @@
 //! A directory of small private JSON documents, keyed by interface name.
 //!
-//! traffic-masq keeps more than one kind of record that has to survive a crash
-//! and must not be readable or replaceable by anyone but root: DHCP leases, and
-//! the journal of addresses this daemon installed. The rules are the same for
-//! all of them — the directory is `0700`, documents are `0600`, a write is
-//! atomic, and a symlink anywhere on the path is refused rather than followed —
-//! and they are the kind of rules that rot when they exist in two copies.
+//! What this adds over [`crate::atomic_file`] is the *keying*: a document is
+//! named by an interface, the key is validated as one, and the directory can be
+//! listed. The `0700`/`0600`/atomic-rename/no-symlink rules themselves live in
+//! `atomic_file`, shared with the stores that are not keyed this way.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::fs::{self, File};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+use crate::atomic_file::{self, PrivateDirError, PRIVATE_DIR_MODE, PRIVATE_FILE_MODE};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PrivateStoreError {
@@ -23,6 +19,19 @@ pub enum PrivateStoreError {
     Symlink(PathBuf),
     #[error("private store I/O error: {0}")]
     Io(#[from] io::Error),
+}
+
+impl From<PrivateDirError> for PrivateStoreError {
+    fn from(error: PrivateDirError) -> Self {
+        match error {
+            PrivateDirError::Symlink(path) => Self::Symlink(path),
+            PrivateDirError::NotADirectory(path) => Self::Io(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                format!("{} is not a directory", path.display()),
+            )),
+            PrivateDirError::Io(error) => Self::Io(error),
+        }
+    }
 }
 
 /// One directory of private per-interface documents.
@@ -39,19 +48,7 @@ impl PrivateJsonDirectory {
         fs::create_dir_all(root)?;
         reject_symlink(root)?;
         let directory = root.join(name);
-        if directory.exists() {
-            reject_symlink(&directory)?;
-            if !directory.is_dir() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotADirectory,
-                    format!("{} is not a directory", directory.display()),
-                )
-                .into());
-            }
-        } else {
-            fs::create_dir(&directory)?;
-        }
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+        atomic_file::ensure_private_dir(&directory, PRIVATE_DIR_MODE)?;
         Ok(Self { directory })
     }
 
@@ -82,36 +79,14 @@ impl PrivateJsonDirectory {
 
     /// Replace a document atomically.
     ///
-    /// Written to a temporary file and renamed, so a reader — including this
-    /// daemon after a crash — never sees half a document. The directory is
-    /// fsynced afterwards, because the rename is the part that has to survive
-    /// power loss.
+    /// The symlink check is repeated here, before delegating, so that a planted
+    /// symlink is reported as [`PrivateStoreError::Symlink`] with its path
+    /// rather than as the generic I/O refusal `atomic_file` raises.
     pub fn write(&self, key: &str, bytes: &[u8]) -> Result<(), PrivateStoreError> {
         let destination = self.path(key)?;
         reject_symlink(&destination)?;
-        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary = self
-            .directory
-            .join(format!(".{key}.{}.{sequence}.tmp", std::process::id()));
-        let result = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(nix::libc::O_NOFOLLOW)
-                .open(&temporary)?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            reject_symlink(&destination)?;
-            fs::rename(&temporary, &destination)?;
-            fs::set_permissions(&destination, fs::Permissions::from_mode(0o600))?;
-            File::open(&self.directory)?.sync_all()?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result
+        atomic_file::replace(&destination, bytes, PRIVATE_FILE_MODE)?;
+        Ok(())
     }
 
     pub fn remove(&self, key: &str) -> Result<(), PrivateStoreError> {

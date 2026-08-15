@@ -6,6 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
+use crate::atomic_file::{self, PRIVATE_FILE_MODE};
 use crate::config::{AppConfig, ShutdownPolicy};
 use crate::dhcp::supervisor::resolve_interface_index;
 use crate::state::overrides::{RuntimeOverrides, WifiClientOverride};
@@ -19,7 +20,7 @@ use crate::wifi::client::render::{
 };
 use crate::wifi::process::{ProcessError, SupervisedProcess, TokioSupervisedProcess};
 use crate::wifi::record::{
-    write_atomically, PersistedWifiRecord, WifiRecordError, WifiRecordStore,
+    PersistedWifiRecord, WifiRecordError, WifiRecordStore,
 };
 use crate::wifi::secret::WifiPassphrase;
 use crate::wifi::store::{resolve_passphrase_parts, PassphraseStore, ResolvePassphraseError};
@@ -733,7 +734,9 @@ async fn write_config_file(rendered: &RenderedClientConfig) -> Result<(), Client
                 .map_err(|source| io_error(&rendered.path, source))?;
         }
     }
-    write_atomically(&rendered.path, rendered.text.as_bytes())
+    let mut content = rendered.text.clone().into_bytes();
+    content.push(b'\n');
+    atomic_file::replace_async(&rendered.path, &content, PRIVATE_FILE_MODE)
         .await
         .map_err(|source| io_error(&rendered.path, source))
 }

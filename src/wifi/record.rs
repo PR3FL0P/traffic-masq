@@ -1,12 +1,11 @@
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::fs::{self, File, OpenOptions};
-use tokio::io::AsyncWriteExt;
+use tokio::fs;
 
+use crate::atomic_file::{self, PRIVATE_FILE_MODE};
 use crate::wifi::render::WifiDigest;
 
 pub const CURRENT_WIFI_RECORD_SCHEMA: u32 = 1;
@@ -137,10 +136,11 @@ impl WifiRecordStore {
             key_digest: record.key_digest,
             ssid: record.ssid.clone(),
         };
-        let content = serde_json::to_vec_pretty(&document)
+        let mut content = serde_json::to_vec_pretty(&document)
             .expect("PersistedWifiRecordDocument serialization is infallible");
+        content.push(b'\n');
 
-        write_atomically(&self.path, &content)
+        atomic_file::replace_async(&self.path, &content, PRIVATE_FILE_MODE)
             .await
             .map_err(|error| WifiRecordError::Write(self.path.clone(), error))
     }
@@ -152,71 +152,6 @@ impl WifiRecordStore {
             Err(error) => Err(WifiRecordError::Write(self.path.clone(), error)),
         }
     }
-}
-
-static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-pub(crate) async fn write_atomically(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("active.json");
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-
-    let mut temporary = None;
-    let mut file = None;
-    for _ in 0..100 {
-        let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let candidate = parent.join(format!(
-            ".{file_name}.tmp-{}-{sequence}",
-            std::process::id()
-        ));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            options.mode(0o600);
-        }
-        match options.open(&candidate).await {
-            Ok(opened) => {
-                temporary = Some(candidate);
-                file = Some(opened);
-                break;
-            }
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    }
-    let temporary = temporary
-        .ok_or_else(|| std::io::Error::other("failed to allocate a unique temporary file"))?;
-    let mut file = file.expect("temporary file set alongside its path");
-
-    let write_result = async {
-        file.write_all(content).await?;
-        file.write_all(b"\n").await?;
-        file.flush().await?;
-        file.sync_all().await?;
-        drop(file);
-        fs::rename(&temporary, path).await?;
-        sync_parent_directory(parent).await?;
-        Ok::<_, std::io::Error>(())
-    }
-    .await;
-
-    if write_result.is_err() {
-        let _ = fs::remove_file(&temporary).await;
-    }
-    write_result
-}
-
-#[cfg(unix)]
-async fn sync_parent_directory(parent: &Path) -> std::io::Result<()> {
-    File::open(parent).await?.sync_all().await
-}
-
-#[cfg(not(unix))]
-async fn sync_parent_directory(_parent: &Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]
