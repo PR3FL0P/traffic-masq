@@ -706,12 +706,6 @@ async fn reconcile_network_runtime_once<
         .await;
     }
 
-    if let Some(dhcp_client) = dhcp_client {
-        if let Err(error) = dhcp_client.ensure_alive().await {
-            tracing::warn!(%error, "failed to check DHCP client liveness");
-        }
-    }
-
     Ok(failures)
 }
 
@@ -834,11 +828,16 @@ fn spawn_runtime_network_reconcile(
 /// One pass of "is everything we spawned still running".
 ///
 /// Split from the task that drives it so it can be exercised against fakes.
-async fn check_process_liveness<D, W, C>(dhcp: &D, wifi: Option<&W>, wifi_client: Option<&C>)
-where
+async fn check_process_liveness<D, W, C, L>(
+    dhcp: &D,
+    wifi: Option<&W>,
+    wifi_client: Option<&C>,
+    dhcp_client: Option<&L>,
+) where
     D: DhcpRuntimeReconciler,
     W: WifiRuntimeReconciler,
     C: WifiRuntimeReconciler,
+    L: DhcpClientRuntimeReconciler,
 {
     if let Err(error) = dhcp.ensure_runtime_alive().await {
         tracing::warn!(%error, "failed to restart the shared DHCP runtime");
@@ -851,6 +850,11 @@ where
     if let Some(wifi_client) = wifi_client {
         if let Err(error) = wifi_client.ensure_alive().await {
             tracing::warn!(%error, "failed to check Wi-Fi client liveness");
+        }
+    }
+    if let Some(dhcp_client) = dhcp_client {
+        if let Err(error) = dhcp_client.ensure_alive().await {
+            tracing::warn!(%error, "failed to check DHCP client liveness");
         }
     }
 }
@@ -869,6 +873,7 @@ fn spawn_process_liveness_checks(
     dhcp: DhcpSupervisor,
     wifi: Option<HostapdSupervisor>,
     wifi_client: Option<WifiClientSupervisor>,
+    dhcp_client: DhcpClientSupervisor,
     mut shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -881,7 +886,13 @@ fn spawn_process_liveness_checks(
                     if shutdown_requested(&shutdown) {
                         break;
                     }
-                    check_process_liveness(&dhcp, wifi.as_ref(), wifi_client.as_ref()).await;
+                    check_process_liveness(
+                        &dhcp,
+                        wifi.as_ref(),
+                        wifi_client.as_ref(),
+                        Some(&dhcp_client),
+                    )
+                    .await;
                 }
                 changed = shutdown.changed() => match changed {
                     Ok(()) if shutdown_requested(&shutdown) => break,
@@ -1271,6 +1282,7 @@ pub async fn run_daemon(config: AppConfig) -> Result<()> {
         dhcp.clone(),
         wifi_supervisor.clone(),
         wifi_client_supervisor.clone(),
+        dhcp_client.clone(),
         shutdown.clone(),
     );
 
@@ -2342,7 +2354,13 @@ mod tests {
         let dhcp = FakeDhcpReconciler::default();
         let wifi_client = FakeWifiReconciler::default();
 
-        check_process_liveness(&dhcp, None::<&FakeWifiReconciler>, Some(&wifi_client)).await;
+        check_process_liveness(
+            &dhcp,
+            None::<&FakeWifiReconciler>,
+            Some(&wifi_client),
+            None::<&FakeDhcpClientReconciler>,
+        )
+        .await;
 
         assert_eq!(*wifi_client.liveness_checks.lock().await, 1);
         assert_eq!(*dhcp.runtime_liveness_checks.lock().await, 1);
@@ -2353,12 +2371,18 @@ mod tests {
         let dhcp = FakeDhcpReconciler::default();
         let wifi = FakeWifiReconciler::default();
         let wifi_client = FakeWifiReconciler::default();
+        let dhcp_client = FakeDhcpClientReconciler::default();
 
-        check_process_liveness(&dhcp, Some(&wifi), Some(&wifi_client)).await;
+        check_process_liveness(&dhcp, Some(&wifi), Some(&wifi_client), Some(&dhcp_client)).await;
 
         assert_eq!(*dhcp.runtime_liveness_checks.lock().await, 1);
         assert_eq!(*wifi.liveness_checks.lock().await, 1);
         assert_eq!(*wifi_client.liveness_checks.lock().await, 1);
+        assert_eq!(
+            *dhcp_client.liveness_checks.lock().await, 1,
+            "every supervised runtime means every one: the DHCP client was the \
+             one left behind in the convergence pass"
+        );
     }
 
     fn dhcp_client_reconcile_config() -> AppConfig {
@@ -2414,7 +2438,10 @@ mod tests {
 
         assert_eq!(dhcp_client.reconcile_calls.lock().await.len(), 1);
         assert!(dhcp_client.disable_calls.lock().await.is_empty());
-        assert_eq!(*dhcp_client.liveness_checks.lock().await, 3);
+        assert_eq!(
+            *dhcp_client.liveness_checks.lock().await, 0,
+            "convergence must not poll for process liveness; that is a separate concern"
+        );
 
         assert_eq!(
             network
