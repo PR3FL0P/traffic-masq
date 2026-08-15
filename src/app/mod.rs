@@ -23,7 +23,6 @@ use crate::core::route::{RouteManager, RouteSnapshot};
 use crate::core::router::{RouterDesired, RouterManager};
 use crate::core::router_subsystems::ProductionRouterSubsystems;
 use crate::core::router_transaction::RouterTransactionCoordinator;
-use crate::core::transaction::NetworkTransactionManager;
 use crate::core::vpn_policy_manager::{VpnPolicyDesired, VpnPolicyManager};
 use crate::dhcp::client::{DhcpClientSpec, DhcpClientSupervisor};
 use crate::dhcp::supervisor::{DhcpServiceSpec, DhcpSupervisor};
@@ -35,7 +34,7 @@ use crate::firewall::{
 use crate::logging::init_logging;
 use crate::netlink::events::KernelEvent;
 use crate::netlink::{
-    Ipv4AddressInfo, NetworkInterface, NetworkProvider, RtnetlinkNetworkProvider,
+    AddressOwner, Ipv4AddressInfo, NetworkInterface, NetworkProvider, RtnetlinkNetworkProvider,
 };
 use crate::state::desired::DesiredNetworkState;
 use crate::state::overrides::{RuntimeOverrideManager, RuntimeOverrides};
@@ -401,6 +400,7 @@ fn interface_needs_reapply(
     interface: &NetworkInterface,
     current_addresses: &[Ipv4AddressInfo],
     config: &InterfaceConfig,
+    ownership_tagging_available: bool,
 ) -> bool {
     if !interface.is_up {
         return true;
@@ -422,9 +422,22 @@ fn interface_needs_reapply(
     }
 
     match desired {
-        Some((address, prefix_len)) => !current_addresses
-            .iter()
-            .any(|current| current.address == address && current.prefix_len == prefix_len),
+        Some((address, prefix_len)) => {
+            let existing = current_addresses
+                .iter()
+                .find(|current| current.address == address && current.prefix_len == prefix_len);
+            match existing {
+                // The address is there but is not tagged as ours. Claiming it
+                // is the whole of the work, and it is not optional: without the
+                // tag we cannot later prove we put it there, and the interface
+                // becomes one we refuse to stop managing.
+                Some(existing) => {
+                    ownership_tagging_available
+                        && existing.owner() != AddressOwner::TrafficMasqStatic
+                }
+                None => true,
+            }
+        }
         None => false,
     }
 }
@@ -522,7 +535,6 @@ async fn reconcile_network_runtime_once<
     _wifi: Option<&W>,
     wifi_client: Option<&C>,
     dhcp_client: Option<&L>,
-    pending_interfaces: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, String>> {
     let effective = desired.effective().await?;
     let management_allowlist = desired.management_allowlist().await;
@@ -536,19 +548,6 @@ async fn reconcile_network_runtime_once<
         .collect();
 
     for (name, config) in &effective.network.interfaces {
-        // A change that has been applied to the kernel but not yet confirmed
-        // owns this interface until it is committed or rolled back. During that
-        // window the kernel deliberately holds the new state while the override
-        // still describes the old one, so reconciling would simply undo the
-        // user's change — within a second, and without leaving a trace.
-        if pending_interfaces.contains(name) {
-            tracing::debug!(
-                interface = %name,
-                "skipping runtime reconcile: an applied network change is awaiting confirmation"
-            );
-            continue;
-        }
-
         if let Some(dhcp_client) = dhcp_client {
             let link_ready = if config.wifi_client.is_some() {
                 match wifi_client {
@@ -582,25 +581,40 @@ async fn reconcile_network_runtime_once<
             continue;
         };
 
-        if config.managed {
-            let current_addresses = match network.list_ipv4_addresses(name).await {
-                Ok(addresses) => addresses,
-                Err(error) => {
-                    tracing::warn!(interface = %name, %error, "failed to list IPv4 addresses during runtime reconcile");
-                    continue;
-                }
-            };
-            if interface_needs_reapply(observed_interface, &current_addresses, config) {
-                let allow_management_change = management_allowlist.contains(name);
+        let current_addresses = match network.list_ipv4_addresses(name).await {
+            Ok(addresses) => addresses,
+            Err(error) => {
+                tracing::warn!(interface = %name, %error, "failed to list IPv4 addresses during runtime reconcile");
+                continue;
+            }
+        };
+        let needs_apply = if config.managed {
+            interface_needs_reapply(
+                observed_interface,
+                &current_addresses,
+                config,
+                network.supports_ipv4_address_protocol(),
+            )
+        } else {
+            // An interface we are not asked to manage has no business carrying
+            // an address tagged as ours, however it got there — a change that
+            // was rolled back, an override that was removed, a previous run.
+            // Convergence is what cleans it up, because convergence is the only
+            // thing that writes.
+            current_addresses
+                .iter()
+                .any(|address| address.owner() == AddressOwner::TrafficMasqStatic)
+        };
+        if needs_apply {
+            let allow_management_change = management_allowlist.contains(name);
 
-                if let Err(error) = interface_manager
-                    .apply_interface(name, config, Some(config.role), allow_management_change)
-                    .await
-                {
-                    tracing::warn!(interface = %name, %error, "failed to converge managed interface");
-                    failures.insert(name.clone(), error.to_string());
-                    continue;
-                }
+            if let Err(error) = interface_manager
+                .apply_interface(name, config, Some(config.role), allow_management_change)
+                .await
+            {
+                tracing::warn!(interface = %name, %error, "failed to converge interface");
+                failures.insert(name.clone(), error.to_string());
+                continue;
             }
         }
 
@@ -688,11 +702,13 @@ fn spawn_runtime_network_reconcile(
     wifi: Option<HostapdSupervisor>,
     wifi_client: Option<WifiClientSupervisor>,
     dhcp_client: DhcpClientSupervisor,
-    transactions: NetworkTransactionManager,
     mut kernel_events: mpsc::UnboundedReceiver<KernelEvent>,
     mut shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        // Announced before the first pass: until something is converging, a
+        // transaction that proposed a change would have nothing to wait for.
+        desired.attach_converger();
         loop {
             if shutdown_requested(&shutdown) {
                 break;
@@ -700,12 +716,7 @@ fn spawn_runtime_network_reconcile(
 
             // Converge first, wait second: the daemon has to reach the desired
             // state at startup without something having to happen first.
-            let pending_interfaces: BTreeSet<String> = transactions
-                .pending()
-                .await
-                .into_iter()
-                .map(|change| change.interface)
-                .collect();
+            //
             // Read the version before the pass, publish it after: the report
             // then says which proposals this pass had actually seen, so a
             // caller cannot mistake an older pass for an answer about its own
@@ -718,7 +729,6 @@ fn spawn_runtime_network_reconcile(
                 wifi.as_ref(),
                 wifi_client.as_ref(),
                 Some(&dhcp_client),
-                &pending_interfaces,
             )
             .await
             {
@@ -1141,6 +1151,12 @@ pub async fn run_daemon(config: AppConfig) -> Result<()> {
             vpn.clone(),
         )));
     }
+    // One desired state for both halves. The transaction manager proposes into
+    // it and the converger drives it; two instances would mean proposals nobody
+    // converges and a converger that never sees them.
+    let desired_state = DesiredNetworkState::new(config.clone(), overrides.clone());
+    control = control.with_desired_state(desired_state.clone());
+
     let transactions = control.transactions();
     let socket_path = bindings.socket_path().to_path_buf();
     let session_reaper = spawn_session_reaper(auth.clone(), shutdown.clone());
@@ -1165,7 +1181,7 @@ pub async fn run_daemon(config: AppConfig) -> Result<()> {
 
     let reconcile_task =
         spawn_runtime_network_reconcile(
-            DesiredNetworkState::new(config.clone(), overrides.clone()),
+            desired_state,
             Arc::new(RtnetlinkNetworkProvider::connect().context(
                 "failed to open rtnetlink connection for runtime interface/DHCP reconcile",
             )?),
@@ -1173,7 +1189,6 @@ pub async fn run_daemon(config: AppConfig) -> Result<()> {
             wifi_supervisor.clone(),
             wifi_client_supervisor.clone(),
             dhcp_client.clone(),
-            transactions.clone(),
             kernel_events,
             shutdown.clone(),
         );
@@ -1185,6 +1200,15 @@ pub async fn run_daemon(config: AppConfig) -> Result<()> {
     );
 
     let api_result = server.run(shutdown.clone()).await;
+
+    // Before the converger is stopped, not after: an unconfirmed change is
+    // abandoned by dropping it from the desired state, and only the converger
+    // can take the machine back to what was committed. Stopping it first would
+    // leave a change nobody ever confirmed on the box for good.
+    if let Err(error) = transactions.rollback_all_pending().await {
+        tracing::error!(%error, "failed to abandon unconfirmed network changes during shutdown");
+    }
+
     reconcile_task.abort();
     let _ = reconcile_task.await;
     liveness_task.abort();
@@ -1846,15 +1870,38 @@ mod tests {
             tx_bytes: 0,
         };
 
-        assert!(!interface_needs_reapply(
-            &interface,
-            &[Ipv4AddressInfo {
+        let configured = |protocol| {
+            [Ipv4AddressInfo {
                 interface_index: 7,
                 address: Ipv4Addr::new(192, 168, 77, 1),
                 prefix_len: 24,
-                protocol: None,
-            }],
+                protocol,
+            }]
+        };
+        let ours = AddressOwnership::Static.protocol();
+
+        assert!(!interface_needs_reapply(
+            &interface,
+            &configured(ours),
             desired,
+            true,
+        ));
+
+        assert!(!interface_needs_reapply(
+            &interface,
+            &configured(None),
+            desired,
+            false,
+        ));
+
+        // The address is right but carries no ownership tag on a kernel that
+        // can hold one: claiming it is work, and it is the only thing that
+        // keeps "did we put this here" answerable later.
+        assert!(interface_needs_reapply(
+            &interface,
+            &configured(None),
+            desired,
+            true,
         ));
 
         assert!(interface_needs_reapply(
@@ -1862,13 +1909,9 @@ mod tests {
                 is_up: false,
                 ..interface.clone()
             },
-            &[Ipv4AddressInfo {
-                interface_index: 7,
-                address: Ipv4Addr::new(192, 168, 77, 1),
-                prefix_len: 24,
-                protocol: None,
-            }],
+            &configured(ours),
             desired,
+            true,
         ));
 
         assert!(interface_needs_reapply(
@@ -1877,9 +1920,10 @@ mod tests {
                 interface_index: 7,
                 address: Ipv4Addr::new(192, 168, 88, 1),
                 prefix_len: 24,
-                protocol: None,
+                protocol: ours,
             }],
             desired,
+            true,
         ));
     }
 
@@ -1929,7 +1973,6 @@ mod tests {
             Some(&wifi),
             None::<&FakeWifiReconciler>,
             None::<&FakeDhcpClientReconciler>,
-            &BTreeSet::new(),
         )
         .await
         .expect("reconcile");
@@ -1962,46 +2005,230 @@ mod tests {
         assert_eq!(*wifi.liveness_checks.lock().await, 0);
     }
 
+    /// The tentative layer is not something convergence works around — it is
+    /// what convergence works towards. An unconfirmed change reaches the
+    /// machine the same way a committed one does, and withdrawing it takes the
+    /// machine back without anything having to remember how to undo it.
     #[tokio::test]
-    async fn runtime_reconcile_leaves_an_interface_with_an_unconfirmed_change_alone() {
+    async fn an_unconfirmed_change_is_converged_to_and_then_back_again() {
         let config = hotplug_reconcile_config();
         let state_dir = tempdir().expect("state dir");
         let overrides = RuntimeOverrideManager::load(state_dir.path(), &config)
             .await
             .expect("overrides");
         let network = Arc::new(FakeNetworkProvider::default());
-        // The state a just-applied, not-yet-committed change leaves behind: the
-        // address is gone from the kernel while the override still says the
-        // interface is managed and configured.
         network
             .add_interface_with_state("lan0", 7, true, Vec::new())
             .await;
         let dhcp = FakeDhcpReconciler::default();
-        let wifi = FakeWifiReconciler::default();
+        let desired = DesiredNetworkState::new(config.clone(), overrides.clone());
 
-        let pending = BTreeSet::from(["lan0".to_string()]);
+        let proposed = InterfaceConfig {
+            ipv4: Some("10.9.9.1/24".parse().expect("network")),
+            dhcp: None,
+            ..config.network.interfaces["lan0"].clone()
+        };
+        desired.propose("token-1", "lan0", proposed, false).await;
+
         reconcile_network_runtime_once(
-            &DesiredNetworkState::new(config.clone(), overrides.clone()),
+            &desired,
             network.clone(),
             &dhcp,
-            Some(&wifi),
+            None::<&FakeWifiReconciler>,
             None::<&FakeWifiReconciler>,
             None::<&FakeDhcpClientReconciler>,
-            &pending,
         )
         .await
         .expect("reconcile");
 
-        assert!(
+        assert_eq!(
             network
                 .list_ipv4_addresses("lan0")
                 .await
                 .expect("addresses")
-                .is_empty(),
-            "reconcile must not undo a change that is still awaiting confirmation"
+                .first()
+                .map(|address| address.address),
+            Some(Ipv4Addr::new(10, 9, 9, 1)),
+            "an unconfirmed change must reach the machine through convergence"
         );
-        assert!(dhcp.configure_calls.lock().await.is_empty());
-        assert!(dhcp.disable_calls.lock().await.is_empty());
+
+        desired.withdraw("token-1").await;
+
+        reconcile_network_runtime_once(
+            &desired,
+            network.clone(),
+            &dhcp,
+            None::<&FakeWifiReconciler>,
+            None::<&FakeWifiReconciler>,
+            None::<&FakeDhcpClientReconciler>,
+        )
+        .await
+        .expect("reconcile");
+
+        assert_eq!(
+            network
+                .list_ipv4_addresses("lan0")
+                .await
+                .expect("addresses")
+                .first()
+                .map(|address| address.address),
+            Some(Ipv4Addr::new(192, 168, 77, 1)),
+            "dropping the tentative layer is the whole of the rollback"
+        );
+    }
+
+    /// A management-role change the operator confirmed has to survive the trip
+    /// through the desired state: the permission lives in the override only
+    /// after the change is committed, so until then the proposal carries it.
+    #[tokio::test]
+    async fn a_proposal_carries_its_own_permission_to_touch_a_management_interface() {
+        let mut config = AppConfig::default();
+        config.network.interfaces.insert(
+            "mgmt0".to_string(),
+            InterfaceConfig {
+                role: InterfaceRole::Management,
+                managed: true,
+                ipv4: Some("192.168.1.10/24".parse().expect("network")),
+                dhcp: None,
+                dhcp_client: None,
+                wifi: None,
+                wifi_client: None,
+            },
+        );
+        let state_dir = tempdir().expect("state dir");
+        let overrides = RuntimeOverrideManager::load(state_dir.path(), &config)
+            .await
+            .expect("overrides");
+        let network = Arc::new(FakeNetworkProvider::default());
+        network
+            .add_interface_with_state("mgmt0", 3, true, Vec::new())
+            .await;
+        let dhcp = FakeDhcpReconciler::default();
+        let desired = DesiredNetworkState::new(config.clone(), overrides.clone());
+
+        let proposed = InterfaceConfig {
+            ipv4: Some("192.168.1.11/24".parse().expect("network")),
+            ..config.network.interfaces["mgmt0"].clone()
+        };
+        desired
+            .propose("token-1", "mgmt0", proposed.clone(), true)
+            .await;
+
+        let failures = reconcile_network_runtime_once(
+            &desired,
+            network.clone(),
+            &dhcp,
+            None::<&FakeWifiReconciler>,
+            None::<&FakeWifiReconciler>,
+            None::<&FakeDhcpClientReconciler>,
+        )
+        .await
+        .expect("reconcile");
+
+        assert!(failures.is_empty(), "unexpected failures: {failures:?}");
+        assert_eq!(
+            network
+                .list_ipv4_addresses("mgmt0")
+                .await
+                .expect("addresses")
+                .first()
+                .map(|address| address.address),
+            Some(Ipv4Addr::new(192, 168, 1, 11))
+        );
+
+        // Without the permission the next change to the same interface is
+        // refused, which is what makes carrying it meaningful rather than
+        // decorative.
+        desired.withdraw("token-1").await;
+        let unconfirmed = InterfaceConfig {
+            ipv4: Some("192.168.1.12/24".parse().expect("network")),
+            ..proposed
+        };
+        desired
+            .propose("token-2", "mgmt0", unconfirmed, false)
+            .await;
+        let failures = reconcile_network_runtime_once(
+            &desired,
+            network.clone(),
+            &dhcp,
+            None::<&FakeWifiReconciler>,
+            None::<&FakeWifiReconciler>,
+            None::<&FakeDhcpClientReconciler>,
+        )
+        .await
+        .expect("reconcile");
+        assert!(failures.contains_key("mgmt0"));
+    }
+
+    /// Cleanup is a state, not an edge: an address tagged as ours on an
+    /// interface we are not asked to manage is removed whenever convergence
+    /// notices it, not only on the apply that stopped managing it.
+    #[tokio::test]
+    async fn convergence_takes_our_addresses_off_an_unmanaged_interface() {
+        let mut config = AppConfig::default();
+        config.network.interfaces.insert(
+            "lan0".to_string(),
+            InterfaceConfig {
+                role: InterfaceRole::Output,
+                managed: false,
+                ipv4: None,
+                dhcp: None,
+                dhcp_client: None,
+                wifi: None,
+                wifi_client: None,
+            },
+        );
+        let state_dir = tempdir().expect("state dir");
+        let overrides = RuntimeOverrideManager::load(state_dir.path(), &config)
+            .await
+            .expect("overrides");
+        let network = Arc::new(FakeNetworkProvider::default());
+        network
+            .add_interface_with_state(
+                "lan0",
+                7,
+                true,
+                vec![
+                    Ipv4AddressInfo {
+                        interface_index: 7,
+                        address: Ipv4Addr::new(192, 168, 77, 1),
+                        prefix_len: 24,
+                        protocol: AddressOwnership::Static.protocol(),
+                    },
+                    Ipv4AddressInfo {
+                        interface_index: 7,
+                        address: Ipv4Addr::new(10, 0, 0, 5),
+                        prefix_len: 24,
+                        protocol: None,
+                    },
+                ],
+            )
+            .await;
+        let dhcp = FakeDhcpReconciler::default();
+
+        reconcile_network_runtime_once(
+            &DesiredNetworkState::new(config.clone(), overrides.clone()),
+            network.clone(),
+            &dhcp,
+            None::<&FakeWifiReconciler>,
+            None::<&FakeWifiReconciler>,
+            None::<&FakeDhcpClientReconciler>,
+        )
+        .await
+        .expect("reconcile");
+
+        let addresses = network
+            .list_ipv4_addresses("lan0")
+            .await
+            .expect("addresses");
+        assert_eq!(
+            addresses
+                .iter()
+                .map(|address| address.address)
+                .collect::<Vec<_>>(),
+            vec![Ipv4Addr::new(10, 0, 0, 5)],
+            "only addresses we tagged as ours may be removed"
+        );
     }
 
     #[tokio::test]
@@ -2021,7 +2248,6 @@ mod tests {
             None::<&FakeWifiReconciler>,
             None::<&FakeWifiReconciler>,
             None::<&FakeDhcpClientReconciler>,
-            &BTreeSet::new(),
         )
         .await
         .expect("reconcile");
@@ -2096,7 +2322,6 @@ mod tests {
                 None::<&FakeWifiReconciler>,
                 None::<&FakeWifiReconciler>,
                 Some(&dhcp_client),
-                &BTreeSet::new(),
             )
             .await
             .expect("reconcile");
@@ -2167,7 +2392,6 @@ mod tests {
             None::<&FakeWifiReconciler>,
             Some(&wifi_client),
             Some(&dhcp_client),
-            &BTreeSet::new(),
         )
         .await
         .expect("disconnected reconcile");
@@ -2194,7 +2418,6 @@ mod tests {
             None::<&FakeWifiReconciler>,
             Some(&wifi_client),
             Some(&dhcp_client),
-            &BTreeSet::new(),
         )
         .await
         .expect("completed reconcile");
@@ -2259,7 +2482,6 @@ mod tests {
             None::<&FakeWifiReconciler>,
             None::<&FakeWifiReconciler>,
             Some(&dhcp_client),
-            &BTreeSet::new(),
         )
         .await
         .expect("reconcile");
@@ -2296,7 +2518,6 @@ mod tests {
             None::<&HostapdSupervisor>,
             None::<&WifiClientSupervisor>,
             None::<&FakeDhcpClientReconciler>,
-            &BTreeSet::new(),
         )
         .await
         .expect("reconcile");

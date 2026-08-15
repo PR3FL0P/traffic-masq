@@ -43,6 +43,7 @@ use crate::dhcp::supervisor::{DhcpServiceSpec, DhcpSupervisor};
 use crate::firewall::NftExecutor;
 use crate::netlink::{Ipv4AddressInfo, NetworkProvider};
 use crate::state::candidate::{RouterIntentProposal, StaleCandidateError};
+use crate::state::desired::DesiredNetworkState;
 use crate::state::overrides::RuntimeOverrideManager;
 use crate::vpn::manager::OWNED_INTERFACE_NAME;
 use crate::vpn::{
@@ -119,6 +120,10 @@ impl ControlService {
             baselines,
             dhcp.clone(),
             config.dhcp.default_lease_seconds,
+            // Replaced by `with_desired_state` once the converger exists. On
+            // its own this one answers what the desired configuration is and
+            // takes proposals; nobody converges it.
+            DesiredNetworkState::new(config.clone(), overrides.clone()),
         );
 
         let wifi_client_profiles =
@@ -151,6 +156,18 @@ impl ControlService {
     /// which for the daemon is the already-merged startup configuration.
     pub fn with_base_config(mut self, base_config: AppConfig) -> Self {
         self.base_config = base_config;
+        self
+    }
+
+    /// Share the desired state that the convergence loop is driving.
+    ///
+    /// Like `with_base_config`, the daemon has to call this: the service is
+    /// built before the converger exists, so it starts with a desired state of
+    /// its own. Applying a change against that one would propose it where
+    /// nothing is converging — the change would be reported as applied without
+    /// anything having reached the machine.
+    pub fn with_desired_state(self, desired: DesiredNetworkState) -> Self {
+        self.transactions.set_desired_state(desired);
         self
     }
 

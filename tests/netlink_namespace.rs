@@ -248,6 +248,134 @@ async fn kernel_address_changes_are_delivered_as_events() -> Result<()> {
     Ok(())
 }
 
+/// The whole of the transaction path, on a real kernel.
+///
+/// An apply is now a proposal: the manager writes a layer of desired state and
+/// waits, and convergence is the only thing that touches the machine. Two
+/// things have to hold on a live kernel and cannot be shown against a fake —
+/// the proposed address really lands, tagged as ours, before the caller is told
+/// the change is applied; and letting the confirmation deadline pass really
+/// puts the committed address back, with nothing having recorded how to undo
+/// anything.
+#[tokio::test]
+#[ignore = "requires root and iproute2; run explicitly on a disposable Linux test host"]
+async fn an_unconfirmed_change_converges_and_expires_on_a_live_kernel() -> Result<()> {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use traffic_masq::config::{AppConfig, InterfaceConfig, InterfaceRole};
+    use traffic_masq::core::interface::InterfaceManager;
+    use traffic_masq::core::transaction::NetworkTransactionManager;
+    use traffic_masq::state::desired::DesiredNetworkState;
+    use traffic_masq::state::overrides::RuntimeOverrideManager;
+
+    let fixture = NetnsFixture::new()?;
+    let state_dir = tempfile::tempdir()?;
+    let committed: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 50);
+    let proposed: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 51);
+
+    let interface = |address: Ipv4Addr| InterfaceConfig {
+        role: InterfaceRole::Output,
+        managed: true,
+        ipv4: Some(format!("{address}/24").parse().expect("network")),
+        dhcp: None,
+        dhcp_client: None,
+        wifi: None,
+        wifi_client: None,
+    };
+
+    let mut base = AppConfig::default();
+    base.network
+        .interfaces
+        .insert(fixture.host_if.clone(), interface(committed));
+    let overrides = RuntimeOverrideManager::load(state_dir.path(), &base).await?;
+    let desired = DesiredNetworkState::new(base, overrides);
+
+    let provider: Arc<dyn NetworkProvider> = Arc::new(RtnetlinkNetworkProvider::connect()?);
+    let interfaces = InterfaceManager::new(provider.clone());
+
+    // Stands in for the daemon's loop: same contract — read the version, make
+    // the machine match, publish the result — without the supervisors, which
+    // have nothing to do with what is being proved here.
+    desired.attach_converger();
+    let converger = tokio::spawn({
+        let desired = desired.clone();
+        let interfaces = interfaces.clone();
+        async move {
+            loop {
+                let version = desired.version();
+                let mut failures = BTreeMap::new();
+                let effective = desired.effective().await.expect("effective config");
+                let allowed = desired.management_allowlist().await;
+                for (name, config) in &effective.network.interfaces {
+                    if let Err(error) = interfaces
+                        .apply_interface(name, config, Some(config.role), allowed.contains(name))
+                        .await
+                    {
+                        failures.insert(name.clone(), error.to_string());
+                    }
+                }
+                desired.report_pass(version, failures);
+                desired.changed().await;
+            }
+        }
+    });
+
+    let manager = NetworkTransactionManager::new(
+        InterfaceManager::new(provider.clone()),
+        Duration::from_secs(2),
+        desired.clone(),
+    );
+
+    let addresses_on_link = || async {
+        Ok::<_, anyhow::Error>(
+            provider
+                .list_ipv4_addresses(&fixture.host_if)
+                .await?
+                .into_iter()
+                .map(|address| (address.address, address.owner()))
+                .collect::<Vec<_>>(),
+        )
+    };
+
+    let change = manager
+        .apply(
+            &fixture.host_if,
+            &interface(proposed),
+            Some(InterfaceRole::Output),
+            false,
+        )
+        .await
+        .context("apply must not return before the change has been converged to")?;
+
+    assert_eq!(
+        addresses_on_link().await?,
+        vec![(proposed, AddressOwner::TrafficMasqStatic)],
+        "the proposed address must be on the link, tagged as ours, by the time apply returns"
+    );
+
+    // Nobody confirms it. The rollback timer withdraws the proposal, and the
+    // committed configuration is what convergence goes back to.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    assert!(manager.pending().await.is_empty());
+    assert_eq!(
+        addresses_on_link().await?,
+        vec![(committed, AddressOwner::TrafficMasqStatic)],
+        "an unconfirmed change must expire back to the committed configuration"
+    );
+    assert!(!desired.is_tentative(&fixture.host_if).await);
+    let _ = change;
+
+    converger.abort();
+    provider
+        .delete_ipv4_address(&fixture.host_if, committed, 24)
+        .await?;
+    provider.set_link_down(&fixture.host_if).await?;
+    Ok(())
+}
+
 fn require_root_or_skip() -> Result<()> {
     let output = Command::new("id")
         .arg("-u")
