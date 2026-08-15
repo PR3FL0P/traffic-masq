@@ -1,6 +1,29 @@
 # traffic-masq
 
-Linux router and VPN gateway manager.
+Change the network on a Linux box you cannot afford to lose access to.
+
+traffic-masq turns a Linux machine into a router, Wi-Fi access point and VPN
+gateway. So do several mature projects. The difference is in how changes are
+made and what happens when one of them is wrong:
+
+- **A change reverts itself unless you confirm it.** Applying a new address
+  starts a timer. Confirm within the timeout and the change is kept; say
+  nothing — because you just locked yourself out — and the machine returns to
+  the configuration it had. The same idea as `commit confirmed` on a Juniper,
+  on an ordinary Linux host.
+- **It only touches what it was given.** Interfaces are managed one by one, and
+  the daemon records every address it installs, both in the kernel and in a
+  journal on disk. An address it did not install is never removed, and handing
+  an interface back leaves nothing behind. Installing it does not mean handing
+  over the machine.
+- **It converges.** The running configuration is a goal, not a sequence of
+  commands. If something else changes an interface, the change is noticed and
+  undone; if an interface is unplugged and returns, it is configured again.
+  Interface and router changes can be previewed before they are applied.
+
+It installs onto a machine that already has a working network, and leaves that
+network alone until it is told which interfaces to manage. Nothing is
+reflashed, and no operating system is replaced.
 
 The project provides two binaries:
 
@@ -9,9 +32,17 @@ The project provides two binaries:
 | `traffic-masqd` | Privileged daemon that manages network state. |
 | `traffic-masq` | Terminal client for daemon configuration and status. |
 
-## Project status 
+## Project status
 
-Not production ready. The project is under active development and may change without notice. Use at your own risk.
+Not production ready. The project is under active development and may change
+without notice. Use at your own risk.
+
+Known limits, so they are not discovered later:
+
+- IPv4 only. IPv6 addresses and routes are not managed; the WireGuard
+  configuration is the one place IPv6 appears.
+- One machine. There is no fleet or central management.
+- No system service unit is installed; the daemon is started by hand.
 
 ## Requirements
 
@@ -176,11 +207,30 @@ The daemon can manage:
 - WireGuard interfaces
 - policy routes and VPN kill switch rules
 
-Configuration changes use a rollback timer. The default timeout is 60 seconds.
-An uncommitted change is reverted when the timer expires.
+### Confirming a change
 
-Management interfaces are not modified unless
-`allow_management_change` is enabled.
+Applying a change does not make it permanent. The daemon brings the machine to
+the requested state and starts a timer, 60 seconds by default. Committing
+within that window keeps the change; letting the timer expire returns the
+machine to the configuration that was there before.
+
+This is written for the case where the change is the reason you can no longer
+reach the machine. Nothing has to be undone by hand, and nothing has to be
+reachable for the revert to happen: it runs on the machine itself.
+
+### What the daemon considers its own
+
+Only interfaces marked as managed are configured. For those, every IPv4 address
+the daemon installs is recorded twice — tagged in the kernel with `IFA_PROTO`,
+and written to a journal on disk before the address is installed. Both are
+checked at startup against what is actually on the links.
+
+An address that neither the tag nor the journal accounts for is never deleted,
+so an address put there by anything else survives. Marking an interface
+unmanaged removes what the daemon installed and leaves the rest alone.
+
+Management interfaces are not modified unless `allow_management_change` is
+enabled, and a change that would alter one is refused rather than attempted.
 
 Test configuration changes on a separate Linux host before production use.
 
