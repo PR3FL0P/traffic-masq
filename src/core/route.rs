@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::config::{OwnedIpv4RouteConfig, RouterConfig};
 use crate::netlink::{Ipv4RouteInfo, Ipv4RouteSpec, NetworkProvider, TRAFFIC_MASQ_ROUTE_PROTOCOL};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -14,6 +15,31 @@ pub struct ManagedIpv4Route {
     pub output_interface: Option<String>,
     pub table: u32,
     pub metric: Option<u32>,
+}
+
+impl From<&OwnedIpv4RouteConfig> for ManagedIpv4Route {
+    fn from(route: &OwnedIpv4RouteConfig) -> Self {
+        Self {
+            destination: route.destination,
+            gateway: route.gateway,
+            output_interface: route.output_interface.clone(),
+            table: route.table,
+            metric: route.metric,
+        }
+    }
+}
+
+/// The routes the router should own, given its configuration.
+///
+/// A free function here rather than a method on `RouterConfig`, because the
+/// result is a domain type of the route manager. Hanging it off the config type
+/// made `config` — the module almost everything else depends on — depend on
+/// `core` in return, which is a cycle at the very bottom of the stack.
+pub fn desired_owned_routes(router: &RouterConfig) -> Vec<ManagedIpv4Route> {
+    if !router.enabled {
+        return Vec::new();
+    }
+    router.owned_routes.iter().map(Into::into).collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -303,6 +329,37 @@ mod tests {
     use crate::netlink::{Ipv4AddressInfo, NetworkInterface, TRAFFIC_MASQ_DHCP_ROUTE_PROTOCOL};
 
     use super::*;
+
+    fn router_with_one_owned_route() -> RouterConfig {
+        RouterConfig {
+            enabled: true,
+            uplink: None,
+            owned_routes: vec![OwnedIpv4RouteConfig {
+                destination: "203.0.113.0/24".parse().expect("route destination"),
+                gateway: None,
+                output_interface: Some("wan0".to_string()),
+                table: 254,
+                metric: Some(100),
+            }],
+            allow_default_route_change: false,
+        }
+    }
+
+    #[test]
+    fn router_config_builds_effective_route_desired_state() {
+        let mut router = router_with_one_owned_route();
+
+        let desired = desired_owned_routes(&router);
+        assert_eq!(desired.len(), 1);
+        assert_eq!(desired[0].destination, router.owned_routes[0].destination);
+        assert_eq!(desired[0].output_interface.as_deref(), Some("wan0"));
+
+        // A disabled router owns nothing, but the configuration it would use if
+        // re-enabled is left untouched.
+        router.enabled = false;
+        assert!(desired_owned_routes(&router).is_empty());
+        assert_eq!(router.owned_routes.len(), 1);
+    }
 
     #[derive(Default)]
     struct FakeNetwork {

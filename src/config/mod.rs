@@ -167,18 +167,6 @@ pub struct OwnedIpv4RouteConfig {
     pub metric: Option<u32>,
 }
 
-impl From<&OwnedIpv4RouteConfig> for crate::core::route::ManagedIpv4Route {
-    fn from(route: &OwnedIpv4RouteConfig) -> Self {
-        Self {
-            destination: route.destination,
-            gateway: route.gateway,
-            output_interface: route.output_interface.clone(),
-            table: route.table,
-            metric: route.metric,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DhcpClientInterfaceConfig {
@@ -598,13 +586,6 @@ impl NetworkConfig {
 }
 
 impl RouterConfig {
-    pub fn desired_owned_routes(&self) -> Vec<crate::core::route::ManagedIpv4Route> {
-        if !self.enabled {
-            return Vec::new();
-        }
-        self.owned_routes.iter().map(Into::into).collect()
-    }
-
     fn validate(&self, network: &NetworkConfig) -> Result<()> {
         if self.enabled {
             // An enabled router without an uplink is a valid control-plane state:
@@ -1405,22 +1386,6 @@ mod tests {
         config
             .validate()
             .expect("explicitly permitted default route should be valid");
-    }
-
-    #[test]
-    fn router_config_builds_effective_route_desired_state() {
-        let mut config = valid_router_config();
-        let desired = config.router.desired_owned_routes();
-        assert_eq!(desired.len(), 1);
-        assert_eq!(
-            desired[0].destination,
-            config.router.owned_routes[0].destination
-        );
-        assert_eq!(desired[0].output_interface.as_deref(), Some("wan0"));
-
-        config.router.enabled = false;
-        assert!(config.router.desired_owned_routes().is_empty());
-        assert_eq!(config.router.owned_routes.len(), 1);
     }
 
     #[test]

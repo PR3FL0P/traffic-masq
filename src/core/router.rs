@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{AppConfig, InterfaceConfig, InterfaceRole, UplinkMode};
 use crate::core::interface::{InterfaceChangePlan, InterfaceSnapshot};
-use crate::core::route::{ManagedIpv4Route, RoutePlan, RouteSnapshot};
+use crate::core::route::{desired_owned_routes, ManagedIpv4Route, RoutePlan, RouteSnapshot};
 use crate::dhcp::client::DhcpClientSpec;
 use crate::dhcp::supervisor::{DhcpServiceSpec, DhcpSupervisor};
 use crate::firewall::{
@@ -124,7 +124,7 @@ impl RouterDesired {
             uplink_dhcp,
             output_wifi,
             dhcp,
-            routes: config.router.desired_owned_routes(),
+            routes: desired_owned_routes(&config.router),
             allow_default_route_change: config.router.allow_default_route_change,
             dataplane: RouterDataplaneTarget::Enabled(dataplane),
             interfaces,
