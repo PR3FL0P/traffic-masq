@@ -9,7 +9,6 @@ use tokio::sync::Mutex;
 use crate::atomic_file::{self, PRIVATE_FILE_MODE};
 use crate::config::{AppConfig, ShutdownPolicy};
 use crate::dhcp::supervisor::resolve_interface_index;
-use crate::state::overrides::{RuntimeOverrides, WifiOverride};
 use crate::wifi::ctrl::{CtrlError, HostapdCtrlClient, HostapdState, MacAddr, Station};
 use crate::wifi::process::{ProcessError, SupervisedProcess, TokioSupervisedProcess};
 use crate::wifi::record::{
@@ -113,16 +112,12 @@ enum OwnershipOutcome {
 }
 
 impl HostapdSupervisor {
-    pub async fn start(
-        config: &AppConfig,
-        overrides: &RuntimeOverrides,
-    ) -> Result<Self, SupervisorError> {
-        Self::start_with_process(config, overrides, Arc::new(TokioSupervisedProcess::new())).await
+    pub async fn start(config: &AppConfig) -> Result<Self, SupervisorError> {
+        Self::start_with_process(config, Arc::new(TokioSupervisedProcess::new())).await
     }
 
     pub async fn start_with_process(
         config: &AppConfig,
-        overrides: &RuntimeOverrides,
         process: Arc<dyn SupervisedProcess>,
     ) -> Result<Self, SupervisorError> {
         let records_dir = config.runtime.state_dir.join("wifi");
@@ -140,7 +135,7 @@ impl HostapdSupervisor {
             }),
         };
 
-        for spec in Self::effective_specs(config, overrides)? {
+        for spec in Self::effective_specs(config)? {
             if resolve_interface_index(&spec.interface).is_err() {
                 tracing::warn!(
                     interface = %spec.interface,
@@ -164,41 +159,15 @@ impl HostapdSupervisor {
         Ok(supervisor)
     }
 
-    pub fn effective_specs(
-        config: &AppConfig,
-        overrides: &RuntimeOverrides,
-    ) -> Result<Vec<WifiApSpec>, anyhow::Error> {
+    /// One access point per interface the configuration asks for.
+    ///
+    /// See [`crate::dhcp::supervisor::DhcpSupervisor::effective_specs`] for why
+    /// this no longer consults the persisted overrides.
+    pub fn effective_specs(config: &AppConfig) -> Result<Vec<WifiApSpec>, anyhow::Error> {
         let mut specs = std::collections::BTreeMap::new();
         for (name, interface) in &config.network.interfaces {
             if let Some(spec) = WifiApSpec::from_interface_config(name, interface)? {
                 specs.insert(name.clone(), spec);
-            }
-        }
-
-        for (interface, value) in &overrides.wifi {
-            let effective = specs.get(interface);
-            match value {
-                WifiOverride::Configured { spec } => {
-                    if &spec.interface != interface {
-                        anyhow::bail!(
-                            "Wi-Fi override key {interface} does not match spec interface {}",
-                            spec.interface
-                        );
-                    }
-                    spec.validate()?;
-                    if effective != Some(spec) {
-                        anyhow::bail!(
-                            "Wi-Fi override for {interface} is inconsistent with the effective interface configuration"
-                        );
-                    }
-                }
-                WifiOverride::Disabled => {
-                    if effective.is_some() {
-                        anyhow::bail!(
-                            "disabled Wi-Fi override for {interface} conflicts with the effective interface configuration"
-                        );
-                    }
-                }
             }
         }
 
@@ -1089,7 +1058,7 @@ mod tests {
             },
         );
 
-        let specs = HostapdSupervisor::effective_specs(&config, &RuntimeOverrides::default())
+        let specs = HostapdSupervisor::effective_specs(&config)
             .expect("effective specs");
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].interface, "wlan0");

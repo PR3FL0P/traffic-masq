@@ -3779,7 +3779,7 @@ mod tests {
             .await
             .effective_config(&base)
             .expect("effective");
-        let dhcp = DhcpSupervisor::start(&effective, &overrides.snapshot().await)
+        let dhcp = DhcpSupervisor::start(&effective)
             .await
             .expect("dhcp supervisor");
         let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
@@ -3827,7 +3827,7 @@ mod tests {
         let overrides = RuntimeOverrideManager::load(directory.path(), &config)
             .await
             .expect("overrides");
-        let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await)
+        let dhcp = DhcpSupervisor::start(&config)
             .await
             .expect("dhcp supervisor");
         let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
@@ -3886,7 +3886,7 @@ mod tests {
         let overrides = RuntimeOverrideManager::load(directory.path(), &config)
             .await
             .expect("overrides");
-        let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await)
+        let dhcp = DhcpSupervisor::start(&config)
             .await
             .expect("dhcp supervisor");
         let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
@@ -3971,7 +3971,7 @@ mod tests {
             overrides.clone(),
             Duration::from_millis(200),
         );
-        let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await)
+        let dhcp = DhcpSupervisor::start(&config)
             .await
             .expect("dhcp supervisor");
         let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
@@ -3989,7 +3989,7 @@ mod tests {
         let overrides = RuntimeOverrideManager::load(directory.path(), &config)
             .await
             .expect("overrides");
-        let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await)
+        let dhcp = DhcpSupervisor::start(&config)
             .await
             .expect("dhcp supervisor");
         let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
@@ -4378,7 +4378,7 @@ mod tests {
         let overrides = RuntimeOverrideManager::load(directory.path(), &config)
             .await
             .expect("overrides");
-        let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await)
+        let dhcp = DhcpSupervisor::start(&config)
             .await
             .expect("dhcp supervisor");
         let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
@@ -4402,7 +4402,7 @@ mod tests {
         let overrides = RuntimeOverrideManager::load(directory.path(), &config)
             .await
             .expect("overrides");
-        let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await)
+        let dhcp = DhcpSupervisor::start(&config)
             .await
             .expect("dhcp supervisor");
         let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
@@ -4775,7 +4775,7 @@ mod tests {
         let overrides = RuntimeOverrideManager::load(directory.path(), &config)
             .await
             .expect("overrides");
-        let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await)
+        let dhcp = DhcpSupervisor::start(&config)
             .await
             .expect("dhcp supervisor");
         let network: Arc<dyn NetworkProvider> = FakePolicyNetwork::with_owned_interface();
@@ -4821,7 +4821,7 @@ mod tests {
         let overrides = RuntimeOverrideManager::load(directory.path(), &config)
             .await
             .expect("overrides");
-        let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await)
+        let dhcp = DhcpSupervisor::start(&config)
             .await
             .expect("dhcp supervisor");
         let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
@@ -5188,7 +5188,7 @@ mod tests {
         let overrides = RuntimeOverrideManager::load(directory.path(), &config)
             .await
             .expect("overrides");
-        let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await)
+        let dhcp = DhcpSupervisor::start(&config)
             .await
             .expect("dhcp supervisor");
         let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
@@ -5197,7 +5197,6 @@ mod tests {
         let process = FakeWifiProcess::new();
         let wifi = WifiSupervisor::start_with_process(
             &config,
-            &overrides.snapshot().await,
             process.clone(),
         )
         .await
@@ -5219,7 +5218,7 @@ mod tests {
         let overrides = RuntimeOverrideManager::load(directory.path(), &config)
             .await
             .expect("overrides");
-        let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await)
+        let dhcp = DhcpSupervisor::start(&config)
             .await
             .expect("dhcp supervisor");
         let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
@@ -5312,7 +5311,7 @@ mod tests {
         let overrides = RuntimeOverrideManager::load(fixture_directory.path(), &config)
             .await
             .expect("overrides");
-        let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await)
+        let dhcp = DhcpSupervisor::start(&config)
             .await
             .expect("dhcp supervisor");
         let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
@@ -5320,7 +5319,7 @@ mod tests {
         });
         let process = FakeWifiProcess::new();
         let wifi =
-            WifiSupervisor::start_with_process(&config, &overrides.snapshot().await, process)
+            WifiSupervisor::start_with_process(&config, process)
                 .await
                 .expect("wifi supervisor");
         let service =
@@ -5566,7 +5565,7 @@ mod tests {
         let overrides = RuntimeOverrideManager::load(directory.path(), &config)
             .await
             .expect("overrides");
-        let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await)
+        let dhcp = DhcpSupervisor::start(&config)
             .await
             .expect("dhcp supervisor");
         let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
@@ -5574,7 +5573,7 @@ mod tests {
         });
         let process = FakeWifiProcess::new();
         let wifi =
-            WifiSupervisor::start_with_process(&config, &overrides.snapshot().await, process)
+            WifiSupervisor::start_with_process(&config, process)
                 .await
                 .expect("wifi supervisor");
 
@@ -5640,7 +5639,7 @@ mod tests {
         let overrides = RuntimeOverrideManager::load(directory.path(), &config)
             .await
             .expect("overrides");
-        let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await)
+        let dhcp = DhcpSupervisor::start(&config)
             .await
             .expect("dhcp supervisor");
         let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
@@ -5656,7 +5655,7 @@ mod tests {
             )
             .unwrap();
         let wifi =
-            WifiSupervisor::start_with_process(&config, &overrides.snapshot().await, process)
+            WifiSupervisor::start_with_process(&config, process)
                 .await
                 .expect("wifi supervisor");
         configure_wlan0(&wifi, &config).await;
@@ -5875,7 +5874,7 @@ mod tests {
         let overrides = RuntimeOverrideManager::load(directory.path(), &config)
             .await
             .expect("overrides");
-        let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await)
+        let dhcp = DhcpSupervisor::start(&config)
             .await
             .expect("dhcp supervisor");
         let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
@@ -5883,7 +5882,6 @@ mod tests {
         });
         let wifi_client = ClientSupervisor::start_with_process(
             &config,
-            &overrides.snapshot().await,
             FakeSupplicantProcess::new(),
         )
         .await
@@ -5914,7 +5912,7 @@ mod tests {
         let overrides = RuntimeOverrideManager::load(directory.path(), &config)
             .await
             .expect("overrides");
-        let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await)
+        let dhcp = DhcpSupervisor::start(&config)
             .await
             .expect("dhcp supervisor");
         let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
@@ -6120,7 +6118,7 @@ mod tests {
         let overrides = RuntimeOverrideManager::load(directory.path(), &config)
             .await
             .expect("overrides");
-        let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await)
+        let dhcp = DhcpSupervisor::start(&config)
             .await
             .expect("dhcp supervisor");
         let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
@@ -6128,7 +6126,6 @@ mod tests {
         });
         let wifi_client = ClientSupervisor::start_with_process(
             &config,
-            &overrides.snapshot().await,
             FakeSupplicantProcess::new(),
         )
         .await
@@ -6318,7 +6315,7 @@ mod tests {
         let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
             addresses: Vec::new(),
         });
-        let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await)
+        let dhcp = DhcpSupervisor::start(&config)
             .await
             .expect("server supervisor");
         let supervisor = DhcpClientSupervisor::start(&config, network.clone())
@@ -6783,14 +6780,14 @@ mod tests {
         let overrides = RuntimeOverrideManager::load(directory.path(), &config)
             .await
             .expect("overrides");
-        let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await)
+        let dhcp = DhcpSupervisor::start(&config)
             .await
             .expect("dhcp supervisor");
 
-        let wifi = WifiSupervisor::start(&config, &overrides.snapshot().await)
+        let wifi = WifiSupervisor::start(&config)
             .await
             .expect("wifi supervisor");
-        let wifi_client = ClientSupervisor::start(&config, &overrides.snapshot().await)
+        let wifi_client = ClientSupervisor::start(&config)
             .await
             .expect("wifi client supervisor");
         let manager = RouterManager::new(subsystems.clone())
@@ -7272,7 +7269,7 @@ mod tests {
         let overrides = RuntimeOverrideManager::load(directory.path(), &config)
             .await
             .expect("overrides");
-        let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await)
+        let dhcp = DhcpSupervisor::start(&config)
             .await
             .expect("dhcp supervisor");
         let service = ControlService::new(

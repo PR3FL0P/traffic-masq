@@ -14,11 +14,12 @@ use crate::config::{
     VpnPolicyMode,
 };
 use crate::core::router::RouterDesired;
-use crate::dhcp::supervisor::DhcpServiceSpec;
 use crate::state::candidate::{RouterCandidate, RouterIntentProposal};
-use crate::wifi::{WifiApSpec, WifiClientSpec};
 
-pub const CURRENT_RUNTIME_OVERRIDES_SCHEMA: u32 = 1;
+/// Bumped to 2 when the derived `dhcp`/`wifi`/`wifi_client` maps left the
+/// persisted format. A version-1 file is refused rather than migrated: it holds
+/// nothing a version-2 file cannot recompute, so there is nothing to carry over.
+pub const CURRENT_RUNTIME_OVERRIDES_SCHEMA: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,14 +39,6 @@ pub struct RuntimeOverrides {
     #[serde(default)]
     pub vpn_mode: Option<VpnPolicyMode>,
     #[serde(default)]
-    pub dhcp: BTreeMap<String, DhcpOverride>,
-
-    #[serde(default)]
-    pub wifi: BTreeMap<String, WifiOverride>,
-
-    #[serde(default)]
-    pub wifi_client: BTreeMap<String, WifiClientOverride>,
-    #[serde(default)]
     pub interfaces: BTreeMap<String, InterfaceOverride>,
 }
 
@@ -58,9 +51,6 @@ impl Default for RuntimeOverrides {
             api: None,
             security: None,
             vpn_mode: None,
-            dhcp: BTreeMap::new(),
-            wifi: BTreeMap::new(),
-            wifi_client: BTreeMap::new(),
             interfaces: BTreeMap::new(),
         }
     }
@@ -68,27 +58,6 @@ impl Default for RuntimeOverrides {
 
 const fn current_schema_version() -> u32 {
     CURRENT_RUNTIME_OVERRIDES_SCHEMA
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum DhcpOverride {
-    Configured { spec: DhcpServiceSpec },
-    Disabled,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum WifiOverride {
-    Configured { spec: WifiApSpec },
-    Disabled,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum WifiClientOverride {
-    Configured { spec: WifiClientSpec },
-    Disabled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,98 +96,15 @@ impl RuntimeOverrides {
         Ok(effective)
     }
 
-    pub fn normalized(&self, default_lease_seconds: u32) -> Result<Self> {
+    /// Stamped with the current schema version.
+    ///
+    /// This used to also rebuild `dhcp`/`wifi`/`wifi_client` from `interfaces`
+    /// and is all that is left of that: those maps were a persisted cache of
+    /// what `interfaces` already determines, and nothing read them.
+    pub fn normalized(&self) -> Result<Self> {
         let mut normalized = self.clone();
         normalized.schema_version = CURRENT_RUNTIME_OVERRIDES_SCHEMA;
-        normalized.rebuild_derived_dhcp(default_lease_seconds)?;
-        normalized.rebuild_derived_wifi()?;
-        normalized.rebuild_derived_wifi_client()?;
         Ok(normalized)
-    }
-
-    fn rebuild_derived_dhcp(&mut self, default_lease_seconds: u32) -> Result<()> {
-        for (interface, value) in &self.interfaces {
-            let derived = DhcpServiceSpec::from_interface_config(
-                interface,
-                &value.config,
-                default_lease_seconds,
-            )?;
-            self.dhcp.insert(
-                interface.clone(),
-                match derived {
-                    Some(spec) => DhcpOverride::Configured { spec },
-                    None => DhcpOverride::Disabled,
-                },
-            );
-        }
-        Ok(())
-    }
-
-    fn validate_derived_dhcp(&self, default_lease_seconds: u32) -> Result<()> {
-        let mut canonical = self.clone();
-        canonical.rebuild_derived_dhcp(default_lease_seconds)?;
-        for interface in self.interfaces.keys() {
-            if self.dhcp.get(interface) != canonical.dhcp.get(interface) {
-                bail!("persisted DHCP override for {interface} is stale relative to its interface config");
-            }
-        }
-        Ok(())
-    }
-
-    fn rebuild_derived_wifi(&mut self) -> Result<()> {
-        for (interface, value) in &self.interfaces {
-            let derived = WifiApSpec::from_interface_config(interface, &value.config)?;
-            self.wifi.insert(
-                interface.clone(),
-                match derived {
-                    Some(spec) => WifiOverride::Configured { spec },
-                    None => WifiOverride::Disabled,
-                },
-            );
-        }
-        Ok(())
-    }
-
-    fn validate_derived_wifi(&self) -> Result<()> {
-        let mut canonical = self.clone();
-        canonical.rebuild_derived_wifi()?;
-        for interface in self.interfaces.keys() {
-            let Some(persisted) = self.wifi.get(interface) else {
-                continue;
-            };
-            if Some(persisted) != canonical.wifi.get(interface) {
-                bail!("persisted Wi-Fi override for {interface} is stale relative to its interface config");
-            }
-        }
-        Ok(())
-    }
-
-    fn rebuild_derived_wifi_client(&mut self) -> Result<()> {
-        for (interface, value) in &self.interfaces {
-            let derived = WifiClientSpec::from_interface_config(interface, &value.config)?;
-            self.wifi_client.insert(
-                interface.clone(),
-                match derived {
-                    Some(spec) => WifiClientOverride::Configured { spec },
-                    None => WifiClientOverride::Disabled,
-                },
-            );
-        }
-        Ok(())
-    }
-
-    fn validate_derived_wifi_client(&self) -> Result<()> {
-        let mut canonical = self.clone();
-        canonical.rebuild_derived_wifi_client()?;
-        for interface in self.interfaces.keys() {
-            let Some(persisted) = self.wifi_client.get(interface) else {
-                continue;
-            };
-            if Some(persisted) != canonical.wifi_client.get(interface) {
-                bail!("persisted Wi-Fi client override for {interface} is stale relative to its interface config");
-            }
-        }
-        Ok(())
     }
 }
 
@@ -318,26 +204,6 @@ impl RuntimeOverrideManager {
     pub async fn load(state_dir: impl AsRef<Path>, base: &AppConfig) -> Result<Self> {
         let store = RuntimeOverrideStore::in_state_dir(state_dir);
         let state = store.load().await?;
-        state
-            .validate_derived_dhcp(base.dhcp.default_lease_seconds)
-            .with_context(|| {
-                format!(
-                    "runtime overrides in {} contain inconsistent derived DHCP state",
-                    store.path().display()
-                )
-            })?;
-        state.validate_derived_wifi().with_context(|| {
-            format!(
-                "runtime overrides in {} contain inconsistent derived Wi-Fi state",
-                store.path().display()
-            )
-        })?;
-        state.validate_derived_wifi_client().with_context(|| {
-            format!(
-                "runtime overrides in {} contain inconsistent derived Wi-Fi client state",
-                store.path().display()
-            )
-        })?;
         validate_candidate(&state, base).with_context(|| {
             format!(
                 "runtime overrides in {} are invalid",
@@ -419,7 +285,7 @@ impl RuntimeOverrideManager {
         state: &mut RuntimeOverrides,
         candidate: RuntimeOverrides,
     ) -> Result<()> {
-        let mut candidate = candidate.normalized(self.base.dhcp.default_lease_seconds)?;
+        let mut candidate = candidate.normalized()?;
         validate_candidate(&candidate, &self.base)?;
         candidate.revision = state
             .revision
@@ -441,13 +307,6 @@ impl RuntimeOverrideManager {
     /// moved since it last looked, and it looks once before it starts waiting.
     pub async fn changed(&self) {
         self.changed.notified().await;
-    }
-
-    pub async fn set_dhcp(&self, interface: String, value: DhcpOverride) -> Result<()> {
-        let mut state = self.state.lock().await;
-        let mut candidate = state.clone();
-        candidate.dhcp.insert(interface, value);
-        self.save_locked(&mut state, candidate).await
     }
 
     pub async fn set_api_config(&self, api: ApiConfig) -> Result<()> {
@@ -527,7 +386,7 @@ impl RuntimeOverrideManager {
                 allow_management_change,
             },
         );
-        let candidate = candidate.normalized(self.base.dhcp.default_lease_seconds)?;
+        let candidate = candidate.normalized()?;
         validate_candidate(&candidate, &self.base)
     }
 
@@ -558,8 +417,6 @@ mod tests {
 
     use crate::config::{
         DhcpClientInterfaceConfig, DhcpInterfaceConfig, InterfaceRole, UplinkConfig, UplinkMode,
-        WifiApConfig, WifiBand, WifiChannelWidth, WifiClientConfig, WifiClientSecurity,
-        WifiSecurity,
     };
 
     use super::*;
@@ -626,17 +483,16 @@ mod tests {
         config
     }
 
-    fn spec() -> DhcpServiceSpec {
-        DhcpServiceSpec {
-            interface: "wlan0".to_string(),
-            server_ip: Ipv4Addr::new(192, 168, 10, 1),
-            prefix_len: 24,
-            subnet_mask: Ipv4Addr::new(255, 255, 255, 0),
-            pool_start: Ipv4Addr::new(192, 168, 10, 100),
-            pool_end: Ipv4Addr::new(192, 168, 10, 200),
-            router: Ipv4Addr::new(192, 168, 10, 1),
-            dns_servers: vec![Ipv4Addr::new(8, 8, 8, 8)],
-            lease_seconds: 3600,
+    /// A successful, self-contained mutation, for tests that need the store to
+    /// change but do not care what changed. `set_dhcp` used to serve this role.
+    fn api_override(port: u16) -> ApiConfig {
+        ApiConfig {
+            tcp: Some(crate::config::TcpApiConfig {
+                enabled: true,
+                listen: format!("0.0.0.0:{port}").parse().expect("socket address"),
+                certificate_path: Some("/etc/traffic-masq/server.pem".into()),
+                private_key_path: Some("/etc/traffic-masq/server-key.pem".into()),
+            }),
         }
     }
 
@@ -647,7 +503,7 @@ mod tests {
         tokio::fs::write(
             store.path(),
             serde_json::to_vec(&serde_json::json!({
-                "dhcp": {"wlan0": {"state": "configured", "spec": spec()}},
+                "api": {"tcp": null},
                 "interfaces": {}
             }))
             .unwrap(),
@@ -661,7 +517,7 @@ mod tests {
         let state = manager.snapshot().await;
         assert_eq!(state.schema_version, CURRENT_RUNTIME_OVERRIDES_SCHEMA);
         assert_eq!(state.revision, 0);
-        assert!(state.dhcp.contains_key("wlan0"));
+        assert_eq!(state.api, Some(ApiConfig { tcp: None }));
     }
 
     #[tokio::test]
@@ -671,8 +527,7 @@ mod tests {
         tokio::fs::write(
             store.path(),
             br#"{
-                "schema_version": 1,
-                "dhcp": {"wan0": {"state": "disabled"}},
+                "schema_version": 2,
                 "interfaces": {
                     "wan0": {
                         "config": {
@@ -743,31 +598,9 @@ mod tests {
             )]),
             ..RuntimeOverrides::default()
         }
-        .normalized(base.dhcp.default_lease_seconds)
+        .normalized()
         .unwrap();
         assert_eq!(normalized.interfaces["wan0"].config, interface);
-    }
-
-    #[tokio::test]
-    async fn current_document_saves_and_reloads() {
-        let directory = tempdir().expect("tempdir");
-        let base = base_config();
-        let manager = RuntimeOverrideManager::load(directory.path(), &base)
-            .await
-            .unwrap();
-        manager
-            .set_dhcp("wlan0".into(), DhcpOverride::Configured { spec: spec() })
-            .await
-            .unwrap();
-
-        let restored = RuntimeOverrideManager::load(directory.path(), &base)
-            .await
-            .unwrap()
-            .snapshot()
-            .await;
-        assert_eq!(restored.schema_version, CURRENT_RUNTIME_OVERRIDES_SCHEMA);
-        assert_eq!(restored.revision, 1);
-        assert!(restored.dhcp.contains_key("wlan0"));
     }
 
     #[tokio::test]
@@ -992,14 +825,14 @@ mod tests {
     async fn rejects_future_schema_version() {
         let directory = tempdir().expect("tempdir");
         let store = RuntimeOverrideStore::in_state_dir(directory.path());
-        tokio::fs::write(store.path(), br#"{"schema_version":2,"revision":0}"#)
+        tokio::fs::write(store.path(), br#"{"schema_version":3,"revision":0}"#)
             .await
             .unwrap();
 
         let error = RuntimeOverrideManager::load(directory.path(), &base_config())
             .await
             .expect_err("future schema");
-        assert!(error.to_string().contains("future schema version 2"));
+        assert!(error.to_string().contains("future schema version 3"));
     }
 
     #[tokio::test]
@@ -1058,54 +891,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_stale_persisted_derived_dhcp() {
-        let directory = tempdir().expect("tempdir");
-        let store = RuntimeOverrideStore::in_state_dir(directory.path());
-        let mut state = RuntimeOverrides::default();
-        state.interfaces.insert(
-            "wlan0".into(),
-            InterfaceOverride {
-                config: dhcp_interface_config("192.168.10.1/24"),
-                allow_management_change: false,
-            },
-        );
-        state.dhcp.insert("wlan0".into(), DhcpOverride::Disabled);
-        store.save(&state).await.unwrap();
-
-        let error = RuntimeOverrideManager::load(directory.path(), &base_config())
-            .await
-            .expect_err("stale DHCP");
-        assert!(format!("{error:#}").contains("stale relative"));
-    }
-
-    #[tokio::test]
-    async fn save_rebuilds_derived_dhcp_deterministically() {
-        let directory = tempdir().expect("tempdir");
-        let base = base_config();
-        let manager = RuntimeOverrideManager::load(directory.path(), &base)
-            .await
-            .unwrap();
-        let mut candidate = manager.snapshot().await;
-        candidate.interfaces.insert(
-            "wlan0".into(),
-            InterfaceOverride {
-                config: dhcp_interface_config("192.168.10.1/24"),
-                allow_management_change: false,
-            },
-        );
-        candidate
-            .dhcp
-            .insert("wlan0".into(), DhcpOverride::Disabled);
-        manager.save_committed(candidate).await.unwrap();
-
-        let state = manager.snapshot().await;
-        let DhcpOverride::Configured { spec } = state.dhcp.get("wlan0").unwrap() else {
-            panic!("derived DHCP must be rebuilt");
-        };
-        assert_eq!(spec.server_ip, Ipv4Addr::new(192, 168, 10, 1));
-    }
-
-    #[tokio::test]
     async fn invalid_candidate_leaves_file_state_and_revision_unchanged() {
         let directory = tempdir().expect("tempdir");
         let mut base = base_config();
@@ -1116,7 +901,7 @@ mod tests {
             .await
             .unwrap();
         manager
-            .set_dhcp("wlan0".into(), DhcpOverride::Configured { spec: spec() })
+            .set_api_config(api_override(9443))
             .await
             .unwrap();
         let before_state = manager.snapshot().await;
@@ -1144,7 +929,7 @@ mod tests {
         let before = manager.snapshot().await;
 
         manager
-            .set_dhcp("wlan0".into(), DhcpOverride::Configured { spec: spec() })
+            .set_api_config(api_override(9443))
             .await
             .expect_err("rename over directory must fail");
 
@@ -1165,7 +950,7 @@ mod tests {
             .unwrap();
 
         manager
-            .set_dhcp("wlan0".into(), DhcpOverride::Configured { spec: spec() })
+            .set_api_config(api_override(9443))
             .await
             .unwrap();
         assert_eq!(manager.snapshot().await.revision, 1);
@@ -1175,7 +960,7 @@ mod tests {
             .expect_err("invalid save");
         assert_eq!(manager.snapshot().await.revision, 1);
         manager
-            .set_dhcp("usb0".into(), DhcpOverride::Disabled)
+            .set_api_config(api_override(9444))
             .await
             .unwrap();
         assert_eq!(manager.snapshot().await.revision, 2);
@@ -1316,21 +1101,15 @@ mod tests {
             .unwrap();
         let first = manager.clone();
         let second = manager.clone();
-        let mut second_spec = spec();
-        second_spec.interface = "usb0".into();
-
         let (first_result, second_result) = tokio::join!(
-            first.set_dhcp("wlan0".into(), DhcpOverride::Configured { spec: spec() }),
-            second.set_dhcp(
-                "usb0".into(),
-                DhcpOverride::Configured { spec: second_spec }
-            )
+            first.set_interface("wlan0".into(), interface_config("192.168.10.1/24"), false),
+            second.set_interface("usb0".into(), interface_config("192.168.20.1/24"), false)
         );
         first_result.unwrap();
         second_result.unwrap();
         let state = manager.snapshot().await;
         assert_eq!(state.revision, 2);
-        assert_eq!(state.dhcp.len(), 2);
+        assert_eq!(state.interfaces.len(), 2);
     }
 
     #[tokio::test]
@@ -1349,231 +1128,4 @@ mod tests {
         assert!(message.contains("runtime-overrides.json"));
     }
 
-    fn wifi_interface_config(address: &str) -> InterfaceConfig {
-        let mut config = interface_config(address);
-        config.wifi = Some(WifiApConfig {
-            ssid: "traffic-masq".to_string(),
-            country_code: Some("PL".to_string()),
-            band: WifiBand::Ghz2,
-            channel: 6,
-            channel_width: WifiChannelWidth::Ht20,
-            security: WifiSecurity::Wpa2,
-            hidden: false,
-            client_isolation: false,
-            max_stations: 32,
-            passphrase_file: None,
-        });
-        config
-    }
-
-    #[tokio::test]
-    async fn saving_an_interface_override_derives_its_wifi_section() {
-        let directory = tempdir().expect("tempdir");
-        let manager = RuntimeOverrideManager::load(directory.path(), &base_config())
-            .await
-            .expect("load");
-
-        manager
-            .set_interface(
-                "wlan0".into(),
-                wifi_interface_config("192.168.10.1/24"),
-                false,
-            )
-            .await
-            .expect("save");
-
-        let state = manager.snapshot().await;
-        let WifiOverride::Configured { spec } = state.wifi.get("wlan0").expect("derived wifi")
-        else {
-            panic!("an interface with a wifi block must derive a configured AP");
-        };
-        assert_eq!(spec.interface, "wlan0");
-        assert_eq!(spec.ssid, "traffic-masq");
-
-        manager
-            .set_interface("lan0".into(), interface_config("192.168.20.1/24"), false)
-            .await
-            .expect("save");
-        assert_eq!(
-            manager.snapshot().await.wifi.get("lan0"),
-            Some(&WifiOverride::Disabled)
-        );
-    }
-
-    #[tokio::test]
-    async fn a_document_predating_the_wifi_section_still_loads() {
-        let directory = tempdir().expect("tempdir");
-        let store = RuntimeOverrideStore::in_state_dir(directory.path());
-
-        tokio::fs::write(
-            store.path(),
-            serde_json::to_vec(&serde_json::json!({
-                "schema_version": CURRENT_RUNTIME_OVERRIDES_SCHEMA,
-                "revision": 7,
-                "dhcp": {"wlan0": {"state": "configured", "spec": spec()}},
-                "interfaces": {}
-            }))
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-
-        let manager = RuntimeOverrideManager::load(directory.path(), &base_config())
-            .await
-            .expect("pre-wifi document loads");
-        let state = manager.snapshot().await;
-        assert_eq!(state.revision, 7);
-        assert!(state.wifi.is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_wifi_section_contradicting_its_interface_is_rejected_at_load() {
-        let directory = tempdir().expect("tempdir");
-        let store = RuntimeOverrideStore::in_state_dir(directory.path());
-        let mut document = RuntimeOverrides::default();
-        document.interfaces.insert(
-            "wlan0".into(),
-            InterfaceOverride {
-                config: wifi_interface_config("192.168.10.1/24"),
-                allow_management_change: false,
-            },
-        );
-        document.dhcp.insert("wlan0".into(), DhcpOverride::Disabled);
-
-        document.wifi.insert("wlan0".into(), WifiOverride::Disabled);
-        tokio::fs::write(store.path(), serde_json::to_vec(&document).unwrap())
-            .await
-            .unwrap();
-
-        let error = RuntimeOverrideManager::load(directory.path(), &base_config())
-            .await
-            .expect_err("inconsistent derived wifi must fail");
-        let message = format!("{error:#}");
-        assert!(
-            message.contains("inconsistent derived Wi-Fi state"),
-            "{message}"
-        );
-    }
-
-    fn wifi_client_interface_config(ssid: &str) -> InterfaceConfig {
-        InterfaceConfig {
-            role: InterfaceRole::Input,
-            managed: false,
-            ipv4: None,
-            dhcp: None,
-            dhcp_client: None,
-            wifi: None,
-            wifi_client: Some(WifiClientConfig {
-                ssid: ssid.to_string(),
-                country_code: Some("PL".to_string()),
-                security: WifiClientSecurity::Wpa2,
-                passphrase_file: None,
-            }),
-        }
-    }
-
-    #[tokio::test]
-    async fn saving_an_interface_override_derives_its_wifi_client_section() {
-        let directory = tempdir().expect("tempdir");
-        let manager = RuntimeOverrideManager::load(directory.path(), &base_config())
-            .await
-            .expect("load");
-
-        manager
-            .set_interface(
-                "wlan1".into(),
-                wifi_client_interface_config("upstream-network"),
-                false,
-            )
-            .await
-            .expect("save");
-
-        let state = manager.snapshot().await;
-        let WifiClientOverride::Configured { spec } =
-            state.wifi_client.get("wlan1").expect("derived wifi client")
-        else {
-            panic!("an interface with a wifi_client block must derive a configured association");
-        };
-        assert_eq!(spec.interface, "wlan1");
-        assert_eq!(spec.ssid, "upstream-network");
-
-        assert_eq!(state.wifi.get("wlan1"), Some(&WifiOverride::Disabled));
-
-        manager
-            .set_interface("lan0".into(), interface_config("192.168.20.1/24"), false)
-            .await
-            .expect("save");
-        assert_eq!(
-            manager.snapshot().await.wifi_client.get("lan0"),
-            Some(&WifiClientOverride::Disabled)
-        );
-    }
-
-    #[tokio::test]
-    async fn a_document_predating_the_derived_wifi_sections_still_loads() {
-        let directory = tempdir().expect("tempdir");
-        let store = RuntimeOverrideStore::in_state_dir(directory.path());
-
-        let document = RuntimeOverrides {
-            interfaces: BTreeMap::from([(
-                "wlan0".to_string(),
-                InterfaceOverride {
-                    config: wifi_interface_config("192.168.10.1/24"),
-                    allow_management_change: false,
-                },
-            )]),
-            ..RuntimeOverrides::default()
-        }
-        .normalized(base_config().dhcp.default_lease_seconds)
-        .expect("normalize");
-        let mut value = serde_json::to_value(&document).expect("serialize");
-        let object = value.as_object_mut().expect("object");
-        for key in ["wifi", "wifi_client"] {
-            object.remove(key).expect("the key is there to be stripped");
-        }
-        assert!(object.contains_key("dhcp"), "the DHCP half must survive");
-        tokio::fs::write(store.path(), serde_json::to_vec(&value).unwrap())
-            .await
-            .unwrap();
-
-        let manager = RuntimeOverrideManager::load(directory.path(), &base_config())
-            .await
-            .expect("a document predating both Wi-Fi maps loads");
-        let state = manager.snapshot().await;
-        assert!(state.interfaces.contains_key("wlan0"));
-        assert!(state.wifi.is_empty());
-        assert!(state.wifi_client.is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_wifi_client_section_contradicting_its_interface_is_rejected_at_load() {
-        let directory = tempdir().expect("tempdir");
-        let store = RuntimeOverrideStore::in_state_dir(directory.path());
-        let mut document = RuntimeOverrides::default();
-        document.interfaces.insert(
-            "wlan1".into(),
-            InterfaceOverride {
-                config: wifi_client_interface_config("upstream-network"),
-                allow_management_change: false,
-            },
-        );
-        document.dhcp.insert("wlan1".into(), DhcpOverride::Disabled);
-        document.wifi.insert("wlan1".into(), WifiOverride::Disabled);
-
-        document
-            .wifi_client
-            .insert("wlan1".into(), WifiClientOverride::Disabled);
-        tokio::fs::write(store.path(), serde_json::to_vec(&document).unwrap())
-            .await
-            .unwrap();
-
-        let error = RuntimeOverrideManager::load(directory.path(), &base_config())
-            .await
-            .expect_err("inconsistent derived wifi client must fail");
-        let message = format!("{error:#}");
-        assert!(
-            message.contains("inconsistent derived Wi-Fi client state"),
-            "{message}"
-        );
-    }
 }

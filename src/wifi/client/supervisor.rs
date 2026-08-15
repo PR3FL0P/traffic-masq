@@ -9,7 +9,6 @@ use tokio::sync::Mutex;
 use crate::atomic_file::{self, PRIVATE_FILE_MODE};
 use crate::config::{AppConfig, ShutdownPolicy};
 use crate::dhcp::supervisor::resolve_interface_index;
-use crate::state::overrides::{RuntimeOverrides, WifiClientOverride};
 use crate::wifi::client::ctrl::{
     CtrlError, WpaState, WpaSupplicantCtrlClient, WpaSupplicantEvent, WpaSupplicantEventClient,
     WpaSupplicantScanResult,
@@ -132,16 +131,12 @@ enum OwnershipOutcome {
 }
 
 impl WifiClientSupervisor {
-    pub async fn start(
-        config: &AppConfig,
-        overrides: &RuntimeOverrides,
-    ) -> Result<Self, ClientSupervisorError> {
-        Self::start_with_process(config, overrides, Arc::new(TokioSupervisedProcess::new())).await
+    pub async fn start(config: &AppConfig) -> Result<Self, ClientSupervisorError> {
+        Self::start_with_process(config, Arc::new(TokioSupervisedProcess::new())).await
     }
 
     pub async fn start_with_process(
         config: &AppConfig,
-        overrides: &RuntimeOverrides,
         process: Arc<dyn SupervisedProcess>,
     ) -> Result<Self, ClientSupervisorError> {
         let records_dir = config.runtime.state_dir.join("wifi");
@@ -160,7 +155,7 @@ impl WifiClientSupervisor {
             }),
         };
 
-        for spec in Self::effective_specs(config, overrides)? {
+        for spec in Self::effective_specs(config)? {
             if resolve_interface_index(&spec.interface).is_err() {
                 tracing::warn!(
                     interface = %spec.interface,
@@ -183,41 +178,15 @@ impl WifiClientSupervisor {
         Ok(supervisor)
     }
 
-    pub fn effective_specs(
-        config: &AppConfig,
-        overrides: &RuntimeOverrides,
-    ) -> Result<Vec<WifiClientSpec>, anyhow::Error> {
+    /// One supplicant per interface the configuration asks for.
+    ///
+    /// See [`crate::dhcp::supervisor::DhcpSupervisor::effective_specs`] for why
+    /// this no longer consults the persisted overrides.
+    pub fn effective_specs(config: &AppConfig) -> Result<Vec<WifiClientSpec>, anyhow::Error> {
         let mut specs = std::collections::BTreeMap::new();
         for (name, interface) in &config.network.interfaces {
             if let Some(spec) = WifiClientSpec::from_interface_config(name, interface)? {
                 specs.insert(name.clone(), spec);
-            }
-        }
-
-        for (interface, value) in &overrides.wifi_client {
-            let effective = specs.get(interface);
-            match value {
-                WifiClientOverride::Configured { spec } => {
-                    if &spec.interface != interface {
-                        anyhow::bail!(
-                            "Wi-Fi client override key {interface} does not match spec interface {}",
-                            spec.interface
-                        );
-                    }
-                    spec.validate()?;
-                    if effective != Some(spec) {
-                        anyhow::bail!(
-                            "Wi-Fi client override for {interface} is inconsistent with the effective interface configuration"
-                        );
-                    }
-                }
-                WifiClientOverride::Disabled => {
-                    if effective.is_some() {
-                        anyhow::bail!(
-                            "disabled Wi-Fi client override for {interface} conflicts with the effective interface configuration"
-                        );
-                    }
-                }
             }
         }
 
@@ -1068,7 +1037,6 @@ mod tests {
     ) -> WifiClientSupervisor {
         WifiClientSupervisor::start_with_process(
             &app_config(state_dir, runtime_dir),
-            &RuntimeOverrides::default(),
             process,
         )
         .await
@@ -1765,33 +1733,4 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn effective_specs_rejects_a_derived_override_that_contradicts_the_config() {
-        let temp = tempdir().expect("tempdir");
-        let mut config = app_config(temp.path(), &temp.path().join("run"));
-        config.network.interfaces.insert(
-            "wlan0".to_string(),
-            InterfaceConfig {
-                role: InterfaceRole::Input,
-                managed: false,
-                ipv4: None,
-                dhcp: None,
-                dhcp_client: None,
-                wifi: None,
-                wifi_client: Some(client_config("upstream")),
-            },
-        );
-
-        let mut overrides = RuntimeOverrides::default();
-        overrides
-            .wifi_client
-            .insert("wlan0".to_string(), WifiClientOverride::Disabled);
-
-        let error = WifiClientSupervisor::effective_specs(&config, &overrides)
-            .expect_err("contradiction must be rejected");
-        assert!(
-            error.to_string().contains("conflicts with"),
-            "unexpected error: {error}"
-        );
-    }
 }

@@ -421,7 +421,7 @@ fn production_dataplane_provider() -> Result<ProductionDataplaneProvider> {
     ))
 }
 
-fn management_allowlist(snapshot: &crate::state::overrides::RuntimeOverrides) -> BTreeSet<String> {
+fn management_allowlist(snapshot: &RuntimeOverrides) -> BTreeSet<String> {
     snapshot
         .interfaces
         .iter()
@@ -891,10 +891,7 @@ async fn preflight_hostapd_binary(binary: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn build_wifi_supervisor(
-    effective_config: &AppConfig,
-    override_snapshot: &RuntimeOverrides,
-) -> Result<Option<HostapdSupervisor>> {
+async fn build_wifi_supervisor(effective_config: &AppConfig) -> Result<Option<HostapdSupervisor>> {
     // Built regardless of `wifi.enabled`: constructing the supervisor has no
     // side effects, and gating it made enabling Wi-Fi a boot-time decision —
     // with no supervisor every Wi-Fi request answers "disabled", which is the
@@ -906,7 +903,7 @@ async fn build_wifi_supervisor(
     if effective_config.wifi.enabled {
         preflight_hostapd_binary(&effective_config.wifi.hostapd_binary).await?;
     }
-    let supervisor = HostapdSupervisor::start(effective_config, override_snapshot).await?;
+    let supervisor = HostapdSupervisor::start(effective_config).await?;
     Ok(Some(supervisor))
 }
 
@@ -926,14 +923,13 @@ async fn preflight_wpa_supplicant_binary(binary: &Path) -> Result<()> {
 
 async fn build_wifi_client_supervisor(
     effective_config: &AppConfig,
-    override_snapshot: &RuntimeOverrides,
 ) -> Result<Option<WifiClientSupervisor>> {
     // Same reasoning as `build_wifi_supervisor`.
     if effective_config.wifi_client.enabled {
         preflight_wpa_supplicant_binary(&effective_config.wifi_client.wpa_supplicant_binary)
             .await?;
     }
-    let supervisor = WifiClientSupervisor::start(effective_config, override_snapshot).await?;
+    let supervisor = WifiClientSupervisor::start(effective_config).await?;
     Ok(Some(supervisor))
 }
 
@@ -981,7 +977,7 @@ pub async fn run_daemon(config: AppConfig) -> Result<()> {
         return Ok(());
     }
 
-    let wifi_supervisor = match build_wifi_supervisor(&effective_config, &override_snapshot).await {
+    let wifi_supervisor = match build_wifi_supervisor(&effective_config).await {
         Ok(supervisor) => supervisor,
         Err(error) => {
             rollback_interfaces(&interface_manager, &startup_baselines).await;
@@ -999,7 +995,7 @@ pub async fn run_daemon(config: AppConfig) -> Result<()> {
     }
 
     let wifi_client_supervisor =
-        match build_wifi_client_supervisor(&effective_config, &override_snapshot).await {
+        match build_wifi_client_supervisor(&effective_config).await {
             Ok(supervisor) => supervisor,
             Err(error) => {
                 rollback_interfaces(&interface_manager, &startup_baselines).await;
@@ -1021,7 +1017,7 @@ pub async fn run_daemon(config: AppConfig) -> Result<()> {
         return Ok(());
     }
 
-    let dhcp = match DhcpSupervisor::start(&effective_config, &override_snapshot).await {
+    let dhcp = match DhcpSupervisor::start(&effective_config).await {
         Ok(supervisor) => supervisor,
         Err(error) => {
             rollback_interfaces(&interface_manager, &startup_baselines).await;
@@ -2917,9 +2913,8 @@ mod tests {
         let mut config = AppConfig::default();
         config.wifi.enabled = false;
         config.wifi.hostapd_binary = std::path::PathBuf::from("/definitely/not/a/real/hostapd");
-        let overrides = RuntimeOverrides::default();
 
-        let supervisor = build_wifi_supervisor(&config, &overrides)
+        let supervisor = build_wifi_supervisor(&config)
             .await
             .expect("a missing binary must not fail startup while Wi-Fi is off")
             .expect("the supervisor must exist so Wi-Fi can be enabled at runtime");
@@ -2938,9 +2933,8 @@ mod tests {
         let mut config = AppConfig::default();
         config.wifi.enabled = true;
         config.wifi.hostapd_binary = std::path::PathBuf::from("/definitely/not/a/real/hostapd");
-        let overrides = RuntimeOverrides::default();
 
-        assert!(build_wifi_supervisor(&config, &overrides).await.is_err());
+        assert!(build_wifi_supervisor(&config).await.is_err());
     }
 
     #[tokio::test]
@@ -2949,9 +2943,8 @@ mod tests {
         config.wifi_client.enabled = false;
         config.wifi_client.wpa_supplicant_binary =
             std::path::PathBuf::from("/definitely/not/a/real/wpa_supplicant");
-        let overrides = RuntimeOverrides::default();
 
-        let supervisor = build_wifi_client_supervisor(&config, &overrides)
+        let supervisor = build_wifi_client_supervisor(&config)
             .await
             .expect("a missing binary must not fail startup while the client is off")
             .expect("the supervisor must exist so the client can be enabled at runtime");

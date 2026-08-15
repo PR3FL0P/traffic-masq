@@ -11,7 +11,6 @@ use tokio::time::sleep;
 use traffic_masq::config::AppConfig;
 use traffic_masq::dhcp::supervisor::{DhcpServiceSpec, DhcpSupervisor};
 use traffic_masq::netlink::{AddressOwnership, NetworkProvider, RtnetlinkNetworkProvider};
-use traffic_masq::state::overrides::RuntimeOverrides;
 
 static NAMESPACE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -111,7 +110,7 @@ async fn two_output_interfaces_serve_isolated_dhcp_pools_concurrently() -> Resul
     let leases = tempdir()?;
     let mut config = AppConfig::default();
     config.dhcp.leases_dir = leases.path().to_path_buf();
-    let supervisor = DhcpSupervisor::start(&config, &RuntimeOverrides::default()).await?;
+    let supervisor = DhcpSupervisor::start(&config).await?;
 
     configure_server(
         &supervisor,
@@ -290,7 +289,7 @@ async fn embedded_dhcp_assigns_lease_to_namespace_client() -> Result<()> {
     let leases = tempdir()?;
     let mut config = AppConfig::default();
     config.dhcp.leases_dir = leases.path().to_path_buf();
-    let supervisor = DhcpSupervisor::start(&config, &RuntimeOverrides::default()).await?;
+    let supervisor = DhcpSupervisor::start(&config).await?;
     configure_server(&supervisor, &network, &fixture, server_ip, 88).await?;
     sleep(Duration::from_millis(150)).await;
 

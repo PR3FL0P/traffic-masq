@@ -1198,10 +1198,7 @@ mod tests {
 
         let interfaces = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
         let routes = RouteManager::new(provider.clone());
-        let dhcp = DhcpSupervisor::start(
-            &AppConfig::default(),
-            &crate::state::overrides::RuntimeOverrides::default(),
-        )
+        let dhcp = DhcpSupervisor::start(&AppConfig::default())
         .await
         .expect("dhcp supervisor without any configured interfaces never binds a socket");
         let dataplane = RouterDataplaneManager::new(FakeDataplaneProvider::default());

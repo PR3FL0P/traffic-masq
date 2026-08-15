@@ -18,7 +18,6 @@ use crate::dhcp::runtime::{
 };
 use crate::dhcp::server::{DhcpHandler, DhcpServerConfig};
 use crate::dhcp::store::LeaseStore;
-use crate::state::overrides::{DhcpOverride, RuntimeOverrides};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DhcpServiceSpec {
@@ -129,46 +128,22 @@ impl DhcpSupervisor {
         Ok(specs)
     }
 
-    pub fn effective_specs(
-        config: &AppConfig,
-        overrides: &RuntimeOverrides,
-    ) -> Result<Vec<DhcpServiceSpec>> {
+    /// One DHCP service per interface the configuration asks for.
+    ///
+    /// Derived purely from the configuration. This used to also take the
+    /// persisted overrides and refuse to proceed when they disagreed — but the
+    /// result was always this, and the map it checked against was itself
+    /// derived from the same configuration.
+    pub fn effective_specs(config: &AppConfig) -> Result<Vec<DhcpServiceSpec>> {
         let specs: BTreeMap<String, DhcpServiceSpec> = Self::service_specs(config)?
             .into_iter()
             .map(|spec| (spec.interface.clone(), spec))
             .collect();
 
-        for (interface, value) in &overrides.dhcp {
-            let effective = specs.get(interface);
-            match value {
-                DhcpOverride::Configured { spec } => {
-                    if &spec.interface != interface {
-                        anyhow::bail!(
-                            "DHCP override key {interface} does not match spec interface {}",
-                            spec.interface
-                        );
-                    }
-                    spec.validate()?;
-                    if effective != Some(spec) {
-                        anyhow::bail!(
-                            "DHCP override for {interface} is inconsistent with the effective interface configuration"
-                        );
-                    }
-                }
-                DhcpOverride::Disabled => {
-                    if effective.is_some() {
-                        anyhow::bail!(
-                            "disabled DHCP override for {interface} conflicts with the effective interface configuration"
-                        );
-                    }
-                }
-            }
-        }
-
         Ok(specs.into_values().collect())
     }
 
-    pub async fn start(config: &AppConfig, overrides: &RuntimeOverrides) -> Result<Self> {
+    pub async fn start(config: &AppConfig) -> Result<Self> {
         let supervisor = Self {
             inner: Arc::new(Inner {
                 leases_dir: config.dhcp.leases_dir.clone(),
@@ -178,7 +153,7 @@ impl DhcpSupervisor {
             }),
         };
 
-        for spec in Self::effective_specs(config, overrides)? {
+        for spec in Self::effective_specs(config)? {
             if resolve_interface_index(&spec.interface).is_err() {
                 tracing::warn!(
                     interface = %spec.interface,
@@ -517,29 +492,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stale_configured_override_is_rejected() {
-        let config: AppConfig = toml::from_str(include_str!("../../examples/config.toml"))
-            .expect("example config should parse");
-        let mut replacement = DhcpSupervisor::service_specs(&config)
-            .expect("base specs")
-            .remove(0);
-        replacement.pool_start = Ipv4Addr::new(192, 168, 101, 50);
-        replacement.pool_end = Ipv4Addr::new(192, 168, 101, 75);
-        replacement.lease_seconds = 1_800;
-        let mut overrides = RuntimeOverrides::default();
-        overrides.dhcp.insert(
-            "wlan0".to_string(),
-            DhcpOverride::Configured {
-                spec: replacement.clone(),
-            },
-        );
-
-        let error = DhcpSupervisor::effective_specs(&config, &overrides)
-            .expect_err("independent DHCP override must not replace interface truth");
-        assert!(error.to_string().contains("inconsistent"));
-    }
-
     #[tokio::test]
     async fn start_skips_absent_configured_dhcp_interface_instead_of_failing() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -564,24 +516,11 @@ mod tests {
             },
         );
 
-        let supervisor = DhcpSupervisor::start(&config, &RuntimeOverrides::default())
+        let supervisor = DhcpSupervisor::start(&config)
             .await
             .expect("startup must tolerate a configured-but-absent DHCP interface");
 
         assert!(supervisor.spec("tm-test-absent0").await.is_none());
     }
 
-    #[test]
-    fn stale_disabled_override_is_rejected() {
-        let config: AppConfig = toml::from_str(include_str!("../../examples/config.toml"))
-            .expect("example config should parse");
-        let mut overrides = RuntimeOverrides::default();
-        overrides
-            .dhcp
-            .insert("wlan0".to_string(), DhcpOverride::Disabled);
-
-        let error = DhcpSupervisor::effective_specs(&config, &overrides)
-            .expect_err("DHCP disable must be represented by effective interface config");
-        assert!(error.to_string().contains("conflicts"));
-    }
 }

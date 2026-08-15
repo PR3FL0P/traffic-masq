@@ -77,10 +77,6 @@ impl RouterIntentProposal {
                 }
                 None => {
                     document.interfaces.remove(interface);
-
-                    document.dhcp.remove(interface);
-                    document.wifi.remove(interface);
-                    document.wifi_client.remove(interface);
                 }
             }
         }
@@ -197,7 +193,7 @@ impl RouterCandidate {
         let mut document = committed.clone();
         proposal.apply_to(&mut document);
 
-        let document = document.normalized(base.dhcp.default_lease_seconds)?;
+        let document = document.normalized()?;
         let effective = document.effective_config(base)?;
         let desired = RouterDesired::from_effective_config(&effective)?;
         let digest = CandidateDigest::of_intent(&document)?;
@@ -249,7 +245,6 @@ mod tests {
     use crate::config::{
         DhcpInterfaceConfig, InterfaceRole, OwnedIpv4RouteConfig, UplinkConfig, UplinkMode,
     };
-    use crate::state::overrides::DhcpOverride;
 
     use super::*;
 
@@ -408,10 +403,6 @@ mod tests {
         assert_eq!(candidate.desired().dhcp.len(), 2);
         assert!(candidate.effective_config().router.enabled);
         assert_eq!(candidate.document().revision, 4);
-        assert!(matches!(
-            candidate.document().dhcp.get("lan1"),
-            Some(DhcpOverride::Configured { .. })
-        ));
     }
 
     #[test]
@@ -597,66 +588,4 @@ mod tests {
         assert_eq!(candidate.digest(), digest);
     }
 
-    #[test]
-    fn removing_an_interface_override_drops_its_derived_dhcp_section() {
-        let base = base_config();
-        let committed = RouterCandidate::build(
-            &base,
-            &committed(),
-            &RouterIntentProposal::new().set_interface(
-                "lan1",
-                output_interface("192.168.20.1/24", 100, 150),
-                false,
-            ),
-        )
-        .expect("candidate with override")
-        .document()
-        .clone();
-        assert!(committed.dhcp.contains_key("lan1"));
-
-        let candidate = RouterCandidate::build(
-            &base,
-            &committed,
-            &RouterIntentProposal::new().remove_interface("lan1"),
-        )
-        .expect("candidate without override");
-
-        assert!(!candidate.document().interfaces.contains_key("lan1"));
-        assert!(!candidate.document().dhcp.contains_key("lan1"));
-        assert_eq!(candidate.desired().dhcp.len(), 1);
-    }
-
-    #[test]
-    fn removing_an_interface_override_drops_its_derived_wifi_sections_too() {
-        let base = base_config();
-        let mut joining = input_interface();
-        joining.wifi_client = Some(crate::config::WifiClientConfig {
-            ssid: "upstream-network".to_string(),
-            country_code: Some("PL".to_string()),
-            security: crate::config::WifiClientSecurity::Wpa2,
-            passphrase_file: None,
-        });
-
-        let committed = RouterCandidate::build(
-            &base,
-            &committed(),
-            &RouterIntentProposal::new().set_interface("wan1", joining, false),
-        )
-        .expect("candidate with override")
-        .document()
-        .clone();
-        assert!(committed.wifi_client.contains_key("wan1"));
-        assert!(committed.wifi.contains_key("wan1"));
-
-        let candidate = RouterCandidate::build(
-            &base,
-            &committed,
-            &RouterIntentProposal::new().remove_interface("wan1"),
-        )
-        .expect("candidate without override");
-
-        assert!(!candidate.document().interfaces.contains_key("wan1"));
-        assert!(!candidate.document().wifi_client.contains_key("wan1"));
-        assert!(!candidate.document().wifi.contains_key("wan1"));
-    }
 }

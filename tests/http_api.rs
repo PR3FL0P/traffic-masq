@@ -109,7 +109,7 @@ async fn dhcp_client_http_routes_allow_viewer_get_and_require_admin_for_put() ->
     config.auth.argon2_memory_kib = 1_024;
     config.auth.argon2_iterations = 1;
     let overrides = RuntimeOverrideManager::load(&config.runtime.state_dir, &config).await?;
-    let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await).await?;
+    let dhcp = DhcpSupervisor::start(&config).await?;
     let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork);
     let control = ControlService::new(config.clone(), network, dhcp.clone(), overrides);
     let auth = AuthService::open(&config.auth).await?;
@@ -189,7 +189,7 @@ async fn authenticated_http_client_controls_daemon_over_unix_socket() -> Result<
     config.validate()?;
 
     let overrides = RuntimeOverrideManager::load(&config.runtime.state_dir, &config).await?;
-    let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await).await?;
+    let dhcp = DhcpSupervisor::start(&config).await?;
     let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork);
     let control = ControlService::new(config.clone(), network, dhcp.clone(), overrides.clone());
     let auth = AuthService::open(&config.auth).await?;
@@ -490,7 +490,7 @@ async fn optional_tcp_listener_serves_http_only_after_tls_handshake() -> Result<
     config.validate()?;
 
     let overrides = RuntimeOverrideManager::load(&config.runtime.state_dir, &config).await?;
-    let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await).await?;
+    let dhcp = DhcpSupervisor::start(&config).await?;
     let control = ControlService::new(
         config.clone(),
         Arc::new(FakeNetwork),
@@ -828,7 +828,7 @@ async fn router_test_server_with(
     config.validate()?;
 
     let overrides = RuntimeOverrideManager::load(&config.runtime.state_dir, &config).await?;
-    let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await).await?;
+    let dhcp = DhcpSupervisor::start(&config).await?;
     let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork);
     let manager = RouterManager::new(fake);
     let coordinator =
@@ -1176,7 +1176,7 @@ async fn vpn_profile_list_import_activate_status_deactivate_over_http() -> Resul
     config.validate()?;
 
     let overrides = RuntimeOverrideManager::load(&config.runtime.state_dir, &config).await?;
-    let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await).await?;
+    let dhcp = DhcpSupervisor::start(&config).await?;
     let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork);
 
     let vpn_store =
@@ -1299,7 +1299,7 @@ async fn vpn_requests_return_vpn_disabled_when_no_vpn_manager_is_attached() -> R
     config.validate()?;
 
     let overrides = RuntimeOverrideManager::load(&config.runtime.state_dir, &config).await?;
-    let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await).await?;
+    let dhcp = DhcpSupervisor::start(&config).await?;
     let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork);
 
     let control = ControlService::new(config.clone(), network, dhcp.clone(), overrides);
@@ -1341,7 +1341,7 @@ async fn wifi_requests_return_wifi_disabled_when_no_supervisor_is_attached() -> 
     config.validate()?;
 
     let overrides = RuntimeOverrideManager::load(&config.runtime.state_dir, &config).await?;
-    let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await).await?;
+    let dhcp = DhcpSupervisor::start(&config).await?;
     let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork);
 
     let control = ControlService::new(config.clone(), network, dhcp.clone(), overrides);
@@ -1583,7 +1583,7 @@ async fn vpn_policy_status_set_mode_clear_mode_over_http() -> Result<()> {
     config.validate()?;
 
     let overrides = RuntimeOverrideManager::load(&config.runtime.state_dir, &config).await?;
-    let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await).await?;
+    let dhcp = DhcpSupervisor::start(&config).await?;
     let network: Arc<dyn NetworkProvider> = FakePolicyNetwork::with_owned_interface();
 
     let vpn_store =
@@ -1796,10 +1796,10 @@ async fn provisioning_test_server() -> Result<ProvisioningServer> {
     config.validate()?;
 
     let overrides = RuntimeOverrideManager::load(&config.runtime.state_dir, &config).await?;
-    let dhcp = DhcpSupervisor::start(&config, &overrides.snapshot().await).await?;
+    let dhcp = DhcpSupervisor::start(&config).await?;
 
-    let wifi = HostapdSupervisor::start(&config, &overrides.snapshot().await).await?;
-    let wifi_client = WifiClientSupervisor::start(&config, &overrides.snapshot().await).await?;
+    let wifi = HostapdSupervisor::start(&config).await?;
+    let wifi_client = WifiClientSupervisor::start(&config).await?;
     let manager = RouterManager::new(Arc::new(FakeRouterSubsystems::default()));
     let coordinator =
         RouterTransactionCoordinator::new(manager, overrides.clone(), Duration::from_secs(30));
