@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use ipnet::Ipv4Net;
 use tokio::signal;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -17,14 +16,16 @@ use tokio::time::{self, MissedTickBehavior};
 use crate::api::control::ControlService;
 use crate::api::server::HttpApiBindings;
 use crate::auth::{AuthService, Principal};
-use crate::config::{AppConfig, InterfaceConfig, InterfaceRole, ShutdownPolicy, VpnPolicyMode};
+use crate::config::{AppConfig, InterfaceConfig, ShutdownPolicy, VpnPolicyMode};
 use crate::core::interface::{InterfaceManager, InterfaceSnapshot};
 use crate::core::ownership::AddressOwnershipJournal;
 use crate::core::route::{RouteManager, RouteSnapshot};
 use crate::core::router::{RouterDesired, RouterManager};
 use crate::core::router_subsystems::ProductionRouterSubsystems;
 use crate::core::router_transaction::RouterTransactionCoordinator;
-use crate::core::vpn_policy_manager::{VpnPolicyDesired, VpnPolicyManager};
+use crate::core::vpn_policy_manager::{
+    vpn_policy_desired, vpn_policy_teardown_target, VpnPolicyManager,
+};
 use crate::dhcp::client::{DhcpClientSpec, DhcpClientSupervisor};
 use crate::dhcp::supervisor::{DhcpServiceSpec, DhcpSupervisor};
 use crate::firewall::{
@@ -39,7 +40,6 @@ use crate::netlink::{
 };
 use crate::state::desired::DesiredNetworkState;
 use crate::state::overrides::{RuntimeOverrideManager, RuntimeOverrides};
-use crate::vpn::manager::OWNED_INTERFACE_NAME;
 use crate::vpn::{
     ActiveProfileStore, NetlinkVpnProvider, ProductionVpnManager, VpnManager, VpnProvider,
     WireGuardProfileStore, WireGuardVpnDriver,
@@ -350,33 +350,6 @@ async fn build_vpn_manager(config: &AppConfig) -> Result<Option<Arc<ProductionVp
     }
 
     Ok(Some(manager))
-}
-
-pub(crate) fn vpn_policy_desired(config: &AppConfig) -> Option<VpnPolicyDesired> {
-    let uplink = config.router.uplink.as_ref()?;
-    let protected_subnets: Vec<Ipv4Net> = config
-        .network
-        .interfaces
-        .values()
-        .filter(|interface| interface.role == InterfaceRole::Output && interface.managed)
-        .filter_map(|interface| interface.ipv4)
-        .collect();
-    if protected_subnets.is_empty() {
-        return None;
-    }
-    Some(VpnPolicyDesired {
-        protected_subnets,
-        vpn_interface: OWNED_INTERFACE_NAME.to_string(),
-        physical_uplink: uplink.interface.clone(),
-    })
-}
-
-pub(crate) fn vpn_policy_teardown_target() -> VpnPolicyDesired {
-    VpnPolicyDesired {
-        protected_subnets: Vec::new(),
-        vpn_interface: OWNED_INTERFACE_NAME.to_string(),
-        physical_uplink: String::new(),
-    }
 }
 
 pub(crate) fn build_vpn_policy_manager<E: NftExecutor>(
@@ -1422,6 +1395,7 @@ mod tests {
         UplinkMode, VpnConfig,
     };
     use crate::firewall::vpn::test_support::{nft_ruleset, FakeNftExecutor};
+    use crate::vpn::manager::OWNED_INTERFACE_NAME;
     use crate::firewall::{OwnedFirewallIntegrity, RouterDataplaneDesired};
     use crate::netlink::{
         Ipv4AddressInfo, Ipv4RouteInfo, Ipv4RouteSpec, Ipv4RuleInfo, Ipv4RuleSpec,
@@ -2753,27 +2727,6 @@ mod tests {
             .expect("snapshot")
             .owned
             .is_none());
-    }
-
-    #[test]
-    fn vpn_policy_desired_builds_from_managed_output_subnets_and_router_uplink() {
-        let config = vpn_policy_startup_config();
-
-        let desired = vpn_policy_desired(&config).expect("desired");
-
-        assert_eq!(desired.vpn_interface, OWNED_INTERFACE_NAME);
-        assert_eq!(desired.physical_uplink, "wan0");
-        assert_eq!(
-            desired.protected_subnets,
-            vec!["192.168.10.1/24".parse::<Ipv4Net>().unwrap()]
-        );
-    }
-
-    #[test]
-    fn vpn_policy_desired_is_none_without_router_uplink() {
-        let config = AppConfig::default();
-
-        assert!(vpn_policy_desired(&config).is_none());
     }
 
     #[tokio::test]

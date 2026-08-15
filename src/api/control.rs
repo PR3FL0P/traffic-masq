@@ -16,7 +16,7 @@ use crate::api::model::{
     VpnPolicyStatusView, WifiClientEditRequest, WifiClientErrorDetail,
     WifiClientProfileErrorDetail, WifiClientProfileWriteRequest, WifiEditRequest, WifiErrorDetail,
 };
-use crate::app::{vpn_policy_desired, vpn_policy_teardown_target};
+use crate::core::vpn_policy_manager::{vpn_policy_desired, vpn_policy_teardown_target};
 use crate::config::{
     ApiConfig, AppConfig, DhcpClientInterfaceConfig, DhcpInterfaceConfig, InterfaceConfig,
     InterfaceRole, SecurityConfig, TcpApiConfig, UplinkMode, VpnPolicyMode, WifiApConfig,

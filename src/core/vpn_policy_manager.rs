@@ -12,6 +12,8 @@ use crate::netlink::{
     Ipv4RouteInfo, Ipv4RouteSpec, Ipv4RuleInfo, Ipv4RuleSpec, NetworkProvider,
     TRAFFIC_MASQ_ROUTE_PROTOCOL,
 };
+use crate::config::{AppConfig, InterfaceRole};
+use crate::vpn::manager::OWNED_INTERFACE_NAME;
 use crate::vpn::{VpnDriver, VpnManager};
 
 const VPN_POLICY_ROUTE_METRIC: u32 = 50;
@@ -21,6 +23,43 @@ pub struct VpnPolicyDesired {
     pub protected_subnets: Vec<Ipv4Net>,
     pub vpn_interface: String,
     pub physical_uplink: String,
+}
+
+/// The VPN policy this configuration calls for, or `None` if there is nothing
+/// to protect.
+///
+/// Lives beside [`VpnPolicyDesired`] rather than in `app`, where it used to sit:
+/// deciding what the policy should be given a configuration is a domain rule,
+/// not part of wiring the daemon together. Having it in `app` meant `api` had
+/// to reach into `app` to ask the question, which closed a cycle between the
+/// two.
+pub fn vpn_policy_desired(config: &AppConfig) -> Option<VpnPolicyDesired> {
+    let uplink = config.router.uplink.as_ref()?;
+    let protected_subnets: Vec<Ipv4Net> = config
+        .network
+        .interfaces
+        .values()
+        .filter(|interface| interface.role == InterfaceRole::Output && interface.managed)
+        .filter_map(|interface| interface.ipv4)
+        .collect();
+    if protected_subnets.is_empty() {
+        return None;
+    }
+    Some(VpnPolicyDesired {
+        protected_subnets,
+        vpn_interface: OWNED_INTERFACE_NAME.to_string(),
+        physical_uplink: uplink.interface.clone(),
+    })
+}
+
+/// The desired state that means "own nothing": used to find and remove whatever
+/// a previous run installed.
+pub fn vpn_policy_teardown_target() -> VpnPolicyDesired {
+    VpnPolicyDesired {
+        protected_subnets: Vec::new(),
+        vpn_interface: OWNED_INTERFACE_NAME.to_string(),
+        physical_uplink: String::new(),
+    }
 }
 
 impl VpnPolicyDesired {
@@ -403,6 +442,70 @@ mod tests {
     use crate::vpn::manager::OWNED_INTERFACE_NAME;
     use crate::vpn::store::WireGuardProfileStore;
     use crate::vpn::wireguard::{WireGuardKey, WireGuardPeerConfig, WireGuardVpnDriver};
+
+    /// A router with one managed output subnet and an uplink — the minimum
+    /// shape `vpn_policy_desired` needs to produce a policy.
+    fn config_with_managed_output_and_uplink() -> AppConfig {
+        use crate::config::{InterfaceConfig, RouterConfig, UplinkConfig, UplinkMode};
+
+        let mut config = AppConfig::default();
+        config.network.interfaces.insert(
+            "wan0".to_string(),
+            InterfaceConfig {
+                role: InterfaceRole::Input,
+                managed: false,
+                ipv4: None,
+                dhcp: None,
+                dhcp_client: None,
+                wifi: None,
+                wifi_client: None,
+            },
+        );
+        config.network.interfaces.insert(
+            "lan0".to_string(),
+            InterfaceConfig {
+                role: InterfaceRole::Output,
+                managed: true,
+                ipv4: Some("192.168.10.1/24".parse().expect("network")),
+                dhcp: None,
+                dhcp_client: None,
+                wifi: None,
+                wifi_client: None,
+            },
+        );
+        config.router = RouterConfig {
+            enabled: true,
+            uplink: Some(UplinkConfig {
+                interface: "wan0".to_string(),
+                mode: UplinkMode::External,
+            }),
+            owned_routes: Vec::new(),
+            allow_default_route_change: false,
+        };
+        config
+    }
+
+    #[test]
+    fn vpn_policy_desired_builds_from_managed_output_subnets_and_router_uplink() {
+        let config = config_with_managed_output_and_uplink();
+
+        let desired = vpn_policy_desired(&config).expect("desired");
+
+        assert_eq!(desired.vpn_interface, OWNED_INTERFACE_NAME);
+        assert_eq!(desired.physical_uplink, "wan0");
+        assert_eq!(
+            desired.protected_subnets,
+            vec!["192.168.10.1/24".parse::<Ipv4Net>().unwrap()]
+        );
+    }
+
+    #[test]
+    fn vpn_policy_desired_is_none_without_router_uplink() {
+        let config = AppConfig::default();
+
+        assert!(vpn_policy_desired(&config).is_none());
+    }
+
     use crate::vpn::{ProviderError, VpnProvider};
 
     const VALID_PRIVATE_KEY: &str = "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=";
