@@ -19,7 +19,7 @@ use anyhow::Result;
 use tokio::sync::{watch, Mutex, Notify};
 
 use crate::config::{AppConfig, InterfaceConfig};
-use crate::state::overrides::RuntimeOverrideManager;
+use crate::core::override_manager::RuntimeOverrideManager;
 
 /// An applied-but-unconfirmed interface configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]

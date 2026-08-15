@@ -13,7 +13,7 @@ use crate::core::interface::{
     DhcpChangeAction, InterfaceChangePlan, InterfaceManager, InterfaceSnapshot,
 };
 use crate::dhcp::supervisor::{DhcpServiceSpec, DhcpSupervisor};
-use crate::state::desired::DesiredNetworkState;
+use crate::core::desired::DesiredNetworkState;
 
 /// How long an apply waits for convergence to reach what it proposed.
 ///
@@ -543,7 +543,7 @@ mod tests {
     use crate::config::{AppConfig, InterfaceConfig, InterfaceRole};
     use crate::core::ownership::AddressOwnershipJournal;
     use crate::netlink::{Ipv4AddressInfo, NetworkInterface, NetworkProvider};
-    use crate::state::overrides::RuntimeOverrideManager;
+    use crate::core::override_manager::RuntimeOverrideManager;
 
     use super::*;
 

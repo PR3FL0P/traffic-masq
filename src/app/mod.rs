@@ -38,8 +38,9 @@ use crate::netlink::events::KernelEvent;
 use crate::netlink::{
     AddressOwner, Ipv4AddressInfo, NetworkInterface, NetworkProvider, RtnetlinkNetworkProvider,
 };
-use crate::state::desired::DesiredNetworkState;
-use crate::state::overrides::{RuntimeOverrideManager, RuntimeOverrides};
+use crate::core::desired::DesiredNetworkState;
+use crate::core::override_manager::RuntimeOverrideManager;
+use crate::state::overrides::RuntimeOverrides;
 use crate::vpn::{
     ActiveProfileStore, NetlinkVpnProvider, ProductionVpnManager, VpnManager, VpnProvider,
     WireGuardProfileStore, WireGuardVpnDriver,

@@ -8,8 +8,8 @@ use thiserror::Error;
 use tokio::sync::{Mutex, MutexGuard};
 
 use crate::core::router::{RouterDesired, RouterManager, RouterPlan, RouterSnapshot};
-use crate::state::candidate::RouterCandidate;
-use crate::state::overrides::RuntimeOverrideManager;
+use crate::core::router_candidate::RouterCandidate;
+use crate::core::override_manager::RuntimeOverrideManager;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ObservationFingerprint([u8; 32]);
@@ -341,7 +341,7 @@ mod tests {
     use crate::core::router::{DhcpPlan, RouterSubsystems};
     use crate::dhcp::supervisor::DhcpServiceSpec;
     use crate::firewall::{RouterDataplanePlan, RouterDataplaneSnapshot};
-    use crate::state::candidate::RouterIntentProposal;
+    use crate::core::router_candidate::RouterIntentProposal;
 
     use super::*;
 

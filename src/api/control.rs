@@ -43,9 +43,9 @@ use crate::dhcp::store::LeaseStore;
 use crate::dhcp::supervisor::{DhcpServiceSpec, DhcpSupervisor};
 use crate::firewall::NftExecutor;
 use crate::netlink::{Ipv4AddressInfo, NetworkProvider};
-use crate::state::candidate::{RouterIntentProposal, StaleCandidateError};
-use crate::state::desired::DesiredNetworkState;
-use crate::state::overrides::RuntimeOverrideManager;
+use crate::core::router_candidate::{RouterIntentProposal, StaleCandidateError};
+use crate::core::desired::DesiredNetworkState;
+use crate::core::override_manager::RuntimeOverrideManager;
 use crate::vpn::manager::OWNED_INTERFACE_NAME;
 use crate::vpn::{
     ManagerError, ProductionVpnManager, StoreError, VpnDriverError, WireGuardVpnDriver,

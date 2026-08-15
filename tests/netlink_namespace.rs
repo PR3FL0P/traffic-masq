@@ -268,8 +268,8 @@ async fn an_unconfirmed_change_converges_and_expires_on_a_live_kernel() -> Resul
     use traffic_masq::core::interface::InterfaceManager;
     use traffic_masq::core::ownership::AddressOwnershipJournal;
     use traffic_masq::core::transaction::NetworkTransactionManager;
-    use traffic_masq::state::desired::DesiredNetworkState;
-    use traffic_masq::state::overrides::RuntimeOverrideManager;
+    use traffic_masq::core::desired::DesiredNetworkState;
+    use traffic_masq::core::override_manager::RuntimeOverrideManager;
 
     let fixture = NetnsFixture::new()?;
     let state_dir = tempfile::tempdir()?;

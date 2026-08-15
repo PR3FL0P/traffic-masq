@@ -11,7 +11,7 @@ use crate::config::{
     RouterConfig, UplinkConfig, UplinkMode, WifiApConfig, WifiBand, WifiChannelWidth,
     WifiClientConfig, WifiClientSecurity, WifiSecurity,
 };
-use crate::state::candidate::RouterIntentProposal;
+use crate::core::router_candidate::RouterIntentProposal;
 
 pub const DEFAULT_DOWNSTREAM_PREFIX: u8 = 24;
 pub const DEFAULT_DOWNSTREAM_THIRD_OCTET: u8 = 0;

@@ -41,7 +41,7 @@ use traffic_masq::firewall::{
     OwnedFirewallIntegrity, RouterDataplanePlan, RouterDataplaneSnapshot,
 };
 use traffic_masq::netlink::{AddressOwnership, Ipv4AddressInfo, NetworkInterface, NetworkProvider};
-use traffic_masq::state::overrides::RuntimeOverrideManager;
+use traffic_masq::core::override_manager::RuntimeOverrideManager;
 use traffic_masq::wifi::{HostapdSupervisor, WifiApSpec, WifiClientSpec, WifiClientSupervisor};
 
 #[derive(Debug)]
