@@ -109,12 +109,8 @@ impl DhcpClientLease {
     }
 }
 
+/// The same rule the private store applies to document names, because a lease
+/// is stored under its interface name and the two must not be able to drift.
 pub(crate) fn valid_interface_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 15
-        && name != "."
-        && name != ".."
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    crate::state::private_store::valid_document_key(name)
 }

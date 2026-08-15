@@ -19,6 +19,7 @@ use crate::api::server::HttpApiBindings;
 use crate::auth::{AuthService, Principal};
 use crate::config::{AppConfig, InterfaceConfig, InterfaceRole, ShutdownPolicy, VpnPolicyMode};
 use crate::core::interface::{InterfaceManager, InterfaceSnapshot};
+use crate::core::ownership::AddressOwnershipJournal;
 use crate::core::route::{RouteManager, RouteSnapshot};
 use crate::core::router::{RouterDesired, RouterManager};
 use crate::core::router_subsystems::ProductionRouterSubsystems;
@@ -220,8 +221,68 @@ where
     }
 }
 
+/// Compare the address ownership journal with the machine, once, at startup.
+///
+/// The journal is written before the kernel is touched, so after a crash it can
+/// claim an address that never made it onto a link, or one that has since been
+/// replaced by somebody else's. Both are dropped here. Everything that survives
+/// is an address this daemon may take off again, which is exactly the authority
+/// that must not be granted on the strength of an unchecked file.
+async fn reconcile_address_ownership(
+    journal: &AddressOwnershipJournal,
+    network: &dyn NetworkProvider,
+) {
+    for interface in journal.interfaces().await {
+        let observed = match network.list_ipv4_addresses(&interface).await {
+            Ok(observed) => observed,
+            Err(error) => {
+                // The interface is not there right now — unplugged, or renamed.
+                // The claims stay: convergence will look again, and dropping
+                // them here would disown addresses that come back with it.
+                tracing::info!(
+                    %interface,
+                    %error,
+                    "keeping recorded IPv4 address ownership: the interface cannot be read right now"
+                );
+                continue;
+            }
+        };
+        match journal.reconcile(&interface, &observed).await {
+            Ok(outcome) => {
+                for (claim, reason) in &outcome.dropped {
+                    tracing::info!(
+                        %interface,
+                        address = %format!("{}/{}", claim.address, claim.prefix_len),
+                        reason = %reason,
+                        "dropping a recorded IPv4 address claim: the machine disagrees"
+                    );
+                }
+                if !outcome.kept.is_empty() {
+                    tracing::info!(
+                        %interface,
+                        addresses = %outcome
+                            .kept
+                            .iter()
+                            .map(|claim| format!("{}/{}", claim.address, claim.prefix_len))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        "adopted IPv4 addresses recorded by a previous run"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(
+                %interface,
+                %error,
+                "failed to reconcile recorded IPv4 address ownership"
+            ),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn production_router_coordinator(
     desired: &RouterDesired,
+    journal: AddressOwnershipJournal,
     dhcp: DhcpSupervisor,
     dhcp_client: DhcpClientSupervisor,
     wifi_client: Option<WifiClientSupervisor>,
@@ -233,7 +294,7 @@ fn production_router_coordinator(
         RtnetlinkNetworkProvider::connect()
             .context("failed to open rtnetlink connection for router transaction coordinator")?,
     );
-    let interfaces = InterfaceManager::new(network.clone());
+    let interfaces = InterfaceManager::new(network.clone(), journal);
     let routes = RouteManager::new(network);
     let dataplane_provider = production_dataplane_provider()
         .context("failed to build router dataplane provider for transaction coordinator")?;
@@ -530,6 +591,7 @@ async fn reconcile_network_runtime_once<
     L: DhcpClientRuntimeReconciler,
 >(
     desired: &DesiredNetworkState,
+    journal: &AddressOwnershipJournal,
     network: Arc<dyn NetworkProvider>,
     dhcp: &D,
     _wifi: Option<&W>,
@@ -539,7 +601,7 @@ async fn reconcile_network_runtime_once<
     let effective = desired.effective().await?;
     let management_allowlist = desired.management_allowlist().await;
     let mut failures: BTreeMap<String, String> = BTreeMap::new();
-    let interface_manager = InterfaceManager::new(network.clone());
+    let interface_manager = InterfaceManager::new(network.clone(), journal.clone());
     let observed_interfaces: HashMap<_, _> = network
         .list_interfaces()
         .await?
@@ -597,13 +659,13 @@ async fn reconcile_network_runtime_once<
             )
         } else {
             // An interface we are not asked to manage has no business carrying
-            // an address tagged as ours, however it got there — a change that
-            // was rolled back, an override that was removed, a previous run.
+            // an address of ours, however it got there — a change that was
+            // rolled back, an override that was removed, a previous run.
             // Convergence is what cleans it up, because convergence is the only
             // thing that writes.
-            current_addresses
-                .iter()
-                .any(|address| address.owner() == AddressOwner::TrafficMasqStatic)
+            interface_manager
+                .owns_any_address(name, &current_addresses)
+                .await
         };
         if needs_apply {
             let allow_management_change = management_allowlist.contains(name);
@@ -697,6 +759,7 @@ fn spawn_session_reaper(auth: AuthService, mut shutdown: watch::Receiver<bool>) 
 #[allow(clippy::too_many_arguments)]
 fn spawn_runtime_network_reconcile(
     desired: DesiredNetworkState,
+    journal: AddressOwnershipJournal,
     network: Arc<dyn NetworkProvider>,
     dhcp: DhcpSupervisor,
     wifi: Option<HostapdSupervisor>,
@@ -724,6 +787,7 @@ fn spawn_runtime_network_reconcile(
             let version = desired.version();
             let failures = match reconcile_network_runtime_once(
                 &desired,
+                &journal,
                 network.clone(),
                 &dhcp,
                 wifi.as_ref(),
@@ -914,7 +978,15 @@ pub async fn run_daemon(config: AppConfig) -> Result<()> {
     let management_allowlist = management_allowlist(&override_snapshot);
 
     let network_provider: Arc<dyn NetworkProvider> = Arc::new(RtnetlinkNetworkProvider::connect()?);
-    let interface_manager = InterfaceManager::new(network_provider.clone());
+    // Opened before anything is configured, and checked against the machine
+    // before anything is configured: what the last run wrote down is only worth
+    // acting on once it has been compared with what is actually on the links.
+    let ownership_journal = AddressOwnershipJournal::open(&config.runtime.state_dir)
+        .context("failed to open the IPv4 address ownership journal")?;
+    reconcile_address_ownership(&ownership_journal, network_provider.as_ref()).await;
+
+    let interface_manager =
+        InterfaceManager::new(network_provider.clone(), ownership_journal.clone());
     let startup_baselines = interface_manager
         .apply_network_with_management_allowlist(&effective_config.network, &management_allowlist)
         .await?;
@@ -1073,6 +1145,7 @@ pub async fn run_daemon(config: AppConfig) -> Result<()> {
     // wiring — it opens a netlink socket and touches no data plane.
     let router_coordinator = match production_router_coordinator(
         &desired,
+        ownership_journal.clone(),
         dhcp.clone(),
         dhcp_client.clone(),
         wifi_client_supervisor.clone(),
@@ -1129,6 +1202,7 @@ pub async fn run_daemon(config: AppConfig) -> Result<()> {
         dhcp.clone(),
         overrides.clone(),
         startup_baselines,
+        ownership_journal.clone(),
     )
     .with_base_config(config.clone());
     if let Some(coordinator) = router_coordinator {
@@ -1182,6 +1256,7 @@ pub async fn run_daemon(config: AppConfig) -> Result<()> {
     let reconcile_task =
         spawn_runtime_network_reconcile(
             desired_state,
+            ownership_journal.clone(),
             Arc::new(RtnetlinkNetworkProvider::connect().context(
                 "failed to open rtnetlink connection for runtime interface/DHCP reconcile",
             )?),
@@ -1968,6 +2043,7 @@ mod tests {
 
         reconcile_network_runtime_once(
             &DesiredNetworkState::new(config.clone(), overrides.clone()),
+            &AddressOwnershipJournal::in_memory(),
             network.clone(),
             &dhcp,
             Some(&wifi),
@@ -2022,6 +2098,7 @@ mod tests {
             .await;
         let dhcp = FakeDhcpReconciler::default();
         let desired = DesiredNetworkState::new(config.clone(), overrides.clone());
+        let journal = AddressOwnershipJournal::in_memory();
 
         let proposed = InterfaceConfig {
             ipv4: Some("10.9.9.1/24".parse().expect("network")),
@@ -2032,6 +2109,7 @@ mod tests {
 
         reconcile_network_runtime_once(
             &desired,
+            &journal,
             network.clone(),
             &dhcp,
             None::<&FakeWifiReconciler>,
@@ -2056,6 +2134,7 @@ mod tests {
 
         reconcile_network_runtime_once(
             &desired,
+            &journal,
             network.clone(),
             &dhcp,
             None::<&FakeWifiReconciler>,
@@ -2105,6 +2184,7 @@ mod tests {
             .await;
         let dhcp = FakeDhcpReconciler::default();
         let desired = DesiredNetworkState::new(config.clone(), overrides.clone());
+        let journal = AddressOwnershipJournal::in_memory();
 
         let proposed = InterfaceConfig {
             ipv4: Some("192.168.1.11/24".parse().expect("network")),
@@ -2116,6 +2196,7 @@ mod tests {
 
         let failures = reconcile_network_runtime_once(
             &desired,
+            &journal,
             network.clone(),
             &dhcp,
             None::<&FakeWifiReconciler>,
@@ -2149,6 +2230,7 @@ mod tests {
             .await;
         let failures = reconcile_network_runtime_once(
             &desired,
+            &journal,
             network.clone(),
             &dhcp,
             None::<&FakeWifiReconciler>,
@@ -2208,6 +2290,7 @@ mod tests {
 
         reconcile_network_runtime_once(
             &DesiredNetworkState::new(config.clone(), overrides.clone()),
+            &AddressOwnershipJournal::in_memory(),
             network.clone(),
             &dhcp,
             None::<&FakeWifiReconciler>,
@@ -2243,6 +2326,7 @@ mod tests {
 
         reconcile_network_runtime_once(
             &DesiredNetworkState::new(config.clone(), overrides.clone()),
+            &AddressOwnershipJournal::in_memory(),
             network,
             &dhcp,
             None::<&FakeWifiReconciler>,
@@ -2317,6 +2401,7 @@ mod tests {
         for _ in 0..3 {
             reconcile_network_runtime_once(
                 &DesiredNetworkState::new(config.clone(), overrides.clone()),
+                &AddressOwnershipJournal::in_memory(),
                 network.clone(),
                 &dhcp,
                 None::<&FakeWifiReconciler>,
@@ -2387,6 +2472,7 @@ mod tests {
 
         reconcile_network_runtime_once(
             &DesiredNetworkState::new(config.clone(), overrides.clone()),
+            &AddressOwnershipJournal::in_memory(),
             network.clone(),
             &dhcp,
             None::<&FakeWifiReconciler>,
@@ -2413,6 +2499,7 @@ mod tests {
             .insert("wan0".to_string(), true);
         reconcile_network_runtime_once(
             &DesiredNetworkState::new(config.clone(), overrides.clone()),
+            &AddressOwnershipJournal::in_memory(),
             network,
             &dhcp,
             None::<&FakeWifiReconciler>,
@@ -2477,6 +2564,7 @@ mod tests {
 
         reconcile_network_runtime_once(
             &DesiredNetworkState::new(config.clone(), overrides.clone()),
+            &AddressOwnershipJournal::in_memory(),
             network,
             &dhcp,
             None::<&FakeWifiReconciler>,
@@ -2513,6 +2601,7 @@ mod tests {
 
         reconcile_network_runtime_once(
             &DesiredNetworkState::new(config.clone(), overrides.clone()),
+            &AddressOwnershipJournal::in_memory(),
             network,
             &dhcp,
             None::<&HostapdSupervisor>,

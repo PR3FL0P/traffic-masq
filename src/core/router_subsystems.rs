@@ -116,6 +116,17 @@ where
     routes: RouteManager,
     dhcp: DhcpSupervisor,
     dataplane: RouterDataplaneManager<P, E>,
+    /// Which interfaces a router transaction is allowed to touch.
+    ///
+    /// In memory on purpose, and not part of the address ownership journal.
+    /// This is not a record of a resource that was installed on the machine —
+    /// it is the scope of an intent, derived from the committed router intent
+    /// every time the daemon starts and narrowed again as the intent changes
+    /// (`adopt` / `retain`). Writing it down would create a second, staler copy
+    /// of something the overrides already hold durably.
+    ///
+    /// The addresses these interfaces carry *are* journalled: the router
+    /// applies them through the same `InterfaceManager` as everything else.
     router_interfaces: RwLock<Vec<String>>,
     dhcp_client: Option<Arc<dyn RouterDhcpClientRuntime>>,
     access_points: Option<Arc<dyn RouterApRuntime>>,
@@ -933,6 +944,7 @@ mod tests {
         AppConfig, DhcpInterfaceConfig, InterfaceConfig, InterfaceRole, RouterConfig, UplinkConfig,
         UplinkMode,
     };
+    use crate::core::ownership::AddressOwnershipJournal;
     use crate::core::router::RouterDesired;
     use crate::firewall::{OwnedFirewallIntegrity, RouterDataplaneDesired};
     use crate::netlink::{
@@ -1184,7 +1196,7 @@ mod tests {
         provider.add_interface("wan0", 1, true).await;
         provider.add_interface("lan0", 2, false).await;
 
-        let interfaces = InterfaceManager::new(provider.clone());
+        let interfaces = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
         let routes = RouteManager::new(provider.clone());
         let dhcp = DhcpSupervisor::start(
             &AppConfig::default(),

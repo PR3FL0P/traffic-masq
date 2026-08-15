@@ -266,6 +266,7 @@ async fn an_unconfirmed_change_converges_and_expires_on_a_live_kernel() -> Resul
 
     use traffic_masq::config::{AppConfig, InterfaceConfig, InterfaceRole};
     use traffic_masq::core::interface::InterfaceManager;
+    use traffic_masq::core::ownership::AddressOwnershipJournal;
     use traffic_masq::core::transaction::NetworkTransactionManager;
     use traffic_masq::state::desired::DesiredNetworkState;
     use traffic_masq::state::overrides::RuntimeOverrideManager;
@@ -293,7 +294,8 @@ async fn an_unconfirmed_change_converges_and_expires_on_a_live_kernel() -> Resul
     let desired = DesiredNetworkState::new(base, overrides);
 
     let provider: Arc<dyn NetworkProvider> = Arc::new(RtnetlinkNetworkProvider::connect()?);
-    let interfaces = InterfaceManager::new(provider.clone());
+    let journal = AddressOwnershipJournal::in_memory();
+    let interfaces = InterfaceManager::new(provider.clone(), journal.clone());
 
     // Stands in for the daemon's loop: same contract — read the version, make
     // the machine match, publish the result — without the supervisors, which
@@ -323,7 +325,7 @@ async fn an_unconfirmed_change_converges_and_expires_on_a_live_kernel() -> Resul
     });
 
     let manager = NetworkTransactionManager::new(
-        InterfaceManager::new(provider.clone()),
+        InterfaceManager::new(provider.clone(), journal.clone()),
         Duration::from_secs(2),
         desired.clone(),
     );
@@ -372,6 +374,101 @@ async fn an_unconfirmed_change_converges_and_expires_on_a_live_kernel() -> Resul
     provider
         .delete_ipv4_address(&fixture.host_if, committed, 24)
         .await?;
+    provider.set_link_down(&fixture.host_if).await?;
+    Ok(())
+}
+
+/// The journal and the kernel tag must never contradict each other.
+///
+/// They are two answers to one question — "did traffic-masq install this" — and
+/// the whole point of keeping both is that either one alone is enough. That is
+/// only safe while they agree on a machine where both work, and only a real
+/// kernel can say whether they do: it is the kernel that stores the tag, and
+/// the journal that survives it. This also covers the restart: the record is
+/// re-read from disk and checked against the link, exactly as the daemon does
+/// when it starts.
+#[tokio::test]
+#[ignore = "requires root, iproute2 and Linux 5.18+; run explicitly on a disposable Linux test host"]
+async fn the_journal_and_the_kernel_tag_agree_about_who_owns_an_address() -> Result<()> {
+    use std::sync::Arc;
+
+    use traffic_masq::config::{InterfaceConfig, InterfaceRole};
+    use traffic_masq::core::interface::InterfaceManager;
+    use traffic_masq::core::ownership::AddressOwnershipJournal;
+
+    let fixture = NetnsFixture::new()?;
+    let state_dir = tempfile::tempdir()?;
+    let test_ip = Ipv4Addr::new(192, 0, 2, 60);
+
+    let provider: Arc<dyn NetworkProvider> = Arc::new(RtnetlinkNetworkProvider::connect()?);
+    let journal = AddressOwnershipJournal::open(state_dir.path())?;
+    let interfaces = InterfaceManager::new(provider.clone(), journal);
+
+    let config = InterfaceConfig {
+        role: InterfaceRole::Output,
+        managed: true,
+        ipv4: Some(format!("{test_ip}/24").parse()?),
+        dhcp: None,
+        dhcp_client: None,
+        wifi: None,
+        wifi_client: None,
+    };
+    interfaces
+        .apply_interface(&fixture.host_if, &config, Some(InterfaceRole::Output), false)
+        .await?;
+
+    let observed = provider
+        .list_ipv4_addresses(&fixture.host_if)
+        .await?
+        .into_iter()
+        .find(|address| address.address == test_ip)
+        .context("the configured address should be on the link")?;
+    assert_eq!(
+        observed.owner(),
+        AddressOwner::TrafficMasqStatic,
+        "the kernel must be holding the tag this address was installed with"
+    );
+
+    // What a restart sees: the journal read back off disk, checked against the
+    // machine, with the daemon's in-memory state gone.
+    let reopened = AddressOwnershipJournal::open(state_dir.path())?;
+    let outcome = reopened
+        .reconcile(&fixture.host_if, &[observed.clone()])
+        .await?;
+    assert!(
+        outcome.dropped.is_empty(),
+        "a claim the kernel confirms must not be dropped: {:?}",
+        outcome.dropped
+    );
+    assert!(reopened.owns(&fixture.host_if, test_ip, 24).await);
+
+    // Taking the address off gives the claim up on both sides at once.
+    let mut released = config.clone();
+    released.managed = false;
+    released.ipv4 = None;
+    let plan = interfaces
+        .plan_interface_transition(
+            &fixture.host_if,
+            &released,
+            Some(&config),
+            Some(InterfaceRole::Output),
+            false,
+        )
+        .await?;
+    interfaces.apply_plan(&plan).await?;
+
+    assert!(provider
+        .list_ipv4_addresses(&fixture.host_if)
+        .await?
+        .iter()
+        .all(|address| address.address != test_ip));
+    assert!(
+        !AddressOwnershipJournal::open(state_dir.path())?
+            .owns(&fixture.host_if, test_ip, 24)
+            .await,
+        "an address that is off the link must not still be claimed on disk"
+    );
+
     provider.set_link_down(&fixture.host_if).await?;
     Ok(())
 }

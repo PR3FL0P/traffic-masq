@@ -5,6 +5,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{InterfaceConfig, InterfaceRole, NetworkConfig};
+use crate::core::ownership::AddressOwnershipJournal;
 use crate::netlink::{AddressOwner, AddressOwnership, Ipv4AddressInfo, NetworkProvider};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,11 +86,41 @@ pub fn owns_dynamic_ipv4(config: &InterfaceConfig) -> bool {
 #[derive(Clone)]
 pub struct InterfaceManager {
     provider: Arc<dyn NetworkProvider>,
+    journal: AddressOwnershipJournal,
 }
 
 impl InterfaceManager {
-    pub fn new(provider: Arc<dyn NetworkProvider>) -> Self {
-        Self { provider }
+    /// The journal is not optional and not a detail of construction: every
+    /// manager that writes addresses has to record them where every manager
+    /// that asks "is this mine" will look, or the answer depends on which
+    /// object you happened to ask.
+    pub fn new(provider: Arc<dyn NetworkProvider>, journal: AddressOwnershipJournal) -> Self {
+        Self { provider, journal }
+    }
+
+    /// Whether traffic-masq installed this address.
+    ///
+    /// Two sources, one answer. The journal is what the daemon wrote down
+    /// before touching the machine; the `IFA_PROTO` tag is the kernel
+    /// confirming it. Either alone is enough, which is the point: the journal
+    /// survives a kernel that cannot hold tags, and the tag survives losing the
+    /// journal.
+    pub async fn owns_address(&self, interface: &str, address: &Ipv4AddressInfo) -> bool {
+        address.owner() == AddressOwner::TrafficMasqStatic
+            || self
+                .journal
+                .owns(interface, address.address, address.prefix_len)
+                .await
+    }
+
+    /// Whether any of these addresses is ours.
+    pub async fn owns_any_address(&self, interface: &str, addresses: &[Ipv4AddressInfo]) -> bool {
+        for address in addresses {
+            if self.owns_address(interface, address).await {
+                return true;
+            }
+        }
+        false
     }
 
     pub async fn snapshot(&self, name: &str) -> Result<InterfaceSnapshot> {
@@ -289,11 +320,6 @@ impl InterfaceManager {
             let releasing_management = previous_config.is_some_and(|previous| previous.managed);
             let delete_ipv4 = {
                 let previous_ipv4 = previous_config.and_then(|previous| previous.ipv4);
-                if previous_ipv4.is_some() && !self.provider.supports_ipv4_address_protocol() {
-                    bail!(
-                        "cannot safely stop managing {name}: this network provider cannot verify IPv4 address ownership"
-                    );
-                }
                 let observed = self.provider.list_ipv4_addresses(name).await?;
                 tracing::info!(
                     interface = %name,
@@ -302,22 +328,34 @@ impl InterfaceManager {
                     releasing_management,
                     "observed IPv4 addresses while planning an unmanaged interface"
                 );
+                // The configured address is still on the link and nothing —
+                // neither the journal nor a tag — says we put it there. Deleting
+                // it would take away an address that belongs to someone else.
                 if let Some(previous_ipv4) = previous_ipv4 {
-                    if let Some(address) = observed.iter().find(|address| {
-                        ipnet::Ipv4Net::new(address.address, address.prefix_len).ok()
-                            == Some(previous_ipv4)
-                            && address.owner() != AddressOwner::TrafficMasqStatic
-                    }) {
+                    let unproven = {
+                        let mut unproven = None;
+                        for address in &observed {
+                            if ipnet::Ipv4Net::new(address.address, address.prefix_len).ok()
+                                == Some(previous_ipv4)
+                                && !self.owns_address(name, address).await
+                            {
+                                unproven = Some(address.clone());
+                                break;
+                            }
+                        }
+                        unproven
+                    };
+                    if let Some(address) = unproven {
                         bail!(
-                            "cannot safely stop managing {name}: configured address {}/{} has no traffic-masq ownership tag (observed protocol {:?}); re-apply the managed configuration before trying again",
+                            "cannot safely stop managing {name}: configured address {}/{} is not recorded as installed by traffic-masq and carries no ownership tag (observed protocol {:?}); re-apply the managed configuration before trying again",
                             address.address,
                             address.prefix_len,
                             address.protocol
                         );
                     }
                 }
-                // Cleanup is a state, not an edge. An address tagged as ours has
-                // no business sitting on an interface we do not manage, however
+                // Cleanup is a state, not an edge. An address of ours has no
+                // business sitting on an interface we do not manage, however
                 // many apply cycles ago we stopped managing it — otherwise a
                 // leftover becomes unremovable once the managed -> unmanaged
                 // transition has been spent.
@@ -325,10 +363,15 @@ impl InterfaceManager {
                 // Only our own static addresses: DHCP-owned ones are torn down
                 // by the DHCP client supervisor's disable path, and deleting
                 // them here as well would race with it.
-                observed
-                    .into_iter()
-                    .filter(|address| address.owner() == AddressOwner::TrafficMasqStatic)
-                    .collect()
+                let mut ours = Vec::new();
+                for address in observed {
+                    if address.owner() != AddressOwner::TrafficMasqDhcp
+                        && self.owns_address(name, &address).await
+                    {
+                        ours.push(address);
+                    }
+                }
+                ours
             };
             return Ok(InterfaceChangePlan {
                 interface: name.to_string(),
@@ -509,9 +552,11 @@ impl InterfaceManager {
                 address = %describe_address(address),
                 "applying interface plan: deleting IPv4 address"
             );
+            self.record_release(&plan.interface, address).await;
             self.provider
                 .delete_ipv4_address(&plan.interface, address.address, address.prefix_len)
                 .await?;
+            self.record_released(&plan.interface, address).await;
         }
 
         if let Some(address) = &plan.retag_ipv4 {
@@ -520,6 +565,7 @@ impl InterfaceManager {
                 address = %describe_address(address),
                 "applying interface plan: claiming existing IPv4 address in place"
             );
+            self.record_claim(&plan.interface, address).await;
             self.provider
                 .set_ipv4_address_ownership(
                     &plan.interface,
@@ -528,6 +574,7 @@ impl InterfaceManager {
                     address.owner().restore_as(),
                 )
                 .await?;
+            self.record_claimed(&plan.interface, address).await;
         }
 
         if let Some(address) = &plan.add_ipv4 {
@@ -536,6 +583,7 @@ impl InterfaceManager {
                 address = %describe_address(address),
                 "applying interface plan: adding IPv4 address"
             );
+            self.record_claim(&plan.interface, address).await;
             self.provider
                 .add_ipv4_address(
                     &plan.interface,
@@ -544,12 +592,89 @@ impl InterfaceManager {
                     address.owner().restore_as(),
                 )
                 .await?;
+            self.record_claimed(&plan.interface, address).await;
         }
 
         if plan.set_link_up {
             self.provider.set_link_up(&plan.interface).await?;
         }
         Ok(())
+    }
+
+    /// Write down that an address is about to become ours.
+    ///
+    /// Before the mutation, always. The other order leaves the crash window on
+    /// the wrong side: an address on the machine that nothing remembers
+    /// installing is an address nobody will ever take off.
+    ///
+    /// Callers decide what counts as ours — installing the configured address
+    /// does, restoring one that was on the link before us does not — because
+    /// the tag cannot decide it: on a kernel that drops `IFA_PROTO` our own
+    /// address goes on untagged, and that is exactly when the journal is the
+    /// only record there is.
+    ///
+    /// A journal that cannot be written is logged and does not fail the
+    /// operation: the address still has to go on, and a machine that refuses to
+    /// configure its network because a bookkeeping file is unwritable is worse
+    /// than one whose bookkeeping is incomplete.
+    async fn record_claim(&self, interface: &str, address: &Ipv4AddressInfo) {
+        if let Err(error) = self
+            .journal
+            .claim(interface, address.address, address.prefix_len)
+            .await
+        {
+            tracing::warn!(
+                interface = %interface,
+                address = %describe_address(address),
+                %error,
+                "failed to record IPv4 address ownership before installing it"
+            );
+        }
+    }
+
+    async fn record_claimed(&self, interface: &str, address: &Ipv4AddressInfo) {
+        if let Err(error) = self
+            .journal
+            .confirm(interface, address.address, address.prefix_len)
+            .await
+        {
+            tracing::warn!(
+                interface = %interface,
+                address = %describe_address(address),
+                %error,
+                "failed to confirm IPv4 address ownership after installing it"
+            );
+        }
+    }
+
+    async fn record_release(&self, interface: &str, address: &Ipv4AddressInfo) {
+        if let Err(error) = self
+            .journal
+            .releasing(interface, address.address, address.prefix_len)
+            .await
+        {
+            tracing::warn!(
+                interface = %interface,
+                address = %describe_address(address),
+                %error,
+                "failed to record IPv4 address release before removing it"
+            );
+        }
+    }
+
+    async fn record_released(&self, interface: &str, address: &Ipv4AddressInfo) {
+        if let Err(error) = self
+            .journal
+            .release(interface, address.address, address.prefix_len)
+            .await
+        {
+            tracing::warn!(
+                interface = %interface,
+                address = %describe_address(address),
+                %error,
+                "failed to drop the IPv4 address claim after removing it"
+            );
+        }
     }
 
     pub async fn rollback(&self, snapshot: &InterfaceSnapshot) -> Result<()> {
@@ -578,9 +703,11 @@ impl InterfaceManager {
                     address = %describe_address(address),
                     "rollback: deleting IPv4 address that was not in the snapshot"
                 );
+                self.record_release(&snapshot.name, address).await;
                 self.provider
                     .delete_ipv4_address(&snapshot.name, address.address, address.prefix_len)
                     .await?;
+                self.record_released(&snapshot.name, address).await;
             }
         }
 
@@ -588,6 +715,10 @@ impl InterfaceManager {
             // Ownership is restored as it was, except that a foreign tag is
             // never replayed: see `AddressOwner::restore_as`.
             let ownership = address.owner().restore_as();
+            // Whether putting this back makes it ours again. An address that
+            // was on the link before traffic-masq touched it is restored, not
+            // claimed — recording it would authorise deleting it later.
+            let ours = self.owns_address(&snapshot.name, address).await;
             match current.iter().find(|item| same_address(item, address)) {
                 Some(present) if present.protocol != address.protocol && can_tag => {
                     tracing::info!(
@@ -596,6 +727,9 @@ impl InterfaceManager {
                         observed = %describe_address(present),
                         "rollback: restoring the ownership tag of an existing IPv4 address"
                     );
+                    if ours {
+                        self.record_claim(&snapshot.name, address).await;
+                    }
                     self.provider
                         .set_ipv4_address_ownership(
                             &snapshot.name,
@@ -604,6 +738,9 @@ impl InterfaceManager {
                             ownership,
                         )
                         .await?;
+                    if ours {
+                        self.record_claimed(&snapshot.name, address).await;
+                    }
                 }
                 Some(_) => {}
                 None => {
@@ -612,6 +749,9 @@ impl InterfaceManager {
                         address = %describe_address(address),
                         "rollback: re-adding an IPv4 address from the snapshot"
                     );
+                    if ours {
+                        self.record_claim(&snapshot.name, address).await;
+                    }
                     self.provider
                         .add_ipv4_address(
                             &snapshot.name,
@@ -620,6 +760,9 @@ impl InterfaceManager {
                             ownership,
                         )
                         .await?;
+                    if ours {
+                        self.record_claimed(&snapshot.name, address).await;
+                    }
                 }
             }
         }
@@ -802,7 +945,7 @@ mod tests {
         provider
             .add_interface("eth0", true, vec![owned.clone(), foreign])
             .await;
-        let manager = InterfaceManager::new(provider);
+        let manager = InterfaceManager::new(provider, AddressOwnershipJournal::in_memory());
         let previous = config(InterfaceRole::Output, "192.168.50.1/24");
         let mut target = previous.clone();
         target.managed = false;
@@ -835,7 +978,7 @@ mod tests {
                 vec![address_with_protocol("192.168.50.1/24", None)],
             )
             .await;
-        let manager = InterfaceManager::new(provider);
+        let manager = InterfaceManager::new(provider, AddressOwnershipJournal::in_memory());
         let previous = config(InterfaceRole::Output, "192.168.50.1/24");
         let mut target = previous.clone();
         target.managed = false;
@@ -854,11 +997,200 @@ mod tests {
         assert!(error.to_string().contains("ownership tag"));
     }
 
+    /// A provider that installs addresses but cannot hold an ownership tag —
+    /// which is every Linux older than 5.18.
+    #[derive(Debug, Default)]
+    struct UntaggedNetworkProvider(FakeNetworkProvider);
+
+    #[async_trait]
+    impl NetworkProvider for UntaggedNetworkProvider {
+        fn supports_ipv4_address_protocol(&self) -> bool {
+            false
+        }
+
+        async fn list_interfaces(&self) -> Result<Vec<NetworkInterface>> {
+            self.0.list_interfaces().await
+        }
+
+        async fn list_ipv4_addresses(&self, interface: &str) -> Result<Vec<Ipv4AddressInfo>> {
+            self.0.list_ipv4_addresses(interface).await
+        }
+
+        async fn set_link_up(&self, name: &str) -> Result<()> {
+            self.0.set_link_up(name).await
+        }
+
+        async fn set_link_down(&self, name: &str) -> Result<()> {
+            self.0.set_link_down(name).await
+        }
+
+        async fn add_ipv4_address(
+            &self,
+            interface: &str,
+            address: Ipv4Addr,
+            prefix_len: u8,
+            _ownership: AddressOwnership,
+        ) -> Result<()> {
+            // The tag is dropped, silently, exactly as the kernel does.
+            self.0
+                .add_ipv4_address(interface, address, prefix_len, AddressOwnership::Untagged)
+                .await
+        }
+
+        async fn delete_ipv4_address(
+            &self,
+            interface: &str,
+            address: Ipv4Addr,
+            prefix_len: u8,
+        ) -> Result<()> {
+            self.0
+                .delete_ipv4_address(interface, address, prefix_len)
+                .await
+        }
+    }
+
+    /// The dead end this stage exists to remove.
+    ///
+    /// On a kernel that cannot hold `IFA_PROTO`, traffic-masq used to install an
+    /// address it could never prove was its own, and refuse to release the
+    /// interface for ever after. The journal is that proof, so the same
+    /// sequence now completes.
+    #[tokio::test]
+    async fn an_interface_can_be_released_on_a_kernel_without_ownership_tags() {
+        let provider = Arc::new(UntaggedNetworkProvider::default());
+        provider.0.add_interface("eth0", true, Vec::new()).await;
+        let manager =
+            InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
+        let managed = config(InterfaceRole::Output, "192.168.50.1/24");
+
+        manager
+            .apply_interface("eth0", &managed, Some(InterfaceRole::Output), false)
+            .await
+            .expect("apply the managed configuration");
+
+        let installed = provider
+            .list_ipv4_addresses("eth0")
+            .await
+            .expect("addresses");
+        assert_eq!(
+            installed[0].owner(),
+            AddressOwner::Untagged,
+            "this kernel cannot hold the tag; the journal has to be what remembers"
+        );
+
+        let mut released = managed.clone();
+        released.managed = false;
+        released.ipv4 = None;
+
+        let plan = manager
+            .plan_interface_transition(
+                "eth0",
+                &released,
+                Some(&managed),
+                Some(InterfaceRole::Output),
+                false,
+            )
+            .await
+            .expect("releasing management must not be a dead end");
+
+        assert_eq!(plan.delete_ipv4, installed);
+        assert!(plan.releasing_management);
+
+        manager.apply_plan(&plan).await.expect("apply the release");
+        assert!(provider
+            .list_ipv4_addresses("eth0")
+            .await
+            .expect("addresses")
+            .is_empty());
+    }
+
+    /// The other half of the same rule: without a record and without a tag, the
+    /// address is not ours and is not touched. The journal must not be a licence
+    /// to delete whatever happens to match the configuration.
+    #[tokio::test]
+    async fn an_untagged_address_nobody_recorded_is_still_refused() {
+        let provider = Arc::new(UntaggedNetworkProvider::default());
+        provider
+            .0
+            .add_interface(
+                "eth0",
+                true,
+                vec![address_with_protocol("192.168.50.1/24", None)],
+            )
+            .await;
+        let manager = InterfaceManager::new(provider, AddressOwnershipJournal::in_memory());
+        let previous = config(InterfaceRole::Output, "192.168.50.1/24");
+        let mut target = previous.clone();
+        target.managed = false;
+        target.ipv4 = None;
+
+        let error = manager
+            .plan_interface_transition(
+                "eth0",
+                &target,
+                Some(&previous),
+                Some(InterfaceRole::Output),
+                false,
+            )
+            .await
+            .expect_err("an address we cannot prove is ours must not be deleted");
+        assert!(error.to_string().contains("not recorded as installed"));
+    }
+
+    /// Installing an address writes it down before the kernel is touched, and
+    /// removing it gives the record up. Without the second half the journal
+    /// would grow claims on addresses that are long gone.
+    #[tokio::test]
+    async fn installing_and_removing_an_address_keeps_the_journal_in_step() {
+        let provider = Arc::new(FakeNetworkProvider::default());
+        provider.add_interface("eth0", true, Vec::new()).await;
+        let journal = AddressOwnershipJournal::in_memory();
+        let manager = InterfaceManager::new(provider.clone(), journal.clone());
+
+        manager
+            .apply_interface(
+                "eth0",
+                &config(InterfaceRole::Output, "192.168.50.1/24"),
+                Some(InterfaceRole::Output),
+                false,
+            )
+            .await
+            .expect("apply");
+
+        assert!(
+            journal
+                .owns("eth0", Ipv4Addr::new(192, 168, 50, 1), 24)
+                .await
+        );
+
+        manager
+            .apply_interface(
+                "eth0",
+                &config(InterfaceRole::Output, "192.168.60.1/24"),
+                Some(InterfaceRole::Output),
+                false,
+            )
+            .await
+            .expect("apply a different address");
+
+        assert!(
+            !journal
+                .owns("eth0", Ipv4Addr::new(192, 168, 50, 1), 24)
+                .await,
+            "an address that has been removed is no longer ours"
+        );
+        assert!(
+            journal
+                .owns("eth0", Ipv4Addr::new(192, 168, 60, 1), 24)
+                .await
+        );
+    }
+
     #[tokio::test]
     async fn snapshotting_reports_a_missing_interface_instead_of_failing() {
         let provider = Arc::new(FakeNetworkProvider::default());
         provider.add_interface("eth0", true, Vec::new()).await;
-        let manager = InterfaceManager::new(provider);
+        let manager = InterfaceManager::new(provider, AddressOwnershipJournal::in_memory());
 
         assert!(manager
             .snapshot_if_present("eth0")
@@ -882,7 +1214,7 @@ mod tests {
         provider
             .add_interface("eth0", true, vec![owned.clone(), foreign])
             .await;
-        let manager = InterfaceManager::new(provider);
+        let manager = InterfaceManager::new(provider, AddressOwnershipJournal::in_memory());
 
         // Both sides already unmanaged: the managed -> unmanaged edge is long
         // gone, but our address is still sitting on the link.
@@ -925,7 +1257,7 @@ mod tests {
                 vec![address_with_protocol("192.168.50.1/24", None)],
             )
             .await;
-        let manager = InterfaceManager::new(provider.clone());
+        let manager = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
 
         // Not a plan the planner currently produces, which is the point: apply
         // must read the tag out of the plan instead of assuming Static.
@@ -967,7 +1299,7 @@ mod tests {
                 vec![address_with_protocol("192.168.50.1/24", None)],
             )
             .await;
-        let manager = InterfaceManager::new(provider);
+        let manager = InterfaceManager::new(provider, AddressOwnershipJournal::in_memory());
         let desired = config(InterfaceRole::Output, "192.168.50.1/24");
 
         // The startup/reconcile path and the transactional path must agree:
@@ -1013,7 +1345,7 @@ mod tests {
                 vec![address_with_protocol("192.168.50.1/24", None)],
             )
             .await;
-        let manager = InterfaceManager::new(provider.clone());
+        let manager = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
         let desired = config(InterfaceRole::Output, "192.168.50.1/24");
 
         manager
@@ -1054,7 +1386,7 @@ mod tests {
                 )],
             )
             .await;
-        let manager = InterfaceManager::new(provider);
+        let manager = InterfaceManager::new(provider, AddressOwnershipJournal::in_memory());
         let desired = config(InterfaceRole::Output, "192.168.50.1/24");
 
         let plan = manager
@@ -1077,7 +1409,7 @@ mod tests {
     async fn refuses_management_change_without_confirmation() {
         let provider = Arc::new(FakeNetworkProvider::default());
         provider.add_interface("eth0", true, Vec::new()).await;
-        let manager = InterfaceManager::new(provider);
+        let manager = InterfaceManager::new(provider, AddressOwnershipJournal::in_memory());
 
         let error = manager
             .apply_interface(
@@ -1096,7 +1428,7 @@ mod tests {
     async fn refuses_relabelling_a_management_interface_without_confirmation() {
         let provider = Arc::new(FakeNetworkProvider::default());
         provider.add_interface("eth0", true, Vec::new()).await;
-        let manager = InterfaceManager::new(provider);
+        let manager = InterfaceManager::new(provider, AddressOwnershipJournal::in_memory());
 
         let error = manager
             .apply_interface(
@@ -1151,7 +1483,7 @@ mod tests {
         provider
             .add_interface("wan0", false, vec![dynamic.clone()])
             .await;
-        let manager = InterfaceManager::new(provider.clone());
+        let manager = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
 
         let mut config = config(InterfaceRole::Input, "192.0.2.42/24");
 
@@ -1197,7 +1529,7 @@ mod tests {
                 }],
             )
             .await;
-        let manager = InterfaceManager::new(provider);
+        let manager = InterfaceManager::new(provider, AddressOwnershipJournal::in_memory());
 
         let mut config = config(InterfaceRole::Input, "192.0.2.10/24");
         config.dhcp_client = Some(crate::config::DhcpClientInterfaceConfig {
@@ -1226,7 +1558,7 @@ mod tests {
         provider
             .add_interface("usb0", false, vec![original.clone()])
             .await;
-        let manager = InterfaceManager::new(provider.clone());
+        let manager = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
         let snapshot = manager.snapshot("usb0").await.expect("snapshot");
 
         manager
@@ -1266,7 +1598,7 @@ mod tests {
         let provider = Arc::new(FakeNetworkProvider::default());
         provider.add_interface("eth0", false, Vec::new()).await;
 
-        let manager = InterfaceManager::new(provider.clone());
+        let manager = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
 
         let mut network = NetworkConfig::default();
         network.interfaces.insert(
@@ -1298,7 +1630,7 @@ mod tests {
         let provider = Arc::new(FakeNetworkProvider::default());
         provider.add_interface("eth0", false, Vec::new()).await;
         provider.add_interface("mgmt0", true, Vec::new()).await;
-        let manager = InterfaceManager::new(provider.clone());
+        let manager = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
 
         let mut network = NetworkConfig::default();
         network.interfaces.insert(

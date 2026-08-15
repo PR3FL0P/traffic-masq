@@ -23,6 +23,7 @@ use crate::config::{
     WifiClientConfig,
 };
 use crate::core::interface::{InterfaceManager, InterfaceSnapshot};
+use crate::core::ownership::AddressOwnershipJournal;
 use crate::core::router::{RouterApplyError, RouterDesired};
 use crate::core::router_provisioning::{
     derive_router_provisioning, ProvisioningInterfaceObservation, ProvisioningKnownNetwork,
@@ -98,13 +99,23 @@ pub struct ControlService {
 }
 
 impl ControlService {
+    /// A service with an ownership journal of its own, which is to say one that
+    /// is not written down. For tests and tooling; the daemon shares the
+    /// journal it opened at startup through [`Self::new_with_baselines`].
     pub fn new(
         config: AppConfig,
         network: Arc<dyn NetworkProvider>,
         dhcp: DhcpSupervisor,
         overrides: RuntimeOverrideManager,
     ) -> Self {
-        Self::new_with_baselines(config, network, dhcp, overrides, Vec::new())
+        Self::new_with_baselines(
+            config,
+            network,
+            dhcp,
+            overrides,
+            Vec::new(),
+            AddressOwnershipJournal::in_memory(),
+        )
     }
 
     pub fn new_with_baselines(
@@ -113,9 +124,10 @@ impl ControlService {
         dhcp: DhcpSupervisor,
         overrides: RuntimeOverrideManager,
         baselines: Vec<InterfaceSnapshot>,
+        journal: AddressOwnershipJournal,
     ) -> Self {
         let transactions = NetworkTransactionManager::new_with_services(
-            InterfaceManager::new(network.clone()),
+            InterfaceManager::new(network.clone(), journal),
             Duration::from_secs(config.security.rollback_timeout_seconds),
             baselines,
             dhcp.clone(),

@@ -1,21 +1,14 @@
-use std::{
-    fs::{self, File, OpenOptions},
-    io::{self, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::{io, path::Path};
 
-use crate::dhcp::client::lease::{valid_interface_name, DhcpClientLease};
-
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+use crate::dhcp::client::lease::DhcpClientLease;
+use crate::state::private_store::{PrivateJsonDirectory, PrivateStoreError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LeaseStoreError {
     #[error("invalid interface name")]
     InvalidInterface,
     #[error("unsafe symlink at {0}")]
-    Symlink(PathBuf),
+    Symlink(std::path::PathBuf),
     #[error("unsupported DHCP lease schema version {0}")]
     UnsupportedSchema(u32),
     #[error("invalid DHCP lease: {0}")]
@@ -26,54 +19,36 @@ pub enum LeaseStoreError {
     Json(#[from] serde_json::Error),
 }
 
+impl From<PrivateStoreError> for LeaseStoreError {
+    fn from(error: PrivateStoreError) -> Self {
+        match error {
+            PrivateStoreError::InvalidKey => Self::InvalidInterface,
+            PrivateStoreError::Symlink(path) => Self::Symlink(path),
+            PrivateStoreError::Io(error) => Self::Io(error),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DhcpClientLeaseStore {
-    directory: PathBuf,
+    documents: PrivateJsonDirectory,
 }
 
 impl DhcpClientLeaseStore {
     pub fn new(state_root: impl AsRef<Path>) -> Result<Self, LeaseStoreError> {
-        let root = state_root.as_ref();
-        reject_symlink(root)?;
-        fs::create_dir_all(root)?;
-        reject_symlink(root)?;
-        let directory = root.join("dhcp-client");
-        if directory.exists() {
-            reject_symlink(&directory)?;
-            if !directory.is_dir() {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotADirectory,
-                    format!("{} is not a directory", directory.display()),
-                )
-                .into());
-            }
-        } else {
-            fs::create_dir(&directory)?;
-        }
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
-        Ok(Self { directory })
+        Ok(Self {
+            documents: PrivateJsonDirectory::open(state_root, "dhcp-client")?,
+        })
     }
 
     pub fn directory(&self) -> &Path {
-        &self.directory
+        self.documents.directory()
     }
 
     pub fn load(&self, interface: &str) -> Result<Option<DhcpClientLease>, LeaseStoreError> {
-        let path = self.path(interface)?;
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(LeaseStoreError::Symlink(path))
-            }
-            Ok(metadata) if !metadata.is_file() => {
-                return Err(
-                    io::Error::new(io::ErrorKind::InvalidData, "lease path is not a file").into(),
-                )
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error.into()),
-        }
-        let bytes = fs::read(path)?;
+        let Some(bytes) = self.documents.read(interface)? else {
+            return Ok(None);
+        };
         let value: serde_json::Value = serde_json::from_slice(&bytes)?;
         let schema = value
             .get("schema_version")
@@ -101,72 +76,22 @@ impl DhcpClientLeaseStore {
             }
             other => LeaseStoreError::InvalidLease(other.to_string()),
         })?;
-        let destination = self.path(&lease.interface)?;
-        reject_existing_symlink(&destination)?;
-        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary = self.directory.join(format!(
-            ".{}.{}.{}.tmp",
-            lease.interface,
-            std::process::id(),
-            sequence
-        ));
-        let result = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(nix::libc::O_NOFOLLOW)
-                .open(&temporary)?;
-            serde_json::to_writer_pretty(&mut file, lease)?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
-            reject_existing_symlink(&destination)?;
-            fs::rename(&temporary, &destination)?;
-            fs::set_permissions(&destination, fs::Permissions::from_mode(0o600))?;
-            File::open(&self.directory)?.sync_all()?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result
-    }
-
-    pub fn remove(&self, interface: &str) -> Result<(), LeaseStoreError> {
-        let path = self.path(interface)?;
-        reject_existing_symlink(&path)?;
-        match fs::remove_file(path) {
-            Ok(()) => File::open(&self.directory)?.sync_all()?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+        let mut document = serde_json::to_vec_pretty(lease)?;
+        document.push(b'\n');
+        self.documents.write(&lease.interface, &document)?;
         Ok(())
     }
 
-    fn path(&self, interface: &str) -> Result<PathBuf, LeaseStoreError> {
-        if !valid_interface_name(interface) {
-            return Err(LeaseStoreError::InvalidInterface);
-        }
-        Ok(self.directory.join(format!("{interface}.json")))
+    pub fn remove(&self, interface: &str) -> Result<(), LeaseStoreError> {
+        self.documents.remove(interface)?;
+        Ok(())
     }
-}
-
-fn reject_symlink(path: &Path) -> Result<(), LeaseStoreError> {
-    if let Ok(metadata) = fs::symlink_metadata(path) {
-        if metadata.file_type().is_symlink() {
-            return Err(LeaseStoreError::Symlink(path.to_path_buf()));
-        }
-    }
-    Ok(())
-}
-
-fn reject_existing_symlink(path: &Path) -> Result<(), LeaseStoreError> {
-    reject_symlink(path)
 }
 
 #[cfg(test)]
 mod tests {
     use std::{
+        fs,
         net::Ipv4Addr,
         os::unix::fs::{symlink, MetadataExt},
     };

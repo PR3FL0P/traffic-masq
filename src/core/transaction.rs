@@ -541,6 +541,7 @@ mod tests {
     use tokio::sync::Mutex;
 
     use crate::config::{AppConfig, InterfaceConfig, InterfaceRole};
+    use crate::core::ownership::AddressOwnershipJournal;
     use crate::netlink::{Ipv4AddressInfo, NetworkInterface, NetworkProvider};
     use crate::state::overrides::RuntimeOverrideManager;
 
@@ -658,7 +659,7 @@ mod tests {
     ) -> tokio::task::JoinHandle<()> {
         desired.attach_converger();
         tokio::spawn(async move {
-            let interfaces = InterfaceManager::new(provider);
+            let interfaces = InterfaceManager::new(provider, AddressOwnershipJournal::in_memory());
             loop {
                 let version = desired.version();
                 let mut failures = BTreeMap::new();
@@ -695,7 +696,7 @@ mod tests {
         let desired = desired_state(directory.path()).await;
         let converger = spawn_converger(desired.clone(), provider.clone());
         let manager = NetworkTransactionManager::new(
-            InterfaceManager::new(provider.clone()),
+            InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory()),
             Duration::from_secs(60),
             desired,
         );
@@ -743,7 +744,7 @@ mod tests {
         let desired = desired_state(directory.path()).await;
         let converger = spawn_converger(desired.clone(), provider.clone());
         let manager = NetworkTransactionManager::new(
-            InterfaceManager::new(provider.clone()),
+            InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory()),
             Duration::from_millis(20),
             desired,
         );
@@ -781,7 +782,7 @@ mod tests {
         let provider = fake_network();
         let desired = desired_state(directory.path()).await;
         let manager = NetworkTransactionManager::new(
-            InterfaceManager::new(provider.clone()),
+            InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory()),
             Duration::from_secs(60),
             desired.clone(),
         );
@@ -816,7 +817,7 @@ mod tests {
         let provider = fake_network();
         let desired = desired_state(directory.path()).await;
         let manager = NetworkTransactionManager::new(
-            InterfaceManager::new(provider.clone()),
+            InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory()),
             Duration::from_secs(60),
             desired.clone(),
         );
