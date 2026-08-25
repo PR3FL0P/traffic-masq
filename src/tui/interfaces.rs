@@ -149,9 +149,9 @@ pub(crate) fn render_interface_list(frame: &mut ratatui::Frame<'_>, area: Rect, 
                 .copied()
                 .unwrap_or(false);
             let managed_span = if is_managed {
-                Span::styled("managed    ", Style::default().fg(theme::GOOD))
+                Span::styled("m  ", Style::default().fg(theme::GOOD))
             } else {
-                Span::styled("not managed", Style::default().fg(theme::MUTED))
+                Span::styled("n/m", Style::default().fg(theme::MUTED))
             };
             Line::from(vec![
                 Span::styled(format!("{marker} {:<12}", status.interface.name), style),
