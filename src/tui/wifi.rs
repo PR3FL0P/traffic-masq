@@ -349,30 +349,32 @@ pub(crate) fn render_wifi(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
             selected_style(index == app.wifi.selected),
         ));
     }
-    if let Some(row) = app.wifi.focused_radio() {
-        lines.push(Line::from(""));
-        for (slot, (_, label)) in actions(row.role).iter().enumerate() {
-            let cursor = app.wifi.rows.len() + slot;
-            let text = format!(
-                "{}{}",
-                if app.wifi.selected == cursor {
-                    "▶ "
-                } else {
-                    "  "
-                },
-                label
-            );
-            app.ui.buttons.push((
-                Rect::new(inner.x, inner.y + lines.len() as u16, text.len() as u16, 1),
-                slot,
-            ));
-            lines.push(Line::styled(
-                text,
-                selected_style(app.wifi.selected == cursor),
-            ));
-        }
-        if row.role == WifiRole::Unknown {
-            lines.push(Line::styled("Role is unknown; configure the interface as managed output (AP) or unmanaged input (client) first.", Style::default().fg(theme::WARN)));
+    if app.wifi.selected >= app.wifi.rows.len() {
+        if let Some(row) = app.wifi.focused_radio() {
+            lines.push(Line::from(""));
+            for (slot, (_, label)) in actions(row.role).iter().enumerate() {
+                let cursor = app.wifi.rows.len() + slot;
+                let text = format!(
+                    "{}{}",
+                    if app.wifi.selected == cursor {
+                        "▶ "
+                    } else {
+                        "  "
+                    },
+                    label
+                );
+                app.ui.buttons.push((
+                    Rect::new(inner.x, inner.y + lines.len() as u16, text.len() as u16, 1),
+                    slot,
+                ));
+                lines.push(Line::styled(
+                    text,
+                    selected_style(app.wifi.selected == cursor),
+                ));
+            }
+            if row.role == WifiRole::Unknown {
+                lines.push(Line::styled("Role is unknown; configure the interface as managed output (AP) or unmanaged input (client) first.", Style::default().fg(theme::WARN)));
+            }
         }
     }
     frame.render_widget(Paragraph::new(lines), inner);
@@ -1084,19 +1086,31 @@ pub(crate) async fn load_wifi_data(app: &mut TuiApp, client: &ApiClient) {
         }
     };
     let mut rows = build_rows(&interfaces, &ap, &clients);
-    for row in rows.iter_mut().filter(|row| row.role == WifiRole::Unknown) {
-        if let Ok(Response::InterfaceConfig {
-            config: Some(config),
-            ..
-        }) = client
+    let mut managed = std::collections::HashMap::new();
+    for row in rows.iter_mut() {
+        let config = match client
             .request(&Request::GetInterfaceConfig {
                 interface: row.interface.clone(),
             })
             .await
         {
-            row.role = role_from_interface(config.role, config.managed);
+            Ok(Response::InterfaceConfig {
+                config: Some(config),
+                ..
+            }) => Some(config),
+            _ => None,
+        };
+        managed.insert(
+            row.interface.clone(),
+            config.as_ref().is_some_and(|c| c.managed),
+        );
+        if row.role == WifiRole::Unknown {
+            if let Some(config) = &config {
+                row.role = role_from_interface(config.role, config.managed);
+            }
         }
     }
+    rows.retain(|row| managed.get(&row.interface).copied().unwrap_or(false));
     app.wifi.rows = rows;
     app.wifi.selected_radio = app
         .wifi

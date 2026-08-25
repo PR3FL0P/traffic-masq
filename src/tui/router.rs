@@ -8,7 +8,7 @@ use ratatui::widgets::Paragraph;
 use crate::api::client::ApiClient;
 use crate::api::model::{Request, Response, RouterErrorDetail, RouterProposalRequest};
 use crate::config::InterfaceRole;
-use crate::core::router::{RouterHealthReport, RouterInterfaceDesired, RouterPlan};
+use crate::core::router::{RouterDesired, RouterHealthReport, RouterInterfaceDesired, RouterPlan};
 use crate::core::router_transaction::CoordinatorStatus;
 use crate::dhcp::supervisor::DhcpServiceSpec;
 use crate::firewall::RouterDataplaneTarget;
@@ -43,6 +43,14 @@ fn toggle_router_field(field: RouterField) -> RouterField {
         RouterField::Provision => RouterField::Plan,
         RouterField::Plan => RouterField::Refresh,
         RouterField::Refresh => RouterField::Provision,
+    }
+}
+
+fn toggle_router_field_reverse(field: RouterField) -> RouterField {
+    match field {
+        RouterField::Provision => RouterField::Refresh,
+        RouterField::Plan => RouterField::Provision,
+        RouterField::Refresh => RouterField::Plan,
     }
 }
 
@@ -95,6 +103,12 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         }
         for line in summarize_dhcp(&plan.desired.dhcp, &router.lease_counts) {
             lines.push(Line::from(format!("  dhcp: {line}")));
+        }
+        for line in ap_without_dhcp_warnings(&plan.desired) {
+            lines.push(Line::styled(
+                format!("  warning: {line}"),
+                Style::default().fg(theme::WARN),
+            ));
         }
         lines.push(Line::from(format!(
             "Forwarding/NAT: {}",
@@ -325,9 +339,8 @@ pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
 pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
     match key {
         KeyCode::Esc => app.screen = Screen::Dashboard,
-        KeyCode::Up | KeyCode::Down => {
-            app.router.field = toggle_router_field(app.router.field);
-        }
+        KeyCode::Up => app.router.field = toggle_router_field_reverse(app.router.field),
+        KeyCode::Down => app.router.field = toggle_router_field(app.router.field),
         KeyCode::Enter => match app.router.field {
             RouterField::Provision => super::provisioning::open(app),
             RouterField::Plan => open_router_plan(app, client).await,
@@ -625,6 +638,21 @@ fn summarize_dhcp(dhcp: &[DhcpServiceSpec], lease_counts: &[(String, usize)]) ->
         .collect()
 }
 
+fn ap_without_dhcp_warnings(desired: &RouterDesired) -> Vec<String> {
+    desired
+        .interfaces
+        .iter()
+        .filter(|iface| iface.config.role == InterfaceRole::Output && iface.config.wifi.is_some())
+        .filter(|iface| !desired.dhcp.iter().any(|spec| spec.interface == iface.name))
+        .map(|iface| {
+            format!(
+                "{} has an access point configured but no DHCP server running on it — clients won't get an automatic IP",
+                iface.name
+            )
+        })
+        .collect()
+}
+
 fn format_forwarding_status(dataplane: &crate::firewall::RouterDataplanePlan) -> String {
     let forwarding = if dataplane.snapshot.ipv4_forwarding {
         "forwarding on"
@@ -771,6 +799,7 @@ mod tests {
                     dhcp_client: None,
                     wifi: None,
                     wifi_client: None,
+                nat: true,
                 },
             },
             RouterInterfaceDesired {
@@ -783,6 +812,7 @@ mod tests {
                     dhcp_client: None,
                     wifi: None,
                     wifi_client: None,
+                nat: true,
                 },
             },
         ];
