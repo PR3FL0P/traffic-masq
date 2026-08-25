@@ -10,10 +10,12 @@ use crate::atomic_file::{self, PRIVATE_FILE_MODE};
 use crate::config::{AppConfig, ShutdownPolicy};
 use crate::dhcp::supervisor::resolve_interface_index;
 use crate::wifi::ctrl::{CtrlError, HostapdCtrlClient, HostapdState, MacAddr, Station};
-use crate::wifi::process::{ProcessError, SupervisedProcess, TokioSupervisedProcess};
+use crate::wifi::process::{
+    find_competing_network_managers, ProcessError, SupervisedProcess, TokioSupervisedProcess,
+};
 use crate::wifi::record::{PersistedWifiRecord, WifiRecordError, WifiRecordStore};
 use crate::wifi::render::{
-    self, render_hostapd_config, ApRenderInput, RenderError, RenderedApConfig,
+    self, render_hostapd_config, ApRenderInput, RenderError, RenderedApConfig, WifiDigest,
 };
 use crate::wifi::secret::WifiPassphrase;
 use crate::wifi::store::{resolve_passphrase, PassphraseStore, ResolvePassphraseError};
@@ -21,7 +23,7 @@ use crate::wifi::WifiApSpec;
 
 const DEFAULT_CTRL_TIMEOUT: Duration = Duration::from_secs(2);
 
-const STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(3);
+const STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -64,12 +66,45 @@ pub enum SupervisorError {
     Configuration(#[from] anyhow::Error),
 }
 
+impl SupervisorError {
+    /// The interface this error is about, when there is one.
+    pub fn interface(&self) -> &str {
+        match self {
+            SupervisorError::NotConfigured { interface }
+            | SupervisorError::NotOwned { interface }
+            | SupervisorError::StartupTimeout { interface, .. } => interface,
+            _ => "",
+        }
+    }
+}
+
+/// Why an access point is or is not working, in user-facing terms.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum WifiHealth {
+    /// hostapd is running and its control socket answers.
+    Healthy,
+    /// A process is running but the control socket does not answer yet.
+    Starting,
+    /// Startup or a restart attempt failed; the supervisor keeps retrying.
+    Retrying {
+        error: String,
+        attempts: u32,
+        /// Seconds until the next restart attempt, when one is scheduled.
+        retry_in_secs: Option<u64>,
+        /// Other network managers detected on this machine that may be
+        /// holding the interface (iwd, NetworkManager, ...).
+        competing_managers: Vec<String>,
+    },
+}
+
 #[derive(Debug, Clone)]
 struct ApTask {
     spec: WifiApSpec,
     record: PersistedWifiRecord,
     consecutive_failures: u32,
     next_restart_earliest: Option<Instant>,
+    last_failure: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -79,6 +114,7 @@ pub struct WifiApStatus {
     pub pid: u32,
     pub hostapd_state: HostapdState,
     pub num_stations: Option<u32>,
+    pub health: WifiHealth,
 }
 
 #[derive(Clone)]
@@ -151,7 +187,22 @@ impl HostapdSupervisor {
                 continue;
             }
 
-            supervisor.configure(spec).await?;
+            // A failure to bring up one access point (interface busy with a
+            // foreign manager, driver refusing the AP mode, ...) must not take
+            // the whole daemon down. The task is recorded anyway so the
+            // periodic liveness loop keeps retrying it with backoff until the
+            // interface becomes available.
+            if let Err(error) = supervisor.configure(spec.clone()).await {
+                tracing::warn!(
+                    interface = %error.interface(),
+                    %error,
+                    "failed to start Wi-Fi access point at startup; \
+                     will keep retrying in the background"
+                );
+                supervisor
+                    .record_failed_startup(&spec, &error.to_string())
+                    .await;
+            }
         }
 
         Ok(supervisor)
@@ -174,6 +225,33 @@ impl HostapdSupervisor {
 
     fn ctrl_path(&self, interface: &str) -> PathBuf {
         self.inner.runtime_dir.join(interface)
+    }
+
+    /// Records a placeholder task for an interface whose access point could not
+    /// be started (e.g. a foreign manager holds the interface). The liveness
+    /// loop treats it like any other dead task and keeps retrying with backoff,
+    /// so the AP comes up as soon as the interface is freed.
+    pub async fn record_failed_startup(&self, spec: &WifiApSpec, error: &str) {
+        let mut tasks = self.inner.tasks.lock().await;
+        tasks
+            .entry(spec.interface.clone())
+            .or_insert_with(|| ApTask {
+                spec: spec.clone(),
+                record: PersistedWifiRecord {
+                    pid: 0,
+                    started_at_unix: 0,
+                    ctrl_path: self.ctrl_path(&spec.interface),
+                    config_path: render::config_path(&self.inner.runtime_dir, &spec.interface),
+                    config_digest: WifiDigest::of(&[]),
+                    key_digest: WifiDigest::of(&[]),
+                    ssid: spec.ssid.clone(),
+                },
+                consecutive_failures: 1,
+                next_restart_earliest: Some(
+                    Instant::now() + backoff_duration(self.inner.restart_backoff_seconds, 1),
+                ),
+                last_failure: Some(error.to_string()),
+            });
     }
 
     fn record_store(&self, interface: &str) -> WifiRecordStore {
@@ -205,7 +283,10 @@ impl HostapdSupervisor {
                 task
             }
             Some(mut task) => {
-                if requires_restart(&task.spec, &spec) {
+                // A pid-0 task is the placeholder `record_failed_startup`
+                // leaves behind: there is no running hostapd to reload, so
+                // treat it exactly like a restart regardless of what changed.
+                if task.record.pid == 0 || requires_restart(&task.spec, &spec) {
                     self.restart_task(&mut task, &spec, &rendered, &ctrl_path)
                         .await?;
                 } else {
@@ -291,6 +372,7 @@ impl HostapdSupervisor {
             record,
             consecutive_failures: 0,
             next_restart_earliest: None,
+            last_failure: None,
         })
     }
 
@@ -375,6 +457,9 @@ impl HostapdSupervisor {
     }
 
     async fn graceful_stop(&self, pid: u32) {
+        if pid == 0 {
+            return;
+        }
         if let Err(error) = self.inner.process.terminate(pid).await {
             tracing::warn!(pid, %error, "failed to send SIGTERM to hostapd");
         }
@@ -438,12 +523,29 @@ impl HostapdSupervisor {
                 Err(_) => (HostapdState::Other("unreachable".to_string()), None),
             };
 
+        let health = if let Some(error) = &task.last_failure {
+            let retry_in_secs = task
+                .next_restart_earliest
+                .map(|earliest| earliest.saturating_duration_since(Instant::now()).as_secs());
+            WifiHealth::Retrying {
+                error: error.clone(),
+                attempts: task.consecutive_failures,
+                retry_in_secs,
+                competing_managers: find_competing_network_managers().await,
+            }
+        } else if hostapd_state == HostapdState::Enabled {
+            WifiHealth::Healthy
+        } else {
+            WifiHealth::Starting
+        };
+
         Some(WifiApStatus {
             interface: interface.to_string(),
             pid: task.record.pid,
             spec: task.spec,
             hostapd_state,
             num_stations,
+            health,
         })
     }
 
@@ -563,6 +665,7 @@ impl HostapdSupervisor {
             if task.consecutive_failures != 0 {
                 task.consecutive_failures = 0;
                 task.next_restart_earliest = None;
+                task.last_failure = None;
                 self.inner
                     .tasks
                     .lock()
@@ -572,14 +675,29 @@ impl HostapdSupervisor {
             return Ok(false);
         }
 
-        tracing::warn!(
-            %interface,
-            pid = task.record.pid,
-            "hostapd is not responding; restarting it"
-        );
+        let competitors = crate::wifi::process::find_competing_network_managers().await;
+        if competitors.is_empty() {
+            tracing::warn!(
+                %interface,
+                pid = task.record.pid,
+                "hostapd is not responding; restarting it"
+            );
+        } else {
+            tracing::warn!(
+                %interface,
+                pid = task.record.pid,
+                competing = ?competitors,
+                "hostapd is not responding; restarting it; other network managers are running and may be controlling this interface"
+            );
+        }
         let rendered = self.render_for(&task.spec).await?;
 
-        self.graceful_stop(task.record.pid).await;
+        // A placeholder task from a failed startup has pid 0; there is no
+        // process to stop, and signalling pid 0 would signal the whole process
+        // group — including this daemon.
+        if task.record.pid != 0 {
+            self.graceful_stop(task.record.pid).await;
+        }
 
         if let Ok(client) = HostapdCtrlClient::connect(&ctrl_path, self.inner.ctrl_timeout).await {
             if client.ping().await.is_ok() {
@@ -597,9 +715,11 @@ impl HostapdSupervisor {
             Ok(record) => {
                 task.record = record;
                 task.next_restart_earliest = None;
+                task.last_failure = None;
             }
             Err(error) => {
                 tracing::error!(%interface, %error, "failed to respawn hostapd");
+                task.last_failure = Some(error.to_string());
                 task.next_restart_earliest = Some(
                     Instant::now()
                         + backoff_duration(
@@ -1142,6 +1262,30 @@ mod tests {
             process.calls().len(),
             1,
             "second configure must not respawn"
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_after_a_failed_startup_spawns_instead_of_reloading() {
+        let temp = tempdir().expect("tempdir");
+        let runtime_dir = temp.path().join("hostapd");
+        let process = FakeProcess::new();
+        let supervisor = test_supervisor(temp.path(), &runtime_dir, process.clone()).await;
+        let spec = spec("wlan0", "net-a");
+
+        supervisor
+            .record_failed_startup(&spec, "interface busy with a foreign manager")
+            .await;
+
+        supervisor
+            .configure(spec.clone())
+            .await
+            .expect("recovering from a failed startup must spawn hostapd, not reload it");
+
+        assert_eq!(
+            process.calls().len(),
+            1,
+            "the placeholder task has no real process to reload; configure must spawn fresh"
         );
     }
 

@@ -186,6 +186,42 @@ fn send_signal(pid: u32, signal: Signal) -> Result<(), ProcessError> {
     }
 }
 
+/// Well-known daemons that may fight us for control of a wireless interface.
+///
+/// Deliberately excludes `hostapd`/`wpa_supplicant`: this daemon supervises
+/// its own instances of both, so their presence on the machine is normal, not
+/// evidence of a foreign manager, and including them here would make the scan
+/// report itself as the competitor on almost every restart.
+const COMPETING_DAEMONS: &[&str] = &["iwd", "NetworkManager", "connman"];
+
+/// Scans /proc for running processes whose comm matches a known network-management
+/// daemon. Used to enrich restart diagnostics: when our supervised daemon keeps
+/// dying, the usual cause is another manager reconfiguring the interface behind
+/// our back.
+pub async fn find_competing_network_managers() -> Vec<String> {
+    let mut found = Vec::new();
+    let mut entries = match tokio::fs::read_dir("/proc").await {
+        Ok(entries) => entries,
+        Err(_) => return found,
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let comm_path = entry.path().join("comm");
+        if let Ok(comm) = tokio::fs::read_to_string(&comm_path).await {
+            let comm = comm.trim_end_matches('\n');
+            if COMPETING_DAEMONS.contains(&comm) && !found.iter().any(|existing| existing == comm) {
+                found.push(comm.to_string());
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
 fn probe_pid_exists(pid: u32) -> bool {
     matches!(
         kill(Pid::from_raw(pid as i32), None),
@@ -263,5 +299,21 @@ mod tests {
             .expect("pid 1 is not hostapd"));
 
         assert!(!process.is_alive(u32::MAX / 2).await.expect("is_alive"));
+    }
+
+    #[tokio::test]
+    async fn competing_manager_scan_returns_a_list_without_errors() {
+        // On any Linux system /proc is readable; the result may legitimately be
+        // empty, but the scan itself must never fail or panic.
+        let _ = super::find_competing_network_managers().await;
+    }
+
+    #[test]
+    fn competing_daemons_excludes_our_own_supervised_processes() {
+        // hostapd and wpa_supplicant are what THIS daemon supervises; treating
+        // them as competitors would make the scan report itself as the
+        // interloper on almost every restart.
+        assert!(!super::COMPETING_DAEMONS.contains(&"hostapd"));
+        assert!(!super::COMPETING_DAEMONS.contains(&"wpa_supplicant"));
     }
 }

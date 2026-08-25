@@ -17,8 +17,11 @@ use crate::wifi::client::render::{
     config_path, render_wpa_supplicant_config, ClientRenderError, ClientRenderInput,
     RenderedClientConfig,
 };
-use crate::wifi::process::{ProcessError, SupervisedProcess, TokioSupervisedProcess};
+use crate::wifi::process::{
+    find_competing_network_managers, ProcessError, SupervisedProcess, TokioSupervisedProcess,
+};
 use crate::wifi::record::{PersistedWifiRecord, WifiRecordError, WifiRecordStore};
+use crate::wifi::render::WifiDigest;
 use crate::wifi::secret::WifiPassphrase;
 use crate::wifi::store::{resolve_passphrase_parts, PassphraseStore, ResolvePassphraseError};
 use crate::wifi::supervisor::interface_is_wireless;
@@ -26,7 +29,7 @@ use crate::wifi::WifiClientSpec;
 
 const DEFAULT_CTRL_TIMEOUT: Duration = Duration::from_secs(2);
 
-const STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(3);
+const STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -82,6 +85,18 @@ pub enum ClientSupervisorError {
     Configuration(#[from] anyhow::Error),
 }
 
+impl ClientSupervisorError {
+    /// The interface this error is about, when there is one.
+    pub fn interface(&self) -> &str {
+        match self {
+            ClientSupervisorError::NotConfigured { interface }
+            | ClientSupervisorError::NotOwned { interface }
+            | ClientSupervisorError::StartupTimeout { interface, .. } => interface,
+            _ => "",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ClientTask {
     spec: WifiClientSpec,
@@ -90,6 +105,7 @@ struct ClientTask {
     next_restart_earliest: Option<Instant>,
 
     associated_or_started_at: Instant,
+    last_failure: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -101,6 +117,7 @@ pub struct WifiClientStatus {
 
     pub bssid: Option<crate::wifi::MacAddr>,
     pub freq: Option<u32>,
+    pub health: crate::wifi::supervisor::WifiHealth,
 }
 
 #[derive(Clone)]
@@ -170,7 +187,20 @@ impl WifiClientSupervisor {
                 continue;
             }
 
-            supervisor.configure(spec).await?;
+            // Same policy as the AP supervisor: one busy or refusing interface
+            // must not take the daemon down. Record a placeholder task so the
+            // liveness loop keeps retrying until the interface is free.
+            if let Err(error) = supervisor.configure(spec.clone()).await {
+                tracing::warn!(
+                    interface = %error.interface(),
+                    %error,
+                    "failed to start Wi-Fi client at startup; \
+                     will keep retrying in the background"
+                );
+                supervisor
+                    .record_failed_startup(&spec, &error.to_string())
+                    .await;
+            }
         }
 
         Ok(supervisor)
@@ -193,6 +223,33 @@ impl WifiClientSupervisor {
 
     fn ctrl_path(&self, interface: &str) -> PathBuf {
         self.inner.runtime_dir.join(interface)
+    }
+
+    /// Records a placeholder task for an interface whose supplicant could not
+    /// be started (e.g. a foreign manager holds the interface). The liveness
+    /// loop keeps retrying it with backoff until the interface is freed.
+    pub async fn record_failed_startup(&self, spec: &WifiClientSpec, error: &str) {
+        let mut tasks = self.inner.tasks.lock().await;
+        tasks
+            .entry(spec.interface.clone())
+            .or_insert_with(|| ClientTask {
+                spec: spec.clone(),
+                record: PersistedWifiRecord {
+                    pid: 0,
+                    started_at_unix: unix_now(),
+                    ctrl_path: self.ctrl_path(&spec.interface),
+                    config_path: config_path(&self.inner.runtime_dir, &spec.interface),
+                    config_digest: WifiDigest::of(&[]),
+                    key_digest: WifiDigest::of(&[]),
+                    ssid: spec.ssid.clone(),
+                },
+                consecutive_failures: 1,
+                next_restart_earliest: Some(
+                    Instant::now() + backoff_duration(self.inner.restart_backoff_seconds, 1),
+                ),
+                associated_or_started_at: Instant::now(),
+                last_failure: Some(error.to_string()),
+            });
     }
 
     fn record_store(&self, interface: &str) -> WifiRecordStore {
@@ -288,6 +345,7 @@ impl WifiClientSupervisor {
             consecutive_failures: 0,
             next_restart_earliest: None,
             associated_or_started_at: Instant::now(),
+            last_failure: None,
         })
     }
 
@@ -380,6 +438,9 @@ impl WifiClientSupervisor {
     }
 
     async fn graceful_stop(&self, pid: u32) {
+        if pid == 0 {
+            return;
+        }
         if let Err(error) = self.inner.process.terminate(pid).await {
             tracing::warn!(pid, %error, "failed to send SIGTERM to wpa_supplicant");
         }
@@ -447,6 +508,22 @@ impl WifiClientSupervisor {
                 Err(_) => (WpaState::Other("unreachable".to_string()), None, None),
             };
 
+        let health = if let Some(error) = &task.last_failure {
+            let retry_in_secs = task
+                .next_restart_earliest
+                .map(|earliest| earliest.saturating_duration_since(Instant::now()).as_secs());
+            crate::wifi::supervisor::WifiHealth::Retrying {
+                error: error.clone(),
+                attempts: task.consecutive_failures,
+                retry_in_secs,
+                competing_managers: find_competing_network_managers().await,
+            }
+        } else if wpa_state.is_connected() {
+            crate::wifi::supervisor::WifiHealth::Healthy
+        } else {
+            crate::wifi::supervisor::WifiHealth::Starting
+        };
+
         Some(WifiClientStatus {
             interface: interface.to_string(),
             pid: task.record.pid,
@@ -454,6 +531,7 @@ impl WifiClientSupervisor {
             wpa_state,
             bssid,
             freq,
+            health,
         })
     }
 
@@ -600,6 +678,7 @@ impl WifiClientSupervisor {
         if status.is_some() && !stuck {
             task.consecutive_failures = 0;
             task.next_restart_earliest = None;
+            task.last_failure = None;
             self.inner
                 .tasks
                 .lock()
@@ -608,23 +687,36 @@ impl WifiClientSupervisor {
             return Ok(false);
         }
 
+        let competitors = crate::wifi::process::find_competing_network_managers().await;
         if stuck {
             tracing::warn!(
                 %interface,
                 pid = task.record.pid,
                 grace = ?ASSOCIATION_GRACE,
+                competing = ?competitors,
                 "wpa_supplicant is alive but has not associated; restarting it"
             );
-        } else {
+        } else if competitors.is_empty() {
             tracing::warn!(
                 %interface,
                 pid = task.record.pid,
                 "wpa_supplicant is not responding; restarting it"
             );
+        } else {
+            tracing::warn!(
+                %interface,
+                pid = task.record.pid,
+                competing = ?competitors,
+                "wpa_supplicant is not responding; restarting it; other network managers are running and may be controlling this interface"
+            );
         }
 
         let rendered = self.render_for(&task.spec).await?;
-        self.graceful_stop(task.record.pid).await;
+        // Placeholder tasks (failed startup) have pid 0; signalling pid 0
+        // would signal the whole process group, including this daemon.
+        if task.record.pid != 0 {
+            self.graceful_stop(task.record.pid).await;
+        }
 
         if let Ok(client) =
             WpaSupplicantCtrlClient::connect(&ctrl_path, self.inner.ctrl_timeout).await
@@ -645,9 +737,11 @@ impl WifiClientSupervisor {
                 task.record = record;
                 task.next_restart_earliest = None;
                 task.associated_or_started_at = Instant::now();
+                task.last_failure = None;
             }
             Err(error) => {
                 tracing::error!(%interface, %error, "failed to respawn wpa_supplicant");
+                task.last_failure = Some(error.to_string());
                 task.next_restart_earliest = Some(
                     Instant::now()
                         + backoff_duration(

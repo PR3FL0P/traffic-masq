@@ -10,6 +10,7 @@ use crate::api::model::{
     WifiErrorDetail,
 };
 use crate::config::{InterfaceRole, WifiBand, WifiChannelWidth, WifiClientSecurity, WifiSecurity};
+use crate::wifi::supervisor::WifiHealth;
 use crate::wifi::{
     WifiApStatus, WifiClientProfileSummary, WifiClientStatus, WpaSupplicantScanResult,
     WpaSupplicantScanSecurity,
@@ -1243,11 +1244,40 @@ fn role_label(role: WifiRole) -> &'static str {
 }
 fn describe_row_state(row: &WifiRow) -> String {
     if let Some(ap) = &row.ap {
-        format!("serving {} ({:?})", ap.spec.ssid, ap.hostapd_state)
+        describe_health(&ap.health, &format!("serving {}", ap.spec.ssid))
     } else if let Some(client) = &row.client {
-        format!("joining {} ({:?})", client.spec.ssid, client.wpa_state)
+        describe_health(&client.health, &format!("joining {}", client.spec.ssid))
     } else {
         "not configured".into()
+    }
+}
+
+/// Turns structured health into a short user-facing sentence.
+fn describe_health(health: &WifiHealth, ok_description: &str) -> String {
+    match health {
+        WifiHealth::Healthy => ok_description.to_string(),
+        WifiHealth::Starting => format!("{ok_description} — starting…"),
+        WifiHealth::Retrying {
+            error,
+            attempts,
+            retry_in_secs,
+            competing_managers,
+        } => {
+            let mut message = format!(
+                "✗ not working — {error} (attempt {attempts}{}",
+                retry_in_secs
+                    .map(|secs| format!(", retrying in {secs}s"))
+                    .unwrap_or_default()
+            );
+            if !competing_managers.is_empty() {
+                message.push_str(&format!(
+                    "; {} may be controlling this interface",
+                    competing_managers.join(" + ")
+                ));
+            }
+            message.push(')');
+            message
+        }
     }
 }
 fn report_unexpected(app: &mut TuiApp, response: Response) {
