@@ -8,12 +8,16 @@ use serde::{Deserialize, Serialize};
 use crate::config::{AppConfig, InterfaceConfig, InterfaceRole, UplinkMode};
 use crate::core::interface::{InterfaceChangePlan, InterfaceSnapshot};
 use crate::core::route::{desired_owned_routes, ManagedIpv4Route, RoutePlan, RouteSnapshot};
+use crate::core::vpn_chain::{VpnHopDesired, VpnHopKind, VpnHopRoutingDesired};
+use crate::core::vpn_policy::VpnPolicyReservedIds;
+use crate::core::vpn_policy_manager::VpnPolicyDesired;
 use crate::dhcp::client::DhcpClientSpec;
 use crate::dhcp::supervisor::{DhcpServiceSpec, DhcpSupervisor};
 use crate::firewall::{
     OutputNetwork, RouterDataplaneDesired, RouterDataplanePlan, RouterDataplaneSnapshot,
     RouterDataplaneTarget,
 };
+use crate::vpn::manager::hop_interface_name;
 use crate::wifi::client::WifiClientSpec;
 use crate::wifi::WifiApSpec;
 
@@ -33,6 +37,10 @@ pub struct RouterDesired {
     pub dhcp: Vec<DhcpServiceSpec>,
     pub routes: Vec<ManagedIpv4Route>,
     pub allow_default_route_change: bool,
+    /// Ordered VPN hop chain; index 0 = hop closest to the uplink. Empty
+    /// means "no VPN" (formerly `VpnPolicyMode::Direct`); length 1 with an
+    /// `Exit` kind is today's single-tunnel `VpnPolicyMode::Vpn`.
+    pub vpn_chain: Vec<VpnHopDesired>,
     pub dataplane: RouterDataplaneTarget,
     pub interfaces: Vec<RouterInterfaceDesired>,
 }
@@ -55,6 +63,7 @@ impl RouterDesired {
                 dhcp,
                 routes: Vec::new(),
                 allow_default_route_change: false,
+                vpn_chain: Vec::new(),
                 dataplane: RouterDataplaneTarget::Disabled,
                 interfaces: Vec::new(),
             });
@@ -78,6 +87,7 @@ impl RouterDesired {
             .collect();
         let outputs = managed_outputs
             .iter()
+            .filter(|(_, interface)| interface.nat)
             .map(|(name, interface)| OutputNetwork {
                 interface: (*name).clone(),
                 subnet: interface
@@ -118,6 +128,55 @@ impl RouterDesired {
             None
         };
 
+        let protected_subnets: Vec<ipnet::Ipv4Net> = config
+            .network
+            .interfaces
+            .values()
+            .filter(|interface| {
+                interface.role == InterfaceRole::Output && interface.managed && interface.nat
+            })
+            .filter_map(|interface| interface.ipv4)
+            .map(|network| network.trunc())
+            .collect();
+
+        let chain_len = config.router.vpn_chain.len();
+        let mut vpn_chain = Vec::with_capacity(chain_len);
+        for (index, hop_config) in config.router.vpn_chain.iter().enumerate() {
+            let hop_index = index as u32;
+            let interface = hop_interface_name(hop_index);
+            let upstream = if index == 0 {
+                uplink.interface.clone()
+            } else {
+                hop_interface_name(hop_index - 1)
+            };
+            let reserved = VpnPolicyReservedIds::for_hop(hop_index)?;
+            let is_last = index + 1 == chain_len;
+            let kind = if is_last {
+                VpnHopKind::Exit {
+                    policy: VpnPolicyDesired {
+                        protected_subnets: protected_subnets.clone(),
+                        vpn_interface: interface.clone(),
+                        physical_uplink: upstream.clone(),
+                    },
+                }
+            } else {
+                VpnHopKind::Relay {
+                    own_route: VpnHopRoutingDesired {
+                        hop_interface: interface.clone(),
+                        upstream_interface: upstream.clone(),
+                    },
+                }
+            };
+            vpn_chain.push(VpnHopDesired {
+                hop_index,
+                profile_name: hop_config.profile_name.clone(),
+                interface,
+                upstream,
+                reserved,
+                kind,
+            });
+        }
+
         Ok(Self {
             enabled: true,
             uplink_wifi,
@@ -126,6 +185,7 @@ impl RouterDesired {
             dhcp,
             routes: desired_owned_routes(&config.router),
             allow_default_route_change: config.router.allow_default_route_change,
+            vpn_chain,
             dataplane: RouterDataplaneTarget::Enabled(dataplane),
             interfaces,
         })
@@ -173,6 +233,7 @@ pub struct RouterPlan {
     pub output_wifi: Vec<WifiPlan<WifiApSpec>>,
     pub dhcp: Vec<DhcpPlan>,
     pub routes: RoutePlan,
+    pub vpn_chain: VpnChainPlan,
     pub dataplane: RouterDataplanePlan,
     pub risk: RouterRisk,
 }
@@ -217,6 +278,35 @@ pub struct WifiSnapshot<T> {
     pub spec: Option<T>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct VpnChainPlan {
+    pub hops: Vec<VpnHopDesired>,
+}
+
+impl VpnChainPlan {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+pub struct VpnChainSnapshot {
+    /// The interfaces (by name) that were active hops before this
+    /// transaction started, in the same order they were applied.
+    pub hops: Vec<String>,
+    /// The full previous hop chain, in application order, kept alongside
+    /// `hops` so `rollback_vpn_chain` can fully reconstruct the prior state
+    /// (profile, kind, reserved IDs) rather than only knowing the names of
+    /// the interfaces that used to exist.
+    pub previous_hops: Vec<VpnHopDesired>,
+}
+
+impl VpnChainSnapshot {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RouterSnapshot {
     pub interfaces: Vec<InterfaceSnapshot>,
@@ -227,6 +317,7 @@ pub struct RouterSnapshot {
 
     pub dhcp_absent_interfaces: Vec<String>,
     pub routes: RouteSnapshot,
+    pub vpn_chain: VpnChainSnapshot,
     pub dataplane: RouterDataplaneSnapshot,
 }
 
@@ -252,6 +343,17 @@ pub trait RouterSubsystems: Send + Sync {
     async fn plan_dhcp(&self, desired: &RouterDesired) -> Result<Vec<DhcpPlan>>;
     async fn plan_dataplane(&self, desired: &RouterDesired) -> Result<RouterDataplanePlan>;
 
+    /// Plan the VPN hop chain. Mirrors the `uplink_wifi`/`output_wifi`
+    /// default pattern: a subsystem implementor that doesn't support
+    /// chaining safely no-ops when there is nothing to chain, and errors
+    /// only if the desired state actually wants one.
+    async fn plan_vpn_chain(&self, desired: &RouterDesired) -> Result<VpnChainPlan> {
+        if !desired.vpn_chain.is_empty() {
+            anyhow::bail!("VPN chain runtime is unavailable")
+        }
+        Ok(VpnChainPlan::empty())
+    }
+
     async fn snapshot_interfaces(&self) -> Result<Vec<InterfaceSnapshot>>;
     async fn snapshot_uplink_wifi(&self) -> Result<Vec<WifiSnapshot<WifiClientSpec>>> {
         Ok(Vec::new())
@@ -264,6 +366,9 @@ pub trait RouterSubsystems: Send + Sync {
     async fn snapshot_dataplane(&self) -> Result<RouterDataplaneSnapshot>;
     async fn snapshot_uplink_dhcp(&self) -> Result<Option<DhcpClientSpec>> {
         Ok(None)
+    }
+    async fn snapshot_vpn_chain(&self) -> Result<VpnChainSnapshot> {
+        Ok(VpnChainSnapshot::empty())
     }
 
     /// Narrow ownership to exactly these interfaces.
@@ -283,6 +388,7 @@ pub trait RouterSubsystems: Send + Sync {
             routes: self.snapshot_routes().await?,
             dhcp: self.snapshot_dhcp().await?,
             dhcp_absent_interfaces: Vec::new(),
+            vpn_chain: self.snapshot_vpn_chain().await?,
             dataplane: self.snapshot_dataplane().await?,
         })
     }
@@ -304,6 +410,16 @@ pub trait RouterSubsystems: Send + Sync {
     async fn apply_dhcp(&self, plan: &[DhcpPlan]) -> Result<()>;
     async fn apply_dataplane(&self, plan: &RouterDataplanePlan) -> Result<()>;
     async fn apply_uplink_dhcp(&self, _desired: Option<&DhcpClientSpec>) -> Result<()> {
+        Ok(())
+    }
+    /// Activate hops 0..N in order. On any hop's failure, must roll back
+    /// N..0 internally before returning `Err` — the outer `RouterManager`
+    /// rollback only ever calls `rollback_vpn_chain` once, against the
+    /// pre-apply snapshot, never mid-chain state.
+    async fn apply_vpn_chain(&self, plan: &VpnChainPlan) -> Result<()> {
+        if !plan.hops.is_empty() {
+            anyhow::bail!("VPN chain runtime is unavailable")
+        }
         Ok(())
     }
 
@@ -333,6 +449,12 @@ pub trait RouterSubsystems: Send + Sync {
     async fn rollback_uplink_dhcp(&self, _snapshot: Option<&DhcpClientSpec>) -> Result<()> {
         Ok(())
     }
+    async fn rollback_vpn_chain(&self, snapshot: &VpnChainSnapshot) -> Result<()> {
+        if !snapshot.hops.is_empty() {
+            anyhow::bail!("VPN chain runtime is unavailable")
+        }
+        Ok(())
+    }
 
     async fn health_interfaces(&self, desired: &RouterDesired) -> Result<()>;
     async fn health_uplink_wifi(&self, desired: &RouterDesired) -> Result<()> {
@@ -353,6 +475,12 @@ pub trait RouterSubsystems: Send + Sync {
         None
     }
     async fn health_dataplane(&self, desired: &RouterDesired) -> Result<()>;
+    async fn health_vpn_chain(&self, desired: &RouterDesired) -> Result<()> {
+        if !desired.vpn_chain.is_empty() {
+            anyhow::bail!("VPN chain runtime is unavailable")
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -409,6 +537,7 @@ impl RouterManager {
         let output_wifi = self.subsystems.plan_output_wifi(&desired).await?;
         let routes = self.subsystems.plan_routes(&desired).await?;
         let dhcp = self.subsystems.plan_dhcp(&desired).await?;
+        let vpn_chain = self.subsystems.plan_vpn_chain(&desired).await?;
         let dataplane = self.subsystems.plan_dataplane(&desired).await?;
         let risk = RouterRisk {
             changes_default_route: routes.changes_default_route(),
@@ -423,6 +552,7 @@ impl RouterManager {
             output_wifi,
             dhcp,
             routes,
+            vpn_chain,
             dataplane,
             risk,
         })
@@ -470,6 +600,7 @@ impl RouterManager {
             routes: self.subsystems.snapshot_routes().await?,
             dhcp: self.subsystems.snapshot_dhcp().await?,
             dhcp_absent_interfaces: Vec::new(),
+            vpn_chain: self.subsystems.snapshot_vpn_chain().await?,
             dataplane: self.subsystems.snapshot_dataplane().await?,
         })
     }
@@ -507,6 +638,10 @@ impl RouterManager {
             Stage::UplinkDhcp,
             self.subsystems
                 .apply_uplink_dhcp(plan.desired.uplink_dhcp.as_ref())
+        );
+        apply_stage!(
+            Stage::VpnChain,
+            self.subsystems.apply_vpn_chain(&plan.vpn_chain)
         );
         apply_stage!(
             Stage::OutputWifi,
@@ -562,6 +697,7 @@ impl RouterManager {
             "output Wi-Fi",
             self.subsystems.health_output_wifi(&plan.desired)
         );
+        check_health!("vpn_chain", self.subsystems.health_vpn_chain(&plan.desired));
         check_health!("dhcp", self.subsystems.health_dhcp(&plan.desired));
         check_health!("routes", self.subsystems.health_routes(&plan.desired));
         check_health!("dataplane", self.subsystems.health_dataplane(&plan.desired));
@@ -587,6 +723,7 @@ impl RouterManager {
                 Stage::Interfaces,
                 Stage::UplinkWifi,
                 Stage::UplinkDhcp,
+                Stage::VpnChain,
                 Stage::OutputWifi,
                 Stage::Dhcp,
                 Stage::Routes,
@@ -613,6 +750,11 @@ impl RouterManager {
                 Stage::UplinkDhcp => {
                     self.subsystems
                         .rollback_uplink_dhcp(snapshot.uplink_dhcp.as_ref())
+                        .await
+                }
+                Stage::VpnChain => {
+                    self.subsystems
+                        .rollback_vpn_chain(&snapshot.vpn_chain)
                         .await
                 }
                 Stage::OutputWifi => {
@@ -645,6 +787,7 @@ enum Stage {
     Interfaces,
     UplinkWifi,
     UplinkDhcp,
+    VpnChain,
     OutputWifi,
     Dhcp,
     Routes,
@@ -657,6 +800,7 @@ impl Stage {
             Self::Interfaces => "interfaces",
             Self::UplinkWifi => "uplink_wifi",
             Self::UplinkDhcp => "uplink_dhcp",
+            Self::VpnChain => "vpn_chain",
             Self::OutputWifi => "output_wifi",
             Self::Dhcp => "dhcp",
             Self::Routes => "routes",
@@ -692,6 +836,7 @@ mod tests {
                 dhcp_client: None,
                 wifi: None,
                 wifi_client: None,
+                nat: true,
             },
         );
         for (name, address, pool_start, pool_end) in [
@@ -716,10 +861,12 @@ mod tests {
                     dhcp_client: None,
                     wifi: None,
                     wifi_client: None,
+                    nat: true,
                 },
             );
         }
         config.router = RouterConfig {
+            vpn_chain: Vec::new(),
             enabled: true,
             uplink: Some(UplinkConfig {
                 interface: "wan0".to_string(),
@@ -883,6 +1030,7 @@ mod tests {
                 add: Vec::new(),
                 delete: Vec::new(),
             },
+            vpn_chain: VpnChainPlan::empty(),
             dataplane: RouterDataplanePlan {
                 snapshot: dataplane_snapshot(),
                 target: desired.dataplane,

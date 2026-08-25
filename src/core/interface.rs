@@ -917,6 +917,7 @@ mod tests {
 
     fn config(role: InterfaceRole, address: &str) -> InterfaceConfig {
         InterfaceConfig {
+            nat: true,
             role,
             managed: true,
             ipv4: Some(address.parse::<Ipv4Net>().expect("network")),
@@ -1303,6 +1304,7 @@ mod tests {
         // Both sides already unmanaged: the managed -> unmanaged edge is long
         // gone, but our address is still sitting on the link.
         let unmanaged = InterfaceConfig {
+            nat: true,
             role: InterfaceRole::Output,
             managed: false,
             ipv4: None,

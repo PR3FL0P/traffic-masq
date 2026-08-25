@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -10,7 +11,20 @@ use crate::vpn::active_profile::{ActiveProfileError, ActiveProfileStore, Persist
 use crate::vpn::store::WireGuardProfileSummary;
 use crate::vpn::{VpnDriver, VpnDriverError};
 
+/// The legacy single-tunnel interface name, kept for the `VpnPolicyMode`
+/// coexistence window (Landing 1): `vpn_policy_set_mode`/`VpnPolicyManager`'s
+/// non-chain callers still activate exactly this interface through
+/// [`VpnManager::activate`]/[`VpnManager::status`] etc. Landing 2 removes it
+/// once those callers are repointed onto the chain exclusively.
 pub const OWNED_INTERFACE_NAME: &str = "tm-wg0";
+
+/// The interface name for a given chain hop: `tm-wg-<hop_index>`. Deliberately
+/// namespaced apart from [`OWNED_INTERFACE_NAME`] (`tm-wg0` vs. `tm-wg-0`) so
+/// the two activation paths can never collide on the same kernel interface
+/// during the coexistence window.
+pub fn hop_interface_name(hop_index: u32) -> String {
+    format!("tm-wg-{hop_index}")
+}
 
 #[derive(Debug, Error)]
 pub enum ManagerError {
@@ -73,7 +87,12 @@ pub struct VpnActiveStatus {
 
 pub struct VpnManager<D: VpnDriver> {
     driver: D,
-    owned: Mutex<Option<OwnedInterfaceRecord<D::OwnershipProof>>>,
+    /// Every interface this manager currently owns, keyed by interface name.
+    /// A `BTreeMap` rather than a single `Option` slot so multiple chain
+    /// hops (each its own named `tm-wg-<hop_index>` interface) can be active
+    /// concurrently; "already active" now means "this specific interface key
+    /// is present", not "the map is non-empty".
+    owned: Mutex<BTreeMap<String, OwnedInterfaceRecord<D::OwnershipProof>>>,
     active_profile_store: ActiveProfileStore,
 
     activation_lock: AsyncMutex<()>,
@@ -83,7 +102,7 @@ impl<D: VpnDriver> VpnManager<D> {
     pub fn new(driver: D, active_profile_store: ActiveProfileStore) -> Self {
         Self {
             driver,
-            owned: Mutex::new(None),
+            owned: Mutex::new(BTreeMap::new()),
             active_profile_store,
             activation_lock: AsyncMutex::new(()),
         }
@@ -102,12 +121,40 @@ impl<D: VpnDriver> VpnManager<D> {
         Ok(self.driver.delete_profile(name)?)
     }
 
+    /// The legacy single-tunnel record, if `OWNED_INTERFACE_NAME` is active.
+    /// Kept for the `VpnPolicyMode` coexistence window; chain callers should
+    /// use [`Self::active_on`].
     pub fn active(&self) -> Option<OwnedInterfaceRecord<D::OwnershipProof>> {
-        self.owned.lock().expect("owned mutex poisoned").clone()
+        self.active_on(OWNED_INTERFACE_NAME)
+    }
+
+    pub fn active_on(&self, interface: &str) -> Option<OwnedInterfaceRecord<D::OwnershipProof>> {
+        self.owned
+            .lock()
+            .expect("owned mutex poisoned")
+            .get(interface)
+            .cloned()
+    }
+
+    /// Every interface this manager currently owns.
+    pub fn active_interfaces(&self) -> Vec<OwnedInterfaceRecord<D::OwnershipProof>> {
+        self.owned
+            .lock()
+            .expect("owned mutex poisoned")
+            .values()
+            .cloned()
+            .collect()
     }
 
     pub async fn status(&self) -> Result<Option<VpnActiveStatus>, ManagerError> {
-        let Some(record) = self.active() else {
+        self.status_on(OWNED_INTERFACE_NAME).await
+    }
+
+    pub async fn status_on(
+        &self,
+        interface: &str,
+    ) -> Result<Option<VpnActiveStatus>, ManagerError> {
+        let Some(record) = self.active_on(interface) else {
             return Ok(None);
         };
         let up = self.driver.is_up(&record.interface).await?;
@@ -119,15 +166,28 @@ impl<D: VpnDriver> VpnManager<D> {
     }
 
     pub async fn plan_activation(&self, name: &str) -> Result<D::Profile, ManagerError> {
+        self.plan_activation_on(OWNED_INTERFACE_NAME, name).await
+    }
+
+    pub async fn plan_activation_on(
+        &self,
+        interface: &str,
+        name: &str,
+    ) -> Result<D::Profile, ManagerError> {
         let profile = self.driver.read_profile(name)?;
 
-        if self.owned.lock().expect("owned mutex poisoned").is_some() {
+        if self
+            .owned
+            .lock()
+            .expect("owned mutex poisoned")
+            .contains_key(interface)
+        {
             return Err(ManagerError::AlreadyActive);
         }
 
-        if self.driver.link_exists(OWNED_INTERFACE_NAME).await? {
+        if self.driver.link_exists(interface).await? {
             return Err(ManagerError::ForeignInterfaceConflict(
-                OWNED_INTERFACE_NAME.to_string(),
+                interface.to_string(),
             ));
         }
 
@@ -135,19 +195,24 @@ impl<D: VpnDriver> VpnManager<D> {
     }
 
     pub async fn snapshot(&self) -> Result<VpnInterfaceSnapshot<D::OwnershipProof>, ManagerError> {
-        let existed_before = self.driver.link_exists(OWNED_INTERFACE_NAME).await?;
+        self.snapshot_on(OWNED_INTERFACE_NAME).await
+    }
+
+    pub async fn snapshot_on(
+        &self,
+        interface: &str,
+    ) -> Result<VpnInterfaceSnapshot<D::OwnershipProof>, ManagerError> {
+        let existed_before = self.driver.link_exists(interface).await?;
         let (ownership_proof, was_up) = if existed_before {
             (
-                self.driver
-                    .read_ownership_proof(OWNED_INTERFACE_NAME)
-                    .await?,
-                self.driver.is_up(OWNED_INTERFACE_NAME).await?,
+                self.driver.read_ownership_proof(interface).await?,
+                self.driver.is_up(interface).await?,
             )
         } else {
             (None, false)
         };
         Ok(VpnInterfaceSnapshot {
-            interface: OWNED_INTERFACE_NAME.to_string(),
+            interface: interface.to_string(),
             existed_before,
             ownership_proof,
             was_up,
@@ -155,17 +220,23 @@ impl<D: VpnDriver> VpnManager<D> {
     }
 
     pub async fn activate(&self, name: &str) -> Result<(), ManagerError> {
+        self.activate_on(OWNED_INTERFACE_NAME, name).await
+    }
+
+    pub async fn activate_on(&self, interface: &str, name: &str) -> Result<(), ManagerError> {
         let _activation_guard = self.activation_lock.lock().await;
 
-        let profile = self.plan_activation(name).await?;
-        let snapshot = self.snapshot().await?;
+        let profile = self.plan_activation_on(interface, name).await?;
+        let snapshot = self.snapshot_on(interface).await?;
 
-        if let Err(error) = self.activate_inner(name, &profile).await {
+        if let Err(error) = self.activate_inner(interface, name, &profile).await {
             let _ = self.rollback(&snapshot).await;
             return Err(error);
         }
 
-        let record = self.active().expect("activate_inner set the owned record");
+        let record = self
+            .active_on(interface)
+            .expect("activate_inner set the owned record");
         let encoded = BASE64.encode(self.driver.encode_ownership_proof(&record.ownership_proof));
         if let Err(error) = self
             .active_profile_store
@@ -183,33 +254,49 @@ impl<D: VpnDriver> VpnManager<D> {
         Ok(())
     }
 
-    async fn activate_inner(&self, name: &str, profile: &D::Profile) -> Result<(), ManagerError> {
-        let ownership_proof = self.driver.activate(OWNED_INTERFACE_NAME, profile).await?;
+    async fn activate_inner(
+        &self,
+        interface: &str,
+        name: &str,
+        profile: &D::Profile,
+    ) -> Result<(), ManagerError> {
+        let ownership_proof = self.driver.activate(interface, profile).await?;
 
-        *self.owned.lock().expect("owned mutex poisoned") = Some(OwnedInterfaceRecord {
-            interface: OWNED_INTERFACE_NAME.to_string(),
-            ownership_proof,
-            profile_name: name.to_string(),
-        });
+        self.owned.lock().expect("owned mutex poisoned").insert(
+            interface.to_string(),
+            OwnedInterfaceRecord {
+                interface: interface.to_string(),
+                ownership_proof,
+                profile_name: name.to_string(),
+            },
+        );
 
         Ok(())
     }
 
     pub async fn deactivate(&self) -> Result<(), ManagerError> {
+        self.deactivate_on(OWNED_INTERFACE_NAME).await
+    }
+
+    pub async fn deactivate_on(&self, interface: &str) -> Result<(), ManagerError> {
         let _activation_guard = self.activation_lock.lock().await;
 
         let record = self
             .owned
             .lock()
             .expect("owned mutex poisoned")
-            .clone()
+            .get(interface)
+            .cloned()
             .ok_or(ManagerError::NotActive)?;
 
         self.assert_still_owned(&record).await?;
 
         self.driver.deactivate(&record.interface).await?;
 
-        *self.owned.lock().expect("owned mutex poisoned") = None;
+        self.owned
+            .lock()
+            .expect("owned mutex poisoned")
+            .remove(interface);
 
         let _ = self.active_profile_store.clear().await;
         Ok(())
@@ -225,11 +312,19 @@ impl<D: VpnDriver> VpnManager<D> {
 
         let currently_exists = self.driver.link_exists(&snapshot.interface).await?;
         if !currently_exists {
-            *self.owned.lock().expect("owned mutex poisoned") = None;
+            self.owned
+                .lock()
+                .expect("owned mutex poisoned")
+                .remove(&snapshot.interface);
             return Ok(());
         }
 
-        let record = self.owned.lock().expect("owned mutex poisoned").clone();
+        let record = self
+            .owned
+            .lock()
+            .expect("owned mutex poisoned")
+            .get(&snapshot.interface)
+            .cloned();
         let record = match record {
             Some(record) if record.interface == snapshot.interface => record,
             _ => {
@@ -242,39 +337,49 @@ impl<D: VpnDriver> VpnManager<D> {
         self.assert_still_owned(&record).await?;
 
         self.driver.deactivate(&record.interface).await?;
-        *self.owned.lock().expect("owned mutex poisoned") = None;
+        self.owned
+            .lock()
+            .expect("owned mutex poisoned")
+            .remove(&snapshot.interface);
         Ok(())
     }
 
     pub async fn reconcile(&self) -> Result<ReconcileOutcome<D::OwnershipProof>, ManagerError> {
-        if !self.driver.link_exists(OWNED_INTERFACE_NAME).await? {
+        self.reconcile_on(OWNED_INTERFACE_NAME).await
+    }
+
+    pub async fn reconcile_on(
+        &self,
+        interface: &str,
+    ) -> Result<ReconcileOutcome<D::OwnershipProof>, ManagerError> {
+        if !self.driver.link_exists(interface).await? {
             return Ok(ReconcileOutcome::Absent);
         }
 
         let persisted = self.active_profile_store.load().await?;
         if let Some(persisted) = persisted {
-            if persisted.interface == OWNED_INTERFACE_NAME {
+            if persisted.interface == interface {
                 let decoded = BASE64
                     .decode(&persisted.ownership_proof_base64)
                     .ok()
                     .and_then(|bytes| self.driver.decode_ownership_proof(&bytes).ok());
                 if let Some(persisted_proof) = decoded {
-                    let observed_proof = self
-                        .driver
-                        .read_ownership_proof(OWNED_INTERFACE_NAME)
-                        .await?;
+                    let observed_proof = self.driver.read_ownership_proof(interface).await?;
                     if observed_proof.as_ref() == Some(&persisted_proof) {
                         let record = OwnedInterfaceRecord {
-                            interface: OWNED_INTERFACE_NAME.to_string(),
+                            interface: interface.to_string(),
                             ownership_proof: persisted_proof,
                             profile_name: persisted.profile_name,
                         };
-                        *self.owned.lock().expect("owned mutex poisoned") = Some(record.clone());
+                        self.owned
+                            .lock()
+                            .expect("owned mutex poisoned")
+                            .insert(interface.to_string(), record.clone());
                         return Ok(ReconcileOutcome::Adopted(record));
                     }
                 } else {
                     tracing::warn!(
-                        interface = OWNED_INTERFACE_NAME,
+                        interface = interface,
                         "persisted active-profile ownership proof could not be decoded; \
                          treating the surviving interface as foreign rather than adopting it"
                     );
@@ -286,12 +391,24 @@ impl<D: VpnDriver> VpnManager<D> {
     }
 
     pub async fn shutdown(&self, policy: ShutdownPolicy) -> Result<(), ManagerError> {
-        if self.active().is_none() {
+        let interfaces: Vec<String> = self
+            .owned
+            .lock()
+            .expect("owned mutex poisoned")
+            .keys()
+            .cloned()
+            .collect();
+        if interfaces.is_empty() {
             return Ok(());
         }
         match policy {
             ShutdownPolicy::PreserveInterfaces => Ok(()),
-            ShutdownPolicy::RestoreInterfaces => self.deactivate().await,
+            ShutdownPolicy::RestoreInterfaces => {
+                for interface in interfaces {
+                    self.deactivate_on(&interface).await?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -551,6 +668,37 @@ mod tests {
         assert!(matches!(error, ManagerError::AlreadyActive));
     }
 
+    #[tokio::test]
+    async fn two_different_hop_interfaces_can_be_activated_concurrently() {
+        let (manager, fake, _dir) = manager_with_store();
+        manager
+            .import_profile("home.conf", valid_config(VALID_PRIVATE_KEY).as_bytes())
+            .expect("import");
+
+        let hop0 = hop_interface_name(0);
+        let hop1 = hop_interface_name(1);
+        assert_ne!(hop0, hop1);
+
+        manager
+            .activate_on(&hop0, "home.conf")
+            .await
+            .expect("hop 0 activates");
+        manager
+            .activate_on(&hop1, "home.conf")
+            .await
+            .expect("a second, differently-named hop activates while hop 0 is still active");
+
+        assert!(manager.active_on(&hop0).is_some());
+        assert!(manager.active_on(&hop1).is_some());
+        assert_eq!(manager.active_interfaces().len(), 2);
+        assert!(fake.link_exists(&hop0).await.unwrap());
+        assert!(fake.link_exists(&hop1).await.unwrap());
+
+        // Re-activating an already-active hop by name is still rejected.
+        let error = manager.activate_on(&hop0, "home.conf").await.unwrap_err();
+        assert!(matches!(error, ManagerError::AlreadyActive));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_activate_calls_never_race_into_a_foreign_interface_conflict() {
         let (manager, fake, _dir) = manager_with_store();
@@ -629,11 +777,14 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        *manager.owned.lock().unwrap() = Some(OwnedInterfaceRecord {
-            interface: OWNED_INTERFACE_NAME.to_string(),
-            ownership_proof,
-            profile_name: "home.conf".to_string(),
-        });
+        manager.owned.lock().unwrap().insert(
+            OWNED_INTERFACE_NAME.to_string(),
+            OwnedInterfaceRecord {
+                interface: OWNED_INTERFACE_NAME.to_string(),
+                ownership_proof,
+                profile_name: "home.conf".to_string(),
+            },
+        );
 
         manager.rollback(&snapshot).await.expect("rollback");
 

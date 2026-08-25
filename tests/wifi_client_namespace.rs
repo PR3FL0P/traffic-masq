@@ -137,6 +137,7 @@ impl WifiClientNamespaceFixture {
         self.config.network.interfaces.insert(
             STA_IF.to_string(),
             InterfaceConfig {
+                nat: true,
                 role: InterfaceRole::Input,
                 managed: false,
                 ipv4: None,

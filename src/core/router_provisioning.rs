@@ -287,6 +287,7 @@ pub fn derive_router_provisioning(
             security: desired.uplink.security,
             passphrase_file: desired.uplink.passphrase_file.clone(),
         }),
+    nat: true,
     };
 
     let output_interface = InterfaceConfig {
@@ -319,6 +320,7 @@ pub fn derive_router_provisioning(
             passphrase_file: desired.output.passphrase_file.clone(),
         }),
         wifi_client: None,
+    nat: true,
     };
 
     let router = RouterConfig {
@@ -329,6 +331,7 @@ pub fn derive_router_provisioning(
         }),
         owned_routes: Vec::new(),
         allow_default_route_change: true,
+    vpn_chain: Vec::new(),
     };
 
     let mut effective_config = context.effective_config.clone();

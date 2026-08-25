@@ -755,7 +755,10 @@ fn next_role(role: InterfaceRole) -> InterfaceRole {
         InterfaceRole::Management => InterfaceRole::Input,
         InterfaceRole::Input => InterfaceRole::Output,
         InterfaceRole::Output => InterfaceRole::Disabled,
-        InterfaceRole::Disabled => InterfaceRole::Management,
+        // `Middle` (a VPN-hop chain slot) isn't part of this TUI's manual
+        // role cycle yet — that's the later topology-view plan's job. It
+        // falls back to `Management` rather than being reachable here.
+        InterfaceRole::Disabled | InterfaceRole::Middle => InterfaceRole::Management,
     }
 }
 

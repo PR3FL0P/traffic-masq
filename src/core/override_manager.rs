@@ -300,6 +300,7 @@ mod tests {
 
     fn interface_config(address: &str) -> InterfaceConfig {
         InterfaceConfig {
+            nat: true,
             role: InterfaceRole::Output,
             managed: true,
             ipv4: Some(address.parse().expect("network")),
@@ -401,6 +402,7 @@ mod tests {
             .await
             .unwrap();
         let mut interface = InterfaceConfig {
+            nat: true,
             role: InterfaceRole::Input,
             managed: true,
             ipv4: None,
@@ -556,6 +558,7 @@ mod tests {
         base.network.interfaces.insert(
             "wan0".into(),
             InterfaceConfig {
+                nat: true,
                 role: InterfaceRole::Input,
                 managed: false,
                 ipv4: None,
@@ -651,6 +654,7 @@ mod tests {
         base.network.interfaces.insert(
             "wan0".into(),
             InterfaceConfig {
+                nat: true,
                 role: InterfaceRole::Input,
                 managed: false,
                 ipv4: None,
@@ -679,6 +683,7 @@ mod tests {
             "wan0".into(),
             InterfaceOverride {
                 config: InterfaceConfig {
+                    nat: true,
                     role: InterfaceRole::Management,
                     managed: false,
                     ipv4: None,
@@ -773,6 +778,7 @@ mod tests {
         base.network.interfaces.insert(
             "wan0".into(),
             InterfaceConfig {
+                nat: true,
                 role: InterfaceRole::Input,
                 managed: false,
                 ipv4: None,

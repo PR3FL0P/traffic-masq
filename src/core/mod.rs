@@ -9,5 +9,6 @@ pub mod router_provisioning;
 pub mod router_subsystems;
 pub mod router_transaction;
 pub mod transaction;
+pub mod vpn_chain;
 pub mod vpn_policy;
 pub mod vpn_policy_manager;

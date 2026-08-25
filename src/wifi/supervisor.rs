@@ -1081,6 +1081,7 @@ mod tests {
             dhcp_client: None,
             wifi: Some(ap_config(ssid)),
             wifi_client: None,
+        nat: true,
         };
         WifiApSpec::from_interface_config(interface, &config)
             .expect("valid")
@@ -1161,6 +1162,7 @@ mod tests {
                 dhcp_client: None,
                 wifi: Some(ap_config("net-a")),
                 wifi_client: None,
+            nat: true,
             },
         );
         config.network.interfaces.insert(
@@ -1173,6 +1175,7 @@ mod tests {
                 dhcp_client: None,
                 wifi: None,
                 wifi_client: None,
+            nat: true,
             },
         );
 

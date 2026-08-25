@@ -618,6 +618,7 @@ mod tests {
 
     fn interface_config(cidr: &str) -> InterfaceConfig {
         InterfaceConfig {
+            nat: true,
             role: InterfaceRole::Output,
             managed: true,
             ipv4: Some(cidr.parse().expect("network")),

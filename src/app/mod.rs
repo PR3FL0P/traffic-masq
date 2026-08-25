@@ -980,7 +980,73 @@ impl<'a> StartupRollback<'a> {
     }
 }
 
-pub async fn run_daemon(config: AppConfig) -> Result<()> {
+/// One-time load-path migration (Landing 1, plan step 10): a persisted
+/// config with `vpn.policy.default_mode == Vpn` and an empty
+/// `router.vpn_chain` predates the chain model entirely — synthesize a
+/// length-1 chain from whatever profile the legacy single-tunnel path had
+/// most recently activated, so the chain becomes the one source of truth
+/// going forward instead of `default_mode` silently continuing to mean
+/// something the rest of the system no longer consults.
+///
+/// LIMITATION: this only ever sees the *legacy* active-profile record
+/// (`<state_dir>/vpn-active-profile.json`, the file `build_vpn_manager`
+/// reads/writes for `OWNED_INTERFACE_NAME`/`tm-wg0`) because that is the
+/// only place "which profile was active" is knowable without a driver
+/// handle — `AppConfig::load` itself is synchronous and has no I/O access to
+/// runtime state, so the migration cannot run there and instead runs here,
+/// at daemon startup, before `RuntimeOverrideManager::load` builds the
+/// effective config every other startup step consumes. If no legacy active
+/// profile was ever persisted (e.g. `default_mode: Vpn` was set but the
+/// tunnel was never actually activated, or the state directory was wiped),
+/// there is nothing to synthesize from and `default_mode` is left in place
+/// unmigrated — falling back to the pre-chain behavior for that one startup
+/// rather than silently fabricating a chain with no real profile. The
+/// synthesized chain is not written back to the on-disk config file in this
+/// landing; it only affects the in-memory `AppConfig` for this run (and
+/// anything derived from it, including `RuntimeOverrideManager`'s base), so
+/// a config file inspected by hand won't yet show the migrated chain.
+async fn migrate_vpn_policy_mode_to_chain(config: &mut AppConfig) {
+    if config.vpn.policy.default_mode != VpnPolicyMode::Vpn || !config.router.vpn_chain.is_empty()
+    {
+        return;
+    }
+    let active_profile_store = ActiveProfileStore::new(
+        config
+            .runtime
+            .state_dir
+            .join("vpn-active-profile.json"),
+    );
+    let persisted = match active_profile_store.load().await {
+        Ok(Some(persisted)) => persisted,
+        Ok(None) => {
+            tracing::warn!(
+                "vpn.policy.default_mode is \"vpn\" but no legacy active VPN profile is \
+                 persisted; leaving vpn_chain empty for this run rather than fabricating a hop \
+                 with no real profile"
+            );
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "failed to read the legacy active VPN profile while migrating \
+                 vpn.policy.default_mode = \"vpn\" to a hop chain; leaving vpn_chain empty for \
+                 this run"
+            );
+            return;
+        }
+    };
+    tracing::info!(
+        profile = %persisted.profile_name,
+        "migrating legacy vpn.policy.default_mode = \"vpn\" to a length-1 VPN hop chain"
+    );
+    config.router.vpn_chain = vec![crate::config::VpnHopConfig {
+        profile_name: persisted.profile_name,
+    }];
+}
+
+pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
+    migrate_vpn_policy_mode_to_chain(&mut config).await;
     config.validate()?;
     let shutdown = install_shutdown_signal()?;
     let _process_guard = ProcessGuard::acquire(&config.runtime.pid_path)?;
@@ -1942,6 +2008,7 @@ mod tests {
         config.network.interfaces.insert(
             "wan0".to_string(),
             InterfaceConfig {
+                nat: true,
                 role: InterfaceRole::Input,
                 managed: false,
                 ipv4: None,
@@ -1954,6 +2021,7 @@ mod tests {
         config.network.interfaces.insert(
             "lan0".to_string(),
             InterfaceConfig {
+                nat: true,
                 role: InterfaceRole::Output,
                 managed: true,
                 ipv4: Some("192.168.10.1/24".parse().expect("network")),
@@ -1979,11 +2047,78 @@ mod tests {
         config
     }
 
+    /// `default_mode: Vpn` with an active legacy profile and an empty
+    /// `vpn_chain` must migrate into a length-1 chain carrying that
+    /// profile's name — the one true migration in Landing 1.
+    #[tokio::test]
+    async fn migrates_default_mode_vpn_with_an_active_profile_into_a_length_one_chain() {
+        let state_dir = tempdir().expect("tempdir");
+        let mut config = vpn_policy_startup_config();
+        config.runtime.state_dir = state_dir.path().to_path_buf();
+        config.vpn.policy.default_mode = VpnPolicyMode::Vpn;
+        assert!(config.router.vpn_chain.is_empty());
+
+        let legacy_store = ActiveProfileStore::new(state_dir.path().join("vpn-active-profile.json"));
+        legacy_store
+            .save(&crate::vpn::active_profile::PersistedActiveProfile {
+                profile_name: "home.conf".to_string(),
+                interface: "tm-wg0".to_string(),
+                ownership_proof_base64: "irrelevant".to_string(),
+            })
+            .await
+            .expect("persist legacy active profile");
+
+        migrate_vpn_policy_mode_to_chain(&mut config).await;
+
+        assert_eq!(config.router.vpn_chain.len(), 1);
+        assert_eq!(config.router.vpn_chain[0].profile_name, "home.conf");
+    }
+
+    /// Without a legacy active profile to synthesize from, the migration
+    /// must leave `vpn_chain` empty rather than fabricate a hop with no real
+    /// profile behind it.
+    #[tokio::test]
+    async fn does_not_synthesize_a_chain_without_a_legacy_active_profile() {
+        let state_dir = tempdir().expect("tempdir");
+        let mut config = vpn_policy_startup_config();
+        config.runtime.state_dir = state_dir.path().to_path_buf();
+        config.vpn.policy.default_mode = VpnPolicyMode::Vpn;
+
+        migrate_vpn_policy_mode_to_chain(&mut config).await;
+
+        assert!(config.router.vpn_chain.is_empty());
+    }
+
+    /// `default_mode: Direct` never triggers the migration, regardless of
+    /// whether a legacy active profile happens to be lying around.
+    #[tokio::test]
+    async fn direct_mode_never_triggers_the_migration() {
+        let state_dir = tempdir().expect("tempdir");
+        let mut config = vpn_policy_startup_config();
+        config.runtime.state_dir = state_dir.path().to_path_buf();
+        config.vpn.policy.default_mode = VpnPolicyMode::Direct;
+
+        let legacy_store = ActiveProfileStore::new(state_dir.path().join("vpn-active-profile.json"));
+        legacy_store
+            .save(&crate::vpn::active_profile::PersistedActiveProfile {
+                profile_name: "home.conf".to_string(),
+                interface: "tm-wg0".to_string(),
+                ownership_proof_base64: "irrelevant".to_string(),
+            })
+            .await
+            .expect("persist legacy active profile");
+
+        migrate_vpn_policy_mode_to_chain(&mut config).await;
+
+        assert!(config.router.vpn_chain.is_empty());
+    }
+
     fn hotplug_reconcile_config() -> AppConfig {
         let mut config = AppConfig::default();
         config.network.interfaces.insert(
             "lan0".to_string(),
             InterfaceConfig {
+                nat: true,
                 role: InterfaceRole::Output,
                 managed: true,
                 ipv4: Some("192.168.77.1/24".parse().expect("network")),
@@ -2235,6 +2370,7 @@ mod tests {
         config.network.interfaces.insert(
             "mgmt0".to_string(),
             InterfaceConfig {
+                nat: true,
                 role: InterfaceRole::Management,
                 managed: true,
                 ipv4: Some("192.168.1.10/24".parse().expect("network")),
@@ -2321,6 +2457,7 @@ mod tests {
         config.network.interfaces.insert(
             "lan0".to_string(),
             InterfaceConfig {
+                nat: true,
                 role: InterfaceRole::Output,
                 managed: false,
                 ipv4: None,
@@ -2449,6 +2586,7 @@ mod tests {
         config.network.interfaces.insert(
             "wan0".to_string(),
             InterfaceConfig {
+                nat: true,
                 role: InterfaceRole::Input,
                 managed: true,
                 ipv4: None,
@@ -2532,6 +2670,7 @@ mod tests {
         config.network.interfaces.insert(
             "eth0".to_string(),
             InterfaceConfig {
+                nat: true,
                 role: InterfaceRole::Input,
                 managed: true,
                 ipv4: None,
@@ -2639,6 +2778,7 @@ mod tests {
         config.network.interfaces.insert(
             "wan0".to_string(),
             InterfaceConfig {
+                nat: true,
                 role: InterfaceRole::Input,
                 managed: false,
                 ipv4: None,
@@ -2710,6 +2850,7 @@ mod tests {
         config.network.interfaces.insert(
             "wan0".to_string(),
             crate::config::InterfaceConfig {
+                nat: true,
                 role: crate::config::InterfaceRole::Input,
                 managed: false,
                 ipv4: None,
@@ -2722,6 +2863,7 @@ mod tests {
         config.network.interfaces.insert(
             "lan0".to_string(),
             crate::config::InterfaceConfig {
+                nat: true,
                 role: crate::config::InterfaceRole::Output,
                 managed: true,
                 ipv4: Some("192.168.10.1/24".parse().expect("network")),
@@ -2732,6 +2874,7 @@ mod tests {
             },
         );
         config.router = RouterConfig {
+            vpn_chain: Vec::new(),
             enabled: true,
             uplink: Some(UplinkConfig {
                 interface: "wan0".to_string(),

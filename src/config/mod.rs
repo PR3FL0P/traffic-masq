@@ -115,7 +115,14 @@ pub enum InterfaceRole {
     Management,
     Input,
     Output,
+    /// A slot naming one of the VPN hop chain's virtual `tm-wg-<hop_index>`
+    /// interfaces. Unaddressed, WireGuard-only: never carries dhcp/wifi/ipv4.
+    Middle,
     Disabled,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -134,6 +141,12 @@ pub struct InterfaceConfig {
 
     #[serde(default)]
     pub wifi_client: Option<WifiClientConfig>,
+
+    /// Whether a managed Output interface's traffic is masqueraded by the
+    /// router dataplane. Defaults to `true` so upgrading a persisted config
+    /// without this key preserves today's unconditional-NAT behavior.
+    #[serde(default = "default_true")]
+    pub nat: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,6 +156,22 @@ pub struct RouterConfig {
     pub uplink: Option<UplinkConfig>,
     pub owned_routes: Vec<OwnedIpv4RouteConfig>,
     pub allow_default_route_change: bool,
+    /// Persisted, user-facing VPN hop chain: profile name per hop, ordered
+    /// (index 0 = closest to the physical uplink). The derived `interface`/
+    /// `reserved` fields of a hop are recomputed at runtime, not persisted.
+    #[serde(default)]
+    pub vpn_chain: Vec<VpnHopConfig>,
+}
+
+/// The maximum number of hops a persisted VPN chain may contain, matching
+/// [`crate::core::vpn_policy::MAX_VPN_HOP_INDEX`]'s bound on reserved-ID
+/// allocation so the priority-band math can never overflow into an
+/// unrelated reserved range.
+pub const MAX_VPN_CHAIN_LEN: usize = 8;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpnHopConfig {
+    pub profile_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -641,6 +670,14 @@ impl RouterConfig {
             }
         }
 
+        if self.vpn_chain.len() > MAX_VPN_CHAIN_LEN {
+            bail!(
+                "vpn_chain length {} exceeds the maximum supported chain length of {}",
+                self.vpn_chain.len(),
+                MAX_VPN_CHAIN_LEN
+            );
+        }
+
         for (index, route) in self.owned_routes.iter().enumerate() {
             route
                 .validate(network, self.uplink.as_ref())
@@ -679,8 +716,8 @@ impl OwnedIpv4RouteConfig {
         match interface.role {
             InterfaceRole::Input if uplink.is_some_and(|uplink| uplink.interface == name) => Ok(()),
             InterfaceRole::Output if interface.managed => Ok(()),
-            InterfaceRole::Management | InterfaceRole::Disabled => {
-                bail!("management or disabled interface {name} cannot own a router route")
+            InterfaceRole::Management | InterfaceRole::Disabled | InterfaceRole::Middle => {
+                bail!("management, disabled, or VPN-hop interface {name} cannot own a router route")
             }
             InterfaceRole::Input => {
                 bail!("route input interface {name} is not the selected uplink")
@@ -702,6 +739,15 @@ impl InterfaceConfig {
 
         if self.dhcp.is_some() && self.role != InterfaceRole::Output {
             bail!("DHCP server can only be enabled on an output interface");
+        }
+
+        if self.role == InterfaceRole::Middle
+            && (self.dhcp.is_some() || self.wifi.is_some() || self.wifi_client.is_some() || self.ipv4.is_some())
+        {
+            bail!(
+                "a Middle (VPN hop) interface is unaddressed and WireGuard-only; it cannot carry \
+                 dhcp, wifi, or an ipv4 address"
+            );
         }
 
         if self.dhcp_client.is_some() && self.role != InterfaceRole::Input {
@@ -1079,6 +1125,7 @@ mod tests {
 
     fn input_interface() -> InterfaceConfig {
         InterfaceConfig {
+            nat: true,
             role: InterfaceRole::Input,
             managed: false,
             ipv4: None,
@@ -1091,6 +1138,7 @@ mod tests {
 
     fn output_interface(ipv4: &str, pool_start: Ipv4Addr, pool_end: Ipv4Addr) -> InterfaceConfig {
         InterfaceConfig {
+            nat: true,
             role: InterfaceRole::Output,
             managed: true,
             ipv4: Some(ipv4.parse().expect("valid network")),
@@ -1135,6 +1183,7 @@ mod tests {
             ),
         );
         config.router = RouterConfig {
+            vpn_chain: Vec::new(),
             enabled: true,
             uplink: Some(UplinkConfig {
                 interface: "wan0".to_string(),
@@ -1403,6 +1452,7 @@ mod tests {
             config.network.interfaces.insert(
                 "foreign0".to_string(),
                 InterfaceConfig {
+                    nat: true,
                     role,
                     managed: false,
                     ipv4: None,
@@ -1877,6 +1927,7 @@ mod tests {
 
     fn client_interface(wifi_client: WifiClientConfig) -> InterfaceConfig {
         InterfaceConfig {
+            nat: true,
             role: InterfaceRole::Input,
             managed: false,
             ipv4: None,
@@ -2125,5 +2176,57 @@ mod tests {
             error.to_string().contains("cannot be both"),
             "expected the mutual-exclusion error specifically, got: {error}"
         );
+    }
+
+    /// A pre-`nat`-field `InterfaceConfig` (an upgrade from before this
+    /// field existed) must deserialize with NAT still on for every output —
+    /// today's behavior — not silently turn NAT off because the key is
+    /// missing.
+    #[test]
+    fn interface_config_without_a_nat_key_defaults_nat_to_true() {
+        let toml = r#"
+            role = "output"
+            managed = true
+            ipv4 = "192.168.10.1/24"
+        "#;
+        let interface: InterfaceConfig = toml::from_str(toml).expect("pre-nat fixture parses");
+        assert!(
+            interface.nat,
+            "a config predating InterfaceConfig.nat must still get NAT on upgrade"
+        );
+    }
+
+    /// A pre-`vpn_chain`-field `RouterConfig` (an upgrade from before the
+    /// hop chain existed) must deserialize with an empty chain, not fail to
+    /// parse or silently synthesize one at the `RouterConfig` level (that is
+    /// `migrate_vpn_policy_mode_to_chain`'s job, exercised separately).
+    #[test]
+    fn router_config_without_a_vpn_chain_key_defaults_to_an_empty_chain() {
+        let toml = r#"
+            enabled = true
+            allow_default_route_change = false
+
+            [uplink]
+            interface = "wan0"
+            mode = "external"
+        "#;
+        let router: RouterConfig = toml::from_str(toml).expect("pre-vpn_chain fixture parses");
+        assert!(
+            router.vpn_chain.is_empty(),
+            "a config predating RouterConfig.vpn_chain must load with an empty chain"
+        );
+    }
+
+    #[test]
+    fn vpn_chain_longer_than_the_cap_is_rejected() {
+        let mut config = valid_router_config();
+        config.router.vpn_chain = (0..=MAX_VPN_CHAIN_LEN)
+            .map(|i| VpnHopConfig {
+                profile_name: format!("hop{i}.conf"),
+            })
+            .collect();
+
+        let error = config.validate().expect_err("chain longer than the cap");
+        assert!(error.to_string().contains("exceeds the maximum"));
     }
 }

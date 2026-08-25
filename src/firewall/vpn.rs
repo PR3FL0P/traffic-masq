@@ -20,7 +20,7 @@ const NFT_VPN_METADATA_COMMENT_PREFIX: &str = "traffic-masq:vpn:v1:part:";
 /// with the policy that decides when to apply them: a firewall mark is a
 /// property of the dataplane. Keeping them in `core::vpn_policy` made the
 /// domain layer and its driver mutually dependent for the sake of two integers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct FirewallMark(u32);
 
 impl FirewallMark {
@@ -29,7 +29,7 @@ impl FirewallMark {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct FirewallMarkMask(u32);
 
 impl FirewallMarkMask {

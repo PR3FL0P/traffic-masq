@@ -1806,6 +1806,7 @@ mod tests {
 
     fn interface_config() -> InterfaceConfig {
         InterfaceConfig {
+            nat: true,
             role: InterfaceRole::Output,
             managed: true,
             ipv4: None,

@@ -349,6 +349,7 @@ mod tests {
         let ipv4: ipnet::Ipv4Net = address.parse().expect("IPv4 network");
         let octet = ipv4.addr().octets()[2];
         InterfaceConfig {
+            nat: true,
             role: InterfaceRole::Output,
             managed: true,
             ipv4: Some(ipv4),
@@ -370,6 +371,7 @@ mod tests {
         config.network.interfaces.insert(
             "wan0".to_string(),
             InterfaceConfig {
+                nat: true,
                 role: InterfaceRole::Input,
                 managed: false,
                 ipv4: None,
@@ -388,6 +390,7 @@ mod tests {
 
     fn enabled_router() -> RouterConfig {
         RouterConfig {
+            vpn_chain: Vec::new(),
             enabled: true,
             uplink: Some(UplinkConfig {
                 interface: "wan0".to_string(),

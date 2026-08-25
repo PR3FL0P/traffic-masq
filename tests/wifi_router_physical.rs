@@ -194,6 +194,7 @@ impl PhysicalWifiFixture {
         self.config.network.interfaces.insert(
             self.uplink_interface.clone(),
             InterfaceConfig {
+                nat: true,
                 role: InterfaceRole::Input,
                 managed: true,
                 ipv4: None,
@@ -211,6 +212,7 @@ impl PhysicalWifiFixture {
         self.config.network.interfaces.insert(
             self.output_interface.clone(),
             InterfaceConfig {
+                nat: true,
                 role: InterfaceRole::Output,
                 managed: true,
                 ipv4: Some(ipnet::Ipv4Net::from_str("10.77.0.1/24")?),

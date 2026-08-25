@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::firewall::vpn::{FirewallMark, FirewallMarkMask, VPN_POLICY_FWMARK, VPN_POLICY_FWMASK};
 use crate::netlink::{
@@ -12,9 +13,32 @@ pub const VPN_POLICY_ROUTE_TABLE_ID: PolicyRouteTableId = PolicyRouteTableId(30_
 
 pub const VPN_POLICY_RULE_PRIORITY_START: PolicyRulePriority = PolicyRulePriority(10_100);
 
-pub const VPN_POLICY_RULE_PRIORITY_END: PolicyRulePriority = PolicyRulePriority(10_199);
+/// Hop 0's slice of the per-hop rule-priority band (`BASE + 0*10 ..= BASE +
+/// 0*10 + 9`) — kept in lockstep with [`VpnPolicyReservedIds::for_hop`] so
+/// `for_hop(0)` reproduces [`VpnPolicyReservedIds::default`] exactly. Each
+/// hop only needs a 10-wide slice (one rule per hop), not the historical
+/// 100-wide single-tunnel band; widening `for_hop(0)` back out to
+/// `10_100..=10_199` would make it overlap every other hop's band instead of
+/// staying disjoint from them.
+pub const VPN_POLICY_RULE_PRIORITY_END: PolicyRulePriority = PolicyRulePriority(10_109);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Base route table id for per-hop allocation: hop N uses `BASE + N`.
+/// Chosen so `for_hop(0)` reproduces [`VPN_POLICY_ROUTE_TABLE_ID`] exactly,
+/// keeping the legacy single-hop `Default` impl unchanged.
+pub const VPN_POLICY_ROUTE_TABLE_BASE: u32 = 30_100;
+
+/// Base rule-priority for per-hop allocation: hop N uses
+/// `BASE + N*10 ..= BASE + N*10 + 9`. Chosen so `for_hop(0)` reproduces
+/// [`VPN_POLICY_RULE_PRIORITY_START`]/`_END` exactly.
+pub const VPN_POLICY_RULE_PRIORITY_BASE: u32 = 10_100;
+
+/// Hop indices beyond this are rejected by [`VpnPolicyReservedIds::for_hop`]:
+/// keeps the widened per-hop priority band (`BASE + N*10 ..= BASE + N*10 + 9`)
+/// inside the historical single reserved band `10_100..=10_199` and bounds
+/// how large a persisted `vpn_chain` may be.
+pub const MAX_VPN_HOP_INDEX: u32 = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PolicyRouteTableId(u32);
 
 impl PolicyRouteTableId {
@@ -23,7 +47,7 @@ impl PolicyRouteTableId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PolicyRulePriority(u32);
 
 impl PolicyRulePriority {
@@ -32,7 +56,7 @@ impl PolicyRulePriority {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpnPolicyReservedIds {
     pub route_table: PolicyRouteTableId,
     pub rule_priority_start: PolicyRulePriority,
@@ -54,6 +78,31 @@ impl Default for VpnPolicyReservedIds {
 }
 
 impl VpnPolicyReservedIds {
+    /// Per-hop allocation: hop N gets route table `BASE + N`, rule
+    /// priorities `BASE + N*10 ..= BASE + N*10 + 9`, and the same fwmark
+    /// namespace as every other hop (fwmark selectors are disambiguated by
+    /// which chain a rule belongs to via the route table/priority, not by a
+    /// distinct mark per hop). `for_hop(0)` is exactly
+    /// [`VpnPolicyReservedIds::default`].
+    pub fn for_hop(hop_index: u32) -> Result<Self> {
+        if hop_index > MAX_VPN_HOP_INDEX {
+            bail!(
+                "VPN hop index {hop_index} exceeds the maximum supported chain length \
+                 ({MAX_VPN_HOP_INDEX})"
+            );
+        }
+        let route_table = VPN_POLICY_ROUTE_TABLE_BASE + hop_index;
+        let priority_start = VPN_POLICY_RULE_PRIORITY_BASE + hop_index * 10;
+        let priority_end = priority_start + 9;
+        Ok(Self {
+            route_table: PolicyRouteTableId(route_table),
+            rule_priority_start: PolicyRulePriority(priority_start),
+            rule_priority_end: PolicyRulePriority(priority_end),
+            fw_mark: VPN_POLICY_FWMARK,
+            fw_mask: VPN_POLICY_FWMASK,
+        })
+    }
+
     pub fn validate(self) -> Result<()> {
         if self.route_table.get() == 0 {
             bail!("VPN policy route table must not be RT_TABLE_UNSPEC (0)");
@@ -557,6 +606,39 @@ mod tests {
         assert!(reserved().contains_priority(reserved().rule_priority_start.get()));
         assert!(reserved().contains_priority(reserved().rule_priority_end.get()));
         assert!(!reserved().contains_priority(reserved().rule_priority_end.get() + 1));
+    }
+
+    #[test]
+    fn for_hop_zero_matches_default() {
+        let hop0 = VpnPolicyReservedIds::for_hop(0).expect("hop 0");
+        assert_eq!(hop0, VpnPolicyReservedIds::default());
+    }
+
+    #[test]
+    fn for_hop_allocates_disjoint_non_overlapping_bands_per_hop() {
+        let mut seen_tables = std::collections::HashSet::new();
+        let mut seen_priorities = std::collections::HashSet::new();
+        for hop in 0..=MAX_VPN_HOP_INDEX {
+            let reserved = VpnPolicyReservedIds::for_hop(hop).expect("valid hop");
+            reserved.validate().expect("valid reserved ids");
+            assert!(
+                seen_tables.insert(reserved.route_table.get()),
+                "route table collided at hop {hop}"
+            );
+            for priority in reserved.rule_priority_start.get()..=reserved.rule_priority_end.get() {
+                assert!(
+                    seen_priorities.insert(priority),
+                    "priority {priority} collided at hop {hop}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn for_hop_rejects_indices_beyond_the_cap() {
+        let error = VpnPolicyReservedIds::for_hop(MAX_VPN_HOP_INDEX + 1)
+            .expect_err("hop index beyond cap must be rejected");
+        assert!(error.to_string().contains("exceeds the maximum"));
     }
 
     #[test]

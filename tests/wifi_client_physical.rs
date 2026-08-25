@@ -135,6 +135,7 @@ impl PhysicalWifiFixture {
         self.config.network.interfaces.insert(
             self.namespace_interface.clone(),
             InterfaceConfig {
+                nat: true,
                 role: InterfaceRole::Input,
                 managed: false,
                 ipv4: None,

@@ -1,28 +1,59 @@
 use std::collections::BTreeMap;
+use std::net::Ipv4Addr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use ipnet::Ipv4Net;
 
 use crate::core::interface::{InterfaceChangePlan, InterfaceManager, InterfaceSnapshot};
 use crate::core::route::{RouteManager, RoutePlan, RouteSnapshot};
 use crate::core::router::{
-    DhcpPlan, RouterDesired, RouterDhcpHealthReason, RouterSubsystems, WifiPlan, WifiSnapshot,
+    DhcpPlan, RouterDesired, RouterDhcpHealthReason, RouterSubsystems, VpnChainPlan,
+    VpnChainSnapshot, WifiPlan, WifiSnapshot,
 };
+use crate::core::vpn_chain::{VpnHopDesired, VpnHopKind, VpnHopRoutingDesired};
+use crate::core::vpn_policy::VpnPolicyReservedIds;
+use crate::core::vpn_policy_manager::VpnPolicyManager;
 use crate::dhcp::client::{
     DhcpClientLeaseState, DhcpClientRunState, DhcpClientSpec, DhcpClientStatus,
     DhcpClientSupervisor,
 };
 use crate::dhcp::supervisor::{DhcpServiceSpec, DhcpSupervisor};
+use crate::firewall::vpn::VpnPolicyFirewallBackend;
 use crate::firewall::{
-    NoopRouterDataplaneEventSink, RouterDataplaneEventSink, RouterDataplaneManager,
+    NftExecutor, NoopRouterDataplaneEventSink, RouterDataplaneEventSink, RouterDataplaneManager,
     RouterDataplanePlan, RouterDataplaneProvider, RouterDataplaneSnapshot,
 };
+use crate::netlink::{
+    Ipv4RouteSpec, Ipv4RuleSpec, NetworkProvider, TRAFFIC_MASQ_ROUTE_PROTOCOL,
+};
+use crate::vpn::active_profile::ActiveProfileStore;
+use crate::vpn::store::WireGuardProfileStore;
+use crate::vpn::wireguard::WireGuardVpnDriver;
+use crate::vpn::{ProductionVpnManager, VpnManager, VpnProvider};
 use crate::wifi::{
     HostapdState, HostapdSupervisor, WifiApSpec, WifiClientSpec, WifiClientSupervisor, WpaState,
 };
+
+/// Shared dependencies for constructing the per-hop `VpnManager`/
+/// `VpnPolicyManager` instances the VPN hop chain needs. Kept as a single
+/// optional bundle (rather than several optional fields) because they are
+/// only ever present or absent together: a build/deployment that doesn't
+/// wire up VPN chaining at all should fall back to the trait's
+/// bail-if-nonempty default behaviour, exactly like `stations`/
+/// `access_points` do for the Wi-Fi stages above.
+pub struct VpnChainDeps {
+    pub vpn_provider: Arc<dyn VpnProvider>,
+    pub wireguard_store: WireGuardProfileStore,
+    /// Base directory for per-hop `active-profile-<hop_index>.json` files.
+    pub state_dir: PathBuf,
+    pub network: Arc<dyn NetworkProvider>,
+    pub nft_executor: Arc<dyn NftExecutor>,
+}
 
 #[async_trait]
 pub trait RouterDhcpClientRuntime: Send + Sync {
@@ -131,6 +162,18 @@ where
     dhcp_client: Option<Arc<dyn RouterDhcpClientRuntime>>,
     access_points: Option<Arc<dyn RouterApRuntime>>,
     stations: Option<Arc<dyn RouterStaRuntime>>,
+    vpn_chain_deps: Option<VpnChainDeps>,
+    /// Per-hop `VpnManager` instances, built lazily and cached by hop index
+    /// so repeated `apply`/`rollback`/`health` calls for the same hop reuse
+    /// the same in-memory `owned` map rather than losing track of what is
+    /// active every time a new instance would otherwise be constructed.
+    vpn_hop_managers: RwLock<BTreeMap<u32, Arc<ProductionVpnManager>>>,
+    /// The chain that is believed active right now, in application order.
+    /// In-memory on purpose, mirroring `router_interfaces` above: it is the
+    /// runtime record of "what this process last successfully applied", not
+    /// a second copy of committed config — `RouterConfig.vpn_chain` (the
+    /// persisted intent) already lives elsewhere.
+    vpn_active_chain: RwLock<Vec<VpnHopDesired>>,
 }
 
 impl<P> ProductionRouterSubsystems<P, NoopRouterDataplaneEventSink>
@@ -153,6 +196,9 @@ where
             dhcp_client: None,
             access_points: None,
             stations: None,
+            vpn_chain_deps: None,
+            vpn_hop_managers: RwLock::new(BTreeMap::new()),
+            vpn_active_chain: RwLock::new(Vec::new()),
         }
     }
 
@@ -173,6 +219,9 @@ where
             dhcp_client: Some(dhcp_client),
             access_points: None,
             stations: None,
+            vpn_chain_deps: None,
+            vpn_hop_managers: RwLock::new(BTreeMap::new()),
+            vpn_active_chain: RwLock::new(Vec::new()),
         }
     }
 }
@@ -239,6 +288,9 @@ where
             dhcp_client: None,
             access_points: None,
             stations: None,
+            vpn_chain_deps: None,
+            vpn_hop_managers: RwLock::new(BTreeMap::new()),
+            vpn_active_chain: RwLock::new(Vec::new()),
         }
     }
 
@@ -250,6 +302,220 @@ where
         self.stations = Some(stations);
         self.access_points = Some(access_points);
         self
+    }
+
+    /// Wire up the VPN hop chain's runtime dependencies. Without this, any
+    /// non-empty `RouterDesired.vpn_chain` makes `plan_vpn_chain`/
+    /// `apply_vpn_chain` fail with "VPN chain runtime is unavailable",
+    /// exactly like `stations`/`access_points` do for the Wi-Fi stages.
+    pub fn with_vpn_chain(mut self, deps: VpnChainDeps) -> Self {
+        self.vpn_chain_deps = Some(deps);
+        self
+    }
+
+    fn require_vpn_chain_deps(&self) -> Result<&VpnChainDeps> {
+        self.vpn_chain_deps
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("VPN chain runtime is unavailable"))
+    }
+
+    /// The per-hop `VpnManager`, built lazily and cached by hop index. Each
+    /// hop gets its own `ActiveProfileStore` (`active-profile-<hop_index>.json`)
+    /// so multiple hops' persisted ownership records don't clobber each
+    /// other the way a single shared store would.
+    async fn vpn_manager_for_hop(&self, hop_index: u32) -> Result<Arc<ProductionVpnManager>> {
+        let deps = self.require_vpn_chain_deps()?;
+        if let Some(existing) = self.vpn_hop_managers.read().await.get(&hop_index) {
+            return Ok(existing.clone());
+        }
+        let driver = WireGuardVpnDriver::new(deps.vpn_provider.clone(), deps.wireguard_store.clone());
+        let active_profile_store = ActiveProfileStore::for_hop(&deps.state_dir, hop_index);
+        let manager = Arc::new(VpnManager::new(driver, active_profile_store));
+        self.vpn_hop_managers
+            .write()
+            .await
+            .insert(hop_index, manager.clone());
+        Ok(manager)
+    }
+
+    /// A `VpnPolicyManager` scoped to `reserved` (the exit hop's per-hop
+    /// reserved IDs) rather than the legacy single-hop default. Cheap to
+    /// build fresh per call — everything it wraps is an `Arc`/`Clone` handle.
+    fn vpn_policy_manager_for_hop(
+        &self,
+        reserved: VpnPolicyReservedIds,
+        tunnel: Arc<ProductionVpnManager>,
+    ) -> Result<VpnPolicyManager<WireGuardVpnDriver, Arc<dyn NftExecutor>>> {
+        let deps = self.require_vpn_chain_deps()?;
+        let firewall = VpnPolicyFirewallBackend::new(deps.nft_executor.clone());
+        Ok(VpnPolicyManager::new_with_reserved(
+            deps.network.clone(),
+            firewall,
+            tunnel,
+            reserved,
+        ))
+    }
+
+    /// Route-only setup for a relay hop: send its own outbound tunnel
+    /// traffic (selected by `hop.reserved`'s fwmark) through the previous
+    /// hop's interface via a dedicated route table.
+    ///
+    /// LIMITATION: this installs the routing-table half only (fwmark ->
+    /// table -> upstream interface). `VpnDriver` has no `wg set <if> fwmark
+    /// <mark>` primitive today, so nothing yet tags a relay hop's own
+    /// outbound WireGuard UDP with `hop.reserved.fw_mark` — the rule/route
+    /// pair installed here is real but currently inert until the driver
+    /// trait grows that capability (or an equivalent netlink call is added
+    /// directly here). Left in place rather than skipped so the reserved
+    /// route table/rule bookkeeping (and its rollback) is exercised end to
+    /// end; flagged explicitly rather than silently claimed as complete.
+    async fn install_relay_route(
+        &self,
+        hop: &VpnHopDesired,
+        own_route: &VpnHopRoutingDesired,
+    ) -> Result<()> {
+        let deps = self.require_vpn_chain_deps()?;
+        let upstream_index = deps
+            .network
+            .list_interfaces()
+            .await
+            .context("failed to list interfaces while installing relay hop route")?
+            .into_iter()
+            .find(|interface| interface.name == own_route.upstream_interface)
+            .map(|interface| interface.index)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "relay hop {} upstream interface {} not found",
+                    hop.hop_index,
+                    own_route.upstream_interface
+                )
+            })?;
+
+        let rule = Ipv4RuleSpec {
+            source: None,
+            destination: None,
+            table: hop.reserved.route_table.get(),
+            priority: Some(hop.reserved.rule_priority_start.get()),
+            fw_mark: Some(hop.reserved.fw_mark.get()),
+            fw_mask: Some(hop.reserved.fw_mask.get()),
+            input_interface: None,
+            output_interface: None,
+        };
+        let route = Ipv4RouteSpec {
+            destination: Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0)
+                .expect("0.0.0.0/0 is always a valid network"),
+            gateway: None,
+            output_interface_index: Some(upstream_index),
+            table: hop.reserved.route_table.get(),
+            metric: Some(50),
+            protocol: TRAFFIC_MASQ_ROUTE_PROTOCOL,
+        };
+
+        deps.network
+            .add_ipv4_rule(&rule)
+            .await
+            .context("failed to install relay hop IPv4 rule")?;
+        if let Err(error) = deps.network.add_ipv4_route(&route).await {
+            let _ = deps
+                .network
+                .delete_ipv4_rule(&crate::netlink::Ipv4RuleInfo {
+                    source: rule.source,
+                    destination: rule.destination,
+                    table: rule.table,
+                    priority: rule.priority,
+                    fw_mark: rule.fw_mark,
+                    fw_mask: rule.fw_mask,
+                    input_interface: rule.input_interface.clone(),
+                    output_interface: rule.output_interface.clone(),
+                })
+                .await;
+            return Err(error).context("failed to install relay hop IPv4 route");
+        }
+        Ok(())
+    }
+
+    async fn remove_relay_route(&self, hop: &VpnHopDesired, own_route: &VpnHopRoutingDesired) {
+        let Ok(deps) = self.require_vpn_chain_deps() else {
+            return;
+        };
+        let _ = own_route;
+        let rule = Ipv4RuleSpec {
+            source: None,
+            destination: None,
+            table: hop.reserved.route_table.get(),
+            priority: Some(hop.reserved.rule_priority_start.get()),
+            fw_mark: Some(hop.reserved.fw_mark.get()),
+            fw_mask: Some(hop.reserved.fw_mask.get()),
+            input_interface: None,
+            output_interface: None,
+        };
+        for rule_info in deps.network.list_ipv4_rules().await.unwrap_or_default() {
+            if rule_info.table == rule.table
+                && rule_info.priority == rule.priority
+                && rule_info.fw_mark == rule.fw_mark
+            {
+                let _ = deps.network.delete_ipv4_rule(&rule_info).await;
+            }
+        }
+        for route_info in deps.network.list_ipv4_routes().await.unwrap_or_default() {
+            if route_info.table == hop.reserved.route_table.get() {
+                let _ = deps.network.delete_ipv4_route(&route_info).await;
+            }
+        }
+    }
+
+    /// Activate a single hop: bring up its WireGuard interface, then apply
+    /// the kind-specific routing/policy on top. Rolls back the interface
+    /// activation itself if the routing/policy step fails, so a failed hop
+    /// never leaves a half-activated tunnel behind.
+    async fn activate_hop(&self, hop: &VpnHopDesired) -> Result<()> {
+        let tunnel = self.vpn_manager_for_hop(hop.hop_index).await?;
+        tunnel
+            .activate_on(&hop.interface, &hop.profile_name)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("failed to activate VPN hop {}: {error}", hop.hop_index)
+            })?;
+
+        let routing_result = match &hop.kind {
+            VpnHopKind::Relay { own_route } => self.install_relay_route(hop, own_route).await,
+            VpnHopKind::Exit { policy } => {
+                match self.vpn_policy_manager_for_hop(hop.reserved, tunnel.clone()) {
+                    Ok(policy_manager) => policy_manager.activate(policy).await.map(|_| ()),
+                    Err(error) => Err(error),
+                }
+            }
+        };
+
+        if let Err(error) = routing_result {
+            let _ = tunnel.deactivate_on(&hop.interface).await;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Tear down a single hop: routing/policy first, then the interface
+    /// itself. Best-effort — used both for normal chain-shrink teardown and
+    /// for rolling back a partially-applied chain, where every failure is
+    /// already being reported by the caller.
+    async fn deactivate_hop(&self, hop: &VpnHopDesired) {
+        match &hop.kind {
+            VpnHopKind::Relay { own_route } => {
+                self.remove_relay_route(hop, own_route).await;
+            }
+            VpnHopKind::Exit { policy } => {
+                if let Ok(tunnel) = self.vpn_manager_for_hop(hop.hop_index).await {
+                    if let Ok(policy_manager) =
+                        self.vpn_policy_manager_for_hop(hop.reserved, tunnel)
+                    {
+                        let _ = policy_manager.deactivate(policy).await;
+                    }
+                }
+            }
+        }
+        if let Ok(tunnel) = self.vpn_manager_for_hop(hop.hop_index).await {
+            let _ = tunnel.deactivate_on(&hop.interface).await;
+        }
     }
 }
 
@@ -544,6 +810,7 @@ where
             routes: self.routes.snapshot().await?,
             dhcp,
             dhcp_absent_interfaces,
+            vpn_chain: self.snapshot_vpn_chain().await?,
             dataplane: self.dataplane.snapshot().await?,
         })
     }
@@ -928,6 +1195,142 @@ where
             )
         }
     }
+
+    async fn plan_vpn_chain(&self, desired: &RouterDesired) -> Result<VpnChainPlan> {
+        if !desired.vpn_chain.is_empty() && self.vpn_chain_deps.is_none() {
+            bail!("VPN chain runtime is unavailable");
+        }
+        Ok(VpnChainPlan {
+            hops: desired.vpn_chain.clone(),
+        })
+    }
+
+    async fn snapshot_vpn_chain(&self) -> Result<VpnChainSnapshot> {
+        let previous = self.vpn_active_chain.read().await.clone();
+        Ok(VpnChainSnapshot {
+            hops: previous.iter().map(|hop| hop.interface.clone()).collect(),
+            previous_hops: previous,
+        })
+    }
+
+    /// Activates hops 0..N in order. On any hop's failure, rolls back the
+    /// hops this call just activated (N..0) — and best-effort restores
+    /// whatever of the previous chain was torn down to make room for the
+    /// new one — entirely inside this method, so `RouterManager::apply`
+    /// never observes mid-chain partial state; it only ever needs to call
+    /// `rollback_vpn_chain` once, against the pre-apply snapshot.
+    async fn apply_vpn_chain(&self, plan: &VpnChainPlan) -> Result<()> {
+        if plan.hops.is_empty() {
+            // Nothing desired: tear down whatever chain is currently active
+            // (if any) and stop, regardless of whether chain deps are wired
+            // up — an empty desired chain must never require a runtime.
+            let previous = self.vpn_active_chain.read().await.clone();
+            for hop in previous.iter().rev() {
+                self.deactivate_hop(hop).await;
+            }
+            *self.vpn_active_chain.write().await = Vec::new();
+            return Ok(());
+        }
+        if self.vpn_chain_deps.is_none() {
+            bail!("VPN chain runtime is unavailable");
+        }
+
+        let previous = self.vpn_active_chain.read().await.clone();
+        let desired_interfaces: std::collections::BTreeSet<&str> =
+            plan.hops.iter().map(|hop| hop.interface.as_str()).collect();
+
+        // Tear down whatever previously-active hop the new plan no longer
+        // wants before activating the new chain, so stale hops never linger
+        // alongside the replacement chain.
+        let mut torn_down: Vec<&VpnHopDesired> = Vec::new();
+        for hop in previous.iter().rev() {
+            if !desired_interfaces.contains(hop.interface.as_str()) {
+                self.deactivate_hop(hop).await;
+                torn_down.push(hop);
+            }
+        }
+
+        let mut applied: Vec<&VpnHopDesired> = Vec::new();
+        for hop in &plan.hops {
+            if let Err(error) = self.activate_hop(hop).await {
+                for done in applied.into_iter().rev() {
+                    self.deactivate_hop(done).await;
+                }
+                // Best-effort: restore whatever of the previous chain was
+                // torn down above, so a failed re-apply doesn't also strand
+                // the router with no VPN chain when one was previously
+                // healthy. Failures here are not fatal to this method's
+                // own error, which already reports the real cause.
+                for hop in torn_down.iter().rev() {
+                    let _ = self.activate_hop(hop).await;
+                }
+                return Err(error);
+            }
+            applied.push(hop);
+        }
+
+        *self.vpn_active_chain.write().await = plan.hops.clone();
+        Ok(())
+    }
+
+    async fn rollback_vpn_chain(&self, snapshot: &VpnChainSnapshot) -> Result<()> {
+        let current = self.vpn_active_chain.read().await.clone();
+        for hop in current.iter().rev() {
+            self.deactivate_hop(hop).await;
+        }
+
+        let mut errors = Vec::new();
+        for hop in &snapshot.previous_hops {
+            if let Err(error) = self.activate_hop(hop).await {
+                errors.push(format!("hop {}: {error:#}", hop.hop_index));
+            }
+        }
+
+        *self.vpn_active_chain.write().await = if errors.is_empty() {
+            snapshot.previous_hops.clone()
+        } else {
+            Vec::new()
+        };
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            bail!("VPN chain rollback was incomplete: {}", errors.join("; "))
+        }
+    }
+
+    async fn health_vpn_chain(&self, desired: &RouterDesired) -> Result<()> {
+        if desired.vpn_chain.is_empty() {
+            return Ok(());
+        }
+        let active = self.vpn_active_chain.read().await.clone();
+        if active.len() != desired.vpn_chain.len() {
+            bail!(
+                "VPN chain intent does not match: expected {} hops, {} active",
+                desired.vpn_chain.len(),
+                active.len()
+            );
+        }
+        for (expected, current) in desired.vpn_chain.iter().zip(active.iter()) {
+            if expected != current {
+                bail!(
+                    "VPN chain intent does not match on hop {}",
+                    expected.hop_index
+                );
+            }
+            let tunnel = self.vpn_manager_for_hop(expected.hop_index).await?;
+            match tunnel.status_on(&expected.interface).await {
+                Ok(Some(status)) if status.up => {}
+                Ok(Some(_)) => bail!("VPN hop {} is not up", expected.hop_index),
+                Ok(None) => bail!("VPN hop {} is missing", expected.hop_index),
+                Err(error) => bail!(
+                    "VPN hop {} status check failed: {error}",
+                    expected.hop_index
+                ),
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1128,6 +1531,7 @@ mod tests {
         let ipv4: ipnet::Ipv4Net = address.parse().expect("IPv4 network");
         let octet = ipv4.addr().octets()[2];
         InterfaceConfig {
+            nat: true,
             role: InterfaceRole::Output,
             managed: true,
             ipv4: Some(ipv4),
@@ -1149,6 +1553,7 @@ mod tests {
         config.network.interfaces.insert(
             "wan0".to_string(),
             InterfaceConfig {
+                nat: true,
                 role: InterfaceRole::Input,
                 managed: false,
                 ipv4: None,
@@ -1163,6 +1568,7 @@ mod tests {
             output_interface("192.168.10.1/24", 100, 150),
         );
         config.router = RouterConfig {
+            vpn_chain: Vec::new(),
             enabled: true,
             uplink: Some(UplinkConfig {
                 interface: "wan0".to_string(),
@@ -1176,6 +1582,7 @@ mod tests {
 
     fn dhcp_less_output_interface(address: &str) -> InterfaceConfig {
         InterfaceConfig {
+            nat: true,
             role: InterfaceRole::Output,
             managed: true,
             ipv4: Some(address.parse().expect("IPv4 network")),
@@ -1489,5 +1896,362 @@ mod tests {
             .expect_err("unknown interface must fail rollback");
         assert!(error.to_string().contains("missing0"));
         assert!(error.to_string().contains("incomplete"));
+    }
+
+    // --- VPN hop chain: `apply_vpn_chain`/`rollback_vpn_chain` -------------
+    //
+    // These use only `Relay` hops (route-only, no nftables mark/killswitch)
+    // rather than mixing in a real `Exit` hop, to avoid needing to also mock
+    // the nft nftables nftables round-trip (`FakeNftExecutor`'s exact
+    // request/response sequencing) for what is fundamentally a test about
+    // hop-activation *ordering*, not about the exit hop's firewall
+    // mechanics (which `vpn_policy_manager.rs`'s own tests already cover in
+    // detail).
+
+    use crate::core::vpn_chain::{VpnHopDesired, VpnHopKind, VpnHopRoutingDesired};
+    use crate::core::vpn_policy::VpnPolicyReservedIds;
+    use crate::firewall::vpn::test_support::FakeNftExecutor;
+    use crate::netlink::{Ipv4RuleInfo, Ipv4RuleSpec as NetIpv4RuleSpec};
+    use crate::vpn::{ProviderError, VpnProvider};
+    use crate::vpn::store::WireGuardProfileStore;
+    use crate::vpn::wireguard::{WireGuardKey, WireGuardPeerConfig};
+    use std::sync::Mutex as StdMutex;
+
+    const VALID_PRIVATE_KEY: &str = "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=";
+    const VALID_PUBLIC_KEY: &str = "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=";
+
+    fn valid_wg_config() -> String {
+        format!(
+            "[Interface]\n\
+             PrivateKey = {VALID_PRIVATE_KEY}\n\
+             Address = 10.0.0.2/24\n\
+             \n\
+             [Peer]\n\
+             PublicKey = {VALID_PUBLIC_KEY}\n\
+             AllowedIPs = 0.0.0.0/0\n\
+             Endpoint = 203.0.113.1:51820\n"
+        )
+    }
+
+    #[derive(Default)]
+    struct FakeChainVpnProvider {
+        links: StdMutex<HashMap<String, bool>>,
+        fail_create: StdMutex<Option<String>>,
+    }
+
+    impl FakeChainVpnProvider {
+        fn fail_create_link_for(&self, name: &str) {
+            *self.fail_create.lock().unwrap() = Some(name.to_string());
+        }
+    }
+
+    #[async_trait]
+    impl VpnProvider for FakeChainVpnProvider {
+        async fn link_exists(&self, name: &str) -> Result<bool, ProviderError> {
+            Ok(self.links.lock().unwrap().contains_key(name))
+        }
+
+        async fn create_link(
+            &self,
+            name: &str,
+            _private_key: &WireGuardKey,
+            _listen_port: Option<u16>,
+        ) -> Result<(), ProviderError> {
+            if self.fail_create.lock().unwrap().as_deref() == Some(name) {
+                return Err(ProviderError::CommandFailed {
+                    command: "create_link",
+                    status: "1".to_string(),
+                    stderr: format!("injected create_link failure for {name}"),
+                });
+            }
+            self.links.lock().unwrap().insert(name.to_string(), false);
+            Ok(())
+        }
+
+        async fn set_addresses(&self, name: &str, _addresses: &[ipnet::IpNet]) -> Result<(), ProviderError> {
+            self.require(name)
+        }
+
+        async fn set_peers(
+            &self,
+            name: &str,
+            _peers: &[WireGuardPeerConfig],
+        ) -> Result<(), ProviderError> {
+            self.require(name)
+        }
+
+        async fn set_link_up(&self, name: &str) -> Result<(), ProviderError> {
+            let mut links = self.links.lock().unwrap();
+            let up = links
+                .get_mut(name)
+                .ok_or_else(|| ProviderError::NotFound(name.to_string()))?;
+            *up = true;
+            Ok(())
+        }
+
+        async fn set_link_down(&self, name: &str) -> Result<(), ProviderError> {
+            let mut links = self.links.lock().unwrap();
+            let up = links
+                .get_mut(name)
+                .ok_or_else(|| ProviderError::NotFound(name.to_string()))?;
+            *up = false;
+            Ok(())
+        }
+
+        async fn delete_link(&self, name: &str) -> Result<(), ProviderError> {
+            self.links
+                .lock()
+                .unwrap()
+                .remove(name)
+                .map(|_| ())
+                .ok_or_else(|| ProviderError::NotFound(name.to_string()))
+        }
+
+        async fn public_key(&self, name: &str) -> Result<Option<WireGuardKey>, ProviderError> {
+            Ok(self
+                .links
+                .lock()
+                .unwrap()
+                .get(name)
+                .map(|_| WireGuardKey::parse(VALID_PUBLIC_KEY, "test").unwrap()))
+        }
+
+        async fn is_up(&self, name: &str) -> Result<bool, ProviderError> {
+            Ok(*self.links.lock().unwrap().get(name).unwrap_or(&false))
+        }
+    }
+
+    impl FakeChainVpnProvider {
+        fn require(&self, name: &str) -> Result<(), ProviderError> {
+            if self.links.lock().unwrap().contains_key(name) {
+                Ok(())
+            } else {
+                Err(ProviderError::NotFound(name.to_string()))
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeChainNetworkProvider {
+        interfaces: Mutex<HashMap<String, NetworkInterface>>,
+        rules: Mutex<Vec<Ipv4RuleInfo>>,
+        routes: Mutex<Vec<Ipv4RouteInfo>>,
+    }
+
+    impl FakeChainNetworkProvider {
+        async fn add_interface(&self, name: &str, index: u32) {
+            self.interfaces.lock().await.insert(
+                name.to_string(),
+                NetworkInterface {
+                    is_wireless: false,
+                    index,
+                    name: name.to_string(),
+                    is_up: true,
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                },
+            );
+        }
+    }
+
+    #[async_trait]
+    impl NetworkProvider for FakeChainNetworkProvider {
+        async fn list_interfaces(&self) -> Result<Vec<NetworkInterface>> {
+            Ok(self.interfaces.lock().await.values().cloned().collect())
+        }
+
+        async fn list_ipv4_addresses(&self, _interface: &str) -> Result<Vec<Ipv4AddressInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn set_link_up(&self, _name: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn set_link_down(&self, _name: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn add_ipv4_address(
+            &self,
+            _interface: &str,
+            _address: Ipv4Addr,
+            _prefix_len: u8,
+            _ownership: AddressOwnership,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete_ipv4_address(
+            &self,
+            _interface: &str,
+            _address: Ipv4Addr,
+            _prefix_len: u8,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn list_ipv4_routes(&self) -> Result<Vec<Ipv4RouteInfo>> {
+            Ok(self.routes.lock().await.clone())
+        }
+
+        async fn add_ipv4_route(&self, route: &Ipv4RouteSpec) -> Result<()> {
+            self.routes.lock().await.push(Ipv4RouteInfo {
+                destination: route.destination,
+                gateway: route.gateway,
+                output_interface_index: route.output_interface_index,
+                table: route.table,
+                metric: route.metric,
+                protocol: route.protocol,
+                scope: 253,
+            });
+            Ok(())
+        }
+
+        async fn delete_ipv4_route(&self, route: &Ipv4RouteInfo) -> Result<()> {
+            self.routes.lock().await.retain(|current| current != route);
+            Ok(())
+        }
+
+        async fn list_ipv4_rules(&self) -> Result<Vec<Ipv4RuleInfo>> {
+            Ok(self.rules.lock().await.clone())
+        }
+
+        async fn add_ipv4_rule(&self, rule: &NetIpv4RuleSpec) -> Result<()> {
+            self.rules.lock().await.push(Ipv4RuleInfo {
+                source: rule.source,
+                destination: rule.destination,
+                table: rule.table,
+                priority: rule.priority,
+                fw_mark: rule.fw_mark,
+                fw_mask: rule.fw_mask,
+                input_interface: rule.input_interface.clone(),
+                output_interface: rule.output_interface.clone(),
+            });
+            Ok(())
+        }
+
+        async fn delete_ipv4_rule(&self, rule: &Ipv4RuleInfo) -> Result<()> {
+            self.rules.lock().await.retain(|current| current != rule);
+            Ok(())
+        }
+    }
+
+    fn relay_hop(hop_index: u32, interface: &str, upstream: &str) -> VpnHopDesired {
+        VpnHopDesired {
+            hop_index,
+            profile_name: "chain.conf".to_string(),
+            interface: interface.to_string(),
+            upstream: upstream.to_string(),
+            reserved: VpnPolicyReservedIds::for_hop(hop_index).expect("reserved ids"),
+            kind: VpnHopKind::Relay {
+                own_route: VpnHopRoutingDesired {
+                    hop_interface: interface.to_string(),
+                    upstream_interface: upstream.to_string(),
+                },
+            },
+        }
+    }
+
+    async fn chain_subsystems() -> (
+        ProductionRouterSubsystems<FakeDataplaneProvider>,
+        Arc<FakeChainVpnProvider>,
+        Arc<FakeChainNetworkProvider>,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let net_provider = Arc::new(FakeChainNetworkProvider::default());
+        net_provider.add_interface("wan0", 1).await;
+
+        let interfaces = InterfaceManager::new(
+            Arc::new(FakeNetworkProvider::default()),
+            AddressOwnershipJournal::in_memory(),
+        );
+        let routes = RouteManager::new(Arc::new(FakeNetworkProvider::default()));
+        let dhcp = DhcpSupervisor::start(&AppConfig::default())
+            .await
+            .expect("dhcp supervisor without any configured interfaces never binds a socket");
+        let dataplane = RouterDataplaneManager::new(FakeDataplaneProvider::default());
+
+        let vpn_provider = Arc::new(FakeChainVpnProvider::default());
+        let wireguard_store = WireGuardProfileStore::new(dir.path().join("wireguard"));
+        wireguard_store
+            .import(&crate::vpn::wireguard::WireGuardDriver, "chain.conf", valid_wg_config().as_bytes())
+            .expect("import chain profile");
+
+        let vpn_provider_erased: Arc<dyn VpnProvider> = vpn_provider.clone();
+        let subsystems = ProductionRouterSubsystems::new(
+            interfaces,
+            routes,
+            dhcp,
+            dataplane,
+            Vec::new(),
+        )
+        .with_vpn_chain(VpnChainDeps {
+            vpn_provider: vpn_provider_erased,
+            wireguard_store,
+            state_dir: dir.path().to_path_buf(),
+            network: net_provider.clone(),
+            nft_executor: Arc::new(FakeNftExecutor::default()),
+        });
+        std::mem::forget(dir);
+        (subsystems, vpn_provider, net_provider)
+    }
+
+    #[tokio::test]
+    async fn apply_vpn_chain_activates_hops_in_order() {
+        let (subsystems, vpn_provider, net) = chain_subsystems().await;
+        net.add_interface("tm-wg-0", 2).await;
+        net.add_interface("tm-wg-1", 3).await;
+        let plan = VpnChainPlan {
+            hops: vec![
+                relay_hop(0, "tm-wg-0", "wan0"),
+                relay_hop(1, "tm-wg-1", "tm-wg-0"),
+                relay_hop(2, "tm-wg-2", "tm-wg-1"),
+            ],
+        };
+
+        subsystems
+            .apply_vpn_chain(&plan)
+            .await
+            .expect("3-hop chain activates");
+
+        for name in ["tm-wg-0", "tm-wg-1", "tm-wg-2"] {
+            assert!(
+                vpn_provider.link_exists(name).await.expect("link_exists"),
+                "{name} should be active after apply_vpn_chain"
+            );
+        }
+    }
+
+    /// If a mid-chain hop fails to activate, every hop this call already
+    /// activated must be rolled back — in reverse order — entirely inside
+    /// `apply_vpn_chain`, before it returns `Err`.
+    #[tokio::test]
+    async fn apply_vpn_chain_rolls_back_already_applied_hops_on_mid_chain_failure() {
+        let (subsystems, vpn_provider, net) = chain_subsystems().await;
+        net.add_interface("tm-wg-0", 2).await;
+        net.add_interface("tm-wg-1", 3).await;
+        vpn_provider.fail_create_link_for("tm-wg-2");
+
+        let plan = VpnChainPlan {
+            hops: vec![
+                relay_hop(0, "tm-wg-0", "wan0"),
+                relay_hop(1, "tm-wg-1", "tm-wg-0"),
+                relay_hop(2, "tm-wg-2", "tm-wg-1"),
+            ],
+        };
+
+        let error = subsystems
+            .apply_vpn_chain(&plan)
+            .await
+            .expect_err("hop 2's activation failure must propagate");
+        assert!(error.to_string().contains("tm-wg-2") || error.to_string().contains("hop"));
+
+        for name in ["tm-wg-0", "tm-wg-1", "tm-wg-2"] {
+            assert!(
+                !vpn_provider.link_exists(name).await.expect("link_exists"),
+                "{name} must have been rolled back after the mid-chain failure"
+            );
+        }
     }
 }

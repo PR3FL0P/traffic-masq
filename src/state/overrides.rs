@@ -203,6 +203,7 @@ mod tests {
             dhcp_client: None,
             wifi: None,
             wifi_client: None,
+            nat: true,
         }
     }
 
@@ -253,6 +254,7 @@ mod tests {
                 dhcp_client: None,
                 wifi: None,
                 wifi_client: None,
+            nat: true,
             },
         );
         base.network
@@ -277,6 +279,7 @@ mod tests {
                     dhcp_client: None,
                     wifi: None,
                     wifi_client: None,
+                nat: true,
                 },
                 allow_management_change: true,
             },

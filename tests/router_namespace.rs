@@ -328,6 +328,7 @@ fn build_config(temp: &tempfile::TempDir, lan_if: &str, uplink_if: &str) -> AppC
     config.network.interfaces.insert(
         uplink_if.to_string(),
         InterfaceConfig {
+            nat: true,
             role: InterfaceRole::Input,
             managed: false,
             ipv4: None,
@@ -340,6 +341,7 @@ fn build_config(temp: &tempfile::TempDir, lan_if: &str, uplink_if: &str) -> AppC
     config.network.interfaces.insert(
         lan_if.to_string(),
         InterfaceConfig {
+            nat: true,
             role: InterfaceRole::Output,
             managed: true,
 
@@ -362,6 +364,7 @@ fn build_config(temp: &tempfile::TempDir, lan_if: &str, uplink_if: &str) -> AppC
     );
 
     config.router = RouterConfig {
+        vpn_chain: Vec::new(),
         enabled: true,
         uplink: Some(UplinkConfig {
             interface: uplink_if.to_string(),

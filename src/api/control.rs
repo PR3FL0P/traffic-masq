@@ -916,6 +916,25 @@ impl ControlService {
         let (Some(policy), Some(_vpn)) = (&self.vpn_policy, &self.vpn) else {
             return vpn_policy_disabled();
         };
+        // Coexistence-window guard (Landing 1): `vpn_policy_set_mode` bypasses
+        // `RouterTransactionCoordinator` entirely, so it must not race a
+        // pending chain-length-1 transaction over the same hop-0
+        // interface/reserved-ID band. Refuse outright while a transaction is
+        // pending or stuck in a failed rollback rather than letting the two
+        // non-coordinated mutation paths touch the same resources at once.
+        if let Some(router) = &self.router {
+            match router.status().await {
+                crate::core::router_transaction::CoordinatorStatus::Idle => {}
+                crate::core::router_transaction::CoordinatorStatus::Pending
+                | crate::core::router_transaction::CoordinatorStatus::RollbackFailed => {
+                    return vpn_policy_error(VpnPolicyErrorDetail::Other {
+                        message: "a router transaction is pending; refusing to change VPN mode \
+                                  until it commits or rolls back"
+                            .to_string(),
+                    });
+                }
+            }
+        }
         let effective = match self.effective_config().await {
             Ok(effective) => effective,
             Err(error) => return vpn_policy_error(VpnPolicyErrorDetail::Other { message: error }),
@@ -3063,6 +3082,7 @@ fn interface_edit_request_to_config(
             dhcp_client: None,
             wifi: None,
             wifi_client: None,
+            nat: true,
         },
         edit.allow_management_change,
     ))
@@ -3338,6 +3358,7 @@ async fn build_dhcp_spec(
         dhcp_client: None,
         wifi: None,
         wifi_client: None,
+        nat: true,
     };
     DhcpServiceSpec::from_interface_config(interface, &interface_config, default_lease_seconds)?
         .ok_or_else(|| anyhow::anyhow!("DHCP is not enabled by the interface configuration"))
@@ -3362,6 +3383,7 @@ fn select_dhcp_network(
             dhcp_client: None,
             wifi: None,
             wifi_client: None,
+            nat: true,
         };
         if candidate.validate(interface).is_ok() {
             candidates.push(network);
@@ -3518,6 +3540,7 @@ mod tests {
             dhcp_client: None,
             wifi: None,
             wifi_client: None,
+            nat: true,
         };
         let edit = InterfaceEditRequest {
             cidr: "192.168.60.1/24".to_string(),
@@ -3547,6 +3570,7 @@ mod tests {
             dhcp_client: None,
             wifi: None,
             wifi_client: None,
+            nat: true,
         };
         let edit = InterfaceEditRequest {
             cidr: String::new(),
@@ -3575,6 +3599,7 @@ mod tests {
             dhcp_client: None,
             wifi: None,
             wifi_client: None,
+            nat: true,
         };
         let edit = InterfaceEditRequest {
             cidr: String::new(),
@@ -3777,6 +3802,7 @@ mod tests {
                 dhcp_client: None,
                 wifi: None,
                 wifi_client: None,
+                nat: true,
             },
         );
 
@@ -3790,6 +3816,7 @@ mod tests {
                 dhcp_client: None,
                 wifi: None,
                 wifi_client: None,
+                nat: true,
             },
         );
         config
@@ -3798,6 +3825,7 @@ mod tests {
     fn router_proposal() -> RouterProposalRequest {
         RouterProposalRequest {
             set_router: Some(RouterConfig {
+                vpn_chain: Vec::new(),
                 enabled: true,
                 uplink: Some(UplinkConfig {
                     interface: "wan0".to_string(),
@@ -3833,6 +3861,7 @@ mod tests {
             dhcp_client: None,
             wifi: None,
             wifi_client: None,
+            nat: true,
         };
         overrides
             .set_interface("lan0".to_string(), overridden, false)
@@ -4013,6 +4042,7 @@ mod tests {
     fn router_base_config_with_router_enabled() -> AppConfig {
         let mut config = router_base_config();
         config.router = RouterConfig {
+            vpn_chain: Vec::new(),
             enabled: true,
             uplink: Some(UplinkConfig {
                 interface: "wan0".to_string(),
@@ -5226,6 +5256,7 @@ mod tests {
                 dhcp_client: None,
                 wifi: Some(wifi_ap_config("net-a", WifiSecurity::Open)),
                 wifi_client: None,
+                nat: true,
             },
         );
         config
@@ -5370,6 +5401,7 @@ mod tests {
                 dhcp_client: None,
                 wifi: None,
                 wifi_client: None,
+                nat: true,
             },
         );
         let overrides = RuntimeOverrideManager::load(fixture_directory.path(), &config)
@@ -5623,6 +5655,7 @@ mod tests {
                 dhcp_client: None,
                 wifi: Some(wifi_ap_config("net-a", WifiSecurity::Wpa2)),
                 wifi_client: None,
+                nat: true,
             },
         );
         let overrides = RuntimeOverrideManager::load(directory.path(), &config)
@@ -5696,6 +5729,7 @@ mod tests {
                 dhcp_client: None,
                 wifi: Some(wifi_ap_config("net-a", WifiSecurity::Wpa2)),
                 wifi_client: None,
+                nat: true,
             },
         );
         let overrides = RuntimeOverrideManager::load(directory.path(), &config)
@@ -5919,6 +5953,7 @@ mod tests {
                     security: WifiClientSecurity::Open,
                     passphrase_file: None,
                 }),
+                nat: true,
             },
         );
         config
@@ -6172,6 +6207,7 @@ mod tests {
                 dhcp_client: None,
                 wifi: None,
                 wifi_client: None,
+                nat: true,
             },
         );
         let overrides = RuntimeOverrideManager::load(directory.path(), &config)
@@ -6346,6 +6382,7 @@ mod tests {
                     dhcp_client: None,
                     wifi: None,
                     wifi_client: None,
+                    nat: true,
                 },
             );
         }
@@ -6364,6 +6401,7 @@ mod tests {
                     security: WifiClientSecurity::Open,
                     passphrase_file: None,
                 }),
+                nat: true,
             },
         );
         let overrides = RuntimeOverrideManager::load(directory.path(), &config)
@@ -7056,6 +7094,7 @@ mod tests {
                 dhcp_client: None,
                 wifi: None,
                 wifi_client: None,
+                nat: true,
             },
         );
         let fixture = provisioning_fixture_with(

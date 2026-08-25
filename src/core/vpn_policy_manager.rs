@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use ipnet::Ipv4Net;
+use serde::{Deserialize, Serialize};
 
 use crate::config::{AppConfig, InterfaceRole};
 use crate::core::vpn_policy::{
@@ -18,7 +19,7 @@ use crate::vpn::{VpnDriver, VpnManager};
 
 const VPN_POLICY_ROUTE_METRIC: u32 = 50;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpnPolicyDesired {
     pub protected_subnets: Vec<Ipv4Net>,
     pub vpn_interface: String,
@@ -99,12 +100,27 @@ impl<D: VpnDriver, E: NftExecutor> VpnPolicyManager<D, E> {
         firewall: VpnPolicyFirewallBackend<E>,
         tunnel: Arc<VpnManager<D>>,
     ) -> Self {
+        Self::new_with_reserved(network, firewall, tunnel, VpnPolicyReservedIds::default())
+    }
+
+    /// Like [`Self::new`], but with an explicit reserved-ID allocation
+    /// instead of the legacy single-hop default. Used by the VPN hop chain
+    /// (`ProductionRouterSubsystems::apply_vpn_chain`) to run one
+    /// `VpnPolicyManager` per exit hop, each scoped to
+    /// `VpnPolicyReservedIds::for_hop(hop_index)` instead of colliding on
+    /// the same reserved band.
+    pub fn new_with_reserved(
+        network: Arc<dyn NetworkProvider>,
+        firewall: VpnPolicyFirewallBackend<E>,
+        tunnel: Arc<VpnManager<D>>,
+        reserved: VpnPolicyReservedIds,
+    ) -> Self {
         Self {
             conflicts: VpnPolicyResourceConflictDetector::new(network.clone()),
             network,
             firewall,
             tunnel,
-            reserved: VpnPolicyReservedIds::default(),
+            reserved,
         }
     }
 
@@ -459,6 +475,7 @@ mod tests {
                 dhcp_client: None,
                 wifi: None,
                 wifi_client: None,
+            nat: true,
             },
         );
         config.network.interfaces.insert(
@@ -471,6 +488,7 @@ mod tests {
                 dhcp_client: None,
                 wifi: None,
                 wifi_client: None,
+            nat: true,
             },
         );
         config.router = RouterConfig {
@@ -481,6 +499,7 @@ mod tests {
             }),
             owned_routes: Vec::new(),
             allow_default_route_change: false,
+        vpn_chain: Vec::new(),
         };
         config
     }

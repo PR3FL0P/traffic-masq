@@ -116,6 +116,7 @@ impl RouterNamespaceFixture {
             config.network.interfaces.insert(
                 management_if.clone(),
                 InterfaceConfig {
+                    nat: true,
                     role: InterfaceRole::Management,
                     managed: true,
                     ipv4: Some(MANAGEMENT_ADDR.parse().expect("management address")),
@@ -484,6 +485,7 @@ fn build_config(temp: &tempfile::TempDir, lan_if: &str, uplink_if: &str) -> AppC
     config.network.interfaces.insert(
         uplink_if.to_string(),
         InterfaceConfig {
+            nat: true,
             role: InterfaceRole::Input,
             managed: false,
             ipv4: None,
@@ -496,6 +498,7 @@ fn build_config(temp: &tempfile::TempDir, lan_if: &str, uplink_if: &str) -> AppC
     config.network.interfaces.insert(
         lan_if.to_string(),
         InterfaceConfig {
+            nat: true,
             role: InterfaceRole::Output,
             managed: true,
             ipv4: Some(
@@ -517,6 +520,7 @@ fn build_config(temp: &tempfile::TempDir, lan_if: &str, uplink_if: &str) -> AppC
     );
 
     config.router = RouterConfig {
+        vpn_chain: Vec::new(),
         enabled: true,
         uplink: Some(UplinkConfig {
             interface: uplink_if.to_string(),
@@ -820,6 +824,7 @@ async fn invalid_overlapping_output_subnet_is_rejected_before_any_mutation() -> 
         config.network.interfaces.insert(
             lan_b.clone(),
             InterfaceConfig {
+                nat: true,
                 role: InterfaceRole::Output,
                 managed: true,
                 ipv4: Some("192.0.2.64/25".parse().expect("overlapping subnet")),

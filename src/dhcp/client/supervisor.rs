@@ -82,6 +82,7 @@ impl DhcpClientSpec {
             dhcp_client: Some(self.interface_config()),
             wifi: None,
             wifi_client: None,
+        nat: true,
         };
         config.validate(&self.interface)
     }
@@ -1126,6 +1127,7 @@ mod tests {
                 dhcp_client: interface,
                 wifi: None,
                 wifi_client: None,
+            nat: true,
             },
         );
         config.network = network;
@@ -1181,6 +1183,7 @@ mod tests {
             dhcp_client: Some(DhcpClientInterfaceConfig::default()),
             wifi: None,
             wifi_client: None,
+        nat: true,
         };
         let derived = DhcpClientSpec::from_interface_config("wan0", &interface)
             .expect("valid")

@@ -100,6 +100,7 @@ impl WifiApSpec {
             dhcp_client: None,
             wifi: Some(self.access_point_config()),
             wifi_client: None,
+        nat: true,
         };
         config.validate(&self.interface)
     }
@@ -152,6 +153,7 @@ mod tests {
             dhcp_client: None,
             wifi,
             wifi_client: None,
+            nat: true,
         }
     }
 

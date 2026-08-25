@@ -177,6 +177,7 @@ async fn authenticated_http_client_controls_daemon_over_unix_socket() -> Result<
     config.network.interfaces.insert(
         "test0".to_string(),
         InterfaceConfig {
+            nat: true,
             role: InterfaceRole::Output,
             managed: true,
             ipv4: Some("192.168.99.1/24".parse()?),
@@ -321,6 +322,7 @@ async fn authenticated_http_client_controls_daemon_over_unix_socket() -> Result<
     assert!(overrides.snapshot().await.security.is_none());
 
     let interface_config = InterfaceConfig {
+        nat: true,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some("192.168.100.1/24".parse()?),
@@ -738,6 +740,7 @@ impl RouterSubsystems for FakeRouterSubsystems {
 fn router_proposal() -> RouterProposalRequest {
     RouterProposalRequest {
         set_router: Some(RouterConfig {
+            vpn_chain: Vec::new(),
             enabled: true,
             uplink: Some(UplinkConfig {
                 interface: "wan0".to_string(),
@@ -751,6 +754,7 @@ fn router_proposal() -> RouterProposalRequest {
             "lan0".to_string(),
             InterfaceOverrideRequest {
                 config: InterfaceConfig {
+                    nat: true,
                     role: InterfaceRole::Output,
                     managed: true,
                     ipv4: Some("192.168.10.1/24".parse().unwrap()),
@@ -780,6 +784,7 @@ async fn router_enabled_test_server() -> Result<(
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            nat: true,
             role: InterfaceRole::Input,
             managed: false,
             ipv4: None,
@@ -806,6 +811,7 @@ async fn router_status_test_server(
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            nat: true,
             role: InterfaceRole::Input,
             managed: false,
             ipv4: None,
@@ -818,6 +824,7 @@ async fn router_status_test_server(
     config.network.interfaces.insert(
         "lan0".to_string(),
         InterfaceConfig {
+            nat: true,
             role: InterfaceRole::Output,
             managed: true,
             ipv4: Some("192.168.10.1/24".parse().unwrap()),
@@ -828,6 +835,7 @@ async fn router_status_test_server(
         },
     );
     config.router = RouterConfig {
+        vpn_chain: Vec::new(),
         enabled: true,
         uplink: Some(UplinkConfig {
             interface: "wan0".to_string(),
@@ -1574,6 +1582,7 @@ async fn vpn_policy_status_set_mode_clear_mode_over_http() -> Result<()> {
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            nat: true,
             role: InterfaceRole::Input,
             managed: false,
             ipv4: None,
@@ -1586,6 +1595,7 @@ async fn vpn_policy_status_set_mode_clear_mode_over_http() -> Result<()> {
     config.network.interfaces.insert(
         "lan0".to_string(),
         InterfaceConfig {
+            nat: true,
             role: InterfaceRole::Output,
             managed: true,
             ipv4: Some("192.168.10.1/24".parse().unwrap()),
@@ -1596,6 +1606,7 @@ async fn vpn_policy_status_set_mode_clear_mode_over_http() -> Result<()> {
         },
     );
     config.router = RouterConfig {
+        vpn_chain: Vec::new(),
         enabled: true,
         uplink: Some(UplinkConfig {
             interface: "wan0".to_string(),

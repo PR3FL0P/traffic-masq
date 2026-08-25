@@ -332,6 +332,7 @@ mod tests {
 
     fn router_with_one_owned_route() -> RouterConfig {
         RouterConfig {
+            vpn_chain: Vec::new(),
             enabled: true,
             uplink: None,
             owned_routes: vec![OwnedIpv4RouteConfig {

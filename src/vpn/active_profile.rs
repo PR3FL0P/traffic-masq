@@ -51,6 +51,14 @@ impl ActiveProfileStore {
         Self { path: path.into() }
     }
 
+    /// A per-hop store, keyed by filename `active-profile-<hop_index>.json`
+    /// inside `dir`. No schema change is needed to generalize from a single
+    /// tunnel to a chain — only the path used to construct the store, one
+    /// per hop.
+    pub fn for_hop(dir: impl AsRef<Path>, hop_index: u32) -> Self {
+        Self::new(dir.as_ref().join(format!("active-profile-{hop_index}.json")))
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

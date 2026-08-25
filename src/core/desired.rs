@@ -255,6 +255,7 @@ mod tests {
 
     fn interface(address: &str) -> InterfaceConfig {
         InterfaceConfig {
+            nat: true,
             role: InterfaceRole::Output,
             managed: true,
             ipv4: Some(address.parse().expect("network")),
