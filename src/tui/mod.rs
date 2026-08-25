@@ -815,6 +815,22 @@ async fn load_daemon_dashboard(client: &ApiClient) -> DashboardData {
         }
     };
 
+    let mut managed = std::collections::HashMap::new();
+    for status in &interfaces {
+        let is_managed = matches!(
+            client
+                .request(&Request::GetInterfaceConfig {
+                    interface: status.interface.name.clone(),
+                })
+                .await,
+            Ok(Response::InterfaceConfig {
+                config: Some(config),
+                ..
+            }) if config.managed
+        );
+        managed.insert(status.interface.name.clone(), is_managed);
+    }
+
     let dhcp_interfaces = match client.request(&Request::DhcpStatus).await {
         Ok(Response::DhcpStatus {
             running_interfaces,
@@ -823,6 +839,7 @@ async fn load_daemon_dashboard(client: &ApiClient) -> DashboardData {
             if !unhealthy_interfaces.is_empty() {
                 return DashboardData {
                     interfaces,
+                    managed,
                     error: Some(format!(
                         "DHCP unhealthy on: {}",
                         unhealthy_interfaces.join(", ")
@@ -835,6 +852,7 @@ async fn load_daemon_dashboard(client: &ApiClient) -> DashboardData {
         Ok(Response::Error { message }) => {
             return DashboardData {
                 interfaces,
+                managed,
                 error: Some(message),
                 ..DashboardData::default()
             }
@@ -843,6 +861,7 @@ async fn load_daemon_dashboard(client: &ApiClient) -> DashboardData {
         Err(error) => {
             return DashboardData {
                 interfaces,
+                managed,
                 error: Some(error.to_string()),
                 ..DashboardData::default()
             }
@@ -854,6 +873,7 @@ async fn load_daemon_dashboard(client: &ApiClient) -> DashboardData {
         Ok(Response::Error { message }) => {
             return DashboardData {
                 interfaces,
+                managed,
                 dhcp_interfaces,
                 error: Some(message),
                 ..DashboardData::default()
@@ -863,6 +883,7 @@ async fn load_daemon_dashboard(client: &ApiClient) -> DashboardData {
         Err(error) => {
             return DashboardData {
                 interfaces,
+                managed,
                 dhcp_interfaces,
                 error: Some(error.to_string()),
                 ..DashboardData::default()
@@ -872,6 +893,7 @@ async fn load_daemon_dashboard(client: &ApiClient) -> DashboardData {
 
     DashboardData {
         interfaces,
+        managed,
         dhcp_interfaces,
         pending_network_changes,
         error: None,
@@ -927,6 +949,7 @@ async fn load_direct_dashboard(network: Option<&RtnetlinkNetworkProvider>) -> Da
 
     DashboardData {
         interfaces: statuses,
+        managed: std::collections::HashMap::new(),
         dhcp_interfaces: Vec::new(),
         pending_network_changes: Vec::new(),
         error: None,

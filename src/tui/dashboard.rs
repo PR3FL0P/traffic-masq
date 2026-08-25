@@ -196,6 +196,7 @@ pub(crate) fn format_rate(bytes_per_sec: u64) -> String {
 #[derive(Debug, Default)]
 pub(crate) struct DashboardData {
     pub(crate) interfaces: Vec<InterfaceStatus>,
+    pub(crate) managed: std::collections::HashMap<String, bool>,
     pub(crate) dhcp_interfaces: Vec<String>,
     pub(crate) pending_network_changes: Vec<PendingNetworkChange>,
     pub(crate) error: Option<String>,
