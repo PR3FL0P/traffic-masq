@@ -16,15 +16,17 @@ use crate::api::model::{
     VpnPolicyStatusView, WifiClientEditRequest, WifiClientErrorDetail,
     WifiClientProfileErrorDetail, WifiClientProfileWriteRequest, WifiEditRequest, WifiErrorDetail,
 };
-use crate::core::vpn_policy_manager::{vpn_policy_desired, vpn_policy_teardown_target};
 use crate::config::{
     ApiConfig, AppConfig, DhcpClientInterfaceConfig, DhcpInterfaceConfig, InterfaceConfig,
     InterfaceRole, SecurityConfig, TcpApiConfig, UplinkMode, VpnPolicyMode, WifiApConfig,
     WifiClientConfig,
 };
+use crate::core::desired::DesiredNetworkState;
 use crate::core::interface::{InterfaceManager, InterfaceSnapshot};
+use crate::core::override_manager::RuntimeOverrideManager;
 use crate::core::ownership::AddressOwnershipJournal;
 use crate::core::router::{RouterApplyError, RouterDesired};
+use crate::core::router_candidate::{RouterIntentProposal, StaleCandidateError};
 use crate::core::router_provisioning::{
     derive_router_provisioning, ProvisioningInterfaceObservation, ProvisioningKnownNetwork,
     ProvisioningOutput, ProvisioningUplink, RouterProvisioningContext, RouterProvisioningDesired,
@@ -36,6 +38,7 @@ use crate::core::router_transaction::{
 };
 use crate::core::transaction::NetworkTransactionManager;
 use crate::core::vpn_policy_manager::VpnPolicyManager;
+use crate::core::vpn_policy_manager::{vpn_policy_desired, vpn_policy_teardown_target};
 use crate::dhcp::client::{
     DhcpClientRunState, DhcpClientSpec, DhcpClientStatus, DhcpClientSupervisor,
 };
@@ -43,9 +46,6 @@ use crate::dhcp::store::LeaseStore;
 use crate::dhcp::supervisor::{DhcpServiceSpec, DhcpSupervisor};
 use crate::firewall::NftExecutor;
 use crate::netlink::{Ipv4AddressInfo, NetworkProvider};
-use crate::core::router_candidate::{RouterIntentProposal, StaleCandidateError};
-use crate::core::desired::DesiredNetworkState;
-use crate::core::override_manager::RuntimeOverrideManager;
 use crate::vpn::manager::OWNED_INTERFACE_NAME;
 use crate::vpn::{
     ManagerError, ProductionVpnManager, StoreError, VpnDriverError, WireGuardVpnDriver,
@@ -3033,6 +3033,19 @@ fn interface_edit_request_to_config(
     if !edit.managed && !edit.cidr.trim().is_empty() {
         anyhow::bail!("cannot change IP while the interface is unmanaged; enable Managed first");
     }
+    // An empty CIDR is the removal request: the interface keeps its role and
+    // stays managed, it just stops carrying an address. The DHCP server cannot
+    // follow it there — it serves the subnet of that very address — so name the
+    // conflict here rather than letting interface validation report a missing
+    // address the operator deliberately removed.
+    if edit.managed
+        && edit.cidr.trim().is_empty()
+        && existing.is_some_and(|config| config.dhcp.is_some())
+    {
+        anyhow::bail!(
+            "cannot remove the IPv4 address while a DHCP server is configured on this interface; disable DHCP first"
+        );
+    }
     let ipv4 = if edit.cidr.trim().is_empty() {
         None
     } else {
@@ -3522,6 +3535,60 @@ mod tests {
         );
         assert_eq!(config.dhcp, Some(existing_dhcp));
         assert!(!allow_management_change);
+    }
+
+    #[test]
+    fn an_empty_cidr_removes_the_configured_address() {
+        let existing = InterfaceConfig {
+            role: InterfaceRole::Output,
+            managed: true,
+            ipv4: Some("192.168.50.1/24".parse().expect("valid cidr")),
+            dhcp: None,
+            dhcp_client: None,
+            wifi: None,
+            wifi_client: None,
+        };
+        let edit = InterfaceEditRequest {
+            cidr: String::new(),
+            role: InterfaceRole::Output,
+            managed: true,
+            allow_management_change: false,
+        };
+
+        let (config, _) =
+            interface_edit_request_to_config(edit, Some(&existing)).expect("edit must convert");
+
+        assert_eq!(config.ipv4, None);
+        assert!(
+            config.managed,
+            "removing the address must not stop managing the interface"
+        );
+    }
+
+    #[test]
+    fn removing_the_address_under_a_dhcp_server_says_what_to_disable_first() {
+        let existing = InterfaceConfig {
+            role: InterfaceRole::Output,
+            managed: true,
+            ipv4: Some("192.168.50.1/24".parse().expect("valid cidr")),
+            dhcp: Some(dhcp_config()),
+            dhcp_client: None,
+            wifi: None,
+            wifi_client: None,
+        };
+        let edit = InterfaceEditRequest {
+            cidr: String::new(),
+            role: InterfaceRole::Output,
+            managed: true,
+            allow_management_change: false,
+        };
+
+        let error = interface_edit_request_to_config(edit, Some(&existing))
+            .expect_err("a DHCP server cannot outlive the address it serves");
+        assert_eq!(
+            error.to_string(),
+            "cannot remove the IPv4 address while a DHCP server is configured on this interface; disable DHCP first"
+        );
     }
 
     #[tokio::test]
@@ -5195,12 +5262,9 @@ mod tests {
             addresses: Vec::new(),
         });
         let process = FakeWifiProcess::new();
-        let wifi = WifiSupervisor::start_with_process(
-            &config,
-            process.clone(),
-        )
-        .await
-        .expect("wifi supervisor");
+        let wifi = WifiSupervisor::start_with_process(&config, process.clone())
+            .await
+            .expect("wifi supervisor");
         configure_wlan0(&wifi, &config).await;
         let service =
             ControlService::new(config, network, dhcp, overrides).with_wifi_supervisor(wifi);
@@ -5318,10 +5382,9 @@ mod tests {
             addresses: Vec::new(),
         });
         let process = FakeWifiProcess::new();
-        let wifi =
-            WifiSupervisor::start_with_process(&config, process)
-                .await
-                .expect("wifi supervisor");
+        let wifi = WifiSupervisor::start_with_process(&config, process)
+            .await
+            .expect("wifi supervisor");
         let service =
             ControlService::new(config, network, dhcp, overrides).with_wifi_supervisor(wifi);
         let _ = &mut fixture_directory;
@@ -5572,10 +5635,9 @@ mod tests {
             addresses: Vec::new(),
         });
         let process = FakeWifiProcess::new();
-        let wifi =
-            WifiSupervisor::start_with_process(&config, process)
-                .await
-                .expect("wifi supervisor");
+        let wifi = WifiSupervisor::start_with_process(&config, process)
+            .await
+            .expect("wifi supervisor");
 
         let passphrase_store = crate::wifi::PassphraseStore::new(directory.path().join("wifi/psk"));
         passphrase_store
@@ -5654,10 +5716,9 @@ mod tests {
                 &crate::wifi::WifiPassphrase::new("seed passphrase").unwrap(),
             )
             .unwrap();
-        let wifi =
-            WifiSupervisor::start_with_process(&config, process)
-                .await
-                .expect("wifi supervisor");
+        let wifi = WifiSupervisor::start_with_process(&config, process)
+            .await
+            .expect("wifi supervisor");
         configure_wlan0(&wifi, &config).await;
         let service =
             ControlService::new(config, network, dhcp, overrides).with_wifi_supervisor(wifi);
@@ -5880,12 +5941,10 @@ mod tests {
         let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
             addresses: Vec::new(),
         });
-        let wifi_client = ClientSupervisor::start_with_process(
-            &config,
-            FakeSupplicantProcess::new(),
-        )
-        .await
-        .expect("wifi client supervisor");
+        let wifi_client =
+            ClientSupervisor::start_with_process(&config, FakeSupplicantProcess::new())
+                .await
+                .expect("wifi client supervisor");
 
         let interface_config = config
             .network
@@ -6124,12 +6183,10 @@ mod tests {
         let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
             addresses: Vec::new(),
         });
-        let wifi_client = ClientSupervisor::start_with_process(
-            &config,
-            FakeSupplicantProcess::new(),
-        )
-        .await
-        .expect("wifi client supervisor");
+        let wifi_client =
+            ClientSupervisor::start_with_process(&config, FakeSupplicantProcess::new())
+                .await
+                .expect("wifi client supervisor");
         let service = ControlService::new(config, network, dhcp, overrides)
             .with_wifi_client_supervisor(wifi_client);
 

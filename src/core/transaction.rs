@@ -9,11 +9,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::config::{InterfaceConfig, InterfaceRole};
+use crate::core::desired::DesiredNetworkState;
 use crate::core::interface::{
     DhcpChangeAction, InterfaceChangePlan, InterfaceManager, InterfaceSnapshot,
 };
 use crate::dhcp::supervisor::{DhcpServiceSpec, DhcpSupervisor};
-use crate::core::desired::DesiredNetworkState;
 
 /// How long an apply waits for convergence to reach what it proposed.
 ///
@@ -83,7 +83,14 @@ impl NetworkTransactionManager {
         baselines: Vec<InterfaceSnapshot>,
         desired: DesiredNetworkState,
     ) -> Self {
-        Self::build(interface_manager, rollback_timeout, baselines, None, 1, desired)
+        Self::build(
+            interface_manager,
+            rollback_timeout,
+            baselines,
+            None,
+            1,
+            desired,
+        )
     }
 
     pub fn new_with_services(
@@ -415,7 +422,10 @@ impl NetworkTransactionManager {
         let desired = self.desired();
         desired.withdraw(token).await;
         self.inner.pending.lock().await.remove(token);
-        if let Err(error) = self.await_convergence(&desired, &pending.info.interface).await {
+        if let Err(error) = self
+            .await_convergence(&desired, &pending.info.interface)
+            .await
+        {
             // The change is gone from the desired state either way, so this is
             // not a failed rollback — it is convergence not having caught up,
             // and it will, on its own.
@@ -541,9 +551,9 @@ mod tests {
     use tokio::sync::Mutex;
 
     use crate::config::{AppConfig, InterfaceConfig, InterfaceRole};
+    use crate::core::override_manager::RuntimeOverrideManager;
     use crate::core::ownership::AddressOwnershipJournal;
     use crate::netlink::{Ipv4AddressInfo, NetworkInterface, NetworkProvider};
-    use crate::core::override_manager::RuntimeOverrideManager;
 
     use super::*;
 
@@ -804,7 +814,13 @@ mod tests {
         );
         assert!(desired.is_tentative("test0").await);
         assert_eq!(
-            desired.effective().await.expect("effective").network.interfaces["test0"].ipv4,
+            desired
+                .effective()
+                .await
+                .expect("effective")
+                .network
+                .interfaces["test0"]
+                .ipv4,
             Some(PROPOSED.parse().expect("network"))
         );
     }

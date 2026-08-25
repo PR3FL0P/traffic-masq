@@ -1196,8 +1196,16 @@ mod tests {
             "the example must not join a network"
         );
 
+        // The warning is a wrapped comment. Match the sentence as it reads,
+        // not as it happens to be broken across lines: rewrapping the example
+        // must not look like deleting the warning.
+        let unwrapped = raw
+            .lines()
+            .map(|line| line.trim_start_matches('#').trim())
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(
-            raw.contains("does NOT give this interface an IP address"),
+            unwrapped.contains("does NOT give this interface an IP address"),
             "the external-address-acquisition warning must stay in the example"
         );
     }

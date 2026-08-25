@@ -179,7 +179,10 @@ mod tests {
 
         let path = store.directory().join("eth0.json");
         assert_eq!(fs::metadata(&path).expect("metadata").mode() & 0o777, 0o600);
-        assert_eq!(store.read("eth0").expect("read").as_deref(), Some(&b"{\"a\":2}"[..]));
+        assert_eq!(
+            store.read("eth0").expect("read").as_deref(),
+            Some(&b"{\"a\":2}"[..])
+        );
         assert!(fs::read_dir(store.directory())
             .expect("read_dir")
             .all(|entry| !entry

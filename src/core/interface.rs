@@ -937,6 +937,91 @@ mod tests {
         }
     }
 
+    /// Removing the address is a configuration in its own right: a managed
+    /// interface with no configured IPv4 is one that must end up carrying none,
+    /// whether the address was ours or was already on the link when we arrived.
+    #[tokio::test]
+    async fn a_managed_interface_without_a_configured_address_has_its_addresses_removed() {
+        let provider = Arc::new(FakeNetworkProvider::default());
+        let ours = address_with_protocol("192.168.50.1/24", Some(TRAFFIC_MASQ_ADDRESS_PROTOCOL));
+        let pre_existing = address_with_protocol("192.168.1.20/24", None);
+        provider
+            .add_interface("eth0", true, vec![ours.clone(), pre_existing.clone()])
+            .await;
+        let manager = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
+        let previous = config(InterfaceRole::Output, "192.168.50.1/24");
+        let mut target = previous.clone();
+        target.ipv4 = None;
+
+        let plan = manager
+            .plan_interface_transition(
+                "eth0",
+                &target,
+                Some(&previous),
+                Some(InterfaceRole::Output),
+                false,
+            )
+            .await
+            .expect("removal plan");
+
+        assert_eq!(plan.delete_ipv4, vec![ours, pre_existing]);
+        assert!(plan.add_ipv4.is_none());
+        assert!(plan.retag_ipv4.is_none());
+        assert!(
+            !plan.releasing_management,
+            "the interface stays managed; only the address goes"
+        );
+
+        manager.apply_plan(&plan).await.expect("apply the removal");
+        assert!(provider
+            .list_ipv4_addresses("eth0")
+            .await
+            .expect("addresses")
+            .is_empty());
+    }
+
+    /// The removal has to be reached by convergence too, not only by the
+    /// operator's apply: an address that comes back — a rollback, a reboot, a
+    /// second daemon — is removed again on the next pass.
+    #[tokio::test]
+    async fn convergence_keeps_removing_an_address_that_is_no_longer_configured() {
+        let provider = Arc::new(FakeNetworkProvider::default());
+        provider
+            .add_interface(
+                "eth0",
+                true,
+                vec![address_with_protocol("192.168.50.1/24", None)],
+            )
+            .await;
+        let manager = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
+        let mut target = config(InterfaceRole::Output, "192.168.50.1/24");
+        target.ipv4 = None;
+
+        manager
+            .apply_interface("eth0", &target, Some(InterfaceRole::Output), false)
+            .await
+            .expect("first pass removes the address");
+        provider
+            .add_ipv4_address(
+                "eth0",
+                Ipv4Addr::new(192, 168, 50, 1),
+                24,
+                AddressOwnership::Untagged,
+            )
+            .await
+            .expect("the address reappears");
+        manager
+            .apply_interface("eth0", &target, Some(InterfaceRole::Output), false)
+            .await
+            .expect("second pass removes it again");
+
+        assert!(provider
+            .list_ipv4_addresses("eth0")
+            .await
+            .expect("addresses")
+            .is_empty());
+    }
+
     #[tokio::test]
     async fn releasing_management_deletes_only_tagged_addresses() {
         let provider = Arc::new(FakeNetworkProvider::default());
@@ -1059,8 +1144,7 @@ mod tests {
     async fn an_interface_can_be_released_on_a_kernel_without_ownership_tags() {
         let provider = Arc::new(UntaggedNetworkProvider::default());
         provider.0.add_interface("eth0", true, Vec::new()).await;
-        let manager =
-            InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
+        let manager = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
         let managed = config(InterfaceRole::Output, "192.168.50.1/24");
 
         manager

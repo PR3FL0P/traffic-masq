@@ -237,7 +237,10 @@ mod tests {
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .filter(|name| name.ends_with(".tmp") || name.contains(".tmp-"))
             .collect();
-        assert!(leftovers.is_empty(), "left temporaries behind: {leftovers:?}");
+        assert!(
+            leftovers.is_empty(),
+            "left temporaries behind: {leftovers:?}"
+        );
     }
 
     #[test]
@@ -279,7 +282,10 @@ mod tests {
 
         ensure_private_dir(&target, PRIVATE_DIR_MODE).expect("create");
 
-        let mode = fs::metadata(&target).expect("metadata").permissions().mode();
+        let mode = fs::metadata(&target)
+            .expect("metadata")
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, PRIVATE_DIR_MODE);
     }
 
@@ -292,7 +298,10 @@ mod tests {
 
         ensure_private_dir(&target, PRIVATE_DIR_MODE).expect("tighten");
 
-        let mode = fs::metadata(&target).expect("metadata").permissions().mode();
+        let mode = fs::metadata(&target)
+            .expect("metadata")
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, PRIVATE_DIR_MODE);
     }
 

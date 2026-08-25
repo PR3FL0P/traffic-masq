@@ -1196,11 +1196,12 @@ mod tests {
         provider.add_interface("wan0", 1, true).await;
         provider.add_interface("lan0", 2, false).await;
 
-        let interfaces = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
+        let interfaces =
+            InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
         let routes = RouteManager::new(provider.clone());
         let dhcp = DhcpSupervisor::start(&AppConfig::default())
-        .await
-        .expect("dhcp supervisor without any configured interfaces never binds a socket");
+            .await
+            .expect("dhcp supervisor without any configured interfaces never binds a socket");
         let dataplane = RouterDataplaneManager::new(FakeDataplaneProvider::default());
         let subsystems = ProductionRouterSubsystems::new(
             interfaces,

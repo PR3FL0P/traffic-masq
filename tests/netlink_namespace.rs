@@ -265,11 +265,11 @@ async fn an_unconfirmed_change_converges_and_expires_on_a_live_kernel() -> Resul
     use std::time::Duration;
 
     use traffic_masq::config::{AppConfig, InterfaceConfig, InterfaceRole};
+    use traffic_masq::core::desired::DesiredNetworkState;
     use traffic_masq::core::interface::InterfaceManager;
+    use traffic_masq::core::override_manager::RuntimeOverrideManager;
     use traffic_masq::core::ownership::AddressOwnershipJournal;
     use traffic_masq::core::transaction::NetworkTransactionManager;
-    use traffic_masq::core::desired::DesiredNetworkState;
-    use traffic_masq::core::override_manager::RuntimeOverrideManager;
 
     let fixture = NetnsFixture::new()?;
     let state_dir = tempfile::tempdir()?;
@@ -414,7 +414,12 @@ async fn the_journal_and_the_kernel_tag_agree_about_who_owns_an_address() -> Res
         wifi_client: None,
     };
     interfaces
-        .apply_interface(&fixture.host_if, &config, Some(InterfaceRole::Output), false)
+        .apply_interface(
+            &fixture.host_if,
+            &config,
+            Some(InterfaceRole::Output),
+            false,
+        )
         .await?;
 
     let observed = provider

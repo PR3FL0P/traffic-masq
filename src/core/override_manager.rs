@@ -709,10 +709,7 @@ mod tests {
         let manager = RuntimeOverrideManager::load(directory.path(), &base)
             .await
             .unwrap();
-        manager
-            .set_api_config(api_override(9443))
-            .await
-            .unwrap();
+        manager.set_api_config(api_override(9443)).await.unwrap();
         let before_state = manager.snapshot().await;
         let before_file = tokio::fs::read(manager.path()).await.unwrap();
 
@@ -758,20 +755,14 @@ mod tests {
             .await
             .unwrap();
 
-        manager
-            .set_api_config(api_override(9443))
-            .await
-            .unwrap();
+        manager.set_api_config(api_override(9443)).await.unwrap();
         assert_eq!(manager.snapshot().await.revision, 1);
         manager
             .set_interface("usb0".into(), interface_config("192.168.10.2/25"), false)
             .await
             .expect_err("invalid save");
         assert_eq!(manager.snapshot().await.revision, 1);
-        manager
-            .set_api_config(api_override(9444))
-            .await
-            .unwrap();
+        manager.set_api_config(api_override(9444)).await.unwrap();
         assert_eq!(manager.snapshot().await.revision, 2);
     }
 

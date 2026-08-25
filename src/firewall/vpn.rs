@@ -505,7 +505,6 @@ mod tests {
     use super::test_support::{nft_ruleset, FakeNftExecutor};
     use super::*;
 
-
     fn desired() -> VpnPolicyFirewallDesired {
         VpnPolicyFirewallDesired {
             protected_subnets: vec![

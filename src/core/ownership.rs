@@ -78,7 +78,9 @@ pub struct InterfaceAddressClaims {
 impl InterfaceAddressClaims {
     fn validate(&self, interface: &str) -> Result<(), OwnershipJournalError> {
         if self.schema_version != ADDRESS_CLAIM_SCHEMA_VERSION {
-            return Err(OwnershipJournalError::UnsupportedSchema(self.schema_version));
+            return Err(OwnershipJournalError::UnsupportedSchema(
+                self.schema_version,
+            ));
         }
         if self.interface != interface {
             return Err(OwnershipJournalError::InvalidRecord(
@@ -165,7 +167,11 @@ impl AddressOwnershipJournal {
             .lock()
             .await
             .get(interface)
-            .is_some_and(|claims| claims.iter().any(|claim| claim.matches(address, prefix_len)))
+            .is_some_and(|claims| {
+                claims
+                    .iter()
+                    .any(|claim| claim.matches(address, prefix_len))
+            })
     }
 
     /// Record an address as ours. Call this *before* installing it.
@@ -283,9 +289,12 @@ impl AddressOwnershipJournal {
                 Some(address) => match address.owner() {
                     // Someone else's tag beats our record: the address on the
                     // link now is not the one we installed.
-                    AddressOwner::TrafficMasqDhcp | AddressOwner::Foreign(_) => result.dropped.push(
-                        (claim, format!("the address is tagged {:?}", address.owner())),
-                    ),
+                    AddressOwner::TrafficMasqDhcp | AddressOwner::Foreign(_) => {
+                        result.dropped.push((
+                            claim,
+                            format!("the address is tagged {:?}", address.owner()),
+                        ))
+                    }
                     AddressOwner::TrafficMasqStatic | AddressOwner::Untagged => {
                         result.kept.push(AddressClaim {
                             state: AddressClaimState::Held,

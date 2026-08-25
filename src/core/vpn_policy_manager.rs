@@ -3,6 +3,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 use ipnet::Ipv4Net;
 
+use crate::config::{AppConfig, InterfaceRole};
 use crate::core::vpn_policy::{
     VpnPolicyDesiredState, VpnPolicyReservedIds, VpnPolicyResourceConflictDetector,
 };
@@ -12,7 +13,6 @@ use crate::netlink::{
     Ipv4RouteInfo, Ipv4RouteSpec, Ipv4RuleInfo, Ipv4RuleSpec, NetworkProvider,
     TRAFFIC_MASQ_ROUTE_PROTOCOL,
 };
-use crate::config::{AppConfig, InterfaceRole};
 use crate::vpn::manager::OWNED_INTERFACE_NAME;
 use crate::vpn::{VpnDriver, VpnManager};
 

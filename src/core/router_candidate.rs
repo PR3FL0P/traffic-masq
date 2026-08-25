@@ -587,5 +587,4 @@ mod tests {
         assert_eq!(candidate.desired().dhcp.len(), 2);
         assert_eq!(candidate.digest(), digest);
     }
-
 }

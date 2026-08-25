@@ -2,7 +2,9 @@ mod process;
 pub mod service;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,7 +19,9 @@ use crate::api::control::ControlService;
 use crate::api::server::HttpApiBindings;
 use crate::auth::{AuthService, Principal};
 use crate::config::{AppConfig, InterfaceConfig, ShutdownPolicy, VpnPolicyMode};
+use crate::core::desired::DesiredNetworkState;
 use crate::core::interface::{InterfaceManager, InterfaceSnapshot};
+use crate::core::override_manager::RuntimeOverrideManager;
 use crate::core::ownership::AddressOwnershipJournal;
 use crate::core::route::{RouteManager, RouteSnapshot};
 use crate::core::router::{RouterDesired, RouterManager};
@@ -38,8 +42,6 @@ use crate::netlink::events::KernelEvent;
 use crate::netlink::{
     AddressOwner, Ipv4AddressInfo, NetworkInterface, NetworkProvider, RtnetlinkNetworkProvider,
 };
-use crate::core::desired::DesiredNetworkState;
-use crate::core::override_manager::RuntimeOverrideManager;
 use crate::state::overrides::RuntimeOverrides;
 use crate::vpn::{
     ActiveProfileStore, NetlinkVpnProvider, ProductionVpnManager, VpnManager, VpnProvider,
@@ -941,6 +943,43 @@ pub async fn reset_device_password(config: &AppConfig, password: &str) -> Result
     Ok(auth.reset_device_password(password).await?)
 }
 
+/// LIFO teardown stack for `run_daemon`'s startup phase only. Each startup
+/// step pushes its own rollback right after it succeeds; any later failure
+/// or shutdown-requested check runs `unwind()` to tear everything down in
+/// reverse order, then returns.
+///
+/// Dropping a non-empty stack without calling `unwind()` is intentional and
+/// correct: it is exactly what happens on the happy path once startup
+/// completes (responsibility passes to the already-correct end-of-run
+/// shutdown path). The pushed futures are inert until polled, so a drop runs
+/// none of their side effects.
+struct StartupRollback<'a> {
+    steps: Vec<Pin<Box<dyn Future<Output = ()> + Send + 'a>>>,
+}
+
+impl<'a> StartupRollback<'a> {
+    fn new() -> Self {
+        Self { steps: Vec::new() }
+    }
+
+    /// Record a rollback action, to run in LIFO order if `unwind` is called.
+    fn push<F>(&mut self, rollback: F)
+    where
+        F: Future<Output = ()> + Send + 'a,
+    {
+        self.steps.push(Box::pin(rollback));
+    }
+
+    /// Run every pushed rollback, most-recently-pushed first. Consumes
+    /// `self`, so a second `unwind()` call is a compile error, not a silent
+    /// double-teardown.
+    async fn unwind(mut self) {
+        while let Some(step) = self.steps.pop() {
+            step.await;
+        }
+    }
+}
+
 pub async fn run_daemon(config: AppConfig) -> Result<()> {
     config.validate()?;
     let shutdown = install_shutdown_signal()?;
@@ -966,14 +1005,28 @@ pub async fn run_daemon(config: AppConfig) -> Result<()> {
         .context("failed to open the IPv4 address ownership journal")?;
     reconcile_address_ownership(&ownership_journal, network_provider.as_ref()).await;
 
+    // Teardown for everything brought up during startup, unwound in reverse
+    // order on any later failure or shutdown-requested check. Each step below
+    // pushes its own rollback right after it succeeds, so a failure N steps in
+    // never has to re-derive what the previous N-1 steps were.
+    let mut stack = StartupRollback::new();
+
     let interface_manager =
         InterfaceManager::new(network_provider.clone(), ownership_journal.clone());
     let startup_baselines = interface_manager
         .apply_network_with_management_allowlist(&effective_config.network, &management_allowlist)
         .await?;
+    // Cloned, not borrowed: `startup_baselines` is moved into
+    // ControlService::new_with_baselines later in this function, and a live
+    // borrow held inside `stack` would make that move a compile error.
+    stack.push({
+        let interface_manager = interface_manager.clone();
+        let startup_baselines = startup_baselines.clone();
+        async move { rollback_interfaces(&interface_manager, &startup_baselines).await }
+    });
 
     if shutdown_requested(&shutdown) {
-        rollback_interfaces(&interface_manager, &startup_baselines).await;
+        stack.unwind().await;
         tracing::info!("shutdown requested during network initialization");
         return Ok(());
     }
@@ -981,39 +1034,39 @@ pub async fn run_daemon(config: AppConfig) -> Result<()> {
     let wifi_supervisor = match build_wifi_supervisor(&effective_config).await {
         Ok(supervisor) => supervisor,
         Err(error) => {
-            rollback_interfaces(&interface_manager, &startup_baselines).await;
+            stack.unwind().await;
             return Err(error);
         }
     };
+    if let Some(wifi) = &wifi_supervisor {
+        let wifi = wifi.clone();
+        stack.push(async move { wifi.shutdown(ShutdownPolicy::RestoreInterfaces).await });
+    }
 
     if shutdown_requested(&shutdown) {
-        if let Some(wifi) = &wifi_supervisor {
-            wifi.shutdown(ShutdownPolicy::RestoreInterfaces).await;
-        }
-        rollback_interfaces(&interface_manager, &startup_baselines).await;
+        stack.unwind().await;
         tracing::info!("shutdown requested during Wi-Fi initialization");
         return Ok(());
     }
 
-    let wifi_client_supervisor =
-        match build_wifi_client_supervisor(&effective_config).await {
-            Ok(supervisor) => supervisor,
-            Err(error) => {
-                rollback_interfaces(&interface_manager, &startup_baselines).await;
-                return Err(error);
-            }
-        };
-
-    if shutdown_requested(&shutdown) {
-        if let Some(wifi) = &wifi_supervisor {
-            wifi.shutdown(ShutdownPolicy::RestoreInterfaces).await;
+    let wifi_client_supervisor = match build_wifi_client_supervisor(&effective_config).await {
+        Ok(supervisor) => supervisor,
+        Err(error) => {
+            stack.unwind().await;
+            return Err(error);
         }
-        if let Some(wifi_client) = &wifi_client_supervisor {
+    };
+    if let Some(wifi_client) = &wifi_client_supervisor {
+        let wifi_client = wifi_client.clone();
+        stack.push(async move {
             wifi_client
                 .shutdown(ShutdownPolicy::RestoreInterfaces)
-                .await;
-        }
-        rollback_interfaces(&interface_manager, &startup_baselines).await;
+                .await
+        });
+    }
+
+    if shutdown_requested(&shutdown) {
+        stack.unwind().await;
         tracing::info!("shutdown requested during Wi-Fi client initialization");
         return Ok(());
     }
@@ -1021,22 +1074,17 @@ pub async fn run_daemon(config: AppConfig) -> Result<()> {
     let dhcp = match DhcpSupervisor::start(&effective_config).await {
         Ok(supervisor) => supervisor,
         Err(error) => {
-            rollback_interfaces(&interface_manager, &startup_baselines).await;
+            stack.unwind().await;
             return Err(error);
         }
     };
+    stack.push({
+        let dhcp = dhcp.clone();
+        async move { dhcp.shutdown().await }
+    });
 
     if shutdown_requested(&shutdown) {
-        if let Some(wifi) = &wifi_supervisor {
-            wifi.shutdown(ShutdownPolicy::RestoreInterfaces).await;
-        }
-        if let Some(wifi_client) = &wifi_client_supervisor {
-            wifi_client
-                .shutdown(ShutdownPolicy::RestoreInterfaces)
-                .await;
-        }
-        dhcp.shutdown().await;
-        rollback_interfaces(&interface_manager, &startup_baselines).await;
+        stack.unwind().await;
         tracing::info!("shutdown requested during DHCP initialization");
         return Ok(());
     }
@@ -1045,75 +1093,62 @@ pub async fn run_daemon(config: AppConfig) -> Result<()> {
         match DhcpClientSupervisor::start(&effective_config, network_provider.clone()).await {
             Ok(supervisor) => supervisor,
             Err(error) => {
-                dhcp.shutdown().await;
-                rollback_interfaces(&interface_manager, &startup_baselines).await;
+                stack.unwind().await;
                 return Err(error);
             }
         };
+    stack.push({
+        let dhcp_client = dhcp_client.clone();
+        async move {
+            dhcp_client
+                .shutdown(ShutdownPolicy::RestoreInterfaces)
+                .await
+        }
+    });
 
     if shutdown_requested(&shutdown) {
-        dhcp_client
-            .shutdown(ShutdownPolicy::RestoreInterfaces)
-            .await;
-        if let Some(wifi) = &wifi_supervisor {
-            wifi.shutdown(ShutdownPolicy::RestoreInterfaces).await;
-        }
-        if let Some(wifi_client) = &wifi_client_supervisor {
-            wifi_client
-                .shutdown(ShutdownPolicy::RestoreInterfaces)
-                .await;
-        }
-        dhcp.shutdown().await;
-        rollback_interfaces(&interface_manager, &startup_baselines).await;
+        stack.unwind().await;
         tracing::info!("shutdown requested during DHCP client initialization");
         return Ok(());
     }
 
-    let desired = RouterDesired::from_effective_config(&effective_config)?;
+    let desired = match RouterDesired::from_effective_config(&effective_config) {
+        Ok(desired) => desired,
+        Err(error) => {
+            stack.unwind().await;
+            return Err(error);
+        }
+    };
+    // `Arc`-wrapped so its rollback closure can own a cheap clone instead of
+    // borrowing: a borrow captured inside `stack` would have to outlive
+    // `router_state` itself, which the final shutdown path below also reads
+    // — two ends pulling on the same value from opposite directions is
+    // exactly what `Arc` sidesteps.
     let router_state = if desired.enabled {
         let dataplane_provider = match production_dataplane_provider() {
             Ok(provider) => provider,
             Err(error) => {
-                dhcp_client
-                    .shutdown(ShutdownPolicy::RestoreInterfaces)
-                    .await;
-                dhcp.shutdown().await;
-                rollback_interfaces(&interface_manager, &startup_baselines).await;
+                stack.unwind().await;
                 return Err(error);
             }
         };
         match apply_router_dataplane(&desired, network_provider.clone(), dataplane_provider).await {
-            Ok(state) => Some(state),
+            Ok(state) => Some(Arc::new(state)),
             Err(error) => {
-                dhcp_client
-                    .shutdown(ShutdownPolicy::RestoreInterfaces)
-                    .await;
-                dhcp.shutdown().await;
-                rollback_interfaces(&interface_manager, &startup_baselines).await;
+                stack.unwind().await;
                 return Err(error);
             }
         }
     } else {
         None
     };
+    if let Some(state) = &router_state {
+        let state = state.clone();
+        stack.push(async move { rollback_router_dataplane(&state).await });
+    }
 
     if shutdown_requested(&shutdown) {
-        if let Some(state) = &router_state {
-            rollback_router_dataplane(state).await;
-        }
-        if let Some(wifi) = &wifi_supervisor {
-            wifi.shutdown(ShutdownPolicy::RestoreInterfaces).await;
-        }
-        if let Some(wifi_client) = &wifi_client_supervisor {
-            wifi_client
-                .shutdown(ShutdownPolicy::RestoreInterfaces)
-                .await;
-        }
-        dhcp_client
-            .shutdown(ShutdownPolicy::RestoreInterfaces)
-            .await;
-        dhcp.shutdown().await;
-        rollback_interfaces(&interface_manager, &startup_baselines).await;
+        stack.unwind().await;
         tracing::info!("shutdown requested during router dataplane initialization");
         return Ok(());
     }
@@ -1136,14 +1171,7 @@ pub async fn run_daemon(config: AppConfig) -> Result<()> {
     ) {
         Ok(coordinator) => Some(coordinator),
         Err(error) => {
-            if let Some(state) = &router_state {
-                rollback_router_dataplane(state).await;
-            }
-            dhcp_client
-                .shutdown(ShutdownPolicy::RestoreInterfaces)
-                .await;
-            dhcp.shutdown().await;
-            rollback_interfaces(&interface_manager, &startup_baselines).await;
+            stack.unwind().await;
             return Err(error);
         }
     };
@@ -1151,17 +1179,18 @@ pub async fn run_daemon(config: AppConfig) -> Result<()> {
     let vpn_manager = match build_vpn_manager(&effective_config).await {
         Ok(vpn_manager) => vpn_manager,
         Err(error) => {
-            if let Some(state) = &router_state {
-                rollback_router_dataplane(state).await;
-            }
-            dhcp_client
-                .shutdown(ShutdownPolicy::RestoreInterfaces)
-                .await;
-            dhcp.shutdown().await;
-            rollback_interfaces(&interface_manager, &startup_baselines).await;
+            stack.unwind().await;
             return Err(error);
         }
     };
+    if let Some(vpn) = &vpn_manager {
+        let vpn = vpn.clone();
+        stack.push(async move {
+            if let Err(error) = vpn.shutdown(ShutdownPolicy::RestoreInterfaces).await {
+                tracing::error!(%error, "failed to shut down VPN manager during startup rollback");
+            }
+        });
+    }
 
     apply_vpn_policy_startup(
         &effective_config,
@@ -1231,23 +1260,43 @@ pub async fn run_daemon(config: AppConfig) -> Result<()> {
     // Subscribed before the converger starts, and fatal if it fails: without
     // kernel notifications nothing would ever be converged, and a daemon that
     // silently stops reconciling is worse than one that refuses to start.
-    let kernel_events = crate::netlink::events::subscribe_to_kernel_changes()
-        .context("failed to subscribe to kernel network change notifications")?;
+    let kernel_events = match crate::netlink::events::subscribe_to_kernel_changes() {
+        Ok(events) => events,
+        Err(error) => {
+            stack.unwind().await;
+            return Err(error)
+                .context("failed to subscribe to kernel network change notifications");
+        }
+    };
 
-    let reconcile_task =
-        spawn_runtime_network_reconcile(
-            desired_state,
-            ownership_journal.clone(),
-            Arc::new(RtnetlinkNetworkProvider::connect().context(
-                "failed to open rtnetlink connection for runtime interface/DHCP reconcile",
-            )?),
-            dhcp.clone(),
-            wifi_supervisor.clone(),
-            wifi_client_supervisor.clone(),
-            dhcp_client.clone(),
-            kernel_events,
-            shutdown.clone(),
-        );
+    let reconcile_network_provider: Arc<dyn NetworkProvider> =
+        match RtnetlinkNetworkProvider::connect() {
+            Ok(provider) => Arc::new(provider),
+            Err(error) => {
+                stack.unwind().await;
+                return Err(error).context(
+                    "failed to open rtnetlink connection for runtime interface/DHCP reconcile",
+                );
+            }
+        };
+    let reconcile_task = spawn_runtime_network_reconcile(
+        desired_state,
+        ownership_journal.clone(),
+        reconcile_network_provider,
+        dhcp.clone(),
+        wifi_supervisor.clone(),
+        wifi_client_supervisor.clone(),
+        dhcp_client.clone(),
+        kernel_events,
+        shutdown.clone(),
+    );
+    // Nothing fallible or shutdown-checked remains between here and the main
+    // serve loop: startup has fully succeeded, so teardown responsibility
+    // passes to the daemon's normal shutdown path below. Dropped explicitly
+    // rather than left to fall out of scope at the end of the function, to
+    // mark the handoff at the point it actually happens.
+    drop(stack);
+
     let liveness_task = spawn_process_liveness_checks(
         dhcp.clone(),
         wifi_supervisor.clone(),
@@ -1392,17 +1441,55 @@ mod tests {
         UplinkMode, VpnConfig,
     };
     use crate::firewall::vpn::test_support::{nft_ruleset, FakeNftExecutor};
-    use crate::vpn::manager::OWNED_INTERFACE_NAME;
     use crate::firewall::{OwnedFirewallIntegrity, RouterDataplaneDesired};
     use crate::netlink::{
         Ipv4AddressInfo, Ipv4RouteInfo, Ipv4RouteSpec, Ipv4RuleInfo, Ipv4RuleSpec,
     };
     use crate::vpn::active_profile::ActiveProfileStore;
+    use crate::vpn::manager::OWNED_INTERFACE_NAME;
     use crate::vpn::store::WireGuardProfileStore;
     use crate::vpn::wireguard::{WireGuardKey, WireGuardPeerConfig, WireGuardVpnDriver};
     use crate::vpn::{ProviderError, VpnProvider};
 
     use super::*;
+
+    #[tokio::test]
+    async fn startup_rollback_unwind_runs_pushed_steps_in_lifo_order() {
+        let order = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let mut stack = StartupRollback::new();
+        for n in [1, 2, 3] {
+            let order = order.clone();
+            stack.push(async move { order.lock().await.push(n) });
+        }
+        stack.unwind().await;
+        assert_eq!(*order.lock().await, vec![3, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn startup_rollback_unwind_on_empty_stack_is_a_noop() {
+        StartupRollback::new().unwind().await;
+    }
+
+    #[tokio::test]
+    async fn startup_rollback_dropping_without_unwind_runs_nothing() {
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let mut stack = StartupRollback::new();
+            let flag = ran.clone();
+            stack.push(async move { flag.store(true, std::sync::atomic::Ordering::SeqCst) });
+        }
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn startup_rollback_unwind_only_runs_what_was_actually_pushed() {
+        let order = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let mut stack = StartupRollback::new();
+        let pushed = order.clone();
+        stack.push(async move { pushed.lock().await.push("interfaces") });
+        stack.unwind().await;
+        assert_eq!(*order.lock().await, vec!["interfaces"]);
+    }
 
     #[derive(Debug, Default)]
     struct FakeNetworkProvider {
@@ -2350,7 +2437,8 @@ mod tests {
         assert_eq!(*wifi.liveness_checks.lock().await, 1);
         assert_eq!(*wifi_client.liveness_checks.lock().await, 1);
         assert_eq!(
-            *dhcp_client.liveness_checks.lock().await, 1,
+            *dhcp_client.liveness_checks.lock().await,
+            1,
             "every supervised runtime means every one: the DHCP client was the \
              one left behind in the convergence pass"
         );
@@ -2410,7 +2498,8 @@ mod tests {
         assert_eq!(dhcp_client.reconcile_calls.lock().await.len(), 1);
         assert!(dhcp_client.disable_calls.lock().await.is_empty());
         assert_eq!(
-            *dhcp_client.liveness_checks.lock().await, 0,
+            *dhcp_client.liveness_checks.lock().await,
+            0,
             "convergence must not poll for process liveness; that is a separate concern"
         );
 

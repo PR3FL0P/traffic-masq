@@ -46,15 +46,42 @@ Known limits, so they are not discovered later:
 
 ## Requirements
 
-- Linux
+### Build
+
 - Rust toolchain with Cargo
+- a C compiler (`cc`, `gcc` or `clang`)
+- `cmake`, on targets other than `x86_64-unknown-linux-gnu`
+
+Two dependencies compile C rather than linking against a system library, so a
+Rust toolchain alone is not enough: `rustls` builds its default cryptography
+backend from C and assembly, and `sqlx` builds SQLite from source. On
+`x86_64-unknown-linux-gnu` both use the compiler directly; elsewhere the
+cryptography backend falls back to a CMake build.
+
+No minimum Rust version is declared. The project is built with a current stable
+toolchain.
+
+### Runtime
+
+- Linux
 - root access for `traffic-masqd`
 - kernel support for nftables and WireGuard
-- `nft` in `PATH`
+- `nft` in `PATH`, built with JSON support
 - two or more network interfaces for router operation
 - `hostapd` for Wi-Fi access point mode
 - `wpa_supplicant` for Wi-Fi client mode
 
+The firewall is read back as JSON (`nft --json list ruleset`), so an nftables
+built without libjansson fails at the first firewall change rather than at
+startup.
+
+`hostapd` and `wpa_supplicant` are looked up at absolute paths, not through
+`PATH`. The defaults are `/usr/sbin/hostapd` and `/usr/sbin/wpa_supplicant`;
+distributions that ship them elsewhere need `wifi.hostapd_binary` and
+`wifi_client.wpa_supplicant_binary` set in the configuration file.
+
+WireGuard is configured over netlink, and both DHCP server and DHCP client are
+part of the daemon, so `wireguard-tools`, `dhcpcd` and `dhclient` are not used.
 The DHCP client requires root or `CAP_NET_RAW`.
 
 ## Build
@@ -69,6 +96,32 @@ The binaries are written to:
 target/release/traffic-masq
 target/release/traffic-masqd
 ```
+
+## Test
+
+The default suite changes no system state and needs no privileges:
+
+```sh
+cargo test
+```
+
+The tests that do change system state are marked `#[ignore]`, so the command
+above skips them. They come in two kinds.
+
+The namespace tests configure real interfaces inside network namespaces they
+create themselves. They require root, `ip` from iproute2, `nft`, and — for the
+Wi-Fi ones — `modprobe`, `modinfo` and the `mac80211_hwsim` kernel module:
+
+```sh
+sudo -E cargo test --test router_namespace -- --ignored
+```
+
+The `*_physical` tests drive real Wi-Fi hardware and are configured through
+`TRAFFIC_MASQ_*` environment variables — interface names, SSIDs and PSK files.
+Some also need Internet access, a second radio, or an operator to unplug a
+cable, and refuse to run until the matching variable is set explicitly.
+
+Run either kind on a host you can afford to disturb.
 
 ## Install
 
@@ -225,9 +278,26 @@ the daemon installs is recorded twice — tagged in the kernel with `IFA_PROTO`,
 and written to a journal on disk before the address is installed. Both are
 checked at startup against what is actually on the links.
 
-An address that neither the tag nor the journal accounts for is never deleted,
-so an address put there by anything else survives. Marking an interface
-unmanaged removes what the daemon installed and leaves the rest alone.
+A managed interface ends up carrying exactly the address it is configured with,
+so an address that was already on it is replaced. Once management is given up,
+that authority ends: an address that neither the tag nor the journal accounts
+for is never deleted, and marking an interface unmanaged removes what the
+daemon installed and leaves the rest alone.
+
+### Removing an address
+
+Having no address is a configuration, not a missing one. Clearing the CIDR
+field in the interface editor — with Backspace or the "Remove IPv4 address"
+row — sends an empty `cidr`, and the daemon plans a delete for every IPv4
+address the managed interface carries, whether it installed the address or
+found it there. It goes through the same dry-run preview, rollback timer and
+commit as any other change, and convergence holds it: an address that comes
+back is taken off again on the next pass.
+
+Two refusals are worth knowing about. An interface that is not managed is not
+written to at all, so removing its address means enabling Managed first. And an
+interface running a DHCP server cannot give up the address that server hands
+out its subnet from — disable DHCP first.
 
 Management interfaces are not modified unless `allow_management_change` is
 enabled, and a change that would alter one is refused rather than attempted.

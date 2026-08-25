@@ -177,9 +177,7 @@ impl RuntimeOverrideStore {
 
         atomic_file::replace_async(&self.path, &content, PRIVATE_FILE_MODE)
             .await
-            .with_context(|| {
-                format!("failed to atomically replace {}", self.path.display())
-            })
+            .with_context(|| format!("failed to atomically replace {}", self.path.display()))
     }
 }
 

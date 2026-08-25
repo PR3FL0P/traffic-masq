@@ -31,6 +31,7 @@ use traffic_masq::config::{
     WifiSecurity,
 };
 use traffic_masq::core::interface::{DhcpChangeAction, InterfaceChangePlan, InterfaceSnapshot};
+use traffic_masq::core::override_manager::RuntimeOverrideManager;
 use traffic_masq::core::route::{RoutePlan, RouteSnapshot};
 use traffic_masq::core::router::{
     DhcpPlan, RouterDesired, RouterManager, RouterSubsystems, WifiPlan, WifiSnapshot,
@@ -41,7 +42,6 @@ use traffic_masq::firewall::{
     OwnedFirewallIntegrity, RouterDataplanePlan, RouterDataplaneSnapshot,
 };
 use traffic_masq::netlink::{AddressOwnership, Ipv4AddressInfo, NetworkInterface, NetworkProvider};
-use traffic_masq::core::override_manager::RuntimeOverrideManager;
 use traffic_masq::wifi::{HostapdSupervisor, WifiApSpec, WifiClientSpec, WifiClientSupervisor};
 
 #[derive(Debug)]
@@ -405,12 +405,45 @@ async fn authenticated_http_client_controls_daemon_over_unix_socket() -> Result<
         interface_config
     );
 
+    // Clearing the CIDR is how an address is taken off over the API: the
+    // interface stays managed and the plan is a pure delete.
+    match admin
+        .request(&Request::DryRunInterfaceEdit {
+            interface: "test0".to_string(),
+            edit: traffic_masq::api::model::InterfaceEditRequest {
+                cidr: String::new(),
+                role: InterfaceRole::Output,
+                managed: true,
+                allow_management_change: false,
+            },
+        })
+        .await?
+    {
+        Response::InterfacePlan { plan } => {
+            assert_eq!(
+                plan.delete_ipv4
+                    .iter()
+                    .map(|address| (address.address, address.prefix_len))
+                    .collect::<Vec<_>>(),
+                vec![(Ipv4Addr::new(192, 168, 99, 1), 24)]
+            );
+            assert!(plan.add_ipv4.is_none());
+            assert!(plan.retag_ipv4.is_none());
+            assert!(!plan.releasing_management);
+        }
+        response => panic!("unexpected response: {response:?}"),
+    }
+
+    // Giving up management gives up the settings with it: an unmanaged
+    // interface carries no traffic-masq IPv4, and an edit that tried to keep
+    // one would be refused.
     let managed_false = InterfaceConfig {
         managed: false,
+        ipv4: None,
         ..interface_config.clone()
     };
     let managed_false_edit = traffic_masq::api::model::InterfaceEditRequest {
-        cidr: "192.168.100.1/24".to_string(),
+        cidr: String::new(),
         role: InterfaceRole::Output,
         managed: false,
         allow_management_change: false,

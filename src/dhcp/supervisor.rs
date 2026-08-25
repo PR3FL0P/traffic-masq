@@ -444,10 +444,10 @@ mod tests {
 
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].interface, "wlan0");
-        assert_eq!(specs[0].server_ip, Ipv4Addr::new(192, 168, 101, 1));
+        assert_eq!(specs[0].server_ip, Ipv4Addr::new(192, 168, 50, 1));
         assert_eq!(specs[0].prefix_len, 24);
-        assert_eq!(specs[0].pool_start, Ipv4Addr::new(192, 168, 101, 100));
-        assert_eq!(specs[0].pool_end, Ipv4Addr::new(192, 168, 101, 200));
+        assert_eq!(specs[0].pool_start, Ipv4Addr::new(192, 168, 50, 100));
+        assert_eq!(specs[0].pool_end, Ipv4Addr::new(192, 168, 50, 200));
         assert_eq!(specs[0].lease_seconds, 86_400);
     }
 
@@ -522,5 +522,4 @@ mod tests {
 
         assert!(supervisor.spec("tm-test-absent0").await.is_none());
     }
-
 }

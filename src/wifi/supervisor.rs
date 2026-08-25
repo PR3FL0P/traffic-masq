@@ -11,9 +11,7 @@ use crate::config::{AppConfig, ShutdownPolicy};
 use crate::dhcp::supervisor::resolve_interface_index;
 use crate::wifi::ctrl::{CtrlError, HostapdCtrlClient, HostapdState, MacAddr, Station};
 use crate::wifi::process::{ProcessError, SupervisedProcess, TokioSupervisedProcess};
-use crate::wifi::record::{
-    PersistedWifiRecord, WifiRecordError, WifiRecordStore,
-};
+use crate::wifi::record::{PersistedWifiRecord, WifiRecordError, WifiRecordStore};
 use crate::wifi::render::{
     self, render_hostapd_config, ApRenderInput, RenderError, RenderedApConfig,
 };
@@ -1058,8 +1056,7 @@ mod tests {
             },
         );
 
-        let specs = HostapdSupervisor::effective_specs(&config)
-            .expect("effective specs");
+        let specs = HostapdSupervisor::effective_specs(&config).expect("effective specs");
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].interface, "wlan0");
         assert_eq!(specs[0].ssid, "net-a");

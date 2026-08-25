@@ -18,9 +18,7 @@ use crate::wifi::client::render::{
     RenderedClientConfig,
 };
 use crate::wifi::process::{ProcessError, SupervisedProcess, TokioSupervisedProcess};
-use crate::wifi::record::{
-    PersistedWifiRecord, WifiRecordError, WifiRecordStore,
-};
+use crate::wifi::record::{PersistedWifiRecord, WifiRecordError, WifiRecordStore};
 use crate::wifi::secret::WifiPassphrase;
 use crate::wifi::store::{resolve_passphrase_parts, PassphraseStore, ResolvePassphraseError};
 use crate::wifi::supervisor::interface_is_wireless;
@@ -1035,12 +1033,9 @@ mod tests {
         runtime_dir: &Path,
         process: Arc<FakeProcess>,
     ) -> WifiClientSupervisor {
-        WifiClientSupervisor::start_with_process(
-            &app_config(state_dir, runtime_dir),
-            process,
-        )
-        .await
-        .expect("start")
+        WifiClientSupervisor::start_with_process(&app_config(state_dir, runtime_dir), process)
+            .await
+            .expect("start")
     }
 
     #[tokio::test]
@@ -1732,5 +1727,4 @@ mod tests {
                 .is_none()
         );
     }
-
 }

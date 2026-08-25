@@ -17,14 +17,16 @@ use super::{current_unix_time, format_addresses, Screen, TuiApp};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InterfaceEditorField {
     Cidr,
+    RemoveIpv4,
     Role,
     Managed,
     AllowManagementChange,
     Save,
 }
 
-const INTERFACE_EDITOR_FIELDS: [InterfaceEditorField; 5] = [
+const INTERFACE_EDITOR_FIELDS: [InterfaceEditorField; 6] = [
     InterfaceEditorField::Cidr,
+    InterfaceEditorField::RemoveIpv4,
     InterfaceEditorField::Role,
     InterfaceEditorField::Managed,
     InterfaceEditorField::AllowManagementChange,
@@ -43,15 +45,33 @@ pub(crate) struct InterfaceEditor {
     pub(crate) original_managed: bool,
     pub(crate) original_cidr: String,
     pub(crate) original_role: InterfaceRole,
+    /// What the interface carries right now, so an empty CIDR field can say
+    /// which addresses saving is about to take off rather than leaving the
+    /// operator to guess what "no address" means.
+    pub(crate) current_addresses: Vec<String>,
 }
 
 impl InterfaceEditor {
+    /// Ask for the address to be taken off. An empty CIDR field is the request:
+    /// the daemon plans a delete for whatever the interface carries.
+    pub(crate) fn remove_ipv4(&mut self) {
+        self.cidr.clear();
+    }
+
     pub(crate) fn edit_request(&self) -> Result<InterfaceEditRequest> {
         // An unmanaged interface carries no traffic-masq settings at all, so
         // refuse every settings edit while Managed is off — naming the fields,
         // because "save did nothing" is the confusing part. Toggling Managed
         // itself stays allowed: that is how you start and stop managing.
         if !self.managed {
+            // Taking an address off is still writing to the interface, and an
+            // unmanaged interface is one we do not write to. Say which switch
+            // unblocks it instead of reporting a generic edit refusal.
+            if self.cidr.trim().is_empty() && !self.original_cidr.trim().is_empty() {
+                anyhow::bail!(
+                    "cannot remove the IP while the interface is unmanaged; enable Managed so traffic-masq may take the address off"
+                );
+            }
             let mut changed = Vec::new();
             if self.cidr.trim() != self.original_cidr.trim() {
                 changed.push("IP");
@@ -134,6 +154,10 @@ pub(crate) fn render_interface_list(frame: &mut ratatui::Frame<'_>, area: Rect, 
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+const REMOVE_IPV4_LABEL: &str = "Remove IPv4 address (clear the field)";
+/// Slot 0 and 1 are already spoken for by Save and the cancel strip below it.
+const REMOVE_IPV4_BUTTON_SLOT: usize = 2;
+
 pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
     let Some(editor) = &app.editor else {
         return;
@@ -178,6 +202,32 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
             Style::default().fg(theme::BAD),
         ));
     }
+    let remove_row_index = lines.len() as u16;
+    lines.push(action_row(
+        REMOVE_IPV4_LABEL,
+        InterfaceEditorField::RemoveIpv4,
+    ));
+    // An empty field is the instruction to take the address off, so it has to
+    // read as one. Silence here is how "I cleared it and nothing happened"
+    // starts.
+    if editor.cidr.trim().is_empty() {
+        let removal = if editor.current_addresses.is_empty() {
+            Line::styled(
+                "  No IPv4 address on this interface; saving leaves it without one",
+                Style::default().fg(theme::MUTED),
+            )
+        } else {
+            Line::styled(
+                format!(
+                    "  Saving removes {} from {}",
+                    editor.current_addresses.join(", "),
+                    editor.interface
+                ),
+                Style::default().fg(theme::WARN),
+            )
+        };
+        lines.push(removal);
+    }
     lines.extend([
         row(
             "Role",
@@ -216,10 +266,12 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         lines.push(Line::styled(message, Style::default().fg(color)));
     }
     if !editor.managed && editor.cidr.trim() != editor.original_cidr.trim() {
-        lines.push(Line::styled(
-            "Cannot change IP while the interface is unmanaged; enable Managed first",
-            Style::default().fg(theme::BAD),
-        ));
+        let message = if editor.cidr.trim().is_empty() {
+            "Cannot remove the IP while the interface is unmanaged; enable Managed first"
+        } else {
+            "Cannot change IP while the interface is unmanaged; enable Managed first"
+        };
+        lines.push(Line::styled(message, Style::default().fg(theme::BAD)));
     }
     if editor.original_managed && !editor.managed {
         lines.push(Line::styled(
@@ -229,6 +281,10 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
     }
     lines.push(Line::styled(
         "j/k or arrows: move | Enter/Space: activate | type digits, '.', '/' to edit CIDR (e.g. 192.168.1.10/24)",
+        Style::default().fg(theme::MUTED),
+    ));
+    lines.push(Line::styled(
+        "An empty CIDR removes the address: clear it with Backspace or the Remove row, then Save",
         Style::default().fg(theme::MUTED),
     ));
     lines.push(Line::from(""));
@@ -248,6 +304,15 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
             height: 1,
         },
         0,
+    ));
+    app.ui.buttons.push((
+        Rect {
+            x: inner.x,
+            y: inner.y + remove_row_index,
+            width: REMOVE_IPV4_LABEL.len() as u16 + 2,
+            height: 1,
+        },
+        REMOVE_IPV4_BUTTON_SLOT,
     ));
     app.ui.buttons.push((
         Rect {
@@ -407,9 +472,13 @@ pub(crate) fn render_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-pub(crate) fn focus_action(app: &mut TuiApp, _slot: usize) {
+pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
     if let Some(editor) = app.editor.as_mut() {
-        editor.field = InterfaceEditorField::Save;
+        editor.field = if slot == REMOVE_IPV4_BUTTON_SLOT {
+            InterfaceEditorField::RemoveIpv4
+        } else {
+            InterfaceEditorField::Save
+        };
     }
 }
 
@@ -468,6 +537,11 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
                 })
                 .unwrap_or_default();
 
+            let current_addresses = status
+                .ipv4_addresses
+                .iter()
+                .map(|address| format!("{}/{}", address.address, address.prefix_len))
+                .collect();
             let original_managed = config.as_ref().is_some_and(|interface| interface.managed);
             let original_cidr = cidr.clone();
             let original_role = config
@@ -484,6 +558,7 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
                 original_managed,
                 original_cidr,
                 original_role,
+                current_addresses,
             });
             app.preview = None;
             app.screen = Screen::InterfaceEditor;
@@ -512,6 +587,7 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
         KeyCode::Down => editor.field = next_editor_field(editor.field),
         KeyCode::Enter => match editor.field {
             InterfaceEditorField::Cidr => {}
+            InterfaceEditorField::RemoveIpv4 => editor.remove_ipv4(),
             InterfaceEditorField::Role => editor.role = next_role(editor.role),
             InterfaceEditorField::Managed => editor.managed = !editor.managed,
             InterfaceEditorField::AllowManagementChange => {
@@ -699,6 +775,7 @@ mod tests {
             original_managed: true,
             original_cidr: "192.168.1.10/24".into(),
             original_role: InterfaceRole::Output,
+            current_addresses: vec!["192.168.1.10/24".into()],
         }
     }
 
@@ -770,10 +847,50 @@ mod tests {
         assert!(editor.edit_request().is_ok());
     }
 
+    /// Clearing the field is the removal request, and it has to survive the
+    /// trip to the daemon as an empty CIDR — that is what makes the planner
+    /// take the address off instead of leaving it alone.
+    #[test]
+    fn an_empty_cidr_on_a_managed_interface_asks_for_the_address_to_be_removed() {
+        let mut editor = default_route_editor(true);
+        editor.cidr.clear();
+        let request = editor.edit_request().expect("removal must be a valid edit");
+        assert!(request.cidr.is_empty());
+        assert!(request.managed, "removal keeps the interface managed");
+        assert_eq!(request.role, InterfaceRole::Output);
+    }
+
+    #[test]
+    fn removing_the_ip_of_an_unmanaged_interface_points_at_the_managed_switch() {
+        let mut editor = unmanaged_editor();
+        editor.cidr.clear();
+        let error = editor.edit_request().unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "cannot remove the IP while the interface is unmanaged; enable Managed so traffic-masq may take the address off"
+        );
+    }
+
+    #[test]
+    fn the_remove_row_clears_the_cidr_field() {
+        let mut editor = default_route_editor(true);
+        editor.remove_ipv4();
+        assert!(editor.cidr.is_empty());
+        assert_eq!(
+            editor.current_addresses,
+            vec!["192.168.1.10/24".to_string()],
+            "the address that is about to go is still reported"
+        );
+    }
+
     #[test]
     fn interface_editor_field_reaches_save_and_clamps_at_both_ends() {
         assert_eq!(
             next_editor_field(InterfaceEditorField::Cidr),
+            InterfaceEditorField::RemoveIpv4
+        );
+        assert_eq!(
+            next_editor_field(InterfaceEditorField::RemoveIpv4),
             InterfaceEditorField::Role
         );
         assert_eq!(
