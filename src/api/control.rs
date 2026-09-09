@@ -442,6 +442,16 @@ impl ControlService {
                         message: error.to_string(),
                     };
                 }
+                if let Err(error) = Self::validate_router_service_management(
+                    &interface,
+                    current.as_ref(),
+                    &config,
+                    allow_management_change,
+                ) {
+                    return Response::Error {
+                        message: error.to_string(),
+                    };
+                }
                 match self
                     .transactions
                     .dry_run_transition(
@@ -479,6 +489,16 @@ impl ControlService {
                             )
                             .await
                         {
+                            return Response::Error {
+                                message: error.to_string(),
+                            };
+                        }
+                        if let Err(error) = Self::validate_router_service_management(
+                            &interface,
+                            current.as_ref(),
+                            &config,
+                            allow_management_change,
+                        ) {
                             return Response::Error {
                                 message: error.to_string(),
                             };
@@ -527,6 +547,16 @@ impl ControlService {
                         message: error.to_string(),
                     };
                 }
+                if let Err(error) = Self::validate_router_service_management(
+                    &interface,
+                    current.as_ref(),
+                    &config,
+                    allow_management_change,
+                ) {
+                    return Response::Error {
+                        message: error.to_string(),
+                    };
+                }
                 match self
                     .transactions
                     .apply_transition(
@@ -564,6 +594,16 @@ impl ControlService {
                             )
                             .await
                         {
+                            return Response::Error {
+                                message: error.to_string(),
+                            };
+                        }
+                        if let Err(error) = Self::validate_router_service_management(
+                            &interface,
+                            current.as_ref(),
+                            &config,
+                            allow_management_change,
+                        ) {
                             return Response::Error {
                                 message: error.to_string(),
                             };
@@ -738,6 +778,50 @@ impl ControlService {
             );
         }
         Ok(())
+    }
+
+    /// Unmanaging (or re-roling away from Output) an interface that currently
+    /// carries a router-owned AP or DHCP server does not stop those services
+    /// — they are only started/stopped by `RouterManager::apply`, which this
+    /// edit path never triggers. Rather than silently leaving hostapd/dnsmasq
+    /// running on an interface that just lost its IP, require the same
+    /// explicit confirmation already used for the default-route and
+    /// Management-role risks, and tell the operator where to actually finish
+    /// the job (the Router tab), instead of "fixing" it with a second,
+    /// independently-triggered mutation path into router state.
+    fn validate_router_service_management(
+        interface: &str,
+        current: Option<&InterfaceConfig>,
+        new_config: &InterfaceConfig,
+        allow_management_change: bool,
+    ) -> Result<()> {
+        if allow_management_change {
+            return Ok(());
+        }
+        let Some(current) = current else {
+            return Ok(());
+        };
+        if current.role != InterfaceRole::Output || !current.managed {
+            return Ok(());
+        }
+        let losing_service = new_config.role != InterfaceRole::Output || !new_config.managed;
+        if !losing_service {
+            return Ok(());
+        }
+        if current.wifi.is_none() && current.dhcp.is_none() {
+            return Ok(());
+        }
+        let mut running = Vec::new();
+        if let Some(wifi) = &current.wifi {
+            running.push(format!("access point '{}'", wifi.ssid));
+        }
+        if current.dhcp.is_some() {
+            running.push("DHCP server".to_string());
+        }
+        anyhow::bail!(
+            "{interface} still runs {} started by the router; set allow_management_change=true to confirm, then re-apply the router config to actually stop them",
+            running.join(" and ")
+        );
     }
 
     async fn interface_config_response(&self, interface: String) -> Result<Response> {
@@ -3080,7 +3164,10 @@ fn interface_edit_request_to_config(
                 .then(|| existing.and_then(|config| config.dhcp.clone()))
                 .flatten(),
             dhcp_client: None,
-            wifi: None,
+            wifi: edit
+                .managed
+                .then(|| existing.and_then(|config| config.wifi.clone()))
+                .flatten(),
             wifi_client: None,
             nat: true,
         },
@@ -3558,6 +3645,133 @@ mod tests {
         );
         assert_eq!(config.dhcp, Some(existing_dhcp));
         assert!(!allow_management_change);
+    }
+
+    fn wifi_ap_config_fixture(ssid: &str) -> crate::config::WifiApConfig {
+        crate::config::WifiApConfig {
+            ssid: ssid.to_string(),
+            country_code: None,
+            band: crate::config::WifiBand::Ghz2,
+            channel: 6,
+            channel_width: crate::config::WifiChannelWidth::Ht20,
+            security: crate::config::WifiSecurity::Wpa2,
+            hidden: false,
+            client_isolation: false,
+            max_stations: 32,
+            passphrase_file: None,
+        }
+    }
+
+    #[test]
+    fn interface_edit_request_preserves_existing_wifi_settings_while_managed() {
+        let existing_wifi = wifi_ap_config_fixture("home-net");
+        let existing = InterfaceConfig {
+            role: InterfaceRole::Output,
+            managed: true,
+            ipv4: Some("192.168.50.1/24".parse().expect("valid cidr")),
+            dhcp: None,
+            dhcp_client: None,
+            wifi: Some(existing_wifi.clone()),
+            wifi_client: None,
+            nat: true,
+        };
+        let edit = InterfaceEditRequest {
+            cidr: "192.168.60.1/24".to_string(),
+            role: InterfaceRole::Output,
+            managed: true,
+            allow_management_change: false,
+        };
+
+        let (config, _) =
+            interface_edit_request_to_config(edit, Some(&existing)).expect("edit must convert");
+
+        assert_eq!(
+            config.wifi, Some(existing_wifi),
+            "an edit that never touches Managed must not silently wipe the AP config"
+        );
+    }
+
+    #[test]
+    fn interface_edit_request_drops_wifi_settings_when_unmanaged() {
+        let existing = InterfaceConfig {
+            role: InterfaceRole::Output,
+            managed: true,
+            ipv4: Some("192.168.50.1/24".parse().expect("valid cidr")),
+            dhcp: None,
+            dhcp_client: None,
+            wifi: Some(wifi_ap_config_fixture("home-net")),
+            wifi_client: None,
+            nat: true,
+        };
+        let edit = InterfaceEditRequest {
+            cidr: String::new(),
+            role: InterfaceRole::Output,
+            managed: false,
+            allow_management_change: true,
+        };
+
+        let (config, _) =
+            interface_edit_request_to_config(edit, Some(&existing)).expect("edit must convert");
+
+        assert_eq!(config.wifi, None);
+    }
+
+    #[test]
+    fn unmanaging_an_interface_with_a_running_ap_requires_explicit_confirmation() {
+        let current = InterfaceConfig {
+            role: InterfaceRole::Output,
+            managed: true,
+            ipv4: Some("192.168.50.1/24".parse().expect("valid cidr")),
+            dhcp: None,
+            dhcp_client: None,
+            wifi: Some(wifi_ap_config_fixture("home-net")),
+            wifi_client: None,
+            nat: true,
+        };
+        let mut new_config = current.clone();
+        new_config.managed = false;
+        new_config.wifi = None;
+
+        let error = ControlService::validate_router_service_management(
+            "wlan0",
+            Some(&current),
+            &new_config,
+            false,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("access point 'home-net'"));
+
+        assert!(ControlService::validate_router_service_management(
+            "wlan0",
+            Some(&current),
+            &new_config,
+            true,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn unmanaging_an_interface_with_no_router_services_needs_no_confirmation() {
+        let current = InterfaceConfig {
+            role: InterfaceRole::Output,
+            managed: true,
+            ipv4: Some("192.168.50.1/24".parse().expect("valid cidr")),
+            dhcp: None,
+            dhcp_client: None,
+            wifi: None,
+            wifi_client: None,
+            nat: true,
+        };
+        let mut new_config = current.clone();
+        new_config.managed = false;
+
+        assert!(ControlService::validate_router_service_management(
+            "wlan0",
+            Some(&current),
+            &new_config,
+            false,
+        )
+        .is_ok());
     }
 
     #[test]

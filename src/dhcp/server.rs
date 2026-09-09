@@ -1,9 +1,17 @@
 use std::net::Ipv4Addr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 
 use crate::dhcp::lease::LeaseManager;
 use crate::dhcp::packet::{DhcpMessageType, DhcpPacket, DHCP_FIXED_HEADER_LEN, DHCP_MAGIC_COOKIE};
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DhcpServerConfig {
@@ -40,7 +48,7 @@ impl DhcpHandler {
             Some(DhcpMessageType::Request) => self.handle_request(&request, mac),
             Some(DhcpMessageType::Decline) => {
                 if let Some(declined) = request.requested_ip().or_else(|| self.leased_ip(mac)) {
-                    self.leases.decline(mac, declined);
+                    self.leases.decline(mac, declined, now_unix());
                 }
                 Ok(None)
             }
@@ -481,6 +489,39 @@ mod tests {
             first,
             "a declined address must not be handed out again"
         );
+    }
+
+    #[test]
+    fn decline_for_an_address_leased_to_another_client_is_ignored() {
+        let mut handler = handler();
+        let victim_ip = Ipv4Addr::new(192, 168, 50, 100);
+
+        handler
+            .handle_packet(&PacketBuilder::new(DhcpMessageType::Discover).build())
+            .expect("handler result")
+            .expect("offer for the victim");
+
+        // The attacker claims the victim's already-leased address in a spoofed
+        // DECLINE; it must be rejected rather than evicting and poisoning it.
+        handler
+            .handle_packet(
+                &PacketBuilder::new(DhcpMessageType::Decline)
+                    .mac(OTHER_MAC)
+                    .requested_ip(victim_ip)
+                    .build(),
+            )
+            .expect("handler result");
+
+        let response = handler
+            .handle_packet(
+                &PacketBuilder::new(DhcpMessageType::Request)
+                    .requested_ip(victim_ip)
+                    .build(),
+            )
+            .expect("handler result")
+            .expect("the victim can still renew their own address");
+
+        assert_eq!(response_type(&response), DhcpMessageType::Ack);
     }
 
     #[test]

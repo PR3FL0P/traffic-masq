@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -31,7 +31,9 @@ pub struct LeaseManager {
     leases_by_mac: HashMap<[u8; 6], DhcpLease>,
     leases_by_ip: HashMap<Ipv4Addr, [u8; 6]>,
 
-    declined: HashSet<Ipv4Addr>,
+    // Maps a declined address to the unix timestamp it becomes offerable again.
+    // Without an expiry, a spoofed DECLINE flood would poison the pool forever.
+    declined: HashMap<Ipv4Addr, u64>,
 }
 
 impl LeaseManager {
@@ -44,7 +46,7 @@ impl LeaseManager {
             config,
             leases_by_mac: HashMap::new(),
             leases_by_ip: HashMap::new(),
-            declined: HashSet::new(),
+            declined: HashMap::new(),
         })
     }
 
@@ -95,8 +97,8 @@ impl LeaseManager {
         }
 
         let ip = requested_ip
-            .filter(|&requested_ip| self.is_available_for_mac(requested_ip, mac))
-            .or_else(|| self.first_available_ip(mac))
+            .filter(|&requested_ip| self.is_available_for_mac(requested_ip, mac, now))
+            .or_else(|| self.first_available_ip(mac, now))
             .ok_or_else(|| anyhow::anyhow!("DHCP pool is exhausted"))?;
 
         let lease = DhcpLease {
@@ -114,7 +116,7 @@ impl LeaseManager {
         let now = now_unix();
         self.reclaim_expired(now);
 
-        if !self.is_available_for_mac(ip, mac) {
+        if !self.is_available_for_mac(ip, mac, now) {
             bail!("address {ip} is not available for this client");
         }
 
@@ -138,24 +140,28 @@ impl LeaseManager {
         Some(lease)
     }
 
-    pub fn decline(&mut self, mac: [u8; 6], ip: Ipv4Addr) {
+    /// Only declines `ip` if `mac` is the address's current holder: a DHCPDECLINE
+    /// is otherwise unauthenticated, so accepting one for any address on behalf
+    /// of any MAC would let a spoofed packet evict and permanently poison an
+    /// address that was never offered to the sender.
+    pub fn decline(&mut self, mac: [u8; 6], ip: Ipv4Addr, now_unix: u64) {
         if !self.contains(ip) {
             return;
         }
-        self.declined.insert(ip);
-        if let Some(owner) = self.leases_by_ip.get(&ip).copied() {
-            self.leases_by_ip.remove(&ip);
-            self.leases_by_mac.remove(&owner);
+        if self.leases_by_mac.get(&mac).map(|lease| lease.ip) != Some(ip) {
+            return;
         }
-        if let Some(lease) = self.leases_by_mac.get(&mac) {
-            if lease.ip == ip {
-                self.leases_by_mac.remove(&mac);
-            }
-        }
+
+        self.leases_by_ip.remove(&ip);
+        self.leases_by_mac.remove(&mac);
+        self.declined
+            .insert(ip, now_unix + self.config.lease_time.as_secs());
     }
 
-    pub fn is_declined(&self, ip: Ipv4Addr) -> bool {
-        self.declined.contains(&ip)
+    pub fn is_declined(&self, ip: Ipv4Addr, now_unix: u64) -> bool {
+        self.declined
+            .get(&ip)
+            .is_some_and(|&expires_at| expires_at > now_unix)
     }
 
     pub fn reclaim_expired(&mut self, now_unix: u64) {
@@ -168,19 +174,22 @@ impl LeaseManager {
         for mac in expired_macs {
             self.release(mac);
         }
+
+        self.declined
+            .retain(|_, &mut expires_at| expires_at > now_unix);
     }
 
-    fn first_available_ip(&self, mac: [u8; 6]) -> Option<Ipv4Addr> {
+    fn first_available_ip(&self, mac: [u8; 6], now_unix: u64) -> Option<Ipv4Addr> {
         let start = ipv4_to_u32(self.config.start);
         let end = ipv4_to_u32(self.config.end);
 
         (start..=end)
             .map(u32_to_ipv4)
-            .find(|ip| self.is_available_for_mac(*ip, mac))
+            .find(|ip| self.is_available_for_mac(*ip, mac, now_unix))
     }
 
-    fn is_available_for_mac(&self, ip: Ipv4Addr, mac: [u8; 6]) -> bool {
-        if !self.contains(ip) || self.declined.contains(&ip) {
+    fn is_available_for_mac(&self, ip: Ipv4Addr, mac: [u8; 6], now_unix: u64) -> bool {
+        if !self.contains(ip) || self.is_declined(ip, now_unix) {
             return false;
         }
 
@@ -311,6 +320,35 @@ mod tests {
         let snapshot = manager.snapshot();
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].ip, Ipv4Addr::new(192, 168, 10, 100));
+    }
+
+    #[test]
+    fn decline_is_ignored_unless_the_mac_owns_the_address() {
+        let mut manager = manager();
+        let owner = [1, 2, 3, 4, 5, 6];
+        let attacker = [6, 5, 4, 3, 2, 1];
+        let owned = manager.allocate(owner, None).expect("lease").ip;
+
+        // The attacker never held `owned`, so this must be a no-op rather than
+        // evicting the real owner and poisoning the address.
+        manager.decline(attacker, owned, 0);
+
+        assert!(manager.holds(owner, owned, 0));
+        assert!(!manager.is_declined(owned, 0));
+    }
+
+    #[test]
+    fn declined_address_becomes_available_again_after_the_lease_time() {
+        let mut manager = manager();
+        let mac = [1, 2, 3, 4, 5, 6];
+        let ip = manager.allocate(mac, None).expect("lease").ip;
+
+        manager.decline(mac, ip, 0);
+        assert!(manager.is_declined(ip, 0));
+        assert!(manager.is_declined(ip, 59));
+
+        // lease_time in `manager()` is 60s.
+        assert!(!manager.is_declined(ip, 60));
     }
 
     #[test]

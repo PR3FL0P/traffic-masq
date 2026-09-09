@@ -49,6 +49,12 @@ pub(crate) struct InterfaceEditor {
     /// which addresses saving is about to take off rather than leaving the
     /// operator to guess what "no address" means.
     pub(crate) current_addresses: Vec<String>,
+    /// What the router-owned AP/DHCP currently running on this interface
+    /// look like, so the operator sees exactly what unmanaging it will
+    /// leave stranded (see `validate_router_service_management` on the
+    /// daemon side, which refuses the save outright unless confirmed).
+    pub(crate) current_wifi_summary: Option<String>,
+    pub(crate) current_dhcp_summary: Option<String>,
 }
 
 impl InterfaceEditor {
@@ -96,6 +102,21 @@ impl InterfaceEditor {
         {
             anyhow::bail!(
                 "this interface carries the default route; enable 'Allow management change' to confirm the connectivity risk"
+            );
+        }
+        if self.original_managed
+            && (!self.managed || self.role != InterfaceRole::Output)
+            && !self.allow_management_change
+            && (self.current_wifi_summary.is_some() || self.current_dhcp_summary.is_some())
+        {
+            let running = [&self.current_wifi_summary, &self.current_dhcp_summary]
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" and ");
+            anyhow::bail!(
+                "this interface still runs {running} started by the router; enable 'Allow management change' to confirm"
             );
         }
         Ok(InterfaceEditRequest {
@@ -273,6 +294,29 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         } else {
             (
                 "Cannot save: this interface carries the default route; enable Allow management change to confirm",
+                theme::BAD,
+            )
+        };
+        lines.push(Line::styled(message, Style::default().fg(color)));
+    }
+    if editor.original_managed
+        && (!editor.managed || editor.role != InterfaceRole::Output)
+        && (editor.current_wifi_summary.is_some() || editor.current_dhcp_summary.is_some())
+    {
+        let running = [&editor.current_wifi_summary, &editor.current_dhcp_summary]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" and ");
+        let (message, color) = if editor.allow_management_change {
+            (
+                format!("Router-started {running} on this interface will keep running until you re-apply the router config"),
+                theme::WARN,
+            )
+        } else {
+            (
+                format!("Cannot save: this interface still runs {running} started by the router; enable Allow management change to confirm"),
                 theme::BAD,
             )
         };
@@ -560,6 +604,14 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
             let original_role = config
                 .as_ref()
                 .map_or(InterfaceRole::Output, |interface| interface.role);
+            let current_wifi_summary = config
+                .as_ref()
+                .and_then(|interface| interface.wifi.as_ref())
+                .map(|wifi| format!("access point '{}'", wifi.ssid));
+            let current_dhcp_summary = config
+                .as_ref()
+                .and_then(|interface| interface.dhcp.as_ref())
+                .map(|dhcp| format!("DHCP pool {}-{}", dhcp.pool_start, dhcp.pool_end));
             app.editor = Some(InterfaceEditor {
                 interface: name,
                 field: InterfaceEditorField::Cidr,
@@ -572,6 +624,8 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
                 original_cidr,
                 original_role,
                 current_addresses,
+                current_wifi_summary,
+                current_dhcp_summary,
             });
             app.preview = None;
             app.screen = Screen::InterfaceEditor;
@@ -792,6 +846,8 @@ mod tests {
             original_cidr: "192.168.1.10/24".into(),
             original_role: InterfaceRole::Output,
             current_addresses: vec!["192.168.1.10/24".into()],
+            current_wifi_summary: None,
+            current_dhcp_summary: None,
         }
     }
 
