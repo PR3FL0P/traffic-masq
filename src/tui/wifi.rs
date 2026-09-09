@@ -3,6 +3,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
+use zeroize::Zeroize;
 
 use crate::api::client::ApiClient;
 use crate::api::model::{
@@ -100,7 +101,7 @@ fn move_field<T: Copy + PartialEq>(fields: &[T], field: T, forward: bool) -> T {
     }]
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct WifiEditor {
     pub(crate) interface: String,
     pub(crate) field: WifiField,
@@ -110,6 +111,20 @@ pub(crate) struct WifiEditor {
     pub(crate) country_code: String,
     pub(crate) existing: bool,
     pub(crate) configure_dhcp: bool,
+    original_spec: Option<crate::wifi::WifiApSpec>,
+}
+
+impl Drop for WifiEditor {
+    fn drop(&mut self) {
+        self.passphrase.zeroize();
+    }
+}
+impl std::fmt::Debug for WifiEditor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WifiEditor")
+            .field("interface", &self.interface)
+            .finish_non_exhaustive()
+    }
 }
 
 impl WifiEditor {
@@ -132,7 +147,8 @@ impl WifiEditor {
             passphrase: String::new(),
             country_code,
             existing: row.ap.is_some(),
-            configure_dhcp: CONFIGURE_DHCP_BY_DEFAULT,
+            configure_dhcp: row.ap.is_none() && CONFIGURE_DHCP_BY_DEFAULT,
+            original_spec: row.ap.as_ref().map(|status| status.spec.clone()),
         }
     }
 
@@ -165,6 +181,7 @@ pub(crate) struct WifiProfilesView {
     pub(crate) selected: usize,
 
     pub(crate) selected_profile: usize,
+    pub(crate) delete_confirmation: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,7 +205,7 @@ const PROFILE_FIELDS: [ProfileField; 7] = [
     ProfileField::Save,
 ];
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct WifiProfileEditor {
     pub(crate) interface: String,
     pub(crate) original_id: Option<String>,
@@ -200,6 +217,19 @@ pub(crate) struct WifiProfileEditor {
     pub(crate) priority: String,
     pub(crate) passphrase: String,
     pub(crate) has_passphrase: bool,
+}
+
+impl Drop for WifiProfileEditor {
+    fn drop(&mut self) {
+        self.passphrase.zeroize();
+    }
+}
+impl std::fmt::Debug for WifiProfileEditor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WifiProfileEditor")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl WifiProfileEditor {
@@ -420,8 +450,41 @@ async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
     match action {
         PrimaryAction::ConfigureAp => {
             if !subsystem_disabled(app, row.role) {
-                app.wifi_editor = Some(WifiEditor::from_row(&row));
-                app.screen = Screen::WifiEditor;
+                match client
+                    .request(&Request::GetInterfaceConfig {
+                        interface: row.interface.clone(),
+                    })
+                    .await
+                {
+                    Ok(Response::InterfaceConfig {
+                        config: Some(config),
+                        ..
+                    }) => {
+                        let spec = match crate::wifi::WifiApSpec::from_interface_config(
+                            &row.interface,
+                            &config,
+                        ) {
+                            Ok(spec) => spec,
+                            Err(error) => {
+                                app.push_message(LogLevel::Error, error.to_string());
+                                return;
+                            }
+                        };
+                        let mut editor = WifiEditor::from_row(&row);
+                        editor.existing = spec.is_some();
+                        editor.configure_dhcp = spec.is_none() && config.dhcp.is_none();
+                        if let Some(spec) = &spec {
+                            editor.ssid = spec.ssid.clone();
+                            editor.security = spec.security;
+                            editor.country_code = spec.country_code.clone().unwrap_or_default();
+                        }
+                        editor.original_spec = spec;
+                        app.wifi_editor = Some(editor);
+                        app.screen = Screen::WifiEditor;
+                    }
+                    Ok(response) => report_unexpected(app, response),
+                    Err(error) => app.push_message(LogLevel::Error, error.to_string()),
+                }
             }
         }
         PrimaryAction::Scan => start_scan(app, client, row.interface).await,
@@ -515,7 +578,16 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
             "Country",
             editor.country_code.clone(),
         ),
-        (WifiField::Apply, "", "Apply AP + passphrase + DHCP".into()),
+        (
+            WifiField::Apply,
+            "",
+            if editor.configure_dhcp {
+                "Apply AP + passphrase + DHCP"
+            } else {
+                "Apply AP; preserve DHCP"
+            }
+            .into(),
+        ),
     ];
     for (field, label, value) in values {
         lines.push(Line::styled(
@@ -527,13 +599,30 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
         ));
     }
     lines.push(Line::from(""));
-    lines.push(Line::styled("DHCP is enabled by default and is automatically derived/applied from the output IPv4: router and pool are derived; DNS is not advertised.", Style::default().fg(theme::WARN)));
     lines.push(Line::styled(
-        "One Enter on Apply provisions the AP, passphrase, and DHCP atomically.",
+        if editor.configure_dhcp {
+            "Creates derived DHCP from output IPv4; DNS is not advertised."
+        } else {
+            "Existing radio settings and DHCP are preserved."
+        },
+        Style::default().fg(theme::WARN),
+    ));
+    lines.push(Line::styled(
+        "Apply updates the AP immediately; no commit-confirm timer is provided by this API.",
         Style::default().fg(theme::MUTED),
     ));
     frame.render_widget(
-        Paragraph::new(lines).block(panel(&format!("Access point on {}", editor.interface))),
+        Paragraph::new(
+            lines
+                .clone()
+                .into_iter()
+                .skip(super::layout::focused_lines_offset(
+                    &lines,
+                    area.height.saturating_sub(2),
+                ))
+                .collect::<Vec<_>>(),
+        )
+        .block(panel(&format!("Access point on {}", editor.interface))),
         area,
     );
 }
@@ -578,13 +667,28 @@ fn ap_provision_request(editor: &WifiEditor) -> Request {
         settings: WifiEditRequest {
             ssid: editor.ssid.clone(),
             country_code: editor.country_code(),
-            band: DEFAULT_BAND,
-            channel: DEFAULT_CHANNEL,
-            channel_width: DEFAULT_CHANNEL_WIDTH,
+            band: editor
+                .original_spec
+                .as_ref()
+                .map_or(DEFAULT_BAND, |s| s.band),
+            channel: editor
+                .original_spec
+                .as_ref()
+                .map_or(DEFAULT_CHANNEL, |s| s.channel),
+            channel_width: editor
+                .original_spec
+                .as_ref()
+                .map_or(DEFAULT_CHANNEL_WIDTH, |s| s.channel_width),
             security: editor.security,
-            hidden: false,
-            client_isolation: false,
-            max_stations: DEFAULT_MAX_STATIONS,
+            hidden: editor.original_spec.as_ref().is_some_and(|s| s.hidden),
+            client_isolation: editor
+                .original_spec
+                .as_ref()
+                .is_some_and(|s| s.client_isolation),
+            max_stations: editor
+                .original_spec
+                .as_ref()
+                .map_or(DEFAULT_MAX_STATIONS, |s| s.max_stations),
         },
         passphrase: (!editor.passphrase.is_empty()).then(|| editor.passphrase.clone()),
         configure_dhcp: editor.configure_dhcp,
@@ -651,6 +755,15 @@ async fn start_scan(app: &mut TuiApp, client: &ApiClient, interface: String) {
 
 pub(crate) fn render_wifi_scan(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
     let Some(scan) = &app.wifi_scan else { return };
+    let block = panel(&format!("Scan results on {}", scan.interface));
+    let inner = block.inner(area);
+    let offset = scan
+        .selected
+        .saturating_sub(inner.height.saturating_sub(1) as usize);
+    app.ui.list_area = Some(inner);
+    app.ui.list_count = scan.networks.len();
+    app.ui.list_row_height = 1;
+    app.ui.list_scroll_offset = offset;
     let lines = scan
         .networks
         .iter()
@@ -673,7 +786,7 @@ pub(crate) fn render_wifi_scan(frame: &mut ratatui::Frame<'_>, area: Rect, app: 
         })
         .collect::<Vec<_>>();
     frame.render_widget(
-        Paragraph::new(lines).block(panel(&format!("Scan results on {}", scan.interface))),
+        Paragraph::new(lines.into_iter().skip(offset).collect::<Vec<_>>()).block(block),
         area,
     );
 }
@@ -713,6 +826,7 @@ async fn open_profiles(app: &mut TuiApp, client: &ApiClient, interface: String) 
         Ok(Response::WifiClientProfiles { mut profiles }) => {
             profiles.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.id.cmp(&b.id)));
             app.wifi_profiles = Some(WifiProfilesView {
+                delete_confirmation: None,
                 interface,
                 profiles,
                 selected: 0,
@@ -732,6 +846,24 @@ pub(crate) fn render_wifi_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, a
     let Some(view) = &app.wifi_profiles else {
         return;
     };
+    let target = view
+        .profiles
+        .get(view.selected_profile)
+        .map_or("none", |p| p.id.as_str());
+    let title = if let Some(id) = &view.delete_confirmation {
+        format!("Delete {id}? Y: confirm, any other key: cancel")
+    } else {
+        format!("Saved profiles — target: {target}")
+    };
+    let block = panel(&title);
+    let inner = block.inner(area);
+    let offset = view
+        .selected
+        .saturating_sub(inner.height.saturating_sub(1) as usize);
+    app.ui.list_area = Some(inner);
+    app.ui.list_count = view.profiles.len() + 5;
+    app.ui.list_row_height = 1;
+    app.ui.list_scroll_offset = offset;
     let mut lines = view
         .profiles
         .iter()
@@ -778,7 +910,7 @@ pub(crate) fn render_wifi_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, a
         ));
     }
     frame.render_widget(
-        Paragraph::new(lines).block(panel("Saved Wi-Fi profiles")),
+        Paragraph::new(lines.into_iter().skip(offset).collect::<Vec<_>>()).block(block),
         area,
     );
 }
@@ -788,6 +920,12 @@ pub(crate) async fn handle_wifi_profiles_key(app: &mut TuiApp, key: KeyCode, cli
         app.screen = Screen::Wifi;
         return;
     };
+    if let Some(id) = view.delete_confirmation.take() {
+        if key == KeyCode::Char('y') || key == KeyCode::Char('Y') {
+            profile_request(app, client, Ok(Request::DeleteWifiClientProfile { id })).await;
+        }
+        return;
+    }
     let limit = view.profiles.len() + 4;
     match key {
         KeyCode::Esc => {
@@ -856,14 +994,18 @@ async fn activate_profile_row(app: &mut TuiApp, client: &ApiClient) {
             profile_request(app, client, request).await;
         }
         3 => {
-            let request = view
-                .profiles
-                .get(view.selected_profile)
-                .map(|profile| Request::DeleteWifiClientProfile {
-                    id: profile.id.clone(),
-                })
-                .ok_or("No saved profile selected");
-            profile_request(app, client, request).await;
+            if let Some(profile) = view.profiles.get(view.selected_profile) {
+                if let Some(current) = app.wifi_profiles.as_mut() {
+                    current.delete_confirmation = Some(profile.id.clone());
+                }
+                app.push_message(
+                    LogLevel::Warn,
+                    format!(
+                        "Delete profile {}? Y confirms; any other key cancels.",
+                        profile.id
+                    ),
+                );
+            }
         }
         4 => {
             profile_request(
@@ -957,7 +1099,17 @@ pub(crate) fn render_wifi_profile_editor(
         })
         .collect::<Vec<_>>();
     frame.render_widget(
-        Paragraph::new(lines).block(panel("Wi-Fi profile editor")),
+        Paragraph::new(
+            lines
+                .clone()
+                .into_iter()
+                .skip(super::layout::focused_lines_offset(
+                    &lines,
+                    area.height.saturating_sub(2),
+                ))
+                .collect::<Vec<_>>(),
+        )
+        .block(panel("Wi-Fi profile editor")),
         area,
     );
 }
@@ -1015,7 +1167,7 @@ async fn save_profile(app: &mut TuiApp, client: &ApiClient) {
             return;
         }
     };
-    let request = if let Some(id) = editor.original_id {
+    let request = if let Some(id) = editor.original_id.clone() {
         Request::UpdateWifiClientProfile { id, profile }
     } else {
         Request::CreateWifiClientProfile { profile }
@@ -1024,7 +1176,7 @@ async fn save_profile(app: &mut TuiApp, client: &ApiClient) {
         Ok(Response::WifiClientProfile { .. }) => {
             app.push_message(LogLevel::Info, "Wi-Fi profile saved");
             app.wifi_profile_editor = None;
-            open_profiles(app, client, editor.interface).await;
+            open_profiles(app, client, editor.interface.clone()).await;
         }
         Ok(Response::WifiClientProfileError { detail }) => {
             app.push_message(LogLevel::Error, format!("{detail:?}"))
@@ -1408,6 +1560,136 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn existing_ap_request_preserves_unedited_radio_settings() {
+        let row = WifiRow {
+            interface: "wlan0".into(),
+            role: WifiRole::AccessPoint,
+            ap: None,
+            client: None,
+        };
+        let mut editor = WifiEditor::from_row(&row);
+        editor.original_spec = Some(crate::wifi::WifiApSpec {
+            interface: "wlan0".into(),
+            ssid: "old".into(),
+            country_code: Some("US".into()),
+            band: WifiBand::Ghz5,
+            channel: 36,
+            channel_width: WifiChannelWidth::Ht20,
+            security: WifiSecurity::Wpa2,
+            hidden: true,
+            client_isolation: true,
+            max_stations: 7,
+            passphrase_file: None,
+        });
+        editor.existing = true;
+        editor.configure_dhcp = false;
+        editor.ssid = "new".into();
+        if let Request::ProvisionWifiAccessPoint {
+            settings,
+            configure_dhcp,
+            ..
+        } = ap_provision_request(&editor)
+        {
+            assert_eq!(settings.ssid, "new");
+            assert_eq!(settings.band, WifiBand::Ghz5);
+            assert_eq!(settings.channel, 36);
+            assert!(settings.hidden && settings.client_isolation);
+            assert_eq!(settings.max_stations, 7);
+            assert!(!configure_dhcp);
+        } else {
+            panic!("wrong request");
+        }
+        editor.passphrase = "never-print-this".into();
+        assert!(!format!("{editor:?}").contains("never-print-this"));
+    }
+
+    #[test]
+    fn scan_scrolls_selected_network_into_view() {
+        let mut app = TuiApp::default();
+        app.wifi_scan = Some(WifiScanPicker {
+            interface: "wlan0".into(),
+            networks: (0..40)
+                .map(|i| {
+                    scan(
+                        &format!("network-{i}"),
+                        -40,
+                        WpaSupplicantScanSecurity::Open,
+                        "00:00:00:00:00:01",
+                    )
+                })
+                .collect(),
+            selected: 39,
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 15)).unwrap();
+        terminal
+            .draw(|frame| render_wifi_scan(frame, frame.area(), &mut app))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("network-39"));
+        assert!(app.ui.list_scroll_offset > 0);
+    }
+
+    #[tokio::test]
+    async fn long_profile_list_keeps_delete_visible_and_requires_confirmation() {
+        let mut app = TuiApp::default();
+        app.wifi_profiles = Some(WifiProfilesView {
+            interface: "wlan0".into(),
+            selected: 43,
+            selected_profile: 39,
+            delete_confirmation: None,
+            profiles: (0..40)
+                .map(|i| WifiClientProfileSummary {
+                    id: format!("p{i}"),
+                    ssid: format!("network{i}"),
+                    country_code: None,
+                    security: WifiClientSecurity::Open,
+                    priority: 0,
+                    created_at: 0,
+                    modified_at: 0,
+                    has_passphrase: false,
+                })
+                .collect(),
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 15)).unwrap();
+        terminal
+            .draw(|frame| render_wifi_profiles(frame, frame.area(), &mut app))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Delete selected"));
+        let client = ApiClient::new("/nonexistent.sock");
+        activate_profile_row(&mut app, &client).await;
+        assert_eq!(
+            app.wifi_profiles
+                .as_ref()
+                .unwrap()
+                .delete_confirmation
+                .as_deref(),
+            Some("p39")
+        );
+        handle_wifi_profiles_key(&mut app, KeyCode::Esc, &client).await;
+        assert!(app
+            .wifi_profiles
+            .as_ref()
+            .unwrap()
+            .delete_confirmation
+            .is_none());
     }
 
     #[test]

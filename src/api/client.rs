@@ -137,6 +137,21 @@ impl ApiClient {
     }
 
     async fn send(&self, method: Method, path: &str, body: Option<Vec<u8>>) -> Result<RawResponse> {
+        let response = tokio::time::timeout(std::time::Duration::from_secs(10), self.send_inner(method, path, body))
+            .await
+            .context("API request timed out; operation outcome may be unknown. Inspect current state before retrying")??;
+        if response.status == StatusCode::UNAUTHORIZED {
+            *self.token.write().await = None;
+        }
+        Ok(response)
+    }
+
+    async fn send_inner(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<RawResponse> {
         let token = self.token.read().await.clone();
         let stream = UnixStream::connect(&self.socket_path)
             .await
@@ -149,7 +164,8 @@ impl ApiClient {
         let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
             .await
             .context("failed to establish HTTP/1 connection to the API")?;
-        let connection_task = tokio::spawn(connection);
+        let mut connection_task = tokio::spawn(connection);
+        let _abort_on_drop = AbortConnection(connection_task.abort_handle());
 
         let has_json_body = body.is_some();
         let mut builder = HttpRequest::builder()
@@ -171,7 +187,7 @@ impl ApiClient {
             Ok(response) => response,
             Err(error) => {
                 drop(sender);
-                let _ = connection_task.await;
+                connection_task.abort();
                 return Err(error).context("failed to send request to the API");
             }
         };
@@ -185,7 +201,7 @@ impl ApiClient {
             .map_err(|error| {
                 anyhow::anyhow!("failed to read API response body (maximum size is 1 MiB): {error}")
             });
-        let connection_result = connection_task.await;
+        let connection_result = (&mut connection_task).await;
 
         let body = body_result?;
         connection_result
@@ -193,6 +209,13 @@ impl ApiClient {
             .context("API HTTP connection failed")?;
 
         Ok(RawResponse { status, body })
+    }
+}
+
+struct AbortConnection(tokio::task::AbortHandle);
+impl Drop for AbortConnection {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -867,6 +890,32 @@ fn encode_path_segment(segment: &str) -> String {
 mod tests {
     use super::*;
     use crate::api::model::Request;
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_api_times_out_and_closes_connection() {
+        use tokio::io::AsyncReadExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let client = ApiClient::new(path);
+        let request = tokio::spawn(async move { client.request(&Request::Ping).await });
+        let (mut peer, _) = listener.accept().await.unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(11)).await;
+        assert!(request
+            .await
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("timed out"));
+        let mut bytes = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            peer.read_to_end(&mut bytes),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
 
     #[test]
     fn percent_encodes_path_segments() {

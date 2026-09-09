@@ -19,8 +19,17 @@ pub(crate) fn panel(title: &str) -> Block<'static> {
         .border_style(Style::default().fg(theme::BORDER))
 }
 
+pub(crate) fn focused_lines_offset(lines: &[Line<'_>], height: u16) -> usize {
+    lines
+        .iter()
+        .position(|line| line.spans.iter().any(|span| span.content.starts_with("▶ ")))
+        .unwrap_or(0)
+        .saturating_sub(height.saturating_sub(1) as usize)
+}
+
 #[derive(Debug, Default, Clone)]
 pub(crate) struct UiLayout {
+    pub(crate) input_enabled: bool,
     pub(crate) tabs: [Rect; SECTIONS.len()],
     pub(crate) list_area: Option<Rect>,
     pub(crate) list_row_height: u16,
@@ -140,7 +149,8 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Tu
     };
 
     frame.render_widget(
-        Paragraph::new(vec![Line::from(spans), message_line]).block(panel("Status")),
+        Paragraph::new(vec![Line::from(spans), message_line])
+            .block(panel("Status — F1: full message")),
         area,
     );
 }

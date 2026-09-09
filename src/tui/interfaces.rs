@@ -353,34 +353,31 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
     let block = panel("Interface editor");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    app.ui.buttons.push((
-        Rect {
-            x: inner.x,
-            y: inner.y + button_row_index,
-            width: SAVE_LABEL.len() as u16,
-            height: 1,
-        },
-        0,
-    ));
-    app.ui.buttons.push((
-        Rect {
-            x: inner.x,
-            y: inner.y + remove_row_index,
-            width: REMOVE_IPV4_LABEL.len() as u16 + 2,
-            height: 1,
-        },
-        REMOVE_IPV4_BUTTON_SLOT,
-    ));
-    app.ui.buttons.push((
-        Rect {
-            x: inner.x,
-            y: inner.y + lines.len() as u16 + 1,
-            width: PREVIEW_CANCEL_LABEL.len() as u16 + 2,
-            height: 1,
-        },
-        1,
-    ));
-    frame.render_widget(Paragraph::new(lines), inner);
+    let offset = super::layout::focused_lines_offset(&lines, inner.height);
+    for (row, width, slot) in [
+        (button_row_index, SAVE_LABEL.len(), 0),
+        (
+            remove_row_index,
+            REMOVE_IPV4_LABEL.len() + 2,
+            REMOVE_IPV4_BUTTON_SLOT,
+        ),
+    ] {
+        if row as usize >= offset && (row as usize) < offset + inner.height as usize {
+            app.ui.buttons.push((
+                Rect::new(
+                    inner.x,
+                    inner.y + (row as usize - offset) as u16,
+                    (width as u16).min(inner.width),
+                    1,
+                ),
+                slot,
+            ));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines.into_iter().skip(offset).collect::<Vec<_>>()),
+        inner,
+    );
 }
 
 const PREVIEW_APPLY_LABEL: &str = "Apply";
@@ -806,8 +803,6 @@ async fn finish_pending(app: &mut TuiApp, client: &ApiClient, commit: bool) {
         }
         Ok(Response::Error { message }) => {
             app.push_message(LogLevel::Error, message);
-            app.pending = None;
-            app.screen = Screen::Dashboard;
         }
         Ok(response) => app.push_message(
             LogLevel::Error,

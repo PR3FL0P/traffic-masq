@@ -343,6 +343,12 @@ pub(crate) struct PasswordChangeEditor {
     pub(crate) confirm: String,
 }
 
+impl Drop for PasswordChangeEditor {
+    fn drop(&mut self) {
+        self.zeroize_all();
+    }
+}
+
 impl PasswordChangeEditor {
     fn new() -> Self {
         Self {

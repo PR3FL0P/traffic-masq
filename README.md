@@ -125,18 +125,55 @@ Run either kind on a host you can afford to disturb.
 
 ## Install
 
+Build or unpack a release with both binaries in the same directory, then run:
+
 ```sh
-sudo ./packaging/install.sh
+sudo ./traffic-masqd install
 ```
 
-The installer creates the `traffic-masq` access group, adds the user invoking
-`sudo`, creates `/etc/traffic-masq/config.toml` when absent, and configures the
-daemon socket for that group. Sign out and back in once after the first install
-so the new group membership takes effect.
+The English-language wizard selects a local TUI user, dependency checks, initial
+password, and optional immediate startup. It shows the complete plan before it
+changes the machine. Dependency presets only check/install prerequisites; they
+never activate routing, Wi-Fi, VPN, DHCP, or interface management.
 
-The installation script installs the binaries and documentation and prepares
-local group access to the daemon socket. It does not install a system service
-or start the daemon automatically.
+For unattended installation, every ambiguous security choice is explicit:
+
+```sh
+sudo ./traffic-masqd install --non-interactive --user alex \
+  --dependency-presets router,wifi-ap --install-deps \
+  --password-file /run/secrets/traffic-masq-password --start
+```
+
+Use `--skip-user-access` instead of `--user`, and `--defer-password` instead of
+`--password-file`, when intentional. Omitted presets default to `router`;
+dependency installation and startup default to off. `--prefix` defaults to
+`/usr/local`, while `--config` defaults to `/etc/traffic-masq/config.toml` and
+remains the daemon's global option. `--dry-run` prints the same preflight plan
+without modifying files, accounts, packages, or processes.
+Password files must be regular, non-symlink files with no group or other access;
+their contents never appear in arguments, plans, logs, or errors.
+
+The installer preserves existing configuration, credentials, profiles, state,
+and ownership journals. It refuses replacement while the daemon is running and
+refuses a conflicting configured socket group. A newly created configuration
+manages no interfaces. Adding a user to `traffic-masq` requires signing out and
+back in before that session can access the socket.
+
+Automatic package commands are currently supported for apt, dnf, and pacman.
+On apt systems, missing Wi-Fi packages must be installed manually because their
+package hooks may start competing services. Unknown package managers receive a
+manual-install diagnostic. DHCP is built in, WireGuard uses netlink, and neither
+DHCP clients nor `wireguard-tools` are installed. Kernel support checks are
+diagnostic because an unloaded module makes absence inconclusive.
+
+No init system is required or configured. `--start` starts the daemon now and
+waits for API readiness; boot autostart remains future work. The compatibility
+`packaging/install.sh` delegates host installs to this command and retains
+`DESTDIR`, `PREFIX`, and `BINARY_DIR` for side-effect-free package staging.
+
+The repository currently has no release-archive automation. Release publishing
+must still package the two ready-built binaries together; target machines do
+not need Rust or a C compiler.
 
 ## Configuration
 
@@ -202,6 +239,22 @@ Later sessions may run without root if the user can access the daemon socket:
 ```sh
 traffic-masq
 ```
+
+The TUI keeps operation messages visible; press F1 to read a full message and
+use Up/Down to scroll it. Finish a form or leave it with Esc before changing
+tabs. Long Wi-Fi lists scroll with the selection; deleting a profile requires
+an explicit Y confirmation naming the profile.
+
+During an API refresh, input takes priority. While an action is in progress,
+the TUI shows its elapsed time and rejects additional actions; Q requests exit
+after the result. A timeout does not prove that a change failed: inspect the
+current state before retrying. An expired session offers login again without
+discarding drafts or extending rollback deadlines. Windows smaller than 60×15
+disable hidden controls; Q still exits.
+
+Editing an existing AP preserves unedited radio settings and DHCP. Creating a
+new AP only derives DHCP when none is configured. AP Apply uses the existing
+immediate API; it does not offer the interface/router commit-confirm timer.
 
 ## Daemon commands
 

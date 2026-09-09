@@ -1210,6 +1210,12 @@ impl ControlService {
 
         let mut desired_interface = previous_interface.clone();
         desired_interface.wifi = Some(wifi_edit_request_to_config(settings));
+        if let (Some(next), Some(previous)) = (
+            desired_interface.wifi.as_mut(),
+            previous_interface.wifi.as_ref(),
+        ) {
+            next.passphrase_file = previous.passphrase_file.clone();
+        }
         let spec = match WifiApSpec::from_interface_config(&interface, &desired_interface) {
             Ok(Some(spec)) => spec,
             Ok(None) => unreachable!("managed output checked above"),

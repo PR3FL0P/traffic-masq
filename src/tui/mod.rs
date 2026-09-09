@@ -207,6 +207,8 @@ struct TuiApp {
     traffic: HashMap<u32, dashboard::TrafficHistory>,
     ui: UiLayout,
     message: Option<String>,
+    message_open: bool,
+    message_scroll: u16,
     should_quit: bool,
     logs: VecDeque<logs::LogEntry>,
     logs_scroll: usize,
@@ -245,6 +247,8 @@ impl Default for TuiApp {
             traffic: HashMap::new(),
             ui: UiLayout::default(),
             message: None,
+            message_open: false,
+            message_scroll: 0,
             should_quit: false,
             logs: VecDeque::new(),
             logs_scroll: 0,
@@ -309,6 +313,16 @@ pub async fn change_device_password(socket_path: PathBuf) -> Result<()> {
     Ok(())
 }
 
+struct TerminalGuard;
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+        let _ = execute!(io::stdout(), crossterm::cursor::Show);
+    }
+}
+
 pub async fn run_tui(socket_path: PathBuf, direct: bool) -> Result<()> {
     let client = ApiClient::new(socket_path);
     if !direct {
@@ -322,6 +336,9 @@ pub async fn run_tui(socket_path: PathBuf, direct: bool) -> Result<()> {
             password.zeroize();
             login_result?;
         } else {
+            if !nix::unistd::Uid::effective().is_root() {
+                anyhow::bail!("Initial password setup requires root. Run sudo traffic-masqd auth set-password while the daemon is stopped, then restart it and run this TUI as your authorized user.");
+            }
             println!(
                 "First-time setup: run this TUI as root to initialize the shared device password."
             );
@@ -341,6 +358,7 @@ pub async fn run_tui(socket_path: PathBuf, direct: bool) -> Result<()> {
     }
 
     enable_raw_mode()?;
+    let terminal_guard = TerminalGuard;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
@@ -348,13 +366,7 @@ pub async fn run_tui(socket_path: PathBuf, direct: bool) -> Result<()> {
 
     let result = run_loop(&mut terminal, &client, direct).await;
 
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+    drop(terminal_guard);
 
     if !direct {
         if let Err(error) = client.logout().await {
@@ -377,54 +389,91 @@ async fn run_loop(
     let mut app = TuiApp::default();
 
     while !app.should_quit {
-        app.dashboard = if direct {
-            load_direct_dashboard(direct_network.as_ref()).await
-        } else {
-            load_daemon_dashboard(client).await
-        };
-        normalize_selection(&mut app);
-        refresh_pending_screen(&mut app);
-        dashboard::record_traffic_samples(&mut app);
+        if !direct && !client.is_authenticated().await {
+            if !reauthenticate(terminal, client, pending_deadline(&app)).await? {
+                break;
+            }
+            app.push_message(
+                LogLevel::Info,
+                "Authenticated again. Inspect pending state before retrying any operation.",
+            );
+        }
+        let snapshot = terminal
+            .draw(|frame| render(frame, &mut app, direct))?
+            .buffer
+            .clone();
+        let deadline = pending_deadline(&app);
+        let refresh = async {
+            app.dashboard = if direct {
+                load_direct_dashboard(direct_network.as_ref()).await
+            } else {
+                load_daemon_dashboard(client).await
+            };
+            normalize_selection(&mut app);
+            refresh_pending_screen(&mut app);
+            dashboard::record_traffic_samples(&mut app);
 
-        if !direct && matches!(app.screen, Screen::Router | Screen::RouterPlan) {
-            router::load_router_data(&mut app, client).await;
-        }
-        if !direct {
-            router::refresh_router_pending_screen(&mut app, client).await;
-        }
-        if !direct && app.screen == Screen::RouterProvisioningPending {
-            provisioning::refresh_pending(&mut app, client).await;
-        }
-        if !direct && app.screen == Screen::Settings {
-            settings::refresh_settings_status(&mut app, client).await;
-        }
-        if !direct && app.screen == Screen::Access {
-            access::refresh_access_status(&mut app, client).await;
-        }
-        if !direct && app.screen == Screen::Wifi {
-            wifi::load_wifi_data(&mut app, client).await;
-        }
-        if !direct && app.screen == Screen::VpnPolicy {
-            vpn_policy::refresh_vpn_policy_status(&mut app, client).await;
-        }
-        if !direct && app.screen == Screen::DhcpLeases {
-            dhcp::refresh_dhcp_leases(&mut app, client).await;
-        }
-        if !direct && app.screen == Screen::Vpn {
-            vpn::load_vpn_data(&mut app, client).await;
-        }
+            if !direct && matches!(app.screen, Screen::Router | Screen::RouterPlan) {
+                router::load_router_data(&mut app, client).await;
+            }
+            if !direct {
+                router::refresh_router_pending_screen(&mut app, client).await;
+            }
+            if !direct && app.screen == Screen::RouterProvisioningPending {
+                provisioning::refresh_pending(&mut app, client).await;
+            }
+            if !direct && app.screen == Screen::Settings {
+                settings::refresh_settings_status(&mut app, client).await;
+            }
+            if !direct && app.screen == Screen::Access {
+                access::refresh_access_status(&mut app, client).await;
+            }
+            if !direct && app.screen == Screen::Wifi {
+                wifi::load_wifi_data(&mut app, client).await;
+            }
+            if !direct && app.screen == Screen::VpnPolicy {
+                vpn_policy::refresh_vpn_policy_status(&mut app, client).await;
+            }
+            if !direct && app.screen == Screen::DhcpLeases {
+                dhcp::refresh_dhcp_leases(&mut app, client).await;
+            }
+            if !direct && app.screen == Screen::Vpn {
+                vpn::load_vpn_data(&mut app, client).await;
+            }
+        };
+        let queued = drive_ui(terminal, snapshot, deadline, refresh, true).await?;
 
         terminal.draw(|frame| render(frame, &mut app, direct))?;
 
-        if event::poll(Duration::from_millis(250))? {
-            match event::read()? {
-                Event::Key(key) => {
-                    handle_key(&mut app, key.code, client, direct).await;
+        let input = if queued.is_some() {
+            queued
+        } else if event::poll(Duration::from_millis(100))? {
+            Some(event::read()?)
+        } else {
+            None
+        };
+        if let Some(input) = input {
+            let snapshot = terminal
+                .draw(|frame| render(frame, &mut app, direct))?
+                .buffer
+                .clone();
+            let deadline = pending_deadline(&app);
+            let action = async {
+                match input {
+                    Event::Key(key) if key.kind == event::KeyEventKind::Press => {
+                        handle_key(&mut app, key.code, client, direct).await;
+                    }
+                    Event::Mouse(mouse) => {
+                        handle_mouse(&mut app, mouse, client, direct).await;
+                    }
+                    _ => {}
                 }
-                Event::Mouse(mouse) => {
-                    handle_mouse(&mut app, mouse, client, direct).await;
-                }
-                _ => {}
+            };
+            if drive_ui(terminal, snapshot, deadline, action, false)
+                .await?
+                .is_some()
+            {
+                app.should_quit = true;
             }
         }
 
@@ -436,7 +485,138 @@ async fn run_loop(
     Ok(())
 }
 
+// Reads may be cancelled to prioritize input. Actions are never cancelled or
+// retried: a lost response does not imply that a mutation was not applied.
+fn pending_deadline(app: &TuiApp) -> Option<u64> {
+    app.pending
+        .as_ref()
+        .map(|p| p.expires_at_unix)
+        .or_else(|| {
+            app.router_pending.as_ref().map(|p| {
+                p.applied_at_unix
+                    .saturating_add(app.router_rollback_timeout_seconds)
+            })
+        })
+        .or_else(|| provisioning::pending_deadline(app))
+}
+
+async fn drive_ui(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    snapshot: ratatui::buffer::Buffer,
+    deadline: Option<u64>,
+    operation: impl std::future::Future<Output = ()>,
+    cancellable: bool,
+) -> Result<Option<Event>> {
+    tokio::pin!(operation);
+    let started = std::time::Instant::now();
+    let mut exit_requested = None;
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut operation => return Ok(exit_requested),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                terminal.draw(|frame| {
+                    let area = frame.area();
+                    if area == snapshot.area {
+                        *frame.buffer_mut() = snapshot.clone();
+                    }
+                    let remaining = deadline.map(|d| format!("; rollback deadline in {}s (outcome unverified)", d.saturating_sub(current_unix_time()))).unwrap_or_default();
+                    let message = format!("{} {}s{remaining}. {}", if cancellable { "Refreshing; displayed data may be stale" } else { "Operation in progress" }, started.elapsed().as_secs(), if cancellable { "Input interrupts refresh" } else { "Q: exit after result; other actions disabled" });
+                    let banner = ratatui::layout::Rect::new(area.x, area.y + area.height.saturating_sub(2), area.width, area.height.min(2));
+                    frame.render_widget(ratatui::widgets::Clear, banner);
+                    frame.render_widget(Paragraph::new(message).wrap(ratatui::widgets::Wrap { trim: true }), banner);
+                })?;
+                if event::poll(Duration::ZERO)? {
+                    let input = event::read()?;
+                    if matches!(input, Event::Key(k) if k.kind != event::KeyEventKind::Press) { continue; }
+                    if cancellable { return Ok(Some(input)); }
+                    if matches!(input, Event::Key(k) if k.code == KeyCode::Char('q')) { exit_requested = Some(input); }
+                }
+            }
+        }
+    }
+}
+
+async fn reauthenticate(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    client: &ApiClient,
+    deadline: Option<u64>,
+) -> Result<bool> {
+    let mut password = zeroize::Zeroizing::new(String::new());
+    let mut message = "Session expired or revoked. Enter device password; Esc: exit. Drafts are preserved; rollback deadlines continue.".to_string();
+    loop {
+        let snapshot = terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new(format!(
+                        "{message}\nPassword: {}",
+                        "*".repeat(password.chars().count())
+                    ))
+                    .wrap(ratatui::widgets::Wrap { trim: true }),
+                    frame.area(),
+                );
+            })?
+            .buffer
+            .clone();
+        if event::poll(Duration::ZERO)? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind != event::KeyEventKind::Press {
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Esc => return Ok(false),
+                    KeyCode::Char(c) => password.push(c),
+                    KeyCode::Backspace => {
+                        password.pop();
+                    }
+                    KeyCode::Enter => {
+                        let mut result = None;
+                        let exit = drive_ui(
+                            terminal,
+                            snapshot,
+                            deadline,
+                            async {
+                                result = Some(client.login(&password).await);
+                            },
+                            false,
+                        )
+                        .await?;
+                        password.zeroize();
+                        if exit.is_some() {
+                            return Ok(false);
+                        }
+                        match result.context("authentication operation did not finish")? {
+                            Ok(_) => return Ok(true),
+                            Err(error) => message = format!("{error}. Try again; Esc: exit."),
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 async fn navigate_to_section(app: &mut TuiApp, section: Section, client: &ApiClient, direct: bool) {
+    if !matches!(
+        app.screen,
+        Screen::Dashboard
+            | Screen::InterfaceList
+            | Screen::DhcpInterfaceList
+            | Screen::DhcpClient
+            | Screen::Wifi
+            | Screen::Router
+            | Screen::Vpn
+            | Screen::Settings
+            | Screen::Log
+    ) {
+        app.push_message(
+            LogLevel::Warn,
+            "Finish this operation or use Esc before changing tabs.",
+        );
+        return;
+    }
     match section {
         Section::Dashboard => app.screen = Screen::Dashboard,
         Section::Interfaces => app.screen = Screen::InterfaceList,
@@ -510,6 +690,9 @@ async fn navigate_to_section(app: &mut TuiApp, section: Section, client: &ApiCli
 }
 
 async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, direct: bool) {
+    if !app.ui.input_enabled {
+        return;
+    }
     let point = (mouse.column, mouse.row);
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
@@ -555,7 +738,9 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                             Screen::WifiProfiles => {
                                 if let Some(view) = app.wifi_profiles.as_mut() {
                                     view.selected = index;
-                                    view.selected_profile = index;
+                                    if index < view.profiles.len() {
+                                        view.selected_profile = index;
+                                    }
                                 }
                             }
                             _ => {}
@@ -565,6 +750,9 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
             }
         }
         MouseEventKind::ScrollUp => match app.screen {
+            Screen::Wifi => wifi::handle_wifi_key(app, KeyCode::Up, client).await,
+            Screen::WifiScan => wifi::handle_wifi_scan_key(app, KeyCode::Up),
+            Screen::WifiProfiles => wifi::handle_wifi_profiles_key(app, KeyCode::Up, client).await,
             Screen::Dashboard | Screen::InterfaceList | Screen::DhcpInterfaceList => {
                 app.selected_interface = app.selected_interface.saturating_sub(1);
             }
@@ -580,6 +768,11 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
             _ => {}
         },
         MouseEventKind::ScrollDown => match app.screen {
+            Screen::Wifi => wifi::handle_wifi_key(app, KeyCode::Down, client).await,
+            Screen::WifiScan => wifi::handle_wifi_scan_key(app, KeyCode::Down),
+            Screen::WifiProfiles => {
+                wifi::handle_wifi_profiles_key(app, KeyCode::Down, client).await
+            }
             Screen::Dashboard | Screen::InterfaceList | Screen::DhcpInterfaceList
                 if app.selected_interface + 1 < app.dashboard.interfaces.len() =>
             {
@@ -607,11 +800,28 @@ const MIN_TERMINAL_HEIGHT: u16 = 15;
 
 fn render(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp, direct: bool) {
     let area = frame.area();
+    app.ui = UiLayout::default();
     if area.width < MIN_TERMINAL_WIDTH || area.height < MIN_TERMINAL_HEIGHT {
         frame.render_widget(
-            Paragraph::new("Terminal too small — resize to at least 60x15 to continue")
+            Paragraph::new("Terminal too small — resize to at least 60x15. Q: exit. Pending changes keep their original rollback deadlines.")
                 .alignment(Alignment::Center)
                 .style(Style::default().fg(theme::WARN)),
+            area,
+        );
+        return;
+    }
+    app.ui.input_enabled = true;
+    if app.message_open {
+        let text = app
+            .message
+            .as_deref()
+            .or(app.dashboard.error.as_deref())
+            .unwrap_or("No message");
+        frame.render_widget(
+            Paragraph::new(text)
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .scroll((app.message_scroll, 0))
+                .block(layout::panel("Message — Up/Down: scroll; Esc/F1: close")),
             area,
         );
         return;
@@ -621,8 +831,8 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp, direct: bool) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Min(8),
-            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(4),
         ])
         .split(area);
 
@@ -684,7 +894,26 @@ fn focus_action_slot(app: &mut TuiApp, slot: usize) {
 }
 
 async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: bool) {
-    app.message = None;
+    if !app.ui.input_enabled {
+        if key == KeyCode::Char('q') {
+            app.should_quit = true;
+        }
+        return;
+    }
+    if key == KeyCode::F(1) {
+        app.message_open = !app.message_open;
+        app.message_scroll = 0;
+        return;
+    }
+    if app.message_open {
+        match key {
+            KeyCode::Esc => app.message_open = false,
+            KeyCode::Up => app.message_scroll = app.message_scroll.saturating_sub(1),
+            KeyCode::Down => app.message_scroll = app.message_scroll.saturating_add(1),
+            _ => {}
+        }
+        return;
+    }
 
     if matches!(
         app.screen,
@@ -759,6 +988,9 @@ fn refresh_pending_screen(app: &mut TuiApp) {
         app.screen = Screen::Dashboard;
         return;
     };
+    if app.dashboard.error.is_some() {
+        return;
+    }
 
     let still_pending = app
         .dashboard
@@ -768,7 +1000,7 @@ fn refresh_pending_screen(app: &mut TuiApp) {
     if !still_pending && current_unix_time() >= change.expires_at_unix {
         app.push_message(
             LogLevel::Info,
-            "Network change was automatically rolled back",
+            "Network transaction is no longer pending; outcome unknown. Inspect current interface state.",
         );
         app.pending = None;
         app.screen = Screen::Dashboard;
@@ -815,20 +1047,35 @@ async fn load_daemon_dashboard(client: &ApiClient) -> DashboardData {
         }
     };
 
+    use futures_util::StreamExt;
+    let configs = futures_util::stream::iter(interfaces.iter().map(|status| async move {
+        let name = status.interface.name.clone();
+        let result = client
+            .request(&Request::GetInterfaceConfig {
+                interface: name.clone(),
+            })
+            .await;
+        (name, result)
+    }))
+    .buffer_unordered(4)
+    .collect::<Vec<_>>()
+    .await;
     let mut managed = std::collections::HashMap::new();
-    for status in &interfaces {
-        let is_managed = matches!(
-            client
-                .request(&Request::GetInterfaceConfig {
-                    interface: status.interface.name.clone(),
-                })
-                .await,
-            Ok(Response::InterfaceConfig {
-                config: Some(config),
-                ..
-            }) if config.managed
-        );
-        managed.insert(status.interface.name.clone(), is_managed);
+    for (name, result) in configs {
+        match result {
+            Ok(Response::InterfaceConfig { config, .. }) => {
+                managed.insert(name, config.is_some_and(|c| c.managed));
+            }
+            other => {
+                return DashboardData {
+                    interfaces,
+                    error: Some(format!(
+                        "Could not refresh interface configuration: {other:?}"
+                    )),
+                    ..DashboardData::default()
+                }
+            }
+        }
     }
 
     let dhcp_interfaces = match client.request(&Request::DhcpStatus).await {
@@ -966,6 +1213,94 @@ fn current_unix_time() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn footer_message_is_visible_at_supported_sizes() {
+        for (width, height) in [(80, 24), (60, 15)] {
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            let mut app = TuiApp::default();
+            app.push_message(LogLevel::Error, "Validation failed");
+            terminal
+                .draw(|frame| render(frame, &mut app, false))
+                .unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(text.contains("Validation failed"));
+        }
+    }
+
+    #[tokio::test]
+    async fn resize_clears_hit_regions_and_blocks_hidden_actions() {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
+        let mut app = TuiApp::default();
+        app.screen = Screen::Preview;
+        app.ui
+            .buttons
+            .push((ratatui::layout::Rect::new(0, 0, 10, 2), 0));
+        terminal
+            .draw(|frame| render(frame, &mut app, false))
+            .unwrap();
+        assert!(app.ui.buttons.is_empty());
+        assert!(app.ui.list_area.is_none());
+        handle_key(
+            &mut app,
+            KeyCode::Enter,
+            &ApiClient::new("/nonexistent.sock"),
+            false,
+        )
+        .await;
+        assert_eq!(app.screen, Screen::Preview);
+        assert!(!app.ui.input_enabled);
+    }
+
+    #[test]
+    fn disconnected_dashboard_does_not_claim_rollback() {
+        let mut app = TuiApp::default();
+        app.screen = Screen::PendingChange;
+        app.pending = Some(PendingNetworkChange {
+            token: "keep".into(),
+            interface: "eth0".into(),
+            rollback_timeout_seconds: 60,
+            expires_at_unix: 0,
+        });
+        app.dashboard.error = Some("connection lost".into());
+        refresh_pending_screen(&mut app);
+        assert_eq!(app.pending.as_ref().unwrap().token, "keep");
+        assert!(app.message.is_none());
+        app.dashboard.error = None;
+        refresh_pending_screen(&mut app);
+        assert!(app.message.as_ref().unwrap().contains("outcome unknown"));
+    }
+
+    #[tokio::test]
+    async fn tabs_do_not_discard_editor_and_navigation_preserves_message() {
+        let mut app = TuiApp::default();
+        app.screen = Screen::WifiEditor;
+        navigate_to_section(
+            &mut app,
+            Section::Dashboard,
+            &ApiClient::new("/nonexistent.sock"),
+            false,
+        )
+        .await;
+        assert_eq!(app.screen, Screen::WifiEditor);
+        app.ui.input_enabled = true;
+        let message = app.message.clone();
+        handle_key(
+            &mut app,
+            KeyCode::Up,
+            &ApiClient::new("/nonexistent.sock"),
+            false,
+        )
+        .await;
+        assert_eq!(app.message, message);
+    }
 
     #[test]
     fn adjacent_section_cycles_forward_and_backward_through_all_nine() {

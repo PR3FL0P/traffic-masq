@@ -82,7 +82,6 @@ impl NetworkChoice {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct ProvisioningWizard {
     field: Field,
     interfaces: Vec<String>,
@@ -102,6 +101,14 @@ pub(crate) struct ProvisioningWizard {
     show_advanced: bool,
     pending: Option<PendingProvisioning>,
     error: Option<String>,
+}
+
+impl std::fmt::Debug for ProvisioningWizard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProvisioningWizard")
+            .field("field", &self.field)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Drop for ProvisioningWizard {
@@ -667,6 +674,13 @@ pub(crate) async fn refresh_pending(app: &mut TuiApp, client: &ApiClient) {
     {
         pending.status = Some(status);
     }
+}
+
+pub(crate) fn pending_deadline(app: &TuiApp) -> Option<u64> {
+    app.provisioning.as_ref()?.pending.as_ref().map(|p| {
+        p.applied_at_unix
+            .saturating_add(app.router_rollback_timeout_seconds)
+    })
 }
 
 pub(crate) fn render_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &TuiApp) {

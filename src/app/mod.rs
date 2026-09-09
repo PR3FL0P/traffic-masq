@@ -1,3 +1,4 @@
+pub mod installer;
 mod process;
 pub mod service;
 

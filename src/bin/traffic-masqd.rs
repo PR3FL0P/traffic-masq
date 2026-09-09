@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use nix::unistd::Uid;
+use traffic_masq::app::installer::{self, InstallArgs};
 use traffic_masq::app::service::{self, ServiceStatus};
 use traffic_masq::app::{reset_device_password, run_daemon};
 use traffic_masq::config::{AppConfig, ResolvedConfig, DEFAULT_CONFIG_PATH};
@@ -24,6 +25,9 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Install both binaries and prepare safe local configuration
+    Install(InstallArgs),
+
     /// Run the daemon in the foreground
     ///
     /// Keeps the process attached to the current terminal. Logs and startup
@@ -105,6 +109,9 @@ enum ConfigCommand {
 async fn main() -> Result<()> {
     let args = Args::parse();
     let command = args.command.unwrap_or(Command::Run);
+    if let Command::Install(install_args) = &command {
+        return installer::run(install_args.clone(), args.config).await;
+    }
     if let Command::Config {
         command: ConfigCommand::Init { path, force },
     } = &command
@@ -120,6 +127,7 @@ async fn main() -> Result<()> {
     let resolved = ResolvedConfig::load(args.config)?;
     let config = &resolved.config;
     match command {
+        Command::Install(_) => unreachable!("install handled before configuration resolution"),
         Command::Config { command } => match command {
             ConfigCommand::Path => {
                 println!("{}", resolved.source);

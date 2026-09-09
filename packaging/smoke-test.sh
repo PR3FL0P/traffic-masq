@@ -13,8 +13,8 @@ chmod 0755 "$fake_bin/traffic-masqd" "$fake_bin/traffic-masq"
 
 DESTDIR="$stage/root" BINARY_DIR="$fake_bin" "$project_dir/packaging/install.sh"
 
-test -x "$stage/root/usr/sbin/traffic-masqd"
-test -x "$stage/root/usr/bin/traffic-masq"
+test -x "$stage/root/usr/local/sbin/traffic-masqd"
+test -x "$stage/root/usr/local/bin/traffic-masq"
 test ! -e "$stage/root/etc/traffic-masq/config.toml"
 
 DESTDIR="$stage/opt-root" PREFIX=/opt/traffic-masq BINARY_DIR="$fake_bin" \
@@ -25,6 +25,6 @@ test -x "$stage/opt-root/opt/traffic-masq/bin/traffic-masq"
 DESTDIR="$stage/root" "$project_dir/packaging/uninstall.sh"
 DESTDIR="$stage/opt-root" PREFIX=/opt/traffic-masq "$project_dir/packaging/uninstall.sh"
 
-test ! -e "$stage/root/usr/sbin/traffic-masqd"
-test ! -e "$stage/root/usr/bin/traffic-masq"
+test ! -e "$stage/root/usr/local/sbin/traffic-masqd"
+test ! -e "$stage/root/usr/local/bin/traffic-masq"
 printf '%s\n' "packaging staging smoke test passed"

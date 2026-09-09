@@ -2,7 +2,7 @@
 set -eu
 
 destdir=${DESTDIR:-}
-prefix=${PREFIX:-/usr}
+prefix=${PREFIX:-/usr/local}
 
 remove_file() {
     path=$1
