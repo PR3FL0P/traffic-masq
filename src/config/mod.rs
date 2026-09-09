@@ -1,3 +1,10 @@
+//! Loading, validation, and resolution of application configuration.
+//!
+//! Configuration describes runtime directories, network interfaces, DHCP,
+//! Wi-Fi, VPN, firewall, API, and security settings. Values may come from a
+//! TOML file and environment variables; [`ResolvedConfig`] records the source
+//! of each resolved value.
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::net::{Ipv4Addr, SocketAddr};

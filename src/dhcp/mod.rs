@@ -1,3 +1,9 @@
+//! DHCP server, DHCP client, lease storage, and supervisors.
+//!
+//! The subsystem assigns IPv4 addresses to local clients and obtains an
+//! address for an upstream interface. Lease state is persisted and runtime
+//! loops are restarted by supervisors after failures.
+
 pub mod client;
 pub mod lease;
 pub mod packet;

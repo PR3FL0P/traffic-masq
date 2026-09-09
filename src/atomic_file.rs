@@ -20,6 +20,11 @@
 //! Deliberately a leaf: nothing here imports from the rest of the crate, so it
 //! can be used from any layer without creating a dependency edge.
 
+//! Atomic file replacement with symlink checks and Unix permission handling.
+//!
+//! These functions are used for secrets and journals: data is first written
+//! to a temporary file with the requested mode, which then replaces the target.
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -27,9 +32,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Mode for a file only root may read.
+/// Default mode for files containing private daemon state or secrets.
 pub const PRIVATE_FILE_MODE: u32 = 0o600;
 
 /// Mode for a directory only root may traverse.
+/// Default mode for directories containing private daemon state.
 pub const PRIVATE_DIR_MODE: u32 = 0o700;
 
 /// How many names to try before giving up on finding an unused temporary.
@@ -75,6 +82,7 @@ impl std::error::Error for PrivateDirError {}
 /// Refuse a path that is a symlink.
 ///
 /// A missing path is fine — it is the *existing* symlink that is the problem.
+/// Reject a symlink at `path` without following it.
 pub fn reject_symlink(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
@@ -92,6 +100,7 @@ pub fn reject_symlink(path: &Path) -> io::Result<()> {
 /// An existing symlink or non-directory is refused rather than replaced: this
 /// runs as root, and silently writing through whatever is already there is the
 /// whole class of bug the check exists to prevent.
+/// Create a directory if needed and ensure it has the requested private mode.
 pub fn ensure_private_dir(path: &Path, mode: u32) -> Result<(), PrivateDirError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -121,6 +130,7 @@ pub fn ensure_private_dir(path: &Path, mode: u32) -> Result<(), PrivateDirError>
 ///
 /// The parent directory must already exist; use [`ensure_private_dir`] first if
 /// that is not guaranteed.
+/// Atomically replace a regular file while preserving the requested mode.
 pub fn replace(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     reject_symlink(path)?;
@@ -150,6 +160,7 @@ pub fn replace(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
 /// The work is genuinely blocking — three fsyncs — so it goes to the blocking
 /// pool rather than being reimplemented against `tokio::fs`. One implementation
 /// of the delicate part is the point of this module.
+/// Asynchronously perform [`replace`] without blocking the Tokio executor.
 pub async fn replace_async(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
     let path = path.to_path_buf();
     let contents = contents.to_vec();

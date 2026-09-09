@@ -723,7 +723,7 @@ mod tests {
             .expect("apply");
         assert_eq!(
             addresses(&provider).await,
-            vec![Ipv4Addr::new(192, 168, 50, 1)],
+            vec![Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::new(192, 168, 50, 1)],
             "apply must not return before the change has reached the machine"
         );
 
@@ -771,7 +771,7 @@ mod tests {
             .expect("apply");
         assert_eq!(
             addresses(&provider).await,
-            vec![Ipv4Addr::new(192, 168, 50, 1)]
+            vec![Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::new(192, 168, 50, 1)]
         );
 
         tokio::time::sleep(Duration::from_millis(200)).await;

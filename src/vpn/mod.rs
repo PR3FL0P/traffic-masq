@@ -1,3 +1,9 @@
+//! WireGuard profiles, VPN interface management, and ownership verification.
+//!
+//! [`VpnManager`] coordinates profile import, activation, deactivation,
+//! rollback, and reconciliation. The driver is separated from the manager,
+//! allowing policy to be tested without real netlink.
+
 pub mod active_profile;
 pub mod manager;
 mod provider;

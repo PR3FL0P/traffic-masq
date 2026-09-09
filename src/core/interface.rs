@@ -416,11 +416,15 @@ impl InterfaceManager {
             AddressOwnership::Untagged
         };
 
-        let delete_ipv4 = current
-            .iter()
-            .filter(|address| desired != Some((address.address, address.prefix_len)))
-            .cloned()
-            .collect();
+        let mut delete_ipv4 = Vec::new();
+        for address in &current {
+            if desired != Some((address.address, address.prefix_len))
+                && address.owner() != AddressOwner::TrafficMasqDhcp
+                && self.owns_address(name, address).await
+            {
+                delete_ipv4.push(address.clone());
+            }
+        }
 
         let existing_desired = desired.and_then(|(address, prefix_len)| {
             current
@@ -428,16 +432,9 @@ impl InterfaceManager {
                 .find(|item| item.address == address && item.prefix_len == prefix_len)
         });
 
-        // The desired address is already on the link but is not ours yet:
-        // claim it in place. Deleting and re-adding it would drop the address
-        // on every unrelated edit, which on a management interface is a blip
-        // the user never asked for.
-        let retag_ipv4 = existing_desired
-            .filter(|address| can_tag && address.owner() != AddressOwner::TrafficMasqStatic)
-            .map(|address| Ipv4AddressInfo {
-                protocol: ownership.protocol(),
-                ..address.clone()
-            });
+        // An address that predates us belongs to its existing owner. Never
+        // retag it merely because it happens to match our desired address.
+        let retag_ipv4 = None;
 
         let add_ipv4 =
             desired
@@ -697,7 +694,7 @@ impl InterfaceManager {
                 .ipv4_addresses
                 .iter()
                 .any(|previous| same_address(previous, address));
-            if !existed_before {
+            if !existed_before && self.owns_address(&snapshot.name, address).await {
                 tracing::info!(
                     interface = %snapshot.name,
                     address = %describe_address(address),
@@ -965,7 +962,7 @@ mod tests {
             .await
             .expect("removal plan");
 
-        assert_eq!(plan.delete_ipv4, vec![ours, pre_existing]);
+        assert_eq!(plan.delete_ipv4, vec![ours]);
         assert!(plan.add_ipv4.is_none());
         assert!(plan.retag_ipv4.is_none());
         assert!(
@@ -974,11 +971,13 @@ mod tests {
         );
 
         manager.apply_plan(&plan).await.expect("apply the removal");
-        assert!(provider
+        assert_eq!(provider
             .list_ipv4_addresses("eth0")
             .await
             .expect("addresses")
-            .is_empty());
+            .as_slice(),
+            &[pre_existing]
+        );
     }
 
     /// The removal has to be reached by convergence too, not only by the
@@ -1016,11 +1015,11 @@ mod tests {
             .await
             .expect("second pass removes it again");
 
-        assert!(provider
+        assert_eq!(provider
             .list_ipv4_addresses("eth0")
             .await
             .expect("addresses")
-            .is_empty());
+            .len(), 2);
     }
 
     #[tokio::test]
@@ -1412,12 +1411,7 @@ mod tests {
                 "claiming an address must not take it off the link"
             );
             assert!(plan.add_ipv4.is_none());
-            assert_eq!(
-                plan.retag_ipv4
-                    .as_ref()
-                    .and_then(|address| address.protocol),
-                Some(TRAFFIC_MASQ_ADDRESS_PROTOCOL)
-            );
+            assert!(plan.retag_ipv4.is_none());
         }
     }
 
@@ -1449,14 +1443,7 @@ mod tests {
             .list_ipv4_addresses("eth0")
             .await
             .expect("addresses");
-        assert_eq!(
-            addresses,
-            vec![address_with_protocol(
-                "192.168.50.1/24",
-                Some(TRAFFIC_MASQ_ADDRESS_PROTOCOL)
-            )],
-            "the address must be the same one, now tagged — not a replacement"
-        );
+        assert_eq!(addresses, vec![address_with_protocol("192.168.50.1/24", None)]);
     }
 
     #[tokio::test]
@@ -1628,7 +1615,7 @@ mod tests {
             .plan_interface("wan0", &config, Some(InterfaceRole::Input), false)
             .await
             .expect("plan");
-        assert_eq!(plan.delete_ipv4.len(), 1);
+        assert_eq!(plan.delete_ipv4.len(), 0);
         assert!(plan.add_ipv4.is_some());
     }
 
@@ -1660,8 +1647,9 @@ mod tests {
             .list_ipv4_addresses("usb0")
             .await
             .expect("addresses");
-        assert_eq!(applied.len(), 1);
-        assert_eq!(applied[0].address, Ipv4Addr::new(192, 168, 50, 1));
+        assert_eq!(applied.len(), 2);
+        assert!(applied.iter().any(|address| address.address == Ipv4Addr::new(192, 168, 50, 1)));
+        assert!(applied.iter().any(|address| address == &original));
 
         manager.rollback(&snapshot).await.expect("rollback");
         let restored = provider

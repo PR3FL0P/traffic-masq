@@ -1,3 +1,5 @@
+//! Installation, startup, and process lifecycle management.
+
 pub mod installer;
 mod process;
 pub mod service;

@@ -1,3 +1,8 @@
+//! Linux netlink adapter for interfaces, addresses, routes, and rules.
+//!
+//! This module isolates the system netlink API from the core and provides
+//! state inspection, safe IPv4 object installation, and drift events.
+
 pub mod events;
 
 use std::net::{IpAddr, Ipv4Addr};

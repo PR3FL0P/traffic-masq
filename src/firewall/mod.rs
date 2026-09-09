@@ -1,3 +1,8 @@
+//! IPv4 forwarding, NAT, and firewall policies.
+//!
+//! Rules are marked with traffic-masq identifiers, so reconciliation changes
+//! only daemon-owned rules and can restore the original state snapshot.
+
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use ipnet::Ipv4Net;
