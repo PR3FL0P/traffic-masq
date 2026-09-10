@@ -326,6 +326,42 @@ fn suggest_pool(address: Ipv4Addr, prefix_len: u8) -> Option<(Ipv4Addr, Ipv4Addr
     crate::dhcp::defaults::suggest_pool(cidr).ok()
 }
 
+fn is_candidate_ipv4(addr: Ipv4Addr, prefix_len: u8) -> bool {
+    if prefix_len >= 31 {
+        return false;
+    }
+    if addr.is_loopback()
+        || addr.is_link_local()
+        || addr.is_unspecified()
+        || addr.is_broadcast()
+        || addr.is_multicast()
+    {
+        return false;
+    }
+    true
+}
+
+fn candidate_cidr_from_status(status: &crate::api::model::InterfaceStatus) -> Option<ipnet::Ipv4Net> {
+    let owned = status.owned_ipv4_addresses.as_deref().unwrap_or(&[]);
+    let addresses = if !owned.is_empty() {
+        owned
+    } else {
+        &status.ipv4_addresses
+    };
+
+    if let Some(info) = addresses
+        .iter()
+        .find(|info| is_candidate_ipv4(info.address, info.prefix_len) && info.address.is_private())
+    {
+        return ipnet::Ipv4Net::new(info.address, info.prefix_len).ok();
+    }
+
+    addresses
+        .iter()
+        .find(|info| is_candidate_ipv4(info.address, info.prefix_len))
+        .and_then(|info| ipnet::Ipv4Net::new(info.address, info.prefix_len).ok())
+}
+
 pub(crate) async fn open_dhcp_editor(app: &mut TuiApp, client: &ApiClient) {
     let Some(status) = app.dashboard.interfaces.get(app.selected_interface) else {
         return;
@@ -360,7 +396,7 @@ pub(crate) async fn open_dhcp_editor(app: &mut TuiApp, client: &ApiClient) {
         Ok(Response::DhcpConfig { spec: None, .. }) => {
             // Read the effective configuration at editor-open time: the dashboard
             // can still contain addresses from before the user's last edit.
-            let cidr = match client
+            let configured_cidr = match client
                 .request(&Request::GetInterfaceConfig {
                     interface: interface.clone(),
                 })
@@ -387,6 +423,9 @@ pub(crate) async fn open_dhcp_editor(app: &mut TuiApp, client: &ApiClient) {
                     return;
                 }
             };
+            let cidr = configured_cidr
+                .filter(|cidr| is_candidate_ipv4(cidr.addr(), cidr.prefix_len()))
+                .or_else(|| candidate_cidr_from_status(status));
             let router = cidr.map(|cidr| cidr.addr().to_string()).unwrap_or_default();
             let (pool_start, pool_end) = cidr
                 .and_then(|cidr| suggest_pool(cidr.addr(), cidr.prefix_len()))
@@ -701,6 +740,118 @@ mod tests {
             handle_dhcp_editor_key(&mut app, KeyCode::Enter, &client).await;
         }
         assert_eq!(app.dhcp_editor.unwrap().field, DhcpField::Save);
+    }
+
+    #[tokio::test]
+    async fn editor_falls_back_to_status_address_ignoring_link_local() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            for body in [
+                serde_json::json!({"type": "dhcp_config", "interface": "lan0", "spec": null}),
+                serde_json::json!({"type": "interface_config", "interface": "lan0",
+                    "allow_management_change": false,
+                    "config": null}),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                let body = body.to_string();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+            }
+        });
+        let mut app = TuiApp::default();
+        app.dashboard
+            .interfaces
+            .push(crate::api::model::InterfaceStatus {
+                interface: crate::netlink::NetworkInterface {
+                    index: 1,
+                    name: "lan0".into(),
+                    is_up: true,
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    is_wireless: false,
+                },
+                ipv4_addresses: vec![
+                    crate::netlink::Ipv4AddressInfo {
+                        interface_index: 1,
+                        address: "169.254.10.20".parse().unwrap(),
+                        prefix_len: 16,
+                        protocol: None,
+                    },
+                    crate::netlink::Ipv4AddressInfo {
+                        interface_index: 1,
+                        address: "192.168.1.1".parse().unwrap(),
+                        prefix_len: 24,
+                        protocol: None,
+                    },
+                ],
+                owned_ipv4_addresses: None,
+                has_default_route: false,
+            });
+        let client = ApiClient::new(socket);
+        open_dhcp_editor(&mut app, &client).await;
+        server.await.unwrap();
+        let editor = app.dhcp_editor.as_ref().expect("DHCP editor should open");
+        assert_eq!(editor.router, "192.168.1.1");
+        assert_eq!(editor.pool_start, "192.168.1.2");
+        assert_eq!(editor.pool_end, "192.168.1.254");
+    }
+
+    #[tokio::test]
+    async fn editor_leaves_fields_empty_if_only_link_local_address_present() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            for body in [
+                serde_json::json!({"type": "dhcp_config", "interface": "lan0", "spec": null}),
+                serde_json::json!({"type": "interface_config", "interface": "lan0",
+                    "allow_management_change": false,
+                    "config": null}),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                let body = body.to_string();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+            }
+        });
+        let mut app = TuiApp::default();
+        app.dashboard
+            .interfaces
+            .push(crate::api::model::InterfaceStatus {
+                interface: crate::netlink::NetworkInterface {
+                    index: 1,
+                    name: "lan0".into(),
+                    is_up: true,
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    is_wireless: false,
+                },
+                ipv4_addresses: vec![crate::netlink::Ipv4AddressInfo {
+                    interface_index: 1,
+                    address: "169.254.10.20".parse().unwrap(),
+                    prefix_len: 16,
+                    protocol: None,
+                }],
+                owned_ipv4_addresses: None,
+                has_default_route: false,
+            });
+        let client = ApiClient::new(socket);
+        open_dhcp_editor(&mut app, &client).await;
+        server.await.unwrap();
+        let editor = app.dhcp_editor.as_ref().expect("DHCP editor should open");
+        assert_eq!(editor.router, "");
+        assert_eq!(editor.pool_start, "");
+        assert_eq!(editor.pool_end, "");
     }
 
     #[test]
