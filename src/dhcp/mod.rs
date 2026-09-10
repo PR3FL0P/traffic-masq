@@ -5,6 +5,7 @@
 //! loops are restarted by supervisors after failures.
 
 pub mod client;
+pub mod defaults;
 pub mod lease;
 pub mod packet;
 pub mod runtime;

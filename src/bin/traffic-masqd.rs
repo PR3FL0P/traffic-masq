@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use nix::unistd::Uid;
+use traffic_masq::app::init::{self, NativeRunner, ServiceStore};
 use traffic_masq::app::installer::{self, InstallArgs, UninstallArgs};
 use traffic_masq::app::service::{self, ServiceStatus};
 use traffic_masq::app::{reset_device_password, run_daemon};
@@ -38,12 +39,14 @@ enum Command {
     /// suited to development and diagnostics.
     Run,
 
-    /// Start the daemon as a background process
+    /// Start through the installed init service, or detach when none is registered
     ///
     /// Detaches the daemon from the terminal, writes its PID under /run, and
     /// sends logs to the configured log directory. Use `traffic-masqd status`
     /// to inspect it and `traffic-masqd stop` to stop it.
     Start {
+        #[arg(long, hide = true)]
+        direct: bool,
         #[arg(
             long,
             default_value_t = 10,
@@ -52,8 +55,10 @@ enum Command {
         timeout_seconds: u64,
     },
 
-    /// Stop the background daemon and wait for it to exit
+    /// Stop through the installed init service and wait for the daemon to exit
     Stop {
+        #[arg(long, hide = true)]
+        direct: bool,
         #[arg(long, default_value_t = 30)]
         timeout_seconds: u64,
     },
@@ -160,29 +165,60 @@ async fn main() -> Result<()> {
             }
             run_daemon(resolved.config).await
         }
-        Command::Start { timeout_seconds } => {
+        Command::Start {
+            timeout_seconds,
+            direct,
+        } => {
             require_root()?;
             if timeout_seconds == 0 {
                 bail!("start timeout must be greater than zero");
             }
-            let pid = service::start(
-                config,
-                resolved.source.path(),
-                Duration::from_secs(timeout_seconds),
-            )
-            .await?;
+            let registration = if direct {
+                None
+            } else {
+                ServiceStore::host().matching(resolved.source.path())?
+            };
+            let pid = if let Some(registration) = registration {
+                init::start(&registration, config, Duration::from_secs(timeout_seconds)).await?
+            } else {
+                service::start(
+                    config,
+                    resolved.source.path(),
+                    Duration::from_secs(timeout_seconds),
+                )
+                .await?
+            };
             println!(
                 "traffic-masqd started (PID {pid}); config: {}",
                 resolved.source
             );
             Ok(())
         }
-        Command::Stop { timeout_seconds } => {
+        Command::Stop {
+            timeout_seconds,
+            direct,
+        } => {
             require_root()?;
             if timeout_seconds == 0 {
                 bail!("stop timeout must be greater than zero");
             }
-            if service::stop(config, Duration::from_secs(timeout_seconds)).await? {
+            let mut stopped_by_manager = false;
+            if !direct {
+                let store = ServiceStore::host();
+                if let Some(registration) = store.matching(resolved.source.path())? {
+                    store
+                        .stop(
+                            &registration,
+                            &NativeRunner,
+                            Duration::from_secs(timeout_seconds),
+                        )
+                        .await?;
+                    stopped_by_manager = true;
+                }
+            }
+            if service::stop(config, Duration::from_secs(timeout_seconds)).await?
+                || stopped_by_manager
+            {
                 println!("traffic-masqd stopped");
             } else {
                 println!("traffic-masqd is already stopped");

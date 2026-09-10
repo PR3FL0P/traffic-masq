@@ -1,0 +1,29 @@
+#!/bin/sh
+# Managed by traffic-masqd install.
+# chkconfig: 2345 90 10
+# description: traffic-masq network daemon
+### BEGIN INIT INFO
+# Provides: traffic-masqd
+# Required-Start: $local_fs $remote_fs
+# Required-Stop: $local_fs $remote_fs
+# Should-Start: $network
+# Should-Stop: $network
+# Default-Start: 2 3 4 5
+# Default-Stop: 0 1 6
+# Short-Description: traffic-masq network daemon
+### END INIT INFO
+set -eu
+case "${1:-}" in
+    start)
+        if @LAUNCHER@ status >/dev/null 2>&1; then exit 0; fi
+        @LAUNCHER@ start --direct
+        ;;
+    stop) @LAUNCHER@ stop --direct --timeout-seconds 60 ;;
+    status) @LAUNCHER@ status ;;
+    restart|force-reload)
+        @LAUNCHER@ config validate
+        @LAUNCHER@ stop --direct --timeout-seconds 60
+        @LAUNCHER@ start --direct
+        ;;
+    *) echo "Usage: $0 {start|stop|status|restart|force-reload}" >&2; exit 2 ;;
+esac

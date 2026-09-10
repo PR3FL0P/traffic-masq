@@ -43,7 +43,8 @@ Known limits, so they are not discovered later:
 - IPv4 only. IPv6 addresses and routes are not managed; the WireGuard
   configuration is the one place IPv6 appears.
 - One machine. There is no fleet or central management.
-- No system service unit is installed; the daemon is started by hand.
+- Boot service integration supports systemd, OpenRC, runit and SysVinit;
+  other init systems use manual startup.
 
 ## Requirements
 
@@ -132,8 +133,14 @@ Build or unpack a release with both binaries in the same directory, then run:
 sudo ./traffic-masqd install
 ```
 
-The English-language wizard selects a local TUI user, dependency checks, initial
-password, and optional immediate startup. It shows the complete plan before it
+The English-language wizard can be completed by pressing Enter at each prompt:
+use the invoking sudo user for TUI access (root-only access when none is known),
+select routing dependencies, install missing packages, start the daemon, enable
+boot autostart using the detected init system, skip advanced settings, defer
+password setup, and apply the displayed plan.
+Initialize the password afterward using `sudo /usr/local/bin/traffic-masq`;
+initialization requires a local root client and has no default password.
+Wi-Fi and WireGuard dependency presets remain opt-in. It shows the complete plan before it
 changes the machine. Dependency presets only check/install prerequisites; they
 never activate routing, Wi-Fi, VPN, DHCP, or interface management.
 
@@ -147,7 +154,7 @@ sudo ./traffic-masqd install --non-interactive --user alex \
 
 Use `--skip-user-access` instead of `--user`, and `--defer-password` instead of
 `--password-file`, when intentional. Omitted presets default to `router`;
-dependency installation and startup default to off. `--prefix` defaults to
+in non-interactive mode, dependency installation and startup default to off. `--prefix` defaults to
 `/usr/local`, while `--config` defaults to `/etc/traffic-masq/config.toml` and
 remains the daemon's global option. `--dry-run` prints the same preflight plan
 without modifying files, accounts, packages, or processes.
@@ -167,10 +174,20 @@ manual-install diagnostic. DHCP is built in, WireGuard uses netlink, and neither
 DHCP clients nor `wireguard-tools` are installed. Kernel support checks are
 diagnostic because an unloaded module makes absence inconclusive.
 
-No init system is required or configured. `--start` starts the daemon now and
-waits for API readiness; boot autostart remains future work. The compatibility
-`packaging/install.sh` delegates host installs to this command and retains
-`DESTDIR`, `PREFIX`, and `BINARY_DIR` for side-effect-free package staging.
+`--init-system auto` (the default in both modes) detects the running init system
+and registers boot autostart independently of `--start`. In a container or on an
+unrecognized init system, auto leaves startup manual and says so in the plan.
+Use `--init-system systemd|openrc|runit|sysv` to select one explicitly, or
+`--init-system none` to omit integration (and remove a previous installer-owned
+registration). `--start` starts through the selected manager and waits for API
+readiness. Runit enables and starts simultaneously, so its registration requires
+`--start`; `--runit-service-dir PATH` selects an existing scan directory if needed.
+
+The compatibility `packaging/install.sh` forwards command-line flags to the daemon
+for host installation. `DESTDIR`, `PREFIX`, and `BINARY_DIR` still provide
+side-effect-free binary package staging: staging never discovers, enables, or
+starts host services. See [init integration](packaging/INIT.md) for lifecycle,
+file ownership, recovery, and native commands.
 
 The repository currently has no release-archive automation. Release publishing
 must still package the two ready-built binaries together; target machines do
@@ -408,3 +425,16 @@ Personal noncommercial use is available under the
 
 Use by an organization, employer, client, sole proprietor, or contractor
 requires a separate commercial license. Contact `prefl0p@proton.me`.
+
+### DHCP editor defaults
+
+When creating DHCP settings, the TUI reads the effective saved interface IPv4
+configuration from the daemon. The router field uses that address, and the pool
+uses the largest contiguous usable range on one side of it. Network, broadcast,
+and router addresses are excluded; /31 and /32 have no suggested pool. Existing
+DHCP settings are preserved when reopening the editor. Enter advances through
+fields to Save. Saving still validates against the current interface subnet and
+requires a managed output interface.
+
+A suggested range does not establish that other devices have no static addresses
+in it: narrow the range to your LAN allocation plan before saving.

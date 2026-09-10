@@ -1,0 +1,24 @@
+#!/sbin/openrc-run
+# Managed by traffic-masqd install.
+description="traffic-masq network daemon"
+depend() {
+    need localmount
+    after bootmisc
+    use net
+}
+start_pre() {
+    @LAUNCHER@ config validate
+}
+start() {
+    ebegin "Starting traffic-masqd"
+    @LAUNCHER@ start --direct
+    eend $?
+}
+stop() {
+    ebegin "Stopping traffic-masqd"
+    @LAUNCHER@ stop --direct --timeout-seconds 60
+    eend $?
+}
+status() {
+    @LAUNCHER@ status
+}

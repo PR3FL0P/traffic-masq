@@ -3189,40 +3189,13 @@ fn interface_edit_request_to_config(
 }
 
 fn default_dhcp_settings(cidr: ipnet::Ipv4Net) -> Result<DhcpEditRequest, String> {
-    if cidr.prefix_len() >= 31 {
-        return Err(format!(
-            "cannot derive a DHCP pool for /{}: no usable client range",
-            cidr.prefix_len()
-        ));
-    }
-    let network = u32::from(cidr.network());
-    let broadcast = u32::from(cidr.broadcast());
-    let router = u32::from(cidr.addr());
-    if router <= network || router >= broadcast {
-        return Err("configured interface address is not a usable DHCP router address".to_string());
-    }
-
-    let lower = (network + 1, router.saturating_sub(1));
-    let upper = (router + 1, broadcast - 1);
-    let lower_len = if lower.0 <= lower.1 {
-        lower.1 - lower.0 + 1
-    } else {
-        0
-    };
-    let upper_len = if upper.0 <= upper.1 {
-        upper.1 - upper.0 + 1
-    } else {
-        0
-    };
-    let (start, end) = if upper_len > lower_len { upper } else { lower };
-    if start > end {
-        return Err("configured subnet has no usable DHCP client addresses".to_string());
-    }
+    let (start, end) = crate::dhcp::defaults::suggest_pool(cidr)?;
+    let router = cidr.addr();
 
     Ok(DhcpEditRequest {
-        pool_start: start.into(),
-        pool_end: end.into(),
-        router: router.into(),
+        pool_start: start,
+        pool_end: end,
+        router,
         dns_servers: Vec::new(),
         lease_seconds: None,
     })

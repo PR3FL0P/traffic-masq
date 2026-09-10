@@ -1,0 +1,18 @@
+# Managed by traffic-masqd install.
+[Unit]
+Description=traffic-masq network daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=@LAUNCHER@ run
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=60s
+# preserve_interfaces deliberately keeps Wi-Fi workers alive across daemon stops.
+# The daemon owns their lifecycle and stops them under restore_interfaces.
+KillMode=process
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

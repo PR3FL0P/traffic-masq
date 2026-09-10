@@ -322,31 +322,8 @@ pub(crate) async fn handle_dhcp_interface_list_key(
 }
 
 fn suggest_pool(address: Ipv4Addr, prefix_len: u8) -> Option<(Ipv4Addr, Ipv4Addr)> {
-    if prefix_len >= 31 {
-        return None;
-    }
-    let mask: u32 = if prefix_len == 0 {
-        0
-    } else {
-        !0u32 << (32 - prefix_len)
-    };
-    let network = u32::from(address) & mask;
-    let broadcast = network | !mask;
-    let router = u32::from(address);
-
-    let mut first_host = network + 1;
-    if first_host == router {
-        first_host += 1;
-    }
-    let mut last_host = broadcast - 1;
-    if last_host == router {
-        last_host -= 1;
-    }
-
-    if first_host > last_host {
-        return None;
-    }
-    Some((Ipv4Addr::from(first_host), Ipv4Addr::from(last_host)))
+    let cidr = ipnet::Ipv4Net::new(address, prefix_len).ok()?;
+    crate::dhcp::defaults::suggest_pool(cidr).ok()
 }
 
 pub(crate) async fn open_dhcp_editor(app: &mut TuiApp, client: &ApiClient) {
@@ -381,15 +358,38 @@ pub(crate) async fn open_dhcp_editor(app: &mut TuiApp, client: &ApiClient) {
             app.screen = Screen::DhcpEditor;
         }
         Ok(Response::DhcpConfig { spec: None, .. }) => {
-            let router = status
-                .ipv4_addresses
-                .first()
-                .map(|address| address.address.to_string())
-                .unwrap_or_default();
-            let (pool_start, pool_end) = status
-                .ipv4_addresses
-                .first()
-                .and_then(|address| suggest_pool(address.address, address.prefix_len))
+            // Read the effective configuration at editor-open time: the dashboard
+            // can still contain addresses from before the user's last edit.
+            let cidr = match client
+                .request(&Request::GetInterfaceConfig {
+                    interface: interface.clone(),
+                })
+                .await
+            {
+                Ok(Response::InterfaceConfig {
+                    interface: name,
+                    config,
+                    ..
+                }) if name == interface => config.and_then(|config| config.ipv4),
+                Ok(Response::Error { message }) => {
+                    app.push_message(LogLevel::Error, message);
+                    return;
+                }
+                Ok(response) => {
+                    app.push_message(
+                        LogLevel::Error,
+                        format!("Unexpected response: {response:?}"),
+                    );
+                    return;
+                }
+                Err(error) => {
+                    app.push_message(LogLevel::Error, error.to_string());
+                    return;
+                }
+            };
+            let router = cidr.map(|cidr| cidr.addr().to_string()).unwrap_or_default();
+            let (pool_start, pool_end) = cidr
+                .and_then(|cidr| suggest_pool(cidr.addr(), cidr.prefix_len()))
                 .map(|(start, end)| (start.to_string(), end.to_string()))
                 .unwrap_or_default();
             app.dhcp_editor = Some(DhcpEditor {
@@ -525,7 +525,7 @@ pub(crate) async fn handle_dhcp_editor_key(app: &mut TuiApp, key: KeyCode, clien
             | DhcpField::PoolEnd
             | DhcpField::Router
             | DhcpField::DnsServers
-            | DhcpField::LeaseSeconds => {}
+            | DhcpField::LeaseSeconds => editor.field = next_dhcp_field(editor.field),
             DhcpField::Save => submit_dhcp_config(app, client).await,
             DhcpField::Leases => {
                 let interface = editor.interface.clone();
@@ -651,6 +651,57 @@ fn format_lease_expiration(expires_at_unix: u64, now_unix: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn editor_uses_saved_address_even_when_dashboard_is_empty() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            for body in [
+                serde_json::json!({"type": "dhcp_config", "interface": "lan0", "spec": null}),
+                serde_json::json!({"type": "interface_config", "interface": "lan0",
+                    "allow_management_change": false,
+                    "config": {"managed": true, "role": "output", "ipv4": "192.168.50.128/24", "nat": true}}),
+            ] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                }
+                let body = body.to_string();
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+            }
+        });
+        let mut app = TuiApp::default();
+        app.dashboard
+            .interfaces
+            .push(crate::api::model::InterfaceStatus {
+                interface: crate::netlink::NetworkInterface {
+                    index: 1,
+                    name: "lan0".into(),
+                    is_up: true,
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    is_wireless: false,
+                },
+                ipv4_addresses: vec![],
+                owned_ipv4_addresses: None,
+                has_default_route: false,
+            });
+        let client = ApiClient::new(socket);
+        open_dhcp_editor(&mut app, &client).await;
+        server.await.unwrap();
+        let editor = app.dhcp_editor.as_ref().expect("DHCP editor should open");
+        assert_eq!(editor.router, "192.168.50.128");
+        assert_eq!(editor.pool_start, "192.168.50.1");
+        assert_eq!(editor.pool_end, "192.168.50.127");
+        for _ in 0..5 {
+            handle_dhcp_editor_key(&mut app, KeyCode::Enter, &client).await;
+        }
+        assert_eq!(app.dhcp_editor.unwrap().field, DhcpField::Save);
+    }
 
     #[test]
     fn formats_mac_address_with_zero_padding() {

@@ -13,6 +13,7 @@ use nix::unistd::{chown, Gid, Group, Uid, User};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use zeroize::Zeroize;
 
+use crate::app::init::{self, InitPlan, InitSystem, NativeRunner, ServiceStore};
 use crate::app::service::{self, ServiceStatus};
 use crate::atomic_file;
 use crate::auth::{AuthService, MINIMUM_PASSWORD_CHARACTERS};
@@ -56,6 +57,12 @@ pub struct InstallArgs {
     /// Start the daemon after installation and wait until its API is ready
     #[arg(long)]
     pub start: bool,
+    /// Boot service integration; auto detects the running init, none removes our registration
+    #[arg(long, value_enum, default_value = "auto")]
+    pub init_system: InitSystem,
+    /// Existing runit scan directory, when its location cannot be detected
+    #[arg(long, value_name = "PATH")]
+    pub runit_service_dir: Option<PathBuf>,
     /// Binary installation prefix
     #[arg(long, default_value = "/usr/local")]
     pub prefix: PathBuf,
@@ -83,6 +90,27 @@ pub struct UninstallArgs {
 pub async fn uninstall(args: UninstallArgs, config_override: Option<PathBuf>) -> Result<()> {
     let files = uninstall_files(&args.prefix)?;
     let resolved = crate::config::ResolvedConfig::load(config_override)?;
+    let store = ServiceStore::host();
+    let registration = store.load()?;
+    if let Some(registration) = &registration {
+        if registration.daemon != init::absolute_path(&args.prefix.join("sbin/traffic-masqd"))?
+            || Some(&registration.config)
+                != resolved
+                    .source
+                    .path()
+                    .map(init::absolute_path)
+                    .transpose()?
+                    .as_ref()
+        {
+            bail!("installed init service uses {} and {}; pass its --prefix and --config to uninstall", registration.daemon.display(), registration.config.display());
+        }
+        store.validate_owned(registration)?;
+        println!(
+            "Disable and remove recorded {} boot service before removing binaries",
+            registration.backend
+        );
+        registration.print_removal();
+    }
     println!(
         "Stop traffic-masqd using configuration: {}",
         resolved.source
@@ -109,11 +137,26 @@ pub async fn uninstall(args: UninstallArgs, config_override: Option<PathBuf>) ->
             return Ok(());
         }
     }
+    let _installation_lock = store.lock_mutation()?;
+    store.ensure_unchanged(registration.as_ref())?;
+    if let Some(registration) = &registration {
+        store.disable(registration, &NativeRunner).await?;
+        store
+            .stop(
+                registration,
+                &NativeRunner,
+                Duration::from_secs(args.timeout_seconds),
+            )
+            .await?;
+    }
     service::stop(&resolved.config, Duration::from_secs(args.timeout_seconds))
         .await
         .context("daemon shutdown failed; installed files were not removed")?;
     let _guard = ProcessGuard::acquire(&resolved.config.runtime.pid_path)
         .context("daemon restarted during uninstallation; installed files were not removed")?;
+    if let Some(registration) = &registration {
+        store.remove(registration, &NativeRunner).await?;
+    }
     remove_uninstall_files(&files)?;
     println!("traffic-masq uninstalled. Configuration, passwords, state and logs were preserved.");
     Ok(())
@@ -181,6 +224,7 @@ struct InstallPlan {
     config_exists: bool,
     auth_initialized: bool,
     dependencies: DependencyPlan,
+    init: InitPlan,
 }
 
 pub async fn run(mut args: InstallArgs, config_override: Option<PathBuf>) -> Result<()> {
@@ -218,7 +262,7 @@ pub async fn run(mut args: InstallArgs, config_override: Option<PathBuf>) -> Res
             println!("Dry run completed; no changes were made.");
             return Ok(());
         }
-        if !args.non_interactive && !prompt_yes_no("Apply this installation plan?", false)? {
+        if !args.non_interactive && !prompt_yes_no("Apply this installation plan?", true)? {
             plan.password.zeroize();
             if prompt_yes_no("Edit installation choices?", false)? {
                 continue;
@@ -256,11 +300,11 @@ async fn interactive_choices(
     if !args.skip_user_access {
         let label = match &suggested {
             Some(u) => format!("User allowed to access the TUI [{u}] (enter '-' to skip): "),
-            None => "User allowed to access the TUI (enter '-' to skip): ".into(),
+            None => "User allowed to access the TUI [- = root-only access]: ".into(),
         };
         loop {
             let answer = prompt(&label)?;
-            if answer == "-" {
+            if answer == "-" || (answer.is_empty() && suggested.is_none()) {
                 args.user = None;
                 break;
             }
@@ -293,8 +337,16 @@ async fn interactive_choices(
             args.dependency_presets.push(preset);
         }
     }
-    args.install_deps = prompt_yes_no("Install missing dependencies?", args.install_deps)?;
-    args.start = prompt_yes_no("Start the daemon after installation?", args.start)?;
+    args.install_deps = prompt_yes_no("Install missing dependencies?", true)?;
+    args.start = prompt_yes_no("Start the daemon after installation?", true)?;
+    if args.init_system != InitSystem::None
+        && !prompt_yes_no(
+            "Enable daemon autostart at boot (detect init system)?",
+            true,
+        )?
+    {
+        args.init_system = InitSystem::None;
+    }
     if prompt_yes_no("Advanced settings?", false)? {
         let prefix = prompt(&format!("Binary prefix [{}]: ", args.prefix.display()))?;
         if !prefix.is_empty() {
@@ -329,7 +381,10 @@ async fn interactive_choices(
     if args.password_file.is_some() || args.defer_password {
         return Ok(None);
     }
-    if !prompt_yes_no("Set the device password now?", true)? {
+    if !prompt_yes_no(
+        "Set the device password now (otherwise initialize via sudo traffic-masq)?",
+        false,
+    )? {
         args.defer_password = true;
         return Ok(None);
     }
@@ -355,6 +410,7 @@ async fn build_plan(
     interactive_password: Option<zeroize::Zeroizing<String>>,
 ) -> Result<InstallPlan> {
     validate_prefix(&args.prefix)?;
+    let config_path = init::absolute_path(&config_path)?;
     let user = match &args.user {
         Some(name) => {
             let found =
@@ -398,6 +454,7 @@ async fn build_plan(
         None => config.runtime.socket_group = Some(ACCESS_GROUP.into()),
     }
     config.validate()?;
+    super::runtime::validate_socket_directory(&config.runtime.socket_path)?;
     if service::status(&config).await? != ServiceStatus::Stopped {
         bail!("traffic-masqd is running or starting; stop it first with `traffic-masqd --config {} stop`", config_path.display());
     }
@@ -427,6 +484,15 @@ async fn build_plan(
             return Err(error);
         }
     }
+    let init = InitPlan::build(
+        &ServiceStore::host(),
+        &init::HostFacts::discover(),
+        args.init_system,
+        &daemon_destination,
+        &config_path,
+        args.runit_service_dir.as_deref(),
+        args.start,
+    )?;
     Ok(InstallPlan {
         user,
         presets,
@@ -442,6 +508,7 @@ async fn build_plan(
         config_exists,
         auth_initialized,
         dependencies,
+        init,
     })
 }
 
@@ -785,7 +852,7 @@ fn print_plan(plan: &InstallPlan) {
             "no"
         }
     );
-    println!("  Boot autostart: not configured");
+    plan.init.print();
 }
 
 async fn apply_plan(plan: &mut InstallPlan) -> Result<()> {
@@ -796,6 +863,15 @@ async fn apply_plan(plan: &mut InstallPlan) -> Result<()> {
 }
 
 async fn apply_plan_inner(plan: &mut InstallPlan, completed: &mut Vec<&'static str>) -> Result<()> {
+    let store = ServiceStore::host();
+    let _installation_lock = store.lock_mutation()?;
+    store.ensure_unchanged(plan.init.previous.as_ref())?;
+    if let Some(previous) = &plan.init.previous {
+        store
+            .stop(previous, &NativeRunner, Duration::from_secs(60))
+            .await?;
+        completed.push("previous init service quiesced");
+    }
     let install_guard = ProcessGuard::acquire(&plan.config.runtime.pid_path)
         .context("traffic-masqd started after installation preflight; stop it and retry")?;
     if plan.install_deps && !plan.dependencies.missing.is_empty() {
@@ -838,7 +914,10 @@ async fn apply_plan_inner(plan: &mut InstallPlan, completed: &mut Vec<&'static s
             completed.push("device password initialized");
         }
     }
+    plan.init.apply(&store, &NativeRunner).await?;
+    completed.push("boot service registration prepared");
     drop(install_guard);
+    plan.init.activate_runit(&store)?;
     println!("Installation completed.");
     if let Some(user) = &plan.user {
         println!("{user} was added to {ACCESS_GROUP}. Sign out and back in before running the TUI; the current shell does not acquire the new group automatically.");
@@ -852,12 +931,27 @@ async fn apply_plan_inner(plan: &mut InstallPlan, completed: &mut Vec<&'static s
         );
     }
     if plan.start {
-        match service::start(&plan.config, Some(&plan.config_path), Duration::from_secs(10)).await {
+        let started = if let Some(registration) = &plan.init.desired {
+            init::start(registration, &plan.config, Duration::from_secs(10)).await
+        } else {
+            service::start_executable(
+                &plan.daemon_destination,
+                &plan.config,
+                Some(&plan.config_path),
+                Duration::from_secs(10),
+            )
+            .await
+        };
+        match started {
             Ok(_) => println!("Daemon started and ready."),
             Err(error) => bail!("installation completed, but daemon startup failed: {error}. Inspect diagnostics with: sudo {} --config {} logs", shell_path(&plan.daemon_destination), shell_path(&plan.config_path)),
         }
     }
-    println!("Boot autostart is not configured.");
+    if let Some(registration) = &plan.init.desired {
+        println!("Boot autostart enabled via {}.", registration.backend);
+    } else {
+        println!("No boot service is registered.");
+    }
     Ok(())
 }
 
@@ -933,14 +1027,7 @@ fn prepare_directories(config: &AppConfig, access_gid: Gid) -> Result<()> {
         Some(Uid::from_raw(0)),
         Some(Gid::from_raw(0)),
     )?;
-    let runtime_dir = config
-        .runtime
-        .socket_path
-        .parent()
-        .unwrap_or(Path::new("/run/traffic-masq"));
-    fs::create_dir_all(runtime_dir)?;
-    fs::set_permissions(runtime_dir, fs::Permissions::from_mode(0o750))?;
-    chown(runtime_dir, Some(Uid::from_raw(0)), Some(access_gid))?;
+    super::runtime::prepare_socket_directory(&config.runtime.socket_path, Some(access_gid))?;
     Ok(())
 }
 
@@ -1069,7 +1156,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_defaults_match_the_interactive_plan_defaults() {
+    fn unattended_defaults_keep_package_installation_and_startup_opt_in() {
         let cli = TestCli::try_parse_from([
             "test",
             "--non-interactive",
@@ -1106,6 +1193,8 @@ mod tests {
             password_file: None,
             defer_password: false,
             start: false,
+            init_system: InitSystem::None,
+            runit_service_dir: None,
             prefix: "/usr/local".into(),
             dry_run: false,
         };

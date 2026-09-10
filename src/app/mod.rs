@@ -1,6 +1,8 @@
 //! Installation, startup, and process lifecycle management.
 
 pub mod installer;
+pub mod init;
+pub(crate) mod runtime;
 mod process;
 pub mod service;
 

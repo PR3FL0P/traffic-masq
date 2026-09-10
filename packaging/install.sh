@@ -15,7 +15,7 @@ fi
 # installs share one validated plan. Keep the shell path for compatibility and
 # for side-effect-free DESTDIR package staging.
 if [ -z "$destdir" ]; then
-    exec "$binary_dir/traffic-masqd" install --prefix "$prefix"
+    exec "$binary_dir/traffic-masqd" install --prefix "$prefix" "$@"
 fi
 
 install -D -m 0755 "$binary_dir/traffic-masqd" "$destdir$prefix/sbin/traffic-masqd"

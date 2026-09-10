@@ -68,7 +68,10 @@ impl HttpApiBindings {
     pub fn bind(config: &AppConfig) -> Result<Self> {
         let (tcp_listener, tls_acceptor) = bind_tls_listener(config.api.tcp.as_ref())?;
         let socket_path = config.runtime.socket_path.clone();
-        prepare_socket_directory(&socket_path)?;
+        let socket_group = config.runtime.socket_group.as_deref().map(|name| {
+            Group::from_name(name)?.ok_or_else(|| anyhow::anyhow!("socket group {name} does not exist"))
+        }).transpose()?.map(|group| group.gid);
+        crate::app::runtime::prepare_socket_directory(&socket_path, socket_group)?;
         prepare_socket_path(&socket_path)?;
         let unix_listener = StdUnixListener::bind(&socket_path)
             .with_context(|| format!("failed to bind HTTP API socket {}", socket_path.display()))?;
@@ -1634,19 +1637,6 @@ async fn drain_connections(connections: &mut JoinSet<()>, listener_name: &'stati
             tracing::warn!(%error, listener = listener_name, "HTTP connection task failed");
         }
     }
-}
-
-fn prepare_socket_directory(path: &Path) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("HTTP API socket path has no parent: {}", path.display()))?;
-    fs::create_dir_all(parent).with_context(|| {
-        format!(
-            "failed to create HTTP API socket directory {}",
-            parent.display()
-        )
-    })?;
-    Ok(())
 }
 
 fn prepare_socket_path(path: &Path) -> Result<()> {

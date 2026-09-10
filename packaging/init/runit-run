@@ -1,0 +1,3 @@
+#!/bin/sh
+# Managed by traffic-masqd install.
+exec @LAUNCHER@ run

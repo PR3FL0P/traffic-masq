@@ -42,11 +42,19 @@ pub async fn start(
     config_path: Option<&Path>,
     startup_timeout: Duration,
 ) -> Result<u32> {
+    let executable = std::env::current_exe().context("failed to resolve traffic-masqd path")?;
+    start_executable(&executable, config, config_path, startup_timeout).await
+}
+
+pub async fn start_executable(
+    executable: &Path,
+    config: &AppConfig,
+    config_path: Option<&Path>,
+    startup_timeout: Duration,
+) -> Result<u32> {
     if status(config).await? != ServiceStatus::Stopped {
         bail!("traffic-masqd is already running or starting");
     }
-
-    let executable = std::env::current_exe().context("failed to resolve traffic-masqd path")?;
     let mut command = Command::new(executable);
     if let Some(config_path) = config_path {
         command.arg("--config").arg(config_path);
