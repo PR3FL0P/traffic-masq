@@ -1,5 +1,5 @@
 # Safe example for a router with an externally configured uplink (wan0), a
-# management interface (eth0), and a managed LAN (wlan0). Replace interface
+# interface outside the router (eth0), and a traffic-masq LAN (wlan0). Replace interface
 # names and addresses before use.
 
 [runtime]
@@ -10,7 +10,7 @@ pid_path = "/run/traffic-masq/traffic-masqd.pid"
 shutdown_policy = "preserve_interfaces"
 
 [network.interfaces.eth0]
-role = "management"
+role = "none"
 managed = false
 
 [network.interfaces.wan0]

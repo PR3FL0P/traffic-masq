@@ -84,7 +84,7 @@ impl DhcpServiceSpec {
             dhcp_client: None,
             wifi: None,
             wifi_client: None,
-        nat: true,
+            nat: true,
         };
         config.validate(&self.interface)
     }
@@ -484,7 +484,7 @@ mod tests {
             dhcp_client: None,
             wifi: None,
             wifi_client: None,
-        nat: true,
+            nat: true,
         };
 
         assert!(
@@ -515,7 +515,7 @@ mod tests {
                 dhcp_client: None,
                 wifi: None,
                 wifi_client: None,
-            nat: true,
+                nat: true,
             },
         );
 

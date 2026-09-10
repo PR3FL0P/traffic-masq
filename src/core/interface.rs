@@ -71,7 +71,7 @@ pub fn is_management_change(
     target_role: InterfaceRole,
     current_role: Option<InterfaceRole>,
 ) -> bool {
-    target_role == InterfaceRole::Management || current_role == Some(InterfaceRole::Management)
+    target_role == InterfaceRole::None || current_role == Some(InterfaceRole::None)
 }
 
 pub fn owns_dynamic_ipv4(config: &InterfaceConfig) -> bool {
@@ -313,7 +313,9 @@ impl InterfaceManager {
 
         let management_change = is_management_change(config.role, current_role);
         if management_change && !allow_management_change {
-            bail!("refusing to modify management interface {name} without explicit confirmation");
+            bail!(
+                "refusing to modify outside-router interface {name} without explicit confirmation"
+            );
         }
 
         if !config.managed {
@@ -971,11 +973,12 @@ mod tests {
         );
 
         manager.apply_plan(&plan).await.expect("apply the removal");
-        assert_eq!(provider
-            .list_ipv4_addresses("eth0")
-            .await
-            .expect("addresses")
-            .as_slice(),
+        assert_eq!(
+            provider
+                .list_ipv4_addresses("eth0")
+                .await
+                .expect("addresses")
+                .as_slice(),
             &[pre_existing]
         );
     }
@@ -1015,11 +1018,14 @@ mod tests {
             .await
             .expect("second pass removes it again");
 
-        assert_eq!(provider
-            .list_ipv4_addresses("eth0")
-            .await
-            .expect("addresses")
-            .len(), 2);
+        assert_eq!(
+            provider
+                .list_ipv4_addresses("eth0")
+                .await
+                .expect("addresses")
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -1443,7 +1449,10 @@ mod tests {
             .list_ipv4_addresses("eth0")
             .await
             .expect("addresses");
-        assert_eq!(addresses, vec![address_with_protocol("192.168.50.1/24", None)]);
+        assert_eq!(
+            addresses,
+            vec![address_with_protocol("192.168.50.1/24", None)]
+        );
     }
 
     #[tokio::test]
@@ -1487,14 +1496,14 @@ mod tests {
         let error = manager
             .apply_interface(
                 "eth0",
-                &config(InterfaceRole::Management, "192.168.1.20/24"),
-                Some(InterfaceRole::Management),
+                &config(InterfaceRole::None, "192.168.1.20/24"),
+                Some(InterfaceRole::None),
                 false,
             )
             .await
             .expect_err("management change should be rejected");
 
-        assert!(error.to_string().contains("management interface"));
+        assert!(error.to_string().contains("outside-router interface"));
     }
 
     #[tokio::test]
@@ -1507,19 +1516,19 @@ mod tests {
             .apply_interface(
                 "eth0",
                 &config(InterfaceRole::Output, "10.0.0.1/24"),
-                Some(InterfaceRole::Management),
+                Some(InterfaceRole::None),
                 false,
             )
             .await
-            .expect_err("relabelling a management interface should be rejected");
+            .expect_err("relabelling an outside-router interface should be rejected");
 
-        assert!(error.to_string().contains("management interface"));
+        assert!(error.to_string().contains("outside-router interface"));
 
         manager
             .apply_interface(
                 "eth0",
                 &config(InterfaceRole::Output, "10.0.0.1/24"),
-                Some(InterfaceRole::Management),
+                Some(InterfaceRole::None),
                 true,
             )
             .await
@@ -1530,11 +1539,11 @@ mod tests {
     fn management_change_is_symmetric_in_current_and_target_role() {
         assert!(is_management_change(
             InterfaceRole::Output,
-            Some(InterfaceRole::Management)
+            Some(InterfaceRole::None)
         ));
-        assert!(is_management_change(InterfaceRole::Management, None));
+        assert!(is_management_change(InterfaceRole::None, None));
         assert!(is_management_change(
-            InterfaceRole::Management,
+            InterfaceRole::None,
             Some(InterfaceRole::Output)
         ));
         assert!(!is_management_change(
@@ -1648,7 +1657,9 @@ mod tests {
             .await
             .expect("addresses");
         assert_eq!(applied.len(), 2);
-        assert!(applied.iter().any(|address| address.address == Ipv4Addr::new(192, 168, 50, 1)));
+        assert!(applied
+            .iter()
+            .any(|address| address.address == Ipv4Addr::new(192, 168, 50, 1)));
         assert!(applied.iter().any(|address| address == &original));
 
         manager.rollback(&snapshot).await.expect("rollback");
@@ -1714,7 +1725,7 @@ mod tests {
 
         network.interfaces.insert(
             "mgmt0".to_string(),
-            config(InterfaceRole::Management, "192.168.70.1/24"),
+            config(InterfaceRole::None, "192.168.70.1/24"),
         );
 
         let error = manager

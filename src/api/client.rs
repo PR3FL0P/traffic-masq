@@ -18,18 +18,58 @@ const API_PREFIX: &str = "/api/v1";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const HOST_VALUE: &str = "localhost";
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct ClientAuthentication {
+    pub(crate) token: zeroize::Zeroizing<String>,
+    pub(crate) authenticated_at: u64,
+    pub(crate) absolute_expires_at: i64,
+}
+
+impl ClientAuthentication {
+    fn from_login(session: &LoginSession) -> Self {
+        Self {
+            token: zeroize::Zeroizing::new(session.token.clone()),
+            authenticated_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            absolute_expires_at: session.absolute_expires_at,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct ApiClient {
     socket_path: PathBuf,
-    token: Arc<RwLock<Option<String>>>,
+    session: Arc<RwLock<Option<ClientAuthentication>>>,
+}
+
+impl std::fmt::Debug for ApiClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiClient")
+            .field("socket_path", &self.socket_path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ApiClient {
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
-            token: Arc::new(RwLock::new(None)),
+            session: Arc::new(RwLock::new(None)),
         }
+    }
+
+    pub(crate) async fn forget_authentication(&self) {
+        *self.session.write().await = None;
+    }
+
+    pub(crate) async fn authentication(&self) -> Option<ClientAuthentication> {
+        self.session.read().await.clone()
+    }
+
+    pub(crate) async fn restore_authentication(&self, session: ClientAuthentication) {
+        *self.session.write().await = Some(session);
     }
 
     pub fn socket_path(&self) -> &Path {
@@ -58,7 +98,7 @@ impl ApiClient {
         let body = into_success_body(response)?;
         let session: LoginSession = serde_json::from_slice(&body)
             .context("failed to decode password initialization response from the API")?;
-        *self.token.write().await = Some(session.token.clone());
+        *self.session.write().await = Some(ClientAuthentication::from_login(&session));
         Ok(session)
     }
 
@@ -78,7 +118,7 @@ impl ApiClient {
         let session: LoginSession = serde_json::from_slice(&body)
             .context("failed to decode login response from the API")?;
 
-        *self.token.write().await = Some(session.token.clone());
+        *self.session.write().await = Some(ClientAuthentication::from_login(&session));
         Ok(session)
     }
 
@@ -95,7 +135,7 @@ impl ApiClient {
             )
             .await?;
         into_success_body(response)?;
-        *self.token.write().await = None;
+        *self.session.write().await = None;
         Ok(())
     }
 
@@ -108,12 +148,12 @@ impl ApiClient {
             Err(error) => Err(error),
         };
 
-        *self.token.write().await = None;
+        *self.session.write().await = None;
         result
     }
 
     pub async fn is_authenticated(&self) -> bool {
-        self.token.read().await.is_some()
+        self.session.read().await.is_some()
     }
 
     pub async fn request(
@@ -141,7 +181,7 @@ impl ApiClient {
             .await
             .context("API request timed out; operation outcome may be unknown. Inspect current state before retrying")??;
         if response.status == StatusCode::UNAUTHORIZED {
-            *self.token.write().await = None;
+            *self.session.write().await = None;
         }
         Ok(response)
     }
@@ -152,7 +192,12 @@ impl ApiClient {
         path: &str,
         body: Option<Vec<u8>>,
     ) -> Result<RawResponse> {
-        let token = self.token.read().await.clone();
+        let token = self
+            .session
+            .read()
+            .await
+            .as_ref()
+            .map(|session| session.token.clone());
         let stream = UnixStream::connect(&self.socket_path)
             .await
             .with_context(|| {
@@ -177,7 +222,7 @@ impl ApiClient {
             builder = builder.header(CONTENT_TYPE, "application/json");
         }
         if let Some(token) = token {
-            builder = builder.header(AUTHORIZATION, format!("Bearer {token}"));
+            builder = builder.header(AUTHORIZATION, format!("Bearer {}", token.as_str()));
         }
 
         let request = builder

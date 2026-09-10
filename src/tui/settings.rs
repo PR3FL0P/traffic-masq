@@ -16,14 +16,20 @@ use super::{Screen, TuiApp};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SettingsField {
     RollbackTimeout,
+    RememberSession,
+    RememberMinutes,
+    SaveSession,
     ChangePassword,
     Reset,
     Save,
     Reload,
 }
 
-const SETTINGS_FIELDS: [SettingsField; 5] = [
+const SETTINGS_FIELDS: [SettingsField; 8] = [
     SettingsField::RollbackTimeout,
+    SettingsField::RememberSession,
+    SettingsField::RememberMinutes,
+    SettingsField::SaveSession,
     SettingsField::ChangePassword,
     SettingsField::Reset,
     SettingsField::Save,
@@ -37,12 +43,19 @@ pub(crate) struct SecurityEditor {
     pub(crate) rollback_timeout_input: String,
     pub(crate) override_active: bool,
     pub(crate) restart_required: bool,
+    pub(crate) remember_session: bool,
+    pub(crate) remember_minutes_input: String,
+    pub(crate) confirmation: Option<SettingsField>,
 }
 
 const SECURITY_SAVE_LABEL: &str = "Save (applies after daemon restart)";
 const SECURITY_RESET_LABEL: &str = "Reset to base config";
 const SECURITY_PASSWORD_LABEL: &str = "Change device password";
 const SECURITY_RELOAD_LABEL: &str = "Reload";
+
+fn note(text: impl Into<String>, style: Style) -> Line<'static> {
+    Line::styled(format!("\tNote: {}", text.into()), style)
+}
 
 pub(crate) fn render_settings(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
     let Some(editor) = &app.settings else {
@@ -85,19 +98,52 @@ pub(crate) fn render_settings(frame: &mut ratatui::Frame<'_>, area: Rect, app: &
             SettingsField::RollbackTimeout,
             Style::default().fg(theme::ACCENT),
         ),
-        Line::styled(
-            "Rollback timeout is persisted immediately but only takes effect after \
-             restarting traffic-masqd.",
+        note(
+            "Saved immediately; takes effect after restarting traffic-masqd.",
             Style::default().fg(theme::WARN),
         ),
-        Line::styled(
-            "Arrows move · Enter activates · type digits to edit the rollback timeout",
+        note(
+            "Arrows move · Enter activates · type digits to edit durations",
             Style::default().fg(theme::MUTED),
         ),
         Line::from(""),
     ];
 
     let mut button_rows: Vec<(u16, &str, usize)> = Vec::new();
+    button_rows.push((lines.len() as u16, "Remember session: enabled", 4));
+    lines.push(row(
+        format!(
+            "Remember session: {}",
+            if editor.remember_session {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ),
+        SettingsField::RememberSession,
+        Style::default().fg(theme::ACCENT),
+    ));
+    button_rows.push((lines.len() as u16, "Remember for (minutes):", 5));
+    lines.push(row(
+        format!("Remember for (minutes): {}_", editor.remember_minutes_input),
+        SettingsField::RememberMinutes,
+        Style::default().fg(theme::ACCENT),
+    ));
+    button_rows.push((
+        lines.len() as u16,
+        "Save session preferences (applies now)",
+        6,
+    ));
+    lines.push(row(
+        "Save session preferences (applies now)".into(),
+        SettingsField::SaveSession,
+        Style::default().fg(theme::ACCENT),
+    ));
+    lines.push(note(
+        "Duration starts at password entry; daemon expiry may be earlier.",
+        Style::default().fg(theme::MUTED),
+    ));
+    lines.push(Line::from(""));
 
     button_rows.push((lines.len() as u16, SECURITY_PASSWORD_LABEL, 0));
     lines.push(row(
@@ -129,21 +175,40 @@ pub(crate) fn render_settings(frame: &mut ratatui::Frame<'_>, area: Rect, app: &
         Style::default().fg(theme::ACCENT),
     ));
 
+    if let Some(field) = editor.confirmation {
+        let action = match field {
+            SettingsField::SaveSession => "save session preferences",
+            SettingsField::Reset => "reset security settings to the base config",
+            SettingsField::Save => "save the rollback timeout override",
+            _ => "apply this change",
+        };
+        lines.push(note(
+            format!("Confirm: press Enter again to {action}; Esc cancels."),
+            Style::default()
+                .fg(theme::WARN)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     let block = panel("Settings");
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let offset = super::layout::focused_lines_offset(&lines, inner.height) as u16;
     for (row_index, label, slot) in button_rows {
+        if row_index < offset || row_index - offset >= inner.height {
+            continue;
+        }
         app.ui.buttons.push((
             Rect {
                 x: inner.x,
-                y: inner.y + row_index,
-                width: label.len() as u16,
+                y: inner.y + row_index - offset,
+                width: (label.len() as u16).min(inner.width),
                 height: 1,
             },
             slot,
         ));
     }
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(lines).scroll((offset, 0)), inner);
 }
 
 pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
@@ -152,6 +217,9 @@ pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
             0 => SettingsField::ChangePassword,
             1 => SettingsField::Reset,
             2 => SettingsField::Save,
+            4 => SettingsField::RememberSession,
+            5 => SettingsField::RememberMinutes,
+            6 => SettingsField::SaveSession,
             _ => SettingsField::Reload,
         };
     }
@@ -164,14 +232,34 @@ pub(crate) async fn handle_settings_key(app: &mut TuiApp, key: KeyCode, client: 
     };
 
     match key {
+        KeyCode::Esc if editor.confirmation.is_some() => editor.confirmation = None,
         KeyCode::Esc => app.screen = Screen::Dashboard,
-        KeyCode::Up => editor.field = previous_settings_field(editor.field),
-        KeyCode::Down => editor.field = next_settings_field(editor.field),
+        KeyCode::Up => {
+            editor.confirmation = None;
+            editor.field = previous_settings_field(editor.field);
+        }
+        KeyCode::Down => {
+            editor.confirmation = None;
+            editor.field = next_settings_field(editor.field);
+        }
         KeyCode::Backspace if editor.field == SettingsField::RollbackTimeout => {
             editor.rollback_timeout_input.pop();
         }
+        KeyCode::Backspace if editor.field == SettingsField::RememberMinutes => {
+            editor.remember_minutes_input.pop();
+        }
+        KeyCode::Char(' ') if editor.field == SettingsField::RememberSession => {
+            editor.remember_session = !editor.remember_session;
+        }
         KeyCode::Enter => match editor.field {
-            SettingsField::RollbackTimeout => {}
+            SettingsField::RollbackTimeout | SettingsField::RememberMinutes => {}
+            SettingsField::RememberSession => editor.remember_session = !editor.remember_session,
+            SettingsField::SaveSession | SettingsField::Reset | SettingsField::Save
+                if editor.confirmation != Some(editor.field) =>
+            {
+                editor.confirmation = Some(editor.field);
+            }
+            SettingsField::SaveSession => save_session_preferences(app, client).await,
             SettingsField::ChangePassword => {
                 app.settings_password = Some(PasswordChangeEditor::new());
                 app.screen = Screen::SettingsPassword;
@@ -181,11 +269,52 @@ pub(crate) async fn handle_settings_key(app: &mut TuiApp, key: KeyCode, client: 
             SettingsField::Reload => load_settings_data(app, client).await,
         },
         KeyCode::Char(character)
+            if character.is_ascii_digit() && editor.field == SettingsField::RememberMinutes =>
+        {
+            editor.remember_minutes_input.push(character);
+        }
+        KeyCode::Char(character)
             if character.is_ascii_digit() && editor.field == SettingsField::RollbackTimeout =>
         {
             editor.rollback_timeout_input.push(character);
         }
         _ => {}
+    }
+}
+
+async fn save_session_preferences(app: &mut TuiApp, client: &ApiClient) {
+    let Some(editor) = &app.settings else {
+        return;
+    };
+    let Ok(minutes) = editor.remember_minutes_input.trim().parse::<u64>() else {
+        app.push_message(
+            LogLevel::Warn,
+            "Session duration must be a whole number of minutes",
+        );
+        return;
+    };
+    let preferences = super::session::SessionPreferences {
+        remember: editor.remember_session,
+        minutes,
+    };
+    let result = async {
+        let store = super::session::SessionStore::for_client(client)?;
+        store.save_preferences(&preferences, client).await
+    }
+    .await;
+    match result {
+        Ok(()) => app.push_message(
+            LogLevel::Info,
+            if preferences.remember {
+                "Session preferences saved; duration starts at the last password entry"
+            } else {
+                "Session saving disabled; the next launch will require a password"
+            },
+        ),
+        Err(error) => app.push_message(
+            LogLevel::Error,
+            format!("Could not save session preferences: {error}"),
+        ),
     }
 }
 
@@ -213,7 +342,22 @@ pub(crate) async fn load_settings_data(app: &mut TuiApp, client: &ApiClient) {
             override_active,
             restart_required,
         }) => {
+            let preferences = match super::session::SessionStore::for_client(client)
+                .and_then(|store| store.preferences())
+            {
+                Ok(preferences) => preferences,
+                Err(error) => {
+                    app.push_message(
+                        LogLevel::Warn,
+                        format!("Could not load session preferences: {error}"),
+                    );
+                    super::session::SessionPreferences::default()
+                }
+            };
             app.settings = Some(SecurityEditor {
+                remember_session: preferences.remember,
+                remember_minutes_input: preferences.minutes.to_string(),
+                confirmation: None,
                 field: SettingsField::RollbackTimeout,
                 active,
                 rollback_timeout_input: desired.rollback_timeout_seconds.to_string(),
@@ -273,7 +417,22 @@ pub(crate) async fn submit_security_settings(app: &mut TuiApp, client: &ApiClien
             override_active,
             restart_required,
         }) => {
+            let preferences = match super::session::SessionStore::for_client(client)
+                .and_then(|store| store.preferences())
+            {
+                Ok(preferences) => preferences,
+                Err(error) => {
+                    app.push_message(
+                        LogLevel::Warn,
+                        format!("Could not load session preferences: {error}"),
+                    );
+                    super::session::SessionPreferences::default()
+                }
+            };
             app.settings = Some(SecurityEditor {
+                remember_session: preferences.remember,
+                remember_minutes_input: preferences.minutes.to_string(),
+                confirmation: None,
                 field: SettingsField::RollbackTimeout,
                 active,
                 rollback_timeout_input: desired.rollback_timeout_seconds.to_string(),
@@ -302,7 +461,22 @@ async fn reset_security_settings(app: &mut TuiApp, client: &ApiClient) {
             override_active,
             restart_required,
         }) => {
+            let preferences = match super::session::SessionStore::for_client(client)
+                .and_then(|store| store.preferences())
+            {
+                Ok(preferences) => preferences,
+                Err(error) => {
+                    app.push_message(
+                        LogLevel::Warn,
+                        format!("Could not load session preferences: {error}"),
+                    );
+                    super::session::SessionPreferences::default()
+                }
+            };
             app.settings = Some(SecurityEditor {
+                remember_session: preferences.remember,
+                remember_minutes_input: preferences.minutes.to_string(),
+                confirmation: None,
                 field: SettingsField::RollbackTimeout,
                 active,
                 rollback_timeout_input: desired.rollback_timeout_seconds.to_string(),
@@ -424,11 +598,11 @@ pub(crate) fn render_settings_password(
             PasswordField::Confirm,
         ),
         Line::from(""),
-        Line::styled(
+        note(
             "Up/Down or Tab: switch field | Enter: submit | Esc: cancel",
             Style::default().fg(theme::MUTED),
         ),
-        Line::styled(
+        note(
             "Changing the device password revokes every other active session; this TUI \
              session is re-authenticated automatically with the new password.",
             Style::default().fg(theme::WARN),
@@ -518,10 +692,16 @@ async fn submit_password_change(app: &mut TuiApp, client: &ApiClient) {
             app.settings_password = None;
             app.screen = Screen::Settings;
             match login_result {
-                Ok(_) => app.push_message(
-                    LogLevel::Info,
-                    "Device password changed; other sessions were revoked",
-                ),
+                Ok(_) => match super::session::remember(client).await {
+                    Ok(_) => app.push_message(
+                        LogLevel::Info,
+                        "Device password changed; other sessions were revoked",
+                    ),
+                    Err(error) => app.push_message(
+                        LogLevel::Warn,
+                        format!("Password changed, but could not save session: {error}"),
+                    ),
+                },
                 Err(error) => app.push_message(
                     LogLevel::Error,
                     format!("Password changed but re-authentication failed: {error}"),
@@ -543,10 +723,87 @@ mod tests {
     use super::*;
 
     #[test]
+    fn session_fields_are_reachable_and_save_stays_visible_on_small_terminal() {
+        assert_eq!(
+            next_settings_field(SettingsField::RememberSession),
+            SettingsField::RememberMinutes
+        );
+        assert_eq!(
+            next_settings_field(SettingsField::RememberMinutes),
+            SettingsField::SaveSession
+        );
+        assert_eq!(
+            next_settings_field(SettingsField::SaveSession),
+            SettingsField::ChangePassword
+        );
+        let mut app = TuiApp::default();
+        app.settings = Some(SecurityEditor {
+            field: SettingsField::SaveSession,
+            active: SecuritySettings {
+                rollback_timeout_seconds: 30,
+            },
+            rollback_timeout_input: "30".into(),
+            override_active: false,
+            restart_required: false,
+            remember_session: true,
+            remember_minutes_input: "5".into(),
+            confirmation: None,
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 10)).unwrap();
+        terminal
+            .draw(|frame| render_settings(frame, frame.area(), &mut app))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Save session preferences"));
+        let (rect, _) = app.ui.buttons.iter().find(|(_, slot)| *slot == 6).unwrap();
+        assert!(rect.y < 9);
+    }
+
+    #[tokio::test]
+    async fn mutating_settings_require_a_second_enter() {
+        for field in [
+            SettingsField::SaveSession,
+            SettingsField::Reset,
+            SettingsField::Save,
+        ] {
+            let mut app = TuiApp::default();
+            app.settings = Some(SecurityEditor {
+                field,
+                active: SecuritySettings {
+                    rollback_timeout_seconds: 30,
+                },
+                rollback_timeout_input: "30".into(),
+                override_active: false,
+                restart_required: false,
+                remember_session: true,
+                remember_minutes_input: "5".into(),
+                confirmation: None,
+            });
+
+            handle_settings_key(
+                &mut app,
+                KeyCode::Enter,
+                &ApiClient::new("/socket-that-must-not-be-opened"),
+            )
+            .await;
+
+            assert_eq!(app.settings.as_ref().unwrap().confirmation, Some(field));
+            assert!(app.message.is_none(), "first Enter must not submit");
+        }
+    }
+
+    #[test]
     fn settings_field_clamps_at_both_ends_instead_of_wrapping() {
         assert_eq!(
             next_settings_field(SettingsField::RollbackTimeout),
-            SettingsField::ChangePassword
+            SettingsField::RememberSession
         );
         assert_eq!(
             next_settings_field(SettingsField::ChangePassword),

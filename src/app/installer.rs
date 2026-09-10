@@ -64,6 +64,93 @@ pub struct InstallArgs {
     pub dry_run: bool,
 }
 
+#[derive(Debug, Clone, Args)]
+pub struct UninstallArgs {
+    /// Binary installation prefix used during install
+    #[arg(long, default_value = "/usr/local")]
+    pub prefix: PathBuf,
+    /// Show what would be removed without stopping the daemon or changing files
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Apply the removal plan without an interactive prompt
+    #[arg(short = 'y', long)]
+    pub yes: bool,
+    /// Maximum time to wait for graceful daemon shutdown
+    #[arg(long, default_value_t = 30)]
+    pub timeout_seconds: u64,
+}
+
+pub async fn uninstall(args: UninstallArgs, config_override: Option<PathBuf>) -> Result<()> {
+    let files = uninstall_files(&args.prefix)?;
+    let resolved = crate::config::ResolvedConfig::load(config_override)?;
+    println!(
+        "Stop traffic-masqd using configuration: {}",
+        resolved.source
+    );
+    for path in &files {
+        println!("Remove if present: {}", path.display());
+    }
+    println!(
+        "Preserve configuration, passwords, state, logs, access group and dependency packages."
+    );
+    if args.dry_run {
+        println!("Dry run completed; no changes were made.");
+        return Ok(());
+    }
+    if !Uid::effective().is_root() {
+        bail!("traffic-masqd uninstall must be run as root");
+    }
+    if !args.yes {
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            bail!("non-interactive removal requires --yes; use --dry-run to inspect the plan");
+        }
+        if !prompt_yes_no("Apply this removal plan?", false)? {
+            println!("Uninstallation cancelled; no changes were made.");
+            return Ok(());
+        }
+    }
+    service::stop(&resolved.config, Duration::from_secs(args.timeout_seconds))
+        .await
+        .context("daemon shutdown failed; installed files were not removed")?;
+    let _guard = ProcessGuard::acquire(&resolved.config.runtime.pid_path)
+        .context("daemon restarted during uninstallation; installed files were not removed")?;
+    remove_uninstall_files(&files)?;
+    println!("traffic-masq uninstalled. Configuration, passwords, state and logs were preserved.");
+    Ok(())
+}
+
+fn uninstall_files(prefix: &Path) -> Result<Vec<PathBuf>> {
+    validate_prefix(prefix)?;
+    let files: Vec<_> = [
+        "bin/traffic-masq",
+        "share/doc/traffic-masq/README.md",
+        "share/doc/traffic-masq/config.example.toml",
+        "sbin/traffic-masqd",
+    ]
+    .iter()
+    .map(|name| prefix.join(name))
+    .collect();
+    for path in &files {
+        validate_destination(path, "uninstall target")?;
+    }
+    Ok(files)
+}
+
+fn remove_uninstall_files(files: &[PathBuf]) -> Result<()> {
+    // Recheck the complete plan before removing any file. Never recurse into directories.
+    for path in files {
+        validate_destination(path, "uninstall target")?;
+    }
+    for path in files {
+        match fs::remove_file(path) {
+            Ok(()) => println!("Removed {}", path.display()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {},
+            Err(error) => return Err(error).with_context(|| format!("failed to remove {}; earlier files may already have been removed; rerun uninstall to finish", path.display())),
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PackageManager {
     Apt,
@@ -898,6 +985,64 @@ fn prompt_yes_no(label: &str, default: bool) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn uninstall_dry_run_preserves_files_and_does_not_create_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = uninstall_files(dir.path()).unwrap();
+        fs::create_dir_all(files[0].parent().unwrap()).unwrap();
+        fs::write(&files[0], "installed").unwrap();
+        let mut config = AppConfig::default();
+        config.runtime.pid_path = dir.path().join("runtime/daemon.pid");
+        let config_path = dir.path().join("config.toml");
+        fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        uninstall(
+            UninstallArgs {
+                prefix: dir.path().to_path_buf(),
+                dry_run: true,
+                yes: true,
+                timeout_seconds: 1,
+            },
+            Some(config_path.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(fs::read_to_string(&files[0]).unwrap(), "installed");
+        assert!(config_path.exists());
+        assert!(!dir.path().join("runtime").exists());
+    }
+
+    #[test]
+    fn uninstall_removes_only_named_files_and_is_repeatable() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = uninstall_files(dir.path()).unwrap();
+        for path in &files {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "installed").unwrap();
+        }
+        let preserved = dir.path().join("share/doc/traffic-masq/custom.txt");
+        fs::write(&preserved, "keep").unwrap();
+        remove_uninstall_files(&files).unwrap();
+        remove_uninstall_files(&files).unwrap();
+        assert!(files.iter().all(|path| !path.exists()));
+        assert_eq!(fs::read_to_string(preserved).unwrap(), "keep");
+    }
+
+    #[test]
+    fn uninstall_rejects_directory_or_symlink_before_removing_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = uninstall_files(dir.path()).unwrap();
+        fs::create_dir_all(files[0].parent().unwrap()).unwrap();
+        fs::write(&files[0], "keep until preflight passes").unwrap();
+        fs::create_dir_all(&files[3]).unwrap();
+        assert!(remove_uninstall_files(&files).is_err());
+        assert!(files[0].exists());
+        fs::remove_dir(&files[3]).unwrap();
+        std::os::unix::fs::symlink(&files[0], &files[3]).unwrap();
+        assert!(uninstall_files(dir.path()).is_err());
+        assert!(files[0].exists());
+        assert!(uninstall_files(Path::new("relative")).is_err());
+    }
+
     use super::*;
     use clap::Parser;
     use tempfile::tempdir;

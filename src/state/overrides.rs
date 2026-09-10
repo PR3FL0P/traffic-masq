@@ -254,7 +254,7 @@ mod tests {
                 dhcp_client: None,
                 wifi: None,
                 wifi_client: None,
-            nat: true,
+                nat: true,
             },
         );
         base.network
@@ -272,14 +272,14 @@ mod tests {
             "wan0".to_string(),
             InterfaceOverride {
                 config: InterfaceConfig {
-                    role: InterfaceRole::Management,
+                    role: InterfaceRole::None,
                     managed: false,
                     ipv4: None,
                     dhcp: None,
                     dhcp_client: None,
                     wifi: None,
                     wifi_client: None,
-                nat: true,
+                    nat: true,
                 },
                 allow_management_change: true,
             },

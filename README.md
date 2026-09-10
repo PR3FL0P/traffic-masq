@@ -11,15 +11,16 @@ made and what happens when one of them is wrong:
   nothing — because you just locked yourself out — and the machine returns to
   the configuration it had. The same idea as `commit confirmed` on a Juniper,
   on an ordinary Linux host.
-- **It only touches what it was given.** Interfaces are managed one by one, and
-  the daemon records every address it installs, both in the kernel and in a
-  journal on disk. An address it did not install is never removed, and handing
-  an interface back leaves nothing behind. Installing it does not mean handing
-  over the machine.
+- **It changes only resources it created.** The daemon records every address,
+  route, firewall object and supervised process it creates. Existing addresses,
+  routes, firewall tables and processes remain under their current owner's
+  control. Handing an interface back removes traffic-masq state and leaves
+  foreign state intact.
 - **It converges.** The running configuration is a goal, not a sequence of
-  commands. If something else changes an interface, the change is noticed and
-  undone; if an interface is unplugged and returns, it is configured again.
-  Interface and router changes can be previewed before they are applied.
+  commands. Drift in traffic-masq-owned state is repaired; foreign state is
+  ignored. If an interface is unplugged and returns, its owned configuration is
+  restored. Interface and router changes can be previewed before they are
+  applied.
 
 It installs onto a machine that already has a working network, and leaves that
 network alone until it is told which interfaces to manage. Nothing is
@@ -240,10 +241,28 @@ Later sessions may run without root if the user can access the daemon socket:
 traffic-masq
 ```
 
+The client asks for the device password inside the TUI. By default, it remembers
+its session for **5 minutes from password entry**, including across client restarts.
+In **Settings**, toggle **Remember session**, edit **Remember for (minutes)**
+(1–1440), then choose **Save session preferences (applies now)**. Disabling this
+removes the saved token and requires a password on the next launch. These are
+per-user, per-daemon-socket preferences and do not require a daemon restart.
+
+Only a session token is saved, never the password. Files are private (`0600`) in
+`$XDG_STATE_HOME/traffic-masq/client` (normally `~/.local/state/traffic-masq/client`),
+inside a `0700` directory. Reopening the client does not extend the chosen duration.
+The daemon still validates the session: password changes, revocation, and its
+configured idle/absolute limits can require a password sooner.
+
 The TUI keeps operation messages visible; press F1 to read a full message and
 use Up/Down to scroll it. Finish a form or leave it with Esc before changing
 tabs. Long Wi-Fi lists scroll with the selection; deleting a profile requires
 an explicit Y confirmation naming the profile.
+
+Changes in **Settings** also require confirmation. The first Enter shows an
+indented `Note: Confirm...` line; the second Enter applies the selected change.
+Esc or moving to another setting cancels the confirmation. Explanatory text is
+shown as an indented `Note:` directly after the setting it describes.
 
 During an API refresh, input takes priority. While an action is in progress,
 the TUI shows its elapsed time and rejects additional actions; Q requests exit
@@ -326,46 +345,61 @@ reachable for the revert to happen: it runs on the machine itself.
 
 ### What the daemon considers its own
 
-Only interfaces marked as managed are configured. For those, every IPv4 address
-the daemon installs is recorded twice — tagged in the kernel with `IFA_PROTO`,
-and written to a journal on disk before the address is installed. Both are
-checked at startup against what is actually on the links.
+Only interfaces with **Configure with traffic-masq** enabled receive interface
+configuration. Every IPv4 address the daemon installs is recorded twice —
+tagged in the kernel with `IFA_PROTO` where supported, and written to a journal
+on disk before installation. Routes, nftables objects and supervised services
+have equivalent ownership records or identifiers.
 
-A managed interface ends up carrying exactly the address it is configured with,
-so an address that was already on it is replaced. Once management is given up,
-that authority ends: an address that neither the tag nor the journal accounts
-for is never deleted, and marking an interface unmanaged removes what the
-daemon installed and leaves the rest alone.
+Changing the desired address removes only an old address recorded as owned by
+traffic-masq. A pre-existing or externally created address is preserved, even
+on an interface configured by traffic-masq. If an external address already
+matches the requested address, it remains externally owned. Turning
+**Configure with traffic-masq** off removes owned settings and leaves all
+foreign settings intact.
 
 ### Removing an address
 
-Having no address is a configuration, not a missing one. Clearing the CIDR
+Having no owned static address is a valid configuration. Clearing the CIDR
 field in the interface editor — with Backspace or the "Remove IPv4 address"
-row — sends an empty `cidr`, and the daemon plans a delete for every IPv4
-address the managed interface carries, whether it installed the address or
-found it there. It goes through the same dry-run preview, rollback timer and
-commit as any other change, and convergence holds it: an address that comes
-back is taken off again on the next pass.
+row — asks the daemon to remove its own static IPv4 address. The preview lists
+the exact address to be removed. External and DHCP-owned addresses are not
+included. The change uses the same rollback timer and commit flow as any other
+interface change.
 
-Two refusals are worth knowing about. An interface that is not managed is not
-written to at all, so removing its address means enabling Managed first. And an
-interface running a DHCP server cannot give up the address that server hands
-out its subnet from — disable DHCP first.
+Two refusals are worth knowing about. With **Configure with traffic-masq** off,
+IPv4 editing is disabled, so removing an owned address requires enabling it
+first. An interface running a DHCP server cannot give up the address whose
+subnet it serves; disable DHCP first.
 
-Management interfaces are not modified unless `allow_management_change` is
-enabled, and a change that would alter one is refused rather than attempted.
+Interfaces with role `none` (outside the router) are not modified until the
+connectivity risk is explicitly confirmed. Interface router roles are `none`,
+`input`, and `output`; VPN hop interfaces use the reserved `middle` role. `none`
+does not disable the link or prevent access to the machine. The legacy
+`management` spelling is accepted as `none`, with its confirmation protection
+preserved. Legacy `disabled` configurations remain readable but are no longer
+offered in the role selector.
+
+In the interface editor, **Configure with traffic-masq** controls configuration
+ownership independently of the router role. Address editing is unavailable
+when it is off. Review changes opens a read-only preview; selecting Apply
+confirms the displayed connectivity risks and starts the rollback timer.
+The API retains `managed` and `allow_management_change` for compatibility.
 
 Test configuration changes on a separate Linux host before production use.
 
 ## Stop and uninstall
 
 ```sh
-sudo traffic-masqd stop
-sudo ./packaging/uninstall.sh
+sudo traffic-masqd uninstall --dry-run
+sudo traffic-masqd uninstall
 ```
-## AI Status
-
-The project was rewritten from another programming language. AI was used to rewrite the code and tests.
+Uninstall stops the daemon gracefully before removing both binaries and packaged
+documentation. Configuration, passwords, state, logs, the access group and
+dependency packages are preserved. Use `--yes` for unattended removal and
+`--prefix /custom/path` if installed under a custom prefix. For a custom
+configuration, pass `--config /path/to/config.toml` so the correct daemon is
+stopped.
 
 ## License
 

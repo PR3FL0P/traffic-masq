@@ -1,3 +1,4 @@
+use ratatui::text::Span;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
@@ -34,6 +35,7 @@ mod layout;
 mod logs;
 mod provisioning;
 mod router;
+mod session;
 mod settings;
 mod vpn;
 mod vpn_policy;
@@ -189,6 +191,7 @@ struct TuiApp {
     dhcp_clients: Vec<DhcpClientStatusView>,
     preview: Option<InterfaceChangePlan>,
     preview_apply_selected: bool,
+    preview_scroll: Option<usize>,
     pending: Option<PendingNetworkChange>,
     router: RouterData,
     router_pending: Option<RouterPendingView>,
@@ -229,6 +232,7 @@ impl Default for TuiApp {
             dhcp_clients: Vec::new(),
             preview: None,
             preview_apply_selected: true,
+            preview_scroll: None,
             pending: None,
             router: RouterData::default(),
             router_pending: None,
@@ -309,6 +313,11 @@ pub async fn change_device_password(socket_path: PathBuf) -> Result<()> {
     new_password.zeroize();
     repeated.zeroize();
     result?;
+    if let Ok(store) = session::SessionStore::for_client(&client) {
+        if let Err(error) = store.clear() {
+            eprintln!("Could not remove the revoked saved session: {error}");
+        }
+    }
     println!("Device password updated; all active sessions were revoked.");
     Ok(())
 }
@@ -331,10 +340,17 @@ pub async fn run_tui(socket_path: PathBuf, direct: bool) -> Result<()> {
             .await
             .context("traffic-masqd is unavailable")?;
         if client.auth_initialized().await? {
-            let mut password = rpassword::prompt_password("Device password: ")?;
-            let login_result = client.login(&password).await;
-            password.zeroize();
-            login_result?;
+            match session::SessionStore::for_client(&client) {
+                Ok(store) => {
+                    if let Err(error) = store.restore(&client).await {
+                        client.forget_authentication().await;
+                        eprintln!(
+                            "Saved session unavailable: {error}. Please enter your password."
+                        );
+                    }
+                }
+                Err(error) => eprintln!("Session storage unavailable: {error}"),
+            }
         } else {
             if !nix::unistd::Uid::effective().is_root() {
                 anyhow::bail!("Initial password setup requires root. Run sudo traffic-masqd auth set-password while the daemon is stopped, then restart it and run this TUI as your authorized user.");
@@ -354,7 +370,11 @@ pub async fn run_tui(socket_path: PathBuf, direct: bool) -> Result<()> {
             repeated.zeroize();
             initialize_result?;
         }
-        println!("Authenticated");
+        if client.is_authenticated().await {
+            if let Err(error) = session::remember(&client).await {
+                eprintln!("Could not save session: {error}");
+            }
+        }
     }
 
     enable_raw_mode()?;
@@ -369,8 +389,17 @@ pub async fn run_tui(socket_path: PathBuf, direct: bool) -> Result<()> {
     drop(terminal_guard);
 
     if !direct {
-        if let Err(error) = client.logout().await {
-            tracing::warn!(%error, "failed to revoke TUI session during logout");
+        let remembered = match session::remember(&client).await {
+            Ok(remembered) => remembered,
+            Err(error) => {
+                eprintln!("Could not save session: {error}");
+                false
+            }
+        };
+        if !remembered {
+            if let Err(error) = client.logout().await {
+                tracing::warn!(%error, "failed to revoke TUI session during logout");
+            }
         }
     }
     result
@@ -387,16 +416,25 @@ async fn run_loop(
         None
     };
     let mut app = TuiApp::default();
+    let mut has_authenticated = client.is_authenticated().await;
 
     while !app.should_quit {
         if !direct && !client.is_authenticated().await {
-            if !reauthenticate(terminal, client, pending_deadline(&app)).await? {
+            if !reauthenticate(terminal, client, pending_deadline(&app), !has_authenticated).await?
+            {
                 break;
             }
-            app.push_message(
-                LogLevel::Info,
-                "Authenticated again. Inspect pending state before retrying any operation.",
-            );
+            has_authenticated = true;
+            match session::remember(client).await {
+                Ok(_) => app.push_message(
+                    LogLevel::Info,
+                    "Authenticated. Inspect pending state before retrying any operation.",
+                ),
+                Err(error) => app.push_message(
+                    LogLevel::Warn,
+                    format!("Authenticated, but could not save session: {error}"),
+                ),
+            }
         }
         let snapshot = terminal
             .draw(|frame| render(frame, &mut app, direct))?
@@ -516,15 +554,9 @@ async fn drive_ui(
             _ = &mut operation => return Ok(exit_requested),
             _ = tokio::time::sleep(Duration::from_millis(50)) => {
                 terminal.draw(|frame| {
-                    let area = frame.area();
-                    if area == snapshot.area {
-                        *frame.buffer_mut() = snapshot.clone();
-                    }
-                    let remaining = deadline.map(|d| format!("; rollback deadline in {}s (outcome unverified)", d.saturating_sub(current_unix_time()))).unwrap_or_default();
-                    let message = format!("{} {}s{remaining}. {}", if cancellable { "Refreshing; displayed data may be stale" } else { "Operation in progress" }, started.elapsed().as_secs(), if cancellable { "Input interrupts refresh" } else { "Q: exit after result; other actions disabled" });
-                    let banner = ratatui::layout::Rect::new(area.x, area.y + area.height.saturating_sub(2), area.width, area.height.min(2));
-                    frame.render_widget(ratatui::widgets::Clear, banner);
-                    frame.render_widget(Paragraph::new(message).wrap(ratatui::widgets::Wrap { trim: true }), banner);
+                    render_operation_snapshot(
+                        frame, &snapshot, deadline, started.elapsed(), cancellable,
+                    );
                 })?;
                 if event::poll(Duration::ZERO)? {
                     let input = event::read()?;
@@ -537,22 +569,81 @@ async fn drive_ui(
     }
 }
 
+/// Keep the notification and footer border intact while an API request runs.
+/// Routine refreshes should finish without flashing a progress indicator.
+fn render_operation_snapshot(
+    frame: &mut ratatui::Frame<'_>,
+    snapshot: &ratatui::buffer::Buffer,
+    deadline: Option<u64>,
+    elapsed: Duration,
+    cancellable: bool,
+) {
+    let area = frame.area();
+    if area != snapshot.area {
+        return;
+    }
+    *frame.buffer_mut() = snapshot.clone();
+    if (cancellable && elapsed < Duration::from_millis(500))
+        || area.width < MIN_TERMINAL_WIDTH
+        || area.height < MIN_TERMINAL_HEIGHT
+    {
+        return;
+    }
+    let remaining = deadline
+        .map(|d| {
+            format!(
+                "; rollback deadline in {}s (outcome unverified)",
+                d.saturating_sub(current_unix_time())
+            )
+        })
+        .unwrap_or_default();
+    let message = format!(
+        "{} {}s{remaining}. {}",
+        if cancellable {
+            "Refreshing"
+        } else {
+            "Operation in progress"
+        },
+        elapsed.as_secs(),
+        if cancellable {
+            "Displayed data may be stale; input interrupts refresh"
+        } else {
+            "Q: exit after result; other actions disabled"
+        },
+    );
+    // The first inner footer row contains key hints. The second contains the
+    // notification; progress must never overwrite it or the bottom border.
+    let banner =
+        ratatui::layout::Rect::new(area.x + 1, area.y + area.height - 3, area.width - 2, 1);
+    frame.render_widget(ratatui::widgets::Clear, banner);
+    frame.render_widget(
+        Paragraph::new(message).style(Style::default().fg(theme::MUTED)),
+        banner,
+    );
+}
+
 async fn reauthenticate(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     client: &ApiClient,
     deadline: Option<u64>,
+    initial: bool,
 ) -> Result<bool> {
     let mut password = zeroize::Zeroizing::new(String::new());
-    let mut message = "Session expired or revoked. Enter device password; Esc: exit. Drafts are preserved; rollback deadlines continue.".to_string();
+    let mut message = if initial {
+        "Enter device password; Enter: sign in; Esc: exit."
+    } else {
+        "Session expired or revoked. Enter device password; Esc: exit. Drafts are preserved; rollback deadlines continue."
+    }.to_string();
     loop {
         let snapshot = terminal
             .draw(|frame| {
                 frame.render_widget(
                     Paragraph::new(format!(
-                        "{message}\nPassword: {}",
+                        "{message}\n\nDevice password: {}",
                         "*".repeat(password.chars().count())
                     ))
-                    .wrap(ratatui::widgets::Wrap { trim: true }),
+                    .wrap(ratatui::widgets::Wrap { trim: true })
+                    .block(layout::panel("traffic-masq · Sign in")),
                     frame.area(),
                 );
             })?
@@ -649,6 +740,8 @@ async fn navigate_to_section(app: &mut TuiApp, section: Section, client: &ApiCli
                 );
             } else {
                 app.screen = Screen::Wifi;
+                app.wifi.actions_open = false;
+                app.wifi.selected = app.wifi.selected_radio;
                 wifi::load_wifi_data(app, client).await;
             }
         }
@@ -707,7 +800,12 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                 .find(|(rect, _)| layout::point_in_rect(point, *rect))
             {
                 focus_action_slot(app, slot);
-                handle_key(app, KeyCode::Enter, client, direct).await;
+                let key = if app.screen == Screen::PendingChange && slot == 1 {
+                    KeyCode::Esc
+                } else {
+                    KeyCode::Enter
+                };
+                handle_key(app, key, client, direct).await;
                 return;
             }
             if let Some(area) = app.ui.list_area {
@@ -721,14 +819,16 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                             | Screen::InterfaceList
                             | Screen::DhcpInterfaceList => {
                                 app.selected_interface = index;
+                                if app.screen == Screen::Dashboard {
+                                    app.dashboard_focus = dashboard::DashboardFocus::List;
+                                }
                             }
                             Screen::Vpn => {
                                 app.vpn.selected_profile = index;
                                 app.vpn.focus = vpn::VpnFocus::List;
                             }
                             Screen::Wifi => {
-                                app.wifi.selected = index;
-                                app.wifi.selected_radio = index;
+                                wifi::open_radio(app, index);
                             }
                             Screen::WifiScan => {
                                 if let Some(scan) = app.wifi_scan.as_mut() {
@@ -1015,18 +1115,46 @@ fn normalize_selection(app: &mut TuiApp) {
     }
 }
 
-fn format_addresses(status: &InterfaceStatus) -> String {
-    let addresses = status
-        .ipv4_addresses
-        .iter()
-        .map(|address| format!("{}/{}", address.address, address.prefix_len))
-        .collect::<Vec<_>>()
-        .join(", ");
-    if addresses.is_empty() {
-        "-".to_string()
+fn address_marker(
+    status: &InterfaceStatus,
+    address: &crate::netlink::Ipv4AddressInfo,
+) -> &'static str {
+    if let Some(owned) = &status.owned_ipv4_addresses {
+        if owned.contains(address) {
+            ""
+        } else {
+            "[ext] "
+        }
     } else {
-        addresses
+        match address.owner() {
+            crate::netlink::AddressOwner::TrafficMasqStatic
+            | crate::netlink::AddressOwner::TrafficMasqDhcp => "",
+            crate::netlink::AddressOwner::Foreign(_) => "[ext] ",
+            crate::netlink::AddressOwner::Untagged => "[?] ",
+        }
     }
+}
+
+fn format_addresses(status: &InterfaceStatus) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for address in &status.ipv4_addresses {
+        if !spans.is_empty() {
+            spans.push(Span::raw(", "));
+        }
+        let marker = address_marker(status, address);
+        spans.push(Span::styled(
+            format!("{marker}{}/{}", address.address, address.prefix_len),
+            Style::default().fg(if marker.is_empty() {
+                theme::MUTED
+            } else {
+                theme::WARN
+            }),
+        ));
+    }
+    if spans.is_empty() {
+        spans.push(Span::raw("-"));
+    }
+    spans
 }
 
 async fn load_daemon_dashboard(client: &ApiClient) -> DashboardData {
@@ -1177,6 +1305,7 @@ async fn load_direct_dashboard(network: Option<&RtnetlinkNetworkProvider>) -> Da
     for interface in interfaces {
         match network.list_ipv4_addresses(&interface.name).await {
             Ok(ipv4_addresses) => statuses.push(InterfaceStatus {
+                owned_ipv4_addresses: None,
                 has_default_route: routes.iter().any(|route| {
                     route.destination.prefix_len() == 0
                         && route.output_interface_index == Some(interface.index)
@@ -1214,6 +1343,113 @@ fn current_unix_time() -> u64 {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn rollback_click_sends_rollback_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut bytes = [0; 1024];
+            while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+                let count = stream.read(&mut bytes).await.unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&bytes[..count]);
+            }
+            stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let mut app = TuiApp::default();
+        app.screen = Screen::PendingChange;
+        app.pending = Some(crate::core::transaction::PendingNetworkChange {
+            token: "test-token".into(),
+            interface: "eth0".into(),
+            rollback_timeout_seconds: 30,
+            expires_at_unix: current_unix_time() + 30,
+        });
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(60, 15)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut app, false))
+            .unwrap();
+        let (rect, _) = *app.ui.buttons.iter().find(|(_, slot)| *slot == 1).unwrap();
+        assert!(
+            rect.y < 10,
+            "rollback must fit inside the content panel at 60x15"
+        );
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x,
+                row: rect.y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            &ApiClient::new(socket),
+            false,
+        )
+        .await;
+        let request = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(request.starts_with("POST /api/v1/network-transactions/rollback "));
+    }
+
+    #[tokio::test]
+    async fn wifi_click_opens_actions_for_clicked_interface() {
+        let mut app = TuiApp::default();
+        app.screen = Screen::Wifi;
+        app.wifi.rows = vec![
+            wifi::WifiRow {
+                interface: "wlan0".into(),
+                role: wifi::WifiRole::AccessPoint,
+                ap: None,
+                client: None,
+            },
+            wifi::WifiRow {
+                interface: "wlan1".into(),
+                role: wifi::WifiRole::Client,
+                ap: None,
+                client: None,
+            },
+        ];
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut app, false))
+            .unwrap();
+        assert!(!app.wifi.actions_open);
+        let area = app.ui.list_area.unwrap();
+        let client = ApiClient::new("/nonexistent.sock");
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: area.x,
+                row: area.y + 1,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            &client,
+            false,
+        )
+        .await;
+        assert!(app.wifi.actions_open);
+        assert_eq!(app.wifi.selected_radio, 1);
+        terminal
+            .draw(|frame| render(frame, &mut app, false))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Scan networks"));
+        assert!(!text.contains("Configure access point"));
+    }
+
     #[test]
     fn footer_message_is_visible_at_supported_sizes() {
         for (width, height) in [(80, 24), (60, 15)] {
@@ -1232,6 +1468,66 @@ mod tests {
                 .map(|c| c.symbol())
                 .collect();
             assert!(text.contains("Validation failed"));
+        }
+    }
+
+    #[test]
+    fn refreshing_preserves_footer_notification_and_does_not_flash_for_fast_reads() {
+        for (width, height) in [(80, 24), (60, 15)] {
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            let mut app = TuiApp::default();
+            app.push_message(LogLevel::Info, "Settings saved");
+            let snapshot = terminal
+                .draw(|frame| render(frame, &mut app, false))
+                .unwrap()
+                .buffer
+                .clone();
+
+            terminal
+                .draw(|frame| {
+                    render_operation_snapshot(
+                        frame,
+                        &snapshot,
+                        None,
+                        Duration::from_millis(100),
+                        true,
+                    )
+                })
+                .unwrap();
+            assert_eq!(terminal.backend().buffer(), &snapshot);
+
+            for cancellable in [true, false] {
+                terminal
+                    .draw(|frame| {
+                        render_operation_snapshot(
+                            frame,
+                            &snapshot,
+                            None,
+                            Duration::from_secs(2),
+                            cancellable,
+                        )
+                    })
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let progress: String = (1..width - 1)
+                    .map(|x| buffer[(x, height - 3)].symbol())
+                    .collect();
+                assert!(progress.contains(if cancellable {
+                    "Refreshing"
+                } else {
+                    "Operation in progress"
+                }));
+                for y in [height - 2, height - 1] {
+                    for x in 0..width {
+                        assert_eq!(
+                            buffer[(x, y)],
+                            snapshot[(x, y)],
+                            "notification and border must stay intact"
+                        );
+                    }
+                }
+            }
         }
     }
 

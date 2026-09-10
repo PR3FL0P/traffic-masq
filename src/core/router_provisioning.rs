@@ -147,7 +147,7 @@ pub enum RouterProvisioningError {
         uplink: String,
         output: String,
     },
-    #[error("changing management interface {interface} requires explicit confirmation")]
+    #[error("changing outside-router interface {interface} requires explicit confirmation")]
     ManagementConfirmationRequired { interface: String },
     #[error("global service {service} must be enabled before router provisioning")]
     GlobalServiceDisabled { service: &'static str },
@@ -201,7 +201,7 @@ pub fn derive_router_provisioning(
         (&desired.uplink.interface, uplink_observation),
         (&desired.output.interface, output_observation),
     ] {
-        if observation.role == Some(InterfaceRole::Management) && !desired.allow_management_change {
+        if observation.role == Some(InterfaceRole::None) && !desired.allow_management_change {
             return Err(RouterProvisioningError::ManagementConfirmationRequired {
                 interface: name.clone(),
             });
@@ -287,7 +287,7 @@ pub fn derive_router_provisioning(
             security: desired.uplink.security,
             passphrase_file: desired.uplink.passphrase_file.clone(),
         }),
-    nat: true,
+        nat: true,
     };
 
     let output_interface = InterfaceConfig {
@@ -320,7 +320,7 @@ pub fn derive_router_provisioning(
             passphrase_file: desired.output.passphrase_file.clone(),
         }),
         wifi_client: None,
-    nat: true,
+        nat: true,
     };
 
     let router = RouterConfig {
@@ -331,7 +331,7 @@ pub fn derive_router_provisioning(
         }),
         owned_routes: Vec::new(),
         allow_default_route_change: true,
-    vpn_chain: Vec::new(),
+        vpn_chain: Vec::new(),
     };
 
     let mut effective_config = context.effective_config.clone();
@@ -612,7 +612,7 @@ mod tests {
     #[test]
     fn management_role_requires_explicit_confirmation() {
         let mut context = context();
-        context.interfaces.get_mut("wlan-up").unwrap().role = Some(InterfaceRole::Management);
+        context.interfaces.get_mut("wlan-up").unwrap().role = Some(InterfaceRole::None);
 
         assert_eq!(
             derive_router_provisioning(&desired(), &context).unwrap_err(),

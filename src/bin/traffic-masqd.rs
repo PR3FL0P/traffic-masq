@@ -7,7 +7,7 @@ use std::time::Duration;
 use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
 use nix::unistd::Uid;
-use traffic_masq::app::installer::{self, InstallArgs};
+use traffic_masq::app::installer::{self, InstallArgs, UninstallArgs};
 use traffic_masq::app::service::{self, ServiceStatus};
 use traffic_masq::app::{reset_device_password, run_daemon};
 use traffic_masq::config::{AppConfig, ResolvedConfig, DEFAULT_CONFIG_PATH};
@@ -27,6 +27,9 @@ struct Args {
 enum Command {
     /// Install both binaries and prepare safe local configuration
     Install(InstallArgs),
+
+    /// Stop the daemon and remove installed files, preserving configuration and state
+    Uninstall(UninstallArgs),
 
     /// Run the daemon in the foreground
     ///
@@ -112,6 +115,9 @@ async fn main() -> Result<()> {
     if let Command::Install(install_args) = &command {
         return installer::run(install_args.clone(), args.config).await;
     }
+    if let Command::Uninstall(uninstall_args) = &command {
+        return installer::uninstall(uninstall_args.clone(), args.config).await;
+    }
     if let Command::Config {
         command: ConfigCommand::Init { path, force },
     } = &command
@@ -127,7 +133,9 @@ async fn main() -> Result<()> {
     let resolved = ResolvedConfig::load(args.config)?;
     let config = &resolved.config;
     match command {
-        Command::Install(_) => unreachable!("install handled before configuration resolution"),
+        Command::Install(_) | Command::Uninstall(_) => {
+            unreachable!("install handled before configuration resolution")
+        }
         Command::Config { command } => match command {
             ConfigCommand::Path => {
                 println!("{}", resolved.source);
@@ -267,6 +275,30 @@ async fn set_password(config: &AppConfig) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn uninstall_cli_accepts_custom_paths_and_preview() {
+        use clap::Parser;
+        let args = super::Args::try_parse_from([
+            "traffic-masqd",
+            "--config",
+            "/tmp/config.toml",
+            "uninstall",
+            "--prefix",
+            "/opt/traffic-masq",
+            "--dry-run",
+            "--yes",
+        ])
+        .unwrap();
+        let Some(super::Command::Uninstall(options)) = args.command else {
+            panic!("wrong command")
+        };
+        assert!(options.dry_run && options.yes);
+        assert_eq!(
+            options.prefix,
+            std::path::PathBuf::from("/opt/traffic-masq")
+        );
+    }
+
     use std::os::unix::fs::PermissionsExt;
 
     use tempfile::tempdir;

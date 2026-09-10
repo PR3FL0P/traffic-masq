@@ -69,6 +69,18 @@ struct PendingTransaction {
 }
 
 impl NetworkTransactionManager {
+    pub(crate) async fn owns_address(
+        &self,
+        interface: &str,
+        address: &crate::netlink::Ipv4AddressInfo,
+    ) -> bool {
+        self.inner
+            .interface_manager
+            .owns_address(interface, address)
+            .await
+            || address.owner() == crate::netlink::AddressOwner::TrafficMasqDhcp
+    }
+
     pub fn new(
         interface_manager: InterfaceManager,
         rollback_timeout: Duration,
@@ -723,7 +735,10 @@ mod tests {
             .expect("apply");
         assert_eq!(
             addresses(&provider).await,
-            vec![Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::new(192, 168, 50, 1)],
+            vec![
+                Ipv4Addr::new(192, 168, 1, 10),
+                Ipv4Addr::new(192, 168, 50, 1)
+            ],
             "apply must not return before the change has reached the machine"
         );
 
@@ -771,7 +786,10 @@ mod tests {
             .expect("apply");
         assert_eq!(
             addresses(&provider).await,
-            vec![Ipv4Addr::new(192, 168, 1, 10), Ipv4Addr::new(192, 168, 50, 1)]
+            vec![
+                Ipv4Addr::new(192, 168, 1, 10),
+                Ipv4Addr::new(192, 168, 50, 1)
+            ]
         );
 
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -843,13 +861,13 @@ mod tests {
             .apply(
                 "test0",
                 &interface_config(PROPOSED),
-                Some(InterfaceRole::Management),
+                Some(InterfaceRole::None),
                 false,
             )
             .await
             .expect_err("a management change without confirmation must be refused");
 
-        assert!(error.to_string().contains("management interface"));
+        assert!(error.to_string().contains("outside-router interface"));
         assert!(!desired.is_tentative("test0").await);
         assert!(manager.pending().await.is_empty());
     }

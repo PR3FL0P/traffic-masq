@@ -119,7 +119,9 @@ pub struct NetworkConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InterfaceRole {
-    Management,
+    /// Does not participate in the router. Legacy management roles retain protection.
+    #[serde(alias = "management")]
+    None,
     Input,
     Output,
     /// A slot naming one of the VPN hop chain's virtual `tm-wg-<hop_index>`
@@ -616,7 +618,7 @@ impl NetworkConfig {
     pub fn management_interfaces(&self) -> impl Iterator<Item = (&str, &InterfaceConfig)> {
         self.interfaces
             .iter()
-            .filter(|(_, config)| config.role == InterfaceRole::Management)
+            .filter(|(_, config)| config.role == InterfaceRole::None)
             .map(|(name, config)| (name.as_str(), config))
     }
 }
@@ -723,8 +725,8 @@ impl OwnedIpv4RouteConfig {
         match interface.role {
             InterfaceRole::Input if uplink.is_some_and(|uplink| uplink.interface == name) => Ok(()),
             InterfaceRole::Output if interface.managed => Ok(()),
-            InterfaceRole::Management | InterfaceRole::Disabled | InterfaceRole::Middle => {
-                bail!("management, disabled, or VPN-hop interface {name} cannot own a router route")
+            InterfaceRole::None | InterfaceRole::Disabled | InterfaceRole::Middle => {
+                bail!("outside-router, disabled, or VPN-hop interface {name} cannot own a router route")
             }
             InterfaceRole::Input => {
                 bail!("route input interface {name} is not the selected uplink")
@@ -749,7 +751,10 @@ impl InterfaceConfig {
         }
 
         if self.role == InterfaceRole::Middle
-            && (self.dhcp.is_some() || self.wifi.is_some() || self.wifi_client.is_some() || self.ipv4.is_some())
+            && (self.dhcp.is_some()
+                || self.wifi.is_some()
+                || self.wifi_client.is_some()
+                || self.ipv4.is_some())
         {
             bail!(
                 "a Middle (VPN hop) interface is unaddressed and WireGuard-only; it cannot carry \
@@ -1128,6 +1133,17 @@ impl Default for AppConfig {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn legacy_management_role_reads_as_none_and_serializes_canonically() {
+        let config: InterfaceConfig =
+            toml::from_str("role = \"management\"\nmanaged = false\n").unwrap();
+        assert_eq!(config.role, InterfaceRole::None);
+        let encoded = toml::to_string(&config).unwrap();
+        assert!(encoded.contains("role = \"none\""));
+        assert!(!encoded.contains("management"));
+    }
+
     use super::*;
 
     fn input_interface() -> InterfaceConfig {
@@ -1299,8 +1315,8 @@ mod tests {
             .network
             .interfaces
             .get("eth0")
-            .expect("example shows a management interface");
-        assert_eq!(management.role, InterfaceRole::Management);
+            .expect("example shows an outside-router interface");
+        assert_eq!(management.role, InterfaceRole::None);
         assert!(!management.managed);
 
         let lan = config
@@ -1414,10 +1430,10 @@ mod tests {
             .interfaces
             .get_mut("wan0")
             .expect("uplink")
-            .role = InterfaceRole::Management;
+            .role = InterfaceRole::None;
         assert!(config
             .validate()
-            .expect_err("management interface cannot be uplink")
+            .expect_err("outside-router interface cannot be uplink")
             .to_string()
             .contains("must have the input role"));
     }
@@ -1454,7 +1470,7 @@ mod tests {
 
     #[test]
     fn rejects_route_ownership_violations() {
-        for role in [InterfaceRole::Management, InterfaceRole::Disabled] {
+        for role in [InterfaceRole::None, InterfaceRole::Disabled] {
             let mut config = valid_router_config();
             config.network.interfaces.insert(
                 "foreign0".to_string(),
@@ -1748,7 +1764,7 @@ mod tests {
             .interfaces
             .get_mut("wlan0")
             .expect("interface");
-        interface.role = InterfaceRole::Management;
+        interface.role = InterfaceRole::None;
         interface.dhcp = None;
         assert!(config.validate().is_err());
     }
@@ -2123,7 +2139,7 @@ mod tests {
     fn rejects_invalid_dhcp_client_ownership_combinations() {
         for role in [
             InterfaceRole::Output,
-            InterfaceRole::Management,
+            InterfaceRole::None,
             InterfaceRole::Disabled,
         ] {
             let mut interface = input_interface();

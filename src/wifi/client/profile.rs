@@ -321,7 +321,7 @@ fn validate_fields(
             security,
             passphrase_file: None,
         }),
-    nat: true,
+        nat: true,
     };
     config
         .validate("wlan0")

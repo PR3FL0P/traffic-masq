@@ -1080,7 +1080,7 @@ mod tests {
             dhcp_client: None,
             wifi: None,
             wifi_client: Some(client_config(ssid)),
-        nat: true,
+            nat: true,
         };
         WifiClientSpec::from_interface_config(interface, &config)
             .expect("valid")

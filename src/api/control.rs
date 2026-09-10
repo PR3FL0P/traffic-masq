@@ -313,12 +313,14 @@ impl ControlService {
                     message: error.to_string(),
                 },
             },
-            Request::ListInterfaces => match interface_statuses(self.network.as_ref()).await {
-                Ok(interfaces) => Response::Interfaces { interfaces },
-                Err(error) => Response::Error {
-                    message: error.to_string(),
-                },
-            },
+            Request::ListInterfaces => {
+                match interface_statuses(self.network.as_ref(), &self.transactions).await {
+                    Ok(interfaces) => Response::Interfaces { interfaces },
+                    Err(error) => Response::Error {
+                        message: error.to_string(),
+                    },
+                }
+            }
             Request::GetInterfaceConfig { interface } => {
                 match self.interface_config_response(interface).await {
                     Ok(response) => response,
@@ -2662,7 +2664,7 @@ fn provisioning_preview_view(
         if context
             .interfaces
             .get(interface)
-            .is_some_and(|observation| observation.role == Some(InterfaceRole::Management))
+            .is_some_and(|observation| observation.role == Some(InterfaceRole::None))
         {
             warnings.push(ProvisioningWarning::ManagementInterfaceAffected {
                 interface: interface.clone(),
@@ -3169,13 +3171,18 @@ fn interface_edit_request_to_config(
                 .managed
                 .then(|| existing.and_then(|config| config.dhcp.clone()))
                 .flatten(),
-            dhcp_client: None,
+            dhcp_client: edit
+                .managed
+                .then(|| existing.and_then(|config| config.dhcp_client.clone()))
+                .flatten(),
             wifi: edit
                 .managed
                 .then(|| existing.and_then(|config| config.wifi.clone()))
                 .flatten(),
-            wifi_client: None,
-            nat: true,
+            wifi_client: existing
+                .filter(|config| edit.managed || !config.managed)
+                .and_then(|config| config.wifi_client.clone()),
+            nat: existing.is_none_or(|config| config.nat),
         },
         edit.allow_management_change,
     ))
@@ -3507,7 +3514,10 @@ fn select_dhcp_network(
     }
 }
 
-async fn interface_statuses(network: &dyn NetworkProvider) -> Result<Vec<InterfaceStatus>> {
+async fn interface_statuses(
+    network: &dyn NetworkProvider,
+    transactions: &NetworkTransactionManager,
+) -> Result<Vec<InterfaceStatus>> {
     let mut result = Vec::new();
     let routes = network.list_ipv4_routes().await.unwrap_or_default();
     for interface in network.list_interfaces().await? {
@@ -3516,7 +3526,14 @@ async fn interface_statuses(network: &dyn NetworkProvider) -> Result<Vec<Interfa
             route.destination.prefix_len() == 0
                 && route.output_interface_index == Some(interface.index)
         });
+        let mut owned = Vec::new();
+        for address in &ipv4_addresses {
+            if transactions.owns_address(&interface.name, address).await {
+                owned.push(address.clone());
+            }
+        }
         result.push(InterfaceStatus {
+            owned_ipv4_addresses: Some(owned),
             interface,
             ipv4_addresses,
             has_default_route,
@@ -3623,6 +3640,39 @@ mod tests {
     }
 
     #[test]
+    fn interface_edit_preserves_client_and_nat_settings() {
+        let existing = InterfaceConfig {
+            role: InterfaceRole::Input,
+            managed: true,
+            ipv4: None,
+            dhcp: None,
+            dhcp_client: Some(crate::config::DhcpClientInterfaceConfig::default()),
+            wifi: None,
+            wifi_client: Some(crate::config::WifiClientConfig {
+                ssid: "uplink".into(),
+                country_code: None,
+                security: crate::config::WifiClientSecurity::Open,
+                passphrase_file: None,
+            }),
+            nat: false,
+        };
+        let (config, _) = interface_edit_request_to_config(
+            InterfaceEditRequest {
+                cidr: String::new(),
+                role: InterfaceRole::Input,
+                managed: true,
+                allow_management_change: false,
+            },
+            Some(&existing),
+        )
+        .unwrap();
+        assert_eq!(config.dhcp_client, existing.dhcp_client);
+        assert_eq!(config.wifi_client, existing.wifi_client);
+        assert!(!config.nat);
+        config.validate("wlan0").unwrap();
+    }
+
+    #[test]
     fn interface_edit_request_preserves_existing_dhcp_settings() {
         let existing_dhcp = dhcp_config();
         let existing = InterfaceConfig {
@@ -3692,7 +3742,8 @@ mod tests {
             interface_edit_request_to_config(edit, Some(&existing)).expect("edit must convert");
 
         assert_eq!(
-            config.wifi, Some(existing_wifi),
+            config.wifi,
+            Some(existing_wifi),
             "an edit that never touches Managed must not silently wipe the AP config"
         );
     }
@@ -7307,7 +7358,7 @@ mod tests {
         config.network.interfaces.insert(
             "wlan-up".to_string(),
             InterfaceConfig {
-                role: InterfaceRole::Management,
+                role: InterfaceRole::None,
                 managed: false,
                 ipv4: Some("192.168.1.20/24".parse().unwrap()),
                 dhcp: None,

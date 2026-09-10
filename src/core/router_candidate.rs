@@ -142,12 +142,12 @@ fn reject_unconfirmed_management_change(
         let touches_management = match target_role {
             Some(target) => is_management_change(target, current_role),
 
-            None => current_role == Some(InterfaceRole::Management),
+            None => current_role == Some(InterfaceRole::None),
         };
 
         if touches_management && !confirmed {
             bail!(
-                "refusing to change management interface {name} without explicit confirmation \
+                "refusing to change outside-router interface {name} without explicit confirmation \
                  (set allow_management_change on its override)"
             );
         }
@@ -315,7 +315,7 @@ mod tests {
     fn management_interface() -> InterfaceConfig {
         InterfaceConfig {
             nat: true,
-            role: InterfaceRole::Management,
+            role: InterfaceRole::None,
             managed: false,
             ipv4: Some("192.168.1.20/24".parse().expect("IPv4 network")),
             dhcp: None,
@@ -353,8 +353,8 @@ mod tests {
             &committed(),
             &RouterIntentProposal::new().set_interface("mgmt0", relabelled.clone(), false),
         )
-        .expect_err("relabelling a management interface should be rejected");
-        assert!(error.to_string().contains("management interface mgmt0"));
+        .expect_err("relabelling an outside-router interface should be rejected");
+        assert!(error.to_string().contains("outside-router interface mgmt0"));
 
         RouterCandidate::build(
             &base,
@@ -372,7 +372,7 @@ mod tests {
             &RouterIntentProposal::new().remove_interface("mgmt0"),
         )
         .expect_err("dropping a management override should be rejected");
-        assert!(error.to_string().contains("management interface mgmt0"));
+        assert!(error.to_string().contains("outside-router interface mgmt0"));
     }
 
     #[test]

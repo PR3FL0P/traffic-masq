@@ -1009,16 +1009,11 @@ impl<'a> StartupRollback<'a> {
 /// anything derived from it, including `RuntimeOverrideManager`'s base), so
 /// a config file inspected by hand won't yet show the migrated chain.
 async fn migrate_vpn_policy_mode_to_chain(config: &mut AppConfig) {
-    if config.vpn.policy.default_mode != VpnPolicyMode::Vpn || !config.router.vpn_chain.is_empty()
-    {
+    if config.vpn.policy.default_mode != VpnPolicyMode::Vpn || !config.router.vpn_chain.is_empty() {
         return;
     }
-    let active_profile_store = ActiveProfileStore::new(
-        config
-            .runtime
-            .state_dir
-            .join("vpn-active-profile.json"),
-    );
+    let active_profile_store =
+        ActiveProfileStore::new(config.runtime.state_dir.join("vpn-active-profile.json"));
     let persisted = match active_profile_store.load().await {
         Ok(Some(persisted)) => persisted,
         Ok(None) => {
@@ -2061,7 +2056,8 @@ mod tests {
         config.vpn.policy.default_mode = VpnPolicyMode::Vpn;
         assert!(config.router.vpn_chain.is_empty());
 
-        let legacy_store = ActiveProfileStore::new(state_dir.path().join("vpn-active-profile.json"));
+        let legacy_store =
+            ActiveProfileStore::new(state_dir.path().join("vpn-active-profile.json"));
         legacy_store
             .save(&crate::vpn::active_profile::PersistedActiveProfile {
                 profile_name: "home.conf".to_string(),
@@ -2101,7 +2097,8 @@ mod tests {
         config.runtime.state_dir = state_dir.path().to_path_buf();
         config.vpn.policy.default_mode = VpnPolicyMode::Direct;
 
-        let legacy_store = ActiveProfileStore::new(state_dir.path().join("vpn-active-profile.json"));
+        let legacy_store =
+            ActiveProfileStore::new(state_dir.path().join("vpn-active-profile.json"));
         legacy_store
             .save(&crate::vpn::active_profile::PersistedActiveProfile {
                 profile_name: "home.conf".to_string(),
@@ -2374,7 +2371,7 @@ mod tests {
             "mgmt0".to_string(),
             InterfaceConfig {
                 nat: true,
-                role: InterfaceRole::Management,
+                role: InterfaceRole::None,
                 managed: true,
                 ipv4: Some("192.168.1.10/24".parse().expect("network")),
                 dhcp: None,

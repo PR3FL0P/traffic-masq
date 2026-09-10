@@ -4,6 +4,11 @@ set -eu
 destdir=${DESTDIR:-}
 prefix=${PREFIX:-/usr/local}
 
+# Keep DESTDIR staging removal independent of the host daemon.
+if [ -z "$destdir" ]; then
+    exec "$prefix/sbin/traffic-masqd" uninstall --prefix "$prefix" "$@"
+fi
+
 remove_file() {
     path=$1
     if [ -e "$path" ] || [ -L "$path" ]; then

@@ -49,6 +49,7 @@ pub(crate) struct WifiData {
     pub(crate) selected: usize,
 
     pub(crate) selected_radio: usize,
+    pub(crate) actions_open: bool,
     pub(crate) ap_disabled: bool,
     pub(crate) client_disabled: bool,
     pub(crate) error: Option<String>,
@@ -67,7 +68,11 @@ impl WifiData {
         let Some(row) = self.focused_radio() else {
             return 0;
         };
-        self.rows.len() + actions(row.role).len() - 1
+        if self.actions_open {
+            self.rows.len() + actions(row.role).len() - 1
+        } else {
+            self.rows.len().saturating_sub(1)
+        }
     }
 }
 
@@ -78,14 +83,28 @@ pub(crate) enum WifiField {
     Security,
     Passphrase,
     CountryCode,
+    Band,
+    Channel,
+    ChannelWidth,
+    Hidden,
+    ClientIsolation,
+    MaxStations,
+    Dhcp,
     Apply,
 }
 
-const WIFI_FIELDS: [WifiField; 5] = [
+const WIFI_FIELDS: [WifiField; 12] = [
     WifiField::Ssid,
     WifiField::Security,
     WifiField::Passphrase,
     WifiField::CountryCode,
+    WifiField::Band,
+    WifiField::Channel,
+    WifiField::ChannelWidth,
+    WifiField::Hidden,
+    WifiField::ClientIsolation,
+    WifiField::MaxStations,
+    WifiField::Dhcp,
     WifiField::Apply,
 ];
 
@@ -112,6 +131,7 @@ pub(crate) struct WifiEditor {
     pub(crate) existing: bool,
     pub(crate) configure_dhcp: bool,
     original_spec: Option<crate::wifi::WifiApSpec>,
+    radio_settings: Option<WifiEditRequest>,
 }
 
 impl Drop for WifiEditor {
@@ -130,7 +150,7 @@ impl std::fmt::Debug for WifiEditor {
 impl WifiEditor {
     fn from_row(row: &WifiRow) -> Self {
         let (ssid, security, country_code) = row.ap.as_ref().map_or_else(
-            || (String::new(), WifiSecurity::Wpa2, String::new()),
+            || ("traffic-masq".into(), WifiSecurity::Wpa2, String::new()),
             |status| {
                 (
                     status.spec.ssid.clone(),
@@ -149,6 +169,7 @@ impl WifiEditor {
             existing: row.ap.is_some(),
             configure_dhcp: row.ap.is_none() && CONFIGURE_DHCP_BY_DEFAULT,
             original_spec: row.ap.as_ref().map(|status| status.spec.clone()),
+            radio_settings: None,
         }
     }
 
@@ -379,9 +400,22 @@ pub(crate) fn render_wifi(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
             selected_style(index == app.wifi.selected),
         ));
     }
-    if app.wifi.selected >= app.wifi.rows.len() {
+    app.ui.list_area = Some(Rect::new(
+        inner.x,
+        inner.y + u16::from(app.wifi.error.is_some()),
+        inner.width,
+        app.wifi.rows.len().min(
+            inner
+                .height
+                .saturating_sub(u16::from(app.wifi.error.is_some())) as usize,
+        ) as u16,
+    ));
+    app.ui.list_count = app.wifi.rows.len();
+    app.ui.list_row_height = 1;
+    app.ui.list_scroll_offset = 0;
+    if app.wifi.actions_open {
         if let Some(row) = app.wifi.focused_radio() {
-            lines.push(Line::from(""));
+            lines.push(Line::from(format!("Actions for {}", row.interface)));
             for (slot, (_, label)) in actions(row.role).iter().enumerate() {
                 let cursor = app.wifi.rows.len() + slot;
                 let text = format!(
@@ -410,23 +444,37 @@ pub(crate) fn render_wifi(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+pub(crate) fn open_radio(app: &mut TuiApp, index: usize) {
+    if index < app.wifi.rows.len() {
+        app.wifi.selected_radio = index;
+        app.wifi.actions_open = true;
+        app.wifi.selected = app.wifi.rows.len();
+    }
+}
+
 pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
     app.wifi.selected = app.wifi.rows.len() + slot;
 }
 
 pub(crate) async fn handle_wifi_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
     match key {
+        KeyCode::Esc if app.wifi.actions_open => {
+            app.wifi.actions_open = false;
+            app.wifi.selected = app.wifi.selected_radio;
+        }
         KeyCode::Esc => app.screen = Screen::Dashboard,
         KeyCode::Up => {
             app.wifi.selected = app.wifi.selected.saturating_sub(1);
             if app.wifi.selected < app.wifi.rows.len() {
                 app.wifi.selected_radio = app.wifi.selected;
+                app.wifi.actions_open = false;
             }
         }
         KeyCode::Down => {
             app.wifi.selected = (app.wifi.selected + 1).min(app.wifi.cursor_limit());
             if app.wifi.selected < app.wifi.rows.len() {
                 app.wifi.selected_radio = app.wifi.selected;
+                app.wifi.actions_open = false;
             }
         }
         KeyCode::Enter => activate_primary(app, client).await,
@@ -439,8 +487,8 @@ async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
         return;
     };
     if app.wifi.selected < app.wifi.rows.len() {
-        app.wifi.selected_radio = app.wifi.selected;
-        app.wifi.selected = app.wifi.rows.len();
+        open_radio(app, app.wifi.selected);
+
         return;
     }
     let slot = app.wifi.selected - app.wifi.rows.len();
@@ -561,6 +609,7 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
         return;
     };
     let mut lines = Vec::new();
+    let settings = ap_settings(editor);
     let values = [
         (WifiField::Ssid, "SSID", editor.ssid.clone()),
         (
@@ -577,6 +626,41 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
             WifiField::CountryCode,
             "Country",
             editor.country_code.clone(),
+        ),
+        (WifiField::Band, "Band", settings.band.to_string()),
+        (
+            WifiField::Channel,
+            "Channel",
+            if settings.channel == 0 {
+                "Auto".into()
+            } else {
+                settings.channel.to_string()
+            },
+        ),
+        (
+            WifiField::ChannelWidth,
+            "Width",
+            format!("{:?}", settings.channel_width),
+        ),
+        (
+            WifiField::Hidden,
+            "Hidden SSID",
+            settings.hidden.to_string(),
+        ),
+        (
+            WifiField::ClientIsolation,
+            "Isolation",
+            settings.client_isolation.to_string(),
+        ),
+        (
+            WifiField::MaxStations,
+            "Max clients",
+            settings.max_stations.to_string(),
+        ),
+        (
+            WifiField::Dhcp,
+            "Configure DHCP",
+            editor.configure_dhcp.to_string(),
         ),
         (
             WifiField::Apply,
@@ -603,7 +687,7 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
         if editor.configure_dhcp {
             "Creates derived DHCP from output IPv4; DNS is not advertised."
         } else {
-            "Existing radio settings and DHCP are preserved."
+            "Existing DHCP is preserved. Enter/Space changes radio options; +/- adjusts client limit."
         },
         Style::default().fg(theme::WARN),
     ));
@@ -645,6 +729,63 @@ pub(crate) async fn handle_wifi_editor_key(app: &mut TuiApp, key: KeyCode, clien
         KeyCode::Char(' ') if editor.field == WifiField::Security => {
             editor.security = cycle_ap_security(editor.security)
         }
+        KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('+') | KeyCode::Char('-')
+            if matches!(
+                editor.field,
+                WifiField::Band
+                    | WifiField::Channel
+                    | WifiField::ChannelWidth
+                    | WifiField::Hidden
+                    | WifiField::ClientIsolation
+                    | WifiField::MaxStations
+                    | WifiField::Dhcp
+            ) =>
+        {
+            let mut settings = ap_settings(editor);
+            match editor.field {
+                WifiField::Band => {
+                    settings.band = if settings.band == WifiBand::Ghz2 {
+                        WifiBand::Ghz5
+                    } else {
+                        WifiBand::Ghz2
+                    };
+                    settings.channel = 0;
+                    settings.channel_width = WifiChannelWidth::Ht20;
+                }
+                WifiField::Channel => {
+                    settings.channel = settings
+                        .band
+                        .channels()
+                        .iter()
+                        .copied()
+                        .find(|c| *c > settings.channel)
+                        .unwrap_or(0);
+                }
+                WifiField::ChannelWidth => {
+                    settings.channel_width = match settings.channel_width {
+                        WifiChannelWidth::Ht20 => WifiChannelWidth::Ht40,
+                        WifiChannelWidth::Ht40 if settings.band == WifiBand::Ghz5 => {
+                            WifiChannelWidth::Vht80
+                        }
+                        _ => WifiChannelWidth::Ht20,
+                    }
+                }
+                WifiField::Hidden => settings.hidden = !settings.hidden,
+                WifiField::ClientIsolation => {
+                    settings.client_isolation = !settings.client_isolation
+                }
+                WifiField::MaxStations => {
+                    settings.max_stations = if key == KeyCode::Char('-') {
+                        settings.max_stations.saturating_sub(1).max(1)
+                    } else {
+                        settings.max_stations.saturating_add(1)
+                    }
+                }
+                WifiField::Dhcp => editor.configure_dhcp = !editor.configure_dhcp,
+                _ => unreachable!(),
+            }
+            editor.radio_settings = Some(settings);
+        }
         KeyCode::Enter if editor.field == WifiField::Apply => apply_ap_editor(app, client).await,
         KeyCode::Enter => editor.field = move_field(&WIFI_FIELDS, editor.field, true),
         KeyCode::Backspace => {
@@ -664,7 +805,17 @@ pub(crate) async fn handle_wifi_editor_key(app: &mut TuiApp, key: KeyCode, clien
 fn ap_provision_request(editor: &WifiEditor) -> Request {
     Request::ProvisionWifiAccessPoint {
         interface: editor.interface.clone(),
-        settings: WifiEditRequest {
+        settings: ap_settings(editor),
+        passphrase: (!editor.passphrase.is_empty()).then(|| editor.passphrase.clone()),
+        configure_dhcp: editor.configure_dhcp,
+    }
+}
+
+fn ap_settings(editor: &WifiEditor) -> WifiEditRequest {
+    let mut settings = editor
+        .radio_settings
+        .clone()
+        .unwrap_or_else(|| WifiEditRequest {
             ssid: editor.ssid.clone(),
             country_code: editor.country_code(),
             band: editor
@@ -689,10 +840,11 @@ fn ap_provision_request(editor: &WifiEditor) -> Request {
                 .original_spec
                 .as_ref()
                 .map_or(DEFAULT_MAX_STATIONS, |s| s.max_stations),
-        },
-        passphrase: (!editor.passphrase.is_empty()).then(|| editor.passphrase.clone()),
-        configure_dhcp: editor.configure_dhcp,
-    }
+        });
+    settings.ssid = editor.ssid.clone();
+    settings.country_code = editor.country_code();
+    settings.security = editor.security;
+    settings
 }
 
 async fn apply_ap_editor(app: &mut TuiApp, client: &ApiClient) {
@@ -1263,6 +1415,14 @@ pub(crate) async fn load_wifi_data(app: &mut TuiApp, client: &ApiClient) {
         }
     }
     rows.retain(|row| managed.get(&row.interface).copied().unwrap_or(false));
+    let previous_radio = app.wifi.focused_radio().map(|row| row.interface.clone());
+    app.wifi.selected_radio = previous_radio
+        .as_ref()
+        .and_then(|name| rows.iter().position(|row| &row.interface == name))
+        .unwrap_or_else(|| {
+            app.wifi.actions_open = false;
+            0
+        });
     app.wifi.rows = rows;
     app.wifi.selected_radio = app
         .wifi
@@ -1473,6 +1633,71 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn ap_options_open_only_on_activation_and_radio_edits_reach_request() {
+        let mut app = TuiApp::default();
+        app.wifi.rows.push(WifiRow {
+            interface: "wlan0".into(),
+            role: WifiRole::AccessPoint,
+            ap: None,
+            client: None,
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| render_wifi(frame, frame.area(), &mut app))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(!text.contains("Configure access point"));
+        assert_eq!(app.wifi.selected, 0);
+        let client = ApiClient::new("/nonexistent.sock");
+        handle_wifi_key(&mut app, KeyCode::Down, &client).await;
+        assert!(!app.wifi.actions_open);
+        handle_wifi_key(&mut app, KeyCode::Enter, &client).await;
+        terminal
+            .draw(|frame| render_wifi(frame, frame.area(), &mut app))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Configure access point"));
+        handle_wifi_key(&mut app, KeyCode::Esc, &client).await;
+        assert!(!app.wifi.actions_open);
+        app.wifi_editor = Some(WifiEditor::from_row(&app.wifi.rows[0]));
+        let client = ApiClient::new("/nonexistent.sock");
+        for field in [
+            WifiField::Band,
+            WifiField::Channel,
+            WifiField::Hidden,
+            WifiField::ClientIsolation,
+            WifiField::MaxStations,
+        ] {
+            app.wifi_editor.as_mut().unwrap().field = field;
+            handle_wifi_editor_key(&mut app, KeyCode::Enter, &client).await;
+        }
+        let editor = app.wifi_editor.as_mut().unwrap();
+        editor.ssid = "Updated SSID".into();
+        let Request::ProvisionWifiAccessPoint { settings, .. } = ap_provision_request(editor)
+        else {
+            panic!("wrong request")
+        };
+        assert_eq!(settings.band, WifiBand::Ghz5);
+        assert_eq!(settings.channel, 32);
+        assert!(settings.hidden && settings.client_isolation);
+        assert_eq!(settings.max_stations, 33);
+        assert_eq!(settings.ssid, "Updated SSID");
+    }
+
     #[test]
     fn scan_sort_is_strongest_first_hidden_last_and_stable_by_identity() {
         let mut rows = vec![
@@ -1552,6 +1777,14 @@ mod tests {
             client: None,
         };
         let editor = WifiEditor::from_row(&row);
+        let settings = ap_settings(&editor);
+        assert_eq!(settings.ssid, "traffic-masq");
+        assert_eq!(settings.band, WifiBand::Ghz2);
+        assert_eq!(settings.channel, 0);
+        assert_eq!(settings.channel_width, WifiChannelWidth::Ht20);
+        assert_eq!(settings.security, WifiSecurity::Wpa2);
+        assert_eq!(settings.max_stations, 32);
+        assert!(!settings.hidden && !settings.client_isolation);
         assert!(editor.configure_dhcp);
         assert!(matches!(
             ap_provision_request(&editor),
@@ -1695,6 +1928,7 @@ mod tests {
     #[test]
     fn unconfigured_radio_never_defaults_to_ap_and_role_mapping_is_strict() {
         let status = InterfaceStatus {
+            owned_ipv4_addresses: None,
             interface: crate::netlink::NetworkInterface {
                 index: 1,
                 name: "wlan0".into(),
@@ -1740,6 +1974,7 @@ mod tests {
             ],
             selected: 2,
             selected_radio: 0,
+            actions_open: true,
             ..WifiData::default()
         };
         assert_eq!(data.focused_radio().unwrap().interface, "wlan0");

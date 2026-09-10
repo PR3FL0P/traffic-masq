@@ -396,7 +396,7 @@ pub(crate) fn render_dashboard_traffic(
             offset + visible
         )
     } else {
-        "Interface traffic".to_string()
+        "Interface traffic | [ext] external, [?] ownership unknown".to_string()
     };
     let block = panel(&title);
     let inner = block.inner(area);
@@ -467,7 +467,7 @@ fn render_traffic_row(
         .map(|history| (history.current_rx_rate, history.current_tx_rate))
         .unwrap_or((0, 0));
 
-    let header = Line::from(vec![
+    let mut header = Line::from(vec![
         Span::styled(
             format!("{marker} {:<12}", status.interface.name),
             name_style,
@@ -484,8 +484,8 @@ fn render_traffic_row(
             Style::default().fg(theme::ACCENT_ALT),
         ),
         Span::raw("   "),
-        Span::styled(format_addresses(status), Style::default().fg(theme::MUTED)),
     ]);
+    header.spans.extend(format_addresses(status));
     frame.render_widget(Paragraph::new(header), rows[0]);
 
     let rx_data: Vec<u64> = history

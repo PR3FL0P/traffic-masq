@@ -28,9 +28,7 @@ use crate::firewall::{
     NftExecutor, NoopRouterDataplaneEventSink, RouterDataplaneEventSink, RouterDataplaneManager,
     RouterDataplanePlan, RouterDataplaneProvider, RouterDataplaneSnapshot,
 };
-use crate::netlink::{
-    Ipv4RouteSpec, Ipv4RuleSpec, NetworkProvider, TRAFFIC_MASQ_ROUTE_PROTOCOL,
-};
+use crate::netlink::{Ipv4RouteSpec, Ipv4RuleSpec, NetworkProvider, TRAFFIC_MASQ_ROUTE_PROTOCOL};
 use crate::vpn::active_profile::ActiveProfileStore;
 use crate::vpn::store::WireGuardProfileStore;
 use crate::vpn::wireguard::WireGuardVpnDriver;
@@ -328,7 +326,8 @@ where
         if let Some(existing) = self.vpn_hop_managers.read().await.get(&hop_index) {
             return Ok(existing.clone());
         }
-        let driver = WireGuardVpnDriver::new(deps.vpn_provider.clone(), deps.wireguard_store.clone());
+        let driver =
+            WireGuardVpnDriver::new(deps.vpn_provider.clone(), deps.wireguard_store.clone());
         let active_profile_store = ActiveProfileStore::for_hop(&deps.state_dir, hop_index);
         let manager = Arc::new(VpnManager::new(driver, active_profile_store));
         self.vpn_hop_managers
@@ -1912,9 +1911,9 @@ mod tests {
     use crate::core::vpn_policy::VpnPolicyReservedIds;
     use crate::firewall::vpn::test_support::FakeNftExecutor;
     use crate::netlink::{Ipv4RuleInfo, Ipv4RuleSpec as NetIpv4RuleSpec};
-    use crate::vpn::{ProviderError, VpnProvider};
     use crate::vpn::store::WireGuardProfileStore;
     use crate::vpn::wireguard::{WireGuardKey, WireGuardPeerConfig};
+    use crate::vpn::{ProviderError, VpnProvider};
     use std::sync::Mutex as StdMutex;
 
     const VALID_PRIVATE_KEY: &str = "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=";
@@ -1968,7 +1967,11 @@ mod tests {
             Ok(())
         }
 
-        async fn set_addresses(&self, name: &str, _addresses: &[ipnet::IpNet]) -> Result<(), ProviderError> {
+        async fn set_addresses(
+            &self,
+            name: &str,
+            _addresses: &[ipnet::IpNet],
+        ) -> Result<(), ProviderError> {
             self.require(name)
         }
 
@@ -2175,24 +2178,23 @@ mod tests {
         let vpn_provider = Arc::new(FakeChainVpnProvider::default());
         let wireguard_store = WireGuardProfileStore::new(dir.path().join("wireguard"));
         wireguard_store
-            .import(&crate::vpn::wireguard::WireGuardDriver, "chain.conf", valid_wg_config().as_bytes())
+            .import(
+                &crate::vpn::wireguard::WireGuardDriver,
+                "chain.conf",
+                valid_wg_config().as_bytes(),
+            )
             .expect("import chain profile");
 
         let vpn_provider_erased: Arc<dyn VpnProvider> = vpn_provider.clone();
-        let subsystems = ProductionRouterSubsystems::new(
-            interfaces,
-            routes,
-            dhcp,
-            dataplane,
-            Vec::new(),
-        )
-        .with_vpn_chain(VpnChainDeps {
-            vpn_provider: vpn_provider_erased,
-            wireguard_store,
-            state_dir: dir.path().to_path_buf(),
-            network: net_provider.clone(),
-            nft_executor: Arc::new(FakeNftExecutor::default()),
-        });
+        let subsystems =
+            ProductionRouterSubsystems::new(interfaces, routes, dhcp, dataplane, Vec::new())
+                .with_vpn_chain(VpnChainDeps {
+                    vpn_provider: vpn_provider_erased,
+                    wireguard_store,
+                    state_dir: dir.path().to_path_buf(),
+                    network: net_provider.clone(),
+                    nft_executor: Arc::new(FakeNftExecutor::default()),
+                });
         std::mem::forget(dir);
         (subsystems, vpn_provider, net_provider)
     }

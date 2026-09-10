@@ -684,7 +684,7 @@ mod tests {
             InterfaceOverride {
                 config: InterfaceConfig {
                     nat: true,
-                    role: InterfaceRole::Management,
+                    role: InterfaceRole::None,
                     managed: false,
                     ipv4: None,
                     dhcp: None,

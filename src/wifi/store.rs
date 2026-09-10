@@ -397,7 +397,7 @@ mod tests {
                 passphrase_file,
             }),
             wifi_client: None,
-        nat: true,
+            nat: true,
         };
         WifiApSpec::from_interface_config(interface, &config)
             .expect("valid")

@@ -117,7 +117,7 @@ impl RouterNamespaceFixture {
                 management_if.clone(),
                 InterfaceConfig {
                     nat: true,
-                    role: InterfaceRole::Management,
+                    role: InterfaceRole::None,
                     managed: true,
                     ipv4: Some(MANAGEMENT_ADDR.parse().expect("management address")),
                     dhcp: None,
@@ -1259,8 +1259,8 @@ async fn management_interface_is_never_touched_without_explicit_allow() -> Resul
         let stdout_log = fixture.temp.path().join("daemon-stdout.log");
         let stdout_contents = fs::read_to_string(&stdout_log).unwrap_or_default();
         assert!(
-            log_contents.contains("management")
-                || stdout_contents.contains("management")
+            log_contents.contains("outside-router")
+                || stdout_contents.contains("outside-router")
                 || log_contents.contains("refusing")
                 || stdout_contents.contains("refusing"),
             "daemon output should explain the refusal; stdout={stdout_contents:?} stderr={log_contents:?}"

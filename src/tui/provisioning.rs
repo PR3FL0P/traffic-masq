@@ -247,7 +247,7 @@ pub(crate) fn render_wizard(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Tu
         selected_line(
             Field::AllowManagement,
             wizard.field,
-            "Allow management change",
+            "Confirm connectivity risk",
             wizard.allow_management_change.to_string(),
         ),
         selected_line(
@@ -803,7 +803,7 @@ fn cancel(app: &mut TuiApp) {
 fn describe_warning(warning: &ProvisioningWarning) -> String {
     match warning {
         ProvisioningWarning::ManagementInterfaceAffected { interface } => {
-            format!("management interface {interface} may be disrupted")
+            format!("outside-router interface {interface} may be disrupted")
         }
         ProvisioningWarning::DownstreamSubnetRelocated {
             preferred,
@@ -837,7 +837,7 @@ fn describe_error(detail: &RouterProvisioningErrorDetail) -> String {
             format!("Both interfaces use radio {phy}; choose separate radios")
         }
         RouterProvisioningErrorDetail::ManagementConfirmationRequired { interface } => {
-            format!("{interface} is management; explicitly enable the management-change option")
+            format!("{interface} is outside the router; enable Confirm connectivity risk")
         }
         RouterProvisioningErrorDetail::UplinkSecretMissing { interface } => {
             format!("Enter or store the upstream passphrase for {interface}")

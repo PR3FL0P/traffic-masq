@@ -71,7 +71,7 @@ impl WifiClientSpec {
             dhcp_client: None,
             wifi: None,
             wifi_client: Some(self.wifi_client_config()),
-        nat: true,
+            nat: true,
         };
         config.validate(&self.interface)
     }

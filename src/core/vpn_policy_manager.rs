@@ -475,7 +475,7 @@ mod tests {
                 dhcp_client: None,
                 wifi: None,
                 wifi_client: None,
-            nat: true,
+                nat: true,
             },
         );
         config.network.interfaces.insert(
@@ -488,7 +488,7 @@ mod tests {
                 dhcp_client: None,
                 wifi: None,
                 wifi_client: None,
-            nat: true,
+                nat: true,
             },
         );
         config.router = RouterConfig {
@@ -499,7 +499,7 @@ mod tests {
             }),
             owned_routes: Vec::new(),
             allow_default_route_change: false,
-        vpn_chain: Vec::new(),
+            vpn_chain: Vec::new(),
         };
         config
     }

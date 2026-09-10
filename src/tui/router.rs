@@ -198,7 +198,7 @@ pub(crate) fn render_router_plan(frame: &mut ratatui::Frame<'_>, area: Rect, app
     }
     if plan.risk.requires_management_confirmation {
         lines.push(Line::styled(
-            "WARNING: this plan touches the management interface",
+            "WARNING: this plan touches the outside-router interface",
             Style::default().fg(theme::BAD).add_modifier(Modifier::BOLD),
         ));
     }
@@ -799,7 +799,7 @@ mod tests {
                     dhcp_client: None,
                     wifi: None,
                     wifi_client: None,
-                nat: true,
+                    nat: true,
                 },
             },
             RouterInterfaceDesired {
@@ -812,7 +812,7 @@ mod tests {
                     dhcp_client: None,
                     wifi: None,
                     wifi_client: None,
-                nat: true,
+                    nat: true,
                 },
             },
         ];

@@ -1084,6 +1084,10 @@ pub enum Response {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterfaceStatus {
+    /// Addresses installed by traffic-masq, verified using tags and its journal.
+    /// None means the provider cannot supply authoritative ownership information.
+    #[serde(default)]
+    pub owned_ipv4_addresses: Option<Vec<Ipv4AddressInfo>>,
     pub interface: NetworkInterface,
     pub ipv4_addresses: Vec<Ipv4AddressInfo>,
     #[serde(default)]

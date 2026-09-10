@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 import pty
+import re
 import select
 import socket
 import struct
@@ -63,13 +64,16 @@ def serve(listener, stopped):
 
 def read_until(master, expected, timeout=5):
     output = b""
+    plain = b""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if select.select([master], [], [], 0.1)[0]:
             output += os.read(master, 65536)
-            if expected in output:
-                return
-    raise AssertionError(f"terminal did not display {expected!r}")
+            # Ratatui skips blank cells using cursor positioning instead of printing spaces.
+            plain = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", lambda m: b" " if m.group().endswith(b"H") else b"", output)
+            if expected in b" ".join(plain.split()):
+                return output
+    raise AssertionError(f"terminal did not display {expected!r}: {plain[-1000:]!r}")
 
 
 def main():
@@ -91,10 +95,11 @@ def main():
             fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
 
         child = subprocess.Popen([binary, "--socket", path], stdin=slave, stdout=slave,
-                                 stderr=slave, preexec_fn=controlling_terminal)
+                                 stderr=slave, preexec_fn=controlling_terminal,
+                                 env={**os.environ, "XDG_STATE_HOME": directory})
         try:
             read_until(master, b"Device password:")
-            os.write(master, b"mock-password-only\n")
+            os.write(master, b"mock-password-only\r")
             read_until(master, b"Session expired or revoked")
             os.write(master, b"mock-password-only\r")
             read_until(master, b"Refreshing")

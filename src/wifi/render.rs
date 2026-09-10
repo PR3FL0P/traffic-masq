@@ -363,7 +363,7 @@ mod tests {
                 passphrase_file: None,
             }),
             wifi_client: None,
-        nat: true,
+            nat: true,
         };
         WifiApSpec::from_interface_config("wlan0", &config)
             .expect("valid")
