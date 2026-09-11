@@ -20,17 +20,19 @@ pub(crate) enum SettingsField {
     RememberMinutes,
     SaveSession,
     ChangePassword,
+    Access,
     Reset,
     Save,
     Reload,
 }
 
-const SETTINGS_FIELDS: [SettingsField; 8] = [
+const SETTINGS_FIELDS: [SettingsField; 9] = [
     SettingsField::RollbackTimeout,
     SettingsField::RememberSession,
     SettingsField::RememberMinutes,
     SettingsField::SaveSession,
     SettingsField::ChangePassword,
+    SettingsField::Access,
     SettingsField::Reset,
     SettingsField::Save,
     SettingsField::Reload,
@@ -51,6 +53,7 @@ pub(crate) struct SecurityEditor {
 const SECURITY_SAVE_LABEL: &str = "Save (applies after daemon restart)";
 const SECURITY_RESET_LABEL: &str = "Reset to base config";
 const SECURITY_PASSWORD_LABEL: &str = "Change device password";
+const SECURITY_ACCESS_LABEL: &str = "HTTPS access settings";
 const SECURITY_RELOAD_LABEL: &str = "Reload";
 
 fn note(text: impl Into<String>, style: Style) -> Line<'static> {
@@ -152,6 +155,13 @@ pub(crate) fn render_settings(frame: &mut ratatui::Frame<'_>, area: Rect, app: &
         Style::default().fg(theme::ACCENT),
     ));
 
+    button_rows.push((lines.len() as u16, SECURITY_ACCESS_LABEL, 7));
+    lines.push(row(
+        SECURITY_ACCESS_LABEL.to_string(),
+        SettingsField::Access,
+        Style::default().fg(theme::ACCENT),
+    ));
+
     lines.push(Line::from(""));
 
     button_rows.push((lines.len() as u16, SECURITY_RESET_LABEL, 1));
@@ -220,6 +230,7 @@ pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
             4 => SettingsField::RememberSession,
             5 => SettingsField::RememberMinutes,
             6 => SettingsField::SaveSession,
+            7 => SettingsField::Access,
             _ => SettingsField::Reload,
         };
     }
@@ -263,6 +274,9 @@ pub(crate) async fn handle_settings_key(app: &mut TuiApp, key: KeyCode, client: 
             SettingsField::ChangePassword => {
                 app.settings_password = Some(PasswordChangeEditor::new());
                 app.screen = Screen::SettingsPassword;
+            }
+            SettingsField::Access => {
+                super::access::open_access_editor(app, client).await;
             }
             SettingsField::Reset => reset_security_settings(app, client).await,
             SettingsField::Save => submit_security_settings(app, client).await,
@@ -807,6 +821,10 @@ mod tests {
         );
         assert_eq!(
             next_settings_field(SettingsField::ChangePassword),
+            SettingsField::Access
+        );
+        assert_eq!(
+            next_settings_field(SettingsField::Access),
             SettingsField::Reset
         );
         assert_eq!(
@@ -830,9 +848,63 @@ mod tests {
             SettingsField::Reset
         );
         assert_eq!(
+            previous_settings_field(SettingsField::Reset),
+            SettingsField::Access
+        );
+        assert_eq!(
+            previous_settings_field(SettingsField::Access),
+            SettingsField::ChangePassword
+        );
+        assert_eq!(
             previous_settings_field(SettingsField::RollbackTimeout),
             SettingsField::RollbackTimeout
         );
+    }
+
+    #[test]
+    fn clicking_access_action_focuses_access_field() {
+        let mut app = TuiApp::default();
+        app.settings = Some(SecurityEditor {
+            field: SettingsField::RollbackTimeout,
+            active: SecuritySettings {
+                rollback_timeout_seconds: 30,
+            },
+            rollback_timeout_input: "30".into(),
+            override_active: false,
+            restart_required: false,
+            remember_session: true,
+            remember_minutes_input: "5".into(),
+            confirmation: None,
+        });
+        focus_action(&mut app, 7);
+        assert_eq!(app.settings.as_ref().unwrap().field, SettingsField::Access);
+    }
+
+    #[tokio::test]
+    async fn enter_on_access_setting_attempts_to_open_access_editor() {
+        let mut app = TuiApp::default();
+        app.screen = Screen::Settings;
+        app.settings = Some(SecurityEditor {
+            field: SettingsField::Access,
+            active: SecuritySettings {
+                rollback_timeout_seconds: 30,
+            },
+            rollback_timeout_input: "30".into(),
+            override_active: false,
+            restart_required: false,
+            remember_session: true,
+            remember_minutes_input: "5".into(),
+            confirmation: None,
+        });
+
+        handle_settings_key(
+            &mut app,
+            KeyCode::Enter,
+            &ApiClient::new("/socket-that-must-not-be-opened"),
+        )
+        .await;
+
+        assert!(app.message.is_some());
     }
 
     #[test]

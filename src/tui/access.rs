@@ -252,12 +252,12 @@ pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
 
 pub(crate) async fn handle_access_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
     let Some(editor) = app.api_access.as_mut() else {
-        app.screen = Screen::Dashboard;
+        app.screen = Screen::Settings;
         return;
     };
 
     match key {
-        KeyCode::Esc => app.screen = Screen::Dashboard,
+        KeyCode::Esc => app.screen = Screen::Settings,
         KeyCode::Up => editor.field = previous_field(editor.field),
         KeyCode::Down => editor.field = next_field(editor.field),
         KeyCode::Enter => match editor.field {
@@ -416,5 +416,14 @@ mod tests {
         assert!(editor.active_value_mut().is_none());
         editor.field = AccessField::Listen;
         assert!(editor.active_value_mut().is_some());
+    }
+
+    #[tokio::test]
+    async fn esc_returns_to_settings_screen() {
+        let mut app = TuiApp::default();
+        app.screen = Screen::Access;
+        let client = ApiClient::new("/socket-that-must-not-be-opened");
+        handle_access_key(&mut app, KeyCode::Esc, &client).await;
+        assert_eq!(app.screen, Screen::Settings);
     }
 }

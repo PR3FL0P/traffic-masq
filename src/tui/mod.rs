@@ -142,7 +142,7 @@ impl Section {
 
 fn section_of(screen: Screen) -> Section {
     match screen {
-        Screen::Dashboard | Screen::PendingChange | Screen::Access => Section::Dashboard,
+        Screen::Dashboard | Screen::PendingChange => Section::Dashboard,
         Screen::InterfaceList | Screen::InterfaceEditor | Screen::Preview => Section::Interfaces,
         Screen::DhcpInterfaceList | Screen::DhcpEditor | Screen::DhcpLeases => Section::Dhcp,
         Screen::DhcpClient => Section::DhcpClient,
@@ -159,7 +159,7 @@ fn section_of(screen: Screen) -> Section {
         | Screen::WifiScan
         | Screen::WifiProfiles
         | Screen::WifiProfileEditor => Section::Wifi,
-        Screen::Settings | Screen::SettingsPassword => Section::Settings,
+        Screen::Settings | Screen::SettingsPassword | Screen::Access => Section::Settings,
         Screen::Log => Section::Log,
     }
 }
@@ -1642,6 +1642,7 @@ mod tests {
         assert_eq!(section_of(Screen::VpnPolicy), Section::Vpn);
         assert_eq!(section_of(Screen::Settings), Section::Settings);
         assert_eq!(section_of(Screen::SettingsPassword), Section::Settings);
+        assert_eq!(section_of(Screen::Access), Section::Settings);
         assert_eq!(section_of(Screen::Log), Section::Log);
     }
 }

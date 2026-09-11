@@ -12,7 +12,6 @@ use crate::api::client::ApiClient;
 use crate::api::model::InterfaceStatus;
 use crate::core::transaction::PendingNetworkChange;
 
-use super::access;
 use super::layout::panel;
 use super::logs::LogLevel;
 use super::theme;
@@ -23,19 +22,16 @@ pub(crate) enum DashboardFocus {
     #[default]
     List,
     Interfaces,
-    HttpsAccess,
     PendingChanges,
 }
 
-pub(crate) const DASHBOARD_ACTIONS: [DashboardFocus; 3] = [
+pub(crate) const DASHBOARD_ACTIONS: [DashboardFocus; 2] = [
     DashboardFocus::Interfaces,
-    DashboardFocus::HttpsAccess,
     DashboardFocus::PendingChanges,
 ];
 
-pub(crate) const DASHBOARD_ACTION_LABELS: [&str; 3] = [
+pub(crate) const DASHBOARD_ACTION_LABELS: [&str; 2] = [
     "Interfaces",
-    "HTTPS access settings",
     "Pending network changes",
 ];
 
@@ -64,7 +60,7 @@ pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
 pub(crate) async fn handle_dashboard_key(
     app: &mut TuiApp,
     key: KeyCode,
-    client: &ApiClient,
+    _client: &ApiClient,
     direct: bool,
 ) {
     match key {
@@ -93,16 +89,6 @@ pub(crate) async fn handle_dashboard_key(
         KeyCode::Enter => match app.dashboard_focus {
             DashboardFocus::List | DashboardFocus::Interfaces => {
                 app.screen = Screen::InterfaceList;
-            }
-            DashboardFocus::HttpsAccess => {
-                if direct {
-                    app.push_message(
-                        LogLevel::Warn,
-                        "HTTPS access settings require the daemon API; unavailable in direct/offline mode",
-                    );
-                } else {
-                    access::open_access_editor(app, client).await;
-                }
             }
             DashboardFocus::PendingChanges => {
                 if direct {
@@ -231,7 +217,7 @@ pub(crate) fn render_dashboard(
         .constraints([
             Constraint::Length(5),
             Constraint::Min(6),
-            Constraint::Length(5),
+            Constraint::Length(4),
         ])
         .split(area);
     render_dashboard_summary(frame, sections[0], app, direct);
@@ -517,10 +503,6 @@ mod tests {
     fn dashboard_focus_reaches_every_action_and_clamps_at_both_ends() {
         assert_eq!(
             next_dashboard_action(DashboardFocus::Interfaces),
-            DashboardFocus::HttpsAccess
-        );
-        assert_eq!(
-            next_dashboard_action(DashboardFocus::HttpsAccess),
             DashboardFocus::PendingChanges
         );
         assert_eq!(
@@ -529,7 +511,7 @@ mod tests {
         );
         assert_eq!(
             previous_dashboard_action(DashboardFocus::PendingChanges),
-            DashboardFocus::HttpsAccess
+            DashboardFocus::Interfaces
         );
         assert_eq!(
             previous_dashboard_action(DashboardFocus::Interfaces),
@@ -550,10 +532,10 @@ mod tests {
     fn clicking_an_action_row_focuses_exactly_that_row() {
         let mut app = TuiApp::default();
         focus_action(&mut app, 1);
-        assert_eq!(app.dashboard_focus, DashboardFocus::HttpsAccess);
+        assert_eq!(app.dashboard_focus, DashboardFocus::PendingChanges);
 
         focus_action(&mut app, 99);
-        assert_eq!(app.dashboard_focus, DashboardFocus::HttpsAccess);
+        assert_eq!(app.dashboard_focus, DashboardFocus::PendingChanges);
     }
 
     #[test]
