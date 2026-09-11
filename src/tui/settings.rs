@@ -1,7 +1,7 @@
 use crossterm::event::KeyCode;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use zeroize::Zeroize;
 
@@ -48,6 +48,17 @@ pub(crate) struct SecurityEditor {
     pub(crate) remember_session: bool,
     pub(crate) remember_minutes_input: String,
     pub(crate) confirmation: Option<SettingsField>,
+    pub(crate) cursor: usize,
+}
+
+impl SecurityEditor {
+    pub(crate) fn reset_cursor(&mut self) {
+        self.cursor = match self.field {
+            SettingsField::RollbackTimeout => self.rollback_timeout_input.chars().count(),
+            SettingsField::RememberMinutes => self.remember_minutes_input.chars().count(),
+            _ => 0,
+        };
+    }
 }
 
 const SECURITY_SAVE_LABEL: &str = "Save (applies after daemon restart)";
@@ -76,6 +87,24 @@ pub(crate) fn render_settings(frame: &mut ratatui::Frame<'_>, area: Rect, app: &
         Line::styled(format!("{marker}{label}"), style)
     };
 
+    let text_row = |label: &str, value: &str, field: SettingsField, base: Style| -> Line<'static> {
+        let active = editor.field == field;
+        let marker = if active { "▶ " } else { "  " };
+        let label_style = if active {
+            base.add_modifier(Modifier::BOLD)
+        } else {
+            base
+        };
+        let mut spans = vec![Span::styled(format!("{marker}{label}: "), label_style)];
+        spans.extend(super::input::render_value_with_cursor(
+            value,
+            editor.cursor,
+            active,
+            label_style,
+        ));
+        Line::from(spans)
+    };
+
     let mut lines = vec![
         Line::from(format!(
             "Current process: rollback timeout {}s",
@@ -93,11 +122,9 @@ pub(crate) fn render_settings(frame: &mut ratatui::Frame<'_>, area: Rect, app: &
                 theme::GOOD
             }),
         ),
-        row(
-            format!(
-                "Rollback timeout after restart (seconds): {}_",
-                editor.rollback_timeout_input
-            ),
+        text_row(
+            "Rollback timeout after restart (seconds)",
+            &editor.rollback_timeout_input,
             SettingsField::RollbackTimeout,
             Style::default().fg(theme::ACCENT),
         ),
@@ -106,7 +133,7 @@ pub(crate) fn render_settings(frame: &mut ratatui::Frame<'_>, area: Rect, app: &
             Style::default().fg(theme::WARN),
         ),
         note(
-            "Arrows move · Enter activates · type digits to edit durations",
+            "Arrows move/edit · Enter activates · type digits to edit durations",
             Style::default().fg(theme::MUTED),
         ),
         Line::from(""),
@@ -127,8 +154,9 @@ pub(crate) fn render_settings(frame: &mut ratatui::Frame<'_>, area: Rect, app: &
         Style::default().fg(theme::ACCENT),
     ));
     button_rows.push((lines.len() as u16, "Remember for (minutes):", 5));
-    lines.push(row(
-        format!("Remember for (minutes): {}_", editor.remember_minutes_input),
+    lines.push(text_row(
+        "Remember for (minutes)",
+        &editor.remember_minutes_input,
         SettingsField::RememberMinutes,
         Style::default().fg(theme::ACCENT),
     ));
@@ -233,6 +261,7 @@ pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
             7 => SettingsField::Access,
             _ => SettingsField::Reload,
         };
+        editor.reset_cursor();
     }
 }
 
@@ -248,16 +277,12 @@ pub(crate) async fn handle_settings_key(app: &mut TuiApp, key: KeyCode, client: 
         KeyCode::Up => {
             editor.confirmation = None;
             editor.field = previous_settings_field(editor.field);
+            editor.reset_cursor();
         }
         KeyCode::Down => {
             editor.confirmation = None;
             editor.field = next_settings_field(editor.field);
-        }
-        KeyCode::Backspace if editor.field == SettingsField::RollbackTimeout => {
-            editor.rollback_timeout_input.pop();
-        }
-        KeyCode::Backspace if editor.field == SettingsField::RememberMinutes => {
-            editor.remember_minutes_input.pop();
+            editor.reset_cursor();
         }
         KeyCode::Char(' ') if editor.field == SettingsField::RememberSession => {
             editor.remember_session = !editor.remember_session;
@@ -282,15 +307,15 @@ pub(crate) async fn handle_settings_key(app: &mut TuiApp, key: KeyCode, client: 
             SettingsField::Save => submit_security_settings(app, client).await,
             SettingsField::Reload => load_settings_data(app, client).await,
         },
-        KeyCode::Char(character)
-            if character.is_ascii_digit() && editor.field == SettingsField::RememberMinutes =>
-        {
-            editor.remember_minutes_input.push(character);
+        other if editor.field == SettingsField::RollbackTimeout => {
+            let cursor = &mut editor.cursor;
+            super::input::TextEditor::new(&mut editor.rollback_timeout_input, cursor)
+                .handle_key_filtered(other, |c| c.is_ascii_digit());
         }
-        KeyCode::Char(character)
-            if character.is_ascii_digit() && editor.field == SettingsField::RollbackTimeout =>
-        {
-            editor.rollback_timeout_input.push(character);
+        other if editor.field == SettingsField::RememberMinutes => {
+            let cursor = &mut editor.cursor;
+            super::input::TextEditor::new(&mut editor.remember_minutes_input, cursor)
+                .handle_key_filtered(other, |c| c.is_ascii_digit());
         }
         _ => {}
     }
@@ -368,15 +393,18 @@ pub(crate) async fn load_settings_data(app: &mut TuiApp, client: &ApiClient) {
                     super::session::SessionPreferences::default()
                 }
             };
+            let rollback_timeout_input = desired.rollback_timeout_seconds.to_string();
+            let cursor = rollback_timeout_input.chars().count();
             app.settings = Some(SecurityEditor {
                 remember_session: preferences.remember,
                 remember_minutes_input: preferences.minutes.to_string(),
                 confirmation: None,
                 field: SettingsField::RollbackTimeout,
                 active,
-                rollback_timeout_input: desired.rollback_timeout_seconds.to_string(),
+                rollback_timeout_input,
                 override_active,
                 restart_required,
+                cursor,
             });
         }
         Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
@@ -443,15 +471,18 @@ pub(crate) async fn submit_security_settings(app: &mut TuiApp, client: &ApiClien
                     super::session::SessionPreferences::default()
                 }
             };
+            let rollback_timeout_input = desired.rollback_timeout_seconds.to_string();
+            let cursor = rollback_timeout_input.chars().count();
             app.settings = Some(SecurityEditor {
                 remember_session: preferences.remember,
                 remember_minutes_input: preferences.minutes.to_string(),
                 confirmation: None,
                 field: SettingsField::RollbackTimeout,
                 active,
-                rollback_timeout_input: desired.rollback_timeout_seconds.to_string(),
+                rollback_timeout_input,
                 override_active,
                 restart_required,
+                cursor,
             });
             app.push_message(
                 LogLevel::Info,
@@ -487,15 +518,18 @@ async fn reset_security_settings(app: &mut TuiApp, client: &ApiClient) {
                     super::session::SessionPreferences::default()
                 }
             };
+            let rollback_timeout_input = desired.rollback_timeout_seconds.to_string();
+            let cursor = rollback_timeout_input.chars().count();
             app.settings = Some(SecurityEditor {
                 remember_session: preferences.remember,
                 remember_minutes_input: preferences.minutes.to_string(),
                 confirmation: None,
                 field: SettingsField::RollbackTimeout,
                 active,
-                rollback_timeout_input: desired.rollback_timeout_seconds.to_string(),
+                rollback_timeout_input,
                 override_active,
                 restart_required,
+                cursor,
             });
             app.push_message(
                 LogLevel::Info,
@@ -529,6 +563,7 @@ pub(crate) struct PasswordChangeEditor {
     pub(crate) current: String,
     pub(crate) new_password: String,
     pub(crate) confirm: String,
+    pub(crate) cursor: usize,
 }
 
 impl Drop for PasswordChangeEditor {
@@ -544,14 +579,42 @@ impl PasswordChangeEditor {
             current: String::new(),
             new_password: String::new(),
             confirm: String::new(),
+            cursor: 0,
         }
     }
 
+    fn reset_cursor(&mut self) {
+        self.cursor = self.active_value().chars().count();
+    }
+
+    fn active_value(&self) -> &str {
+        match self.field {
+            PasswordField::Current => &self.current,
+            PasswordField::New => &self.new_password,
+            PasswordField::Confirm => &self.confirm,
+        }
+    }
+
+    #[allow(dead_code)]
     fn active_value_mut(&mut self) -> &mut String {
         match self.field {
             PasswordField::Current => &mut self.current,
             PasswordField::New => &mut self.new_password,
             PasswordField::Confirm => &mut self.confirm,
+        }
+    }
+
+    fn active_editor(&mut self) -> super::input::TextEditor<'_> {
+        match self.field {
+            PasswordField::Current => {
+                super::input::TextEditor::new(&mut self.current, &mut self.cursor)
+            }
+            PasswordField::New => {
+                super::input::TextEditor::new(&mut self.new_password, &mut self.cursor)
+            }
+            PasswordField::Confirm => {
+                super::input::TextEditor::new(&mut self.confirm, &mut self.cursor)
+            }
         }
     }
 
@@ -589,7 +652,7 @@ pub(crate) fn render_settings_password(
         return;
     };
 
-    let field_line = |label: &str, value: &str, field: PasswordField| {
+    let field_line = |label: &str, value: &str, field: PasswordField| -> Line<'static> {
         let active = editor.field == field;
         let marker = if active { "▶ " } else { "  " };
         let style = if active {
@@ -599,8 +662,15 @@ pub(crate) fn render_settings_password(
         } else {
             Style::default()
         };
-        let masked = "•".repeat(value.chars().count());
-        Line::styled(format!("{marker}{label}: {masked}"), style)
+        let mut spans = vec![Span::styled(format!("{marker}{label}: "), style)];
+        spans.extend(super::input::render_masked_with_cursor(
+            value.chars().count(),
+            editor.cursor,
+            active,
+            '•',
+            style,
+        ));
+        Line::from(spans)
     };
 
     let mut lines = vec![
@@ -664,16 +734,18 @@ pub(crate) async fn handle_settings_password_key(
             app.settings_password = None;
             app.screen = Screen::Settings;
         }
-        KeyCode::Down => editor.field = next_password_field(editor.field),
-        KeyCode::Up => editor.field = previous_password_field(editor.field),
-        KeyCode::Backspace => {
-            editor.active_value_mut().pop();
+        KeyCode::Down => {
+            editor.field = next_password_field(editor.field);
+            editor.reset_cursor();
+        }
+        KeyCode::Up => {
+            editor.field = previous_password_field(editor.field);
+            editor.reset_cursor();
         }
         KeyCode::Enter => submit_password_change(app, client).await,
-        KeyCode::Char(character) if !character.is_control() => {
-            editor.active_value_mut().push(character);
+        other => {
+            editor.active_editor().handle_key(other);
         }
-        _ => {}
     }
 }
 
@@ -762,6 +834,7 @@ mod tests {
             remember_session: true,
             remember_minutes_input: "5".into(),
             confirmation: None,
+            cursor: 0,
         });
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 10)).unwrap();
@@ -799,6 +872,7 @@ mod tests {
                 remember_session: true,
                 remember_minutes_input: "5".into(),
                 confirmation: None,
+                cursor: 0,
             });
 
             handle_settings_key(
@@ -875,6 +949,7 @@ mod tests {
             remember_session: true,
             remember_minutes_input: "5".into(),
             confirmation: None,
+            cursor: 0,
         });
         focus_action(&mut app, 7);
         assert_eq!(app.settings.as_ref().unwrap().field, SettingsField::Access);
@@ -895,6 +970,7 @@ mod tests {
             remember_session: true,
             remember_minutes_input: "5".into(),
             confirmation: None,
+            cursor: 0,
         });
 
         handle_settings_key(
@@ -960,5 +1036,57 @@ mod tests {
         assert!(editor.current.is_empty());
         assert!(editor.new_password.is_empty());
         assert!(editor.confirm.is_empty());
+    }
+
+    #[tokio::test]
+    async fn settings_editor_cursor_navigation_and_editing() {
+        let mut app = TuiApp::default();
+        app.screen = Screen::Settings;
+        app.settings = Some(SecurityEditor {
+            field: SettingsField::RollbackTimeout,
+            active: SecuritySettings {
+                rollback_timeout_seconds: 30,
+            },
+            rollback_timeout_input: "30".into(),
+            override_active: false,
+            restart_required: false,
+            remember_session: true,
+            remember_minutes_input: "5".into(),
+            confirmation: None,
+            cursor: 2,
+        });
+        let client = ApiClient::new("/socket-that-must-not-be-opened");
+
+        handle_settings_key(&mut app, KeyCode::Left, &client).await;
+        assert_eq!(app.settings.as_ref().unwrap().cursor, 1);
+
+        handle_settings_key(&mut app, KeyCode::Char('5'), &client).await;
+        assert_eq!(app.settings.as_ref().unwrap().rollback_timeout_input, "350");
+        assert_eq!(app.settings.as_ref().unwrap().cursor, 2);
+
+        handle_settings_key(&mut app, KeyCode::Backspace, &client).await;
+        assert_eq!(app.settings.as_ref().unwrap().rollback_timeout_input, "30");
+        assert_eq!(app.settings.as_ref().unwrap().cursor, 1);
+    }
+
+    #[tokio::test]
+    async fn password_editor_cursor_navigation_and_editing() {
+        let mut app = TuiApp::default();
+        app.screen = Screen::SettingsPassword;
+        let mut editor = PasswordChangeEditor::new();
+        editor.current = "secret".into();
+        editor.cursor = 6;
+        app.settings_password = Some(editor);
+        let client = ApiClient::new("/socket-that-must-not-be-opened");
+
+        handle_settings_password_key(&mut app, KeyCode::Left, &client).await;
+        assert_eq!(app.settings_password.as_ref().unwrap().cursor, 5);
+
+        handle_settings_password_key(&mut app, KeyCode::Home, &client).await;
+        assert_eq!(app.settings_password.as_ref().unwrap().cursor, 0);
+
+        handle_settings_password_key(&mut app, KeyCode::Char('a'), &client).await;
+        assert_eq!(app.settings_password.as_ref().unwrap().current, "asecret");
+        assert_eq!(app.settings_password.as_ref().unwrap().cursor, 1);
     }
 }

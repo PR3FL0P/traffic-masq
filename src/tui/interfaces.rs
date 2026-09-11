@@ -52,13 +52,23 @@ pub(crate) struct InterfaceEditor {
     /// daemon side, which refuses the save outright unless confirmed).
     pub(crate) current_wifi_summary: Option<String>,
     pub(crate) current_dhcp_summary: Option<String>,
+    pub(crate) cursor: usize,
 }
 
 impl InterfaceEditor {
+    pub(crate) fn reset_cursor(&mut self) {
+        if self.field == InterfaceEditorField::Cidr {
+            self.cursor = self.cidr.chars().count();
+        } else {
+            self.cursor = 0;
+        }
+    }
+
     /// Ask for the address to be taken off. An empty CIDR field is the request:
     /// the daemon plans deletion only for addresses it owns.
     pub(crate) fn remove_ipv4(&mut self) {
         self.cidr.clear();
+        self.cursor = 0;
     }
 
     pub(crate) fn edit_request(&self) -> Result<InterfaceEditRequest> {
@@ -221,13 +231,26 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         Line::styled(format!("{marker}{label}"), style)
     };
 
+    let active = editor.field == InterfaceEditorField::Cidr;
+    let cidr_label_style = if active {
+        Style::default()
+            .fg(theme::ACCENT)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme::ACCENT)
+    };
+    let cidr_marker = if active { "▶ " } else { "  " };
+    let mut cidr_spans = vec![Span::styled(format!("{cidr_marker}IPv4 CIDR: "), cidr_label_style)];
+    cidr_spans.extend(super::input::render_value_with_cursor(
+        &editor.cidr,
+        editor.cursor,
+        active && editor.managed,
+        cidr_label_style,
+    ));
+
     let mut lines = vec![
         Line::from(format!("Interface: {}", editor.interface)),
-        row(
-            "IPv4 CIDR",
-            format!("{}_", editor.cidr),
-            InterfaceEditorField::Cidr,
-        ),
+        Line::from(cidr_spans),
     ];
     if !editor.managed {
         lines.push(Line::styled(
@@ -539,6 +562,7 @@ pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
         } else {
             InterfaceEditorField::Save
         };
+        editor.reset_cursor();
     }
 }
 
@@ -611,6 +635,7 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
                 .as_ref()
                 .and_then(|interface| interface.dhcp.as_ref())
                 .map(|dhcp| format!("DHCP pool {}-{}", dhcp.pool_start, dhcp.pool_end));
+            let cursor = cidr.chars().count();
             app.editor = Some(InterfaceEditor {
                 interface: name,
                 field: InterfaceEditorField::Cidr,
@@ -625,6 +650,7 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
                 current_addresses,
                 current_wifi_summary,
                 current_dhcp_summary,
+                cursor,
             });
             app.preview = None;
             app.screen = Screen::InterfaceEditor;
@@ -649,8 +675,22 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
 
     match key {
         KeyCode::Esc => app.screen = Screen::InterfaceList,
-        KeyCode::Up | KeyCode::Char('k') => editor.field = previous_editor_field(editor.field),
-        KeyCode::Down | KeyCode::Char('j') => editor.field = next_editor_field(editor.field),
+        KeyCode::Up | KeyCode::Char('k') if editor.field != InterfaceEditorField::Cidr => {
+            editor.field = previous_editor_field(editor.field);
+            editor.reset_cursor();
+        }
+        KeyCode::Up => {
+            editor.field = previous_editor_field(editor.field);
+            editor.reset_cursor();
+        }
+        KeyCode::Down | KeyCode::Char('j') if editor.field != InterfaceEditorField::Cidr => {
+            editor.field = next_editor_field(editor.field);
+            editor.reset_cursor();
+        }
+        KeyCode::Down => {
+            editor.field = next_editor_field(editor.field);
+            editor.reset_cursor();
+        }
         KeyCode::Enter | KeyCode::Char(' ') => match editor.field {
             InterfaceEditorField::Cidr => {}
             InterfaceEditorField::RemoveIpv4 => {
@@ -662,15 +702,10 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
             InterfaceEditorField::Managed => editor.managed = !editor.managed,
             InterfaceEditorField::Save => submit_dry_run(app, client).await,
         },
-        KeyCode::Backspace if editor.field == InterfaceEditorField::Cidr && editor.managed => {
-            editor.cidr.pop();
-        }
-        KeyCode::Char(character)
-            if editor.field == InterfaceEditorField::Cidr
-                && editor.managed
-                && (character.is_ascii_digit() || matches!(character, '.' | '/')) =>
-        {
-            editor.cidr.push(character);
+        other if editor.field == InterfaceEditorField::Cidr && editor.managed => {
+            let cursor = &mut editor.cursor;
+            super::input::TextEditor::new(&mut editor.cidr, cursor)
+                .handle_key_filtered(other, |c| c.is_ascii_digit() || matches!(c, '.' | '/'));
         }
         _ => {}
     }
@@ -854,6 +889,7 @@ mod tests {
             observed_addresses: vec![],
             current_wifi_summary: None,
             current_dhcp_summary: None,
+            cursor: 0,
         }
     }
 
@@ -990,6 +1026,36 @@ mod tests {
         seen.sort_by_key(|role| format!("{role:?}"));
         seen.dedup();
         assert_eq!(seen.len(), 3, "all three roles must be distinct");
+    }
+
+    #[tokio::test]
+    async fn interface_editor_cursor_navigation_and_editing() {
+        let mut app = TuiApp::default();
+        app.screen = Screen::InterfaceEditor;
+        let mut editor = default_route_editor(true);
+        editor.field = InterfaceEditorField::Cidr;
+        editor.cidr = "192.168.1.1/24".into();
+        editor.cursor = editor.cidr.len();
+        app.editor = Some(editor);
+        let client = ApiClient::new("/socket-that-must-not-be-opened");
+
+        handle_editor_key(&mut app, KeyCode::Left, &client).await;
+        assert_eq!(app.editor.as_ref().unwrap().cursor, 13);
+
+        handle_editor_key(&mut app, KeyCode::Char('0'), &client).await;
+        assert_eq!(app.editor.as_ref().unwrap().cidr, "192.168.1.1/204");
+        assert_eq!(app.editor.as_ref().unwrap().cursor, 14);
+
+        handle_editor_key(&mut app, KeyCode::Backspace, &client).await;
+        assert_eq!(app.editor.as_ref().unwrap().cidr, "192.168.1.1/24");
+        assert_eq!(app.editor.as_ref().unwrap().cursor, 13);
+
+        handle_editor_key(&mut app, KeyCode::Home, &client).await;
+        assert_eq!(app.editor.as_ref().unwrap().cursor, 0);
+
+        handle_editor_key(&mut app, KeyCode::Delete, &client).await;
+        assert_eq!(app.editor.as_ref().unwrap().cidr, "92.168.1.1/24");
+        assert_eq!(app.editor.as_ref().unwrap().cursor, 0);
     }
 }
 

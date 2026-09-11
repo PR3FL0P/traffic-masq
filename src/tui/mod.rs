@@ -1,4 +1,4 @@
-use ratatui::text::Span;
+use ratatui::text::{Line, Span};
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
@@ -30,6 +30,7 @@ mod access;
 mod dashboard;
 mod dhcp;
 mod dhcp_client;
+mod input;
 mod interfaces;
 mod layout;
 mod logs;
@@ -629,6 +630,7 @@ async fn reauthenticate(
     initial: bool,
 ) -> Result<bool> {
     let mut password = zeroize::Zeroizing::new(String::new());
+    let mut cursor = 0;
     let mut message = if initial {
         "Enter device password; Enter: sign in; Esc: exit."
     } else {
@@ -637,13 +639,20 @@ async fn reauthenticate(
     loop {
         let snapshot = terminal
             .draw(|frame| {
+                let mut spans = vec![
+                    Span::styled(format!("{message}\n\nDevice password: "), Style::default()),
+                ];
+                spans.extend(input::render_masked_with_cursor(
+                    password.chars().count(),
+                    cursor,
+                    true,
+                    '*',
+                    Style::default(),
+                ));
                 frame.render_widget(
-                    Paragraph::new(format!(
-                        "{message}\n\nDevice password: {}",
-                        "*".repeat(password.chars().count())
-                    ))
-                    .wrap(ratatui::widgets::Wrap { trim: true })
-                    .block(layout::panel("traffic-masq · Sign in")),
+                    Paragraph::new(Line::from(spans))
+                        .wrap(ratatui::widgets::Wrap { trim: true })
+                        .block(layout::panel("traffic-masq · Sign in")),
                     frame.area(),
                 );
             })?
@@ -656,10 +665,6 @@ async fn reauthenticate(
                 }
                 match key.code {
                     KeyCode::Esc => return Ok(false),
-                    KeyCode::Char(c) => password.push(c),
-                    KeyCode::Backspace => {
-                        password.pop();
-                    }
                     KeyCode::Enter => {
                         let mut result = None;
                         let exit = drive_ui(
@@ -673,6 +678,7 @@ async fn reauthenticate(
                         )
                         .await?;
                         password.zeroize();
+                        cursor = 0;
                         if exit.is_some() {
                             return Ok(false);
                         }
@@ -681,7 +687,9 @@ async fn reauthenticate(
                             Err(error) => message = format!("{error}. Try again; Esc: exit."),
                         }
                     }
-                    _ => {}
+                    other => {
+                        input::TextEditor::new(&mut password, &mut cursor).handle_key(other);
+                    }
                 }
             }
         }
@@ -1029,14 +1037,34 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
     ) {
         match key {
             KeyCode::Left => {
-                let target = adjacent_section(section_of(app.screen), false);
-                navigate_to_section(app, target, client, direct).await;
-                return;
+                let is_editing_settings_text = app.screen == Screen::Settings
+                    && app.settings.as_ref().map_or(false, |s| {
+                        matches!(
+                            s.field,
+                            settings::SettingsField::RollbackTimeout
+                                | settings::SettingsField::RememberMinutes
+                        )
+                    });
+                if !is_editing_settings_text {
+                    let target = adjacent_section(section_of(app.screen), false);
+                    navigate_to_section(app, target, client, direct).await;
+                    return;
+                }
             }
             KeyCode::Right => {
-                let target = adjacent_section(section_of(app.screen), true);
-                navigate_to_section(app, target, client, direct).await;
-                return;
+                let is_editing_settings_text = app.screen == Screen::Settings
+                    && app.settings.as_ref().map_or(false, |s| {
+                        matches!(
+                            s.field,
+                            settings::SettingsField::RollbackTimeout
+                                | settings::SettingsField::RememberMinutes
+                        )
+                    });
+                if !is_editing_settings_text {
+                    let target = adjacent_section(section_of(app.screen), true);
+                    navigate_to_section(app, target, client, direct).await;
+                    return;
+                }
             }
             _ => {}
         }

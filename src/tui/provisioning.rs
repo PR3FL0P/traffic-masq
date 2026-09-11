@@ -1,7 +1,7 @@
 use crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Gauge, Paragraph};
 use zeroize::Zeroize;
 
@@ -101,6 +101,7 @@ pub(crate) struct ProvisioningWizard {
     show_advanced: bool,
     pending: Option<PendingProvisioning>,
     error: Option<String>,
+    pub(crate) cursor: usize,
 }
 
 impl std::fmt::Debug for ProvisioningWizard {
@@ -115,6 +116,37 @@ impl Drop for ProvisioningWizard {
     fn drop(&mut self) {
         self.uplink_passphrase.zeroize();
         self.output_passphrase.zeroize();
+    }
+}
+
+impl ProvisioningWizard {
+    pub(crate) fn active_text(&self) -> Option<&str> {
+        match self.field {
+            Field::UplinkPassphrase => Some(&self.uplink_passphrase),
+            Field::OutputSsid => Some(&self.output_ssid),
+            Field::OutputPassphrase => Some(&self.output_passphrase),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn reset_cursor(&mut self) {
+        self.cursor = self.active_text().map_or(0, |v| v.chars().count());
+    }
+
+    pub(crate) fn active_editor(&mut self) -> Option<super::input::TextEditor<'_>> {
+        let cursor = &mut self.cursor;
+        match self.field {
+            Field::UplinkPassphrase => {
+                Some(super::input::TextEditor::new(&mut self.uplink_passphrase, cursor))
+            }
+            Field::OutputSsid => {
+                Some(super::input::TextEditor::new(&mut self.output_ssid, cursor))
+            }
+            Field::OutputPassphrase => {
+                Some(super::input::TextEditor::new(&mut self.output_passphrase, cursor))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -159,6 +191,7 @@ pub(crate) fn open(app: &mut TuiApp) {
         show_advanced: false,
         pending: None,
         error: None,
+        cursor: 0,
     });
     app.screen = Screen::RouterProvisioning;
 }
@@ -178,6 +211,73 @@ fn selected_line(field: Field, active: Field, label: &str, value: String) -> Lin
     )
 }
 
+fn selected_text_line(
+    field: Field,
+    active: Field,
+    cursor: usize,
+    label: &str,
+    value: &str,
+    is_masked: bool,
+    placeholder: Option<&str>,
+) -> Line<'static> {
+    let selected = field == active;
+    let style = if selected {
+        Style::default()
+            .fg(theme::SELECTED_FG)
+            .bg(theme::SELECTED_BG)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme::TEXT)
+    };
+    let prefix = format!("{}{label:<22}", if selected { "▶ " } else { "  " });
+    let mut spans = vec![Span::styled(prefix, style)];
+    if selected {
+        if is_masked {
+            if value.is_empty() {
+                if let Some(ph) = placeholder {
+                    spans.push(Span::styled(
+                        ph.to_string(),
+                        Style::default().fg(theme::MUTED),
+                    ));
+                }
+                spans.extend(super::input::render_masked_with_cursor(
+                    0, 0, true, '•', style,
+                ));
+            } else {
+                spans.extend(super::input::render_masked_with_cursor(
+                    value.chars().count(),
+                    cursor,
+                    true,
+                    '•',
+                    style,
+                ));
+            }
+        } else {
+            spans.extend(super::input::render_value_with_cursor(
+                value,
+                cursor,
+                true,
+                style,
+            ));
+        }
+    } else if is_masked {
+        if value.is_empty() {
+            if let Some(ph) = placeholder {
+                spans.push(Span::styled(
+                    ph.to_string(),
+                    Style::default().fg(theme::MUTED),
+                ));
+            }
+        } else {
+            spans.push(Span::styled("•".repeat(value.chars().count()), style));
+        }
+    } else {
+        spans.push(Span::styled(value.to_string(), style));
+    }
+    Line::from(spans)
+}
+
+#[cfg(test)]
 fn masked(value: &str) -> String {
     if value.is_empty() {
         "<use stored key if available>".into()
@@ -214,11 +314,14 @@ pub(crate) fn render_wizard(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Tu
                 wizard.uplink_ssid.clone()
             },
         ),
-        selected_line(
+        selected_text_line(
             Field::UplinkPassphrase,
             wizard.field,
+            wizard.cursor,
             "Upstream passphrase",
-            masked(&wizard.uplink_passphrase),
+            &wizard.uplink_passphrase,
+            true,
+            Some("<use stored key if available>"),
         ),
         selected_line(
             Field::OutputInterface,
@@ -226,11 +329,14 @@ pub(crate) fn render_wizard(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Tu
             "Output interface",
             output.clone(),
         ),
-        selected_line(
+        selected_text_line(
             Field::OutputSsid,
             wizard.field,
+            wizard.cursor,
             "Access-point SSID",
-            wizard.output_ssid.clone(),
+            &wizard.output_ssid,
+            false,
+            None,
         ),
         selected_line(
             Field::OutputSecurity,
@@ -238,11 +344,14 @@ pub(crate) fn render_wizard(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Tu
             "AP security",
             format!("{:?}", wizard.output_security),
         ),
-        selected_line(
+        selected_text_line(
             Field::OutputPassphrase,
             wizard.field,
+            wizard.cursor,
             "AP passphrase",
-            masked(&wizard.output_passphrase),
+            &wizard.output_passphrase,
+            true,
+            Some("<use stored key if available>"),
         ),
         selected_line(
             Field::AllowManagement,
@@ -280,8 +389,8 @@ pub(crate) async fn handle_wizard_key(app: &mut TuiApp, key: KeyCode, client: &A
         KeyCode::Esc => cancel(app),
         KeyCode::Up | KeyCode::BackTab => move_field(wizard, false),
         KeyCode::Down | KeyCode::Tab => move_field(wizard, true),
-        KeyCode::Left => cycle_value(wizard, false),
-        KeyCode::Right => cycle_value(wizard, true),
+        KeyCode::Left if wizard.active_editor().is_none() => cycle_value(wizard, false),
+        KeyCode::Right if wizard.active_editor().is_none() => cycle_value(wizard, true),
         KeyCode::Enter => match wizard.field {
             Field::UplinkNetwork => load_networks(app, client).await,
             Field::Preview => preview(app, client).await,
@@ -291,17 +400,11 @@ pub(crate) async fn handle_wizard_key(app: &mut TuiApp, key: KeyCode, client: &A
             | Field::AllowManagement => cycle_value(wizard, true),
             _ => move_field(wizard, true),
         },
-        KeyCode::Backspace => {
-            if let Some(value) = active_text(wizard) {
-                value.pop();
+        other => {
+            if let Some(mut text_editor) = wizard.active_editor() {
+                text_editor.handle_key(other);
             }
         }
-        KeyCode::Char(character) => {
-            if let Some(value) = active_text(wizard) {
-                value.push(character);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -315,6 +418,7 @@ fn move_field(wizard: &mut ProvisioningWizard, forward: bool) {
     } else {
         FIELDS[index.saturating_sub(1)]
     };
+    wizard.reset_cursor();
 }
 
 fn cycle_value(wizard: &mut ProvisioningWizard, forward: bool) {
@@ -345,6 +449,7 @@ fn cycle_value(wizard: &mut ProvisioningWizard, forward: bool) {
     }
 }
 
+#[allow(dead_code)]
 fn active_text(wizard: &mut ProvisioningWizard) -> Option<&mut String> {
     match wizard.field {
         Field::UplinkPassphrase => Some(&mut wizard.uplink_passphrase),
@@ -899,5 +1004,52 @@ mod tests {
             describe_error(&RouterProvisioningErrorDetail::StalePlan),
             "Network state changed; preview again"
         );
+    }
+
+    #[tokio::test]
+    async fn wizard_cursor_navigation_and_editing() {
+        let mut app = TuiApp::default();
+        let wizard = ProvisioningWizard {
+            field: Field::OutputSsid,
+            interfaces: vec!["wlan0".into(), "wlan1".into()],
+            uplink_index: 0,
+            output_index: 1,
+            uplink_ssid: String::new(),
+            uplink_country: None,
+            uplink_security: WifiClientSecurity::Wpa2,
+            uplink_passphrase: String::new(),
+            output_ssid: "MyRouter".into(),
+            output_security: WifiSecurity::Wpa2,
+            output_passphrase: String::new(),
+            allow_management_change: false,
+            choices: Vec::new(),
+            choice_index: 0,
+            preview: None,
+            show_advanced: false,
+            pending: None,
+            error: None,
+            cursor: 8,
+        };
+        app.provisioning = Some(wizard);
+        app.screen = Screen::RouterProvisioning;
+        let client = ApiClient::new("/nonexistent.sock");
+
+        handle_wizard_key(&mut app, KeyCode::Left, &client).await;
+        assert_eq!(app.provisioning.as_ref().unwrap().cursor, 7);
+
+        handle_wizard_key(&mut app, KeyCode::Char('!'), &client).await;
+        assert_eq!(app.provisioning.as_ref().unwrap().output_ssid, "MyRoute!r");
+        assert_eq!(app.provisioning.as_ref().unwrap().cursor, 8);
+
+        handle_wizard_key(&mut app, KeyCode::Backspace, &client).await;
+        assert_eq!(app.provisioning.as_ref().unwrap().output_ssid, "MyRouter");
+        assert_eq!(app.provisioning.as_ref().unwrap().cursor, 7);
+
+        handle_wizard_key(&mut app, KeyCode::Home, &client).await;
+        assert_eq!(app.provisioning.as_ref().unwrap().cursor, 0);
+
+        handle_wizard_key(&mut app, KeyCode::Delete, &client).await;
+        assert_eq!(app.provisioning.as_ref().unwrap().output_ssid, "yRouter");
+        assert_eq!(app.provisioning.as_ref().unwrap().cursor, 0);
     }
 }

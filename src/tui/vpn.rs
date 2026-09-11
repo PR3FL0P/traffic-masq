@@ -1,7 +1,7 @@
 use crossterm::event::KeyCode;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use zeroize::Zeroize;
 
@@ -70,13 +70,34 @@ pub(crate) struct VpnImportEditor {
     pub(crate) field: VpnImportField,
     pub(crate) name: String,
     pub(crate) path: String,
+    pub(crate) cursor: usize,
 }
 
 impl VpnImportEditor {
+    #[allow(dead_code)]
     fn active_value_mut(&mut self) -> &mut String {
         match self.field {
             VpnImportField::Name => &mut self.name,
             VpnImportField::Path => &mut self.path,
+        }
+    }
+
+    pub(crate) fn active_value(&self) -> &str {
+        match self.field {
+            VpnImportField::Name => &self.name,
+            VpnImportField::Path => &self.path,
+        }
+    }
+
+    pub(crate) fn reset_cursor(&mut self) {
+        self.cursor = self.active_value().chars().count();
+    }
+
+    pub(crate) fn active_editor(&mut self) -> super::input::TextEditor<'_> {
+        let cursor = &mut self.cursor;
+        match self.field {
+            VpnImportField::Name => super::input::TextEditor::new(&mut self.name, cursor),
+            VpnImportField::Path => super::input::TextEditor::new(&mut self.path, cursor),
         }
     }
 }
@@ -215,7 +236,14 @@ pub(crate) fn render_vpn_import(frame: &mut ratatui::Frame<'_>, area: Rect, app:
         } else {
             Style::default()
         };
-        Line::styled(format!("{marker}{label}: {value}"), style)
+        let mut spans = vec![Span::styled(format!("{marker}{label}: "), style)];
+        spans.extend(super::input::render_value_with_cursor(
+            value,
+            editor.cursor,
+            active,
+            style,
+        ));
+        Line::from(spans)
     };
     let mut lines = vec![
         field_line("Name", &editor.name, VpnImportField::Name),
@@ -307,6 +335,7 @@ fn open_vpn_import(app: &mut TuiApp) {
         field: VpnImportField::Name,
         name: String::new(),
         path: String::new(),
+        cursor: 0,
     });
     app.screen = Screen::VpnImport;
 }
@@ -327,17 +356,14 @@ pub(crate) async fn handle_vpn_import_key(app: &mut TuiApp, key: KeyCode, client
             app.vpn_import = None;
             app.screen = Screen::Vpn;
         }
-        KeyCode::Up | KeyCode::Down => {
+        KeyCode::Up | KeyCode::Down | KeyCode::Tab => {
             editor.field = toggle_vpn_import_field(editor.field);
-        }
-        KeyCode::Backspace => {
-            editor.active_value_mut().pop();
+            editor.reset_cursor();
         }
         KeyCode::Enter => vpn_import_submit(app, client).await,
-        KeyCode::Char(character) if !character.is_control() => {
-            editor.active_value_mut().push(character);
+        other => {
+            editor.active_editor().handle_key(other);
         }
-        _ => {}
     }
 }
 
@@ -623,6 +649,7 @@ mod tests {
             field: VpnImportField::Name,
             name: "home".to_string(),
             path: "/etc/wireguard/home.conf".to_string(),
+            cursor: 0,
         };
         editor.active_value_mut().push_str(".conf");
         assert_eq!(editor.name, "home.conf");
@@ -640,11 +667,48 @@ mod tests {
             field: VpnImportField::Name,
             name: "home.conf".to_string(),
             path: "/etc/wireguard/home.conf".to_string(),
+            cursor: 0,
         };
         let debug = format!("{editor:?}");
         assert!(debug.contains("name"));
         assert!(debug.contains("path"));
         assert!(!debug.contains("contents"));
         assert!(!debug.contains("PrivateKey"));
+    }
+
+    #[tokio::test]
+    async fn vpn_import_editor_cursor_navigation_and_editing() {
+        let mut app = TuiApp::default();
+        let mut editor = VpnImportEditor {
+            field: VpnImportField::Name,
+            name: "work".to_string(),
+            path: "/tmp/vpn.conf".to_string(),
+            cursor: 4,
+        };
+        editor.cursor = editor.name.len();
+        app.vpn_import = Some(editor);
+        app.screen = Screen::VpnImport;
+        let client = ApiClient::new("/nonexistent.sock");
+
+        handle_vpn_import_key(&mut app, KeyCode::Left, &client).await;
+        assert_eq!(app.vpn_import.as_ref().unwrap().cursor, 3);
+
+        handle_vpn_import_key(&mut app, KeyCode::Char('1'), &client).await;
+        assert_eq!(app.vpn_import.as_ref().unwrap().name, "wor1k");
+        assert_eq!(app.vpn_import.as_ref().unwrap().cursor, 4);
+
+        handle_vpn_import_key(&mut app, KeyCode::Backspace, &client).await;
+        assert_eq!(app.vpn_import.as_ref().unwrap().name, "work");
+        assert_eq!(app.vpn_import.as_ref().unwrap().cursor, 3);
+
+        handle_vpn_import_key(&mut app, KeyCode::Down, &client).await;
+        assert_eq!(
+            app.vpn_import.as_ref().unwrap().field,
+            VpnImportField::Path
+        );
+        assert_eq!(
+            app.vpn_import.as_ref().unwrap().cursor,
+            "/tmp/vpn.conf".len()
+        );
     }
 }

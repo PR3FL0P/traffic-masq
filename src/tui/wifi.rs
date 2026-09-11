@@ -1,7 +1,7 @@
 use crossterm::event::KeyCode;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use zeroize::Zeroize;
 
@@ -132,6 +132,7 @@ pub(crate) struct WifiEditor {
     pub(crate) configure_dhcp: bool,
     original_spec: Option<crate::wifi::WifiApSpec>,
     radio_settings: Option<WifiEditRequest>,
+    pub(crate) cursor: usize,
 }
 
 impl Drop for WifiEditor {
@@ -159,6 +160,7 @@ impl WifiEditor {
                 )
             },
         );
+        let cursor = ssid.chars().count();
         Self {
             interface: row.interface.clone(),
             field: WifiField::Ssid,
@@ -170,14 +172,43 @@ impl WifiEditor {
             configure_dhcp: row.ap.is_none() && CONFIGURE_DHCP_BY_DEFAULT,
             original_spec: row.ap.as_ref().map(|status| status.spec.clone()),
             radio_settings: None,
+            cursor,
         }
     }
 
+    #[allow(dead_code)]
     fn active_value_mut(&mut self) -> Option<&mut String> {
         match self.field {
             WifiField::Ssid => Some(&mut self.ssid),
             WifiField::Passphrase => Some(&mut self.passphrase),
             WifiField::CountryCode => Some(&mut self.country_code),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn active_value(&self) -> Option<&str> {
+        match self.field {
+            WifiField::Ssid => Some(&self.ssid),
+            WifiField::Passphrase => Some(&self.passphrase),
+            WifiField::CountryCode => Some(&self.country_code),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn reset_cursor(&mut self) {
+        self.cursor = self.active_value().map_or(0, |v| v.chars().count());
+    }
+
+    pub(crate) fn active_editor(&mut self) -> Option<super::input::TextEditor<'_>> {
+        let cursor = &mut self.cursor;
+        match self.field {
+            WifiField::Ssid => Some(super::input::TextEditor::new(&mut self.ssid, cursor)),
+            WifiField::Passphrase => {
+                Some(super::input::TextEditor::new(&mut self.passphrase, cursor))
+            }
+            WifiField::CountryCode => {
+                Some(super::input::TextEditor::new(&mut self.country_code, cursor))
+            }
             _ => None,
         }
     }
@@ -238,6 +269,7 @@ pub(crate) struct WifiProfileEditor {
     pub(crate) priority: String,
     pub(crate) passphrase: String,
     pub(crate) has_passphrase: bool,
+    pub(crate) cursor: usize,
 }
 
 impl Drop for WifiProfileEditor {
@@ -259,21 +291,25 @@ impl WifiProfileEditor {
         network: &WpaSupplicantScanResult,
     ) -> Result<Self, &'static str> {
         let security = map_scan_security(network.security)?;
+        let id = profile_id_for_ssid(&network.ssid);
+        let cursor = id.chars().count();
         Ok(Self {
             interface,
             original_id: None,
             field: ProfileField::Id,
-            id: profile_id_for_ssid(&network.ssid),
+            id,
             ssid: network.ssid.clone(),
             security,
             country: String::new(),
             priority: "0".into(),
             passphrase: String::new(),
             has_passphrase: false,
+            cursor,
         })
     }
 
     fn from_profile(interface: String, profile: &WifiClientProfileSummary) -> Self {
+        let cursor = profile.id.chars().count();
         Self {
             interface,
             original_id: Some(profile.id.clone()),
@@ -285,9 +321,11 @@ impl WifiProfileEditor {
             priority: profile.priority.to_string(),
             passphrase: String::new(),
             has_passphrase: profile.has_passphrase,
+            cursor,
         }
     }
 
+    #[allow(dead_code)]
     fn active_value_mut(&mut self) -> Option<&mut String> {
         match self.field {
             ProfileField::Id => Some(&mut self.id),
@@ -295,6 +333,39 @@ impl WifiProfileEditor {
             ProfileField::Country => Some(&mut self.country),
             ProfileField::Priority => Some(&mut self.priority),
             ProfileField::Passphrase => Some(&mut self.passphrase),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn active_value(&self) -> Option<&str> {
+        match self.field {
+            ProfileField::Id => Some(&self.id),
+            ProfileField::Ssid => Some(&self.ssid),
+            ProfileField::Country => Some(&self.country),
+            ProfileField::Priority => Some(&self.priority),
+            ProfileField::Passphrase => Some(&self.passphrase),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn reset_cursor(&mut self) {
+        self.cursor = self.active_value().map_or(0, |v| v.chars().count());
+    }
+
+    pub(crate) fn active_editor(&mut self) -> Option<super::input::TextEditor<'_>> {
+        let cursor = &mut self.cursor;
+        match self.field {
+            ProfileField::Id => Some(super::input::TextEditor::new(&mut self.id, cursor)),
+            ProfileField::Ssid => Some(super::input::TextEditor::new(&mut self.ssid, cursor)),
+            ProfileField::Country => {
+                Some(super::input::TextEditor::new(&mut self.country, cursor))
+            }
+            ProfileField::Priority => {
+                Some(super::input::TextEditor::new(&mut self.priority, cursor))
+            }
+            ProfileField::Passphrase => {
+                Some(super::input::TextEditor::new(&mut self.passphrase, cursor))
+            }
             _ => None,
         }
     }
@@ -674,13 +745,39 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
         ),
     ];
     for (field, label, value) in values {
-        lines.push(Line::styled(
-            format!(
-                "{}{label:<14}{value}",
-                if editor.field == field { "▶ " } else { "  " }
-            ),
-            selected_style(editor.field == field),
-        ));
+        let active = editor.field == field;
+        let style = selected_style(active);
+        let prefix = format!("{}{label:<14}", if active { "▶ " } else { "  " });
+        let mut spans = vec![Span::styled(prefix, style)];
+        if active && matches!(field, WifiField::Ssid | WifiField::CountryCode) {
+            spans.extend(super::input::render_value_with_cursor(
+                &value,
+                editor.cursor,
+                true,
+                style,
+            ));
+        } else if active && field == WifiField::Passphrase {
+            if editor.passphrase.is_empty() && editor.existing {
+                spans.push(Span::styled(
+                    "•••••• (saved; leave blank to keep) ",
+                    Style::default().fg(theme::MUTED),
+                ));
+                spans.extend(super::input::render_masked_with_cursor(
+                    0, 0, true, '•', style,
+                ));
+            } else {
+                spans.extend(super::input::render_masked_with_cursor(
+                    editor.passphrase.chars().count(),
+                    editor.cursor,
+                    true,
+                    '•',
+                    style,
+                ));
+            }
+        } else {
+            spans.push(Span::styled(value, style));
+        }
+        lines.push(Line::from(spans));
     }
     lines.push(Line::from(""));
     lines.push(Line::styled(
@@ -721,8 +818,14 @@ pub(crate) async fn handle_wifi_editor_key(app: &mut TuiApp, key: KeyCode, clien
             app.wifi_editor = None;
             app.screen = Screen::Wifi;
         }
-        KeyCode::Up => editor.field = move_field(&WIFI_FIELDS, editor.field, false),
-        KeyCode::Down => editor.field = move_field(&WIFI_FIELDS, editor.field, true),
+        KeyCode::Up => {
+            editor.field = move_field(&WIFI_FIELDS, editor.field, false);
+            editor.reset_cursor();
+        }
+        KeyCode::Down => {
+            editor.field = move_field(&WIFI_FIELDS, editor.field, true);
+            editor.reset_cursor();
+        }
         KeyCode::Enter if editor.field == WifiField::Security => {
             editor.security = cycle_ap_security(editor.security)
         }
@@ -787,18 +890,15 @@ pub(crate) async fn handle_wifi_editor_key(app: &mut TuiApp, key: KeyCode, clien
             editor.radio_settings = Some(settings);
         }
         KeyCode::Enter if editor.field == WifiField::Apply => apply_ap_editor(app, client).await,
-        KeyCode::Enter => editor.field = move_field(&WIFI_FIELDS, editor.field, true),
-        KeyCode::Backspace => {
-            if let Some(value) = editor.active_value_mut() {
-                value.pop();
+        KeyCode::Enter => {
+            editor.field = move_field(&WIFI_FIELDS, editor.field, true);
+            editor.reset_cursor();
+        }
+        other => {
+            if let Some(mut text_editor) = editor.active_editor() {
+                text_editor.handle_key(other);
             }
         }
-        KeyCode::Char(character) => {
-            if let Some(value) = editor.active_value_mut() {
-                value.push(character);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -1122,6 +1222,7 @@ async fn activate_profile_row(app: &mut TuiApp, client: &ApiClient) {
                 priority: "0".into(),
                 passphrase: String::new(),
                 has_passphrase: false,
+                cursor: 0,
             });
             app.screen = Screen::WifiProfileEditor;
         }
@@ -1241,13 +1342,47 @@ pub(crate) fn render_wifi_profile_editor(
     let lines = values
         .into_iter()
         .map(|(field, label, value)| {
-            Line::styled(
-                format!(
-                    "{}{label:<14}{value}",
-                    if editor.field == field { "▶ " } else { "  " }
-                ),
-                selected_style(editor.field == field),
-            )
+            let active = editor.field == field;
+            let style = selected_style(active);
+            let prefix = format!("{}{label:<14}", if active { "▶ " } else { "  " });
+            let mut spans = vec![Span::styled(prefix, style)];
+            if active
+                && matches!(
+                    field,
+                    ProfileField::Id
+                        | ProfileField::Ssid
+                        | ProfileField::Country
+                        | ProfileField::Priority
+                )
+            {
+                spans.extend(super::input::render_value_with_cursor(
+                    &value,
+                    editor.cursor,
+                    true,
+                    style,
+                ));
+            } else if active && field == ProfileField::Passphrase {
+                if editor.passphrase.is_empty() && editor.has_passphrase {
+                    spans.push(Span::styled(
+                        "•••••• (saved; leave blank to keep) ",
+                        Style::default().fg(theme::MUTED),
+                    ));
+                    spans.extend(super::input::render_masked_with_cursor(
+                        0, 0, true, '•', style,
+                    ));
+                } else {
+                    spans.extend(super::input::render_masked_with_cursor(
+                        editor.passphrase.chars().count(),
+                        editor.cursor,
+                        true,
+                        '•',
+                        style,
+                    ));
+                }
+            } else {
+                spans.push(Span::styled(value, style));
+            }
+            Line::from(spans)
         })
         .collect::<Vec<_>>();
     frame.render_widget(
@@ -1284,8 +1419,14 @@ pub(crate) async fn handle_wifi_profile_editor_key(
                 Screen::WifiScan
             };
         }
-        KeyCode::Up => editor.field = move_field(&PROFILE_FIELDS, editor.field, false),
-        KeyCode::Down => editor.field = move_field(&PROFILE_FIELDS, editor.field, true),
+        KeyCode::Up => {
+            editor.field = move_field(&PROFILE_FIELDS, editor.field, false);
+            editor.reset_cursor();
+        }
+        KeyCode::Down => {
+            editor.field = move_field(&PROFILE_FIELDS, editor.field, true);
+            editor.reset_cursor();
+        }
         KeyCode::Enter if editor.field == ProfileField::Security => {
             editor.security = cycle_client_security(editor.security)
         }
@@ -1293,18 +1434,15 @@ pub(crate) async fn handle_wifi_profile_editor_key(
             editor.security = cycle_client_security(editor.security)
         }
         KeyCode::Enter if editor.field == ProfileField::Save => save_profile(app, client).await,
-        KeyCode::Enter => editor.field = move_field(&PROFILE_FIELDS, editor.field, true),
-        KeyCode::Backspace => {
-            if let Some(value) = editor.active_value_mut() {
-                value.pop();
+        KeyCode::Enter => {
+            editor.field = move_field(&PROFILE_FIELDS, editor.field, true);
+            editor.reset_cursor();
+        }
+        other => {
+            if let Some(mut text_editor) = editor.active_editor() {
+                text_editor.handle_key(other);
             }
         }
-        KeyCode::Char(character) => {
-            if let Some(value) = editor.active_value_mut() {
-                value.push(character);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -1761,6 +1899,7 @@ mod tests {
             priority: "10".into(),
             passphrase: String::new(),
             has_passphrase: true,
+            cursor: 0,
         };
         let request = editor.request().unwrap();
         assert_eq!(request.country_code.as_deref(), Some("PL"));
@@ -1980,5 +2119,67 @@ mod tests {
         assert_eq!(data.focused_radio().unwrap().interface, "wlan0");
         assert_eq!(data.cursor_limit(), 6);
         assert_eq!(actions(WifiRole::Client)[0].1, "Scan networks");
+    }
+
+    #[tokio::test]
+    async fn wifi_editor_cursor_navigation_and_editing() {
+        let mut app = TuiApp::default();
+        let row = WifiRow {
+            interface: "wlan0".into(),
+            role: WifiRole::AccessPoint,
+            ap: None,
+            client: None,
+        };
+        let mut editor = WifiEditor::from_row(&row);
+        editor.field = WifiField::Ssid;
+        editor.ssid = "MyNet".into();
+        editor.cursor = editor.ssid.len();
+        app.wifi_editor = Some(editor);
+        app.screen = Screen::WifiEditor;
+        let client = ApiClient::new("/nonexistent.sock");
+
+        handle_wifi_editor_key(&mut app, KeyCode::Left, &client).await;
+        assert_eq!(app.wifi_editor.as_ref().unwrap().cursor, 4);
+
+        handle_wifi_editor_key(&mut app, KeyCode::Char('1'), &client).await;
+        assert_eq!(app.wifi_editor.as_ref().unwrap().ssid, "MyNe1t");
+        assert_eq!(app.wifi_editor.as_ref().unwrap().cursor, 5);
+
+        handle_wifi_editor_key(&mut app, KeyCode::Backspace, &client).await;
+        assert_eq!(app.wifi_editor.as_ref().unwrap().ssid, "MyNet");
+        assert_eq!(app.wifi_editor.as_ref().unwrap().cursor, 4);
+    }
+
+    #[tokio::test]
+    async fn wifi_profile_editor_cursor_navigation_and_editing() {
+        let mut app = TuiApp::default();
+        let mut editor = WifiProfileEditor {
+            interface: "wlan0".into(),
+            original_id: None,
+            field: ProfileField::Ssid,
+            id: "net-1".into(),
+            ssid: "Office".into(),
+            security: WifiClientSecurity::Wpa2,
+            country: String::new(),
+            priority: "0".into(),
+            passphrase: String::new(),
+            has_passphrase: false,
+            cursor: 6,
+        };
+        editor.cursor = editor.ssid.len();
+        app.wifi_profile_editor = Some(editor);
+        app.screen = Screen::WifiProfileEditor;
+        let client = ApiClient::new("/nonexistent.sock");
+
+        handle_wifi_profile_editor_key(&mut app, KeyCode::Home, &client).await;
+        assert_eq!(app.wifi_profile_editor.as_ref().unwrap().cursor, 0);
+
+        handle_wifi_profile_editor_key(&mut app, KeyCode::Char('X'), &client).await;
+        assert_eq!(app.wifi_profile_editor.as_ref().unwrap().ssid, "XOffice");
+        assert_eq!(app.wifi_profile_editor.as_ref().unwrap().cursor, 1);
+
+        handle_wifi_profile_editor_key(&mut app, KeyCode::Delete, &client).await;
+        assert_eq!(app.wifi_profile_editor.as_ref().unwrap().ssid, "Xffice");
+        assert_eq!(app.wifi_profile_editor.as_ref().unwrap().cursor, 1);
     }
 }

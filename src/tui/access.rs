@@ -1,7 +1,7 @@
 use crossterm::event::KeyCode;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::api::client::ApiClient;
@@ -30,10 +30,47 @@ pub(crate) struct AccessEditor {
     pub(crate) desired: ApiHttpsSettings,
     pub(crate) override_active: bool,
     pub(crate) restart_required: bool,
+    pub(crate) cursor: usize,
 }
 
 impl AccessEditor {
-    fn active_value_mut(&mut self) -> Option<&mut String> {
+    pub(crate) fn reset_cursor(&mut self) {
+        self.cursor = self.active_value().map(|s| s.chars().count()).unwrap_or(0);
+    }
+
+    pub(crate) fn active_value(&self) -> Option<&str> {
+        match self.field {
+            AccessField::Listen => Some(&self.desired.listen),
+            AccessField::CertificatePath => self.desired.certificate_path.as_deref(),
+            AccessField::PrivateKeyPath => self.desired.private_key_path.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn active_editor(&mut self) -> Option<super::input::TextEditor<'_>> {
+        let cursor = &mut self.cursor;
+        match self.field {
+            AccessField::Enabled | AccessField::Save | AccessField::Reset | AccessField::Reload => {
+                None
+            }
+            AccessField::Listen => Some(super::input::TextEditor::new(&mut self.desired.listen, cursor)),
+            AccessField::CertificatePath => Some(super::input::TextEditor::new(
+                self.desired
+                    .certificate_path
+                    .get_or_insert_with(String::new),
+                cursor,
+            )),
+            AccessField::PrivateKeyPath => Some(super::input::TextEditor::new(
+                self.desired
+                    .private_key_path
+                    .get_or_insert_with(String::new),
+                cursor,
+            )),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn active_value_mut(&mut self) -> Option<&mut String> {
         match self.field {
             AccessField::Enabled | AccessField::Save | AccessField::Reset | AccessField::Reload => {
                 None
@@ -80,6 +117,7 @@ pub(crate) async fn open_access_editor(app: &mut TuiApp, client: &ApiClient) {
                 desired,
                 override_active,
                 restart_required,
+                cursor: 0,
             });
             app.screen = Screen::Access;
         }
@@ -125,6 +163,26 @@ pub(crate) fn render_access(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
             Style::default()
         };
         Line::styled(format!("{marker}{label}: {value}"), style)
+    };
+
+    let text_row = |label: &str, value: &str, field: AccessField| -> Line<'static> {
+        let active = editor.field == field;
+        let marker = if active { "▶ " } else { "  " };
+        let label_style = if active {
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let mut spans = vec![Span::styled(format!("{marker}{label}: "), label_style)];
+        spans.extend(super::input::render_value_with_cursor(
+            value,
+            editor.cursor,
+            active,
+            label_style,
+        ));
+        Line::from(spans)
     };
 
     let action_row = |label: &str, field: AccessField| {
@@ -176,25 +234,19 @@ pub(crate) fn render_access(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
             editor.desired.enabled.to_string(),
             AccessField::Enabled,
         ),
-        row(
+        text_row(
             "Listen after restart",
-            format!("{}_", editor.desired.listen),
+            &editor.desired.listen,
             AccessField::Listen,
         ),
-        row(
+        text_row(
             "Certificate path",
-            format!(
-                "{}_",
-                editor.desired.certificate_path.as_deref().unwrap_or_default()
-            ),
+            editor.desired.certificate_path.as_deref().unwrap_or_default(),
             AccessField::CertificatePath,
         ),
-        row(
+        text_row(
             "Private key path",
-            format!(
-                "{}_",
-                editor.desired.private_key_path.as_deref().unwrap_or_default()
-            ),
+            editor.desired.private_key_path.as_deref().unwrap_or_default(),
             AccessField::PrivateKeyPath,
         ),
         Line::styled(
@@ -206,7 +258,7 @@ pub(crate) fn render_access(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
             Style::default().fg(theme::MUTED),
         ),
         Line::styled(
-            "j/k: move | Enter/Space: activate | type to edit",
+            "j/k or arrows: move | Enter/Space: activate | type or arrows to edit",
             Style::default().fg(theme::MUTED),
         ),
         Line::from(""),
@@ -247,6 +299,7 @@ pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
             1 => AccessField::Reset,
             _ => AccessField::Reload,
         };
+        editor.reset_cursor();
     }
 }
 
@@ -258,8 +311,14 @@ pub(crate) async fn handle_access_key(app: &mut TuiApp, key: KeyCode, client: &A
 
     match key {
         KeyCode::Esc => app.screen = Screen::Settings,
-        KeyCode::Up => editor.field = previous_field(editor.field),
-        KeyCode::Down => editor.field = next_field(editor.field),
+        KeyCode::Up => {
+            editor.field = previous_field(editor.field);
+            editor.reset_cursor();
+        }
+        KeyCode::Down => {
+            editor.field = next_field(editor.field);
+            editor.reset_cursor();
+        }
         KeyCode::Enter => match editor.field {
             AccessField::Enabled => editor.desired.enabled = !editor.desired.enabled,
             AccessField::Listen | AccessField::CertificatePath | AccessField::PrivateKeyPath => {}
@@ -267,17 +326,11 @@ pub(crate) async fn handle_access_key(app: &mut TuiApp, key: KeyCode, client: &A
             AccessField::Reset => reset_access_settings(app, client).await,
             AccessField::Reload => open_access_editor(app, client).await,
         },
-        KeyCode::Backspace => {
-            if let Some(value) = editor.active_value_mut() {
-                value.pop();
+        other => {
+            if let Some(mut text_ed) = editor.active_editor() {
+                text_ed.handle_key(other);
             }
         }
-        KeyCode::Char(character) if !character.is_control() => {
-            if let Some(value) = editor.active_value_mut() {
-                value.push(character);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -303,6 +356,7 @@ pub(crate) async fn submit_access_settings(app: &mut TuiApp, client: &ApiClient)
                 desired,
                 override_active,
                 restart_required,
+                cursor: 0,
             });
             app.push_message(
                 LogLevel::Info,
@@ -332,6 +386,7 @@ pub(crate) async fn reset_access_settings(app: &mut TuiApp, client: &ApiClient) 
                 desired,
                 override_active,
                 restart_required,
+                cursor: 0,
             });
             app.push_message(
                 LogLevel::Info,
@@ -406,6 +461,7 @@ mod tests {
             desired: settings,
             override_active: false,
             restart_required: false,
+            cursor: 0,
         };
         assert!(editor.active_value_mut().is_none());
         editor.field = AccessField::Reset;
@@ -416,6 +472,45 @@ mod tests {
         assert!(editor.active_value_mut().is_none());
         editor.field = AccessField::Listen;
         assert!(editor.active_value_mut().is_some());
+    }
+
+    #[tokio::test]
+    async fn access_editor_cursor_navigation_and_editing() {
+        let mut app = TuiApp::default();
+        app.screen = Screen::Access;
+        let settings = ApiHttpsSettings {
+            enabled: false,
+            listen: "127.0.0.1:8443".into(),
+            certificate_path: None,
+            private_key_path: None,
+        };
+        let editor = AccessEditor {
+            field: AccessField::Listen,
+            active: settings.clone(),
+            desired: settings,
+            override_active: false,
+            restart_required: false,
+            cursor: 14,
+        };
+        app.api_access = Some(editor);
+        let client = ApiClient::new("/socket-that-must-not-be-opened");
+
+        handle_access_key(&mut app, KeyCode::Left, &client).await;
+        assert_eq!(app.api_access.as_ref().unwrap().cursor, 13);
+
+        handle_access_key(&mut app, KeyCode::Right, &client).await;
+        assert_eq!(app.api_access.as_ref().unwrap().cursor, 14);
+
+        handle_access_key(&mut app, KeyCode::Home, &client).await;
+        assert_eq!(app.api_access.as_ref().unwrap().cursor, 0);
+
+        handle_access_key(&mut app, KeyCode::Char('a'), &client).await;
+        assert_eq!(app.api_access.as_ref().unwrap().desired.listen, "a127.0.0.1:8443");
+        assert_eq!(app.api_access.as_ref().unwrap().cursor, 1);
+
+        handle_access_key(&mut app, KeyCode::Backspace, &client).await;
+        assert_eq!(app.api_access.as_ref().unwrap().desired.listen, "127.0.0.1:8443");
+        assert_eq!(app.api_access.as_ref().unwrap().cursor, 0);
     }
 
     #[tokio::test]

@@ -36,6 +36,7 @@ pub(crate) struct DhcpEditor {
     pub(crate) router: String,
     pub(crate) dns_servers: String,
     pub(crate) lease_seconds: String,
+    pub(crate) cursor: usize,
 }
 
 impl DhcpEditor {
@@ -62,6 +63,7 @@ impl DhcpEditor {
         })
     }
 
+    #[allow(dead_code)]
     fn active_value_mut(&mut self) -> Option<&mut String> {
         match self.field {
             DhcpField::PoolStart => Some(&mut self.pool_start),
@@ -69,6 +71,43 @@ impl DhcpEditor {
             DhcpField::Router => Some(&mut self.router),
             DhcpField::DnsServers => Some(&mut self.dns_servers),
             DhcpField::LeaseSeconds => Some(&mut self.lease_seconds),
+            DhcpField::Save | DhcpField::Leases | DhcpField::Disable => None,
+        }
+    }
+
+    pub(crate) fn active_value(&self) -> Option<&str> {
+        match self.field {
+            DhcpField::PoolStart => Some(&self.pool_start),
+            DhcpField::PoolEnd => Some(&self.pool_end),
+            DhcpField::Router => Some(&self.router),
+            DhcpField::DnsServers => Some(&self.dns_servers),
+            DhcpField::LeaseSeconds => Some(&self.lease_seconds),
+            DhcpField::Save | DhcpField::Leases | DhcpField::Disable => None,
+        }
+    }
+
+    pub(crate) fn reset_cursor(&mut self) {
+        self.cursor = self.active_value().map_or(0, |v| v.chars().count());
+    }
+
+    pub(crate) fn active_editor(&mut self) -> Option<super::input::TextEditor<'_>> {
+        let cursor = &mut self.cursor;
+        match self.field {
+            DhcpField::PoolStart => {
+                Some(super::input::TextEditor::new(&mut self.pool_start, cursor))
+            }
+            DhcpField::PoolEnd => {
+                Some(super::input::TextEditor::new(&mut self.pool_end, cursor))
+            }
+            DhcpField::Router => {
+                Some(super::input::TextEditor::new(&mut self.router, cursor))
+            }
+            DhcpField::DnsServers => {
+                Some(super::input::TextEditor::new(&mut self.dns_servers, cursor))
+            }
+            DhcpField::LeaseSeconds => {
+                Some(super::input::TextEditor::new(&mut self.lease_seconds, cursor))
+            }
             DhcpField::Save | DhcpField::Leases | DhcpField::Disable => None,
         }
     }
@@ -155,7 +194,14 @@ pub(crate) fn render_dhcp_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
         } else {
             Style::default()
         };
-        Line::styled(format!("{marker} {label}: {value}"), style)
+        let mut spans = vec![Span::styled(format!("{marker} {label}: "), style)];
+        spans.extend(super::input::render_value_with_cursor(
+            value,
+            editor.cursor,
+            active,
+            style,
+        ));
+        Line::from(spans)
     };
     let action = |label: &str, active: bool| {
         let marker = if active { "▶ " } else { "  " };
@@ -295,6 +341,7 @@ pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
             1 => DhcpField::Leases,
             _ => DhcpField::Disable,
         };
+        editor.reset_cursor();
     }
 }
 
@@ -377,10 +424,12 @@ pub(crate) async fn open_dhcp_editor(app: &mut TuiApp, client: &ApiClient) {
         Ok(Response::DhcpConfig {
             spec: Some(spec), ..
         }) => {
+            let pool_start = spec.pool_start.to_string();
+            let cursor = pool_start.chars().count();
             app.dhcp_editor = Some(DhcpEditor {
                 interface,
                 field: DhcpField::PoolStart,
-                pool_start: spec.pool_start.to_string(),
+                pool_start,
                 pool_end: spec.pool_end.to_string(),
                 router: spec.router.to_string(),
                 dns_servers: spec
@@ -390,6 +439,7 @@ pub(crate) async fn open_dhcp_editor(app: &mut TuiApp, client: &ApiClient) {
                     .collect::<Vec<_>>()
                     .join(","),
                 lease_seconds: spec.lease_seconds.to_string(),
+                cursor,
             });
             app.screen = Screen::DhcpEditor;
         }
@@ -431,6 +481,7 @@ pub(crate) async fn open_dhcp_editor(app: &mut TuiApp, client: &ApiClient) {
                 .and_then(|cidr| suggest_pool(cidr.addr(), cidr.prefix_len()))
                 .map(|(start, end)| (start.to_string(), end.to_string()))
                 .unwrap_or_default();
+            let cursor = pool_start.chars().count();
             app.dhcp_editor = Some(DhcpEditor {
                 interface,
                 field: DhcpField::PoolStart,
@@ -439,6 +490,7 @@ pub(crate) async fn open_dhcp_editor(app: &mut TuiApp, client: &ApiClient) {
                 router,
                 dns_servers: "8.8.8.8".to_string(),
                 lease_seconds: "86400".to_string(),
+                cursor,
             });
             app.screen = Screen::DhcpEditor;
         }
@@ -557,14 +609,23 @@ pub(crate) async fn handle_dhcp_editor_key(app: &mut TuiApp, key: KeyCode, clien
 
     match key {
         KeyCode::Esc => app.screen = Screen::DhcpInterfaceList,
-        KeyCode::Up => editor.field = previous_dhcp_field(editor.field),
-        KeyCode::Down => editor.field = next_dhcp_field(editor.field),
+        KeyCode::Up => {
+            editor.field = previous_dhcp_field(editor.field);
+            editor.reset_cursor();
+        }
+        KeyCode::Down => {
+            editor.field = next_dhcp_field(editor.field);
+            editor.reset_cursor();
+        }
         KeyCode::Enter => match editor.field {
             DhcpField::PoolStart
             | DhcpField::PoolEnd
             | DhcpField::Router
             | DhcpField::DnsServers
-            | DhcpField::LeaseSeconds => editor.field = next_dhcp_field(editor.field),
+            | DhcpField::LeaseSeconds => {
+                editor.field = next_dhcp_field(editor.field);
+                editor.reset_cursor();
+            }
             DhcpField::Save => submit_dhcp_config(app, client).await,
             DhcpField::Leases => {
                 let interface = editor.interface.clone();
@@ -572,19 +633,12 @@ pub(crate) async fn handle_dhcp_editor_key(app: &mut TuiApp, key: KeyCode, clien
             }
             DhcpField::Disable => disable_dhcp_for_current_editor(app, client).await,
         },
-        KeyCode::Backspace => {
-            if let Some(value) = editor.active_value_mut() {
-                value.pop();
+        other => {
+            if let Some(mut text_editor) = editor.active_editor() {
+                text_editor
+                    .handle_key_filtered(other, |c| c.is_ascii_digit() || matches!(c, '.' | ','));
             }
         }
-        KeyCode::Char(character)
-            if character.is_ascii_digit() || matches!(character, '.' | ',') =>
-        {
-            if let Some(value) = editor.active_value_mut() {
-                value.push(character);
-            }
-        }
-        _ => {}
     }
 }
 
@@ -930,6 +984,7 @@ mod tests {
             router: String::new(),
             dns_servers: String::new(),
             lease_seconds: String::new(),
+            cursor: 0,
         };
         assert!(editor.active_value_mut().is_none());
         editor.field = DhcpField::Leases;
@@ -938,5 +993,33 @@ mod tests {
         assert!(editor.active_value_mut().is_none());
         editor.field = DhcpField::PoolStart;
         assert!(editor.active_value_mut().is_some());
+    }
+
+    #[tokio::test]
+    async fn dhcp_editor_cursor_navigation_and_editing() {
+        let mut app = TuiApp::default();
+        app.screen = Screen::DhcpEditor;
+        app.dhcp_editor = Some(DhcpEditor {
+            interface: "lan0".to_string(),
+            field: DhcpField::PoolStart,
+            pool_start: "192.168.1.10".to_string(),
+            pool_end: "192.168.1.100".to_string(),
+            router: "192.168.1.1".to_string(),
+            dns_servers: "8.8.8.8".to_string(),
+            lease_seconds: "86400".to_string(),
+            cursor: 12,
+        });
+        let client = ApiClient::new("/socket-that-must-not-be-opened");
+
+        handle_dhcp_editor_key(&mut app, KeyCode::Left, &client).await;
+        assert_eq!(app.dhcp_editor.as_ref().unwrap().cursor, 11);
+
+        handle_dhcp_editor_key(&mut app, KeyCode::Char('5'), &client).await;
+        assert_eq!(app.dhcp_editor.as_ref().unwrap().pool_start, "192.168.1.150");
+        assert_eq!(app.dhcp_editor.as_ref().unwrap().cursor, 12);
+
+        handle_dhcp_editor_key(&mut app, KeyCode::Backspace, &client).await;
+        assert_eq!(app.dhcp_editor.as_ref().unwrap().pool_start, "192.168.1.10");
+        assert_eq!(app.dhcp_editor.as_ref().unwrap().cursor, 11);
     }
 }
