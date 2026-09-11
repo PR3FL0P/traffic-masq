@@ -775,6 +775,15 @@ impl InterfaceConfig {
             bail!("an enabled DHCP client requires a managed input interface");
         }
 
+        if self.ipv4.is_some()
+            && self
+                .dhcp_client
+                .as_ref()
+                .is_some_and(|dhcp_client| dhcp_client.enabled)
+        {
+            bail!("an interface cannot have both a static IPv4 address and an enabled DHCP client");
+        }
+
         if self.wifi.is_some() && self.wifi_client.is_some() {
             bail!("an interface cannot be both a Wi-Fi access point and a Wi-Fi client (non-goal: concurrent AP+STA)");
         }
@@ -801,9 +810,10 @@ impl InterfaceConfig {
                 .dhcp_client
                 .as_ref()
                 .is_some_and(|dhcp_client| dhcp_client.enabled)
+            && self.ipv4.is_none()
         {
             bail!(
-                "a managed Wi-Fi client requires an enabled dhcp_client block; otherwise leave it unmanaged for external L3 ownership"
+                "a managed Wi-Fi client requires an enabled dhcp_client block or a static IPv4 address; otherwise leave it unmanaged for external L3 ownership"
             );
         }
 
@@ -2113,7 +2123,7 @@ mod tests {
         let external_wifi = client_interface(client_association("upstream"));
         external_wifi.validate("wlan0").expect("legacy external L3");
 
-        let mut managed_wifi = external_wifi;
+        let mut managed_wifi = external_wifi.clone();
         managed_wifi.managed = true;
         managed_wifi.dhcp_client = Some(dhcp_client());
         managed_wifi
@@ -2133,6 +2143,22 @@ mod tests {
         existing_static_owner
             .validate("wan0")
             .expect("existing managed static input semantics remain valid");
+
+        let mut managed_wifi_static = external_wifi;
+        managed_wifi_static.managed = true;
+        managed_wifi_static.ipv4 = Some("192.0.2.50/24".parse().unwrap());
+        managed_wifi_static
+            .validate("wlan0")
+            .expect("managed Wi-Fi static input");
+
+        let mut conflict = managed_wifi_static;
+        conflict.dhcp_client = Some(dhcp_client());
+        let err = conflict
+            .validate("wlan0")
+            .expect_err("static IP and DHCP client are mutually exclusive");
+        assert!(err
+            .to_string()
+            .contains("both a static IPv4 address and an enabled DHCP client"));
     }
 
     #[test]

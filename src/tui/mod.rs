@@ -95,6 +95,7 @@ enum Screen {
     WifiScan,
     WifiProfiles,
     WifiProfileEditor,
+    WifiConnectPrompt,
     Settings,
     SettingsPassword,
     Log,
@@ -159,7 +160,8 @@ fn section_of(screen: Screen) -> Section {
         | Screen::WifiEditor
         | Screen::WifiScan
         | Screen::WifiProfiles
-        | Screen::WifiProfileEditor => Section::Wifi,
+        | Screen::WifiProfileEditor
+        | Screen::WifiConnectPrompt => Section::Wifi,
         Screen::Settings | Screen::SettingsPassword | Screen::Access => Section::Settings,
         Screen::Log => Section::Log,
     }
@@ -206,6 +208,7 @@ struct TuiApp {
     wifi_scan: Option<wifi::WifiScanPicker>,
     wifi_profiles: Option<wifi::WifiProfilesView>,
     wifi_profile_editor: Option<wifi::WifiProfileEditor>,
+    wifi_connect: Option<wifi::WifiConnectPrompt>,
     settings: Option<SecurityEditor>,
     settings_password: Option<PasswordChangeEditor>,
     traffic: HashMap<u32, dashboard::TrafficHistory>,
@@ -247,6 +250,7 @@ impl Default for TuiApp {
             wifi_scan: None,
             wifi_profiles: None,
             wifi_profile_editor: None,
+            wifi_connect: None,
             settings: None,
             settings_password: None,
             traffic: HashMap::new(),
@@ -976,6 +980,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp, direct: bool) {
         Screen::WifiScan => wifi::render_wifi_scan(frame, chunks[1], app),
         Screen::WifiProfiles => wifi::render_wifi_profiles(frame, chunks[1], app),
         Screen::WifiProfileEditor => wifi::render_wifi_profile_editor(frame, chunks[1], app),
+        Screen::WifiConnectPrompt => wifi::render_wifi_connect_prompt(frame, chunks[1], app),
         Screen::Settings => settings::render_settings(frame, chunks[1], app),
         Screen::SettingsPassword => settings::render_settings_password(frame, chunks[1], app),
         Screen::Log => logs::render_log(frame, chunks[1], app),
@@ -1102,6 +1107,7 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
         Screen::WifiScan => wifi::handle_wifi_scan_key(app, key),
         Screen::WifiProfiles => wifi::handle_wifi_profiles_key(app, key, client).await,
         Screen::WifiProfileEditor => wifi::handle_wifi_profile_editor_key(app, key, client).await,
+        Screen::WifiConnectPrompt => wifi::handle_wifi_connect_prompt_key(app, key, client).await,
         Screen::Settings => settings::handle_settings_key(app, key, client).await,
         Screen::SettingsPassword => settings::handle_settings_password_key(app, key, client).await,
         Screen::Log => logs::handle_log_key(app, key),

@@ -570,7 +570,14 @@ impl ControlService {
                     )
                     .await
                 {
-                    Ok(change) => Response::NetworkChangePending { change },
+                    Ok(change) => {
+                        if config.role != InterfaceRole::Output || config.wifi.is_none() {
+                            if let Some(wifi) = &self.wifi {
+                                let _ = wifi.disable(&interface).await;
+                            }
+                        }
+                        Response::NetworkChangePending { change }
+                    }
                     Err(error) => Response::Error {
                         message: error.to_string(),
                     },
@@ -621,7 +628,14 @@ impl ControlService {
                             )
                             .await
                         {
-                            Ok(change) => Response::NetworkChangePending { change },
+                            Ok(change) => {
+                                if config.role != InterfaceRole::Output || config.wifi.is_none() {
+                                    if let Some(wifi) = &self.wifi {
+                                        let _ = wifi.disable(&interface).await;
+                                    }
+                                }
+                                Response::NetworkChangePending { change }
+                            }
                             Err(error) => Response::Error {
                                 message: error.to_string(),
                             },
@@ -640,7 +654,22 @@ impl ControlService {
                 })
                 .await
             {
-                Ok(change) => Response::NetworkChangeCommitted { change },
+                Ok(change) => {
+                    let committed = self
+                        .overrides
+                        .effective_interface(&change.interface)
+                        .await
+                        .ok()
+                        .flatten();
+                    if let Some(config) = committed {
+                        if config.role != InterfaceRole::Output || config.wifi.is_none() {
+                            if let Some(wifi) = &self.wifi {
+                                let _ = wifi.disable(&change.interface).await;
+                            }
+                        }
+                    }
+                    Response::NetworkChangeCommitted { change }
+                }
                 Err(error) => Response::Error {
                     message: error.to_string(),
                 },
@@ -1488,6 +1517,10 @@ impl ControlService {
         interface_config.managed = true;
         interface_config.ipv4 = None;
         interface_config.dhcp = None;
+        interface_config.wifi = None;
+        if let Some(wifi) = &self.wifi {
+            let _ = wifi.disable(&interface).await;
+        }
         interface_config.dhcp_client = Some(dhcp_client_request_to_config(&request, true));
         let spec = match DhcpClientSpec::from_interface_config(&interface, &interface_config) {
             Ok(Some(spec)) => spec,
@@ -3162,26 +3195,41 @@ fn interface_edit_request_to_config(
     } else {
         Some(edit.cidr.trim().parse()?)
     };
+    let is_output = edit.role == InterfaceRole::Output;
+    let is_input = edit.role == InterfaceRole::Input;
+
+    let dhcp = if is_output && edit.managed {
+        existing.and_then(|config| config.dhcp.clone())
+    } else {
+        None
+    };
+    let wifi = if is_output && edit.managed {
+        existing.and_then(|config| config.wifi.clone())
+    } else {
+        None
+    };
+    let dhcp_client = if is_input && edit.managed && ipv4.is_none() {
+        existing.and_then(|config| config.dhcp_client.clone())
+    } else {
+        None
+    };
+    let wifi_client = if is_input {
+        existing
+            .filter(|config| edit.managed || !config.managed)
+            .and_then(|config| config.wifi_client.clone())
+    } else {
+        None
+    };
+
     Ok((
         InterfaceConfig {
             role: edit.role,
             managed: edit.managed,
             ipv4,
-            dhcp: edit
-                .managed
-                .then(|| existing.and_then(|config| config.dhcp.clone()))
-                .flatten(),
-            dhcp_client: edit
-                .managed
-                .then(|| existing.and_then(|config| config.dhcp_client.clone()))
-                .flatten(),
-            wifi: edit
-                .managed
-                .then(|| existing.and_then(|config| config.wifi.clone()))
-                .flatten(),
-            wifi_client: existing
-                .filter(|config| edit.managed || !config.managed)
-                .and_then(|config| config.wifi_client.clone()),
+            dhcp,
+            dhcp_client,
+            wifi,
+            wifi_client,
             nat: existing.is_none_or(|config| config.nat),
         },
         edit.allow_management_change,

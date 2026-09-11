@@ -169,7 +169,7 @@ fn screen_help_pairs(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("Enter", "activate"),
             ("Esc", "back"),
         ],
-        Screen::WifiEditor | Screen::WifiProfileEditor => vec![
+        Screen::WifiEditor | Screen::WifiProfileEditor | Screen::WifiConnectPrompt => vec![
             ("↑/↓", "move"),
             ("Enter", "activate"),
             ("type", "edit value"),
