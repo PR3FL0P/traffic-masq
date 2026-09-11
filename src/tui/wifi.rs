@@ -206,9 +206,10 @@ impl WifiEditor {
             WifiField::Passphrase => {
                 Some(super::input::TextEditor::new(&mut self.passphrase, cursor))
             }
-            WifiField::CountryCode => {
-                Some(super::input::TextEditor::new(&mut self.country_code, cursor))
-            }
+            WifiField::CountryCode => Some(super::input::TextEditor::new(
+                &mut self.country_code,
+                cursor,
+            )),
             _ => None,
         }
     }
@@ -357,9 +358,7 @@ impl WifiProfileEditor {
         match self.field {
             ProfileField::Id => Some(super::input::TextEditor::new(&mut self.id, cursor)),
             ProfileField::Ssid => Some(super::input::TextEditor::new(&mut self.ssid, cursor)),
-            ProfileField::Country => {
-                Some(super::input::TextEditor::new(&mut self.country, cursor))
-            }
+            ProfileField::Country => Some(super::input::TextEditor::new(&mut self.country, cursor)),
             ProfileField::Priority => {
                 Some(super::input::TextEditor::new(&mut self.priority, cursor))
             }
@@ -408,8 +407,6 @@ pub(crate) enum WifiIpChoice {
 pub(crate) enum WifiConnectField {
     Choice(WifiIpChoice),
     StaticCidr,
-    StaticGateway,
-    StaticDns,
     Submit,
     Cancel,
 }
@@ -423,8 +420,6 @@ pub(crate) struct WifiConnectPrompt {
     pub(crate) choice: WifiIpChoice,
     pub(crate) field: WifiConnectField,
     pub(crate) static_cidr: String,
-    pub(crate) static_gateway: String,
-    pub(crate) static_dns: String,
     pub(crate) cursor: usize,
 }
 
@@ -445,8 +440,6 @@ impl WifiConnectPrompt {
             choice: WifiIpChoice::Dhcp,
             field: WifiConnectField::Choice(WifiIpChoice::Dhcp),
             static_cidr: initial_cidr,
-            static_gateway: String::new(),
-            static_dns: String::new(),
             cursor,
         }
     }
@@ -470,8 +463,6 @@ impl WifiConnectPrompt {
         }
         if self.choice == WifiIpChoice::NewStatic {
             fields.push(WifiConnectField::StaticCidr);
-            fields.push(WifiConnectField::StaticGateway);
-            fields.push(WifiConnectField::StaticDns);
         }
         fields.push(WifiConnectField::Submit);
         fields.push(WifiConnectField::Cancel);
@@ -1558,7 +1549,10 @@ async fn save_profile(app: &mut TuiApp, client: &ApiClient) {
         Request::CreateWifiClientProfile { profile }
     };
     match client.request(&request).await {
-        Ok(Response::WifiClientProfile { profile: saved_profile, .. }) => {
+        Ok(Response::WifiClientProfile {
+            profile: saved_profile,
+            ..
+        }) => {
             app.push_message(LogLevel::Info, "Wi-Fi profile saved");
             let interface = editor.interface.clone();
             let is_new = editor.original_id.is_none();
@@ -1658,12 +1652,6 @@ pub(crate) async fn handle_wifi_connect_prompt_key(
                         WifiConnectField::StaticCidr => {
                             prompt.cursor = prompt.static_cidr.len();
                         }
-                        WifiConnectField::StaticGateway => {
-                            prompt.cursor = prompt.static_gateway.len();
-                        }
-                        WifiConnectField::StaticDns => {
-                            prompt.cursor = prompt.static_dns.len();
-                        }
                         _ => {}
                     }
                 }
@@ -1681,94 +1669,22 @@ pub(crate) async fn handle_wifi_connect_prompt_key(
                         WifiConnectField::StaticCidr => {
                             prompt.cursor = prompt.static_cidr.len();
                         }
-                        WifiConnectField::StaticGateway => {
-                            prompt.cursor = prompt.static_gateway.len();
-                        }
-                        WifiConnectField::StaticDns => {
-                            prompt.cursor = prompt.static_dns.len();
-                        }
                         _ => {}
                     }
                 }
             }
         }
-        KeyCode::Left => match prompt.field {
-            WifiConnectField::StaticCidr => {
-                prompt.cursor = prompt.cursor.saturating_sub(1);
+        KeyCode::Left if prompt.field == WifiConnectField::Cancel => {
+            prompt.field = WifiConnectField::Submit;
+        }
+        KeyCode::Right if prompt.field == WifiConnectField::Submit => {
+            prompt.field = WifiConnectField::Cancel;
+        }
+        KeyCode::Char(' ') if matches!(prompt.field, WifiConnectField::Choice(_)) => {
+            if let WifiConnectField::Choice(choice) = prompt.field {
+                prompt.choice = choice;
             }
-            WifiConnectField::StaticGateway => {
-                prompt.cursor = prompt.cursor.saturating_sub(1);
-            }
-            WifiConnectField::StaticDns => {
-                prompt.cursor = prompt.cursor.saturating_sub(1);
-            }
-            WifiConnectField::Cancel => {
-                prompt.field = WifiConnectField::Submit;
-            }
-            _ => {}
-        },
-        KeyCode::Right => match prompt.field {
-            WifiConnectField::StaticCidr => {
-                prompt.cursor = (prompt.cursor + 1).min(prompt.static_cidr.len());
-            }
-            WifiConnectField::StaticGateway => {
-                prompt.cursor = (prompt.cursor + 1).min(prompt.static_gateway.len());
-            }
-            WifiConnectField::StaticDns => {
-                prompt.cursor = (prompt.cursor + 1).min(prompt.static_dns.len());
-            }
-            WifiConnectField::Submit => {
-                prompt.field = WifiConnectField::Cancel;
-            }
-            _ => {}
-        },
-        KeyCode::Char(c) => match prompt.field {
-            WifiConnectField::Choice(choice) => {
-                if c == ' ' {
-                    prompt.choice = choice;
-                }
-            }
-            WifiConnectField::StaticCidr => {
-                if c.is_ascii_digit() || c == '.' || c == '/' {
-                    prompt.static_cidr.insert(prompt.cursor, c);
-                    prompt.cursor += 1;
-                }
-            }
-            WifiConnectField::StaticGateway => {
-                if c.is_ascii_digit() || c == '.' {
-                    prompt.static_gateway.insert(prompt.cursor, c);
-                    prompt.cursor += 1;
-                }
-            }
-            WifiConnectField::StaticDns => {
-                if c.is_ascii_digit() || c == '.' {
-                    prompt.static_dns.insert(prompt.cursor, c);
-                    prompt.cursor += 1;
-                }
-            }
-            _ => {}
-        },
-        KeyCode::Backspace => match prompt.field {
-            WifiConnectField::StaticCidr => {
-                if prompt.cursor > 0 && prompt.cursor <= prompt.static_cidr.len() {
-                    prompt.static_cidr.remove(prompt.cursor - 1);
-                    prompt.cursor -= 1;
-                }
-            }
-            WifiConnectField::StaticGateway => {
-                if prompt.cursor > 0 && prompt.cursor <= prompt.static_gateway.len() {
-                    prompt.static_gateway.remove(prompt.cursor - 1);
-                    prompt.cursor -= 1;
-                }
-            }
-            WifiConnectField::StaticDns => {
-                if prompt.cursor > 0 && prompt.cursor <= prompt.static_dns.len() {
-                    prompt.static_dns.remove(prompt.cursor - 1);
-                    prompt.cursor -= 1;
-                }
-            }
-            _ => {}
-        },
+        }
         KeyCode::Enter => match prompt.field {
             WifiConnectField::Choice(c) => {
                 prompt.choice = c;
@@ -1780,14 +1696,6 @@ pub(crate) async fn handle_wifi_connect_prompt_key(
                 }
             }
             WifiConnectField::StaticCidr => {
-                prompt.field = WifiConnectField::StaticGateway;
-                prompt.cursor = prompt.static_gateway.len();
-            }
-            WifiConnectField::StaticGateway => {
-                prompt.field = WifiConnectField::StaticDns;
-                prompt.cursor = prompt.static_dns.len();
-            }
-            WifiConnectField::StaticDns => {
                 prompt.field = WifiConnectField::Submit;
             }
             WifiConnectField::Submit => {
@@ -1802,7 +1710,82 @@ pub(crate) async fn handle_wifi_connect_prompt_key(
                 };
             }
         },
+        other if prompt.field == WifiConnectField::StaticCidr => {
+            let cursor = &mut prompt.cursor;
+            super::input::TextEditor::new(&mut prompt.static_cidr, cursor)
+                .handle_key_filtered(other, |c| c.is_ascii_digit() || c == '.' || c == '/');
+        }
         _ => {}
+    }
+}
+
+async fn apply_wifi_static_ip(
+    app: &mut TuiApp,
+    client: &ApiClient,
+    interface: &str,
+    cidr: &str,
+    ssid: &str,
+) {
+    let apply_res = client
+        .request(&Request::ApplyInterfaceEdit {
+            interface: interface.to_string(),
+            edit: InterfaceEditRequest {
+                cidr: cidr.to_string(),
+                role: InterfaceRole::Input,
+                managed: true,
+                allow_management_change: true,
+            },
+        })
+        .await;
+
+    match apply_res {
+        Ok(Response::NetworkChangePending { change }) => {
+            let commit_res = client
+                .request(&Request::CommitNetworkChange {
+                    token: change.token,
+                })
+                .await;
+            match commit_res {
+                Ok(Response::NetworkChangeCommitted { .. }) => {
+                    app.push_message(
+                        LogLevel::Info,
+                        format!("Connected to '{ssid}' with static IP {cidr}"),
+                    );
+                }
+                Ok(Response::Error { message }) => {
+                    app.push_message(
+                        LogLevel::Warn,
+                        format!("Profile activated, but commit failed: {message}"),
+                    );
+                }
+                Ok(r) => report_unexpected(app, r),
+                Err(e) => {
+                    app.push_message(
+                        LogLevel::Warn,
+                        format!("Profile activated, but commit failed: {e}"),
+                    );
+                }
+            }
+        }
+        Ok(Response::NetworkChangeCommitted { .. }) => {
+            app.push_message(
+                LogLevel::Info,
+                format!("Connected to '{ssid}' with static IP {cidr}"),
+            );
+        }
+        Ok(Response::Error { message }) => {
+            app.push_message(
+                LogLevel::Warn,
+                format!("Profile activated, but static IP failed: {message}"),
+            );
+        }
+        Ok(r) => report_unexpected(app, r),
+        Err(e) => {
+            app.push_message(
+                LogLevel::Warn,
+                format!("Profile activated, but static IP failed: {e}"),
+            );
+        }
     }
 }
 
@@ -1810,38 +1793,54 @@ async fn submit_wifi_connect(app: &mut TuiApp, client: &ApiClient) {
     let Some(prompt) = app.wifi_connect.clone() else {
         return;
     };
+
+    if prompt.choice == WifiIpChoice::NewStatic {
+        let cidr_str = prompt.static_cidr.trim();
+        if cidr_str.is_empty() {
+            app.push_message(LogLevel::Warn, "Static IP / CIDR is required");
+            return;
+        }
+        if let Err(e) = cidr_str.parse::<ipnet::Ipv4Net>() {
+            app.push_message(
+                LogLevel::Warn,
+                format!("Invalid CIDR format (e.g. 192.168.1.100/24): {e}"),
+            );
+            return;
+        }
+    }
+
+    let res = client
+        .request(&Request::ActivateWifiClientProfile {
+            interface: prompt.interface.clone(),
+            profile_id: prompt.profile_id.clone(),
+        })
+        .await;
+    match res {
+        Ok(Response::WifiClientProfileActivated { .. }) => {}
+        Ok(Response::WifiClientProfileError { detail }) => {
+            app.push_message(LogLevel::Error, format!("{detail:?}"));
+            return;
+        }
+        Ok(Response::WifiClientError { detail }) => {
+            app.push_message(LogLevel::Error, format!("{detail:?}"));
+            return;
+        }
+        Ok(Response::Error { message }) => {
+            app.push_message(LogLevel::Error, message);
+            return;
+        }
+        Ok(r) => {
+            report_unexpected(app, r);
+            return;
+        }
+        Err(e) => {
+            app.push_message(LogLevel::Error, e.to_string());
+            return;
+        }
+    }
+
     match prompt.choice {
         WifiIpChoice::Dhcp => {
-            let res = client
-                .request(&Request::ActivateWifiClientProfile {
-                    interface: prompt.interface.clone(),
-                    profile_id: prompt.profile_id.clone(),
-                })
-                .await;
-            match res {
-                Ok(Response::WifiClientProfileActivated { .. }) => {}
-                Ok(Response::WifiClientProfileError { detail }) => {
-                    app.push_message(LogLevel::Error, format!("{detail:?}"));
-                    return;
-                }
-                Ok(Response::WifiClientError { detail }) => {
-                    app.push_message(LogLevel::Error, format!("{detail:?}"));
-                    return;
-                }
-                Ok(Response::Error { message }) => {
-                    app.push_message(LogLevel::Error, message);
-                    return;
-                }
-                Ok(r) => {
-                    report_unexpected(app, r);
-                    return;
-                }
-                Err(e) => {
-                    app.push_message(LogLevel::Error, e.to_string());
-                    return;
-                }
-            }
-
             let dhcp_res = client
                 .request(&Request::ConfigureDhcpClient {
                     interface: prompt.interface.clone(),
@@ -1858,7 +1857,9 @@ async fn submit_wifi_connect(app: &mut TuiApp, client: &ApiClient) {
                 Ok(Response::DhcpClientError { detail }) => {
                     app.push_message(
                         LogLevel::Warn,
-                        format!("Profile activated, but DHCP client configuration failed: {detail:?}"),
+                        format!(
+                            "Profile activated, but DHCP client configuration failed: {detail:?}"
+                        ),
                     );
                 }
                 Ok(r) => report_unexpected(app, r),
@@ -1867,193 +1868,41 @@ async fn submit_wifi_connect(app: &mut TuiApp, client: &ApiClient) {
                     format!("Profile activated, but DHCP client configuration failed: {e}"),
                 ),
             }
-            app.wifi_connect = None;
-            app.screen = Screen::Wifi;
-            load_wifi_data(app, client).await;
         }
         WifiIpChoice::KeepStatic => {
-            let res = client
-                .request(&Request::ActivateWifiClientProfile {
-                    interface: prompt.interface.clone(),
-                    profile_id: prompt.profile_id.clone(),
-                })
-                .await;
-            match res {
-                Ok(Response::WifiClientProfileActivated { .. }) => {}
-                Ok(Response::WifiClientProfileError { detail }) => {
-                    app.push_message(LogLevel::Error, format!("{detail:?}"));
-                    return;
-                }
-                Ok(Response::WifiClientError { detail }) => {
-                    app.push_message(LogLevel::Error, format!("{detail:?}"));
-                    return;
-                }
-                Ok(Response::Error { message }) => {
-                    app.push_message(LogLevel::Error, message);
-                    return;
-                }
-                Ok(r) => {
-                    report_unexpected(app, r);
-                    return;
-                }
-                Err(e) => {
-                    app.push_message(LogLevel::Error, e.to_string());
-                    return;
-                }
-            }
-
             let _ = client
                 .request(&Request::DisableDhcpClient {
                     interface: prompt.interface.clone(),
                 })
                 .await;
 
-            let ip_str = prompt
-                .current_static_ip
-                .as_deref()
-                .unwrap_or("assigned static IP");
-            app.push_message(
-                LogLevel::Info,
-                format!("Connected to '{}' keeping {ip_str}", prompt.ssid),
-            );
-            app.wifi_connect = None;
-            app.screen = Screen::Wifi;
-            load_wifi_data(app, client).await;
+            if let Some(static_ip) = &prompt.current_static_ip {
+                apply_wifi_static_ip(app, client, &prompt.interface, static_ip, &prompt.ssid).await;
+            } else {
+                app.push_message(LogLevel::Info, format!("Connected to '{}'", prompt.ssid));
+            }
         }
         WifiIpChoice::NewStatic => {
-            let cidr_str = prompt.static_cidr.trim();
-            if cidr_str.is_empty() {
-                app.push_message(LogLevel::Warn, "Static IP / CIDR is required");
-                return;
-            }
-            if let Err(e) = cidr_str.parse::<ipnet::Ipv4Net>() {
-                app.push_message(
-                    LogLevel::Warn,
-                    format!("Invalid CIDR format (e.g. 192.168.1.100/24): {e}"),
-                );
-                return;
-            }
-            if !prompt.static_gateway.trim().is_empty() {
-                if let Err(e) = prompt.static_gateway.trim().parse::<std::net::Ipv4Addr>() {
-                    app.push_message(
-                        LogLevel::Warn,
-                        format!("Invalid Gateway format (e.g. 192.168.1.1): {e}"),
-                    );
-                    return;
-                }
-            }
-            if !prompt.static_dns.trim().is_empty() {
-                if let Err(e) = prompt.static_dns.trim().parse::<std::net::Ipv4Addr>() {
-                    app.push_message(
-                        LogLevel::Warn,
-                        format!("Invalid DNS format (e.g. 1.1.1.1): {e}"),
-                    );
-                    return;
-                }
-            }
-
-            let res = client
-                .request(&Request::ActivateWifiClientProfile {
-                    interface: prompt.interface.clone(),
-                    profile_id: prompt.profile_id.clone(),
-                })
-                .await;
-            match res {
-                Ok(Response::WifiClientProfileActivated { .. }) => {}
-                Ok(Response::WifiClientProfileError { detail }) => {
-                    app.push_message(LogLevel::Error, format!("{detail:?}"));
-                    return;
-                }
-                Ok(Response::WifiClientError { detail }) => {
-                    app.push_message(LogLevel::Error, format!("{detail:?}"));
-                    return;
-                }
-                Ok(Response::Error { message }) => {
-                    app.push_message(LogLevel::Error, message);
-                    return;
-                }
-                Ok(r) => {
-                    report_unexpected(app, r);
-                    return;
-                }
-                Err(e) => {
-                    app.push_message(LogLevel::Error, e.to_string());
-                    return;
-                }
-            }
-
             let _ = client
                 .request(&Request::DisableDhcpClient {
                     interface: prompt.interface.clone(),
                 })
                 .await;
 
-            let apply_res = client
-                .request(&Request::ApplyInterfaceEdit {
-                    interface: prompt.interface.clone(),
-                    edit: InterfaceEditRequest {
-                        cidr: cidr_str.to_string(),
-                        role: InterfaceRole::Input,
-                        managed: true,
-                        allow_management_change: true,
-                    },
-                })
-                .await;
-
-            match apply_res {
-                Ok(Response::NetworkChangePending { change }) => {
-                    let commit_res = client
-                        .request(&Request::CommitNetworkChange {
-                            token: change.token,
-                        })
-                        .await;
-                    match commit_res {
-                        Ok(Response::NetworkChangeCommitted { .. }) => {
-                            app.push_message(
-                                LogLevel::Info,
-                                format!("Connected to '{}' with static IP {cidr_str}", prompt.ssid),
-                            );
-                        }
-                        Ok(Response::Error { message }) => {
-                            app.push_message(
-                                LogLevel::Warn,
-                                format!("Profile activated, but commit failed: {message}"),
-                            );
-                        }
-                        Ok(r) => report_unexpected(app, r),
-                        Err(e) => {
-                            app.push_message(
-                                LogLevel::Warn,
-                                format!("Profile activated, but commit failed: {e}"),
-                            );
-                        }
-                    }
-                }
-                Ok(Response::NetworkChangeCommitted { .. }) => {
-                    app.push_message(
-                        LogLevel::Info,
-                        format!("Connected to '{}' with static IP {cidr_str}", prompt.ssid),
-                    );
-                }
-                Ok(Response::Error { message }) => {
-                    app.push_message(
-                        LogLevel::Warn,
-                        format!("Profile activated, but static IP failed: {message}"),
-                    );
-                }
-                Ok(r) => report_unexpected(app, r),
-                Err(e) => {
-                    app.push_message(
-                        LogLevel::Warn,
-                        format!("Profile activated, but static IP failed: {e}"),
-                    );
-                }
-            }
-            app.wifi_connect = None;
-            app.screen = Screen::Wifi;
-            load_wifi_data(app, client).await;
+            apply_wifi_static_ip(
+                app,
+                client,
+                &prompt.interface,
+                prompt.static_cidr.trim(),
+                &prompt.ssid,
+            )
+            .await;
         }
     }
+
+    app.wifi_connect = None;
+    app.screen = Screen::Wifi;
+    load_wifi_data(app, client).await;
 }
 
 pub(crate) fn render_wifi_connect_prompt(
@@ -2141,70 +1990,6 @@ pub(crate) fn render_wifi_connect_prompt(
             ));
         }
         lines.push(Line::from(cidr_spans));
-
-        // Gateway
-        let gw_active = prompt.field == WifiConnectField::StaticGateway;
-        let gw_style = selected_style(gw_active);
-        let gw_prefix = format!(
-            "{}{:<24}",
-            if gw_active { "▶ " } else { "  " },
-            "Default Gateway:"
-        );
-        let mut gw_spans = vec![Span::styled(gw_prefix, gw_style)];
-        if gw_active {
-            gw_spans.extend(super::input::render_value_with_cursor(
-                &prompt.static_gateway,
-                prompt.cursor,
-                true,
-                gw_style,
-            ));
-        } else {
-            gw_spans.push(Span::styled(
-                if prompt.static_gateway.is_empty() {
-                    "optional, e.g. 192.168.1.1".to_string()
-                } else {
-                    prompt.static_gateway.clone()
-                },
-                if prompt.static_gateway.is_empty() {
-                    Style::default().fg(theme::MUTED)
-                } else {
-                    gw_style
-                },
-            ));
-        }
-        lines.push(Line::from(gw_spans));
-
-        // DNS
-        let dns_active = prompt.field == WifiConnectField::StaticDns;
-        let dns_style = selected_style(dns_active);
-        let dns_prefix = format!(
-            "{}{:<24}",
-            if dns_active { "▶ " } else { "  " },
-            "DNS Server:"
-        );
-        let mut dns_spans = vec![Span::styled(dns_prefix, dns_style)];
-        if dns_active {
-            dns_spans.extend(super::input::render_value_with_cursor(
-                &prompt.static_dns,
-                prompt.cursor,
-                true,
-                dns_style,
-            ));
-        } else {
-            dns_spans.push(Span::styled(
-                if prompt.static_dns.is_empty() {
-                    "optional, e.g. 1.1.1.1".to_string()
-                } else {
-                    prompt.static_dns.clone()
-                },
-                if prompt.static_dns.is_empty() {
-                    Style::default().fg(theme::MUTED)
-                } else {
-                    dns_style
-                },
-            ));
-        }
-        lines.push(Line::from(dns_spans));
     }
 
     lines.push(Line::from(""));
@@ -2234,7 +2019,7 @@ pub(crate) fn render_wifi_connect_prompt(
 
     lines.push(Line::from(""));
     lines.push(Line::styled(
-        "↑/↓: navigate • Space: select • Enter/F10: connect • Esc: cancel",
+        "↑/↓: navigate • Enter/F10: connect • Esc: cancel",
         Style::default().fg(theme::MUTED),
     ));
 
@@ -2960,12 +2745,8 @@ mod tests {
 
     #[test]
     fn wifi_connect_prompt_choices_omits_keep_static_when_no_static_ip() {
-        let prompt_no_static = WifiConnectPrompt::new(
-            "wlan0".into(),
-            "prof1".into(),
-            "HomeNet".into(),
-            None,
-        );
+        let prompt_no_static =
+            WifiConnectPrompt::new("wlan0".into(), "prof1".into(), "HomeNet".into(), None);
         assert_eq!(
             prompt_no_static.available_choices(),
             vec![WifiIpChoice::Dhcp, WifiIpChoice::NewStatic]
@@ -3010,15 +2791,17 @@ mod tests {
 
     #[tokio::test]
     async fn wifi_connect_prompt_key_handling() {
-        let mut app = TuiApp::default();
         let prompt = WifiConnectPrompt::new(
             "wlan0".into(),
             "prof1".into(),
             "HomeNet".into(),
             Some("192.168.1.50/24".into()),
         );
-        app.wifi_connect = Some(prompt);
-        app.screen = Screen::WifiConnectPrompt;
+        let mut app = TuiApp {
+            screen: Screen::WifiConnectPrompt,
+            wifi_connect: Some(prompt),
+            ..Default::default()
+        };
         let client = ApiClient::new("/nonexistent.sock");
 
         // Move down to KeepStatic
@@ -3047,6 +2830,38 @@ mod tests {
         handle_wifi_connect_prompt_key(&mut app, KeyCode::Char('5'), &client).await;
         let p = app.wifi_connect.as_ref().unwrap();
         assert_eq!(p.static_cidr, "192.168.1.50/25");
+
+        // Home key moves cursor to 0
+        handle_wifi_connect_prompt_key(&mut app, KeyCode::Home, &client).await;
+        let p = app.wifi_connect.as_ref().unwrap();
+        assert_eq!(p.cursor, 0);
+
+        // Delete removes first character
+        handle_wifi_connect_prompt_key(&mut app, KeyCode::Delete, &client).await;
+        let p = app.wifi_connect.as_ref().unwrap();
+        assert_eq!(p.static_cidr, "92.168.1.50/25");
+        assert_eq!(p.cursor, 0);
+
+        // Insert character at start
+        handle_wifi_connect_prompt_key(&mut app, KeyCode::Char('1'), &client).await;
+        let p = app.wifi_connect.as_ref().unwrap();
+        assert_eq!(p.static_cidr, "192.168.1.50/25");
+        assert_eq!(p.cursor, 1);
+
+        // End key moves cursor to end
+        handle_wifi_connect_prompt_key(&mut app, KeyCode::End, &client).await;
+        let p = app.wifi_connect.as_ref().unwrap();
+        assert_eq!(p.cursor, p.static_cidr.len());
+
+        // Left key moves cursor left
+        handle_wifi_connect_prompt_key(&mut app, KeyCode::Left, &client).await;
+        let p = app.wifi_connect.as_ref().unwrap();
+        assert_eq!(p.cursor, p.static_cidr.len() - 1);
+
+        // Right key moves cursor right
+        handle_wifi_connect_prompt_key(&mut app, KeyCode::Right, &client).await;
+        let p = app.wifi_connect.as_ref().unwrap();
+        assert_eq!(p.cursor, p.static_cidr.len());
 
         // Esc closes prompt
         handle_wifi_connect_prompt_key(&mut app, KeyCode::Esc, &client).await;

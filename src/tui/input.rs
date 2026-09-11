@@ -124,7 +124,7 @@ pub(crate) fn is_cursor_blink_visible() -> bool {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    (millis / 500) % 2 == 0
+    (millis / 500).is_multiple_of(2)
 }
 
 /// Formats text into Spans, rendering the cursor on the currently selected character.
@@ -218,7 +218,9 @@ pub(crate) fn render_masked_with_cursor(
         spans.push(Span::styled(mask_char.to_string(), style));
         if clamped_cursor + 1 < char_count {
             spans.push(Span::styled(
-                mask_char.to_string().repeat(char_count - clamped_cursor - 1),
+                mask_char
+                    .to_string()
+                    .repeat(char_count - clamped_cursor - 1),
                 base_style,
             ));
         }

@@ -49,9 +49,30 @@ pub(crate) struct SecurityEditor {
     pub(crate) remember_minutes_input: String,
     pub(crate) confirmation: Option<SettingsField>,
     pub(crate) cursor: usize,
+    pub(crate) editing: bool,
 }
 
 impl SecurityEditor {
+    pub(crate) fn is_editing(&self) -> bool {
+        self.editing
+            && matches!(
+                self.field,
+                SettingsField::RollbackTimeout | SettingsField::RememberMinutes
+            )
+    }
+
+    pub(crate) fn active_text_input(&mut self) -> Option<(&mut String, &mut usize)> {
+        match self.field {
+            SettingsField::RollbackTimeout => {
+                Some((&mut self.rollback_timeout_input, &mut self.cursor))
+            }
+            SettingsField::RememberMinutes => {
+                Some((&mut self.remember_minutes_input, &mut self.cursor))
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn reset_cursor(&mut self) {
         self.cursor = match self.field {
             SettingsField::RollbackTimeout => self.rollback_timeout_input.chars().count(),
@@ -89,6 +110,7 @@ pub(crate) fn render_settings(frame: &mut ratatui::Frame<'_>, area: Rect, app: &
 
     let text_row = |label: &str, value: &str, field: SettingsField, base: Style| -> Line<'static> {
         let active = editor.field == field;
+        let is_editing = active && editor.is_editing();
         let marker = if active { "▶ " } else { "  " };
         let label_style = if active {
             base.add_modifier(Modifier::BOLD)
@@ -99,7 +121,7 @@ pub(crate) fn render_settings(frame: &mut ratatui::Frame<'_>, area: Rect, app: &
         spans.extend(super::input::render_value_with_cursor(
             value,
             editor.cursor,
-            active,
+            is_editing,
             label_style,
         ));
         Line::from(spans)
@@ -133,7 +155,11 @@ pub(crate) fn render_settings(frame: &mut ratatui::Frame<'_>, area: Rect, app: &
             Style::default().fg(theme::WARN),
         ),
         note(
-            "Arrows move/edit · Enter activates · type digits to edit durations",
+            if editor.is_editing() {
+                "←/→ move cursor · 0-9 edit · Enter/Esc finish editing"
+            } else {
+                "Arrows move · Enter edits duration · type digits to edit"
+            },
             Style::default().fg(theme::MUTED),
         ),
         Line::from(""),
@@ -261,6 +287,7 @@ pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
             7 => SettingsField::Access,
             _ => SettingsField::Reload,
         };
+        editor.editing = false;
         editor.reset_cursor();
     }
 }
@@ -272,15 +299,20 @@ pub(crate) async fn handle_settings_key(app: &mut TuiApp, key: KeyCode, client: 
     };
 
     match key {
+        KeyCode::Esc if editor.is_editing() => {
+            editor.editing = false;
+        }
         KeyCode::Esc if editor.confirmation.is_some() => editor.confirmation = None,
         KeyCode::Esc => app.screen = Screen::Dashboard,
         KeyCode::Up => {
             editor.confirmation = None;
+            editor.editing = false;
             editor.field = previous_settings_field(editor.field);
             editor.reset_cursor();
         }
         KeyCode::Down => {
             editor.confirmation = None;
+            editor.editing = false;
             editor.field = next_settings_field(editor.field);
             editor.reset_cursor();
         }
@@ -288,7 +320,12 @@ pub(crate) async fn handle_settings_key(app: &mut TuiApp, key: KeyCode, client: 
             editor.remember_session = !editor.remember_session;
         }
         KeyCode::Enter => match editor.field {
-            SettingsField::RollbackTimeout | SettingsField::RememberMinutes => {}
+            SettingsField::RollbackTimeout | SettingsField::RememberMinutes => {
+                editor.editing = !editor.editing;
+                if editor.editing {
+                    editor.reset_cursor();
+                }
+            }
             SettingsField::RememberSession => editor.remember_session = !editor.remember_session,
             SettingsField::SaveSession | SettingsField::Reset | SettingsField::Save
                 if editor.confirmation != Some(editor.field) =>
@@ -307,15 +344,16 @@ pub(crate) async fn handle_settings_key(app: &mut TuiApp, key: KeyCode, client: 
             SettingsField::Save => submit_security_settings(app, client).await,
             SettingsField::Reload => load_settings_data(app, client).await,
         },
-        other if editor.field == SettingsField::RollbackTimeout => {
-            let cursor = &mut editor.cursor;
-            super::input::TextEditor::new(&mut editor.rollback_timeout_input, cursor)
-                .handle_key_filtered(other, |c| c.is_ascii_digit());
-        }
-        other if editor.field == SettingsField::RememberMinutes => {
-            let cursor = &mut editor.cursor;
-            super::input::TextEditor::new(&mut editor.remember_minutes_input, cursor)
-                .handle_key_filtered(other, |c| c.is_ascii_digit());
+        key if editor.is_editing()
+            || (editor.active_text_input().is_some()
+                && (matches!(key, KeyCode::Char(c) if c.is_ascii_digit())
+                    || matches!(key, KeyCode::Backspace | KeyCode::Delete))) =>
+        {
+            editor.editing = true;
+            if let Some((input, cursor)) = editor.active_text_input() {
+                super::input::TextEditor::new(input, cursor)
+                    .handle_key_filtered(key, |c| c.is_ascii_digit());
+            }
         }
         _ => {}
     }
@@ -405,6 +443,7 @@ pub(crate) async fn load_settings_data(app: &mut TuiApp, client: &ApiClient) {
                 override_active,
                 restart_required,
                 cursor,
+                editing: false,
             });
         }
         Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
@@ -483,6 +522,7 @@ pub(crate) async fn submit_security_settings(app: &mut TuiApp, client: &ApiClien
                 override_active,
                 restart_required,
                 cursor,
+                editing: false,
             });
             app.push_message(
                 LogLevel::Info,
@@ -530,6 +570,7 @@ async fn reset_security_settings(app: &mut TuiApp, client: &ApiClient) {
                 override_active,
                 restart_required,
                 cursor,
+                editing: false,
             });
             app.push_message(
                 LogLevel::Info,
@@ -835,6 +876,7 @@ mod tests {
             remember_minutes_input: "5".into(),
             confirmation: None,
             cursor: 0,
+            editing: false,
         });
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 10)).unwrap();
@@ -873,6 +915,7 @@ mod tests {
                 remember_minutes_input: "5".into(),
                 confirmation: None,
                 cursor: 0,
+                editing: false,
             });
 
             handle_settings_key(
@@ -950,6 +993,7 @@ mod tests {
             remember_minutes_input: "5".into(),
             confirmation: None,
             cursor: 0,
+            editing: false,
         });
         focus_action(&mut app, 7);
         assert_eq!(app.settings.as_ref().unwrap().field, SettingsField::Access);
@@ -971,6 +1015,7 @@ mod tests {
             remember_minutes_input: "5".into(),
             confirmation: None,
             cursor: 0,
+            editing: false,
         });
 
         handle_settings_key(
@@ -1054,6 +1099,7 @@ mod tests {
             remember_minutes_input: "5".into(),
             confirmation: None,
             cursor: 2,
+            editing: true,
         });
         let client = ApiClient::new("/socket-that-must-not-be-opened");
 
@@ -1067,6 +1113,58 @@ mod tests {
         handle_settings_key(&mut app, KeyCode::Backspace, &client).await;
         assert_eq!(app.settings.as_ref().unwrap().rollback_timeout_input, "30");
         assert_eq!(app.settings.as_ref().unwrap().cursor, 1);
+    }
+
+    #[tokio::test]
+    async fn settings_editor_editing_mode_toggling() {
+        let mut app = TuiApp {
+            screen: Screen::Settings,
+            settings: Some(SecurityEditor {
+                field: SettingsField::RollbackTimeout,
+                active: SecuritySettings {
+                    rollback_timeout_seconds: 30,
+                },
+                rollback_timeout_input: "30".into(),
+                override_active: false,
+                restart_required: false,
+                remember_session: true,
+                remember_minutes_input: "5".into(),
+                confirmation: None,
+                cursor: 0,
+                editing: false,
+            }),
+            ..Default::default()
+        };
+        let client = ApiClient::new("/socket-that-must-not-be-opened");
+
+        assert!(!app.settings.as_ref().unwrap().is_editing());
+
+        // Enter activates editing mode
+        handle_settings_key(&mut app, KeyCode::Enter, &client).await;
+        assert!(app.settings.as_ref().unwrap().is_editing());
+
+        // Esc exits editing mode
+        handle_settings_key(&mut app, KeyCode::Esc, &client).await;
+        assert!(!app.settings.as_ref().unwrap().is_editing());
+        assert_eq!(app.screen, Screen::Settings);
+
+        // Enter activates again
+        handle_settings_key(&mut app, KeyCode::Enter, &client).await;
+        assert!(app.settings.as_ref().unwrap().is_editing());
+
+        // Enter again finishes editing mode
+        handle_settings_key(&mut app, KeyCode::Enter, &client).await;
+        assert!(!app.settings.as_ref().unwrap().is_editing());
+
+        // Up/Down navigation clears editing mode
+        handle_settings_key(&mut app, KeyCode::Enter, &client).await;
+        assert!(app.settings.as_ref().unwrap().is_editing());
+        handle_settings_key(&mut app, KeyCode::Down, &client).await;
+        assert!(!app.settings.as_ref().unwrap().is_editing());
+        assert_eq!(
+            app.settings.as_ref().unwrap().field,
+            SettingsField::RememberSession
+        );
     }
 
     #[tokio::test]

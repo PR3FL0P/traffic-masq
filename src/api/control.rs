@@ -2057,6 +2057,34 @@ impl ControlService {
         let Some(wifi_client) = &self.wifi_client else {
             return wifi_client_disabled();
         };
+        if let Err(error) = wifi_client.preflight_binary().await {
+            return classify_wifi_client_error(error);
+        }
+        let interfaces = match self.network.list_interfaces().await {
+            Ok(interfaces) => interfaces,
+            Err(error) => {
+                return Response::Error {
+                    message: error.to_string(),
+                };
+            }
+        };
+        if !interfaces.is_empty() {
+            let Some(target) = interfaces.iter().find(|i| i.name == interface) else {
+                return wifi_client_error(WifiClientErrorDetail::InterfaceNotFound);
+            };
+            if !target.is_wireless {
+                return wifi_client_error(WifiClientErrorDetail::NotWireless);
+            }
+        }
+        if let Some(wifi) = &self.wifi {
+            if wifi.status(&interface).await.is_some() {
+                return wifi_client_error(WifiClientErrorDetail::InvalidSpec {
+                    message: format!(
+                        "interface {interface} is currently operating as an access point"
+                    ),
+                });
+            }
+        }
         match wifi_client.scan(&interface).await {
             Ok(results) => Response::WifiClientScanResults { interface, results },
             Err(error) => classify_wifi_client_error(error),
@@ -6100,19 +6128,27 @@ mod tests {
             let shutdown_for_thread = shutdown.clone();
 
             let join = std::thread::spawn(move || {
-                let content = std::fs::read_to_string(&config_path).expect("read fake config");
-                let hex = content
+                let content = std::fs::read_to_string(&config_path).unwrap_or_default();
+                let ssid = content
                     .lines()
                     .map(str::trim)
                     .find_map(|line| line.strip_prefix("ssid="))
-                    .expect("ssid present");
-                let bytes: Vec<u8> = (0..hex.len())
-                    .step_by(2)
-                    .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap())
-                    .collect();
-                let ssid = String::from_utf8(bytes).expect("utf8 ssid");
+                    .and_then(|hex| {
+                        let bytes: Vec<u8> = (0..hex.len())
+                            .step_by(2)
+                            .filter_map(|index| {
+                                if index + 2 <= hex.len() {
+                                    u8::from_str_radix(&hex[index..index + 2], 16).ok()
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        String::from_utf8(bytes).ok()
+                    });
 
                 let mut buffer = [0u8; 4096];
+                let mut attached: Vec<std::os::unix::net::SocketAddr> = Vec::new();
                 while !shutdown_for_thread.load(WifiOrdering::Relaxed) {
                     let (read, from) = match socket.recv_from(&mut buffer) {
                         Ok(result) => result,
@@ -6129,9 +6165,38 @@ mod tests {
                     let command = String::from_utf8_lossy(&buffer[..read]).into_owned();
                     let reply = match command.as_str() {
                         "PING" => "PONG\n".to_string(),
-                        "STATUS" => format!(
-                            "wpa_state=COMPLETED\nssid={ssid}\nbssid=02:00:00:00:00:01\nfreq=2437\n"
-                        ),
+                        "STATUS" => {
+                            let mut reply = "wpa_state=COMPLETED\n".to_string();
+                            if let Some(ssid) = &ssid {
+                                reply.push_str(&format!("ssid={ssid}\n"));
+                            }
+                            reply.push_str("bssid=02:00:00:00:00:01\nfreq=2437\n");
+                            reply
+                        }
+                        "ATTACH" => {
+                            attached.push(from.clone());
+                            "OK\n".to_string()
+                        }
+                        "DETACH" => {
+                            #[cfg(target_os = "linux")]
+                            {
+                                use std::os::linux::net::SocketAddrExt;
+                                if let Some(name) = from.as_abstract_name() {
+                                    attached
+                                        .retain(|address| address.as_abstract_name() != Some(name));
+                                }
+                            }
+                            "OK\n".to_string()
+                        }
+                        "SCAN" => {
+                            for addr in &attached {
+                                let _ = socket.send_to_addr(b"<3>CTRL-EVENT-SCAN-RESULTS\n", addr);
+                            }
+                            "OK\n".to_string()
+                        }
+                        "SCAN_RESULTS" => "bssid / frequency / signal level / flags / ssid\n\
+                             02:00:00:00:00:01\t2412\t-42\t[WPA2-PSK-CCMP][SAE][ESS]\tupstream\n"
+                            .to_string(),
                         "RECONNECT" | "DISCONNECT" | "REASSOCIATE" => "OK\n".to_string(),
                         _ => "UNKNOWN COMMAND\n".to_string(),
                     };
@@ -6177,11 +6242,27 @@ mod tests {
     impl SupervisedProcess for FakeSupplicantProcess {
         async fn spawn(
             &self,
+            binary: &std::path::Path,
+            config_path: &std::path::Path,
+        ) -> Result<u32, WifiProcessError> {
+            let interface = config_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("wlan0");
+            self.spawn_wifi_client(binary, interface, config_path).await
+        }
+
+        async fn spawn_wifi_client(
+            &self,
             _binary: &std::path::Path,
+            interface: &str,
             config_path: &std::path::Path,
         ) -> Result<u32, WifiProcessError> {
             let pid = self.next_pid.fetch_add(1, WifiOrdering::Relaxed);
-            let ctrl_path = config_path.with_extension("");
+            let ctrl_path = config_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(""))
+                .join(interface);
             let responder = FakeSupplicant::spawn(ctrl_path, config_path.to_path_buf());
             self.responders.lock().unwrap().insert(pid, responder);
             self.configs
@@ -6636,6 +6717,114 @@ mod tests {
                 }
             ),
             "got {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wifi_client_scan_on_configured_interface_returns_scan_results() {
+        let fixture = wifi_client_enabled_fixture().await;
+        let response = fixture
+            .service
+            .dispatch(Request::WifiClientScan {
+                interface: "wlan1".to_string(),
+            })
+            .await;
+        let Response::WifiClientScanResults { interface, results } = response else {
+            panic!("expected scan results, got {response:?}");
+        };
+        assert_eq!(interface, "wlan1");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].ssid, "upstream");
+    }
+
+    #[tokio::test]
+    async fn wifi_client_scan_on_unconfigured_interface_performs_ephemeral_scan() {
+        let fixture = wifi_client_enabled_fixture().await;
+        let response = fixture
+            .service
+            .dispatch(Request::WifiClientScan {
+                interface: "wlan2".to_string(),
+            })
+            .await;
+        let Response::WifiClientScanResults { interface, results } = response else {
+            panic!("expected scan results, got {response:?}");
+        };
+        assert_eq!(interface, "wlan2");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].ssid, "upstream");
+    }
+
+    #[tokio::test]
+    async fn wifi_client_scan_rejects_non_wireless_interface() {
+        let directory = tempdir().expect("tempdir");
+        let config = wifi_client_base_config(directory.path());
+        let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+            .await
+            .expect("overrides");
+        let dhcp = DhcpSupervisor::start(&config)
+            .await
+            .expect("dhcp supervisor");
+        let network: Arc<dyn NetworkProvider> =
+            Arc::new(ProvisioningNetwork::with_wireless(&["wlan1"]).with_address(
+                "eth0",
+                [192, 168, 1, 1],
+                24,
+            ));
+        let wifi_client =
+            ClientSupervisor::start_with_process(&config, FakeSupplicantProcess::new())
+                .await
+                .expect("wifi client supervisor");
+        let service = ControlService::new(config, network, dhcp, overrides)
+            .with_wifi_client_supervisor(wifi_client);
+
+        let response = service
+            .dispatch(Request::WifiClientScan {
+                interface: "eth0".to_string(),
+            })
+            .await;
+        assert!(
+            matches!(
+                response,
+                Response::WifiClientError {
+                    detail: WifiClientErrorDetail::NotWireless
+                }
+            ),
+            "expected NotWireless for non-wireless NIC, got {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wifi_client_scan_rejects_missing_interface_when_network_known() {
+        let directory = tempdir().expect("tempdir");
+        let config = wifi_client_base_config(directory.path());
+        let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+            .await
+            .expect("overrides");
+        let dhcp = DhcpSupervisor::start(&config)
+            .await
+            .expect("dhcp supervisor");
+        let network: Arc<dyn NetworkProvider> =
+            Arc::new(ProvisioningNetwork::with_wireless(&["wlan1"]));
+        let wifi_client =
+            ClientSupervisor::start_with_process(&config, FakeSupplicantProcess::new())
+                .await
+                .expect("wifi client supervisor");
+        let service = ControlService::new(config, network, dhcp, overrides)
+            .with_wifi_client_supervisor(wifi_client);
+
+        let response = service
+            .dispatch(Request::WifiClientScan {
+                interface: "wlan9".to_string(),
+            })
+            .await;
+        assert!(
+            matches!(
+                response,
+                Response::WifiClientError {
+                    detail: WifiClientErrorDetail::InterfaceNotFound
+                }
+            ),
+            "expected InterfaceNotFound, got {response:?}"
         );
     }
 

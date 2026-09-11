@@ -111,10 +111,7 @@ impl ServiceStore {
             match fs::symlink_metadata(&path) {
                 Ok(_)
                     if previous.and_then(Registration::runit_link).as_ref() == Some(&link)
-                        && fs::read_link(&path).ok().as_deref() == Some(Path::new(RUNIT_DIR)) =>
-                {
-                    ()
-                }
+                        && fs::read_link(&path).ok().as_deref() == Some(Path::new(RUNIT_DIR)) => {}
                 Ok(_) => bail!(
                     "refusing to replace unowned runit activation path {}",
                     path.display()
@@ -232,10 +229,7 @@ fn regular_or_missing(path: &Path) -> Result<()> {
                 if m.file_type().is_symlink()
                     && path == Path::new("/etc/init.d")
                     && fs::canonicalize(path).ok().as_deref()
-                        == Some(Path::new("/etc/rc.d/init.d")) =>
-            {
-                ()
-            }
+                        == Some(Path::new("/etc/rc.d/init.d")) => {}
             Ok(m) if !m.is_dir() || m.file_type().is_symlink() => bail!(
                 "service file has a non-directory or symlinked parent {}",
                 path.display()

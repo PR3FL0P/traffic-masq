@@ -643,9 +643,10 @@ async fn reauthenticate(
     loop {
         let snapshot = terminal
             .draw(|frame| {
-                let mut spans = vec![
-                    Span::styled(format!("{message}\n\nDevice password: "), Style::default()),
-                ];
+                let mut spans = vec![Span::styled(
+                    format!("{message}\n\nDevice password: "),
+                    Style::default(),
+                )];
                 spans.extend(input::render_masked_with_cursor(
                     password.chars().count(),
                     cursor,
@@ -1043,13 +1044,7 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
         match key {
             KeyCode::Left => {
                 let is_editing_settings_text = app.screen == Screen::Settings
-                    && app.settings.as_ref().map_or(false, |s| {
-                        matches!(
-                            s.field,
-                            settings::SettingsField::RollbackTimeout
-                                | settings::SettingsField::RememberMinutes
-                        )
-                    });
+                    && app.settings.as_ref().is_some_and(|s| s.is_editing());
                 if !is_editing_settings_text {
                     let target = adjacent_section(section_of(app.screen), false);
                     navigate_to_section(app, target, client, direct).await;
@@ -1058,13 +1053,7 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
             }
             KeyCode::Right => {
                 let is_editing_settings_text = app.screen == Screen::Settings
-                    && app.settings.as_ref().map_or(false, |s| {
-                        matches!(
-                            s.field,
-                            settings::SettingsField::RollbackTimeout
-                                | settings::SettingsField::RememberMinutes
-                        )
-                    });
+                    && app.settings.as_ref().is_some_and(|s| s.is_editing());
                 if !is_editing_settings_text {
                     let target = adjacent_section(section_of(app.screen), true);
                     navigate_to_section(app, target, client, direct).await;
@@ -1678,5 +1667,70 @@ mod tests {
         assert_eq!(section_of(Screen::SettingsPassword), Section::Settings);
         assert_eq!(section_of(Screen::Access), Section::Settings);
         assert_eq!(section_of(Screen::Log), Section::Log);
+    }
+
+    #[tokio::test]
+    async fn settings_tab_switching_and_editing_arrow_isolation() {
+        let mut app = TuiApp {
+            screen: Screen::Settings,
+            ui: layout::UiLayout {
+                input_enabled: true,
+                ..Default::default()
+            },
+            settings: Some(SecurityEditor {
+                field: settings::SettingsField::RollbackTimeout,
+                active: crate::api::model::SecuritySettings {
+                    rollback_timeout_seconds: 60,
+                },
+                rollback_timeout_input: "60".into(),
+                override_active: false,
+                restart_required: false,
+                remember_session: false,
+                remember_minutes_input: "5".into(),
+                confirmation: None,
+                cursor: 2,
+                editing: false,
+            }),
+            ..Default::default()
+        };
+        let client = ApiClient::new("/nonexistent.sock");
+
+        // When not editing, Right navigates to Log section
+        handle_key(&mut app, KeyCode::Right, &client, false).await;
+        assert_eq!(app.screen, Screen::Log);
+
+        // When on Log, Left navigates back to Settings section
+        handle_key(&mut app, KeyCode::Left, &client, false).await;
+        assert_eq!(app.screen, Screen::Settings);
+
+        // When not editing, Left navigates to Wifi section
+        handle_key(&mut app, KeyCode::Left, &client, false).await;
+        assert_eq!(app.screen, Screen::Wifi);
+
+        // Navigate back to Settings
+        handle_key(&mut app, KeyCode::Right, &client, false).await;
+        assert_eq!(app.screen, Screen::Settings);
+
+        // Enter activates editing mode on RollbackTimeout
+        handle_key(&mut app, KeyCode::Enter, &client, false).await;
+        assert!(app.settings.as_ref().unwrap().is_editing());
+
+        // When editing, Left moves the cursor and does NOT switch sections
+        handle_key(&mut app, KeyCode::Left, &client, false).await;
+        assert_eq!(app.screen, Screen::Settings);
+        assert_eq!(app.settings.as_ref().unwrap().cursor, 1);
+
+        // When editing, Right moves the cursor and does NOT switch sections
+        handle_key(&mut app, KeyCode::Right, &client, false).await;
+        assert_eq!(app.screen, Screen::Settings);
+        assert_eq!(app.settings.as_ref().unwrap().cursor, 2);
+
+        // Enter finishes editing mode
+        handle_key(&mut app, KeyCode::Enter, &client, false).await;
+        assert!(!app.settings.as_ref().unwrap().is_editing());
+
+        // Once editing is finished, Right navigates to Log section again
+        handle_key(&mut app, KeyCode::Right, &client, false).await;
+        assert_eq!(app.screen, Screen::Log);
     }
 }

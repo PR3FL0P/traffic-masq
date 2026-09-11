@@ -14,8 +14,8 @@ use crate::wifi::client::ctrl::{
     WpaSupplicantScanResult,
 };
 use crate::wifi::client::render::{
-    config_path, render_wpa_supplicant_config, ClientRenderError, ClientRenderInput,
-    RenderedClientConfig,
+    config_path, render_scan_config, render_wpa_supplicant_config, scan_config_path,
+    ClientRenderError, ClientRenderInput, RenderedClientConfig,
 };
 use crate::wifi::process::{
     find_competing_network_managers, ProcessError, SupervisedProcess, TokioSupervisedProcess,
@@ -551,17 +551,76 @@ impl WifiClientSupervisor {
         &self,
         interface: &str,
     ) -> Result<Vec<WpaSupplicantScanResult>, ClientSupervisorError> {
+        crate::config::validate_interface_name(interface)?;
         let _operation = self.inner.operation_lock.lock().await;
-        if !self.inner.tasks.lock().await.contains_key(interface) {
-            return Err(ClientSupervisorError::NotConfigured {
-                interface: interface.to_string(),
-            });
+        let ctrl_path = self.ctrl_path(interface);
+
+        if self.inner.tasks.lock().await.contains_key(interface) {
+            return self.perform_scan(&ctrl_path, interface).await;
         }
 
-        let ctrl_path = self.ctrl_path(interface);
+        // If a supplicant is already active and responding on the control socket, reuse it
+        if let Ok(client) =
+            WpaSupplicantCtrlClient::connect(&ctrl_path, Duration::from_millis(50)).await
+        {
+            if client.ping().await.is_ok() {
+                return self.perform_scan(&ctrl_path, interface).await;
+            }
+        }
+
+        // Ephemeral scan for unconfigured or inactive interface
+        tokio::fs::create_dir_all(&self.inner.runtime_dir)
+            .await
+            .map_err(|source| anyhow::anyhow!("failed to create runtime dir: {source}"))?;
+
+        let scan_config_path = scan_config_path(&self.inner.runtime_dir, interface);
+        let scan_config = render_scan_config(&self.inner.runtime_dir);
+
+        tokio::fs::write(&scan_config_path, scan_config.as_bytes())
+            .await
+            .map_err(|source| anyhow::anyhow!("failed to write scan config: {source}"))?;
+
+        // Clean up stale socket if present
+        let _ = tokio::fs::remove_file(&ctrl_path).await;
+
+        let pid = match self
+            .inner
+            .process
+            .spawn_wifi_client(
+                &self.inner.wpa_supplicant_binary,
+                interface,
+                &scan_config_path,
+            )
+            .await
+        {
+            Ok(pid) => pid,
+            Err(err) => {
+                let _ = tokio::fs::remove_file(&scan_config_path).await;
+                return Err(ClientSupervisorError::from(err));
+            }
+        };
+
+        let ready = wait_for_ready(&ctrl_path, self.inner.ctrl_timeout, interface).await;
+        let scan_result = match ready {
+            Ok(()) => self.perform_scan(&ctrl_path, interface).await,
+            Err(err) => Err(err),
+        };
+
+        self.graceful_stop(pid).await;
+        let _ = tokio::fs::remove_file(&scan_config_path).await;
+        let _ = tokio::fs::remove_file(&ctrl_path).await;
+
+        scan_result
+    }
+
+    async fn perform_scan(
+        &self,
+        ctrl_path: &Path,
+        interface: &str,
+    ) -> Result<Vec<WpaSupplicantScanResult>, ClientSupervisorError> {
         let (events, mut receiver) =
-            WpaSupplicantEventClient::attach(&ctrl_path, self.inner.ctrl_timeout).await?;
-        let client = WpaSupplicantCtrlClient::connect(&ctrl_path, self.inner.ctrl_timeout).await?;
+            WpaSupplicantEventClient::attach(ctrl_path, self.inner.ctrl_timeout).await?;
+        let client = WpaSupplicantCtrlClient::connect(ctrl_path, self.inner.ctrl_timeout).await?;
         if let Err(error) = client.scan().await {
             events.close().await;
             return match error {
@@ -854,18 +913,23 @@ mod tests {
     };
     use crate::wifi::render::WifiDigest;
 
-    fn read_ssid_from_config(path: &Path) -> String {
-        let content = std::fs::read_to_string(path).expect("read fake wpa_supplicant config");
+    fn read_ssid_from_config(path: &Path) -> Option<String> {
+        let content = std::fs::read_to_string(path).ok()?;
         let hex = content
             .lines()
             .map(str::trim)
-            .find_map(|line| line.strip_prefix("ssid="))
-            .expect("ssid line present");
+            .find_map(|line| line.strip_prefix("ssid="))?;
         let bytes: Vec<u8> = (0..hex.len())
             .step_by(2)
-            .map(|index| u8::from_str_radix(&hex[index..index + 2], 16).expect("valid hex"))
+            .filter_map(|index| {
+                if index + 2 <= hex.len() {
+                    u8::from_str_radix(&hex[index..index + 2], 16).ok()
+                } else {
+                    None
+                }
+            })
             .collect();
-        String::from_utf8(bytes).expect("ssid decodes as UTF-8 in these tests")
+        String::from_utf8(bytes).ok()
     }
 
     struct FakeSupplicantCtrl {
@@ -886,8 +950,9 @@ mod tests {
             let config = config.to_path_buf();
 
             let join = std::thread::spawn(move || {
-                let ssid = Some(read_ssid_from_config(&config));
+                let ssid = read_ssid_from_config(&config);
                 let mut buffer = [0u8; 4096];
+                let mut attached: Vec<std::os::unix::net::SocketAddr> = Vec::new();
                 while !shutdown_for_thread.load(Ordering::Relaxed) {
                     let (read, from) = match socket.recv_from(&mut buffer) {
                         Ok(result) => result,
@@ -915,6 +980,30 @@ mod tests {
                             }
                             reply
                         }
+                        "ATTACH" => {
+                            attached.push(from.clone());
+                            "OK\n".to_string()
+                        }
+                        "DETACH" => {
+                            #[cfg(target_os = "linux")]
+                            {
+                                use std::os::linux::net::SocketAddrExt;
+                                if let Some(name) = from.as_abstract_name() {
+                                    attached
+                                        .retain(|address| address.as_abstract_name() != Some(name));
+                                }
+                            }
+                            "OK\n".to_string()
+                        }
+                        "SCAN" => {
+                            for addr in &attached {
+                                let _ = socket.send_to_addr(b"<3>CTRL-EVENT-SCAN-RESULTS\n", addr);
+                            }
+                            "OK\n".to_string()
+                        }
+                        "SCAN_RESULTS" => "bssid / frequency / signal level / flags / ssid\n\
+                             02:00:00:00:00:01\t2412\t-42\t[WPA2-PSK-CCMP][SAE][ESS]\tupstream\n"
+                            .to_string(),
                         "RECONNECT" | "DISCONNECT" | "REASSOCIATE" => "OK\n".to_string(),
                         _ => "UNKNOWN COMMAND\n".to_string(),
                     };
@@ -1001,7 +1090,20 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SupervisedProcess for FakeProcess {
-        async fn spawn(&self, _binary: &Path, config_path: &Path) -> Result<u32, ProcessError> {
+        async fn spawn(&self, binary: &Path, config_path: &Path) -> Result<u32, ProcessError> {
+            let interface = config_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("wlan0");
+            self.spawn_wifi_client(binary, interface, config_path).await
+        }
+
+        async fn spawn_wifi_client(
+            &self,
+            _binary: &Path,
+            interface: &str,
+            config_path: &Path,
+        ) -> Result<u32, ProcessError> {
             self.calls
                 .lock()
                 .unwrap()
@@ -1014,7 +1116,10 @@ mod tests {
             }
             let pid = self.next_pid.fetch_add(1, Ordering::Relaxed);
             if !self.suppress_spawn_responder.load(Ordering::Relaxed) {
-                let ctrl_path = config_path.with_extension("");
+                let ctrl_path = config_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new(""))
+                    .join(interface);
                 let state = self.spawn_state.lock().unwrap().clone();
                 let responder = FakeSupplicantCtrl::spawn(ctrl_path, &state, config_path);
                 self.responders.lock().unwrap().insert(pid, responder);
@@ -1821,5 +1926,54 @@ mod tests {
                 .expect("load")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn scan_on_unconfigured_interface_performs_ephemeral_scan_and_cleans_up() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = temp.path().join("run");
+        let process = FakeProcess::new();
+        let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
+
+        let results = supervisor.scan("wlan0").await.expect("scan succeeds");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].ssid, "upstream");
+        assert_eq!(results[0].frequency_mhz, 2412);
+
+        // Ephemeral process was spawned and terminated:
+        assert_eq!(process.spawn_count(), 1);
+        let calls = process.calls();
+        assert!(calls.iter().any(|c| matches!(c, FakeCall::Terminate(_))));
+
+        // Ephemeral config and socket were removed:
+        assert!(!runtime.join("wlan0-scan.conf").exists());
+        assert!(!runtime.join("wlan0").exists());
+    }
+
+    #[tokio::test]
+    async fn scan_on_configured_interface_reuses_running_supplicant() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = temp.path().join("run");
+        let process = FakeProcess::new();
+        let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
+
+        supervisor
+            .configure(spec("wlan0", "upstream"))
+            .await
+            .expect("configure");
+        assert_eq!(process.spawn_count(), 1);
+
+        let results = supervisor.scan("wlan0").await.expect("scan succeeds");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].ssid, "upstream");
+
+        // No new process was spawned, and the running process was NOT terminated:
+        assert_eq!(process.spawn_count(), 1);
+        let terminate_count = process
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, FakeCall::Terminate(_)))
+            .count();
+        assert_eq!(terminate_count, 0);
     }
 }

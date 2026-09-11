@@ -131,6 +131,17 @@ pub fn config_path(runtime_dir: &Path, interface: &str) -> PathBuf {
     runtime_dir.join(format!("{interface}.conf"))
 }
 
+pub fn scan_config_path(runtime_dir: &Path, interface: &str) -> PathBuf {
+    runtime_dir.join(format!("{interface}-scan.conf"))
+}
+
+pub fn render_scan_config(ctrl_interface: &Path) -> String {
+    format!(
+        "ctrl_interface={}\nupdate_config=0\n",
+        ctrl_interface.display()
+    )
+}
+
 fn append_security_lines(
     lines: &mut Vec<Line>,
     spec: &WifiClientSpec,
@@ -415,5 +426,14 @@ mod tests {
             rendered.path,
             Path::new("/run/traffic-masq/wpa_supplicant/wlan0.conf")
         );
+    }
+
+    #[test]
+    fn the_scan_config_renders_ctrl_interface_and_update_config() {
+        let path = scan_config_path(Path::new("/run/wpa"), "wlan1");
+        assert_eq!(path, Path::new("/run/wpa/wlan1-scan.conf"));
+
+        let rendered = render_scan_config(Path::new("/run/wpa"));
+        assert_eq!(rendered, "ctrl_interface=/run/wpa\nupdate_config=0\n");
     }
 }
