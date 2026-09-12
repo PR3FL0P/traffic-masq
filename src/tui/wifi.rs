@@ -17,7 +17,7 @@ use crate::wifi::{
     WpaSupplicantScanSecurity,
 };
 
-use super::layout::panel;
+use super::layout::{panel, UiLayout};
 use super::logs::LogLevel;
 use super::{theme, Screen, TuiApp};
 
@@ -226,11 +226,19 @@ pub(crate) struct WifiScanPicker {
     pub(crate) selected: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WifiProfilesMode {
+    Menu,
+    Management,
+    ProfileActions,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct WifiProfilesView {
     pub(crate) interface: String,
     pub(crate) profiles: Vec<WifiClientProfileSummary>,
 
+    pub(crate) mode: WifiProfilesMode,
     pub(crate) selected: usize,
 
     pub(crate) selected_profile: usize,
@@ -680,7 +688,9 @@ async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
             }
         }
         PrimaryAction::Scan => start_scan(app, client, row.interface).await,
-        PrimaryAction::Profiles => open_profiles(app, client, row.interface).await,
+        PrimaryAction::Profiles => {
+            open_profiles(app, client, row.interface, WifiProfilesMode::Menu).await
+        }
         PrimaryAction::Reconnect => {
             request_simple(
                 app,
@@ -1146,16 +1156,59 @@ pub(crate) fn handle_wifi_scan_key(app: &mut TuiApp, key: KeyCode) {
     }
 }
 
-async fn open_profiles(app: &mut TuiApp, client: &ApiClient, interface: String) {
+fn open_create_profile(app: &mut TuiApp, interface: String) {
+    app.wifi_profile_editor = Some(WifiProfileEditor {
+        interface,
+        original_id: None,
+        field: ProfileField::Id,
+        id: String::new(),
+        ssid: String::new(),
+        security: WifiClientSecurity::Wpa2,
+        country: String::new(),
+        priority: "0".into(),
+        passphrase: String::new(),
+        has_passphrase: false,
+        cursor: 0,
+    });
+    app.screen = Screen::WifiProfileEditor;
+}
+
+async fn open_profiles(
+    app: &mut TuiApp,
+    client: &ApiClient,
+    interface: String,
+    mode: WifiProfilesMode,
+) {
     match client.request(&Request::ListWifiClientProfiles).await {
         Ok(Response::WifiClientProfiles { mut profiles }) => {
             profiles.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.id.cmp(&b.id)));
+            let previous_selected = app
+                .wifi_profiles
+                .as_ref()
+                .map(|v| v.selected_profile)
+                .unwrap_or(0);
+            let selected_profile = if profiles.is_empty() {
+                0
+            } else {
+                previous_selected.min(profiles.len() - 1)
+            };
+            let mode = if profiles.is_empty() && mode == WifiProfilesMode::ProfileActions {
+                WifiProfilesMode::Management
+            } else {
+                mode
+            };
+            let selected = match mode {
+                WifiProfilesMode::Menu => 0,
+                WifiProfilesMode::Management => selected_profile,
+                WifiProfilesMode::ProfileActions => 0,
+            };
             app.wifi_profiles = Some(WifiProfilesView {
                 delete_confirmation: None,
                 interface,
                 profiles,
-                selected: 0,
-                selected_profile: 0,
+                mode,
+                selected,
+                selected_profile,
             });
             app.screen = Screen::WifiProfiles;
         }
@@ -1171,6 +1224,68 @@ pub(crate) fn render_wifi_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, a
     let Some(view) = &app.wifi_profiles else {
         return;
     };
+    match view.mode {
+        WifiProfilesMode::Menu => render_profiles_menu(frame, area, &mut app.ui, view),
+        WifiProfilesMode::Management => render_profiles_management(frame, area, &mut app.ui, view),
+        WifiProfilesMode::ProfileActions => render_profile_actions(frame, area, &mut app.ui, view),
+    }
+}
+
+fn render_profiles_menu(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    ui: &mut UiLayout,
+    view: &WifiProfilesView,
+) {
+    let block = panel(&format!("Saved profiles — {}", view.interface));
+    let inner = block.inner(area);
+
+    ui.list_area = Some(inner);
+    ui.list_count = 2;
+    ui.list_row_height = 1;
+    ui.list_scroll_offset = 0;
+
+    let count = view.profiles.len();
+    let count_desc = match count {
+        0 => "no profiles saved".to_string(),
+        1 => "1 profile saved".to_string(),
+        n => format!("{n} profiles saved"),
+    };
+
+    let menu_items = [
+        ("Management", format!("Manage existing saved profiles ({count_desc})")),
+        ("Create new", "Configure and add a new wireless profile".to_string()),
+    ];
+
+    let mut lines = Vec::new();
+    for (idx, (label, desc)) in menu_items.iter().enumerate() {
+        let is_selected = view.selected == idx;
+        lines.push(Line::styled(
+            format!(
+                "{}{:<16} {}",
+                if is_selected { "▶ " } else { "  " },
+                label,
+                desc
+            ),
+            selected_style(is_selected),
+        ));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::styled(
+        "  ↑/↓: navigate │ Enter: select │ Esc: back",
+        Style::default().fg(theme::MUTED),
+    ));
+
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn render_profiles_management(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    ui: &mut UiLayout,
+    view: &WifiProfilesView,
+) {
     let target = view
         .profiles
         .get(view.selected_profile)
@@ -1178,26 +1293,50 @@ pub(crate) fn render_wifi_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, a
     let title = if let Some(id) = &view.delete_confirmation {
         format!("Delete {id}? Y: confirm, any other key: cancel")
     } else {
-        format!("Saved profiles — target: {target}")
+        format!("Saved profiles — Management (selected: {target})")
     };
     let block = panel(&title);
     let inner = block.inner(area);
+
+    if view.profiles.is_empty() {
+        ui.list_area = Some(inner);
+        ui.list_count = 0;
+        ui.list_row_height = 1;
+        ui.list_scroll_offset = 0;
+
+        let lines = vec![
+            Line::styled(
+                "  No saved Wi-Fi profiles found.",
+                Style::default().fg(theme::MUTED),
+            ),
+            Line::from(""),
+            Line::styled(
+                "  Press [Enter] to create a new profile, or [Esc] to return.",
+                Style::default().fg(theme::ACCENT),
+            ),
+        ];
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+        return;
+    }
+
     let offset = view
         .selected
         .saturating_sub(inner.height.saturating_sub(1) as usize);
-    app.ui.list_area = Some(inner);
-    app.ui.list_count = view.profiles.len() + 5;
-    app.ui.list_row_height = 1;
-    app.ui.list_scroll_offset = offset;
-    let mut lines = view
+    ui.list_area = Some(inner);
+    ui.list_count = view.profiles.len();
+    ui.list_row_height = 1;
+    ui.list_scroll_offset = offset;
+
+    let lines = view
         .profiles
         .iter()
         .enumerate()
         .map(|(index, profile)| {
+            let is_selected = index == view.selected;
             Line::styled(
                 format!(
                     "{}{: <18} {: <28} {: <5} priority {}{}",
-                    if index == view.selected { "▶ " } else { "  " },
+                    if is_selected { "▶ " } else { "  " },
                     profile.id,
                     profile.ssid,
                     client_security_label(profile.security),
@@ -1208,36 +1347,95 @@ pub(crate) fn render_wifi_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, a
                         ""
                     }
                 ),
-                selected_style(index == view.selected),
+                selected_style(is_selected),
             )
         })
         .collect::<Vec<_>>();
-    let action_labels = [
-        "Create profile",
-        "Edit selected",
-        "Activate selected",
-        "Delete selected",
-        "Deactivate client",
-    ];
-    for (slot, label) in action_labels.iter().enumerate() {
-        let cursor = view.profiles.len() + slot;
-        lines.push(Line::styled(
-            format!(
-                "{}{}",
-                if view.selected == cursor {
-                    "▶ "
-                } else {
-                    "  "
-                },
-                label
-            ),
-            selected_style(view.selected == cursor),
-        ));
-    }
+
     frame.render_widget(
         Paragraph::new(lines.into_iter().skip(offset).collect::<Vec<_>>()).block(block),
         area,
     );
+}
+
+fn render_profile_actions(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    ui: &mut UiLayout,
+    view: &WifiProfilesView,
+) {
+    let target = view
+        .profiles
+        .get(view.selected_profile)
+        .map_or("none", |p| p.id.as_str());
+    let title = if let Some(id) = &view.delete_confirmation {
+        format!("Delete {id}? Y: confirm, any other key: cancel")
+    } else {
+        format!("Profile management — target: {target}")
+    };
+    let block = panel(&title);
+    let inner = block.inner(area);
+
+    let action_labels = [
+        "Activate / Connect",
+        "Edit profile",
+        "Delete profile",
+        "Deactivate client",
+        "Back to profile list",
+    ];
+
+    let has_header = view.profiles.get(view.selected_profile).is_some();
+    let header_lines = if has_header { 2 } else { 0 };
+
+    let list_area = Rect::new(
+        inner.x,
+        inner.y + header_lines as u16,
+        inner.width,
+        inner.height.saturating_sub(header_lines as u16),
+    );
+    let offset = view
+        .selected
+        .saturating_sub(list_area.height.saturating_sub(1) as usize);
+
+    ui.list_area = Some(list_area);
+    ui.list_count = action_labels.len();
+    ui.list_row_height = 1;
+    ui.list_scroll_offset = offset;
+
+    let mut lines = Vec::new();
+    if let Some(profile) = view.profiles.get(view.selected_profile) {
+        lines.push(Line::styled(
+            format!(
+                "  ID: {} │ SSID: {} │ Security: {} │ Priority: {}",
+                profile.id,
+                profile.ssid,
+                client_security_label(profile.security),
+                profile.priority
+            ),
+            Style::default().fg(theme::ACCENT),
+        ));
+        lines.push(Line::from(""));
+    }
+
+    for (slot, label) in action_labels.iter().enumerate().skip(offset) {
+        let is_selected = view.selected == slot;
+        lines.push(Line::styled(
+            format!(
+                "{}{}",
+                if is_selected { "▶ " } else { "  " },
+                label
+            ),
+            selected_style(is_selected),
+        ));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::styled(
+        "  ↑/↓: choose action │ Enter: execute │ Esc: back",
+        Style::default().fg(theme::MUTED),
+    ));
+
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 pub(crate) async fn handle_wifi_profiles_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
@@ -1251,112 +1449,197 @@ pub(crate) async fn handle_wifi_profiles_key(app: &mut TuiApp, key: KeyCode, cli
         }
         return;
     }
-    let limit = view.profiles.len() + 4;
-    match key {
-        KeyCode::Esc => {
-            app.wifi_profiles = None;
-            app.screen = Screen::Wifi;
-        }
-        KeyCode::Up => {
-            view.selected = view.selected.saturating_sub(1);
-            if view.selected < view.profiles.len() {
-                view.selected_profile = view.selected;
+
+    match view.mode {
+        WifiProfilesMode::Menu => match key {
+            KeyCode::Esc => {
+                app.wifi_profiles = None;
+                app.screen = Screen::Wifi;
+            }
+            KeyCode::Up => {
+                view.selected = view.selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                view.selected = (view.selected + 1).min(1);
+            }
+            KeyCode::Home => {
+                view.selected = 0;
+            }
+            KeyCode::End => {
+                view.selected = 1;
+            }
+            KeyCode::Enter => activate_profile_row(app, client).await,
+            _ => {}
+        },
+        WifiProfilesMode::Management => {
+            if view.profiles.is_empty() {
+                match key {
+                    KeyCode::Esc => {
+                        view.mode = WifiProfilesMode::Menu;
+                        view.selected = 0;
+                    }
+                    KeyCode::Enter => {
+                        let interface = view.interface.clone();
+                        open_create_profile(app, interface);
+                    }
+                    _ => {}
+                }
+                return;
+            }
+
+            let count = view.profiles.len();
+            match key {
+                KeyCode::Esc => {
+                    view.mode = WifiProfilesMode::Menu;
+                    view.selected = 0;
+                }
+                KeyCode::Up => {
+                    view.selected = view.selected.saturating_sub(1);
+                    view.selected_profile = view.selected;
+                }
+                KeyCode::Down => {
+                    if view.selected + 1 < count {
+                        view.selected += 1;
+                        view.selected_profile = view.selected;
+                    }
+                }
+                KeyCode::Home => {
+                    view.selected = 0;
+                    view.selected_profile = 0;
+                }
+                KeyCode::End => {
+                    view.selected = count.saturating_sub(1);
+                    view.selected_profile = view.selected;
+                }
+                KeyCode::Enter => activate_profile_row(app, client).await,
+                _ => {}
             }
         }
-        KeyCode::Down => {
-            view.selected = (view.selected + 1).min(limit);
-            if view.selected < view.profiles.len() {
-                view.selected_profile = view.selected;
+        WifiProfilesMode::ProfileActions => match key {
+            KeyCode::Esc => {
+                view.mode = WifiProfilesMode::Management;
+                view.selected = view.selected_profile;
             }
+            KeyCode::Up => {
+                view.selected = view.selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                view.selected = (view.selected + 1).min(4);
+            }
+            KeyCode::Home => {
+                view.selected = 0;
+            }
+            KeyCode::End => {
+                view.selected = 4;
+            }
+            KeyCode::Enter => activate_profile_row(app, client).await,
+            _ => {}
+        },
+    }
+}
+
+async fn activate_profile_action(app: &mut TuiApp, client: &ApiClient, slot: usize) {
+    if slot == 4 {
+        if let Some(current) = app.wifi_profiles.as_mut() {
+            current.mode = WifiProfilesMode::Management;
+            current.selected = current.selected_profile;
         }
-        KeyCode::Enter => activate_profile_row(app, client).await,
+        return;
+    }
+    if slot == 3 {
+        let interface = app
+            .wifi_profiles
+            .as_ref()
+            .map(|v| v.interface.clone())
+            .unwrap_or_default();
+        profile_request(
+            app,
+            client,
+            Ok(Request::DeactivateWifiClientProfile { interface }),
+        )
+        .await;
+        return;
+    }
+
+    let Some((interface, profile)) = app.wifi_profiles.as_ref().and_then(|v| {
+        v.profiles
+            .get(v.selected_profile)
+            .cloned()
+            .map(|p| (v.interface.clone(), p))
+    }) else {
+        app.push_message(LogLevel::Warn, "Select a profile first");
+        return;
+    };
+
+    match slot {
+        0 => {
+            open_wifi_connect_prompt(
+                app,
+                client,
+                interface,
+                profile.id,
+                profile.ssid,
+            )
+            .await;
+        }
+        1 => {
+            app.wifi_profile_editor =
+                Some(WifiProfileEditor::from_profile(interface, &profile));
+            app.screen = Screen::WifiProfileEditor;
+        }
+        2 => {
+            if let Some(current) = app.wifi_profiles.as_mut() {
+                current.delete_confirmation = Some(profile.id.clone());
+            }
+            app.push_message(
+                LogLevel::Warn,
+                format!(
+                    "Delete profile {}? Y confirms; any other key cancels.",
+                    profile.id
+                ),
+            );
+        }
         _ => {}
     }
 }
 
 async fn activate_profile_row(app: &mut TuiApp, client: &ApiClient) {
-    let Some(view) = app.wifi_profiles.clone() else {
+    let Some((mode, selected, is_empty, interface)) = app.wifi_profiles.as_ref().map(|v| {
+        (
+            v.mode,
+            v.selected,
+            v.profiles.is_empty(),
+            v.interface.clone(),
+        )
+    }) else {
         return;
     };
-    if view.selected < view.profiles.len() {
-        if let Some(profile) = view.profiles.get(view.selected) {
-            open_wifi_connect_prompt(
-                app,
-                client,
-                view.interface.clone(),
-                profile.id.clone(),
-                profile.ssid.clone(),
-            )
-            .await;
-        }
-        return;
-    }
-    let slot = view.selected - view.profiles.len();
-    match slot {
-        0 => {
-            app.wifi_profile_editor = Some(WifiProfileEditor {
-                interface: view.interface,
-                original_id: None,
-                field: ProfileField::Id,
-                id: String::new(),
-                ssid: String::new(),
-                security: WifiClientSecurity::Wpa2,
-                country: String::new(),
-                priority: "0".into(),
-                passphrase: String::new(),
-                has_passphrase: false,
-                cursor: 0,
-            });
-            app.screen = Screen::WifiProfileEditor;
-        }
-        1 => {
-            if let Some(profile) = view.profiles.get(view.selected_profile) {
-                app.wifi_profile_editor =
-                    Some(WifiProfileEditor::from_profile(view.interface, profile));
-                app.screen = Screen::WifiProfileEditor;
-            } else {
-                app.push_message(LogLevel::Warn, "Select a profile first");
-            }
-        }
-        2 => {
-            if let Some(profile) = view.profiles.get(view.selected_profile) {
-                open_wifi_connect_prompt(
-                    app,
-                    client,
-                    view.interface.clone(),
-                    profile.id.clone(),
-                    profile.ssid.clone(),
-                )
-                .await;
-            } else {
-                app.push_message(LogLevel::Warn, "Select a profile first");
-            }
-        }
-        3 => {
-            if let Some(profile) = view.profiles.get(view.selected_profile) {
+    match mode {
+        WifiProfilesMode::Menu => {
+            if selected == 0 {
                 if let Some(current) = app.wifi_profiles.as_mut() {
-                    current.delete_confirmation = Some(profile.id.clone());
+                    current.mode = WifiProfilesMode::Management;
+                    current.selected = if current.profiles.is_empty() {
+                        0
+                    } else {
+                        current.selected_profile.min(current.profiles.len() - 1)
+                    };
                 }
-                app.push_message(
-                    LogLevel::Warn,
-                    format!(
-                        "Delete profile {}? Y confirms; any other key cancels.",
-                        profile.id
-                    ),
-                );
+            } else {
+                open_create_profile(app, interface);
             }
         }
-        4 => {
-            profile_request(
-                app,
-                client,
-                Ok(Request::DeactivateWifiClientProfile {
-                    interface: view.interface,
-                }),
-            )
-            .await
+        WifiProfilesMode::Management => {
+            if is_empty {
+                open_create_profile(app, interface);
+            } else if let Some(current) = app.wifi_profiles.as_mut() {
+                current.mode = WifiProfilesMode::ProfileActions;
+                current.selected = 0;
+            }
         }
-        _ => {}
+        WifiProfilesMode::ProfileActions => {
+            activate_profile_action(app, client, selected).await;
+        }
     }
 }
 
@@ -1374,7 +1657,6 @@ async fn profile_request(
     };
     match client.request(&request).await {
         Ok(Response::WifiClientProfileActivated { .. })
-        | Ok(Response::WifiClientProfileDeleted { .. })
         | Ok(Response::WifiClientDisabled { .. }) => {
             app.push_message(LogLevel::Info, "Wi-Fi profile action applied");
             let interface = app
@@ -1382,7 +1664,21 @@ async fn profile_request(
                 .as_ref()
                 .map(|v| v.interface.clone())
                 .unwrap_or_default();
-            open_profiles(app, client, interface).await;
+            let mode = app
+                .wifi_profiles
+                .as_ref()
+                .map(|v| v.mode)
+                .unwrap_or(WifiProfilesMode::Management);
+            open_profiles(app, client, interface, mode).await;
+        }
+        Ok(Response::WifiClientProfileDeleted { .. }) => {
+            app.push_message(LogLevel::Info, "Wi-Fi profile action applied");
+            let interface = app
+                .wifi_profiles
+                .as_ref()
+                .map(|v| v.interface.clone())
+                .unwrap_or_default();
+            open_profiles(app, client, interface, WifiProfilesMode::Management).await;
         }
         Ok(Response::WifiClientProfileError { detail }) => {
             app.push_message(LogLevel::Error, format!("{detail:?}"))
@@ -1562,7 +1858,7 @@ async fn save_profile(app: &mut TuiApp, client: &ApiClient) {
             if is_new {
                 open_wifi_connect_prompt(app, client, interface, profile_id, ssid).await;
             } else {
-                open_profiles(app, client, interface).await;
+                open_profiles(app, client, interface, WifiProfilesMode::Management).await;
             }
         }
         Ok(Response::WifiClientProfileError { detail }) => {
@@ -2572,7 +2868,8 @@ mod tests {
         let mut app = TuiApp::default();
         app.wifi_profiles = Some(WifiProfilesView {
             interface: "wlan0".into(),
-            selected: 43,
+            mode: WifiProfilesMode::Management,
+            selected: 39,
             selected_profile: 39,
             delete_confirmation: None,
             profiles: (0..40)
@@ -2600,9 +2897,18 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        assert!(text.contains("Delete selected"));
+        assert!(text.contains("p39"));
+        assert!(!text.contains("Create profile"));
         let client = ApiClient::new("/nonexistent.sock");
-        activate_profile_row(&mut app, &client).await;
+        handle_wifi_profiles_key(&mut app, KeyCode::Enter, &client).await;
+        assert_eq!(
+            app.wifi_profiles.as_ref().unwrap().mode,
+            WifiProfilesMode::ProfileActions
+        );
+        handle_wifi_profiles_key(&mut app, KeyCode::Down, &client).await;
+        handle_wifi_profiles_key(&mut app, KeyCode::Down, &client).await;
+        assert_eq!(app.wifi_profiles.as_ref().unwrap().selected, 2);
+        handle_wifi_profiles_key(&mut app, KeyCode::Enter, &client).await;
         assert_eq!(
             app.wifi_profiles
                 .as_ref()
@@ -2618,6 +2924,121 @@ mod tests {
             .unwrap()
             .delete_confirmation
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn wifi_profiles_menu_shows_management_and_create_new() {
+        let mut app = TuiApp::default();
+        app.wifi_profiles = Some(WifiProfilesView {
+            interface: "wlan0".into(),
+            mode: WifiProfilesMode::Menu,
+            selected: 0,
+            selected_profile: 0,
+            delete_confirmation: None,
+            profiles: vec![WifiClientProfileSummary {
+                id: "home".into(),
+                ssid: "HomeNet".into(),
+                country_code: None,
+                security: WifiClientSecurity::Wpa2,
+                priority: 10,
+                created_at: 0,
+                modified_at: 0,
+                has_passphrase: true,
+            }],
+        });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 15)).unwrap();
+        terminal
+            .draw(|frame| render_wifi_profiles(frame, frame.area(), &mut app))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Management"));
+        assert!(text.contains("Create new"));
+        // Top menu does not mix in profile table
+        assert!(!text.contains("HomeNet"));
+
+        let client = ApiClient::new("/nonexistent.sock");
+        // Down moves to Create new
+        handle_wifi_profiles_key(&mut app, KeyCode::Down, &client).await;
+        assert_eq!(app.wifi_profiles.as_ref().unwrap().selected, 1);
+
+        // Enter on Create new opens WifiProfileEditor
+        handle_wifi_profiles_key(&mut app, KeyCode::Enter, &client).await;
+        assert_eq!(app.screen, Screen::WifiProfileEditor);
+        assert!(app.wifi_profile_editor.is_some());
+
+        // Cancel editor returns to profiles
+        handle_wifi_profile_editor_key(&mut app, KeyCode::Esc, &client).await;
+        assert_eq!(app.screen, Screen::WifiProfiles);
+
+        // Now select Management
+        handle_wifi_profiles_key(&mut app, KeyCode::Up, &client).await;
+        assert_eq!(app.wifi_profiles.as_ref().unwrap().selected, 0);
+        handle_wifi_profiles_key(&mut app, KeyCode::Enter, &client).await;
+        assert_eq!(
+            app.wifi_profiles.as_ref().unwrap().mode,
+            WifiProfilesMode::Management
+        );
+
+        // In Management, HomeNet is displayed cleanly
+        terminal
+            .draw(|frame| render_wifi_profiles(frame, frame.area(), &mut app))
+            .unwrap();
+        let mgmt_text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(mgmt_text.contains("HomeNet"));
+        assert!(mgmt_text.contains("home"));
+
+        // Enter in Management opens ProfileActions
+        handle_wifi_profiles_key(&mut app, KeyCode::Enter, &client).await;
+        assert_eq!(
+            app.wifi_profiles.as_ref().unwrap().mode,
+            WifiProfilesMode::ProfileActions
+        );
+        terminal
+            .draw(|frame| render_wifi_profiles(frame, frame.area(), &mut app))
+            .unwrap();
+        let actions_text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(actions_text.contains("Activate / Connect"));
+        assert!(actions_text.contains("Edit profile"));
+        assert!(actions_text.contains("Delete profile"));
+        assert!(actions_text.contains("Deactivate client"));
+        assert!(actions_text.contains("Back to profile list"));
+
+        // Esc in ProfileActions goes back to Management
+        handle_wifi_profiles_key(&mut app, KeyCode::Esc, &client).await;
+        assert_eq!(
+            app.wifi_profiles.as_ref().unwrap().mode,
+            WifiProfilesMode::Management
+        );
+
+        // Esc in Management goes back to Menu
+        handle_wifi_profiles_key(&mut app, KeyCode::Esc, &client).await;
+        assert_eq!(
+            app.wifi_profiles.as_ref().unwrap().mode,
+            WifiProfilesMode::Menu
+        );
+
+        // Esc in Menu exits to Wifi screen
+        handle_wifi_profiles_key(&mut app, KeyCode::Esc, &client).await;
+        assert_eq!(app.screen, Screen::Wifi);
     }
 
     #[test]
@@ -2867,5 +3288,40 @@ mod tests {
         handle_wifi_connect_prompt_key(&mut app, KeyCode::Esc, &client).await;
         assert!(app.wifi_connect.is_none());
         assert_eq!(app.screen, Screen::Wifi);
+    }
+
+    #[test]
+    fn wifi_profile_actions_list_area_excludes_header_for_mouse_clicks() {
+        let mut app = TuiApp {
+            wifi_profiles: Some(WifiProfilesView {
+                interface: "wlan0".into(),
+                mode: WifiProfilesMode::ProfileActions,
+                selected: 0,
+                selected_profile: 0,
+                delete_confirmation: None,
+                profiles: vec![WifiClientProfileSummary {
+                    id: "p0".into(),
+                    ssid: "net0".into(),
+                    country_code: None,
+                    security: WifiClientSecurity::Open,
+                    priority: 0,
+                    created_at: 0,
+                    modified_at: 0,
+                    has_passphrase: false,
+                }],
+            }),
+            ..Default::default()
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| render_wifi_profiles(frame, frame.area(), &mut app))
+            .unwrap();
+
+        let list_area = app.ui.list_area.expect("list_area must be populated");
+        assert_eq!(app.ui.list_count, 5);
+        assert_eq!(app.ui.list_scroll_offset, 0);
+        // Header height is 2 lines, panel top border is 1 line, so list_area starts at y = 3
+        assert_eq!(list_area.y, 3);
     }
 }

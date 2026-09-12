@@ -1766,27 +1766,92 @@ impl ControlService {
             return wifi_client_disabled();
         };
         let _mutation = self.wifi_client_mutations.lock().await;
-        let previous = wifi_client
-            .status(&interface)
-            .await
-            .map(|status| status.spec);
-
-        if let Err(error) = wifi_client.disable(&interface).await {
-            return classify_wifi_client_error(error);
-        }
+        let _dhcp_mutation = if self.dhcp_client.is_some() {
+            Some(self.dhcp_client_mutations.lock().await)
+        } else {
+            None
+        };
 
         let committed = match self.overrides.effective_interface(&interface).await {
             Ok(config) => config,
             Err(error) => {
                 return wifi_client_error(WifiClientErrorDetail::Other {
                     message: error.to_string(),
-                })
+                });
             }
         };
         let Some(mut interface_config) = committed else {
+            let mut previous_dhcp = None;
+            if let Some(dhcp_client) = &self.dhcp_client {
+                match dhcp_client.disable(&interface).await {
+                    Ok(spec) => previous_dhcp = spec,
+                    Err(error) => {
+                        return wifi_client_error(WifiClientErrorDetail::Other {
+                            message: format!("failed to disable DHCP client: {error}"),
+                        });
+                    }
+                }
+            }
+            if let Err(error) = wifi_client.disable(&interface).await {
+                if let (Some(dhcp_client), Some(previous_dhcp)) = (&self.dhcp_client, previous_dhcp) {
+                    let _ = dhcp_client.configure_with_link_ready(previous_dhcp, false).await;
+                }
+                return classify_wifi_client_error(error);
+            }
             return Response::WifiClientDisabled { interface };
         };
+
+        let had_enabled_dhcp = interface_config
+            .dhcp_client
+            .as_ref()
+            .is_some_and(|c| c.enabled);
+        let previous_dhcp_spec = if had_enabled_dhcp {
+            DhcpClientSpec::from_interface_config(&interface, &interface_config)
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+
         interface_config.wifi_client = None;
+
+        let mut previous_dhcp = None;
+        if let Some(dhcp_client) = &self.dhcp_client {
+            match dhcp_client.disable(&interface).await {
+                Ok(disabled_spec) => {
+                    previous_dhcp = disabled_spec.or(previous_dhcp_spec.clone());
+                }
+                Err(error) => {
+                    tracing::warn!(%interface, %error, "failed to disable DHCP client during Wi-Fi disable");
+                    if let Some(previous_dhcp) = previous_dhcp_spec {
+                        let _ = dhcp_client.configure_with_link_ready(previous_dhcp, false).await;
+                    }
+                    return wifi_client_error(WifiClientErrorDetail::Other {
+                        message: format!("failed to disable DHCP client: {error}"),
+                    });
+                }
+            }
+        }
+        if had_enabled_dhcp {
+            interface_config.dhcp_client = Some(dhcp_client_request_to_config(
+                &DhcpClientConfigRequest::default(),
+                false,
+            ));
+            interface_config.managed = false;
+        }
+
+        let previous = wifi_client
+            .status(&interface)
+            .await
+            .map(|status| status.spec);
+
+        if let Err(error) = wifi_client.disable(&interface).await {
+            if let (Some(dhcp_client), Some(previous_dhcp)) = (&self.dhcp_client, previous_dhcp) {
+                let _ = dhcp_client.configure_with_link_ready(previous_dhcp, false).await;
+            }
+            return classify_wifi_client_error(error);
+        }
+
         if let Err(error) = self
             .overrides
             .set_interface(interface.clone(), interface_config, false)
@@ -1794,6 +1859,9 @@ impl ControlService {
         {
             if let Some(previous) = previous {
                 let _ = wifi_client.configure(previous).await;
+            }
+            if let (Some(dhcp_client), Some(previous_dhcp)) = (&self.dhcp_client, previous_dhcp) {
+                let _ = dhcp_client.configure_with_link_ready(previous_dhcp, false).await;
             }
             return wifi_client_error(WifiClientErrorDetail::Other {
                 message: format!(
@@ -7071,6 +7139,265 @@ mod tests {
             );
             assert!(fixture.supervisor.spec("wan0").await.is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn disabling_wifi_client_also_cleans_up_and_disables_active_dhcp_client() {
+        let directory = tempdir().expect("tempdir");
+        let mut config = wifi_client_base_config(directory.path());
+        let mut wlan1_cfg = config
+            .network
+            .interfaces
+            .get("wlan1")
+            .expect("wlan1 declared")
+            .clone();
+        wlan1_cfg.managed = true;
+        wlan1_cfg.dhcp_client = Some(DhcpClientInterfaceConfig::default());
+        config
+            .network
+            .interfaces
+            .insert("wlan1".to_string(), wlan1_cfg.clone());
+
+        let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+            .await
+            .expect("overrides");
+        let dhcp = DhcpSupervisor::start(&config)
+            .await
+            .expect("dhcp supervisor");
+        let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
+            addresses: Vec::new(),
+        });
+        let wifi_client =
+            ClientSupervisor::start_with_process(&config, FakeSupplicantProcess::new())
+                .await
+                .expect("wifi client supervisor");
+        let wifi_spec = WifiClientSpec::from_interface_config("wlan1", &wlan1_cfg)
+            .expect("valid")
+            .expect("wifi_client declared on wlan1");
+        wifi_client
+            .configure(wifi_spec)
+            .await
+            .expect("configure wlan1 wifi");
+
+        let dhcp_client = DhcpClientSupervisor::start(&config, network.clone())
+            .await
+            .expect("client supervisor");
+        let dhcp_spec = DhcpClientSpec::from_interface_config("wlan1", &wlan1_cfg)
+            .expect("valid")
+            .expect("dhcp_client declared on wlan1");
+        dhcp_client.configure(dhcp_spec).await;
+        assert!(dhcp_client.spec("wlan1").await.is_some());
+
+        let service = ControlService::new(config, network, dhcp, overrides.clone())
+            .with_wifi_client_supervisor(wifi_client)
+            .with_dhcp_client_supervisor(dhcp_client.clone());
+
+        let response = service
+            .dispatch(Request::DeactivateWifiClientProfile {
+                interface: "wlan1".to_string(),
+            })
+            .await;
+        assert!(
+            matches!(response, Response::WifiClientDisabled { .. }),
+            "got {response:?}"
+        );
+
+        // DHCP client supervisor must be stopped and purged
+        assert!(dhcp_client.spec("wlan1").await.is_none());
+
+        // Interface config in overrides must have wifi_client cleared and dhcp_client disabled
+        let persisted = overrides
+            .effective_interface("wlan1")
+            .await
+            .expect("overrides")
+            .expect("interface wlan1 exists");
+        assert!(persisted.wifi_client.is_none());
+        assert!(!persisted.managed);
+        assert!(!persisted.dhcp_client.expect("dhcp_client block").enabled);
+    }
+
+    #[tokio::test]
+    async fn disabling_wifi_client_restores_dhcp_and_wifi_if_persistence_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().expect("tempdir");
+        let mut config = wifi_client_base_config(directory.path());
+        let mut wlan1_cfg = config
+            .network
+            .interfaces
+            .get("wlan1")
+            .expect("wlan1 declared")
+            .clone();
+        wlan1_cfg.managed = true;
+        wlan1_cfg.dhcp_client = Some(DhcpClientInterfaceConfig::default());
+        config
+            .network
+            .interfaces
+            .insert("wlan1".to_string(), wlan1_cfg.clone());
+
+        let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+            .await
+            .expect("overrides");
+        let dhcp = DhcpSupervisor::start(&config)
+            .await
+            .expect("dhcp supervisor");
+        let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
+            addresses: Vec::new(),
+        });
+        let wifi_client =
+            ClientSupervisor::start_with_process(&config, FakeSupplicantProcess::new())
+                .await
+                .expect("wifi client supervisor");
+        let wifi_spec = WifiClientSpec::from_interface_config("wlan1", &wlan1_cfg)
+            .expect("valid")
+            .expect("wifi_client declared on wlan1");
+        wifi_client
+            .configure(wifi_spec)
+            .await
+            .expect("configure wlan1 wifi");
+
+        let dhcp_client = DhcpClientSupervisor::start(&config, network.clone())
+            .await
+            .expect("client supervisor");
+        let dhcp_spec = DhcpClientSpec::from_interface_config("wlan1", &wlan1_cfg)
+            .expect("valid")
+            .expect("dhcp_client declared on wlan1");
+        dhcp_client.configure(dhcp_spec).await;
+        assert!(dhcp_client.spec("wlan1").await.is_some());
+
+        // Make the override directory read-only so set_interface will fail persistence
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o500))
+            .expect("read-only permissions");
+
+        let service = ControlService::new(config, network, dhcp, overrides.clone())
+            .with_wifi_client_supervisor(wifi_client.clone())
+            .with_dhcp_client_supervisor(dhcp_client.clone());
+
+        let response = service
+            .dispatch(Request::DeactivateWifiClientProfile {
+                interface: "wlan1".to_string(),
+            })
+            .await;
+        assert!(
+            matches!(response, Response::WifiClientError { .. }),
+            "got {response:?}"
+        );
+
+        // Restore permissions so tempdir cleanup doesn't error
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("restore permissions");
+
+        // Both Wi-Fi and DHCP client supervisors must be restored
+        assert!(wifi_client.status("wlan1").await.is_some());
+        assert!(dhcp_client.spec("wlan1").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn disabling_wifi_client_fails_and_restores_state_if_dhcp_disable_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().expect("tempdir");
+        let mut config = wifi_client_base_config(directory.path());
+        let mut wlan1_cfg = config
+            .network
+            .interfaces
+            .get("wlan1")
+            .expect("wlan1 declared")
+            .clone();
+        wlan1_cfg.managed = true;
+        wlan1_cfg.dhcp_client = Some(DhcpClientInterfaceConfig::default());
+        config
+            .network
+            .interfaces
+            .insert("wlan1".to_string(), wlan1_cfg.clone());
+
+        let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+            .await
+            .expect("overrides");
+        let dhcp = DhcpSupervisor::start(&config)
+            .await
+            .expect("dhcp supervisor");
+        let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
+            addresses: Vec::new(),
+        });
+        let wifi_client =
+            ClientSupervisor::start_with_process(&config, FakeSupplicantProcess::new())
+                .await
+                .expect("wifi client supervisor");
+        let wifi_spec = WifiClientSpec::from_interface_config("wlan1", &wlan1_cfg)
+            .expect("valid")
+            .expect("wifi_client declared on wlan1");
+        wifi_client
+            .configure(wifi_spec)
+            .await
+            .expect("configure wlan1 wifi");
+
+        let dhcp_client = DhcpClientSupervisor::start(&config, network.clone())
+            .await
+            .expect("client supervisor");
+        let dhcp_spec = DhcpClientSpec::from_interface_config("wlan1", &wlan1_cfg)
+            .expect("valid")
+            .expect("dhcp_client declared on wlan1");
+        dhcp_client.configure(dhcp_spec).await;
+        assert!(dhcp_client.spec("wlan1").await.is_some());
+
+        let store = crate::dhcp::client::store::DhcpClientLeaseStore::new(&config.runtime.state_dir)
+            .expect("store");
+        let lease = crate::dhcp::client::lease::DhcpClientLease {
+            schema_version: crate::dhcp::client::lease::DHCP_CLIENT_LEASE_SCHEMA_VERSION,
+            state: crate::dhcp::client::lease::DhcpClientLeaseState::Bound,
+            interface: "wlan1".into(),
+            interface_index: 2,
+            hardware_address: vec![2, 0, 0, 0, 0, 1],
+            client_identifier: vec![1, 2, 0, 0, 0, 0, 1],
+            server_identifier: std::net::Ipv4Addr::new(192, 0, 2, 1),
+            address: std::net::Ipv4Addr::new(192, 0, 2, 20),
+            prefix_len: 24,
+            routers: vec![std::net::Ipv4Addr::new(192, 0, 2, 1)],
+            dns_servers: vec![std::net::Ipv4Addr::new(192, 0, 2, 53)],
+            lease_seconds: 3600,
+            renewal_seconds: 1800,
+            rebinding_seconds: 3150,
+            expires_at_unix: 10_000,
+            owned_routes: Vec::new(),
+        };
+        store.save(&lease).expect("save initial lease");
+
+        // Make dhcp-client directory read-only so cleanup save fails during dhcp disable
+        let dhcp_client_dir = store.directory();
+        std::fs::set_permissions(dhcp_client_dir, std::fs::Permissions::from_mode(0o500))
+            .expect("read-only permissions");
+
+        let service = ControlService::new(config, network, dhcp, overrides.clone())
+            .with_wifi_client_supervisor(wifi_client.clone())
+            .with_dhcp_client_supervisor(dhcp_client.clone());
+
+        let response = service
+            .dispatch(Request::DeactivateWifiClientProfile {
+                interface: "wlan1".to_string(),
+            })
+            .await;
+        assert!(
+            matches!(response, Response::WifiClientError { .. }),
+            "got {response:?}"
+        );
+
+        // Restore permissions
+        std::fs::set_permissions(dhcp_client_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("restore permissions");
+
+        // Both Wi-Fi and DHCP client supervisors must remain configured
+        assert!(wifi_client.status("wlan1").await.is_some());
+        assert!(dhcp_client.spec("wlan1").await.is_some());
+
+        // Overrides must not have been modified
+        let current = overrides
+            .effective_interface("wlan1")
+            .await
+            .expect("overrides")
+            .expect("interface exists");
+        assert!(current.wifi_client.is_some());
+        assert!(current.managed);
     }
 
     use crate::api::model::{ProvisioningOutputRequest, ProvisioningUplinkRequest};

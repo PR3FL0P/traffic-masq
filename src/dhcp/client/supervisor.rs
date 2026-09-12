@@ -324,6 +324,10 @@ impl DhcpClientSupervisor {
     pub async fn disable(&self, interface: &str) -> Result<Option<DhcpClientSpec>> {
         let _operation = self.inner.operation_lock.lock().await;
         if !self.inner.tasks.lock().await.contains_key(interface) {
+            if let Err(error) = self.inner.applier.cleanup(interface).await {
+                tracing::warn!(%interface, %error, "failed to release owned DHCP client state while disabling it; cleanup will be retried");
+                return Err(error.into());
+            }
             return Ok(None);
         }
         self.stop_task(interface).await;

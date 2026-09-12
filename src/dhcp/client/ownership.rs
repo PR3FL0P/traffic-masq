@@ -193,7 +193,14 @@ impl DhcpClientOwnershipApplier {
         let Some(mut lease) = self.store.load(interface)? else {
             return Ok(());
         };
-        self.verify_identity(&lease).await?;
+        match self.verify_identity(&lease).await {
+            Ok(()) => {}
+            Err(OwnershipError::Conflict(OwnershipConflict::InterfaceMissing { .. })) => {
+                self.store.remove(interface)?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
         lease.state = DhcpClientLeaseState::CleanupNeeded;
         self.store.save(&lease)?;
         let routes = self
@@ -441,6 +448,7 @@ mod tests {
         routes: Mutex<Vec<Ipv4RouteInfo>>,
         route_adds: Mutex<usize>,
         fail_route_add: Mutex<Option<usize>>,
+        hide_interface: Mutex<bool>,
     }
 
     impl FakeNetwork {
@@ -456,6 +464,9 @@ mod tests {
     #[async_trait]
     impl NetworkProvider for FakeNetwork {
         async fn list_interfaces(&self) -> Result<Vec<NetworkInterface>> {
+            if *self.hide_interface.lock().unwrap() {
+                return Ok(Vec::new());
+            }
             Ok(vec![NetworkInterface {
                 index: *self.index.lock().unwrap(),
                 name: "eth0".into(),
@@ -771,5 +782,20 @@ mod tests {
         ));
         assert!(store.load("eth0").unwrap().is_none());
         assert!(network.addresses.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_interface_cleanup_removes_record_cleanly() {
+        let network = FakeNetwork::new();
+        let (_dir, store, applier) = fixture(network.clone());
+        let _bound = applier.apply(lease()).await.unwrap();
+        assert!(store.load("eth0").unwrap().is_some());
+
+        *network.hide_interface.lock().unwrap() = true;
+        applier
+            .cleanup("eth0")
+            .await
+            .expect("missing interface cleanup must succeed");
+        assert!(store.load("eth0").unwrap().is_none());
     }
 }

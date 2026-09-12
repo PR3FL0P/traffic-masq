@@ -65,7 +65,7 @@ impl NetworkProvider for FakeNetwork {
             interface_index: 7,
             address: Ipv4Addr::new(192, 168, 99, 1),
             prefix_len: 24,
-            protocol: None,
+            protocol: Some(traffic_masq::netlink::TRAFFIC_MASQ_ADDRESS_PROTOCOL),
         }])
     }
 

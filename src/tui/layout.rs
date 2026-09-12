@@ -180,7 +180,7 @@ fn screen_help_pairs(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("Enter", "create profile"),
             ("Esc", "back"),
         ],
-        Screen::WifiProfiles => vec![("↑/↓", "move"), ("Enter", "activate"), ("Esc", "back")],
+        Screen::WifiProfiles => vec![("↑/↓", "move"), ("Enter", "select"), ("Esc", "back")],
         Screen::InterfaceList
         | Screen::DhcpInterfaceList
         | Screen::DhcpClient
