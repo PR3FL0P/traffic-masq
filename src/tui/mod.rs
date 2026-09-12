@@ -852,7 +852,7 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                                 if let Some(view) = app.wifi_profiles.as_mut() {
                                     match view.mode {
                                         wifi::WifiProfilesMode::Menu => {
-                                            if index < 2 {
+                                            if index < wifi::WifiProfilesMenuAction::ALL.len() {
                                                 view.selected = index;
                                             }
                                         }
@@ -863,7 +863,7 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                                             }
                                         }
                                         wifi::WifiProfilesMode::ProfileActions => {
-                                            if index < 5 {
+                                            if index < wifi::WifiProfileAction::ALL.len() {
                                                 view.selected = index;
                                             }
                                         }
