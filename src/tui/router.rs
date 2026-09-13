@@ -1538,8 +1538,6 @@ pub(crate) async fn refresh_router_data(app: &mut TuiApp, client: &ApiClient) {
 
 pub(crate) async fn load_router_data(app: &mut TuiApp, client: &ApiClient) {
     app.router.error = None;
-    app.router.topology.loaded = false;
-    app.router.plan = None;
 
     match client.request(&Request::RouterStatus).await {
         Ok(Response::RouterStatus {
@@ -1555,6 +1553,8 @@ pub(crate) async fn load_router_data(app: &mut TuiApp, client: &ApiClient) {
         }
         Ok(Response::RouterError { detail }) => {
             app.router.error = Some(detail);
+            app.router.topology.loaded = false;
+            app.router.plan = None;
             return;
         }
         Ok(response) => {
@@ -1562,10 +1562,14 @@ pub(crate) async fn load_router_data(app: &mut TuiApp, client: &ApiClient) {
                 LogLevel::Error,
                 format!("Unexpected response: {response:?}"),
             );
+            app.router.topology.loaded = false;
+            app.router.plan = None;
             return;
         }
         Err(error) => {
             app.push_message(LogLevel::Error, error.to_string());
+            app.router.topology.loaded = false;
+            app.router.plan = None;
             return;
         }
     }
@@ -1625,12 +1629,21 @@ pub(crate) async fn load_router_data(app: &mut TuiApp, client: &ApiClient) {
             app.router.lease_counts = lease_counts;
             app.router.plan = Some(plan);
         }
-        Ok(Response::RouterError { detail }) => app.router.error = Some(detail),
-        Ok(response) => app.push_message(
-            LogLevel::Error,
-            format!("Unexpected response: {response:?}"),
-        ),
-        Err(error) => app.push_message(LogLevel::Error, error.to_string()),
+        Ok(Response::RouterError { detail }) => {
+            app.router.error = Some(detail);
+            app.router.plan = None;
+        }
+        Ok(response) => {
+            app.push_message(
+                LogLevel::Error,
+                format!("Unexpected response: {response:?}"),
+            );
+            app.router.plan = None;
+        }
+        Err(error) => {
+            app.push_message(LogLevel::Error, error.to_string());
+            app.router.plan = None;
+        }
     }
 }
 

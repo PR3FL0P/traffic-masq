@@ -2,7 +2,7 @@ use ratatui::text::{Line, Span};
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossterm::event::{
@@ -410,7 +410,12 @@ pub async fn run_tui(socket_path: PathBuf, direct: bool) -> Result<()> {
     enable_raw_mode()?;
     let terminal_guard = TerminalGuard;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        crossterm::cursor::Hide
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -454,6 +459,8 @@ async fn run_loop(
         }
     }
     let mut has_authenticated = client.is_authenticated().await;
+    let mut last_refresh: Option<Instant> = None;
+    let mut queued_input: Option<Event> = None;
 
     while !app.should_quit {
         if !direct && !client.is_authenticated().await {
@@ -462,6 +469,7 @@ async fn run_loop(
                 break;
             }
             has_authenticated = true;
+            last_refresh = None;
             match session::remember(client).await {
                 Ok(_) => app.push_message(
                     LogLevel::Info,
@@ -473,57 +481,81 @@ async fn run_loop(
                 ),
             }
         }
-        let snapshot = terminal
-            .draw(|frame| render(frame, &mut app, direct))?
-            .buffer
-            .clone();
-        let deadline = pending_deadline(&app);
-        let refresh = async {
-            app.dashboard = if direct {
-                load_direct_dashboard(direct_network.as_ref()).await
-            } else {
-                load_daemon_dashboard(client).await
-            };
-            normalize_selection(&mut app);
-            refresh_pending_screen(&mut app);
-            dashboard::record_traffic_samples(&mut app);
 
-            if !direct && matches!(app.screen, Screen::Router | Screen::RouterPlan) {
-                router::load_router_data(&mut app, client).await;
-            }
-            if !direct {
-                router::refresh_router_pending_screen(&mut app, client).await;
-            }
-            if !direct && app.screen == Screen::RouterProvisioningPending {
-                provisioning::refresh_pending(&mut app, client).await;
-            }
-            if !direct && app.screen == Screen::Settings {
-                settings::refresh_settings_status(&mut app, client).await;
-            }
-            if !direct && app.screen == Screen::Access {
-                access::refresh_access_status(&mut app, client).await;
-            }
-            if !direct && app.screen == Screen::Wifi {
-                wifi::load_wifi_data(&mut app, client).await;
-            }
-            if !direct && app.screen == Screen::VpnPolicy {
-                vpn_policy::refresh_vpn_policy_status(&mut app, client).await;
-            }
-            if !direct && app.screen == Screen::DhcpLeases {
-                dhcp::refresh_dhcp_leases(&mut app, client).await;
-            }
-            if !direct && app.screen == Screen::Vpn {
-                vpn::load_vpn_data(&mut app, client).await;
-            }
+        let refresh_interval = if pending_deadline(&app).is_some() {
+            Duration::from_millis(500)
+        } else {
+            Duration::from_secs(1)
         };
-        let queued = drive_ui(terminal, snapshot, deadline, refresh, true).await?;
 
-        terminal.draw(|frame| render(frame, &mut app, direct))?;
+        let should_refresh = last_refresh.is_none_or(|t| t.elapsed() >= refresh_interval);
 
-        let input = if queued.is_some() {
-            queued
-        } else if event::poll(Duration::from_millis(100))? {
-            Some(event::read()?)
+        if should_refresh {
+            let snapshot = terminal
+                .draw(|frame| render(frame, &mut app, direct))?
+                .buffer
+                .clone();
+            let deadline = pending_deadline(&app);
+            let refresh = async {
+                app.dashboard = if direct {
+                    load_direct_dashboard(direct_network.as_ref()).await
+                } else {
+                    load_daemon_dashboard(client).await
+                };
+                normalize_selection(&mut app);
+                refresh_pending_screen(&mut app);
+                dashboard::record_traffic_samples(&mut app);
+
+                if !direct && matches!(app.screen, Screen::Router | Screen::RouterPlan) {
+                    router::load_router_data(&mut app, client).await;
+                }
+                if !direct {
+                    router::refresh_router_pending_screen(&mut app, client).await;
+                }
+                if !direct && app.screen == Screen::RouterProvisioningPending {
+                    provisioning::refresh_pending(&mut app, client).await;
+                }
+                if !direct && app.screen == Screen::Settings {
+                    settings::refresh_settings_status(&mut app, client).await;
+                }
+                if !direct && app.screen == Screen::Access {
+                    access::refresh_access_status(&mut app, client).await;
+                }
+                if !direct && app.screen == Screen::Wifi {
+                    wifi::load_wifi_data(&mut app, client).await;
+                }
+                if !direct && app.screen == Screen::VpnPolicy {
+                    vpn_policy::refresh_vpn_policy_status(&mut app, client).await;
+                }
+                if !direct && app.screen == Screen::DhcpLeases {
+                    dhcp::refresh_dhcp_leases(&mut app, client).await;
+                }
+                if !direct && app.screen == Screen::Vpn {
+                    vpn::load_vpn_data(&mut app, client).await;
+                }
+            };
+            let interrupted = drive_ui(terminal, snapshot, deadline, refresh, true).await?;
+            if interrupted.is_some() {
+                queued_input = interrupted;
+            } else {
+                last_refresh = Some(Instant::now());
+                terminal.draw(|frame| render(frame, &mut app, direct))?;
+            }
+        }
+
+        let poll_timeout = refresh_interval
+            .saturating_sub(last_refresh.map_or(Duration::ZERO, |t| t.elapsed()))
+            .min(Duration::from_millis(100));
+
+        let input = if queued_input.is_some() {
+            queued_input.take()
+        } else if event::poll(poll_timeout)? {
+            let ev = event::read()?;
+            match ev {
+                Event::Mouse(m) if matches!(m.kind, MouseEventKind::Moved) => None,
+                Event::Key(k) if k.kind != event::KeyEventKind::Press => None,
+                _ => Some(ev),
+            }
         } else {
             None
         };
@@ -550,6 +582,7 @@ async fn run_loop(
             {
                 app.should_quit = true;
             }
+            terminal.draw(|frame| render(frame, &mut app, direct))?;
         }
 
         if terminal::size().is_err() {
@@ -590,14 +623,23 @@ async fn drive_ui(
             biased;
             _ = &mut operation => return Ok(exit_requested),
             _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                terminal.draw(|frame| {
-                    render_operation_snapshot(
-                        frame, &snapshot, deadline, started.elapsed(), cancellable,
-                    );
-                })?;
-                if event::poll(Duration::ZERO)? {
+                let elapsed = started.elapsed();
+                let is_resized = terminal.size().ok().map(|s| ratatui::layout::Rect::new(0, 0, s.width, s.height)) != Some(snapshot.area);
+                let should_render = !is_resized
+                    && (!cancellable
+                        || elapsed >= Duration::from_millis(500)
+                        || deadline.is_some());
+                if should_render {
+                    terminal.draw(|frame| {
+                        render_operation_snapshot(
+                            frame, &snapshot, deadline, elapsed, cancellable,
+                        );
+                    })?;
+                }
+                while event::poll(Duration::ZERO)? {
                     let input = event::read()?;
                     if matches!(input, Event::Key(k) if k.kind != event::KeyEventKind::Press) { continue; }
+                    if matches!(input, Event::Mouse(m) if matches!(m.kind, MouseEventKind::Moved)) { continue; }
                     if cancellable { return Ok(Some(input)); }
                     if matches!(input, Event::Key(k) if k.code == KeyCode::Char('q')) { exit_requested = Some(input); }
                 }
@@ -1003,7 +1045,7 @@ pub(crate) fn format_message_lines(text: &str) -> Vec<Line<'_>> {
                 }
                 Line::from(spans)
             } else {
-                Line::raw(line)
+                Line::from(vec![Span::raw(line)])
             }
         })
         .collect()

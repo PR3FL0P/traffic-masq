@@ -119,16 +119,32 @@ pub(crate) struct TrafficSample {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TrafficHistory {
     last: Option<TrafficSample>,
-    pub(crate) rx_rate_history: VecDeque<u64>,
-    pub(crate) tx_rate_history: VecDeque<u64>,
+    rx_rate_history: VecDeque<u64>,
+    tx_rate_history: VecDeque<u64>,
     pub(crate) current_rx_rate: u64,
     pub(crate) current_tx_rate: u64,
 }
 
 pub(crate) const TRAFFIC_HISTORY_LEN: usize = 96;
-pub(crate) const TRAFFIC_MIN_SAMPLE_INTERVAL: Duration = Duration::from_millis(200);
+pub(crate) const TRAFFIC_MIN_SAMPLE_INTERVAL: Duration = Duration::from_millis(400);
 
 impl TrafficHistory {
+    pub(crate) fn rx_rates(&self) -> &[u64] {
+        debug_assert!(
+            self.rx_rate_history.as_slices().1.is_empty(),
+            "rx_rate_history must be contiguous"
+        );
+        self.rx_rate_history.as_slices().0
+    }
+
+    pub(crate) fn tx_rates(&self) -> &[u64] {
+        debug_assert!(
+            self.tx_rate_history.as_slices().1.is_empty(),
+            "tx_rate_history must be contiguous"
+        );
+        self.tx_rate_history.as_slices().0
+    }
+
     pub(crate) fn record(&mut self, rx_bytes: u64, tx_bytes: u64, now: Instant) {
         let Some(last) = self.last.clone() else {
             self.last = Some(TrafficSample {
@@ -162,6 +178,7 @@ fn push_capped(queue: &mut VecDeque<u64>, value: u64) {
     if queue.len() > TRAFFIC_HISTORY_LEN {
         queue.pop_front();
     }
+    queue.make_contiguous();
 }
 
 pub(crate) fn format_rate(bytes_per_sec: u64) -> String {
@@ -474,22 +491,22 @@ fn render_traffic_row(
     header.spans.extend(format_addresses(status));
     frame.render_widget(Paragraph::new(header), rows[0]);
 
-    let rx_data: Vec<u64> = history
-        .map(|history| history.rx_rate_history.iter().copied().collect())
-        .unwrap_or_default();
-    let tx_data: Vec<u64> = history
-        .map(|history| history.tx_rate_history.iter().copied().collect())
-        .unwrap_or_default();
+    let rx_slice = history
+        .map(|history| history.rx_rates())
+        .unwrap_or(&[]);
+    let tx_slice = history
+        .map(|history| history.tx_rates())
+        .unwrap_or(&[]);
 
     frame.render_widget(
         Sparkline::default()
-            .data(rx_data)
+            .data(rx_slice)
             .style(Style::default().fg(theme::ACCENT)),
         rows[1],
     );
     frame.render_widget(
         Sparkline::default()
-            .data(tx_data)
+            .data(tx_slice)
             .style(Style::default().fg(theme::ACCENT_ALT)),
         rows[2],
     );

@@ -357,7 +357,10 @@ pub(crate) async fn handle_settings_key(app: &mut TuiApp, key: KeyCode, client: 
             {
                 editor.confirmation = Some(editor.field);
             }
-            SettingsField::SaveSession => save_session_preferences(app, client).await,
+            SettingsField::SaveSession => {
+                editor.confirmation = None;
+                save_session_preferences(app, client).await;
+            }
             SettingsField::ChangePassword => {
                 app.settings_password = Some(PasswordChangeEditor::new());
                 app.screen = Screen::SettingsPassword;
@@ -365,8 +368,14 @@ pub(crate) async fn handle_settings_key(app: &mut TuiApp, key: KeyCode, client: 
             SettingsField::Access => {
                 super::access::open_access_editor(app, client).await;
             }
-            SettingsField::Reset => reset_security_settings(app, client).await,
-            SettingsField::Save => submit_security_settings(app, client).await,
+            SettingsField::Reset => {
+                editor.confirmation = None;
+                reset_security_settings(app, client).await;
+            }
+            SettingsField::Save => {
+                editor.confirmation = None;
+                submit_security_settings(app, client).await;
+            }
             SettingsField::Reload => load_settings_data(app, client).await,
         },
         key if editor.is_editing()
