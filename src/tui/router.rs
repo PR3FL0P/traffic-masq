@@ -5,8 +5,7 @@ use ipnet::Ipv4Net;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Gauge;
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Cell, Gauge, Paragraph, Row, Table};
 
 use crate::api::client::ApiClient;
 use crate::api::model::{Request, Response, RouteStatus, RouterErrorDetail, RouterProposalRequest};
@@ -184,7 +183,7 @@ fn format_owner_badge(owner: RouteOwner) -> Span<'static> {
         RouteOwner::TrafficMasqDhcp => {
             Span::styled(owner.to_string(), Style::default().fg(theme::ACCENT))
         }
-        _ => Span::styled(owner.to_string(), Style::default().fg(theme::MUTED)),
+        _ => Span::styled(owner.to_string(), Style::default().fg(theme::WARN)),
     }
 }
 
@@ -647,12 +646,57 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
     let table_inner = table_block.inner(chunks[1]);
     frame.render_widget(table_block, chunks[1]);
 
-    let mut table_lines = vec![Line::styled(
-        "   Destination         Gateway          Interface   Metric  Table       Owner",
+    let headers = [
+        "",
+        "Destination",
+        "Gateway",
+        "Interface",
+        "Metric",
+        "Table",
+        "Owner",
+    ];
+    let route_cells: Vec<_> = router
+        .routes
+        .iter()
+        .map(|route| {
+            [
+                route.destination.to_string(),
+                route
+                    .gateway
+                    .map(|g| g.to_string())
+                    .unwrap_or_else(|| "direct".into()),
+                route.output_interface.clone().unwrap_or_else(|| "-".into()),
+                route
+                    .metric
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| "-".into()),
+                match route.table {
+                    254 => "main (254)".into(),
+                    255 => "local (255)".into(),
+                    table => table.to_string(),
+                },
+            ]
+        })
+        .collect();
+    // Measure all routes so columns stay aligned while scrolling, including
+    // long interface names and the full range of metric/table values.
+    let mut widths = vec![Constraint::Length(1)];
+    for column in 0..5 {
+        let width = route_cells
+            .iter()
+            .map(|cells| Span::raw(cells[column].as_str()).width())
+            .max()
+            .unwrap_or(0)
+            .max(headers[column + 1].len());
+        widths.push(Constraint::Length(width as u16));
+    }
+    widths.push(Constraint::Min(5));
+    let header = Row::new(headers).style(
         Style::default()
             .fg(theme::MUTED)
             .add_modifier(Modifier::BOLD),
-    )];
+    );
+    let mut rows = Vec::new();
 
     let header_offset = 1;
     let available_rows = table_inner.height.saturating_sub(header_offset as u16) as usize;
@@ -672,12 +716,7 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
     app.ui.list_count = router.routes.len();
     app.ui.list_scroll_offset = scroll;
 
-    if router.routes.is_empty() {
-        table_lines.push(Line::styled(
-            "   No routes found.",
-            Style::default().fg(theme::MUTED),
-        ));
-    } else {
+    if !router.routes.is_empty() {
         for (index, route) in router
             .routes
             .iter()
@@ -686,52 +725,37 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
             .take(available_rows)
         {
             let is_selected = index == router.selected_route;
-            let marker = if is_selected { "▶ " } else { "  " };
-            let style = if is_selected && router.focus == RouterFocus::RouteTable {
-                Style::default()
-                    .fg(theme::ACCENT)
-                    .add_modifier(Modifier::BOLD)
+            let marker = if is_selected { "▶" } else { " " };
+            let mut style = if !route.owner.is_owned() {
+                Style::default().fg(theme::WARN)
             } else if is_selected {
                 Style::default().fg(theme::ACCENT)
             } else {
                 Style::default()
             };
-
-            let dest = format!("{:<20}", route.destination);
-            let gw = format!(
-                "{:<17}",
-                route
-                    .gateway
-                    .map(|g| g.to_string())
-                    .unwrap_or_else(|| "direct".to_string())
+            if is_selected && router.focus == RouterFocus::RouteTable {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            let mut cells = vec![Cell::from(marker)];
+            cells.extend(
+                route_cells[index]
+                    .iter()
+                    .map(|value| Cell::from(value.as_str())),
             );
-            let iface = format!("{:<12}", route.output_interface.as_deref().unwrap_or("-"));
-            let metric = format!(
-                "{:<8}",
-                route
-                    .metric
-                    .map(|m| m.to_string())
-                    .unwrap_or_else(|| "-".to_string())
-            );
-            let table = format!(
-                "{:<12}",
-                if route.table == 254 {
-                    "main (254)".to_string()
-                } else if route.table == 255 {
-                    "local (255)".to_string()
-                } else {
-                    route.table.to_string()
-                }
-            );
-            let badge = format_owner_badge(route.owner);
-
-            table_lines.push(Line::from(vec![
-                Span::styled(format!("{marker}{dest}{gw}{iface}{metric}{table}"), style),
-                badge,
-            ]));
+            cells.push(Cell::from(format_owner_badge(route.owner)));
+            rows.push(Row::new(cells).style(style));
         }
     }
-    frame.render_widget(Paragraph::new(table_lines), table_inner);
+    frame.render_widget(
+        Table::new(rows, widths).header(header).column_spacing(2),
+        table_inner,
+    );
+    if router.routes.is_empty() {
+        frame.render_widget(
+            Paragraph::new("   No routes found.").style(Style::default().fg(theme::MUTED)),
+            app.ui.list_area.unwrap(),
+        );
+    }
 
     let actions_block = panel("Actions");
     let actions_inner = actions_block.inner(chunks[2]);
@@ -1828,7 +1852,7 @@ mod tests {
 
         let kernel_badge = format_owner_badge(RouteOwner::Kernel);
         assert_eq!(kernel_badge.content, "[ext:kernel]");
-        assert_eq!(kernel_badge.style.fg, Some(theme::MUTED));
+        assert_eq!(kernel_badge.style.fg, Some(theme::WARN));
     }
 
     #[test]
