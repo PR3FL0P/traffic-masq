@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 
 use super::theme;
-use super::{section_of, Screen, Section, TuiApp, SECTIONS};
+use super::{active_sections, section_of, Screen, Section, TuiApp};
 
 pub(crate) fn panel(title: &str) -> Block<'static> {
     Block::default()
@@ -30,7 +30,7 @@ pub(crate) fn focused_lines_offset(lines: &[Line<'_>], height: u16) -> usize {
 #[derive(Debug, Default, Clone)]
 pub(crate) struct UiLayout {
     pub(crate) input_enabled: bool,
-    pub(crate) tabs: [Rect; SECTIONS.len()],
+    pub(crate) tabs: Vec<(Rect, Section)>,
     pub(crate) list_area: Option<Rect>,
     pub(crate) list_row_height: u16,
     pub(crate) list_count: usize,
@@ -45,10 +45,9 @@ pub(crate) fn point_in_rect(point: (u16, u16), rect: Rect) -> bool {
     x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
 }
 
-pub(crate) fn section_at(tabs: &[Rect], point: (u16, u16)) -> Option<Section> {
+pub(crate) fn section_at(tabs: &[(Rect, Section)], point: (u16, u16)) -> Option<Section> {
     tabs.iter()
-        .zip(SECTIONS.iter())
-        .find(|(rect, _)| point_in_rect(point, **rect))
+        .find(|(rect, _)| point_in_rect(point, *rect))
         .map(|(_, section)| *section)
 }
 
@@ -82,20 +81,22 @@ pub(crate) fn render_header(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let sections = active_sections(app.show_dhcp_client);
     let segments = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(vec![
-            Constraint::Ratio(1, SECTIONS.len() as u32);
-            SECTIONS.len()
+            Constraint::Ratio(1, sections.len() as u32);
+            sections.len()
         ])
         .split(inner);
     app.ui.tabs = segments
-        .as_ref()
-        .try_into()
-        .expect("tab bar always splits into SECTIONS.len() segments");
+        .iter()
+        .copied()
+        .zip(sections.iter().copied())
+        .collect();
 
     let active = section_of(app.screen);
-    for (index, section) in SECTIONS.iter().enumerate() {
+    for (index, section) in sections.iter().enumerate() {
         let selected = *section == active;
         let style = if selected {
             Style::default()
@@ -117,7 +118,12 @@ pub(crate) fn render_header(
 
 pub(crate) fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &TuiApp) {
     let mut spans = Vec::new();
-    for (index, (key, description)) in screen_help_pairs(app.screen).into_iter().enumerate() {
+    let help = if app.screen == Screen::Router && app.router.topology.open {
+        vec![("Arrows", "scroll"), ("PgUp/Dn", "page"), ("Esc/t", "back")]
+    } else {
+        screen_help_pairs(app.screen)
+    };
+    for (index, (key, description)) in help.into_iter().enumerate() {
         if index > 0 {
             spans.push(Span::styled("  ", Style::default().fg(theme::MUTED)));
         }
@@ -181,14 +187,20 @@ fn screen_help_pairs(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("Esc", "back"),
         ],
         Screen::WifiProfiles => vec![("↑/↓", "move"), ("Enter", "select"), ("Esc", "back")],
-        Screen::InterfaceList
-        | Screen::DhcpInterfaceList
-        | Screen::DhcpClient
-        | Screen::Router
-        | Screen::Vpn => vec![
+        Screen::InterfaceList | Screen::DhcpInterfaceList | Screen::DhcpClient | Screen::Vpn => {
+            vec![
+                ("↑/↓", "move"),
+                ("←/→", "section"),
+                ("Enter", "select"),
+                ("Esc", "back"),
+            ]
+        }
+        Screen::Router => vec![
             ("↑/↓", "move"),
-            ("←/→", "section"),
-            ("Enter", "select"),
+            ("t", "topology"),
+            ("Tab", "focus"),
+            ("Enter", "activate"),
+            ("Del", "delete"),
             ("Esc", "back"),
         ],
         Screen::Access
@@ -266,15 +278,15 @@ mod tests {
     #[test]
     fn section_at_finds_the_tab_containing_the_click_point() {
         let tabs = [
-            Rect::new(0, 0, 8, 1),
-            Rect::new(8, 0, 8, 1),
-            Rect::new(16, 0, 8, 1),
-            Rect::new(24, 0, 8, 1),
-            Rect::new(32, 0, 8, 1),
-            Rect::new(40, 0, 8, 1),
-            Rect::new(48, 0, 8, 1),
-            Rect::new(56, 0, 8, 1),
-            Rect::new(64, 0, 8, 1),
+            (Rect::new(0, 0, 8, 1), Section::Dashboard),
+            (Rect::new(8, 0, 8, 1), Section::Interfaces),
+            (Rect::new(16, 0, 8, 1), Section::Dhcp),
+            (Rect::new(24, 0, 8, 1), Section::DhcpClient),
+            (Rect::new(32, 0, 8, 1), Section::Router),
+            (Rect::new(40, 0, 8, 1), Section::Vpn),
+            (Rect::new(48, 0, 8, 1), Section::Wifi),
+            (Rect::new(56, 0, 8, 1), Section::Settings),
+            (Rect::new(64, 0, 8, 1), Section::Log),
         ];
         assert_eq!(section_at(&tabs, (3, 0)), Some(Section::Dashboard));
         assert_eq!(section_at(&tabs, (11, 0)), Some(Section::Interfaces));
@@ -286,5 +298,21 @@ mod tests {
         assert_eq!(section_at(&tabs, (59, 0)), Some(Section::Settings));
         assert_eq!(section_at(&tabs, (67, 0)), Some(Section::Log));
         assert_eq!(section_at(&tabs, (73, 0)), None);
+    }
+
+    #[test]
+    fn section_at_works_without_dhcp_client_tab() {
+        let tabs = [
+            (Rect::new(0, 0, 8, 1), Section::Dashboard),
+            (Rect::new(8, 0, 8, 1), Section::Interfaces),
+            (Rect::new(16, 0, 8, 1), Section::Dhcp),
+            (Rect::new(24, 0, 8, 1), Section::Router),
+            (Rect::new(32, 0, 8, 1), Section::Vpn),
+            (Rect::new(40, 0, 8, 1), Section::Wifi),
+            (Rect::new(48, 0, 8, 1), Section::Settings),
+            (Rect::new(56, 0, 8, 1), Section::Log),
+        ];
+        assert_eq!(section_at(&tabs, (19, 0)), Some(Section::Dhcp));
+        assert_eq!(section_at(&tabs, (27, 0)), Some(Section::Router));
     }
 }

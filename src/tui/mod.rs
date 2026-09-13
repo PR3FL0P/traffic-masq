@@ -36,6 +36,7 @@ mod layout;
 mod logs;
 mod provisioning;
 mod router;
+mod router_topology;
 mod session;
 mod settings;
 mod vpn;
@@ -103,7 +104,7 @@ enum Screen {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Section {
+pub(crate) enum Section {
     Dashboard,
     Interfaces,
     Dhcp,
@@ -115,7 +116,7 @@ enum Section {
     Log,
 }
 
-const SECTIONS: [Section; 9] = [
+const ALL_SECTIONS: [Section; 9] = [
     Section::Dashboard,
     Section::Interfaces,
     Section::Dhcp,
@@ -127,13 +128,32 @@ const SECTIONS: [Section; 9] = [
     Section::Log,
 ];
 
+const DEFAULT_SECTIONS: [Section; 8] = [
+    Section::Dashboard,
+    Section::Interfaces,
+    Section::Dhcp,
+    Section::Router,
+    Section::Vpn,
+    Section::Wifi,
+    Section::Settings,
+    Section::Log,
+];
+
+pub(crate) fn active_sections(show_dhcp_client: bool) -> &'static [Section] {
+    if show_dhcp_client {
+        &ALL_SECTIONS
+    } else {
+        &DEFAULT_SECTIONS
+    }
+}
+
 impl Section {
     fn title(self) -> &'static str {
         match self {
             Section::Dashboard => "Dashboard",
             Section::Interfaces => "Interfaces",
             Section::Dhcp => "DHCP Server",
-            Section::DhcpClient => "Uplink DHCP",
+            Section::DhcpClient => "DHCP Client",
             Section::Router => "Router",
             Section::Vpn => "VPN",
             Section::Wifi => "Wi-Fi",
@@ -169,18 +189,19 @@ fn section_of(screen: Screen) -> Section {
     }
 }
 
-fn adjacent_section(current: Section, forward: bool) -> Section {
-    let index = SECTIONS
+fn adjacent_section(current: Section, forward: bool, show_dhcp_client: bool) -> Section {
+    let sections = active_sections(show_dhcp_client);
+    let index = sections
         .iter()
         .position(|section| *section == current)
         .unwrap_or(0);
-    let len = SECTIONS.len();
+    let len = sections.len();
     let next_index = if forward {
         (index + 1) % len
     } else {
         (index + len - 1) % len
     };
-    SECTIONS[next_index]
+    sections[next_index]
 }
 
 struct TuiApp {
@@ -213,6 +234,7 @@ struct TuiApp {
     wifi_connect: Option<wifi::WifiConnectPrompt>,
     settings: Option<SecurityEditor>,
     settings_password: Option<PasswordChangeEditor>,
+    pub(crate) show_dhcp_client: bool,
     traffic: HashMap<u32, dashboard::TrafficHistory>,
     ui: UiLayout,
     message: Option<String>,
@@ -255,6 +277,7 @@ impl Default for TuiApp {
             wifi_connect: None,
             settings: None,
             settings_password: None,
+            show_dhcp_client: false,
             traffic: HashMap::new(),
             ui: UiLayout::default(),
             message: None,
@@ -423,6 +446,13 @@ async fn run_loop(
         None
     };
     let mut app = TuiApp::default();
+    if !direct {
+        if let Ok(store) = session::SessionStore::for_client(client) {
+            if let Ok(preferences) = store.preferences() {
+                app.show_dhcp_client = preferences.show_dhcp_client;
+            }
+        }
+    }
     let mut has_authenticated = client.is_authenticated().await;
 
     while !app.should_quit {
@@ -737,10 +767,15 @@ async fn navigate_to_section(app: &mut TuiApp, section: Section, client: &ApiCli
             }
         }
         Section::DhcpClient => {
-            if direct {
+            if !app.show_dhcp_client {
                 app.push_message(
                     LogLevel::Warn,
-                    "Uplink DHCP management requires the daemon API",
+                    "DHCP Client tab is disabled in Settings",
+                );
+            } else if direct {
+                app.push_message(
+                    LogLevel::Warn,
+                    "DHCP Client management requires the daemon API",
                 );
             } else {
                 app.screen = Screen::DhcpClient;
@@ -1071,9 +1106,10 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
                 let is_editing_settings_text = app.screen == Screen::Settings
                     && app.settings.as_ref().is_some_and(|s| s.is_editing());
                 let is_router_actions_focused = app.screen == Screen::Router
-                    && app.router.focus == RouterFocus::Actions;
+                    && (app.router.focus == RouterFocus::Actions || app.router.topology.open);
                 if !is_editing_settings_text && !is_router_actions_focused {
-                    let target = adjacent_section(section_of(app.screen), false);
+                    let target =
+                        adjacent_section(section_of(app.screen), false, app.show_dhcp_client);
                     navigate_to_section(app, target, client, direct).await;
                     return;
                 }
@@ -1082,9 +1118,10 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
                 let is_editing_settings_text = app.screen == Screen::Settings
                     && app.settings.as_ref().is_some_and(|s| s.is_editing());
                 let is_router_actions_focused = app.screen == Screen::Router
-                    && app.router.focus == RouterFocus::Actions;
+                    && (app.router.focus == RouterFocus::Actions || app.router.topology.open);
                 if !is_editing_settings_text && !is_router_actions_focused {
-                    let target = adjacent_section(section_of(app.screen), true);
+                    let target =
+                        adjacent_section(section_of(app.screen), true, app.show_dhcp_client);
                     navigate_to_section(app, target, client, direct).await;
                     return;
                 }
@@ -1654,21 +1691,52 @@ mod tests {
     #[test]
     fn adjacent_section_cycles_forward_and_backward_through_all_nine() {
         assert_eq!(
-            adjacent_section(Section::Dashboard, true),
+            adjacent_section(Section::Dashboard, true, true),
             Section::Interfaces
         );
-        assert_eq!(adjacent_section(Section::Vpn, true), Section::Wifi);
-        assert_eq!(adjacent_section(Section::Wifi, true), Section::Settings);
-        assert_eq!(adjacent_section(Section::Settings, true), Section::Log);
-        assert_eq!(adjacent_section(Section::Log, true), Section::Dashboard);
-        assert_eq!(adjacent_section(Section::Dashboard, false), Section::Log);
+        assert_eq!(adjacent_section(Section::Vpn, true, true), Section::Wifi);
+        assert_eq!(adjacent_section(Section::Wifi, true, true), Section::Settings);
+        assert_eq!(adjacent_section(Section::Settings, true, true), Section::Log);
+        assert_eq!(adjacent_section(Section::Log, true, true), Section::Dashboard);
+        assert_eq!(adjacent_section(Section::Dashboard, false, true), Section::Log);
         assert_eq!(
-            adjacent_section(Section::Interfaces, false),
+            adjacent_section(Section::Interfaces, false, true),
             Section::Dashboard
         );
-        assert_eq!(adjacent_section(Section::Interfaces, true), Section::Dhcp);
-        assert_eq!(adjacent_section(Section::Dhcp, true), Section::DhcpClient);
-        assert_eq!(adjacent_section(Section::DhcpClient, true), Section::Router);
+        assert_eq!(adjacent_section(Section::Interfaces, true, true), Section::Dhcp);
+        assert_eq!(adjacent_section(Section::Dhcp, true, true), Section::DhcpClient);
+        assert_eq!(adjacent_section(Section::DhcpClient, true, true), Section::Router);
+    }
+
+    #[test]
+    fn adjacent_section_cycles_without_dhcp_client_by_default() {
+        assert_eq!(
+            adjacent_section(Section::Dhcp, true, false),
+            Section::Router
+        );
+        assert_eq!(
+            adjacent_section(Section::Router, false, false),
+            Section::Dhcp
+        );
+    }
+
+    #[tokio::test]
+    async fn navigating_to_disabled_dhcp_client_warns_and_aborts() {
+        let mut app = TuiApp::default();
+        assert!(!app.show_dhcp_client);
+        navigate_to_section(
+            &mut app,
+            Section::DhcpClient,
+            &ApiClient::new("/socket-that-must-not-be-opened"),
+            false,
+        )
+        .await;
+        assert_eq!(app.screen, Screen::Dashboard);
+        assert!(app
+            .message
+            .as_ref()
+            .unwrap()
+            .contains("DHCP Client tab is disabled in Settings"));
     }
 
     #[test]
@@ -1718,6 +1786,7 @@ mod tests {
                 restart_required: false,
                 remember_session: false,
                 remember_minutes_input: "5".into(),
+                show_dhcp_client: false,
                 confirmation: None,
                 cursor: 2,
                 editing: false,

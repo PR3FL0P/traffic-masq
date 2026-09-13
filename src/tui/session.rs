@@ -20,6 +20,7 @@ use crate::atomic_file;
 pub(crate) struct SessionPreferences {
     pub(crate) remember: bool,
     pub(crate) minutes: u64,
+    pub(crate) show_dhcp_client: bool,
 }
 
 impl Default for SessionPreferences {
@@ -27,6 +28,7 @@ impl Default for SessionPreferences {
         Self {
             remember: true,
             minutes: 5,
+            show_dhcp_client: false,
         }
     }
 }
@@ -239,12 +241,14 @@ mod tests {
         assert!(!prefs.accepts(&session, 1100));
         assert!(!SessionPreferences {
             remember: false,
-            minutes: 5
+            minutes: 5,
+            show_dhcp_client: false,
         }
         .accepts(&session, 1000));
         assert!(SessionPreferences {
             remember: true,
-            minutes: 0
+            minutes: 0,
+            show_dhcp_client: false,
         }
         .validate()
         .is_err());
@@ -289,6 +293,7 @@ mod tests {
         let prefs = SessionPreferences {
             remember: false,
             minutes: 12,
+            show_dhcp_client: false,
         };
         store.save_preferences(&prefs, &next).await.unwrap();
         assert_eq!(store.preferences().unwrap(), prefs);
@@ -314,6 +319,7 @@ mod tests {
                 &SessionPreferences {
                     remember: true,
                     minutes: 1,
+                    show_dhcp_client: false,
                 },
                 &client,
             )
@@ -437,5 +443,14 @@ mod tests {
         assert!(!revoked.is_authenticated().await);
         assert!(!store.path("session").exists());
         task.abort();
+    }
+
+    #[test]
+    fn preferences_defaults_to_hidden_dhcp_client_tab_when_unspecified() {
+        let json = r#"{"remember": true, "minutes": 10}"#;
+        let prefs: SessionPreferences = serde_json::from_str(json).unwrap();
+        assert!(!prefs.show_dhcp_client);
+        assert!(prefs.remember);
+        assert_eq!(prefs.minutes, 10);
     }
 }

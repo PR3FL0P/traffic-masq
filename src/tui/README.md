@@ -15,7 +15,7 @@ The TUI serves as the primary operational console for the `traffic-masq` network
 
 1. **Daemon Mode (Default):**
    - Communicates with `traffic-masqd` over a local Unix domain socket (`/run/traffic-masq/traffic-masqd.sock`).
-   - Fully interactive: supports all tabs (Interfaces, DHCP Server, Uplink DHCP, Router, VPN, Wi-Fi, Settings, Logs).
+   - Fully interactive: supports all tabs (Interfaces, DHCP Server, DHCP Client (configurable in Settings), Router, VPN, Wi-Fi, Settings, Logs).
    - Authenticated via shared device password; supports secure session caching in `$XDG_STATE_HOME`.
    - All state modifications are transactional, subject to dry-run previews and automatic rollback timers.
 

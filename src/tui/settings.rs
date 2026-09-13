@@ -18,6 +18,7 @@ pub(crate) enum SettingsField {
     RollbackTimeout,
     RememberSession,
     RememberMinutes,
+    ShowDhcpClient,
     SaveSession,
     ChangePassword,
     Access,
@@ -26,10 +27,11 @@ pub(crate) enum SettingsField {
     Reload,
 }
 
-const SETTINGS_FIELDS: [SettingsField; 9] = [
+const SETTINGS_FIELDS: [SettingsField; 10] = [
     SettingsField::RollbackTimeout,
     SettingsField::RememberSession,
     SettingsField::RememberMinutes,
+    SettingsField::ShowDhcpClient,
     SettingsField::SaveSession,
     SettingsField::ChangePassword,
     SettingsField::Access,
@@ -47,6 +49,7 @@ pub(crate) struct SecurityEditor {
     pub(crate) restart_required: bool,
     pub(crate) remember_session: bool,
     pub(crate) remember_minutes_input: String,
+    pub(crate) show_dhcp_client: bool,
     pub(crate) confirmation: Option<SettingsField>,
     pub(crate) cursor: usize,
     pub(crate) editing: bool,
@@ -186,6 +189,19 @@ pub(crate) fn render_settings(frame: &mut ratatui::Frame<'_>, area: Rect, app: &
         SettingsField::RememberMinutes,
         Style::default().fg(theme::ACCENT),
     ));
+    button_rows.push((lines.len() as u16, "DHCP client tab: enabled", 8));
+    lines.push(row(
+        format!(
+            "DHCP client tab: {}",
+            if editor.show_dhcp_client {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ),
+        SettingsField::ShowDhcpClient,
+        Style::default().fg(theme::ACCENT),
+    ));
     button_rows.push((
         lines.len() as u16,
         "Save session preferences (applies now)",
@@ -285,6 +301,7 @@ pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
             5 => SettingsField::RememberMinutes,
             6 => SettingsField::SaveSession,
             7 => SettingsField::Access,
+            8 => SettingsField::ShowDhcpClient,
             _ => SettingsField::Reload,
         };
         editor.editing = false;
@@ -319,6 +336,10 @@ pub(crate) async fn handle_settings_key(app: &mut TuiApp, key: KeyCode, client: 
         KeyCode::Char(' ') if editor.field == SettingsField::RememberSession => {
             editor.remember_session = !editor.remember_session;
         }
+        KeyCode::Char(' ') if editor.field == SettingsField::ShowDhcpClient => {
+            editor.show_dhcp_client = !editor.show_dhcp_client;
+            app.show_dhcp_client = editor.show_dhcp_client;
+        }
         KeyCode::Enter => match editor.field {
             SettingsField::RollbackTimeout | SettingsField::RememberMinutes => {
                 editor.editing = !editor.editing;
@@ -327,6 +348,10 @@ pub(crate) async fn handle_settings_key(app: &mut TuiApp, key: KeyCode, client: 
                 }
             }
             SettingsField::RememberSession => editor.remember_session = !editor.remember_session,
+            SettingsField::ShowDhcpClient => {
+                editor.show_dhcp_client = !editor.show_dhcp_client;
+                app.show_dhcp_client = editor.show_dhcp_client;
+            }
             SettingsField::SaveSession | SettingsField::Reset | SettingsField::Save
                 if editor.confirmation != Some(editor.field) =>
             {
@@ -373,7 +398,9 @@ async fn save_session_preferences(app: &mut TuiApp, client: &ApiClient) {
     let preferences = super::session::SessionPreferences {
         remember: editor.remember_session,
         minutes,
+        show_dhcp_client: editor.show_dhcp_client,
     };
+    app.show_dhcp_client = preferences.show_dhcp_client;
     let result = async {
         let store = super::session::SessionStore::for_client(client)?;
         store.save_preferences(&preferences, client).await
@@ -431,11 +458,13 @@ pub(crate) async fn load_settings_data(app: &mut TuiApp, client: &ApiClient) {
                     super::session::SessionPreferences::default()
                 }
             };
+            app.show_dhcp_client = preferences.show_dhcp_client;
             let rollback_timeout_input = desired.rollback_timeout_seconds.to_string();
             let cursor = rollback_timeout_input.chars().count();
             app.settings = Some(SecurityEditor {
                 remember_session: preferences.remember,
                 remember_minutes_input: preferences.minutes.to_string(),
+                show_dhcp_client: preferences.show_dhcp_client,
                 confirmation: None,
                 field: SettingsField::RollbackTimeout,
                 active,
@@ -510,11 +539,13 @@ pub(crate) async fn submit_security_settings(app: &mut TuiApp, client: &ApiClien
                     super::session::SessionPreferences::default()
                 }
             };
+            app.show_dhcp_client = preferences.show_dhcp_client;
             let rollback_timeout_input = desired.rollback_timeout_seconds.to_string();
             let cursor = rollback_timeout_input.chars().count();
             app.settings = Some(SecurityEditor {
                 remember_session: preferences.remember,
                 remember_minutes_input: preferences.minutes.to_string(),
+                show_dhcp_client: preferences.show_dhcp_client,
                 confirmation: None,
                 field: SettingsField::RollbackTimeout,
                 active,
@@ -558,11 +589,13 @@ async fn reset_security_settings(app: &mut TuiApp, client: &ApiClient) {
                     super::session::SessionPreferences::default()
                 }
             };
+            app.show_dhcp_client = preferences.show_dhcp_client;
             let rollback_timeout_input = desired.rollback_timeout_seconds.to_string();
             let cursor = rollback_timeout_input.chars().count();
             app.settings = Some(SecurityEditor {
                 remember_session: preferences.remember,
                 remember_minutes_input: preferences.minutes.to_string(),
+                show_dhcp_client: preferences.show_dhcp_client,
                 confirmation: None,
                 field: SettingsField::RollbackTimeout,
                 active,
@@ -857,6 +890,10 @@ mod tests {
         );
         assert_eq!(
             next_settings_field(SettingsField::RememberMinutes),
+            SettingsField::ShowDhcpClient
+        );
+        assert_eq!(
+            next_settings_field(SettingsField::ShowDhcpClient),
             SettingsField::SaveSession
         );
         assert_eq!(
@@ -874,6 +911,7 @@ mod tests {
             restart_required: false,
             remember_session: true,
             remember_minutes_input: "5".into(),
+            show_dhcp_client: false,
             confirmation: None,
             cursor: 0,
             editing: false,
@@ -913,6 +951,7 @@ mod tests {
                 restart_required: false,
                 remember_session: true,
                 remember_minutes_input: "5".into(),
+                show_dhcp_client: false,
                 confirmation: None,
                 cursor: 0,
                 editing: false,
@@ -935,6 +974,14 @@ mod tests {
         assert_eq!(
             next_settings_field(SettingsField::RollbackTimeout),
             SettingsField::RememberSession
+        );
+        assert_eq!(
+            next_settings_field(SettingsField::RememberMinutes),
+            SettingsField::ShowDhcpClient
+        );
+        assert_eq!(
+            next_settings_field(SettingsField::ShowDhcpClient),
+            SettingsField::SaveSession
         );
         assert_eq!(
             next_settings_field(SettingsField::ChangePassword),
@@ -973,6 +1020,14 @@ mod tests {
             SettingsField::ChangePassword
         );
         assert_eq!(
+            previous_settings_field(SettingsField::SaveSession),
+            SettingsField::ShowDhcpClient
+        );
+        assert_eq!(
+            previous_settings_field(SettingsField::ShowDhcpClient),
+            SettingsField::RememberMinutes
+        );
+        assert_eq!(
             previous_settings_field(SettingsField::RollbackTimeout),
             SettingsField::RollbackTimeout
         );
@@ -991,12 +1046,38 @@ mod tests {
             restart_required: false,
             remember_session: true,
             remember_minutes_input: "5".into(),
+            show_dhcp_client: false,
             confirmation: None,
             cursor: 0,
             editing: false,
         });
         focus_action(&mut app, 7);
         assert_eq!(app.settings.as_ref().unwrap().field, SettingsField::Access);
+    }
+
+    #[test]
+    fn clicking_dhcp_client_action_focuses_show_dhcp_client_field() {
+        let mut app = TuiApp::default();
+        app.settings = Some(SecurityEditor {
+            field: SettingsField::RollbackTimeout,
+            active: SecuritySettings {
+                rollback_timeout_seconds: 30,
+            },
+            rollback_timeout_input: "30".into(),
+            override_active: false,
+            restart_required: false,
+            remember_session: true,
+            remember_minutes_input: "5".into(),
+            show_dhcp_client: false,
+            confirmation: None,
+            cursor: 0,
+            editing: false,
+        });
+        focus_action(&mut app, 8);
+        assert_eq!(
+            app.settings.as_ref().unwrap().field,
+            SettingsField::ShowDhcpClient
+        );
     }
 
     #[tokio::test]
@@ -1013,6 +1094,7 @@ mod tests {
             restart_required: false,
             remember_session: true,
             remember_minutes_input: "5".into(),
+            show_dhcp_client: false,
             confirmation: None,
             cursor: 0,
             editing: false,
@@ -1097,6 +1179,7 @@ mod tests {
             restart_required: false,
             remember_session: true,
             remember_minutes_input: "5".into(),
+            show_dhcp_client: false,
             confirmation: None,
             cursor: 2,
             editing: true,
@@ -1129,6 +1212,7 @@ mod tests {
                 restart_required: false,
                 remember_session: true,
                 remember_minutes_input: "5".into(),
+                show_dhcp_client: false,
                 confirmation: None,
                 cursor: 0,
                 editing: false,
@@ -1186,5 +1270,40 @@ mod tests {
         handle_settings_password_key(&mut app, KeyCode::Char('a'), &client).await;
         assert_eq!(app.settings_password.as_ref().unwrap().current, "asecret");
         assert_eq!(app.settings_password.as_ref().unwrap().cursor, 1);
+    }
+
+    #[tokio::test]
+    async fn toggling_dhcp_client_tab_updates_editor_and_app_state() {
+        let mut app = TuiApp {
+            screen: Screen::Settings,
+            show_dhcp_client: false,
+            settings: Some(SecurityEditor {
+                field: SettingsField::ShowDhcpClient,
+                active: SecuritySettings {
+                    rollback_timeout_seconds: 30,
+                },
+                rollback_timeout_input: "30".into(),
+                override_active: false,
+                restart_required: false,
+                remember_session: true,
+                remember_minutes_input: "5".into(),
+                show_dhcp_client: false,
+                confirmation: None,
+                cursor: 0,
+                editing: false,
+            }),
+            ..Default::default()
+        };
+        let client = ApiClient::new("/socket-that-must-not-be-opened");
+
+        // Pressing Space toggles on
+        handle_settings_key(&mut app, KeyCode::Char(' '), &client).await;
+        assert!(app.settings.as_ref().unwrap().show_dhcp_client);
+        assert!(app.show_dhcp_client);
+
+        // Pressing Enter toggles off
+        handle_settings_key(&mut app, KeyCode::Enter, &client).await;
+        assert!(!app.settings.as_ref().unwrap().show_dhcp_client);
+        assert!(!app.show_dhcp_client);
     }
 }

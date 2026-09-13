@@ -13,7 +13,7 @@ use super::theme;
 use super::TuiApp;
 
 pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
-    let block = panel("Uplink DHCP client");
+    let block = panel("DHCP Client");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     app.ui.list_area = Some(inner);
@@ -217,7 +217,7 @@ mod tests {
                 .iter()
                 .map(|cell| cell.symbol())
                 .collect::<String>();
-            assert!(rendered.contains("Uplink DHCP client"));
+            assert!(rendered.contains("DHCP Client"));
             assert!(rendered.contains("separate from the DHCP server"));
             assert!(rendered.contains(label));
             assert!(rendered.contains("192.0.2.42"));

@@ -18,6 +18,7 @@ use crate::netlink::RouteOwner;
 
 use super::layout::panel;
 use super::logs::LogLevel;
+use super::router_topology;
 use super::theme;
 use super::{current_unix_time, Screen, TuiApp};
 
@@ -38,6 +39,7 @@ pub(crate) struct RouterData {
     pub(crate) lease_counts: Vec<(String, usize)>,
     pub(crate) error: Option<RouterErrorDetail>,
     pub(crate) warning_message: Option<String>,
+    pub(crate) topology: router_topology::TopologyView,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +58,7 @@ pub(crate) enum RouterAction {
     PlanApply,
     Provision,
     Refresh,
+    Topology,
 }
 
 impl RouterAction {
@@ -66,18 +69,20 @@ impl RouterAction {
             Self::DeleteRoute => Self::PlanApply,
             Self::PlanApply => Self::Provision,
             Self::Provision => Self::Refresh,
-            Self::Refresh => Self::AddRoute,
+            Self::Refresh => Self::Topology,
+            Self::Topology => Self::AddRoute,
         }
     }
 
     pub(crate) fn prev(self) -> Self {
         match self {
-            Self::AddRoute => Self::Refresh,
+            Self::AddRoute => Self::Topology,
             Self::EditRoute => Self::AddRoute,
             Self::DeleteRoute => Self::EditRoute,
             Self::PlanApply => Self::DeleteRoute,
             Self::Provision => Self::PlanApply,
             Self::Refresh => Self::Provision,
+            Self::Topology => Self::Refresh,
         }
     }
 }
@@ -435,8 +440,24 @@ fn delete_selected_route(app: &mut TuiApp) {
     }
     let route = &app.router.routes[app.router.selected_route];
     if !route.owner.is_editable() {
-        app.router.warning_message = Some("External route cannot be deleted".to_string());
-        app.push_message(LogLevel::Warn, "External route cannot be deleted");
+        let message = match manual_route_delete_command(route) {
+            Ok(command) => format!(
+                "Delete route manually: {}\n\n\
+                 Run this command in a terminal on the machine running traffic-masqd:\n\n\
+                 {command}\n\n\
+                 traffic-masq only displays this command; it does not execute it.\n\
+                 Removing this route can interrupt connections that use it.\n\
+                 The kernel, DHCP client or network manager may recreate the route. \
+                 For a lasting change, update the configuration that creates it.\n\n\
+                 After running it, return to Router and choose Refresh.\n\n\
+                 Esc: close",
+                route.destination,
+            ),
+            Err(message) => message.to_string(),
+        };
+        app.push_message(LogLevel::Warn, message);
+        app.message_scroll = 0;
+        app.message_open = true;
         return;
     }
     let target_dest = route.destination;
@@ -471,6 +492,30 @@ fn delete_selected_route(app: &mut TuiApp) {
         LogLevel::Info,
         format!("Removed route {target_dest} from proposed routes"),
     );
+}
+
+fn manual_route_delete_command(route: &RouteStatus) -> Result<String, &'static str> {
+    // Never drop a known output-interface constraint from a deletion command.
+    if route.output_interface.is_none() && route.output_interface_index.is_some() {
+        return Err("Cannot generate the command: the route's interface name is unavailable. Refresh the route list first.");
+    }
+    let mut command = format!("sudo ip -4 route del {}", route.destination);
+    if let Some(gateway) = route.gateway {
+        command.push_str(&format!(" via {gateway}"));
+    }
+    if let Some(interface) = &route.output_interface {
+        // Interface names are data, including any shell metacharacters.
+        let quoted = format!("'{}'", interface.replace('\'', "'\\''"));
+        command.push_str(&format!(" dev {quoted}"));
+    }
+    command.push_str(&format!(
+        " table {} metric {} proto {} scope {}",
+        route.table,
+        route.metric.unwrap_or(0),
+        route.protocol,
+        route.scope,
+    ));
+    Ok(command)
 }
 
 async fn open_route_editor_for_selected(app: &mut TuiApp, client: &ApiClient) {
@@ -544,7 +589,58 @@ async fn fetch_available_interfaces(app: &TuiApp, client: &ApiClient) -> Vec<Str
     }
 }
 
+fn router_action_buttons(router: &RouterData) -> [(RouterAction, &'static str); 7] {
+    let manual_delete = router
+        .routes
+        .get(router.selected_route)
+        .is_some_and(|route| !route.owner.is_editable());
+    [
+        (RouterAction::AddRoute, "[Add route]"),
+        (RouterAction::EditRoute, "[Edit route]"),
+        (
+            RouterAction::DeleteRoute,
+            if manual_delete {
+                "[Delete manually]"
+            } else {
+                "[Delete route]"
+            },
+        ),
+        (RouterAction::PlanApply, "[Plan / Apply]"),
+        (RouterAction::Provision, "[Set up router]"),
+        (RouterAction::Refresh, "[Refresh]"),
+        (RouterAction::Topology, "[Topology: t]"),
+    ]
+}
+
+fn router_button_positions(buttons: &[(RouterAction, &str)], width: u16) -> Vec<(u16, u16)> {
+    let (mut x, mut y) = (0, 0);
+    buttons
+        .iter()
+        .map(|(_, label)| {
+            let length = label.len() as u16;
+            if x > 0 && x + length > width {
+                x = 0;
+                y += 1;
+            }
+            let position = (x, y);
+            x += length + 2;
+            position
+        })
+        .collect()
+}
+
 pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
+    if app.router.topology.open {
+        router_topology::render(frame, area, app, true);
+        return;
+    }
+    let area = if area.width >= 112 {
+        let columns = Layout::horizontal([Constraint::Length(30), Constraint::Min(82)]).split(area);
+        router_topology::render(frame, columns[0], app, false);
+        columns[1]
+    } else {
+        area
+    };
     let router = &app.router;
 
     let mut status_lines = vec![Line::from(vec![
@@ -620,14 +716,20 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         ));
     }
 
-    let status_height = (status_lines.len() as u16 + 2).clamp(3, 8);
+    let buttons = router_action_buttons(router);
+    let button_positions = router_button_positions(&buttons, area.width.saturating_sub(2));
+    let warning_rows = u16::from(router.warning_message.is_some());
+    let actions_height = button_positions.last().map_or(0, |(_, y)| y + 1) + warning_rows + 2;
+    let status_height = (status_lines.len() as u16 + 2)
+        .clamp(3, 8)
+        .min(area.height.saturating_sub(actions_height + 3));
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(status_height),
-            Constraint::Min(6),
-            Constraint::Length(5),
+            Constraint::Min(3),
+            Constraint::Length(actions_height),
         ])
         .split(area);
 
@@ -637,9 +739,7 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
     frame.render_widget(Paragraph::new(status_lines), status_inner);
 
     let table_title = match router.focus {
-        RouterFocus::RouteTable => {
-            "Routes [Table Focused - Up/Down: select, Enter: edit, Del: remove, Tab: actions]"
-        }
+        RouterFocus::RouteTable => "Routes | Up/Down: select; Down at end / Tab: actions",
         RouterFocus::Actions => "Routes [Tab: focus table]",
     };
     let table_block = panel(table_title);
@@ -757,35 +857,27 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         );
     }
 
-    let actions_block = panel("Actions");
+    let actions_block = panel("Actions | Arrows: move; Enter: activate; Tab: routes");
     let actions_inner = actions_block.inner(chunks[2]);
     frame.render_widget(actions_block, chunks[2]);
 
-    let mut action_lines = Vec::new();
-
     if let Some(ref warn) = router.warning_message {
-        action_lines.push(Line::styled(
-            format!("⚠ {warn}"),
-            Style::default()
-                .fg(theme::WARN)
-                .add_modifier(Modifier::BOLD),
-        ));
+        frame.render_widget(
+            Paragraph::new(format!("⚠ {warn}")).style(
+                Style::default()
+                    .fg(theme::WARN)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Rect::new(
+                actions_inner.x,
+                actions_inner.y,
+                actions_inner.width,
+                actions_inner.height.min(1),
+            ),
+        );
     }
 
-    let buttons = [
-        (RouterAction::AddRoute, "[Add route]"),
-        (RouterAction::EditRoute, "[Edit route]"),
-        (RouterAction::DeleteRoute, "[Delete route]"),
-        (RouterAction::PlanApply, "[Plan / Apply]"),
-        (RouterAction::Provision, "[Set up router]"),
-        (RouterAction::Refresh, "[Refresh]"),
-    ];
-
-    let mut button_spans = Vec::new();
-    let button_y = actions_inner.y + action_lines.len() as u16;
-    let mut current_x = actions_inner.x;
-
-    for (slot, (action, label)) in buttons.iter().enumerate() {
+    for (slot, ((action, label), (x, y))) in buttons.iter().zip(button_positions).enumerate() {
         let is_active = router.focus == RouterFocus::Actions && router.action == *action;
         let style = if is_active {
             Style::default()
@@ -796,26 +888,18 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
             Style::default().fg(theme::ACCENT)
         };
 
-        if slot > 0 {
-            button_spans.push(Span::raw("  "));
-            current_x += 2;
+        let rect = Rect::new(
+            actions_inner.x + x,
+            actions_inner.y + warning_rows + y,
+            label.len() as u16,
+            1,
+        )
+        .intersection(actions_inner);
+        if !rect.is_empty() {
+            app.ui.buttons.push((rect, slot));
+            frame.render_widget(Paragraph::new(*label).style(style), rect);
         }
-
-        app.ui.buttons.push((
-            Rect {
-                x: current_x,
-                y: button_y,
-                width: label.len() as u16,
-                height: 1,
-            },
-            slot,
-        ));
-        button_spans.push(Span::styled(*label, style));
-        current_x += label.len() as u16;
     }
-    action_lines.push(Line::from(button_spans));
-
-    frame.render_widget(Paragraph::new(action_lines), actions_inner);
 }
 
 pub(crate) fn render_route_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
@@ -1204,12 +1288,19 @@ pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
         2 => RouterAction::DeleteRoute,
         3 => RouterAction::PlanApply,
         4 => RouterAction::Provision,
+        6 => RouterAction::Topology,
         _ => RouterAction::Refresh,
     };
 }
 
 pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
+    if app.router.topology.open {
+        app.router.topology.handle_key(key);
+        return;
+    }
     match key {
+        KeyCode::Char('t') => app.router.topology.show(),
+        KeyCode::PageUp | KeyCode::PageDown => app.router.topology.handle_key(key),
         KeyCode::Esc => app.screen = Screen::Dashboard,
         KeyCode::Tab => {
             app.router.focus = match app.router.focus {
@@ -1238,6 +1329,9 @@ pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &A
                         && app.router.selected_route + 1 < app.router.routes.len()
                     {
                         app.router.selected_route += 1;
+                    } else {
+                        app.router.focus = RouterFocus::Actions;
+                        app.router.action = RouterAction::AddRoute;
                     }
                     app.router.warning_message = None;
                 }
@@ -1250,6 +1344,20 @@ pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &A
                 _ => {}
             },
             RouterFocus::Actions => match key {
+                KeyCode::Up => {
+                    if app.router.action == RouterAction::AddRoute {
+                        app.router.focus = RouterFocus::RouteTable;
+                    } else {
+                        app.router.action = app.router.action.prev();
+                    }
+                    app.router.warning_message = None;
+                }
+                KeyCode::Down => {
+                    if app.router.action != RouterAction::Topology {
+                        app.router.action = app.router.action.next();
+                    }
+                    app.router.warning_message = None;
+                }
                 KeyCode::Left => {
                     app.router.action = app.router.action.prev();
                     app.router.warning_message = None;
@@ -1265,6 +1373,7 @@ pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &A
                     RouterAction::PlanApply => open_router_plan(app, client).await,
                     RouterAction::Provision => super::provisioning::open(app),
                     RouterAction::Refresh => refresh_router_data(app, client).await,
+                    RouterAction::Topology => app.router.topology.show(),
                 },
                 _ => {}
             },
@@ -1428,6 +1537,8 @@ pub(crate) async fn refresh_router_data(app: &mut TuiApp, client: &ApiClient) {
 
 pub(crate) async fn load_router_data(app: &mut TuiApp, client: &ApiClient) {
     app.router.error = None;
+    app.router.topology.loaded = false;
+    app.router.plan = None;
 
     match client.request(&Request::RouterStatus).await {
         Ok(Response::RouterStatus {
@@ -1458,11 +1569,14 @@ pub(crate) async fn load_router_data(app: &mut TuiApp, client: &ApiClient) {
         }
     }
 
+    let mut topology_loaded = true;
     if !app.router.staged {
         if let Ok(Response::RouterConfig { config }) =
             client.request(&Request::GetRouterConfig).await
         {
             app.router.proposed_router_config = config;
+        } else {
+            topology_loaded = false;
         }
 
         if let Ok(Response::Routes { routes }) = client
@@ -1476,8 +1590,11 @@ pub(crate) async fn load_router_data(app: &mut TuiApp, client: &ApiClient) {
             {
                 app.router.selected_route = app.router.routes.len() - 1;
             }
+        } else {
+            topology_loaded = false;
         }
     }
+    app.router.topology.loaded = topology_loaded;
 
     if !app.router.enabled && app.router.proposed_router_config.owned_routes.is_empty() {
         app.router.plan = None;
@@ -1806,11 +1923,16 @@ mod tests {
         );
         assert_eq!(
             action.next().next().next().next().next().next(),
+            RouterAction::Topology
+        );
+        assert_eq!(
+            action.next().next().next().next().next().next().next(),
             RouterAction::AddRoute
         );
 
-        assert_eq!(action.prev(), RouterAction::Refresh);
-        assert_eq!(action.prev().prev(), RouterAction::Provision);
+        assert_eq!(action.prev(), RouterAction::Topology);
+        assert_eq!(action.prev().prev(), RouterAction::Refresh);
+        assert_eq!(action.prev().prev().prev(), RouterAction::Provision);
     }
 
     #[test]
@@ -2154,7 +2276,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_selected_route_blocks_external_and_deletes_owned() {
+    fn delete_selected_route_shows_manual_command_for_external_and_stages_owned() {
         let mut app = TuiApp {
             screen: Screen::Router,
             ..Default::default()
@@ -2167,8 +2289,8 @@ mod tests {
             output_interface_index: None,
             table: 254,
             metric: None,
-            protocol: 3, // Kernel
-            scope: 0,
+            protocol: 2,
+            scope: 253,
             owner: RouteOwner::Kernel,
         };
         let owned_route = RouteStatus {
@@ -2191,17 +2313,21 @@ mod tests {
             metric: Some(50),
         }];
 
-        // Attempt to delete external route
+        // External routes only produce instructions, leaving all state intact.
+        let original_routes = app.router.routes.clone();
+        let original_config = app.router.proposed_router_config.clone();
         app.router.selected_route = 0;
         delete_selected_route(&mut app);
-        assert_eq!(app.router.routes.len(), 2);
-        assert_eq!(
-            app.router.warning_message.as_deref(),
-            Some("External route cannot be deleted")
-        );
-        assert!(app.router.proposed_router_config.enabled);
+        assert_eq!(app.router.routes, original_routes);
+        assert_eq!(app.router.proposed_router_config, original_config);
+        assert!(!app.router.staged);
+        assert!(app.message_open);
+        assert!(app.message.as_deref().unwrap().contains(
+            "sudo ip -4 route del 10.0.0.0/8 dev 'eth0' table 254 metric 0 proto 2 scope 253"
+        ));
 
         // Delete owned route
+        app.message_open = false;
         app.router.selected_route = 1;
         delete_selected_route(&mut app);
         assert_eq!(app.router.routes.len(), 1);
@@ -2209,6 +2335,129 @@ mod tests {
         assert!(!app.router.proposed_router_config.enabled);
         assert!(app.router.staged);
         assert_eq!(app.router.warning_message, None);
+    }
+
+    #[test]
+    fn manual_delete_preserves_route_selectors_and_quotes_interface_names() {
+        let mut route = route_status(&route_config("0.0.0.0/0"), RouteOwner::Dhcp);
+        route.gateway = Some(Ipv4Addr::new(192, 0, 2, 1));
+        route.output_interface = Some("eth'$(id);0".into());
+        route.table = 1000;
+        route.metric = Some(600);
+        route.protocol = 16;
+        assert_eq!(
+            manual_route_delete_command(&route).unwrap(),
+            "sudo ip -4 route del 0.0.0.0/0 via 192.0.2.1 dev 'eth'\\''$(id);0' table 1000 metric 600 proto 16 scope 0"
+        );
+        route.output_interface = None;
+        assert!(manual_route_delete_command(&route).is_err());
+    }
+
+    #[tokio::test]
+    async fn router_actions_are_reachable_with_arrows_and_activate_only_on_enter() {
+        let mut app = TuiApp {
+            screen: Screen::Router,
+            ..Default::default()
+        };
+        app.ui.input_enabled = true;
+        app.router.routes = vec![route_status(
+            &route_config("10.0.0.0/8"),
+            RouteOwner::Static,
+        )];
+        let client = ApiClient::new("/socket-that-must-not-be-opened");
+        for expected in [
+            RouterAction::AddRoute,
+            RouterAction::EditRoute,
+            RouterAction::DeleteRoute,
+        ] {
+            super::super::handle_key(&mut app, KeyCode::Down, &client, false).await;
+            assert_eq!(app.router.focus, RouterFocus::Actions);
+            assert_eq!(app.router.action, expected);
+            assert_eq!(app.screen, Screen::Router);
+            assert!(!app.message_open);
+            assert!(!app.router.staged);
+        }
+        super::super::handle_key(&mut app, KeyCode::Enter, &client, false).await;
+        assert!(app.message_open);
+        assert!(app
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("sudo ip -4 route del"));
+        assert_eq!(app.router.routes.len(), 1);
+        assert!(!app.router.staged);
+        super::super::handle_key(&mut app, KeyCode::Esc, &client, false).await;
+        assert!(!app.message_open);
+        assert_eq!(app.screen, Screen::Router);
+        for key in [KeyCode::Left, KeyCode::Right] {
+            super::super::handle_key(&mut app, key, &client, false).await;
+            assert_eq!(app.screen, Screen::Router);
+        }
+        for _ in 0..3 {
+            super::super::handle_key(&mut app, KeyCode::Up, &client, false).await;
+        }
+        assert_eq!(app.router.focus, RouterFocus::RouteTable);
+        super::super::handle_key(&mut app, KeyCode::Tab, &client, false).await;
+        assert_eq!(app.router.focus, RouterFocus::Actions);
+        super::super::handle_key(&mut app, KeyCode::BackTab, &client, false).await;
+        assert_eq!(app.router.focus, RouterFocus::RouteTable);
+    }
+
+    #[tokio::test]
+    async fn empty_router_reaches_every_action_and_clamps_at_the_last() {
+        let mut app = TuiApp::default();
+        let client = ApiClient::new("/socket-that-must-not-be-opened");
+        for (action, _) in router_action_buttons(&app.router) {
+            handle_router_key(&mut app, KeyCode::Down, &client).await;
+            assert_eq!(app.router.focus, RouterFocus::Actions);
+            assert_eq!(app.router.action, action);
+        }
+        handle_router_key(&mut app, KeyCode::Down, &client).await;
+        assert_eq!(app.router.action, RouterAction::Topology);
+    }
+
+    #[test]
+    fn router_buttons_wrap_and_remain_visible_at_supported_sizes() {
+        use ratatui::{backend::TestBackend, Terminal};
+        for (width, height) in [(60, 15), (80, 24), (120, 30)] {
+            for warning in [None, Some("External route is read-only".to_string())] {
+                let mut app = TuiApp {
+                    screen: Screen::Router,
+                    ..Default::default()
+                };
+                app.router.warning_message = warning;
+                app.router.routes = vec![route_status(
+                    &route_config("10.0.0.0/8"),
+                    RouteOwner::Static,
+                )];
+                app.router.focus = RouterFocus::Actions;
+                app.router.action = RouterAction::DeleteRoute;
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| super::super::render(frame, &mut app, false))
+                    .unwrap();
+                let action_buttons = if width >= 112 {
+                    assert_eq!(app.ui.buttons.len(), 8, "{width}x{height}");
+                    &app.ui.buttons[1..]
+                } else {
+                    assert_eq!(app.ui.buttons.len(), 7, "{width}x{height}");
+                    &app.ui.buttons[..]
+                };
+                let buffer = terminal.backend().buffer();
+                for ((rect, slot), (_, label)) in action_buttons
+                    .iter()
+                    .zip(router_action_buttons(&app.router))
+                {
+                    let text: String = (rect.x..rect.right())
+                        .map(|x| buffer[(x, rect.y)].symbol())
+                        .collect();
+                    assert_eq!(text, label, "button {slot} at {width}x{height}");
+                    assert!(rect.bottom() <= height - 4, "button must be above footer");
+                }
+                let (rect, _) = action_buttons[2];
+                assert_eq!(buffer[(rect.x, rect.y)].bg, theme::SELECTED_BG);
+            }
+        }
     }
 
     #[test]

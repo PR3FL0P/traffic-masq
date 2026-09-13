@@ -276,6 +276,17 @@ use Up/Down to scroll it. Finish a form or leave it with Esc before changing
 tabs. Long Wi-Fi lists scroll with the selection; deleting a profile requires
 an explicit Y confirmation naming the profile.
 
+In **Router**, Down after the last route moves into **Actions**; Up/Down or
+Left/Right selects an action, and Enter or Space activates it. Up from the first
+action returns to the route list. Tab switches between routes and actions.
+Buttons wrap to fit the terminal. For a route outside the static route editor,
+**Delete manually** (or Del on the selected route) displays an `ip -4 route del`
+command to run on the daemon's machine. The TUI never executes that command or
+changes the proposed configuration for that route. After running it, choose
+**Refresh**. DHCP or another network manager may recreate the route; a lasting
+change belongs in the configuration that creates it. Deleting a traffic-masq
+static route continues to stage the change for **Plan / Apply**.
+
 Changes in **Settings** also require confirmation. The first Enter shows an
 indented `Note: Confirm...` line; the second Enter applies the selected change.
 Esc or moving to another setting cancels the confirmation. Explanatory text is
