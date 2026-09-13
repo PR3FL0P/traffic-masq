@@ -836,6 +836,18 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
     if !app.ui.input_enabled {
         return;
     }
+    if app.message_open {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                app.message_scroll = app.message_scroll.saturating_sub(1);
+            }
+            MouseEventKind::ScrollDown => {
+                app.message_scroll = app.message_scroll.saturating_add(1);
+            }
+            _ => {}
+        }
+        return;
+    }
     let point = (mouse.column, mouse.row);
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
@@ -969,6 +981,34 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
 const MIN_TERMINAL_WIDTH: u16 = 60;
 const MIN_TERMINAL_HEIGHT: u16 = 15;
 
+pub(crate) fn format_message_lines(text: &str) -> Vec<Line<'_>> {
+    const SHIFT_HINT: &str = "to copy, hold down shift";
+    text.lines()
+        .map(|line| {
+            let lower = line.to_ascii_lowercase();
+            if let Some(idx) = lower.find(SHIFT_HINT) {
+                let before = &line[..idx];
+                let matched = &line[idx..idx + SHIFT_HINT.len()];
+                let after = &line[idx + SHIFT_HINT.len()..];
+                let mut spans = Vec::new();
+                if !before.is_empty() {
+                    spans.push(Span::raw(before));
+                }
+                spans.push(Span::styled(
+                    matched,
+                    Style::default().fg(theme::BAD),
+                ));
+                if !after.is_empty() {
+                    spans.push(Span::raw(after));
+                }
+                Line::from(spans)
+            } else {
+                Line::raw(line)
+            }
+        })
+        .collect()
+}
+
 fn render(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp, direct: bool) {
     let area = frame.area();
     app.ui = UiLayout::default();
@@ -989,7 +1029,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp, direct: bool) {
             .or(app.dashboard.error.as_deref())
             .unwrap_or("No message");
         frame.render_widget(
-            Paragraph::new(text)
+            Paragraph::new(format_message_lines(text))
                 .wrap(ratatui::widgets::Wrap { trim: false })
                 .scroll((app.message_scroll, 0))
                 .block(layout::panel("Message — Up/Down: scroll; Esc/F1: close")),
@@ -1832,5 +1872,73 @@ mod tests {
         // Once editing is finished, Right navigates to Log section again
         handle_key(&mut app, KeyCode::Right, &client, false).await;
         assert_eq!(app.screen, Screen::Log);
+    }
+
+    #[test]
+    fn format_message_lines_highlights_shift_copy_hint_in_red() {
+        let text = "Delete route manually:\nsudo ip route del ...\n\nTo copy, hold down Shift\n\nEsc: close";
+        let lines = format_message_lines(text);
+        assert_eq!(lines.len(), 6);
+        assert_eq!(lines[0].spans[0].style, Style::default());
+        assert_eq!(lines[2].spans[0].style, Style::default());
+        let hint_line = &lines[3];
+        assert_eq!(hint_line.spans.len(), 1);
+        assert_eq!(hint_line.spans[0].content, "To copy, hold down Shift");
+        assert_eq!(hint_line.spans[0].style, Style::default().fg(theme::BAD));
+    }
+
+    #[tokio::test]
+    async fn mouse_scrolls_message_when_open_and_ignores_navigation() {
+        let mut app = TuiApp {
+            screen: Screen::Dashboard,
+            message_open: true,
+            message_scroll: 5,
+            ..Default::default()
+        };
+        app.ui.input_enabled = true;
+        let client = ApiClient::new("/nonexistent.sock");
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 10,
+                row: 10,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            &client,
+            false,
+        )
+        .await;
+        assert_eq!(app.message_scroll, 4);
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 10,
+                row: 10,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            &client,
+            false,
+        )
+        .await;
+        assert_eq!(app.message_scroll, 5);
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            &client,
+            false,
+        )
+        .await;
+        assert_eq!(app.screen, Screen::Dashboard);
+        assert!(app.message_open);
     }
 }

@@ -445,6 +445,7 @@ fn delete_selected_route(app: &mut TuiApp) {
                 "Delete route manually: {}\n\n\
                  Run this command in a terminal on the machine running traffic-masqd:\n\n\
                  {command}\n\n\
+                 To copy, hold down Shift\n\n\
                  traffic-masq only displays this command; it does not execute it.\n\
                  Removing this route can interrupt connections that use it.\n\
                  The kernel, DHCP client or network manager may recreate the route. \
@@ -2325,6 +2326,11 @@ mod tests {
         assert!(app.message.as_deref().unwrap().contains(
             "sudo ip -4 route del 10.0.0.0/8 dev 'eth0' table 254 metric 0 proto 2 scope 253"
         ));
+        assert!(app
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("To copy, hold down Shift"));
 
         // Delete owned route
         app.message_open = false;
