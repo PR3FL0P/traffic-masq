@@ -181,7 +181,7 @@ impl RouterCandidate {
         proposal: &RouterIntentProposal,
     ) -> Result<Self> {
         if let RouterOverrideChange::Set(router) = &proposal.router {
-            if router.enabled && router.uplink.is_none() {
+            if router.enabled && router.uplink.is_none() && router.owned_routes.is_empty() {
                 bail!(
                     "router.uplink is required before an enabled router candidate can be activated"
                 );
@@ -245,6 +245,7 @@ mod tests {
     use crate::config::{
         DhcpInterfaceConfig, InterfaceRole, OwnedIpv4RouteConfig, UplinkConfig, UplinkMode,
     };
+    use crate::firewall::RouterDataplaneTarget;
 
     use super::*;
 
@@ -423,6 +424,30 @@ mod tests {
         .expect_err("activation must require a complete router intent");
 
         assert!(error.to_string().contains("router.uplink is required"));
+    }
+
+    #[test]
+    fn activates_enabled_router_candidate_without_uplink_when_routes_present() {
+        let mut router = enabled_router();
+        router.uplink = None;
+        router.owned_routes = vec![OwnedIpv4RouteConfig {
+            destination: "10.0.0.0/24".parse().expect("route"),
+            gateway: Some(Ipv4Addr::new(192, 168, 1, 1)),
+            output_interface: None,
+            table: 254,
+            metric: Some(100),
+        }];
+
+        let candidate = RouterCandidate::build(
+            &base_config(),
+            &committed(),
+            &RouterIntentProposal::new().set_router(router),
+        )
+        .expect("candidate without uplink but with routes must build");
+
+        assert!(candidate.desired().enabled);
+        assert_eq!(candidate.desired().routes.len(), 1);
+        assert_eq!(candidate.desired().dataplane, RouterDataplaneTarget::Disabled);
     }
 
     #[test]

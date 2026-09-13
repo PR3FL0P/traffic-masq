@@ -1785,6 +1785,29 @@ impl NetworkProvider for ProvisioningNetwork {
     async fn delete_ipv4_address(&self, _: &str, _: Ipv4Addr, _: u8) -> Result<()> {
         Ok(())
     }
+
+    async fn list_ipv4_routes(&self) -> Result<Vec<traffic_masq::netlink::Ipv4RouteInfo>> {
+        Ok(vec![
+            traffic_masq::netlink::Ipv4RouteInfo {
+                destination: "0.0.0.0/0".parse().unwrap(),
+                gateway: Some(Ipv4Addr::new(192, 168, 1, 1)),
+                output_interface_index: Some(1),
+                table: 254,
+                metric: Some(100),
+                protocol: 3,
+                scope: 0,
+            },
+            traffic_masq::netlink::Ipv4RouteInfo {
+                destination: "127.0.0.1/32".parse().unwrap(),
+                gateway: None,
+                output_interface_index: Some(1),
+                table: 255,
+                metric: None,
+                protocol: 2,
+                scope: 254,
+            },
+        ])
+    }
 }
 
 struct ProvisioningServer {
@@ -2203,6 +2226,51 @@ async fn provisioning_applies_advanced_overrides_over_http() -> Result<()> {
             assert_eq!(dhcp.pool_end, Ipv4Addr::new(172, 20, 5, 40));
             assert_eq!(dhcp.lease_seconds, Some(600));
             assert_eq!(dhcp.dns_servers, vec![Ipv4Addr::new(9, 9, 9, 9)]);
+        }
+        response => panic!("unexpected response: {response:?}"),
+    }
+
+    server.shutdown().await
+}
+
+#[tokio::test]
+async fn http_routes_list_and_router_config_endpoints_work() -> Result<()> {
+    let server = provisioning_test_server().await?;
+
+    let routes_resp = server
+        .admin
+        .request(&Request::ListRoutes {
+            include_local_table: false,
+        })
+        .await?;
+    match routes_resp {
+        Response::Routes { routes } => {
+            assert_eq!(routes.len(), 1);
+            assert_eq!(routes[0].destination, "0.0.0.0/0".parse().unwrap());
+            assert_eq!(routes[0].output_interface.as_deref(), Some("eth0"));
+            assert_eq!(routes[0].owner, traffic_masq::netlink::RouteOwner::Boot);
+        }
+        response => panic!("unexpected response: {response:?}"),
+    }
+
+    let all_routes_resp = server
+        .admin
+        .request(&Request::ListRoutes {
+            include_local_table: true,
+        })
+        .await?;
+    match all_routes_resp {
+        Response::Routes { routes } => {
+            assert_eq!(routes.len(), 2);
+            assert_eq!(routes[1].table, 255);
+        }
+        response => panic!("unexpected response: {response:?}"),
+    }
+
+    let config_resp = server.admin.request(&Request::GetRouterConfig).await?;
+    match config_resp {
+        Response::RouterConfig { config } => {
+            assert!(!config.enabled);
         }
         response => panic!("unexpected response: {response:?}"),
     }

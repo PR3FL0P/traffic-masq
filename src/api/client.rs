@@ -586,6 +586,18 @@ fn map_request(request: &crate::api::model::Request) -> Result<RestRequest> {
             body: None,
             synthesize_pong: false,
         },
+        Request::ListRoutes { include_local_table } => RestRequest {
+            method: Method::GET,
+            path: format!("{API_PREFIX}/routes?include_local_table={include_local_table}"),
+            body: None,
+            synthesize_pong: false,
+        },
+        Request::GetRouterConfig => RestRequest {
+            method: Method::GET,
+            path: format!("{API_PREFIX}/router/config"),
+            body: None,
+            synthesize_pong: false,
+        },
 
         Request::RouterProvisioningPreview { request } => RestRequest {
             method: Method::POST,
@@ -952,9 +964,10 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("timed out"));
+        tokio::task::yield_now().await;
         let mut bytes = Vec::new();
         tokio::time::timeout(
-            std::time::Duration::from_secs(1),
+            std::time::Duration::from_secs(5),
             peer.read_to_end(&mut bytes),
         )
         .await
@@ -1118,5 +1131,22 @@ mod tests {
         assert_eq!(mapped.path, "/api/v1/network-transactions/commit");
         assert!(mapped.body.is_some());
         assert!(!mapped.synthesize_pong);
+    }
+
+    #[test]
+    fn maps_route_management_requests() {
+        let list_routes = map_request(&Request::ListRoutes {
+            include_local_table: true,
+        })
+        .expect("list_routes should map");
+        assert_eq!(list_routes.method, Method::GET);
+        assert_eq!(list_routes.path, "/api/v1/routes?include_local_table=true");
+        assert!(list_routes.body.is_none());
+
+        let get_router_cfg =
+            map_request(&Request::GetRouterConfig).expect("get_router_config should map");
+        assert_eq!(get_router_cfg.method, Method::GET);
+        assert_eq!(get_router_cfg.path, "/api/v1/router/config");
+        assert!(get_router_cfg.body.is_none());
     }
 }

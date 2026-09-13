@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 
-use axum::extract::{DefaultBodyLimit, Extension, Path as AxumPath, Request as AxumRequest, State};
+use axum::extract::{
+    DefaultBodyLimit, Extension, Path as AxumPath, Query, Request as AxumRequest, State,
+};
 use axum::http::{header::AUTHORIZATION, StatusCode};
 use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response as AxumResponse};
@@ -221,6 +223,8 @@ fn build_router(state: AppState) -> Router {
         .route("/network-transactions", get(pending_transactions))
         .route("/network-transactions/commit", post(commit_transaction))
         .route("/network-transactions/rollback", post(rollback_transaction))
+        .route("/routes", get(routes_list))
+        .route("/router/config", get(router_get_config))
         .route("/router/status", get(router_status))
         .route("/router/plan", post(router_plan))
         .route("/router/apply", post(router_apply))
@@ -839,6 +843,34 @@ async fn rollback_transaction(
         },
     )
     .await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListRoutesQuery {
+    #[serde(default)]
+    pub include_local_table: bool,
+}
+
+async fn routes_list(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Query(query): Query<ListRoutesQuery>,
+) -> Result<Json<Response>, ApiError> {
+    dispatch_control(
+        &state,
+        &principal,
+        Request::ListRoutes {
+            include_local_table: query.include_local_table,
+        },
+    )
+    .await
+}
+
+async fn router_get_config(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<Response>, ApiError> {
+    dispatch_control(&state, &principal, Request::GetRouterConfig).await
 }
 
 async fn router_status(

@@ -191,7 +191,11 @@ fn screen_help_pairs(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("Enter", "select"),
             ("Esc", "back"),
         ],
-        Screen::Access | Screen::InterfaceEditor | Screen::DhcpEditor | Screen::VpnPolicy => vec![
+        Screen::Access
+        | Screen::InterfaceEditor
+        | Screen::DhcpEditor
+        | Screen::RouteEditor
+        | Screen::VpnPolicy => vec![
             ("↑/↓", "move"),
             ("Enter", "activate"),
             ("type", "edit value"),

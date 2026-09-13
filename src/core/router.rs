@@ -51,10 +51,7 @@ impl RouterDesired {
         let mut dhcp = DhcpSupervisor::service_specs(config)?;
         dhcp.sort_by(|left, right| left.interface.cmp(&right.interface));
 
-        // `enabled` without an uplink means the router capability is available,
-        // but no data-plane intent has been provisioned yet.  Treat it exactly
-        // like an inactive data plane until provisioning commits a full intent.
-        if !config.router.enabled || config.router.uplink.is_none() {
+        if !config.router.enabled {
             return Ok(Self {
                 enabled: false,
                 uplink_wifi: None,
@@ -62,29 +59,62 @@ impl RouterDesired {
                 output_wifi: Vec::new(),
                 dhcp,
                 routes: Vec::new(),
-                allow_default_route_change: false,
+                // Disabling the router still removes its owned routes, so
+                // retain explicit permission to delete an owned default route.
+                allow_default_route_change: config.router.allow_default_route_change,
                 vpn_chain: Vec::new(),
                 dataplane: RouterDataplaneTarget::Disabled,
                 interfaces: Vec::new(),
             });
         }
 
-        let uplink = config
-            .router
-            .uplink
-            .as_ref()
-            .expect("configured enabled router has an uplink");
-        let uplink_config = config
-            .network
-            .interfaces
-            .get(&uplink.interface)
-            .expect("validated router uplink interface is configured");
+        let routes = desired_owned_routes(&config.router);
+        let allow_default_route_change = config.router.allow_default_route_change;
+
         let managed_outputs: Vec<(&String, &InterfaceConfig)> = config
             .network
             .interfaces
             .iter()
             .filter(|(_, interface)| interface.role == InterfaceRole::Output && interface.managed)
             .collect();
+
+        let Some(uplink) = config.router.uplink.as_ref() else {
+            let interfaces: Vec<_> = managed_outputs
+                .into_iter()
+                .map(|(name, interface)| RouterInterfaceDesired {
+                    name: name.clone(),
+                    config: interface.clone(),
+                })
+                .collect();
+
+            let mut output_wifi = interfaces
+                .iter()
+                .filter_map(|interface| {
+                    WifiApSpec::from_interface_config(&interface.name, &interface.config)
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            output_wifi.sort_by(|left, right| left.interface.cmp(&right.interface));
+
+            return Ok(Self {
+                enabled: true,
+                uplink_wifi: None,
+                uplink_dhcp: None,
+                output_wifi,
+                dhcp,
+                routes,
+                allow_default_route_change,
+                vpn_chain: Vec::new(),
+                dataplane: RouterDataplaneTarget::Disabled,
+                interfaces,
+            });
+        };
+
+        let uplink_config = config
+            .network
+            .interfaces
+            .get(&uplink.interface)
+            .expect("validated router uplink interface is configured");
         let outputs = managed_outputs
             .iter()
             .filter(|(_, interface)| interface.nat)
@@ -183,8 +213,8 @@ impl RouterDesired {
             uplink_dhcp,
             output_wifi,
             dhcp,
-            routes: desired_owned_routes(&config.router),
-            allow_default_route_change: config.router.allow_default_route_change,
+            routes,
+            allow_default_route_change,
             vpn_chain,
             dataplane: RouterDataplaneTarget::Enabled(dataplane),
             interfaces,
@@ -945,15 +975,17 @@ mod tests {
     }
 
     #[test]
-    fn unconfigured_router_does_not_claim_routes_or_dataplane() {
+    fn enabled_router_without_uplink_claims_routes_with_disabled_dataplane() {
         let mut config = enabled_config();
         config.router.uplink = None;
 
         let desired = RouterDesired::from_effective_config(&config).expect("desired");
 
-        assert!(!desired.enabled);
-        assert!(desired.interfaces.is_empty());
-        assert!(desired.routes.is_empty());
+        assert!(desired.enabled);
+        assert_eq!(desired.interfaces.len(), 2);
+        assert_eq!(desired.routes.len(), 1);
+        assert!(desired.uplink_wifi.is_none());
+        assert!(desired.uplink_dhcp.is_none());
         assert_eq!(desired.dataplane, RouterDataplaneTarget::Disabled);
     }
 

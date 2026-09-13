@@ -159,6 +159,57 @@ pub struct Ipv4RouteSpec {
     pub protocol: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteOwner {
+    TrafficMasqStatic, // proto 201 (TRAFFIC_MASQ_ROUTE_PROTOCOL)
+    TrafficMasqDhcp,   // proto 202 (TRAFFIC_MASQ_DHCP_ROUTE_PROTOCOL)
+    Kernel,            // proto 2 (RTPROT_KERNEL)
+    Boot,              // proto 3 (RTPROT_BOOT)
+    Static,            // proto 4 (RTPROT_STATIC)
+    Dhcp,              // proto 16 (RTPROT_DHCP)
+    Foreign(u8),       // other rt_proto
+    Untagged,          // RTPROT_UNSPEC (0)
+}
+
+impl RouteOwner {
+    pub fn from_protocol(protocol: u8) -> Self {
+        match protocol {
+            0 => Self::Untagged,
+            2 => Self::Kernel,
+            3 => Self::Boot,
+            4 => Self::Static,
+            16 => Self::Dhcp,
+            TRAFFIC_MASQ_ROUTE_PROTOCOL => Self::TrafficMasqStatic,
+            TRAFFIC_MASQ_DHCP_ROUTE_PROTOCOL => Self::TrafficMasqDhcp,
+            other => Self::Foreign(other),
+        }
+    }
+
+    pub fn is_owned(self) -> bool {
+        matches!(self, Self::TrafficMasqStatic | Self::TrafficMasqDhcp)
+    }
+
+    pub fn is_editable(self) -> bool {
+        matches!(self, Self::TrafficMasqStatic)
+    }
+}
+
+impl std::fmt::Display for RouteOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TrafficMasqStatic => write!(f, "traffic-masq"),
+            Self::TrafficMasqDhcp => write!(f, "traffic-masq (dhcp)"),
+            Self::Kernel => write!(f, "[ext:kernel]"),
+            Self::Boot => write!(f, "[ext:boot]"),
+            Self::Static => write!(f, "[ext:static]"),
+            Self::Dhcp => write!(f, "[ext:dhcp]"),
+            Self::Foreign(proto) => write!(f, "[ext:proto {proto}]"),
+            Self::Untagged => write!(f, "[?]"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ipv4RouteInfo {
     pub destination: ipnet::Ipv4Net,
@@ -168,6 +219,12 @@ pub struct Ipv4RouteInfo {
     pub metric: Option<u32>,
     pub protocol: u8,
     pub scope: u8,
+}
+
+impl Ipv4RouteInfo {
+    pub fn owner(&self) -> RouteOwner {
+        RouteOwner::from_protocol(self.protocol)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,8 +256,24 @@ impl Ipv4RouteSpec {
         if self.table == 0 {
             anyhow::bail!("IPv4 route table must not be RT_TABLE_UNSPEC (0)");
         }
+        if self.table == 255 {
+            anyhow::bail!("IPv4 route table must not be RT_TABLE_LOCAL (255)");
+        }
+        if self.destination.addr() != self.destination.network() {
+            anyhow::bail!(
+                "IPv4 route destination prefix {} has host bits set",
+                self.destination
+            );
+        }
         if self.gateway.is_none() && self.output_interface_index.is_none() {
             anyhow::bail!("IPv4 route requires a gateway or output interface");
+        }
+        if let Some(gateway) = self.gateway {
+            if gateway.is_unspecified() || gateway.is_broadcast() || gateway.is_multicast() {
+                anyhow::bail!(
+                    "IPv4 route gateway must not be unspecified, multicast, or broadcast: {gateway}"
+                );
+            }
         }
         if self.protocol == 0 {
             anyhow::bail!("IPv4 route protocol must not be RTPROT_UNSPEC (0)");
@@ -1203,5 +1276,60 @@ mod tests {
             filtered[0].destination,
             "0.0.0.0/0".parse().expect("default route")
         );
+    }
+
+    #[test]
+    fn route_owner_classification_and_display() {
+        let cases = [
+            (TRAFFIC_MASQ_ROUTE_PROTOCOL, RouteOwner::TrafficMasqStatic, true, true, "traffic-masq"),
+            (TRAFFIC_MASQ_DHCP_ROUTE_PROTOCOL, RouteOwner::TrafficMasqDhcp, true, false, "traffic-masq (dhcp)"),
+            (2, RouteOwner::Kernel, false, false, "[ext:kernel]"),
+            (3, RouteOwner::Boot, false, false, "[ext:boot]"),
+            (4, RouteOwner::Static, false, false, "[ext:static]"),
+            (16, RouteOwner::Dhcp, false, false, "[ext:dhcp]"),
+            (42, RouteOwner::Foreign(42), false, false, "[ext:proto 42]"),
+            (0, RouteOwner::Untagged, false, false, "[?]"),
+        ];
+
+        for (proto, expected_owner, owned, editable, display) in cases {
+            let owner = RouteOwner::from_protocol(proto);
+            assert_eq!(owner, expected_owner);
+            assert_eq!(owner.is_owned(), owned);
+            assert_eq!(owner.is_editable(), editable);
+            assert_eq!(owner.to_string(), display);
+        }
+    }
+
+    #[test]
+    fn ipv4_route_spec_validates_gateway_and_table() {
+        let valid = Ipv4RouteSpec {
+            destination: "192.168.1.0/24".parse().unwrap(),
+            gateway: Some(std::net::Ipv4Addr::new(192, 168, 1, 1)),
+            output_interface_index: None,
+            table: 254,
+            metric: Some(100),
+            protocol: TRAFFIC_MASQ_ROUTE_PROTOCOL,
+        };
+        assert!(valid.validate().is_ok());
+
+        // Rejects 0.0.0.0
+        let mut invalid_gw = valid.clone();
+        invalid_gw.gateway = Some(std::net::Ipv4Addr::UNSPECIFIED);
+        assert!(invalid_gw.validate().is_err());
+
+        // Rejects broadcast 255.255.255.255
+        invalid_gw.gateway = Some(std::net::Ipv4Addr::BROADCAST);
+        assert!(invalid_gw.validate().is_err());
+
+        // Rejects multicast 224.0.0.1
+        invalid_gw.gateway = Some(std::net::Ipv4Addr::new(224, 0, 0, 1));
+        assert!(invalid_gw.validate().is_err());
+
+        // Rejects table 0 and 255
+        let mut invalid_table = valid.clone();
+        invalid_table.table = 0;
+        assert!(invalid_table.validate().is_err());
+        invalid_table.table = 255;
+        assert!(invalid_table.validate().is_err());
     }
 }

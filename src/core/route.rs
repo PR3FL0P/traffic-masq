@@ -115,8 +115,15 @@ impl RouteManager {
         desired: &[ManagedIpv4Route],
         allow_default_route_change: bool,
     ) -> Result<RoutePlan> {
+        let all_routes = self.provider.list_ipv4_routes().await?;
+        let mut current: Vec<_> = all_routes
+            .iter()
+            .filter(|route| route.protocol == TRAFFIC_MASQ_ROUTE_PROTOCOL)
+            .cloned()
+            .collect();
+        sort_routes(&mut current);
+
         let desired = self.resolve_desired(desired).await?;
-        let current = self.owned_routes().await?;
 
         let mut add: Vec<_> = desired
             .iter()
@@ -129,6 +136,35 @@ impl RouteManager {
             .collect();
         sort_specs(&mut add);
         sort_routes(&mut delete);
+
+        let foreign_routes: HashMap<(u32, ipnet::Ipv4Net, u32), crate::netlink::RouteOwner> =
+            all_routes
+                .iter()
+                .filter(|r| r.protocol != TRAFFIC_MASQ_ROUTE_PROTOCOL)
+                .map(|r| {
+                    (
+                        (r.table, r.destination.trunc(), r.metric.unwrap_or(0)),
+                        r.owner(),
+                    )
+                })
+                .collect();
+
+        for desired_route in &add {
+            let key = (
+                desired_route.table,
+                desired_route.destination.trunc(),
+                desired_route.metric.unwrap_or(0),
+            );
+            if let Some(owner) = foreign_routes.get(&key) {
+                bail!(
+                    "destination prefix {} in table {} collides with existing route owned by {} with identical metric {}",
+                    desired_route.destination,
+                    desired_route.table,
+                    owner,
+                    desired_route.metric.unwrap_or(0)
+                );
+            }
+        }
 
         let plan = RoutePlan { add, delete };
         if plan.changes_default_route() && !allow_default_route_change {
@@ -176,10 +212,12 @@ impl RouteManager {
         let current = self.owned_routes().await?;
         let mut errors = Vec::new();
 
-        for route in current
-            .iter()
-            .filter(|route| !snapshot.owned_routes.contains(route))
-        {
+        for route in current.iter().filter(|route| {
+            !snapshot
+                .owned_routes
+                .iter()
+                .any(|s| route_info_matches(s, route))
+        }) {
             if let Err(error) = self.provider.delete_ipv4_route(route).await {
                 errors.push(format!("failed to delete {}: {error}", route.destination));
             }
@@ -189,7 +227,7 @@ impl RouteManager {
         for route in snapshot
             .owned_routes
             .iter()
-            .filter(|route| !current.contains(route))
+            .filter(|route| !current.iter().any(|c| route_info_matches(c, route)))
         {
             if let Err(error) = self.provider.add_ipv4_route(&spec_from_info(route)).await {
                 errors.push(format!("failed to restore {}: {error}", route.destination));
@@ -250,7 +288,7 @@ impl RouteManager {
                     None => None,
                 };
             let spec = Ipv4RouteSpec {
-                destination: route.destination,
+                destination: route.destination.trunc(),
                 gateway: route.gateway,
                 output_interface_index,
                 table: route.table,
@@ -258,7 +296,11 @@ impl RouteManager {
                 protocol: TRAFFIC_MASQ_ROUTE_PROTOCOL,
             };
             spec.validate()?;
-            if resolved.contains(&spec) {
+            if resolved.iter().any(|r: &Ipv4RouteSpec| {
+                r.table == spec.table
+                    && r.destination == spec.destination
+                    && r.metric.unwrap_or(0) == spec.metric.unwrap_or(0)
+            }) {
                 bail!("duplicate managed IPv4 route: {}", route.destination);
             }
             resolved.push(spec);
@@ -274,8 +316,17 @@ fn route_matches(info: &Ipv4RouteInfo, spec: &Ipv4RouteSpec) -> bool {
         && info.gateway == spec.gateway
         && info.output_interface_index == spec.output_interface_index
         && info.table == spec.table
-        && info.metric == spec.metric
+        && info.metric.unwrap_or(0) == spec.metric.unwrap_or(0)
         && info.protocol == spec.protocol
+}
+
+fn route_info_matches(a: &Ipv4RouteInfo, b: &Ipv4RouteInfo) -> bool {
+    a.destination == b.destination
+        && a.gateway == b.gateway
+        && a.output_interface_index == b.output_interface_index
+        && a.table == b.table
+        && a.metric.unwrap_or(0) == b.metric.unwrap_or(0)
+        && a.protocol == b.protocol
 }
 
 fn spec_from_info(info: &Ipv4RouteInfo) -> Ipv4RouteSpec {
@@ -297,7 +348,7 @@ fn sort_specs(routes: &mut [Ipv4RouteSpec]) {
             route.destination.prefix_len(),
             route.gateway,
             route.output_interface_index,
-            route.metric,
+            route.metric.unwrap_or(0),
             route.protocol,
         )
     });
@@ -311,7 +362,7 @@ fn sort_routes(routes: &mut [Ipv4RouteInfo]) {
             route.destination.prefix_len(),
             route.gateway,
             route.output_interface_index,
-            route.metric,
+            route.metric.unwrap_or(0),
             route.protocol,
             route.scope,
         )
@@ -502,6 +553,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_router_removes_default_route_only_with_explicit_permission() {
+        let provider = Arc::new(FakeNetwork::default());
+        let owned = route("0.0.0.0/0", TRAFFIC_MASQ_ROUTE_PROTOCOL);
+        let foreign = route("0.0.0.0/0", 4);
+        provider
+            .routes
+            .lock()
+            .await
+            .extend([owned.clone(), foreign.clone()]);
+        let manager = RouteManager::new(provider.clone());
+        let mut config = crate::config::AppConfig::default();
+        let desired = crate::core::router::RouterDesired::from_effective_config(&config)
+            .expect("disabled router intent");
+
+        let error = manager
+            .apply(&desired.routes, desired.allow_default_route_change)
+            .await
+            .expect_err("removing an owned default still requires permission");
+        assert!(error.to_string().contains("without explicit confirmation"));
+        assert_eq!(
+            provider.route_snapshot().await,
+            vec![owned.clone(), foreign.clone()]
+        );
+
+        config.router.allow_default_route_change = true;
+        let desired = crate::core::router::RouterDesired::from_effective_config(&config)
+            .expect("confirmed disabled router intent");
+        let snapshot = manager
+            .apply(&desired.routes, desired.allow_default_route_change)
+            .await
+            .expect("explicitly allowed default route removal");
+        assert_eq!(provider.route_snapshot().await, vec![foreign.clone()]);
+
+        manager
+            .rollback(&snapshot)
+            .await
+            .expect("restore owned default route");
+        let restored = provider.route_snapshot().await;
+        assert_eq!(restored.len(), 2);
+        assert!(restored.contains(&owned));
+        assert!(restored.contains(&foreign));
+    }
+
+    #[tokio::test]
     async fn route_plan_exposes_default_route_risk() {
         let manager = RouteManager::new(Arc::new(FakeNetwork::default()));
         let ordinary = manager
@@ -573,5 +668,140 @@ mod tests {
         assert!(routes.contains(&foreign));
         assert!(routes.contains(&dynamic));
         assert!(!routes.contains(&route("198.51.100.0/24", TRAFFIC_MASQ_ROUTE_PROTOCOL)));
+    }
+
+    #[tokio::test]
+    async fn preflight_foreign_collision_detection_rejects_matching_table_dest_and_metric() {
+        let provider = Arc::new(FakeNetwork::default());
+        provider
+            .routes
+            .lock()
+            .await
+            .push(route("198.51.100.0/24", 4));
+        let manager = RouteManager::new(provider.clone());
+
+        let err = manager
+            .plan(&[desired("198.51.100.0/24")], false)
+            .await
+            .expect_err("should collide with foreign static route");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("destination prefix 198.51.100.0/24 in table 254 collides with existing route owned by [ext:static] with identical metric 100"),
+            "unexpected error message: {msg}"
+        );
+
+        let mut non_colliding = desired("198.51.100.0/24");
+        non_colliding.metric = Some(200);
+        let plan = manager
+            .plan(&[non_colliding], false)
+            .await
+            .expect("different metric must not collide");
+        assert_eq!(plan.add.len(), 1);
+        assert_eq!(plan.add[0].metric, Some(200));
+
+        let mut different_table = desired("198.51.100.0/24");
+        different_table.table = 100;
+        let plan = manager
+            .plan(&[different_table], false)
+            .await
+            .expect("different table must not collide");
+        assert_eq!(plan.add.len(), 1);
+        assert_eq!(plan.add[0].table, 100);
+    }
+
+    #[tokio::test]
+    async fn preflight_foreign_collision_detects_dhcp_and_kernel_routes() {
+        let provider = Arc::new(FakeNetwork::default());
+        provider.routes.lock().await.extend([
+            route("0.0.0.0/0", TRAFFIC_MASQ_DHCP_ROUTE_PROTOCOL),
+            route("10.0.0.0/24", 2),
+        ]);
+        let manager = RouteManager::new(provider.clone());
+
+        let err = manager
+            .plan(&[desired("0.0.0.0/0")], true)
+            .await
+            .expect_err("should collide with dhcp default route");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("collides with existing route owned by traffic-masq (dhcp) with identical metric 100"),
+            "unexpected error message: {msg}"
+        );
+
+        let err = manager
+            .plan(&[desired("10.0.0.0/24")], false)
+            .await
+            .expect_err("should collide with kernel route");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(
+                "collides with existing route owned by [ext:kernel] with identical metric 100"
+            ),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_routes_scopes_exclusively_to_proto_201() {
+        let provider = Arc::new(FakeNetwork::default());
+        provider.routes.lock().await.extend([
+            route("192.0.2.0/24", TRAFFIC_MASQ_ROUTE_PROTOCOL),
+            route("0.0.0.0/0", TRAFFIC_MASQ_DHCP_ROUTE_PROTOCOL),
+            route("10.0.0.0/24", 2),
+            route("172.16.0.0/24", 4),
+        ]);
+        let manager = RouteManager::new(provider);
+        let snapshot = manager.snapshot().await.expect("snapshot");
+        assert_eq!(snapshot.owned_routes.len(), 1);
+        assert_eq!(
+            snapshot.owned_routes[0].destination,
+            "192.0.2.0/24".parse().unwrap()
+        );
+        assert_eq!(
+            snapshot.owned_routes[0].protocol,
+            TRAFFIC_MASQ_ROUTE_PROTOCOL
+        );
+    }
+
+    #[tokio::test]
+    async fn route_matches_and_plan_treats_none_and_zero_metric_as_equivalent() {
+        let provider = Arc::new(FakeNetwork::default());
+        let mut existing = route("192.0.2.0/24", TRAFFIC_MASQ_ROUTE_PROTOCOL);
+        existing.metric = None; // dumped from kernel with metric 0 omitted
+        provider.routes.lock().await.push(existing);
+
+        let manager = RouteManager::new(provider);
+        let mut desired_zero = desired("192.0.2.0/24");
+        desired_zero.metric = Some(0);
+
+        // Should match existing route without generating any additions or deletions
+        let plan = manager
+            .plan(&[desired_zero], false)
+            .await
+            .expect("plan with metric 0 matching None");
+        assert!(plan.is_empty(), "expected empty plan, got: {plan:?}");
+    }
+
+    #[tokio::test]
+    async fn rollback_treats_none_and_zero_metric_as_equivalent() {
+        let provider = Arc::new(FakeNetwork::default());
+        let mut snapshot_route = route("192.0.2.0/24", TRAFFIC_MASQ_ROUTE_PROTOCOL);
+        snapshot_route.metric = None;
+        let snapshot = RouteSnapshot {
+            owned_routes: vec![snapshot_route],
+        };
+
+        let mut current_route = route("192.0.2.0/24", TRAFFIC_MASQ_ROUTE_PROTOCOL);
+        current_route.metric = Some(0);
+        provider.routes.lock().await.push(current_route);
+
+        let manager = RouteManager::new(provider.clone());
+        manager
+            .rollback(&snapshot)
+            .await
+            .expect("rollback should succeed without changes");
+
+        let routes = provider.routes.lock().await;
+        assert_eq!(routes.len(), 1);
     }
 }

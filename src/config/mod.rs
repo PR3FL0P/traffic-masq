@@ -626,55 +626,63 @@ impl NetworkConfig {
 impl RouterConfig {
     fn validate(&self, network: &NetworkConfig) -> Result<()> {
         if self.enabled {
-            // An enabled router without an uplink is a valid control-plane state:
-            // the daemon can start and the user can complete setup through the
-            // provisioning API.  A complete uplink remains mandatory before a
-            // router candidate can be activated.
-            let Some(uplink) = self.uplink.as_ref() else {
-                return Ok(());
-            };
-            validate_interface_name(&uplink.interface)
-                .map_err(|error| anyhow::anyhow!("router uplink: {error}"))?;
-            let interface = network.interfaces.get(&uplink.interface).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "router uplink interface {} is not configured",
-                    uplink.interface
-                )
-            })?;
-            if interface.role != InterfaceRole::Input {
-                bail!("router uplink interface must have the input role");
-            }
-            match uplink.mode {
-                UplinkMode::External if interface.managed => {
-                    bail!("external router uplink must be unmanaged");
+            if let Some(uplink) = self.uplink.as_ref() {
+                validate_interface_name(&uplink.interface)
+                    .map_err(|error| anyhow::anyhow!("router uplink: {error}"))?;
+                let interface = network.interfaces.get(&uplink.interface).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "router uplink interface {} is not configured",
+                        uplink.interface
+                    )
+                })?;
+                if interface.role != InterfaceRole::Input {
+                    bail!("router uplink interface must have the input role");
                 }
-                UplinkMode::Dhcp
-                    if !interface.managed
-                        || !interface
-                            .dhcp_client
-                            .as_ref()
-                            .is_some_and(|config| config.enabled) =>
-                {
-                    bail!(
-                        "DHCP router uplink must be a managed input interface with an enabled dhcp_client block"
-                    );
+                match uplink.mode {
+                    UplinkMode::External if interface.managed => {
+                        bail!("external router uplink must be unmanaged");
+                    }
+                    UplinkMode::Dhcp
+                        if !interface.managed
+                            || !interface
+                                .dhcp_client
+                                .as_ref()
+                                .is_some_and(|config| config.enabled) =>
+                    {
+                        bail!(
+                            "DHCP router uplink must be a managed input interface with an enabled dhcp_client block"
+                        );
+                    }
+                    UplinkMode::External | UplinkMode::Dhcp => {}
                 }
-                UplinkMode::External | UplinkMode::Dhcp => {}
-            }
 
-            let outputs = network
-                .interfaces
-                .iter()
-                .filter(|(_, interface)| {
-                    interface.role == InterfaceRole::Output && interface.managed
-                })
-                .collect::<Vec<_>>();
-            if outputs.is_empty() {
-                bail!("enabled router mode requires at least one managed output interface");
-            }
-            for (name, interface) in outputs {
-                if interface.ipv4.is_none() {
-                    bail!("router output interface {name} requires a static IPv4 subnet");
+                let outputs = network
+                    .interfaces
+                    .iter()
+                    .filter(|(_, interface)| {
+                        interface.role == InterfaceRole::Output && interface.managed
+                    })
+                    .collect::<Vec<_>>();
+                if outputs.is_empty() {
+                    bail!("enabled router mode requires at least one managed output interface");
+                }
+                for (name, interface) in outputs {
+                    if interface.ipv4.is_none() {
+                        bail!("router output interface {name} requires a static IPv4 subnet");
+                    }
+                }
+            } else {
+                let outputs = network
+                    .interfaces
+                    .iter()
+                    .filter(|(_, interface)| {
+                        interface.role == InterfaceRole::Output && interface.managed
+                    })
+                    .collect::<Vec<_>>();
+                for (name, interface) in outputs {
+                    if interface.ipv4.is_none() {
+                        bail!("router output interface {name} requires a static IPv4 subnet");
+                    }
                 }
             }
         }
@@ -696,8 +704,17 @@ impl RouterConfig {
                     "router owned default route requires router.allow_default_route_change = true"
                 );
             }
-            if self.owned_routes[..index].contains(route) {
-                bail!("duplicate router owned IPv4 route: {}", route.destination);
+            if self.owned_routes[..index].iter().any(|prior| {
+                prior.table == route.table
+                    && prior.destination.trunc() == route.destination.trunc()
+                    && prior.metric.unwrap_or(0) == route.metric.unwrap_or(0)
+            }) {
+                bail!(
+                    "duplicate router owned IPv4 route: {} in table {} with metric {}",
+                    route.destination,
+                    route.table,
+                    route.metric.unwrap_or(0)
+                );
             }
         }
 
@@ -706,33 +723,44 @@ impl RouterConfig {
 }
 
 impl OwnedIpv4RouteConfig {
-    fn validate(&self, network: &NetworkConfig, uplink: Option<&UplinkConfig>) -> Result<()> {
+    fn validate(&self, network: &NetworkConfig, _uplink: Option<&UplinkConfig>) -> Result<()> {
         if self.table == 0 {
             bail!("IPv4 route table must not be RT_TABLE_UNSPEC (0)");
         }
+        if self.table == 255 {
+            bail!("IPv4 route table must not be RT_TABLE_LOCAL (255)");
+        }
+        if self.destination.prefix_len() > 32 {
+            bail!("invalid IPv4 prefix length {}", self.destination.prefix_len());
+        }
+        if self.destination.addr() != self.destination.network() {
+            bail!(
+                "destination prefix {} has host bits set (did you mean {}?)",
+                self.destination,
+                self.destination.trunc()
+            );
+        }
         if self.gateway.is_none() && self.output_interface.is_none() {
             bail!("IPv4 route requires a gateway or output interface");
+        }
+        if let Some(gateway) = self.gateway {
+            if gateway.is_unspecified() || gateway.is_broadcast() || gateway.is_multicast() {
+                bail!(
+                    "IPv4 route gateway must not be unspecified, multicast, or broadcast: {gateway}"
+                );
+            }
         }
 
         let Some(name) = self.output_interface.as_deref() else {
             return Ok(());
         };
         validate_interface_name(name)?;
-        let interface = network
-            .interfaces
-            .get(name)
-            .ok_or_else(|| anyhow::anyhow!("output interface {name} is not configured"))?;
-        match interface.role {
-            InterfaceRole::Input if uplink.is_some_and(|uplink| uplink.interface == name) => Ok(()),
-            InterfaceRole::Output if interface.managed => Ok(()),
-            InterfaceRole::None | InterfaceRole::Disabled | InterfaceRole::Middle => {
-                bail!("outside-router, disabled, or VPN-hop interface {name} cannot own a router route")
+        if let Some(interface) = network.interfaces.get(name) {
+            if interface.role == InterfaceRole::Disabled {
+                bail!("disabled interface {name} cannot own a router route");
             }
-            InterfaceRole::Input => {
-                bail!("route input interface {name} is not the selected uplink")
-            }
-            InterfaceRole::Output => bail!("route output interface {name} must be managed"),
         }
+        Ok(())
     }
 }
 
@@ -1480,28 +1508,44 @@ mod tests {
 
     #[test]
     fn rejects_route_ownership_violations() {
-        for role in [InterfaceRole::None, InterfaceRole::Disabled] {
-            let mut config = valid_router_config();
-            config.network.interfaces.insert(
-                "foreign0".to_string(),
-                InterfaceConfig {
-                    nat: true,
-                    role,
-                    managed: false,
-                    ipv4: None,
-                    dhcp: None,
-                    dhcp_client: None,
-                    wifi: None,
-                    wifi_client: None,
-                },
-            );
-            config.router.owned_routes[0].output_interface = Some("foreign0".to_string());
-            assert!(config
-                .validate()
-                .expect_err("protected role cannot own route")
-                .to_string()
-                .contains("cannot own a router route"));
-        }
+        let mut config = valid_router_config();
+        config.network.interfaces.insert(
+            "disabled0".to_string(),
+            InterfaceConfig {
+                nat: true,
+                role: InterfaceRole::Disabled,
+                managed: false,
+                ipv4: None,
+                dhcp: None,
+                dhcp_client: None,
+                wifi: None,
+                wifi_client: None,
+            },
+        );
+        config.router.owned_routes[0].output_interface = Some("disabled0".to_string());
+        assert!(config
+            .validate()
+            .expect_err("disabled role cannot own route")
+            .to_string()
+            .contains("cannot own a router route"));
+
+        // Non-disabled roles (None, unselected Input) and host interfaces not in network.interfaces are permitted
+        let mut config = valid_router_config();
+        config.network.interfaces.insert(
+            "unmanaged0".to_string(),
+            InterfaceConfig {
+                nat: true,
+                role: InterfaceRole::None,
+                managed: false,
+                ipv4: None,
+                dhcp: None,
+                dhcp_client: None,
+                wifi: None,
+                wifi_client: None,
+            },
+        );
+        config.router.owned_routes[0].output_interface = Some("unmanaged0".to_string());
+        config.validate().expect("unmanaged interface should be valid for static route");
 
         let mut config = valid_router_config();
         config
@@ -1509,11 +1553,57 @@ mod tests {
             .interfaces
             .insert("other-wan".to_string(), input_interface());
         config.router.owned_routes[0].output_interface = Some("other-wan".to_string());
-        assert!(config
+        config.validate().expect("unselected input interface should be valid for static route");
+
+        let mut config = valid_router_config();
+        config.router.owned_routes[0].output_interface = Some("eth9".to_string());
+        config.validate().expect("system interface not declared in network.interfaces should pass config validation");
+    }
+
+    #[test]
+    fn router_without_uplink_validates_routes_and_detects_duplicates() {
+        let mut config = valid_router_config();
+        config.router.uplink = None;
+        config.router.owned_routes = vec![
+            OwnedIpv4RouteConfig {
+                destination: "10.0.0.0/24".parse().expect("destination"),
+                gateway: Some(Ipv4Addr::new(192, 168, 1, 1)),
+                output_interface: None,
+                table: 254,
+                metric: None,
+            },
+            OwnedIpv4RouteConfig {
+                destination: "10.0.0.0/24".parse().expect("destination"),
+                gateway: Some(Ipv4Addr::new(192, 168, 1, 2)),
+                output_interface: None,
+                table: 254,
+                metric: Some(0),
+            },
+        ];
+
+        let error = config
             .validate()
-            .expect_err("unselected input cannot own route")
-            .to_string()
-            .contains("not the selected uplink"));
+            .expect_err("duplicate routes with None and Some(0) metrics must be rejected");
+        assert!(error.to_string().contains("duplicate router owned IPv4 route"));
+
+        // Valid single route without uplink
+        config.router.owned_routes.pop();
+        config.validate().expect("valid router without uplink should validate");
+
+        // Reject host bits in CIDR
+        config.router.owned_routes[0].destination = "192.168.100.5/24".parse().unwrap();
+        let error = config
+            .validate()
+            .expect_err("destination with host bits must be rejected");
+        assert!(error.to_string().contains("has host bits set"));
+
+        // Reject RT_TABLE_LOCAL (255)
+        config.router.owned_routes[0].destination = "192.168.100.0/24".parse().unwrap();
+        config.router.owned_routes[0].table = 255;
+        let error = config
+            .validate()
+            .expect_err("table 255 must be rejected");
+        assert!(error.to_string().contains("RT_TABLE_LOCAL (255)"));
     }
 
     #[test]

@@ -325,7 +325,6 @@ mod tests {
 
     /// A successful, self-contained mutation, for tests that need the store to
     /// change but do not care what changed. `set_dhcp` used to serve this role.
-
     fn api_override(port: u16) -> ApiConfig {
         ApiConfig {
             tcp: Some(crate::config::TcpApiConfig {

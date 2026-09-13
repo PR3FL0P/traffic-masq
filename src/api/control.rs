@@ -15,6 +15,7 @@ use crate::api::model::{
     RouterProvisioningStatusView, SecuritySettings, VpnErrorDetail, VpnPolicyErrorDetail,
     VpnPolicyStatusView, WifiClientEditRequest, WifiClientErrorDetail,
     WifiClientProfileErrorDetail, WifiClientProfileWriteRequest, WifiEditRequest, WifiErrorDetail,
+    RouteStatus,
 };
 use crate::config::{
     ApiConfig, AppConfig, DhcpClientInterfaceConfig, DhcpInterfaceConfig, InterfaceConfig,
@@ -691,6 +692,10 @@ impl ControlService {
             Request::RouterCommit => self.router_commit().await,
             Request::RouterRollback => self.router_rollback().await,
             Request::RouterPendingTransaction => self.router_pending_transaction().await,
+            Request::ListRoutes { include_local_table } => {
+                self.list_routes(include_local_table).await
+            }
+            Request::GetRouterConfig => self.get_router_config().await,
             Request::RouterProvisioningPreview { request } => {
                 self.router_provisioning_preview(request).await
             }
@@ -2199,6 +2204,63 @@ impl ControlService {
         }
     }
 
+    async fn list_routes(&self, include_local_table: bool) -> Response {
+        let routes = match self.network.list_ipv4_routes().await {
+            Ok(routes) => routes,
+            Err(error) => {
+                return Response::Error {
+                    message: error.to_string(),
+                };
+            }
+        };
+        let interfaces = self.network.list_interfaces().await.unwrap_or_default();
+        let if_map: std::collections::HashMap<u32, String> = interfaces
+            .into_iter()
+            .map(|iface| (iface.index, iface.name))
+            .collect();
+
+        let mut status_routes: Vec<RouteStatus> = routes
+            .into_iter()
+            .filter(|route| include_local_table || route.table != 255)
+            .map(|route| {
+                let output_interface = route
+                    .output_interface_index
+                    .and_then(|idx| if_map.get(&idx).cloned());
+                RouteStatus::from_info(&route, output_interface)
+            })
+            .collect();
+
+        status_routes.sort_by(|a, b| {
+            let table_rank = |table: u32| -> (u8, u32) {
+                if table == 254 {
+                    (0, 0)
+                } else if table == 255 {
+                    (2, 255)
+                } else {
+                    (1, table)
+                }
+            };
+            table_rank(a.table)
+                .cmp(&table_rank(b.table))
+                .then_with(|| b.destination.prefix_len().cmp(&a.destination.prefix_len()))
+                .then_with(|| a.destination.network().cmp(&b.destination.network()))
+                .then_with(|| a.metric.unwrap_or(0).cmp(&b.metric.unwrap_or(0)))
+        });
+
+        Response::Routes {
+            routes: status_routes,
+        }
+    }
+
+    async fn get_router_config(&self) -> Response {
+        match self.effective_config().await {
+            Ok(effective) => Response::RouterConfig {
+                config: effective.router,
+            },
+            Err(message) => Response::Error { message },
+        }
+    }
+
     async fn router_plan(&self, proposal: RouterProposalRequest) -> Response {
         let Some(router) = &self.router else {
             return router_disabled();
@@ -2492,7 +2554,9 @@ impl ControlService {
                 return provisioning_error(RouterProvisioningErrorDetail::Other { message })
             }
         };
-        let unconfigured = effective.router.enabled && effective.router.uplink.is_none();
+        let unconfigured = effective.router.enabled
+            && effective.router.uplink.is_none()
+            && effective.router.owned_routes.is_empty();
         let desired = match RouterDesired::from_effective_config(&effective) {
             Ok(desired) => desired,
             Err(error) => {
@@ -2509,7 +2573,7 @@ impl ControlService {
             .await
             .map(|failure| failure.failures)
             .unwrap_or_default();
-        let ready = desired.enabled && readiness.ready();
+        let ready = desired.enabled && readiness.ready() && !unconfigured;
         let stage = match coordinator {
             CoordinatorStatus::RollbackFailed => ProvisioningStage::RollbackFailed,
             CoordinatorStatus::Pending => ProvisioningStage::AwaitingConfirmation,
@@ -4514,11 +4578,36 @@ mod tests {
         match service.dispatch(Request::RouterProvisioningStatus).await {
             Response::RouterProvisioningStatus { status } => {
                 assert_eq!(status.stage, ProvisioningStage::Unconfigured);
-                assert!(!status.enabled);
+                assert!(status.enabled);
                 assert!(!status.ready);
                 assert_eq!(status.coordinator, CoordinatorStatus::Idle);
             }
             other => panic!("expected unconfigured provisioning status, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn enabled_router_without_uplink_with_routes_reports_ready_provisioning_state() {
+        let mut config = router_base_config_with_router_enabled();
+        config.router.uplink = None;
+        config.router.owned_routes = vec![crate::config::OwnedIpv4RouteConfig {
+            destination: "10.0.0.0/24".parse().expect("destination"),
+            gateway: Some(std::net::Ipv4Addr::new(192, 168, 1, 1)),
+            output_interface: None,
+            table: 254,
+            metric: Some(100),
+        }];
+        let (service, _directory) =
+            router_service_with_config(Arc::new(FakeRouterSubsystems::default()), config).await;
+
+        match service.dispatch(Request::RouterProvisioningStatus).await {
+            Response::RouterProvisioningStatus { status } => {
+                assert_eq!(status.stage, ProvisioningStage::Ready);
+                assert!(status.enabled);
+                assert!(status.ready);
+                assert_eq!(status.coordinator, CoordinatorStatus::Idle);
+            }
+            other => panic!("expected ready provisioning status, got {other:?}"),
         }
     }
 
@@ -8340,5 +8429,156 @@ mod tests {
         assert!(!formatted.contains("upstream-secret"), "{formatted}");
         assert!(formatted.contains("<redacted>"), "{formatted}");
         assert!(formatted.contains("<absent>"), "{formatted}");
+    }
+
+    struct RouteFakeNetwork {
+        interfaces: Vec<NetworkInterface>,
+        routes: Vec<crate::netlink::Ipv4RouteInfo>,
+    }
+
+    #[async_trait]
+    impl NetworkProvider for RouteFakeNetwork {
+        async fn list_interfaces(&self) -> Result<Vec<NetworkInterface>> {
+            Ok(self.interfaces.clone())
+        }
+
+        async fn list_ipv4_addresses(&self, _interface: &str) -> Result<Vec<Ipv4AddressInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_ipv4_routes(&self) -> Result<Vec<crate::netlink::Ipv4RouteInfo>> {
+            Ok(self.routes.clone())
+        }
+
+        async fn set_link_up(&self, _name: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn set_link_down(&self, _name: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn add_ipv4_address(
+            &self,
+            _interface: &str,
+            _address: Ipv4Addr,
+            _prefix_len: u8,
+            _ownership: AddressOwnership,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete_ipv4_address(
+            &self,
+            _interface: &str,
+            _address: Ipv4Addr,
+            _prefix_len: u8,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn list_routes_and_get_router_config_dispatch() {
+        let directory = tempdir().expect("tempdir");
+        let config = router_base_config();
+        let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+            .await
+            .expect("overrides");
+        let dhcp = DhcpSupervisor::start(&config)
+            .await
+            .expect("dhcp supervisor");
+        let network: Arc<dyn NetworkProvider> = Arc::new(RouteFakeNetwork {
+            interfaces: vec![
+                NetworkInterface {
+                    index: 2,
+                    name: "eth0".to_string(),
+                    is_up: true,
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    is_wireless: false,
+                },
+                NetworkInterface {
+                    index: 3,
+                    name: "wlan0".to_string(),
+                    is_up: true,
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    is_wireless: true,
+                },
+            ],
+            routes: vec![
+                crate::netlink::Ipv4RouteInfo {
+                    destination: "0.0.0.0/0".parse().unwrap(),
+                    gateway: Some(Ipv4Addr::new(192, 168, 1, 1)),
+                    output_interface_index: Some(2),
+                    table: 254,
+                    metric: Some(100),
+                    protocol: 3, // Boot
+                    scope: 0,
+                },
+                crate::netlink::Ipv4RouteInfo {
+                    destination: "10.0.0.0/24".parse().unwrap(),
+                    gateway: None,
+                    output_interface_index: Some(3),
+                    table: 254,
+                    metric: None,
+                    protocol: 201, // TrafficMasqStatic
+                    scope: 253,
+                },
+                crate::netlink::Ipv4RouteInfo {
+                    destination: "127.0.0.1/32".parse().unwrap(),
+                    gateway: None,
+                    output_interface_index: Some(1),
+                    table: 255, // Local table
+                    metric: None,
+                    protocol: 2, // Kernel
+                    scope: 254,
+                },
+            ],
+        });
+        let service = ControlService::new(config.clone(), network, dhcp, overrides);
+
+        let resp = service
+            .dispatch(Request::ListRoutes {
+                include_local_table: false,
+            })
+            .await;
+        match resp {
+            Response::Routes { routes } => {
+                assert_eq!(routes.len(), 2);
+                assert_eq!(routes[0].destination, "10.0.0.0/24".parse().unwrap());
+                assert_eq!(routes[0].output_interface.as_deref(), Some("wlan0"));
+                assert_eq!(routes[0].owner, crate::netlink::RouteOwner::TrafficMasqStatic);
+
+                assert_eq!(routes[1].destination, "0.0.0.0/0".parse().unwrap());
+                assert_eq!(routes[1].output_interface.as_deref(), Some("eth0"));
+                assert_eq!(routes[1].owner, crate::netlink::RouteOwner::Boot);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let resp_all = service
+            .dispatch(Request::ListRoutes {
+                include_local_table: true,
+            })
+            .await;
+        match resp_all {
+            Response::Routes { routes } => {
+                assert_eq!(routes.len(), 3);
+                assert_eq!(routes[2].table, 255);
+                assert_eq!(routes[2].destination, "127.0.0.1/32".parse().unwrap());
+                assert_eq!(routes[2].owner, crate::netlink::RouteOwner::Kernel);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let cfg_resp = service.dispatch(Request::GetRouterConfig).await;
+        match cfg_resp {
+            Response::RouterConfig { config: router_cfg } => {
+                assert_eq!(router_cfg.enabled, config.router.enabled);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
     }
 }

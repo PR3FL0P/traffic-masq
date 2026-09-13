@@ -18,7 +18,7 @@ use crate::core::router_transaction::CoordinatorStatus;
 use crate::core::transaction::PendingNetworkChange;
 use crate::dhcp::lease::DhcpLease;
 use crate::dhcp::supervisor::DhcpServiceSpec;
-use crate::netlink::{Ipv4AddressInfo, NetworkInterface};
+use crate::netlink::{Ipv4AddressInfo, NetworkInterface, RouteOwner};
 use crate::wifi::{
     Station, WifiApSpec, WifiApStatus, WifiClientProfileSummary, WifiClientSpec, WifiClientStatus,
     WpaSupplicantScanResult,
@@ -780,6 +780,11 @@ pub enum Request {
     RouterCommit,
     RouterRollback,
     RouterPendingTransaction,
+    ListRoutes {
+        #[serde(default)]
+        include_local_table: bool,
+    },
+    GetRouterConfig,
     RouterProvisioningPreview {
         request: RouterProvisioningPreviewRequest,
     },
@@ -974,6 +979,12 @@ pub enum Response {
         status: CoordinatorStatus,
         rollback_failure: Option<Vec<String>>,
     },
+    Routes {
+        routes: Vec<RouteStatus>,
+    },
+    RouterConfig {
+        config: RouterConfig,
+    },
     RouterError {
         detail: RouterErrorDetail,
     },
@@ -1092,4 +1103,99 @@ pub struct InterfaceStatus {
     pub ipv4_addresses: Vec<Ipv4AddressInfo>,
     #[serde(default)]
     pub has_default_route: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteStatus {
+    pub destination: Ipv4Net,
+    pub gateway: Option<Ipv4Addr>,
+    pub output_interface: Option<String>,
+    pub output_interface_index: Option<u32>,
+    pub table: u32,
+    pub metric: Option<u32>,
+    pub protocol: u8,
+    pub scope: u8,
+    pub owner: RouteOwner,
+}
+
+impl RouteStatus {
+    pub fn from_info(
+        info: &crate::netlink::Ipv4RouteInfo,
+        output_interface: Option<String>,
+    ) -> Self {
+        Self {
+            destination: info.destination,
+            gateway: info.gateway,
+            output_interface,
+            output_interface_index: info.output_interface_index,
+            table: info.table,
+            metric: info.metric,
+            protocol: info.protocol,
+            scope: info.scope,
+            owner: info.owner(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_status_serde_roundtrip() {
+        let status = RouteStatus {
+            destination: "192.168.1.0/24".parse().expect("dest"),
+            gateway: Some(Ipv4Addr::new(10, 0, 0, 1)),
+            output_interface: Some("eth0".to_string()),
+            output_interface_index: Some(2),
+            table: 254,
+            metric: Some(100),
+            protocol: 201,
+            scope: 0,
+            owner: RouteOwner::TrafficMasqStatic,
+        };
+
+        let json = serde_json::to_string(&status).expect("serialize");
+        let parsed: RouteStatus = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, status);
+    }
+
+    #[test]
+    fn request_and_response_route_variants_roundtrip() {
+        let req = Request::ListRoutes {
+            include_local_table: true,
+        };
+        let json_req = serde_json::to_string(&req).expect("serialize request");
+        let parsed_req: Request = serde_json::from_str(&json_req).expect("deserialize request");
+        match parsed_req {
+            Request::ListRoutes {
+                include_local_table,
+            } => assert!(include_local_table),
+            _ => panic!("wrong variant"),
+        }
+
+        let resp = Response::Routes {
+            routes: vec![RouteStatus {
+                destination: "0.0.0.0/0".parse().expect("dest"),
+                gateway: Some(Ipv4Addr::new(192, 168, 1, 1)),
+                output_interface: Some("wan0".to_string()),
+                output_interface_index: Some(3),
+                table: 254,
+                metric: None,
+                protocol: 201,
+                scope: 0,
+                owner: RouteOwner::TrafficMasqStatic,
+            }],
+        };
+        let json_resp = serde_json::to_string(&resp).expect("serialize response");
+        let parsed_resp: Response =
+            serde_json::from_str(&json_resp).expect("deserialize response");
+        match parsed_resp {
+            Response::Routes { routes } => {
+                assert_eq!(routes.len(), 1);
+                assert_eq!(routes[0].owner, RouteOwner::TrafficMasqStatic);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
 }

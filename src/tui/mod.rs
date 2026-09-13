@@ -48,7 +48,7 @@ use dhcp::{DhcpEditor, DhcpLeasesView};
 use interfaces::InterfaceEditor;
 use layout::UiLayout;
 use logs::LogLevel;
-use router::{RouterData, RouterPendingView};
+use router::{RouterData, RouterFocus, RouterPendingView};
 use settings::{PasswordChangeEditor, SecurityEditor};
 use vpn::{VpnData, VpnImportEditor};
 use vpn_policy::VpnPolicyData;
@@ -83,6 +83,7 @@ enum Screen {
     Router,
     RouterPlan,
     RouterPending,
+    RouteEditor,
     RouterProvisioning,
     RouterProvisioningNetworks,
     RouterProvisioningConfirm,
@@ -149,6 +150,7 @@ fn section_of(screen: Screen) -> Section {
         Screen::DhcpInterfaceList | Screen::DhcpEditor | Screen::DhcpLeases => Section::Dhcp,
         Screen::DhcpClient => Section::DhcpClient,
         Screen::Router
+        | Screen::RouteEditor
         | Screen::RouterPlan
         | Screen::RouterPending
         | Screen::RouterProvisioning
@@ -813,7 +815,10 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                 .find(|(rect, _)| layout::point_in_rect(point, *rect))
             {
                 focus_action_slot(app, slot);
-                let key = if app.screen == Screen::PendingChange && slot == 1 {
+                let key = if (app.screen == Screen::PendingChange
+                    || app.screen == Screen::RouterPending)
+                    && slot == 1
+                {
                     KeyCode::Esc
                 } else {
                     KeyCode::Enter
@@ -842,6 +847,10 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                             }
                             Screen::Wifi => {
                                 wifi::open_radio(app, index);
+                            }
+                            Screen::Router => {
+                                app.router.selected_route = index;
+                                app.router.focus = RouterFocus::RouteTable;
                             }
                             Screen::WifiScan => {
                                 if let Some(scan) = app.wifi_scan.as_mut() {
@@ -979,6 +988,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp, direct: bool) {
         Screen::Preview => interfaces::render_preview(frame, chunks[1], app),
         Screen::PendingChange => interfaces::render_pending(frame, chunks[1], app),
         Screen::Router => router::render_router(frame, chunks[1], app),
+        Screen::RouteEditor => router::render_route_editor(frame, chunks[1], app),
         Screen::RouterPlan => router::render_router_plan(frame, chunks[1], app),
         Screen::RouterPending => router::render_router_pending(frame, chunks[1], app),
         Screen::RouterProvisioning => provisioning::render_wizard(frame, chunks[1], app),
@@ -1012,6 +1022,7 @@ fn focus_action_slot(app: &mut TuiApp, slot: usize) {
         Screen::Preview => interfaces::focus_preview_action(app, slot),
         Screen::DhcpEditor => dhcp::focus_action(app, slot),
         Screen::Router => router::focus_action(app, slot),
+        Screen::RouteEditor => router::focus_route_editor_action(app, slot),
         Screen::Vpn => vpn::focus_action(app, slot),
         Screen::VpnPolicy => vpn_policy::focus_action(app, slot),
         Screen::Wifi => wifi::focus_action(app, slot),
@@ -1059,7 +1070,9 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
             KeyCode::Left => {
                 let is_editing_settings_text = app.screen == Screen::Settings
                     && app.settings.as_ref().is_some_and(|s| s.is_editing());
-                if !is_editing_settings_text {
+                let is_router_actions_focused = app.screen == Screen::Router
+                    && app.router.focus == RouterFocus::Actions;
+                if !is_editing_settings_text && !is_router_actions_focused {
                     let target = adjacent_section(section_of(app.screen), false);
                     navigate_to_section(app, target, client, direct).await;
                     return;
@@ -1068,7 +1081,9 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
             KeyCode::Right => {
                 let is_editing_settings_text = app.screen == Screen::Settings
                     && app.settings.as_ref().is_some_and(|s| s.is_editing());
-                if !is_editing_settings_text {
+                let is_router_actions_focused = app.screen == Screen::Router
+                    && app.router.focus == RouterFocus::Actions;
+                if !is_editing_settings_text && !is_router_actions_focused {
                     let target = adjacent_section(section_of(app.screen), true);
                     navigate_to_section(app, target, client, direct).await;
                     return;
@@ -1092,6 +1107,7 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
         Screen::Preview => interfaces::handle_preview_key(app, key, client).await,
         Screen::PendingChange => interfaces::handle_pending_key(app, key, client).await,
         Screen::Router => router::handle_router_key(app, key, client).await,
+        Screen::RouteEditor => router::handle_route_editor_key(app, key, client).await,
         Screen::RouterPlan => router::handle_router_plan_key(app, key, client).await,
         Screen::RouterPending => router::handle_router_pending_key(app, key, client).await,
         Screen::RouterProvisioning => provisioning::handle_wizard_key(app, key, client).await,
@@ -1667,6 +1683,7 @@ mod tests {
         assert_eq!(section_of(Screen::DhcpLeases), Section::Dhcp);
         assert_eq!(section_of(Screen::DhcpClient), Section::DhcpClient);
         assert_eq!(section_of(Screen::Router), Section::Router);
+        assert_eq!(section_of(Screen::RouteEditor), Section::Router);
         assert_eq!(section_of(Screen::RouterProvisioning), Section::Router);
         assert_eq!(
             section_of(Screen::RouterProvisioningPending),

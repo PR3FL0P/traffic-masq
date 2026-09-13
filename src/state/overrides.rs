@@ -193,7 +193,6 @@ mod tests {
 
     /// The converger has no timer any more, so a change that does not announce
     /// itself is a change that never gets applied.
-
     fn interface_config(address: &str) -> InterfaceConfig {
         InterfaceConfig {
             role: InterfaceRole::Output,

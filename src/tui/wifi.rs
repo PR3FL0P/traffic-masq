@@ -1546,11 +1546,9 @@ pub(crate) async fn handle_wifi_profiles_key(app: &mut TuiApp, key: KeyCode, cli
                     view.selected = view.selected.saturating_sub(1);
                     view.selected_profile = view.selected;
                 }
-                KeyCode::Down => {
-                    if view.selected + 1 < count {
-                        view.selected += 1;
-                        view.selected_profile = view.selected;
-                    }
+                KeyCode::Down if view.selected + 1 < count => {
+                    view.selected += 1;
+                    view.selected_profile = view.selected;
                 }
                 KeyCode::Home => {
                     view.selected = 0;
