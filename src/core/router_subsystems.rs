@@ -1567,6 +1567,7 @@ mod tests {
             output_interface("192.168.10.1/24", 100, 150),
         );
         config.router = RouterConfig {
+            forwarding: None,
             vpn_chain: Vec::new(),
             enabled: true,
             uplink: Some(UplinkConfig {

@@ -331,6 +331,7 @@ pub fn derive_router_provisioning(
         }),
         owned_routes: Vec::new(),
         allow_default_route_change: true,
+        forwarding: None,
         vpn_chain: Vec::new(),
     };
 

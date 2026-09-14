@@ -78,6 +78,75 @@ impl RouterDesired {
             .filter(|(_, interface)| interface.role == InterfaceRole::Output && interface.managed)
             .collect();
 
+        if let Some(forwarding) = &config.router.forwarding {
+            let mut interfaces: Vec<_> = managed_outputs
+                .iter()
+                .map(|(name, interface)| RouterInterfaceDesired {
+                    name: (*name).clone(),
+                    config: (*interface).clone(),
+                })
+                .collect();
+            if let Some(uplink) = &config.router.uplink {
+                let interface = config
+                    .network
+                    .interfaces
+                    .get(&uplink.interface)
+                    .ok_or_else(|| anyhow::anyhow!("configured uplink interface is missing"))?;
+                interfaces.push(RouterInterfaceDesired {
+                    name: uplink.interface.clone(),
+                    config: interface.clone(),
+                });
+            }
+            let output_wifi = interfaces
+                .iter()
+                .filter_map(|interface| {
+                    WifiApSpec::from_interface_config(&interface.name, &interface.config)
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let dataplane = if forwarding.is_empty() {
+                RouterDataplaneTarget::Disabled
+            } else {
+                RouterDataplaneTarget::Enabled(RouterDataplaneDesired {
+                    forwarding: Some(forwarding.clone()),
+                    uplink: String::new(),
+                    outputs: Vec::new(),
+                })
+            };
+            let uplink_config = config.router.uplink.as_ref().and_then(|uplink| {
+                config
+                    .network
+                    .interfaces
+                    .get(&uplink.interface)
+                    .map(|interface| (uplink, interface))
+            });
+            let uplink_wifi = uplink_config
+                .map(|(uplink, interface)| {
+                    WifiClientSpec::from_interface_config(&uplink.interface, interface)
+                })
+                .transpose()?
+                .flatten();
+            let uplink_dhcp = uplink_config
+                .filter(|(uplink, _)| uplink.mode == UplinkMode::Dhcp)
+                .map(|(uplink, interface)| {
+                    DhcpClientSpec::from_interface_config(&uplink.interface, interface)
+                })
+                .transpose()?
+                .flatten();
+            return Ok(Self {
+                enabled: true,
+                uplink_wifi,
+                uplink_dhcp,
+                output_wifi,
+                dhcp,
+                routes,
+                allow_default_route_change,
+                vpn_chain: Vec::new(),
+                dataplane,
+                interfaces,
+            });
+        }
+
         let Some(uplink) = config.router.uplink.as_ref() else {
             let interfaces: Vec<_> = managed_outputs
                 .into_iter()
@@ -127,6 +196,7 @@ impl RouterDesired {
             })
             .collect();
         let dataplane = RouterDataplaneDesired {
+            forwarding: None,
             uplink: uplink.interface.clone(),
             outputs,
         };
@@ -896,6 +966,7 @@ mod tests {
             );
         }
         config.router = RouterConfig {
+            forwarding: None,
             vpn_chain: Vec::new(),
             enabled: true,
             uplink: Some(UplinkConfig {
@@ -915,6 +986,34 @@ mod tests {
     }
 
     #[test]
+    fn explicit_connections_replace_legacy_nat_and_empty_does_not_restore_it() {
+        let mut config = enabled_config();
+        let connections = vec![crate::config::ForwardingConfig {
+            source_subnet: None,
+            from: "lan0".into(),
+            to: "wg0".into(),
+            masquerade: false,
+        }];
+        config.router.forwarding = Some(connections.clone());
+        let desired = RouterDesired::from_effective_config(&config).unwrap();
+        let RouterDataplaneTarget::Enabled(dataplane) = desired.dataplane else {
+            panic!("enabled");
+        };
+        assert_eq!(dataplane.forwarding, Some(connections));
+        assert!(dataplane.outputs.is_empty());
+        assert!(dataplane.uplink.is_empty());
+        assert_eq!(desired.dhcp.len(), 2);
+        assert_eq!(desired.routes.len(), 1);
+        config.router.forwarding = Some(vec![]);
+        assert_eq!(
+            RouterDesired::from_effective_config(&config)
+                .unwrap()
+                .dataplane,
+            RouterDataplaneTarget::Disabled
+        );
+    }
+
+    #[test]
     fn builds_enabled_router_desired_from_one_effective_config() {
         let desired = RouterDesired::from_effective_config(&enabled_config()).expect("desired");
         assert!(desired.enabled);
@@ -926,6 +1025,7 @@ mod tests {
         assert_eq!(
             desired.dataplane,
             RouterDataplaneTarget::Enabled(RouterDataplaneDesired {
+                forwarding: None,
                 uplink: "wan0".to_string(),
                 outputs: vec![
                     OutputNetwork {
@@ -958,6 +1058,23 @@ mod tests {
         assert_eq!(intent.interface, "wan0");
         assert_eq!(intent.route_metric, 321);
         assert!(!intent.request_dns);
+    }
+
+    #[test]
+    fn switching_to_connections_preserves_existing_uplink_services() {
+        let mut config = enabled_config();
+        let uplink = config.network.interfaces.get_mut("wan0").unwrap();
+        uplink.managed = true;
+        uplink.dhcp_client = Some(DhcpClientInterfaceConfig::default());
+        config.router.uplink.as_mut().unwrap().mode = UplinkMode::Dhcp;
+        let before = RouterDesired::from_effective_config(&config).unwrap();
+        config.router.forwarding = Some(vec![]);
+        let after = RouterDesired::from_effective_config(&config).unwrap();
+        assert_eq!(after.uplink_dhcp, before.uplink_dhcp);
+        assert_eq!(after.uplink_wifi, before.uplink_wifi);
+        assert_eq!(after.output_wifi, before.output_wifi);
+        assert_eq!(after.dhcp, before.dhcp);
+        assert_eq!(after.interfaces.len(), before.interfaces.len());
     }
 
     #[test]

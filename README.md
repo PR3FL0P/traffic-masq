@@ -287,6 +287,67 @@ changes the proposed configuration for that route. After running it, choose
 change belongs in the configuration that creates it. Deleting a traffic-masq
 static route continues to stage the change for **Plan / Apply**.
 
+The **Router** tab has three sections, selected with **1 / 2 / 3** or by clicking
+its section labels:
+
+- **Routes** edits destinations, gateways, interfaces, tables and metrics.
+- **Internet sharing** lists independent connections in **From / Through / NAT /
+  Source subnet** columns. Select a row and **Edit**, or choose **Add** or **Delete**.
+  Up/Down selects rows; Tab switches to actions; Left/Right selects an action.
+- **Topology** shows configured connections and observed default routes. This is
+  a configuration overview, not a verified packet path.
+
+In the sharing editor, choose **Traffic from**, **Internet through** and
+**Masquerade**. **Advanced** reveals the optional IPv4 **Source subnet**; leaving
+it empty means any source. A scope such as `192.168.10.0/24` restricts both
+forwarding and NAT. Enter on **Save connection** stages the change. Editing an
+existing connection replaces that row, including when its interfaces change.
+Esc cancels the current editor without discarding earlier staged changes.
+
+From a selected route, press **n** or **Share via: n** to start a new sharing
+connection with the route's output interface filled in. The resulting rule is
+independent of the route: changing or deleting that route does not rewrite the
+sharing rule.
+
+Route and sharing edits share one draft across sections. **Review / Apply**
+(or **Plan / Apply** in Routes) previews the entire draft, then uses the existing
+apply/commit/rollback transaction. Refresh preserves pending draft changes.
+
+Connections refer to existing interfaces, including externally managed Ethernet
+and VPN interfaces. Both must be up when applying. Creating a connection does
+not take ownership of interface addresses, set up Wi-Fi, or configure DHCP.
+Each source may have several allowed destinations. Return traffic for established
+connections is allowed; other IPv4 forwarding to/from configured source
+interfaces is blocked. Other interfaces and foreign firewall tables remain
+outside these rules.
+
+The equivalent configuration is:
+
+```toml
+[router]
+enabled = true
+forwarding = [
+  { from = "lan0", to = "wan0", masquerade = true },
+  { from = "lan1", to = "wg0", masquerade = true, source_subnet = "192.168.10.0/24" },
+]
+```
+
+Routes determine which allowed destination a packet actually uses. Masquerading
+rewrites the source address on egress; it does not select routes or nest VPN
+encapsulation ([nftables NAT documentation](https://wiki.iptables.org/wiki-nftables/index.php/Performing_Network_Address_Translation_%28NAT%29)).
+An `Ethernet → VPN → VPN → Internet` path also needs the tunnels and their
+endpoint/policy routes configured. This editor manages forwarding/NAT between
+existing interfaces; it is not yet a VPN-chain routing editor. Explicit
+`forwarding` and the legacy global `vpn_chain`/VPN policy cannot be combined.
+Use direct global VPN policy with explicit connections and separately configured
+tunnel routing. Existing legacy VPN-chain configurations continue to work.
+
+Old configurations without `forwarding` retain their `uplink` and per-interface
+`nat` behavior. Opening the editor imports those existing NAT pairs for review.
+Once `forwarding` is present it is authoritative: `forwarding = []` removes all
+owned connection rules and never resurrects the old implicit NAT rules.
+The legacy `uplink` may remain to preserve its Wi-Fi/DHCP client services.
+
 Changes in **Settings** also require confirmation. The first Enter shows an
 indented `Note: Confirm...` line; the second Enter applies the selected change.
 Esc or moving to another setting cancels the confirmation. Explanatory text is

@@ -40,6 +40,29 @@ pub(crate) struct RouterData {
     pub(crate) error: Option<RouterErrorDetail>,
     pub(crate) warning_message: Option<String>,
     pub(crate) topology: router_topology::TopologyView,
+    pub(crate) pane: RouterPane,
+    pub(crate) pane_tabs: Vec<(Rect, RouterPane)>,
+    pub(crate) selected_connection: usize,
+    pub(crate) sharing_action: usize,
+    pub(crate) sharing_actions_focused: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouterPane {
+    #[default]
+    Routes,
+    Sharing,
+    Topology,
+}
+
+pub(crate) fn select_pane(app: &mut TuiApp, pane: RouterPane) {
+    app.router.pane = pane;
+    app.router.focus = RouterFocus::RouteTable;
+    app.router.sharing_actions_focused = false;
+    if pane == RouterPane::Topology { app.router.topology.show(); }
+    else { app.router.topology.open = false; }
+    app.ui.buttons.clear();
+    app.ui.list_area = None;
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +79,7 @@ pub(crate) enum RouterAction {
     EditRoute,
     DeleteRoute,
     PlanApply,
-    Provision,
+    ShareViaRoute,
     Refresh,
     Topology,
 }
@@ -67,8 +90,8 @@ impl RouterAction {
             Self::AddRoute => Self::EditRoute,
             Self::EditRoute => Self::DeleteRoute,
             Self::DeleteRoute => Self::PlanApply,
-            Self::PlanApply => Self::Provision,
-            Self::Provision => Self::Refresh,
+            Self::PlanApply => Self::ShareViaRoute,
+            Self::ShareViaRoute => Self::Refresh,
             Self::Refresh => Self::Topology,
             Self::Topology => Self::AddRoute,
         }
@@ -80,8 +103,8 @@ impl RouterAction {
             Self::EditRoute => Self::AddRoute,
             Self::DeleteRoute => Self::EditRoute,
             Self::PlanApply => Self::DeleteRoute,
-            Self::Provision => Self::PlanApply,
-            Self::Refresh => Self::Provision,
+            Self::ShareViaRoute => Self::PlanApply,
+            Self::Refresh => Self::ShareViaRoute,
             Self::Topology => Self::Refresh,
         }
     }
@@ -480,6 +503,7 @@ fn delete_selected_route(app: &mut TuiApp) {
     }
     if app.router.proposed_router_config.owned_routes.is_empty()
         && app.router.proposed_router_config.uplink.is_none()
+        && app.router.proposed_router_config.forwarding.as_ref().is_none_or(Vec::is_empty)
     {
         app.router.proposed_router_config.enabled = false;
     }
@@ -607,7 +631,7 @@ fn router_action_buttons(router: &RouterData) -> [(RouterAction, &'static str); 
             },
         ),
         (RouterAction::PlanApply, "[Plan / Apply]"),
-        (RouterAction::Provision, "[Set up router]"),
+        (RouterAction::ShareViaRoute, "[Share via: n]"),
         (RouterAction::Refresh, "[Refresh]"),
         (RouterAction::Topology, "[Topology: t]"),
     ]
@@ -631,6 +655,22 @@ fn router_button_positions(buttons: &[(RouterAction, &str)], width: u16) -> Vec<
 }
 
 pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
+    let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
+    app.router.pane_tabs.clear();
+    let mut x = sections[0].x;
+    for (label, pane) in [("[1 Routes]", RouterPane::Routes), ("[2 Internet sharing]", RouterPane::Sharing), ("[3 Topology]", RouterPane::Topology)] {
+        let rect = Rect::new(x, sections[0].y, label.len() as u16, 1);
+        app.router.pane_tabs.push((rect, pane));
+        frame.render_widget(Paragraph::new(label).style(if app.router.pane == pane {
+            Style::default().fg(theme::SELECTED_FG).bg(theme::SELECTED_BG)
+        } else { Style::default().fg(theme::MUTED) }), rect);
+        x += rect.width + 1;
+    }
+    let area = sections[1];
+    if app.router.pane == RouterPane::Sharing {
+        super::forwarding::render_list(frame, area, app);
+        return;
+    }
     if app.router.topology.open {
         router_topology::render(frame, area, app, true);
         return;
@@ -694,7 +734,7 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
     if router.staged {
         status_lines.push(Line::styled(
             format!(
-                "Staged proposal: {} owned route(s) (use [Plan / Apply] to review and apply)",
+                "Staged configuration: {} owned route(s); review all changes with [Plan / Apply]",
                 router.proposed_router_config.owned_routes.len()
             ),
             Style::default()
@@ -719,8 +759,9 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
 
     let buttons = router_action_buttons(router);
     let button_positions = router_button_positions(&buttons, area.width.saturating_sub(2));
-    let warning_rows = u16::from(router.warning_message.is_some());
-    let actions_height = button_positions.last().map_or(0, |(_, y)| y + 1) + warning_rows + 2;
+    let base_actions_height = button_positions.last().map_or(0, |(_, y)| y + 1) + 2;
+    let warning_rows = u16::from(router.warning_message.is_some() && area.height >= base_actions_height + 4);
+    let actions_height = base_actions_height + warning_rows;
     let status_height = (status_lines.len() as u16 + 2)
         .clamp(3, 8)
         .min(area.height.saturating_sub(actions_height + 3));
@@ -740,7 +781,7 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
     frame.render_widget(Paragraph::new(status_lines), status_inner);
 
     let table_title = match router.focus {
-        RouterFocus::RouteTable => "Routes | Up/Down: select; Down at end / Tab: actions",
+        RouterFocus::RouteTable => "Routes | n: share via selected interface; Tab: actions",
         RouterFocus::Actions => "Routes [Tab: focus table]",
     };
     let table_block = panel(table_title);
@@ -862,7 +903,7 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
     let actions_inner = actions_block.inner(chunks[2]);
     frame.render_widget(actions_block, chunks[2]);
 
-    if let Some(ref warn) = router.warning_message {
+    if let Some(ref warn) = router.warning_message.as_ref().filter(|_| warning_rows > 0) {
         frame.render_widget(
             Paragraph::new(format!("⚠ {warn}")).style(
                 Style::default()
@@ -1066,6 +1107,15 @@ pub(crate) fn render_router_plan(frame: &mut ratatui::Frame<'_>, area: Rect, app
         "Uplink: {}",
         summarize_uplink(&plan.dataplane.target)
     ))];
+    if let RouterDataplaneTarget::Enabled(desired) = &plan.dataplane.target {
+        if let Some(connections) = &desired.forwarding {
+            for connection in connections {
+                lines.push(Line::from(format!("Share: {} → {} ({}, source {})", connection.from, connection.to,
+                    if connection.masquerade { "masquerade" } else { "no NAT" },
+                    connection.source_subnet.map_or("any".into(), |subnet| subnet.to_string()))));
+            }
+        }
+    }
     for line in summarize_output_interfaces(&plan.desired.interfaces) {
         lines.push(Line::from(format!("Output: {line}")));
     }
@@ -1282,25 +1332,45 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
 }
 
 pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
+    if app.router.pane == RouterPane::Sharing {
+        app.router.sharing_actions_focused = true;
+        app.router.sharing_action = slot;
+        return;
+    }
     app.router.focus = RouterFocus::Actions;
     app.router.action = match slot {
         0 => RouterAction::AddRoute,
         1 => RouterAction::EditRoute,
         2 => RouterAction::DeleteRoute,
         3 => RouterAction::PlanApply,
-        4 => RouterAction::Provision,
+        4 => RouterAction::ShareViaRoute,
         6 => RouterAction::Topology,
         _ => RouterAction::Refresh,
     };
 }
 
 pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
+    match key {
+        KeyCode::Char('1') => { select_pane(app, RouterPane::Routes); return; }
+        KeyCode::Char('2') => { select_pane(app, RouterPane::Sharing); return; }
+        KeyCode::Char('3') => { select_pane(app, RouterPane::Topology); return; }
+        KeyCode::Char('t') => {
+            select_pane(app, if app.router.pane == RouterPane::Topology { RouterPane::Routes } else { RouterPane::Topology });
+            return;
+        }
+        _ => {}
+    }
+    if app.router.pane == RouterPane::Sharing {
+        super::forwarding::handle_list_key(app, key, client).await;
+        return;
+    }
     if app.router.topology.open {
         app.router.topology.handle_key(key);
+        if !app.router.topology.open { select_pane(app, RouterPane::Routes); }
         return;
     }
     match key {
-        KeyCode::Char('t') => app.router.topology.show(),
+        KeyCode::Char('n') => super::forwarding::open_from_route(app, client).await,
         KeyCode::PageUp | KeyCode::PageDown => app.router.topology.handle_key(key),
         KeyCode::Esc => app.screen = Screen::Dashboard,
         KeyCode::Tab => {
@@ -1330,9 +1400,6 @@ pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &A
                         && app.router.selected_route + 1 < app.router.routes.len()
                     {
                         app.router.selected_route += 1;
-                    } else {
-                        app.router.focus = RouterFocus::Actions;
-                        app.router.action = RouterAction::AddRoute;
                     }
                     app.router.warning_message = None;
                 }
@@ -1346,11 +1413,7 @@ pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &A
             },
             RouterFocus::Actions => match key {
                 KeyCode::Up => {
-                    if app.router.action == RouterAction::AddRoute {
-                        app.router.focus = RouterFocus::RouteTable;
-                    } else {
-                        app.router.action = app.router.action.prev();
-                    }
+                    app.router.action = app.router.action.prev();
                     app.router.warning_message = None;
                 }
                 KeyCode::Down => {
@@ -1372,9 +1435,9 @@ pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &A
                     RouterAction::EditRoute => open_route_editor_for_selected(app, client).await,
                     RouterAction::DeleteRoute => delete_selected_route(app),
                     RouterAction::PlanApply => open_router_plan(app, client).await,
-                    RouterAction::Provision => super::provisioning::open(app),
+                    RouterAction::ShareViaRoute => super::forwarding::open_from_route(app, client).await,
                     RouterAction::Refresh => refresh_router_data(app, client).await,
-                    RouterAction::Topology => app.router.topology.show(),
+                    RouterAction::Topology => select_pane(app, RouterPane::Topology),
                 },
                 _ => {}
             },
@@ -1475,7 +1538,7 @@ pub(crate) async fn handle_route_editor_key(app: &mut TuiApp, key: KeyCode, _cli
     }
 }
 
-async fn open_router_plan(app: &mut TuiApp, client: &ApiClient) {
+pub(crate) async fn open_router_plan(app: &mut TuiApp, client: &ApiClient) {
     let proposal = RouterProposalRequest {
         set_router: Some(app.router.proposed_router_config.clone()),
         ..Default::default()
@@ -1532,7 +1595,6 @@ pub(crate) async fn handle_router_pending_key(app: &mut TuiApp, key: KeyCode, cl
 }
 
 pub(crate) async fn refresh_router_data(app: &mut TuiApp, client: &ApiClient) {
-    app.router.staged = false;
     load_router_data(app, client).await;
 }
 
@@ -1788,7 +1850,13 @@ fn format_coordinator_status(status: CoordinatorStatus) -> &'static str {
 
 fn summarize_uplink(target: &RouterDataplaneTarget) -> String {
     match target {
-        RouterDataplaneTarget::Enabled(desired) => desired.uplink.clone(),
+        RouterDataplaneTarget::Enabled(desired) => {
+            if desired.forwarding.is_some() {
+                "per-connection".into()
+            } else {
+                desired.uplink.clone()
+            }
+        }
         RouterDataplaneTarget::Disabled => "none (dataplane disabled)".to_string(),
     }
 }
@@ -1865,7 +1933,7 @@ fn format_forwarding_status(dataplane: &crate::firewall::RouterDataplanePlan) ->
 fn describe_router_error(detail: &RouterErrorDetail) -> String {
     match detail {
         RouterErrorDetail::RouterDisabled => {
-            "Router has no committed intent yet; use Provision to set one up".to_string()
+            "Router has no committed intent yet; configure Forwarding / NAT".to_string()
         }
         RouterErrorDetail::TransactionPending => {
             "Another router transaction is already pending; commit or roll it back first"
@@ -1930,7 +1998,7 @@ mod tests {
         assert_eq!(action.next(), RouterAction::EditRoute);
         assert_eq!(action.next().next(), RouterAction::DeleteRoute);
         assert_eq!(action.next().next().next(), RouterAction::PlanApply);
-        assert_eq!(action.next().next().next().next(), RouterAction::Provision);
+        assert_eq!(action.next().next().next().next(), RouterAction::ShareViaRoute);
         assert_eq!(
             action.next().next().next().next().next(),
             RouterAction::Refresh
@@ -1946,7 +2014,7 @@ mod tests {
 
         assert_eq!(action.prev(), RouterAction::Topology);
         assert_eq!(action.prev().prev(), RouterAction::Refresh);
-        assert_eq!(action.prev().prev().prev(), RouterAction::Provision);
+        assert_eq!(action.prev().prev().prev(), RouterAction::ShareViaRoute);
     }
 
     #[test]
@@ -2379,23 +2447,31 @@ mod tests {
             ..Default::default()
         };
         app.ui.input_enabled = true;
-        app.router.routes = vec![route_status(
-            &route_config("10.0.0.0/8"),
-            RouteOwner::Static,
-        )];
+        app.router.routes = vec![
+            route_status(&route_config("10.0.0.0/8"), RouteOwner::Static),
+            route_status(&route_config("172.16.0.0/12"), RouteOwner::Static),
+        ];
         let client = ApiClient::new("/socket-that-must-not-be-opened");
-        for expected in [
-            RouterAction::AddRoute,
-            RouterAction::EditRoute,
-            RouterAction::DeleteRoute,
-        ] {
-            super::super::handle_key(&mut app, KeyCode::Down, &client, false).await;
-            assert_eq!(app.router.focus, RouterFocus::Actions);
-            assert_eq!(app.router.action, expected);
-            assert_eq!(app.screen, Screen::Router);
-            assert!(!app.message_open);
-            assert!(!app.router.staged);
-        }
+        // Scrolling Down stays in RouteTable and clamps at the end of routes
+        super::super::handle_key(&mut app, KeyCode::Down, &client, false).await;
+        assert_eq!(app.router.focus, RouterFocus::RouteTable);
+        assert_eq!(app.router.selected_route, 1);
+        super::super::handle_key(&mut app, KeyCode::Down, &client, false).await;
+        assert_eq!(app.router.focus, RouterFocus::RouteTable);
+        assert_eq!(app.router.selected_route, 1);
+
+        // Enter actions exclusively via Tab
+        super::super::handle_key(&mut app, KeyCode::Tab, &client, false).await;
+        assert_eq!(app.router.focus, RouterFocus::Actions);
+        assert_eq!(app.router.action, RouterAction::AddRoute);
+
+        // In actions, navigate between buttons
+        super::super::handle_key(&mut app, KeyCode::Down, &client, false).await;
+        assert_eq!(app.router.action, RouterAction::EditRoute);
+        super::super::handle_key(&mut app, KeyCode::Down, &client, false).await;
+        assert_eq!(app.router.action, RouterAction::DeleteRoute);
+        assert_eq!(app.router.focus, RouterFocus::Actions);
+
         super::super::handle_key(&mut app, KeyCode::Enter, &client, false).await;
         assert!(app.message_open);
         assert!(app
@@ -2403,7 +2479,7 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("sudo ip -4 route del"));
-        assert_eq!(app.router.routes.len(), 1);
+        assert_eq!(app.router.routes.len(), 2);
         assert!(!app.router.staged);
         super::super::handle_key(&mut app, KeyCode::Esc, &client, false).await;
         assert!(!app.message_open);
@@ -2412,9 +2488,11 @@ mod tests {
             super::super::handle_key(&mut app, key, &client, false).await;
             assert_eq!(app.screen, Screen::Router);
         }
-        for _ in 0..3 {
+        for _ in 0..5 {
             super::super::handle_key(&mut app, KeyCode::Up, &client, false).await;
+            assert_eq!(app.router.focus, RouterFocus::Actions);
         }
+        super::super::handle_key(&mut app, KeyCode::Tab, &client, false).await;
         assert_eq!(app.router.focus, RouterFocus::RouteTable);
         super::super::handle_key(&mut app, KeyCode::Tab, &client, false).await;
         assert_eq!(app.router.focus, RouterFocus::Actions);
@@ -2423,16 +2501,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_router_reaches_every_action_and_clamps_at_the_last() {
+    async fn empty_router_actions_require_tab_and_clamp_at_the_last() {
         let mut app = TuiApp::default();
         let client = ApiClient::new("/socket-that-must-not-be-opened");
+        handle_router_key(&mut app, KeyCode::Down, &client).await;
+        assert_eq!(app.router.focus, RouterFocus::RouteTable);
+
+        handle_router_key(&mut app, KeyCode::Tab, &client).await;
+        assert_eq!(app.router.focus, RouterFocus::Actions);
+
         for (action, _) in router_action_buttons(&app.router) {
+            assert_eq!(app.router.action, action);
             handle_router_key(&mut app, KeyCode::Down, &client).await;
             assert_eq!(app.router.focus, RouterFocus::Actions);
-            assert_eq!(app.router.action, action);
         }
-        handle_router_key(&mut app, KeyCode::Down, &client).await;
         assert_eq!(app.router.action, RouterAction::Topology);
+
+        handle_router_key(&mut app, KeyCode::Tab, &client).await;
+        assert_eq!(app.router.focus, RouterFocus::RouteTable);
     }
 
     #[test]
@@ -2574,6 +2660,7 @@ mod tests {
     #[test]
     fn summarizes_uplink_for_enabled_and_disabled_dataplane() {
         let enabled = RouterDataplaneTarget::Enabled(RouterDataplaneDesired {
+            forwarding: None,
             uplink: "wan0".to_string(),
             outputs: Vec::new(),
         });
@@ -2593,6 +2680,7 @@ mod tests {
                 owned_firewall_integrity: crate::firewall::OwnedFirewallIntegrity::Intact,
             },
             target: RouterDataplaneTarget::Enabled(RouterDataplaneDesired {
+                forwarding: None,
                 uplink: "wan0".to_string(),
                 outputs: Vec::new(),
             }),

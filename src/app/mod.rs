@@ -1011,7 +1011,7 @@ impl<'a> StartupRollback<'a> {
 /// anything derived from it, including `RuntimeOverrideManager`'s base), so
 /// a config file inspected by hand won't yet show the migrated chain.
 async fn migrate_vpn_policy_mode_to_chain(config: &mut AppConfig) {
-    if config.vpn.policy.default_mode != VpnPolicyMode::Vpn || !config.router.vpn_chain.is_empty() {
+    if config.router.forwarding.is_some() || config.vpn.policy.default_mode != VpnPolicyMode::Vpn || !config.router.vpn_chain.is_empty() {
         return;
     }
     let active_profile_store =
@@ -2876,6 +2876,7 @@ mod tests {
             },
         );
         config.router = RouterConfig {
+            forwarding: None,
             vpn_chain: Vec::new(),
             enabled: true,
             uplink: Some(UplinkConfig {

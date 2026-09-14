@@ -35,6 +35,7 @@ pub struct VpnPolicyDesired {
 /// to reach into `app` to ask the question, which closed a cycle between the
 /// two.
 pub fn vpn_policy_desired(config: &AppConfig) -> Option<VpnPolicyDesired> {
+    if config.router.forwarding.is_some() { return None; }
     let uplink = config.router.uplink.as_ref()?;
     let protected_subnets: Vec<Ipv4Net> = config
         .network
@@ -499,6 +500,7 @@ mod tests {
             }),
             owned_routes: Vec::new(),
             allow_default_route_change: false,
+            forwarding: None,
             vpn_chain: Vec::new(),
         };
         config

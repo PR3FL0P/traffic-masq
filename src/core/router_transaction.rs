@@ -390,6 +390,7 @@ mod tests {
 
     fn enabled_router() -> RouterConfig {
         RouterConfig {
+            forwarding: None,
             vpn_chain: Vec::new(),
             enabled: true,
             uplink: Some(UplinkConfig {

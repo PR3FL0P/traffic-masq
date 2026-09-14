@@ -80,7 +80,27 @@ fn topology_lines(router: &RouterData, expanded: bool) -> Vec<Line<'static>> {
         lines.push(Line::styled("Refresh incomplete / no data", Style::default().fg(theme::WARN)));
     }
     if router.staged {
-        lines.push(Line::styled("Includes staged route edits", Style::default().fg(theme::WARN)));
+        lines.push(Line::styled("Includes staged configuration edits", Style::default().fg(theme::WARN)));
+    }
+
+    if let Some(connections) = &router.proposed_router_config.forwarding {
+        lines.push(note("IPv4 forwarding connections"));
+        for connection in connections {
+            lines.push(node(format!("{} → {}", connection.from, connection.to), None,
+                related(&connection.from) || related(&connection.to)));
+            lines.push(note(format!("    {} · source {}", if connection.masquerade { "Masquerade" } else { "No NAT" },
+                connection.source_subnet.map_or("any".into(), |subnet| subnet.to_string()))));
+        }
+        if connections.is_empty() { lines.push(note("  No forwarding connections")); }
+        lines.push(note("Routes determine the packet path."));
+        if expanded {
+            lines.push(note("Observed default routes"));
+            for route in router.routes.iter().filter(|route| route.destination.prefix_len() == 0) {
+                lines.push(note(format!("  {} via {} (table {})", route.output_interface.as_deref().unwrap_or("unknown"),
+                    route.gateway.map_or("on-link".into(), |gateway| gateway.to_string()), route.table)));
+            }
+        }
+        return lines;
     }
 
     lines.push(note("Local networks / Wi-Fi"));
@@ -356,6 +376,6 @@ mod tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect::<Vec<_>>()
             .join(" ");
-        assert!(text_staged.contains("Includes staged route edits"));
+        assert!(text_staged.contains("Includes staged configuration edits"));
     }
 }

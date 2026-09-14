@@ -520,6 +520,7 @@ fn build_config(temp: &tempfile::TempDir, lan_if: &str, uplink_if: &str) -> AppC
     );
 
     config.router = RouterConfig {
+        forwarding: None,
         vpn_chain: Vec::new(),
         enabled: true,
         uplink: Some(UplinkConfig {

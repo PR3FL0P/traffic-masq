@@ -383,6 +383,7 @@ mod tests {
 
     fn router_with_one_owned_route() -> RouterConfig {
         RouterConfig {
+            forwarding: None,
             vpn_chain: Vec::new(),
             enabled: true,
             uplink: None,

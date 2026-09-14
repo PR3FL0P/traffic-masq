@@ -4277,6 +4277,7 @@ mod tests {
     fn router_proposal() -> RouterProposalRequest {
         RouterProposalRequest {
             set_router: Some(RouterConfig {
+                forwarding: None,
                 vpn_chain: Vec::new(),
                 enabled: true,
                 uplink: Some(UplinkConfig {
@@ -4494,6 +4495,7 @@ mod tests {
     fn router_base_config_with_router_enabled() -> AppConfig {
         let mut config = router_base_config();
         config.router = RouterConfig {
+            forwarding: None,
             vpn_chain: Vec::new(),
             enabled: true,
             uplink: Some(UplinkConfig {

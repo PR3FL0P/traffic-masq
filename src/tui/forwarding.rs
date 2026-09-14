@@ -1,0 +1,799 @@
+//! Internet sharing is independent of the route list. Editing only stages intent.
+use super::{
+    layout::{focused_lines_offset, panel},
+    logs::LogLevel,
+    router::{RouterData, RouterPane},
+    theme, Screen, TuiApp,
+};
+use crate::api::{
+    client::ApiClient,
+    model::{Request, Response, RouterProposalRequest},
+};
+use crate::config::{validate_forwarding, ForwardingConfig};
+use crate::firewall::RouterDataplaneTarget;
+use crossterm::event::KeyCode;
+use ratatui::{
+    layout::{Constraint, Layout, Rect},
+    style::Style,
+    text::{Line, Span},
+    widgets::{Cell, Paragraph, Row, Table},
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Field {
+    From,
+    To,
+    Masquerade,
+    Advanced,
+    Source,
+    Save,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ForwardingEditor {
+    rules: Vec<ForwardingConfig>,
+    editing: Option<usize>,
+    interfaces: Vec<String>,
+    from: usize,
+    to: usize,
+    masquerade: bool,
+    advanced: bool,
+    source: String,
+    cursor: usize,
+    field: Field,
+    error: Option<String>,
+}
+
+impl ForwardingEditor {
+    fn fields(&self) -> Vec<Field> {
+        let mut fields = vec![Field::From, Field::To, Field::Masquerade, Field::Advanced];
+        if self.advanced {
+            fields.push(Field::Source);
+        }
+        fields.push(Field::Save);
+        fields
+    }
+
+    fn save(&self) -> anyhow::Result<Vec<ForwardingConfig>> {
+        let source_subnet = if self.source.trim().is_empty() {
+            None
+        } else {
+            Some(self.source.trim().parse::<ipnet::Ipv4Net>().map_err(|_| {
+                anyhow::anyhow!("Enter an IPv4 subnet, e.g. 192.168.10.0/24, or leave it empty")
+            })?)
+        };
+        let rule = ForwardingConfig {
+            from: self.interfaces[self.from].clone(),
+            to: self.interfaces[self.to].clone(),
+            masquerade: self.masquerade,
+            source_subnet,
+        };
+        let mut rules = self.rules.clone();
+        if let Some(index) = self.editing {
+            rules[index] = rule;
+        } else {
+            rules.push(rule);
+        }
+        validate_forwarding(&rules)?;
+        Ok(rules)
+    }
+}
+
+/// None means the old implicit rules have not been loaded, not an empty list.
+pub(crate) fn displayed_rules(router: &RouterData) -> Option<Vec<ForwardingConfig>> {
+    if let Some(rules) = &router.proposed_router_config.forwarding {
+        return Some(rules.clone());
+    }
+    if !router.topology.loaded {
+        return None;
+    }
+    if router.proposed_router_config.uplink.is_none() {
+        return Some(vec![]);
+    }
+    let plan = router.plan.as_ref()?;
+    if let RouterDataplaneTarget::Enabled(desired) = &plan.dataplane.target {
+        Some(
+            desired
+                .outputs
+                .iter()
+                .map(|output| ForwardingConfig {
+                    from: output.interface.clone(),
+                    to: desired.uplink.clone(),
+                    masquerade: true,
+                    source_subnet: None,
+                })
+                .collect(),
+        )
+    } else {
+        None
+    }
+}
+
+async fn load_rules(app: &mut TuiApp, client: &ApiClient) -> Option<Vec<ForwardingConfig>> {
+    if !app.router.staged {
+        match client.request(&Request::GetRouterConfig).await {
+            Ok(Response::RouterConfig { config }) => app.router.proposed_router_config = config,
+            _ => {
+                app.push_message(
+                    LogLevel::Error,
+                    "Could not load sharing configuration; refresh and try again",
+                );
+                return None;
+            }
+        }
+    }
+    if !app.router.proposed_router_config.vpn_chain.is_empty() {
+        app.push_message(LogLevel::Warn, "The global VPN chain uses legacy forwarding. Configure its tunnel routing before switching to per-interface sharing.");
+        return None;
+    }
+    if let Some(rules) = &app.router.proposed_router_config.forwarding {
+        return Some(rules.clone());
+    }
+    if app.router.proposed_router_config.uplink.is_none() {
+        return Some(vec![]);
+    }
+    let mut legacy = app.router.proposed_router_config.clone();
+    legacy.enabled = true;
+    let proposal = RouterProposalRequest {
+        set_router: Some(legacy),
+        ..Default::default()
+    };
+    if let Ok(Response::RouterPlan { plan }) = client.request(&Request::RouterPlan { proposal }).await {
+        if let RouterDataplaneTarget::Enabled(desired) = plan.dataplane.target {
+            return Some(
+                desired
+                    .outputs
+                    .into_iter()
+                    .map(|output| ForwardingConfig {
+                        from: output.interface,
+                        to: desired.uplink.clone(),
+                        masquerade: true,
+                        source_subnet: None,
+                    })
+                    .collect(),
+            );
+        }
+    }
+    app.push_message(
+        LogLevel::Error,
+        "Could not load existing sharing rules; refresh and review the router plan",
+    );
+    None
+}
+
+pub(crate) async fn open_from_route(app: &mut TuiApp, client: &ApiClient) {
+    let Some(interface) = app
+        .router
+        .routes
+        .get(app.router.selected_route)
+        .and_then(|route| route.output_interface.clone())
+    else {
+        app.push_message(
+            LogLevel::Warn,
+            "Select a route with an output interface first",
+        );
+        return;
+    };
+    open(app, client, false, Some(interface)).await;
+}
+
+async fn open(app: &mut TuiApp, client: &ApiClient, edit: bool, egress: Option<String>) {
+    let selected = displayed_rules(&app.router)
+        .and_then(|rules| rules.get(app.router.selected_connection).cloned());
+    let Some(rules) = load_rules(app, client).await else {
+        return;
+    };
+    let editing = if edit {
+        let Some(index) = selected
+            .as_ref()
+            .and_then(|selected| rules.iter().position(|rule| rule == selected))
+        else {
+            app.push_message(
+                LogLevel::Warn,
+                "The selected connection changed; refresh and select it again",
+            );
+            return;
+        };
+        Some(index)
+    } else {
+        None
+    };
+    let mut interfaces: Vec<_> = app
+        .dashboard
+        .interfaces
+        .iter()
+        .map(|status| status.interface.name.clone())
+        .collect();
+    for rule in &rules {
+        interfaces.extend([rule.from.clone(), rule.to.clone()]);
+    }
+    if let Some(egress) = &egress {
+        interfaces.push(egress.clone());
+    }
+    interfaces.sort();
+    interfaces.dedup();
+    if interfaces.len() < 2 {
+        app.push_message(
+            LogLevel::Warn,
+            "Sharing needs two interfaces. Create/connect interfaces or VPN tunnels first.",
+        );
+        return;
+    }
+    let rule = editing.map(|index| &rules[index]);
+    let to = interfaces
+        .iter()
+        .position(|name| Some(name) == rule.map(|rule| &rule.to).or(egress.as_ref()))
+        .unwrap_or(1);
+    let from = rule
+        .and_then(|rule| interfaces.iter().position(|name| name == &rule.from))
+        .unwrap_or_else(|| usize::from(to == 0));
+    let source = rule
+        .and_then(|rule| rule.source_subnet)
+        .map_or(String::new(), |subnet| subnet.to_string());
+    let editor = ForwardingEditor {
+        interfaces,
+        editing,
+        from,
+        to,
+        masquerade: rule.is_none_or(|rule| rule.masquerade),
+        advanced: !source.is_empty(),
+        cursor: source.chars().count(),
+        source,
+        rules,
+        field: Field::From,
+        error: None,
+    };
+    app.forwarding = Some(editor);
+    app.screen = Screen::Forwarding;
+}
+
+fn stage(app: &mut TuiApp, rules: Vec<ForwardingConfig>) {
+    app.router.selected_connection = app
+        .router
+        .selected_connection
+        .min(rules.len().saturating_sub(1));
+    app.router.proposed_router_config.forwarding = Some(rules);
+    app.router.proposed_router_config.enabled = true;
+    app.router.staged = true;
+    app.router.error = None;
+}
+
+const ACTIONS: [&str; 5] = [
+    "[Add]",
+    "[Edit]",
+    "[Delete]",
+    "[Review / Apply]",
+    "[Refresh]",
+];
+
+pub(crate) fn render_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(3),
+    ])
+    .split(area);
+    frame.render_widget(
+        Paragraph::new(if app.router.staged {
+            "Draft changes — Review / Apply to confirm"
+        } else {
+            "Sharing permissions and NAT; routes choose the path"
+        })
+        .style(Style::default().fg(theme::MUTED)),
+        chunks[0],
+    );
+    let block = panel("Internet sharing");
+    let inner = block.inner(chunks[1]);
+    let rules = displayed_rules(&app.router);
+    let rules_slice = rules.as_deref().unwrap_or(&[]);
+    app.router.selected_connection = app
+        .router
+        .selected_connection
+        .min(rules_slice.len().saturating_sub(1));
+    let visible = usize::from(inner.height.saturating_sub(1));
+    let scroll = app
+        .router
+        .selected_connection
+        .saturating_sub(visible.saturating_sub(1));
+    let rows = rules_slice
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(visible)
+        .map(|(index, rule)| {
+            Row::new(vec![
+                Cell::from(if index == app.router.selected_connection {
+                    "▶"
+                } else {
+                    " "
+                }),
+                Cell::from(rule.from.clone()),
+                Cell::from(rule.to.clone()),
+                Cell::from(if rule.masquerade { "On" } else { "Off" }),
+                Cell::from(
+                    rule.source_subnet
+                        .map_or("Any".into(), |subnet| subnet.to_string()),
+                ),
+            ])
+            .style(
+                if index == app.router.selected_connection && !app.router.sharing_actions_focused {
+                    Style::default()
+                        .fg(theme::SELECTED_FG)
+                        .bg(theme::SELECTED_BG)
+                } else {
+                    Style::default()
+                },
+            )
+        });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(1),
+            Constraint::Min(9),
+            Constraint::Min(9),
+            Constraint::Length(4),
+            Constraint::Length(18),
+        ],
+    )
+    .header(
+        Row::new(["", "From", "Through", "NAT", "Source subnet"])
+            .style(Style::default().fg(theme::MUTED)),
+    )
+    .block(block);
+    frame.render_widget(table, chunks[1]);
+    app.ui.list_area = Some(Rect::new(
+        inner.x,
+        inner.y.saturating_add(1),
+        inner.width,
+        inner.height.saturating_sub(1),
+    ));
+    app.ui.list_row_height = 1;
+    app.ui.list_count = rules_slice.len();
+    app.ui.list_scroll_offset = scroll;
+    if rules_slice.is_empty() {
+        frame.render_widget(
+            Paragraph::new(if rules.is_some() {
+                "No connections. Choose Add."
+            } else {
+                "Legacy/unavailable data — refresh before editing"
+            }),
+            app.ui.list_area.unwrap(),
+        );
+    }
+    let block = panel("Sharing actions");
+    let inner = block.inner(chunks[2]);
+    frame.render_widget(block, chunks[2]);
+    let mut x = inner.x;
+    for (index, label) in ACTIONS.into_iter().enumerate() {
+        let rect = Rect::new(x, inner.y, label.len() as u16, 1);
+        frame.render_widget(
+            Paragraph::new(label).style(
+                if app.router.sharing_actions_focused && app.router.sharing_action == index {
+                    Style::default()
+                        .fg(theme::SELECTED_FG)
+                        .bg(theme::SELECTED_BG)
+                } else {
+                    Style::default().fg(theme::ACCENT)
+                },
+            ),
+            rect,
+        );
+        app.ui.buttons.push((rect, index));
+        x += rect.width + 1;
+    }
+}
+
+pub(crate) async fn handle_list_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
+    let len = displayed_rules(&app.router).map_or(0, |rules| rules.len());
+    match key {
+        KeyCode::Esc => {
+            if app.router.sharing_actions_focused {
+                app.router.sharing_actions_focused = false;
+            } else {
+                super::router::select_pane(app, RouterPane::Routes);
+            }
+        }
+        KeyCode::Tab | KeyCode::BackTab => {
+            app.router.sharing_actions_focused = !app.router.sharing_actions_focused
+        }
+        KeyCode::Char('a') => open(app, client, false, None).await,
+        KeyCode::Delete => delete(app, client).await,
+        KeyCode::Up if !app.router.sharing_actions_focused => {
+            app.router.selected_connection = app.router.selected_connection.saturating_sub(1)
+        }
+        KeyCode::Down
+            if !app.router.sharing_actions_focused
+                && app.router.selected_connection + 1 < len =>
+        {
+            app.router.selected_connection += 1;
+        }
+        KeyCode::Left | KeyCode::Up if app.router.sharing_actions_focused => {
+            app.router.sharing_action = app.router.sharing_action.saturating_sub(1)
+        }
+        KeyCode::Right | KeyCode::Down if app.router.sharing_actions_focused => {
+            app.router.sharing_action = (app.router.sharing_action + 1).min(ACTIONS.len() - 1)
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            if !app.router.sharing_actions_focused {
+                if len > 0 {
+                    open(app, client, true, None).await;
+                }
+                return;
+            }
+            match app.router.sharing_action {
+                0 => open(app, client, false, None).await,
+                1 => {
+                    if len > 0 {
+                        open(app, client, true, None).await;
+                    }
+                }
+                2 => delete(app, client).await,
+                3 => super::router::open_router_plan(app, client).await,
+                _ => super::router::refresh_router_data(app, client).await,
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn delete(app: &mut TuiApp, client: &ApiClient) {
+    let selected = displayed_rules(&app.router)
+        .and_then(|rules| rules.get(app.router.selected_connection).cloned());
+    let Some(selected) = selected else {
+        return;
+    };
+    let Some(mut rules) = load_rules(app, client).await else {
+        return;
+    };
+    if let Some(index) = rules.iter().position(|rule| rule == &selected) {
+        rules.remove(index);
+        stage(app, rules);
+    } else {
+        app.push_message(
+            LogLevel::Warn,
+            "The selected connection changed; refresh and select it again",
+        );
+    }
+}
+
+pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
+    let Some(editor) = &app.forwarding else {
+        return;
+    };
+    let mut lines = vec![];
+    for field in editor.fields() {
+        let selected = editor.field == field;
+        let style = if selected {
+            Style::default()
+                .fg(theme::SELECTED_FG)
+                .bg(theme::SELECTED_BG)
+        } else {
+            Style::default().fg(theme::TEXT)
+        };
+        let label = match field {
+            Field::From => format!("Traffic from: {}", editor.interfaces[editor.from]),
+            Field::To => format!("Internet through: {}", editor.interfaces[editor.to]),
+            Field::Masquerade => format!(
+                "Masquerade: {}",
+                if editor.masquerade { "on" } else { "off" }
+            ),
+            Field::Advanced => format!(
+                "Advanced: {}",
+                if editor.advanced {
+                    "expanded"
+                } else {
+                    "collapsed"
+                }
+            ),
+            Field::Source => format!(
+                "Source subnet: {}",
+                if editor.source.is_empty() {
+                    "Any (empty)"
+                } else {
+                    &editor.source
+                }
+            ),
+            Field::Save => "[Save connection]".into(),
+        };
+        if field == Field::Source && selected {
+            let mut spans = vec![Span::styled("▶ Source subnet: ", style)];
+            spans.extend(super::input::render_value_with_cursor(
+                &editor.source,
+                editor.cursor,
+                true,
+                style,
+            ));
+            lines.push(Line::from(spans));
+        } else {
+            lines.push(Line::styled(
+                format!("{}{}", if selected { "▶ " } else { "  " }, label),
+                style,
+            ));
+        }
+    }
+    if let Some(error) = &editor.error {
+        lines.push(Line::styled(error.clone(), Style::default().fg(theme::BAD)));
+    }
+    let block = panel(if editor.editing.is_some() {
+        "Edit sharing connection"
+    } else {
+        "Add sharing connection"
+    });
+    let inner = block.inner(area);
+    let offset = if editor.error.is_some() {
+        lines.len().saturating_sub(inner.height as usize)
+    } else {
+        focused_lines_offset(&lines, inner.height)
+    };
+    if let Some(row) = editor
+        .fields()
+        .iter()
+        .position(|field| *field == Field::Save)
+        .filter(|row| *row >= offset && *row < offset + inner.height as usize)
+    {
+        app.ui.buttons.push((
+            Rect::new(inner.x, inner.y + (row - offset) as u16, 19, 1),
+            0,
+        ));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((offset as u16, 0))
+            .block(block),
+        area,
+    );
+}
+
+pub(crate) fn focus_action(app: &mut TuiApp, _slot: usize) {
+    if let Some(editor) = &mut app.forwarding {
+        editor.field = Field::Save;
+    }
+}
+
+pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, _client: &ApiClient) {
+    let Some(editor) = &mut app.forwarding else {
+        app.screen = Screen::Router;
+        return;
+    };
+    match key {
+        KeyCode::Esc => {
+            app.forwarding = None;
+            app.screen = Screen::Router;
+        }
+        KeyCode::Up | KeyCode::BackTab | KeyCode::Down | KeyCode::Tab => {
+            let fields = editor.fields();
+            let index = fields
+                .iter()
+                .position(|field| *field == editor.field)
+                .unwrap_or(0);
+            editor.field = fields[if matches!(key, KeyCode::Up | KeyCode::BackTab) {
+                index.saturating_sub(1)
+            } else {
+                (index + 1).min(fields.len() - 1)
+            }];
+        }
+        KeyCode::Enter if editor.field == Field::Save => match editor.save() {
+            Ok(rules) => {
+                let selected = editor.editing.unwrap_or(rules.len() - 1);
+                stage(app, rules);
+                app.router.selected_connection = selected;
+                app.forwarding = None;
+                app.screen = Screen::Router;
+                super::router::select_pane(app, RouterPane::Sharing);
+            }
+            Err(error) => editor.error = Some(error.to_string()),
+        },
+        key if editor.field == Field::Source => {
+            super::input::TextEditor::new(&mut editor.source, &mut editor.cursor).handle_key(key);
+        }
+        KeyCode::Left | KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ') => {
+            let delta = if key == KeyCode::Left {
+                editor.interfaces.len() - 1
+            } else {
+                1
+            };
+            match editor.field {
+                Field::From => editor.from = (editor.from + delta) % editor.interfaces.len(),
+                Field::To => editor.to = (editor.to + delta) % editor.interfaces.len(),
+                Field::Masquerade => editor.masquerade = !editor.masquerade,
+                Field::Advanced => editor.advanced = !editor.advanced,
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn connection(from: &str, to: &str) -> ForwardingConfig {
+        ForwardingConfig {
+            from: from.into(),
+            to: to.into(),
+            masquerade: true,
+            source_subnet: None,
+        }
+    }
+
+    fn editor() -> ForwardingEditor {
+        ForwardingEditor {
+            rules: vec![connection("lan0", "wan0")],
+            editing: Some(0),
+            interfaces: vec!["lan0".into(), "wan0".into(), "wg0".into()],
+            from: 0,
+            to: 2,
+            masquerade: false,
+            advanced: true,
+            source: "192.168.10.0/24".into(),
+            cursor: 15,
+            field: Field::Save,
+            error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn editing_replaces_the_selected_connection_and_preserves_route_intent() {
+        let mut app = TuiApp::default();
+        app.router
+            .proposed_router_config
+            .owned_routes
+            .push(crate::config::OwnedIpv4RouteConfig {
+                destination: "10.0.0.0/8".parse().unwrap(),
+                gateway: None,
+                output_interface: Some("wan0".into()),
+                table: 254,
+                metric: None,
+            });
+        let routes = app.router.proposed_router_config.owned_routes.clone();
+        app.forwarding = Some(editor());
+        app.screen = Screen::Forwarding;
+        handle_key(
+            &mut app,
+            KeyCode::Enter,
+            &ApiClient::new("/must-not-be-used.sock"),
+        )
+        .await;
+        assert_eq!(app.screen, Screen::Router);
+        assert_eq!(app.router.pane, RouterPane::Sharing);
+        assert!(app.router.staged);
+        assert_eq!(app.router.proposed_router_config.owned_routes, routes);
+        let rules = app
+            .router
+            .proposed_router_config
+            .forwarding
+            .as_ref()
+            .unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].to, "wg0");
+        assert!(!rules[0].masquerade);
+        assert_eq!(
+            rules[0].source_subnet,
+            Some("192.168.10.0/24".parse().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_subnet_and_cancel_do_not_modify_the_draft() {
+        let mut app = TuiApp::default();
+        app.router.proposed_router_config.forwarding = Some(vec![connection("lan0", "wan0")]);
+        app.router.staged = true;
+        let before = app.router.proposed_router_config.clone();
+        let mut form = editor();
+        form.source = "192.168.10.3/24".into();
+        app.forwarding = Some(form);
+        app.screen = Screen::Forwarding;
+        let client = ApiClient::new("/must-not-be-used.sock");
+        handle_key(&mut app, KeyCode::Enter, &client).await;
+        assert!(app.forwarding.as_ref().unwrap().error.is_some());
+        assert_eq!(app.router.proposed_router_config, before);
+        handle_key(&mut app, KeyCode::Esc, &client).await;
+        assert_eq!(app.router.proposed_router_config, before);
+        assert!(app.router.staged);
+    }
+
+    #[test]
+    fn disjoint_source_subnets_share_a_pair_but_overlap_is_rejected() {
+        let mut form = editor();
+        form.rules[0].to = "wg0".into();
+        form.rules[0].source_subnet = Some("192.168.20.0/24".parse().unwrap());
+        form.editing = None;
+        assert_eq!(form.save().unwrap().len(), 2);
+        form.source = "192.168.0.0/16".into();
+        assert!(form.save().is_err());
+        form.source.clear();
+        assert!(form.save().is_err());
+    }
+
+    #[tokio::test]
+    async fn route_shortcut_prefills_egress_without_changing_routes_or_staging() {
+        let mut app = TuiApp::default();
+        app.router.staged = true; // A local draft avoids any API request.
+        app.router.proposed_router_config.forwarding = Some(vec![connection("lan0", "wan0")]);
+        let route = crate::api::model::RouteStatus {
+            destination: "10.0.0.0/8".parse().unwrap(),
+            gateway: None,
+            output_interface: Some("wg0".into()),
+            output_interface_index: None,
+            table: 254,
+            metric: None,
+            protocol: 4,
+            scope: 0,
+            owner: crate::netlink::RouteOwner::Static,
+        };
+        app.router.routes.push(route);
+        let before = app.router.proposed_router_config.clone();
+        open_from_route(&mut app, &ApiClient::new("/must-not-be-used.sock")).await;
+        let form = app.forwarding.as_ref().unwrap();
+        assert_eq!(form.interfaces[form.to], "wg0");
+        assert_eq!(form.editing, None);
+        assert_eq!(app.router.proposed_router_config, before);
+    }
+
+    #[tokio::test]
+    async fn section_keys_mouse_and_action_arrows_preserve_the_shared_draft() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = TuiApp::default();
+        app.screen = Screen::Router;
+        app.ui.input_enabled = true;
+        app.router.staged = true;
+        app.router.proposed_router_config.forwarding = Some(vec![connection("lan0", "wan0")]);
+        let before = app.router.proposed_router_config.clone();
+        let client = ApiClient::new("/must-not-be-used.sock");
+        super::super::handle_key(&mut app, KeyCode::Char('2'), &client, false).await;
+        super::super::handle_key(&mut app, KeyCode::Tab, &client, false).await;
+        super::super::handle_key(&mut app, KeyCode::Right, &client, false).await;
+        assert_eq!(app.screen, Screen::Router);
+        assert_eq!(app.router.pane, RouterPane::Sharing);
+        assert_eq!(app.router.sharing_action, 1);
+        super::super::handle_key(&mut app, KeyCode::Char('3'), &client, false).await;
+        assert!(app.router.topology.open);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| super::super::render(frame, &mut app, false))
+            .unwrap();
+        let rect = app.router.pane_tabs[0].0;
+        super::super::handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x,
+                row: rect.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &client,
+            false,
+        )
+        .await;
+        assert_eq!(app.router.pane, RouterPane::Routes);
+        assert!(!app.router.topology.open);
+        assert_eq!(app.router.proposed_router_config, before);
+        assert!(app.router.staged);
+    }
+
+    #[test]
+    fn sharing_sections_and_controls_fit_small_and_large_terminals() {
+        use ratatui::{backend::TestBackend, Terminal};
+        for (width, height) in [(60, 15), (80, 24), (120, 30)] {
+            let mut app = TuiApp::default();
+            app.screen = Screen::Router;
+            app.router.pane = RouterPane::Sharing;
+            app.router.proposed_router_config.forwarding =
+                Some(vec![connection("lan0", "wg0"); 20]);
+            app.router.selected_connection = 19;
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| super::super::render(frame, &mut app, false))
+                .unwrap();
+            assert_eq!(app.router.pane_tabs.len(), 3);
+            assert_eq!(app.ui.buttons.len(), 5);
+            assert!(app.ui.list_scroll_offset > 0);
+            for (rect, _) in &app.ui.buttons {
+                assert!(rect.right() <= width);
+                assert!(rect.bottom() <= height - 4);
+            }
+        }
+    }
+}

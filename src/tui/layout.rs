@@ -196,6 +196,8 @@ fn screen_help_pairs(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ]
         }
         Screen::Router => vec![
+            ("1/2/3", "router section"),
+            ("n", "share via route"),
             ("↑/↓", "move"),
             ("t", "topology"),
             ("Tab", "focus"),
@@ -233,22 +235,13 @@ fn screen_help_pairs(screen: Screen) -> Vec<(&'static str, &'static str)> {
             ("Esc", "back"),
         ],
         Screen::Preview | Screen::RouterPlan => vec![("Enter", "apply"), ("Esc", "back")],
-        Screen::RouterProvisioning => vec![
+        Screen::Forwarding => vec![
             ("↑/↓", "field"),
             ("←/→", "choose"),
-            ("Enter", "continue"),
+            ("Enter", "select/save"),
             ("Esc", "cancel"),
         ],
-        Screen::RouterProvisioningNetworks => {
-            vec![("↑/↓", "network"), ("Enter", "select"), ("Esc", "back")]
-        }
-        Screen::RouterProvisioningConfirm => {
-            vec![("Tab", "advanced"), ("Enter", "apply"), ("Esc", "back")]
-        }
         Screen::PendingChange | Screen::RouterPending => {
-            vec![("Enter", "commit"), ("Esc", "rollback")]
-        }
-        Screen::RouterProvisioningPending => {
             vec![("Enter", "commit"), ("Esc", "rollback")]
         }
         Screen::Log => vec![

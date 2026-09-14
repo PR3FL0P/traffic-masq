@@ -34,7 +34,7 @@ mod input;
 mod interfaces;
 mod layout;
 mod logs;
-mod provisioning;
+mod forwarding;
 mod router;
 mod router_topology;
 mod session;
@@ -85,10 +85,7 @@ enum Screen {
     RouterPlan,
     RouterPending,
     RouteEditor,
-    RouterProvisioning,
-    RouterProvisioningNetworks,
-    RouterProvisioningConfirm,
-    RouterProvisioningPending,
+    Forwarding,
     Vpn,
     VpnImport,
     VpnPolicy,
@@ -173,10 +170,7 @@ fn section_of(screen: Screen) -> Section {
         | Screen::RouteEditor
         | Screen::RouterPlan
         | Screen::RouterPending
-        | Screen::RouterProvisioning
-        | Screen::RouterProvisioningNetworks
-        | Screen::RouterProvisioningConfirm
-        | Screen::RouterProvisioningPending => Section::Router,
+        | Screen::Forwarding => Section::Router,
         Screen::Vpn | Screen::VpnImport | Screen::VpnPolicy => Section::Vpn,
         Screen::Wifi
         | Screen::WifiEditor
@@ -221,7 +215,7 @@ struct TuiApp {
     pending: Option<PendingNetworkChange>,
     router: RouterData,
     router_pending: Option<RouterPendingView>,
-    provisioning: Option<provisioning::ProvisioningWizard>,
+    forwarding: Option<forwarding::ForwardingEditor>,
     router_rollback_timeout_seconds: u64,
     vpn: VpnData,
     vpn_import: Option<VpnImportEditor>,
@@ -264,7 +258,7 @@ impl Default for TuiApp {
             pending: None,
             router: RouterData::default(),
             router_pending: None,
-            provisioning: None,
+            forwarding: None,
             router_rollback_timeout_seconds: 60,
             vpn: VpnData::default(),
             vpn_import: None,
@@ -512,9 +506,6 @@ async fn run_loop(
                 if !direct {
                     router::refresh_router_pending_screen(&mut app, client).await;
                 }
-                if !direct && app.screen == Screen::RouterProvisioningPending {
-                    provisioning::refresh_pending(&mut app, client).await;
-                }
                 if !direct && app.screen == Screen::Settings {
                     settings::refresh_settings_status(&mut app, client).await;
                 }
@@ -605,7 +596,6 @@ fn pending_deadline(app: &TuiApp) -> Option<u64> {
                     .saturating_add(app.router_rollback_timeout_seconds)
             })
         })
-        .or_else(|| provisioning::pending_deadline(app))
 }
 
 async fn drive_ui(
@@ -844,6 +834,8 @@ async fn navigate_to_section(app: &mut TuiApp, section: Section, client: &ApiCli
                     "Router management requires the daemon API; unavailable in direct/offline mode",
                 );
             } else {
+                app.router.focus = RouterFocus::RouteTable;
+                app.router.sharing_actions_focused = false;
                 router::load_router_data(app, client).await;
                 app.screen = Screen::Router;
             }
@@ -897,6 +889,12 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                 navigate_to_section(app, section, client, direct).await;
                 return;
             }
+            if app.screen == Screen::Router {
+                if let Some((_, pane)) = app.router.pane_tabs.iter().find(|(rect, _)| layout::point_in_rect(point, *rect)).copied() {
+                    router::select_pane(app, pane);
+                    return;
+                }
+            }
             if let Some(&(_, slot)) = app
                 .ui
                 .buttons
@@ -938,8 +936,13 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                                 wifi::open_radio(app, index);
                             }
                             Screen::Router => {
-                                app.router.selected_route = index;
-                                app.router.focus = RouterFocus::RouteTable;
+                                if app.router.pane == router::RouterPane::Sharing {
+                                    app.router.selected_connection = index;
+                                    app.router.sharing_actions_focused = false;
+                                } else {
+                                    app.router.selected_route = index;
+                                    app.router.focus = RouterFocus::RouteTable;
+                                }
                             }
                             Screen::WifiScan => {
                                 if let Some(scan) = app.wifi_scan.as_mut() {
@@ -1108,12 +1111,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp, direct: bool) {
         Screen::RouteEditor => router::render_route_editor(frame, chunks[1], app),
         Screen::RouterPlan => router::render_router_plan(frame, chunks[1], app),
         Screen::RouterPending => router::render_router_pending(frame, chunks[1], app),
-        Screen::RouterProvisioning => provisioning::render_wizard(frame, chunks[1], app),
-        Screen::RouterProvisioningNetworks => provisioning::render_networks(frame, chunks[1], app),
-        Screen::RouterProvisioningConfirm => {
-            provisioning::render_confirmation(frame, chunks[1], app)
-        }
-        Screen::RouterProvisioningPending => provisioning::render_pending(frame, chunks[1], app),
+        Screen::Forwarding => forwarding::render(frame, chunks[1], app),
         Screen::Vpn => vpn::render_vpn(frame, chunks[1], app),
         Screen::VpnImport => vpn::render_vpn_import(frame, chunks[1], app),
         Screen::VpnPolicy => vpn_policy::render_vpn_policy(frame, chunks[1], app),
@@ -1139,6 +1137,7 @@ fn focus_action_slot(app: &mut TuiApp, slot: usize) {
         Screen::Preview => interfaces::focus_preview_action(app, slot),
         Screen::DhcpEditor => dhcp::focus_action(app, slot),
         Screen::Router => router::focus_action(app, slot),
+        Screen::Forwarding => forwarding::focus_action(app, slot),
         Screen::RouteEditor => router::focus_route_editor_action(app, slot),
         Screen::Vpn => vpn::focus_action(app, slot),
         Screen::VpnPolicy => vpn_policy::focus_action(app, slot),
@@ -1188,7 +1187,9 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
                 let is_editing_settings_text = app.screen == Screen::Settings
                     && app.settings.as_ref().is_some_and(|s| s.is_editing());
                 let is_router_actions_focused = app.screen == Screen::Router
-                    && (app.router.focus == RouterFocus::Actions || app.router.topology.open);
+                    && (app.router.focus == RouterFocus::Actions
+                        || (app.router.pane == router::RouterPane::Sharing && app.router.sharing_actions_focused)
+                        || app.router.topology.open);
                 if !is_editing_settings_text && !is_router_actions_focused {
                     let target =
                         adjacent_section(section_of(app.screen), false, app.show_dhcp_client);
@@ -1200,7 +1201,9 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
                 let is_editing_settings_text = app.screen == Screen::Settings
                     && app.settings.as_ref().is_some_and(|s| s.is_editing());
                 let is_router_actions_focused = app.screen == Screen::Router
-                    && (app.router.focus == RouterFocus::Actions || app.router.topology.open);
+                    && (app.router.focus == RouterFocus::Actions
+                        || (app.router.pane == router::RouterPane::Sharing && app.router.sharing_actions_focused)
+                        || app.router.topology.open);
                 if !is_editing_settings_text && !is_router_actions_focused {
                     let target =
                         adjacent_section(section_of(app.screen), true, app.show_dhcp_client);
@@ -1229,14 +1232,7 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
         Screen::RouteEditor => router::handle_route_editor_key(app, key, client).await,
         Screen::RouterPlan => router::handle_router_plan_key(app, key, client).await,
         Screen::RouterPending => router::handle_router_pending_key(app, key, client).await,
-        Screen::RouterProvisioning => provisioning::handle_wizard_key(app, key, client).await,
-        Screen::RouterProvisioningNetworks => provisioning::handle_network_key(app, key).await,
-        Screen::RouterProvisioningConfirm => {
-            provisioning::handle_confirmation_key(app, key, client).await
-        }
-        Screen::RouterProvisioningPending => {
-            provisioning::handle_pending_key(app, key, client).await
-        }
+        Screen::Forwarding => forwarding::handle_key(app, key, client).await,
         Screen::Vpn => vpn::handle_vpn_key(app, key, client).await,
         Screen::VpnImport => vpn::handle_vpn_import_key(app, key, client).await,
         Screen::VpnPolicy => vpn_policy::handle_vpn_policy_key(app, key, client).await,
@@ -1834,11 +1830,7 @@ mod tests {
         assert_eq!(section_of(Screen::DhcpClient), Section::DhcpClient);
         assert_eq!(section_of(Screen::Router), Section::Router);
         assert_eq!(section_of(Screen::RouteEditor), Section::Router);
-        assert_eq!(section_of(Screen::RouterProvisioning), Section::Router);
-        assert_eq!(
-            section_of(Screen::RouterProvisioningPending),
-            Section::Router
-        );
+        assert_eq!(section_of(Screen::Forwarding), Section::Router);
         assert_eq!(section_of(Screen::RouterPlan), Section::Router);
         assert_eq!(section_of(Screen::RouterPending), Section::Router);
         assert_eq!(section_of(Screen::Vpn), Section::Vpn);
@@ -1914,6 +1906,55 @@ mod tests {
         // Once editing is finished, Right navigates to Log section again
         handle_key(&mut app, KeyCode::Right, &client, false).await;
         assert_eq!(app.screen, Screen::Log);
+    }
+
+    #[tokio::test]
+    async fn router_screen_preserves_horizontal_navigation_and_requires_tab_for_actions() {
+        let mut app = TuiApp {
+            screen: Screen::Router,
+            ..Default::default()
+        };
+        app.ui.input_enabled = true;
+        let client = ApiClient::new("/nonexistent.sock");
+
+        // When in Router screen with RouteTable focus, Right navigates to VPN
+        handle_key(&mut app, KeyCode::Right, &client, false).await;
+        assert_eq!(app.screen, Screen::Vpn);
+
+        // Left navigates back to Router
+        handle_key(&mut app, KeyCode::Left, &client, false).await;
+        assert_eq!(app.screen, Screen::Router);
+        assert_eq!(app.router.focus, router::RouterFocus::RouteTable);
+
+        // Scrolling Down does NOT enter Actions; clamps and stays in RouteTable
+        handle_key(&mut app, KeyCode::Down, &client, false).await;
+        assert_eq!(app.router.focus, router::RouterFocus::RouteTable);
+
+        // Right continues to navigate to VPN
+        handle_key(&mut app, KeyCode::Right, &client, false).await;
+        assert_eq!(app.screen, Screen::Vpn);
+
+        // Navigate back to Router
+        handle_key(&mut app, KeyCode::Left, &client, false).await;
+        assert_eq!(app.screen, Screen::Router);
+
+        // Tab enters Actions
+        handle_key(&mut app, KeyCode::Tab, &client, false).await;
+        assert_eq!(app.router.focus, router::RouterFocus::Actions);
+        assert_eq!(app.router.action, router::RouterAction::AddRoute);
+
+        // In Actions, Right moves to next action and does NOT switch sections
+        handle_key(&mut app, KeyCode::Right, &client, false).await;
+        assert_eq!(app.screen, Screen::Router);
+        assert_eq!(app.router.action, router::RouterAction::EditRoute);
+
+        // Tab exits Actions back to RouteTable
+        handle_key(&mut app, KeyCode::Tab, &client, false).await;
+        assert_eq!(app.router.focus, router::RouterFocus::RouteTable);
+
+        // Now Right navigates to VPN again
+        handle_key(&mut app, KeyCode::Right, &client, false).await;
+        assert_eq!(app.screen, Screen::Vpn);
     }
 
     #[test]

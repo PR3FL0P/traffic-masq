@@ -31,7 +31,11 @@ lease_seconds = 86400
 
 [router]
 enabled = true
-uplink = { interface = "wan0", mode = "external" }
+# Existing routing on wan0 supplies the upstream gateway.
+forwarding = [{ from = "wlan0", to = "wan0", masquerade = true }]
+# Add independent pairs, e.g. lan1 -> wg0, after creating interfaces/routes.
+# Optional source_subnet = "192.168.50.0/24" scopes forwarding and NAT.
+# forwarding = [] removes all explicitly configured connection rules.
 owned_routes = []
 allow_default_route_change = false
 

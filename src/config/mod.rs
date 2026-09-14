@@ -152,7 +152,8 @@ pub struct InterfaceConfig {
     pub wifi_client: Option<WifiClientConfig>,
 
     /// Whether a managed Output interface's traffic is masqueraded by the
-    /// router dataplane. Defaults to `true` so upgrading a persisted config
+    /// legacy router dataplane (ignored when router.forwarding is present).
+    /// Defaults to `true` so upgrading a persisted config
     /// without this key preserves today's unconditional-NAT behavior.
     #[serde(default = "default_true")]
     pub nat: bool,
@@ -163,6 +164,9 @@ pub struct InterfaceConfig {
 pub struct RouterConfig {
     pub enabled: bool,
     pub uplink: Option<UplinkConfig>,
+    /// Explicit ingress → egress rules. None preserves legacy uplink NAT;
+    /// Some(empty) disables forwarding without restoring legacy rules.
+    pub forwarding: Option<Vec<ForwardingConfig>>,
     pub owned_routes: Vec<OwnedIpv4RouteConfig>,
     pub allow_default_route_change: bool,
     /// Persisted, user-facing VPN hop chain: profile name per hop, ordered
@@ -170,6 +174,46 @@ pub struct RouterConfig {
     /// `reserved` fields of a hop are recomputed at runtime, not persisted.
     #[serde(default)]
     pub vpn_chain: Vec<VpnHopConfig>,
+}
+
+/// A directional permission to forward IPv4 traffic between existing interfaces.
+/// Routing selects the egress; this rule does not create routes or VPN tunnels.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardingConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_subnet: Option<Ipv4Net>,
+    pub from: String,
+    pub to: String,
+    #[serde(default = "default_true")]
+    pub masquerade: bool,
+}
+
+pub fn validate_forwarding(rules: &[ForwardingConfig]) -> Result<()> {
+    for (index, rule) in rules.iter().enumerate() {
+        validate_interface_name(&rule.from)?;
+        validate_interface_name(&rule.to)?;
+        if rule.from == rule.to {
+            bail!("forwarding requires different ingress and egress interfaces");
+        }
+        if rule.source_subnet.is_some_and(|subnet| subnet != subnet.trunc()) {
+            bail!("source subnet must be a network address (no host bits)");
+        }
+        if rules[..index]
+            .iter()
+            .any(|prior| prior.from == rule.from && prior.to == rule.to &&
+                match (prior.source_subnet, rule.source_subnet) {
+                    (Some(a), Some(b)) => a.contains(&b.addr()) || b.contains(&a.addr()),
+                    _ => true,
+                })
+        {
+            bail!(
+                "duplicate or overlapping forwarding connection: {} -> {}",
+                rule.from,
+                rule.to
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The maximum number of hops a persisted VPN chain may contain, matching
@@ -482,6 +526,9 @@ impl AppConfig {
     pub fn validate(&self) -> Result<()> {
         self.network.validate()?;
         self.router.validate(&self.network)?;
+        if self.router.forwarding.is_some() && self.vpn.policy.default_mode == VpnPolicyMode::Vpn {
+            bail!("explicit forwarding requires direct global VPN policy; configure routes for each VPN interface separately");
+        }
         self.vpn.validate(&self.router)?;
         self.wifi.validate(&self.network)?;
         self.wifi_client.validate()?;
@@ -625,6 +672,12 @@ impl NetworkConfig {
 
 impl RouterConfig {
     fn validate(&self, network: &NetworkConfig) -> Result<()> {
+        if let Some(rules) = &self.forwarding {
+            validate_forwarding(rules)?;
+            if !self.vpn_chain.is_empty() {
+                bail!("explicit forwarding cannot be combined with the legacy global vpn_chain; configure tunnel routing separately");
+            }
+        }
         if self.enabled {
             if let Some(uplink) = self.uplink.as_ref() {
                 validate_interface_name(&uplink.interface)
@@ -660,10 +713,12 @@ impl RouterConfig {
                     .interfaces
                     .iter()
                     .filter(|(_, interface)| {
-                        interface.role == InterfaceRole::Output && interface.managed
+                        self.forwarding.is_none()
+                            && interface.role == InterfaceRole::Output
+                            && interface.managed
                     })
                     .collect::<Vec<_>>();
-                if outputs.is_empty() {
+                if outputs.is_empty() && self.forwarding.is_none() {
                     bail!("enabled router mode requires at least one managed output interface");
                 }
                 for (name, interface) in outputs {
@@ -676,7 +731,9 @@ impl RouterConfig {
                     .interfaces
                     .iter()
                     .filter(|(_, interface)| {
-                        interface.role == InterfaceRole::Output && interface.managed
+                        self.forwarding.is_none()
+                            && interface.role == InterfaceRole::Output
+                            && interface.managed
                     })
                     .collect::<Vec<_>>();
                 for (name, interface) in outputs {
@@ -1173,6 +1230,75 @@ impl Default for AppConfig {
 mod tests {
 
     #[test]
+    fn explicit_forwarding_accepts_unmanaged_and_vpn_interfaces_without_a_global_uplink() {
+        let mut config = AppConfig::default();
+        config.router.enabled = true;
+        config.router.forwarding = Some(vec![
+            ForwardingConfig {
+                source_subnet: None,
+                from: "eth1".into(),
+                to: "wg0".into(),
+                masquerade: true,
+            },
+            ForwardingConfig {
+                source_subnet: None,
+                from: "wg0".into(),
+                to: "wg1".into(),
+                masquerade: false,
+            },
+        ]);
+        config.validate().unwrap();
+        let encoded = toml::to_string(&config).unwrap();
+        let decoded: AppConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.router.forwarding, config.router.forwarding);
+        config.router.forwarding = Some(vec![]);
+        let decoded: AppConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(decoded.router.forwarding, Some(vec![]));
+    }
+
+    #[test]
+    fn forwarding_rejects_self_links_duplicates_and_unsafe_names() {
+        let rule = ForwardingConfig {
+            source_subnet: None,
+            from: "lan0".into(),
+            to: "wan0".into(),
+            masquerade: true,
+        };
+        assert!(validate_forwarding(&[rule.clone(), rule.clone()]).is_err());
+        assert!(validate_forwarding(&[ForwardingConfig {
+            to: "lan0".into(),
+            ..rule.clone()
+        }])
+        .is_err());
+        assert!(validate_forwarding(&[ForwardingConfig {
+            to: "wan*".into(),
+            ..rule
+        }])
+        .is_err());
+    }
+
+    #[test]
+    fn explicit_forwarding_refuses_ambiguous_global_vpn_policy() {
+        let mut config = AppConfig::default();
+        config.router.forwarding = Some(vec![]);
+        config.router.vpn_chain = vec![VpnHopConfig {
+            profile_name: "vpn.conf".into(),
+        }];
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("vpn_chain"));
+        config.router.vpn_chain.clear();
+        config.vpn.policy.default_mode = VpnPolicyMode::Vpn;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("global VPN policy"));
+    }
+
+    #[test]
     fn legacy_management_role_reads_as_none_and_serializes_canonically() {
         let config: InterfaceConfig =
             toml::from_str("role = \"management\"\nmanaged = false\n").unwrap();
@@ -1244,6 +1370,7 @@ mod tests {
             ),
         );
         config.router = RouterConfig {
+            forwarding: None,
             vpn_chain: Vec::new(),
             enabled: true,
             uplink: Some(UplinkConfig {
@@ -1326,13 +1453,16 @@ mod tests {
             .expect("example config should parse");
 
         assert!(config.router.enabled, "example should demonstrate routing");
-        let uplink = config
-            .router
-            .uplink
-            .as_ref()
-            .expect("example has an uplink");
-        assert_eq!(uplink.interface, "wan0");
-        assert_eq!(uplink.mode, UplinkMode::External);
+        assert!(config.router.uplink.is_none());
+        assert_eq!(
+            config.router.forwarding,
+            Some(vec![ForwardingConfig {
+                source_subnet: None,
+                from: "wlan0".into(),
+                to: "wan0".into(),
+                masquerade: true,
+            }])
+        );
         assert!(
             !config.router.allow_default_route_change,
             "example must not ship with default-route replacement pre-authorized"
@@ -1557,7 +1687,9 @@ mod tests {
 
         let mut config = valid_router_config();
         config.router.owned_routes[0].output_interface = Some("eth9".to_string());
-        config.validate().expect("system interface not declared in network.interfaces should pass config validation");
+        config.validate().expect(
+            "system interface not declared in network.interfaces should pass config validation",
+        );
     }
 
     #[test]
