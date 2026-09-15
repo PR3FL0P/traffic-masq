@@ -120,6 +120,24 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Tu
     let mut spans = Vec::new();
     let help = if app.screen == Screen::Router && app.router.topology.open {
         vec![("Arrows", "scroll"), ("PgUp/Dn", "page"), ("Esc/t", "back")]
+    } else if matches!(app.screen, Screen::Dashboard)
+        && app.dashboard_focus != super::dashboard::DashboardFocus::List
+        || app.screen == Screen::Vpn && app.vpn.focus != super::vpn::VpnFocus::List
+        || app.screen == Screen::Log && app.logs_focus != super::logs::LogFocus::Scroll
+        || app.screen == Screen::Wifi && app.wifi.actions_open
+    {
+        vec![("Arrows", "action"), ("Enter", "activate"), ("Esc", "list")]
+    } else if app.screen == Screen::Settings
+        && app
+            .settings
+            .as_ref()
+            .is_some_and(|editor| editor.is_editing())
+    {
+        vec![
+            ("←/→", "cursor"),
+            ("Tab/S-Tab", "field"),
+            ("Enter/Esc", "finish"),
+        ]
     } else {
         screen_help_pairs(app.screen)
     };
@@ -156,7 +174,7 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Tu
 
     frame.render_widget(
         Paragraph::new(vec![Line::from(spans), message_line])
-            .block(panel("Status — F1: full message")),
+            .block(panel("F1:msg F2/3:tabs Tab/S-Tab:focus ^C:quit")),
         area,
     );
 }

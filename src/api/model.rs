@@ -299,6 +299,8 @@ pub struct WifiClientProfileWriteRequest {
     #[serde(default)]
     pub priority: i32,
     #[serde(default)]
+    pub autoconnect: bool,
+    #[serde(default)]
     pub passphrase: Option<String>,
     #[serde(default)]
     pub clear_passphrase: bool,

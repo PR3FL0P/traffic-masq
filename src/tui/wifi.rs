@@ -64,6 +64,28 @@ impl WifiData {
         }
     }
 
+    fn replace_rows(&mut self, rows: Vec<WifiRow>) {
+        let previous = self
+            .focused_radio()
+            .map(|row| (row.interface.clone(), row.role));
+        let action = self
+            .actions_open
+            .then(|| self.selected.saturating_sub(self.rows.len()));
+        let retained = previous.as_ref().and_then(|(name, role)| {
+            rows.iter()
+                .position(|row| &row.interface == name && &row.role == role)
+        });
+        self.rows = rows;
+        self.selected_radio = retained.unwrap_or(0);
+        self.actions_open = self.actions_open && retained.is_some();
+        self.selected = if self.actions_open {
+            self.rows.len() + action.unwrap_or(0)
+        } else {
+            self.selected_radio
+        }
+        .min(self.cursor_limit());
+    }
+
     fn cursor_limit(&self) -> usize {
         let Some(row) = self.focused_radio() else {
             return 0;
@@ -313,16 +335,18 @@ pub(crate) enum ProfileField {
     Security,
     Country,
     Priority,
+    Autoconnect,
     Passphrase,
     Save,
 }
 
-const PROFILE_FIELDS: [ProfileField; 7] = [
+const PROFILE_FIELDS: [ProfileField; 8] = [
     ProfileField::Id,
     ProfileField::Ssid,
     ProfileField::Security,
     ProfileField::Country,
     ProfileField::Priority,
+    ProfileField::Autoconnect,
     ProfileField::Passphrase,
     ProfileField::Save,
 ];
@@ -337,6 +361,7 @@ pub(crate) struct WifiProfileEditor {
     pub(crate) security: WifiClientSecurity,
     pub(crate) country: String,
     pub(crate) priority: String,
+    pub(crate) autoconnect: bool,
     pub(crate) passphrase: String,
     pub(crate) has_passphrase: bool,
     pub(crate) cursor: usize,
@@ -372,6 +397,7 @@ impl WifiProfileEditor {
             security,
             country: String::new(),
             priority: "0".into(),
+            autoconnect: false,
             passphrase: String::new(),
             has_passphrase: false,
             cursor,
@@ -389,6 +415,7 @@ impl WifiProfileEditor {
             security: profile.security,
             country: profile.country_code.clone().unwrap_or_default(),
             priority: profile.priority.to_string(),
+            autoconnect: profile.autoconnect,
             passphrase: String::new(),
             has_passphrase: profile.has_passphrase,
             cursor,
@@ -459,6 +486,7 @@ impl WifiProfileEditor {
             country_code: normalized_country(&self.country),
             security: self.security,
             priority,
+            autoconnect: self.autoconnect,
             passphrase: (!self.passphrase.is_empty()).then(|| self.passphrase.clone()),
             clear_passphrase: self.security == WifiClientSecurity::Open && self.has_passphrase,
         })
@@ -613,19 +641,8 @@ pub(crate) fn render_wifi(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
             selected_style(index == app.wifi.selected),
         ));
     }
-    app.ui.list_area = Some(Rect::new(
-        inner.x,
-        inner.y + u16::from(app.wifi.error.is_some()),
-        inner.width,
-        app.wifi.rows.len().min(
-            inner
-                .height
-                .saturating_sub(u16::from(app.wifi.error.is_some())) as usize,
-        ) as u16,
-    ));
-    app.ui.list_count = app.wifi.rows.len();
-    app.ui.list_row_height = 1;
-    app.ui.list_scroll_offset = 0;
+    let radio_start = usize::from(app.wifi.error.is_some());
+    let mut button_rows = Vec::new();
     if app.wifi.actions_open {
         if let Some(row) = app.wifi.focused_radio() {
             lines.push(Line::from(format!("Actions for {}", row.interface)));
@@ -640,10 +657,7 @@ pub(crate) fn render_wifi(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
                     },
                     label
                 );
-                app.ui.buttons.push((
-                    Rect::new(inner.x, inner.y + lines.len() as u16, text.len() as u16, 1),
-                    slot,
-                ));
+                button_rows.push((lines.len(), slot));
                 lines.push(Line::styled(
                     text,
                     selected_style(app.wifi.selected == cursor),
@@ -687,21 +701,52 @@ pub(crate) fn render_wifi(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
                     competing.join(" + "),
                     row.interface
                 ),
-                Style::default().fg(theme::WARN).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme::WARN)
+                    .add_modifier(Modifier::BOLD),
             ));
             lines.push(Line::styled(
                 "How to release this interface:",
                 Style::default().fg(theme::TEXT),
             ));
-            let advice_text = advice_opt
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| crate::wifi::process::format_competing_manager_advice(competing, &row.interface));
+            let advice_text = advice_opt.map(|s| s.to_string()).unwrap_or_else(|| {
+                crate::wifi::process::format_competing_manager_advice(competing, &row.interface)
+            });
             for line in advice_text.lines() {
-                lines.push(Line::styled(format!("  {line}"), Style::default().fg(theme::MUTED)));
+                lines.push(Line::styled(
+                    format!("  {line}"),
+                    Style::default().fg(theme::MUTED),
+                ));
             }
         }
     }
-    frame.render_widget(Paragraph::new(lines), inner);
+    let selected_line = radio_start + app.wifi.selected + usize::from(app.wifi.actions_open);
+    let offset = selected_line.saturating_sub(inner.height.saturating_sub(1) as usize);
+    let visible_start = offset.max(radio_start);
+    let visible_end = (offset + inner.height as usize).min(radio_start + app.wifi.rows.len());
+    if visible_start < visible_end {
+        app.ui.list_area = Some(Rect::new(
+            inner.x,
+            inner.y + (visible_start - offset) as u16,
+            inner.width,
+            (visible_end - visible_start) as u16,
+        ));
+        app.ui.list_scroll_offset = visible_start - radio_start;
+    }
+    app.ui.list_count = app.wifi.rows.len();
+    app.ui.list_row_height = 1;
+    for (line, slot) in button_rows {
+        if line >= offset && line < offset + inner.height as usize {
+            app.ui.buttons.push((
+                Rect::new(inner.x, inner.y + (line - offset) as u16, inner.width, 1),
+                slot,
+            ));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines.into_iter().skip(offset).collect::<Vec<_>>()),
+        inner,
+    );
 }
 
 pub(crate) fn open_radio(app: &mut TuiApp, index: usize) {
@@ -723,14 +768,43 @@ pub(crate) async fn handle_wifi_key(app: &mut TuiApp, key: KeyCode, client: &Api
             app.wifi.selected = app.wifi.selected_radio;
         }
         KeyCode::Esc => app.screen = Screen::Dashboard,
-        KeyCode::Up => {
+        KeyCode::Tab | KeyCode::BackTab => {
+            if app.wifi.actions_open {
+                app.wifi.actions_open = false;
+                app.wifi.selected = app.wifi.selected_radio;
+            } else {
+                open_radio(app, app.wifi.selected_radio);
+            }
+        }
+        KeyCode::Home => {
+            app.wifi.selected = if app.wifi.actions_open {
+                app.wifi.rows.len()
+            } else {
+                0
+            };
+            if !app.wifi.actions_open {
+                app.wifi.selected_radio = 0;
+            }
+        }
+        KeyCode::End => {
+            app.wifi.selected = app.wifi.cursor_limit();
+            if !app.wifi.actions_open {
+                app.wifi.selected_radio = app.wifi.selected;
+            }
+        }
+        KeyCode::Up | KeyCode::Left => {
+            if app.wifi.actions_open && app.wifi.selected == app.wifi.rows.len() {
+                app.wifi.actions_open = false;
+                app.wifi.selected = app.wifi.selected_radio;
+                return;
+            }
             app.wifi.selected = app.wifi.selected.saturating_sub(1);
             if app.wifi.selected < app.wifi.rows.len() {
                 app.wifi.selected_radio = app.wifi.selected;
                 app.wifi.actions_open = false;
             }
         }
-        KeyCode::Down => {
+        KeyCode::Down | KeyCode::Right => {
             app.wifi.selected = (app.wifi.selected + 1).min(app.wifi.cursor_limit());
             if app.wifi.selected < app.wifi.rows.len() {
                 app.wifi.selected_radio = app.wifi.selected;
@@ -1181,6 +1255,7 @@ async fn start_scan(app: &mut TuiApp, client: &ApiClient, interface: String) {
     {
         Ok(Response::WifiClientScanResults { mut results, .. }) => {
             sort_scan_results(&mut results);
+            app.wifi_profiles = None;
             app.wifi_scan = Some(WifiScanPicker {
                 interface,
                 networks: results,
@@ -1248,6 +1323,8 @@ pub(crate) fn handle_wifi_scan_key(app: &mut TuiApp, key: KeyCode) {
         KeyCode::Down => {
             scan.selected = (scan.selected + 1).min(scan.networks.len().saturating_sub(1))
         }
+        KeyCode::Home => scan.selected = 0,
+        KeyCode::End => scan.selected = scan.networks.len().saturating_sub(1),
         KeyCode::Enter => {
             let Some(network) = scan.networks.get(scan.selected) else {
                 return;
@@ -1274,6 +1351,7 @@ fn open_create_profile(app: &mut TuiApp, interface: String) {
         security: WifiClientSecurity::Wpa2,
         country: String::new(),
         priority: "0".into(),
+        autoconnect: false,
         passphrase: String::new(),
         has_passphrase: false,
         cursor: 0,
@@ -1290,16 +1368,17 @@ async fn open_profiles(
     match client.request(&Request::ListWifiClientProfiles).await {
         Ok(Response::WifiClientProfiles { mut profiles }) => {
             profiles.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.id.cmp(&b.id)));
-            let previous_selected = app
-                .wifi_profiles
-                .as_ref()
-                .map(|v| v.selected_profile)
-                .unwrap_or(0);
-            let selected_profile = if profiles.is_empty() {
-                0
-            } else {
-                previous_selected.min(profiles.len() - 1)
-            };
+            let previous = app.wifi_profiles.as_ref();
+            let previous_id = previous
+                .and_then(|view| view.profiles.get(view.selected_profile))
+                .map(|profile| &profile.id);
+            let selected_profile = previous_id
+                .and_then(|id| profiles.iter().position(|profile| &profile.id == id))
+                .unwrap_or_else(|| {
+                    previous
+                        .map_or(0, |view| view.selected_profile)
+                        .min(profiles.len().saturating_sub(1))
+                });
             let mode = if profiles.is_empty() && mode == WifiProfilesMode::ProfileActions {
                 WifiProfilesMode::Management
             } else {
@@ -1438,11 +1517,12 @@ fn render_profiles_management(
             let is_selected = index == view.selected;
             Line::styled(
                 format!(
-                    "{}{: <18} {: <28} {: <5} priority {}{}",
+                    "{}{: <18} {: <28} {: <5} auto:{} priority {}{}",
                     if is_selected { "▶ " } else { "  " },
                     profile.id,
                     profile.ssid,
                     client_security_label(profile.security),
+                    if profile.autoconnect { "on" } else { "off" },
                     profile.priority,
                     if profile.has_passphrase {
                         "  key: saved"
@@ -1501,11 +1581,12 @@ fn render_profile_actions(
     if let Some(profile) = view.profiles.get(view.selected_profile) {
         lines.push(Line::styled(
             format!(
-                "  ID: {} │ SSID: {} │ Security: {} │ Priority: {}",
+                "  ID: {} │ SSID: {} │ Security: {} │ Priority: {} │ Auto: {}",
                 profile.id,
                 profile.ssid,
                 client_security_label(profile.security),
-                profile.priority
+                profile.priority,
+                if profile.autoconnect { "on" } else { "off" }
             ),
             Style::default().fg(theme::ACCENT),
         ));
@@ -1801,6 +1882,16 @@ pub(crate) fn render_wifi_profile_editor(
         (ProfileField::Country, "Country", editor.country.clone()),
         (ProfileField::Priority, "Priority", editor.priority.clone()),
         (
+            ProfileField::Autoconnect,
+            "Autoconnect",
+            if editor.autoconnect {
+                "[x] On"
+            } else {
+                "[ ] Off"
+            }
+            .into(),
+        ),
+        (
             ProfileField::Passphrase,
             "Passphrase",
             masked(&editor.passphrase, editor.has_passphrase),
@@ -1903,6 +1994,9 @@ pub(crate) async fn handle_wifi_profile_editor_key(
             editor.field = move_field(&PROFILE_FIELDS, editor.field, true);
             editor.reset_cursor();
         }
+        KeyCode::Enter | KeyCode::Char(' ') if editor.field == ProfileField::Autoconnect => {
+            editor.autoconnect = !editor.autoconnect;
+        }
         KeyCode::Enter if editor.field == ProfileField::Security => {
             editor.security = cycle_client_security(editor.security)
         }
@@ -1949,6 +2043,7 @@ async fn save_profile(app: &mut TuiApp, client: &ApiClient) {
             let profile_id = saved_profile.id.clone();
             let ssid = saved_profile.ssid.clone();
             app.wifi_profile_editor = None;
+            app.screen = Screen::Wifi;
             if is_new {
                 open_wifi_connect_prompt(app, client, interface, profile_id, ssid).await;
             } else {
@@ -1970,7 +2065,7 @@ pub(crate) async fn open_wifi_connect_prompt(
     profile_id: String,
     ssid: String,
 ) {
-    let mut current_static_ip = match client
+    let current_static_ip = match client
         .request(&Request::GetInterfaceConfig {
             interface: interface.clone(),
         })
@@ -1979,25 +2074,18 @@ pub(crate) async fn open_wifi_connect_prompt(
         Ok(Response::InterfaceConfig {
             config: Some(cfg), ..
         }) => cfg.ipv4.map(|ip| ip.to_string()),
-        _ => None,
-    };
-
-    if current_static_ip.is_none() {
-        if let Some(status) = app
-            .dashboard
-            .interfaces
-            .iter()
-            .find(|status| status.interface.name == interface)
-        {
-            for addr in &status.ipv4_addresses {
-                let ip = addr.address;
-                if !ip.is_loopback() && !ip.is_link_local() {
-                    current_static_ip = Some(format!("{}/{}", ip, addr.prefix_len));
-                    break;
-                }
-            }
+        Ok(response) => {
+            report_unexpected(app, response);
+            None
         }
-    }
+        Err(error) => {
+            app.push_message(
+                LogLevel::Warn,
+                format!("Could not read current IP configuration: {error}"),
+            );
+            None
+        }
+    };
 
     app.wifi_connect = Some(WifiConnectPrompt::new(
         interface,
@@ -2036,9 +2124,6 @@ pub(crate) async fn handle_wifi_connect_prompt_key(
                 if pos > 0 {
                     prompt.field = focusable[pos - 1];
                     match prompt.field {
-                        WifiConnectField::Choice(c) => {
-                            prompt.choice = c;
-                        }
                         WifiConnectField::StaticCidr => {
                             prompt.cursor = prompt.static_cidr.len();
                         }
@@ -2053,9 +2138,6 @@ pub(crate) async fn handle_wifi_connect_prompt_key(
                 if pos + 1 < focusable.len() {
                     prompt.field = focusable[pos + 1];
                     match prompt.field {
-                        WifiConnectField::Choice(c) => {
-                            prompt.choice = c;
-                        }
                         WifiConnectField::StaticCidr => {
                             prompt.cursor = prompt.static_cidr.len();
                         }
@@ -2082,7 +2164,7 @@ pub(crate) async fn handle_wifi_connect_prompt_key(
                     prompt.field = WifiConnectField::StaticCidr;
                     prompt.cursor = prompt.static_cidr.len();
                 } else {
-                    submit_wifi_connect(app, client).await;
+                    prompt.field = WifiConnectField::Submit;
                 }
             }
             WifiConnectField::StaticCidr => {
@@ -2109,14 +2191,42 @@ pub(crate) async fn handle_wifi_connect_prompt_key(
     }
 }
 
+async fn disable_dhcp_for_static(app: &mut TuiApp, client: &ApiClient, interface: &str) -> bool {
+    use crate::api::model::DhcpClientErrorDetail;
+    match client
+        .request(&Request::DisableDhcpClient {
+            interface: interface.to_string(),
+        })
+        .await
+    {
+        Ok(Response::DhcpClientDisabled { .. })
+        | Ok(Response::DhcpClientError {
+            detail: DhcpClientErrorDetail::Disabled | DhcpClientErrorDetail::DhcpClientDisabled,
+        }) => true,
+        Ok(response) => {
+            app.push_message(
+                LogLevel::Warn,
+                format!("Cannot configure static IP: DHCP client was not stopped: {response:?}"),
+            );
+            false
+        }
+        Err(error) => {
+            app.push_message(
+                LogLevel::Warn,
+                format!("Cannot configure static IP: DHCP client was not stopped: {error}"),
+            );
+            false
+        }
+    }
+}
+
 async fn apply_wifi_static_ip(
     app: &mut TuiApp,
     client: &ApiClient,
     interface: &str,
     cidr: &str,
-    ssid: &str,
-) {
-    let apply_res = client
+) -> bool {
+    match client
         .request(&Request::ApplyInterfaceEdit {
             interface: interface.to_string(),
             edit: InterfaceEditRequest {
@@ -2126,55 +2236,33 @@ async fn apply_wifi_static_ip(
                 allow_management_change: true,
             },
         })
-        .await;
-
-    match apply_res {
+        .await
+    {
         Ok(Response::NetworkChangePending { change }) => {
-            let commit_res = client
+            match client
                 .request(&Request::CommitNetworkChange {
-                    token: change.token,
+                    token: change.token.clone(),
                 })
-                .await;
-            match commit_res {
-                Ok(Response::NetworkChangeCommitted { .. }) => {
-                    app.push_message(
-                        LogLevel::Info,
-                        format!("Connected to '{ssid}' with static IP {cidr}"),
-                    );
-                }
-                Ok(Response::Error { message }) => {
-                    app.push_message(
-                        LogLevel::Warn,
-                        format!("Profile activated, but commit failed: {message}"),
-                    );
-                }
-                Ok(r) => report_unexpected(app, r),
-                Err(e) => {
-                    app.push_message(
-                        LogLevel::Warn,
-                        format!("Profile activated, but commit failed: {e}"),
-                    );
+                .await
+            {
+                Ok(Response::NetworkChangeCommitted { .. }) => true,
+                result => {
+                    // Retain the token and deadline so the user can inspect/roll back
+                    // an ambiguous commit instead of losing the pending transaction.
+                    app.pending = Some(change);
+                    app.screen = Screen::PendingChange;
+                    app.push_message(LogLevel::Warn, format!("Static IP commit was not confirmed: {result:?}. Inspect pending state before retrying."));
+                    false
                 }
             }
         }
-        Ok(Response::NetworkChangeCommitted { .. }) => {
-            app.push_message(
-                LogLevel::Info,
-                format!("Connected to '{ssid}' with static IP {cidr}"),
-            );
-        }
-        Ok(Response::Error { message }) => {
+        Ok(Response::NetworkChangeCommitted { .. }) => true,
+        result => {
             app.push_message(
                 LogLevel::Warn,
-                format!("Profile activated, but static IP failed: {message}"),
+                format!("Static IP configuration failed: {result:?}"),
             );
-        }
-        Ok(r) => report_unexpected(app, r),
-        Err(e) => {
-            app.push_message(
-                LogLevel::Warn,
-                format!("Profile activated, but static IP failed: {e}"),
-            );
+            false
         }
     }
 }
@@ -2183,116 +2271,75 @@ async fn submit_wifi_connect(app: &mut TuiApp, client: &ApiClient) {
     let Some(prompt) = app.wifi_connect.clone() else {
         return;
     };
-
-    if prompt.choice == WifiIpChoice::NewStatic {
-        let cidr_str = prompt.static_cidr.trim();
-        if cidr_str.is_empty() {
+    let static_cidr = match prompt.choice {
+        WifiIpChoice::Dhcp => None,
+        WifiIpChoice::KeepStatic => prompt.current_static_ip.as_deref(),
+        WifiIpChoice::NewStatic => Some(prompt.static_cidr.trim()),
+    };
+    if prompt.choice != WifiIpChoice::Dhcp {
+        let Some(cidr) = static_cidr.filter(|cidr| !cidr.is_empty()) else {
             app.push_message(LogLevel::Warn, "Static IP / CIDR is required");
             return;
-        }
-        if let Err(e) = cidr_str.parse::<ipnet::Ipv4Net>() {
+        };
+        if let Err(error) = cidr.parse::<ipnet::Ipv4Net>() {
             app.push_message(
                 LogLevel::Warn,
-                format!("Invalid CIDR format (e.g. 192.168.1.100/24): {e}"),
+                format!("Invalid CIDR format (e.g. 192.168.1.100/24): {error}"),
             );
             return;
         }
     }
 
-    let res = client
+    // Activation validates that an IP configuration already exists. Configure
+    // it first, and stop immediately if any prerequisite fails.
+    if let Some(cidr) = static_cidr {
+        if !disable_dhcp_for_static(app, client, &prompt.interface).await
+            || !apply_wifi_static_ip(app, client, &prompt.interface, cidr).await
+        {
+            return;
+        }
+    } else {
+        match client
+            .request(&Request::ConfigureDhcpClient {
+                interface: prompt.interface.clone(),
+                config: DhcpClientConfigRequest::default(),
+            })
+            .await
+        {
+            Ok(Response::DhcpClientInterface { .. }) => {}
+            result => {
+                app.push_message(
+                    LogLevel::Warn,
+                    format!("DHCP client configuration failed: {result:?}"),
+                );
+                return;
+            }
+        }
+    }
+
+    match client
         .request(&Request::ActivateWifiClientProfile {
             interface: prompt.interface.clone(),
             profile_id: prompt.profile_id.clone(),
         })
-        .await;
-    match res {
-        Ok(Response::WifiClientProfileActivated { .. }) => {}
-        Ok(Response::WifiClientProfileError { detail }) => {
-            app.push_message(LogLevel::Error, format!("{detail:?}"));
-            return;
-        }
-        Ok(Response::WifiClientError { detail }) => {
-            app.push_message(LogLevel::Error, format!("{detail:?}"));
-            return;
-        }
-        Ok(Response::Error { message }) => {
-            app.push_message(LogLevel::Error, message);
-            return;
-        }
-        Ok(r) => {
-            report_unexpected(app, r);
-            return;
-        }
-        Err(e) => {
-            app.push_message(LogLevel::Error, e.to_string());
-            return;
-        }
-    }
-
-    match prompt.choice {
-        WifiIpChoice::Dhcp => {
-            let dhcp_res = client
-                .request(&Request::ConfigureDhcpClient {
-                    interface: prompt.interface.clone(),
-                    config: DhcpClientConfigRequest::default(),
-                })
-                .await;
-            match dhcp_res {
-                Ok(Response::DhcpClientInterface { .. }) => {
-                    app.push_message(
-                        LogLevel::Info,
-                        format!("Connected to '{}' via DHCP", prompt.ssid),
-                    );
-                }
-                Ok(Response::DhcpClientError { detail }) => {
-                    app.push_message(
-                        LogLevel::Warn,
-                        format!(
-                            "Profile activated, but DHCP client configuration failed: {detail:?}"
-                        ),
-                    );
-                }
-                Ok(r) => report_unexpected(app, r),
-                Err(e) => app.push_message(
-                    LogLevel::Warn,
-                    format!("Profile activated, but DHCP client configuration failed: {e}"),
+        .await
+    {
+        Ok(Response::WifiClientProfileActivated { .. }) => {
+            app.push_message(
+                LogLevel::Info,
+                format!(
+                    "Profile '{}' activated; waiting for Wi-Fi connection and IP readiness.",
+                    prompt.ssid
                 ),
-            }
+            );
+            app.wifi_connect = None;
+            app.screen = Screen::Wifi;
+            load_wifi_data(app, client).await;
         }
-        WifiIpChoice::KeepStatic => {
-            let _ = client
-                .request(&Request::DisableDhcpClient {
-                    interface: prompt.interface.clone(),
-                })
-                .await;
-
-            if let Some(static_ip) = &prompt.current_static_ip {
-                apply_wifi_static_ip(app, client, &prompt.interface, static_ip, &prompt.ssid).await;
-            } else {
-                app.push_message(LogLevel::Info, format!("Connected to '{}'", prompt.ssid));
-            }
-        }
-        WifiIpChoice::NewStatic => {
-            let _ = client
-                .request(&Request::DisableDhcpClient {
-                    interface: prompt.interface.clone(),
-                })
-                .await;
-
-            apply_wifi_static_ip(
-                app,
-                client,
-                &prompt.interface,
-                prompt.static_cidr.trim(),
-                &prompt.ssid,
-            )
-            .await;
+        result => {
+            app.push_message(LogLevel::Warn, format!("IP configuration was updated, but profile activation was not confirmed: {result:?}. Inspect interface state before retrying."));
         }
     }
-
-    app.wifi_connect = None;
-    app.screen = Screen::Wifi;
-    load_wifi_data(app, client).await;
 }
 
 pub(crate) fn render_wifi_connect_prompt(
@@ -2384,6 +2431,7 @@ pub(crate) fn render_wifi_connect_prompt(
 
     lines.push(Line::from(""));
 
+    let buttons_line = lines.len();
     // Buttons
     let submit_active = prompt.field == WifiConnectField::Submit;
     let cancel_active = prompt.field == WifiConnectField::Cancel;
@@ -2409,11 +2457,30 @@ pub(crate) fn render_wifi_connect_prompt(
 
     lines.push(Line::from(""));
     lines.push(Line::styled(
-        "↑/↓: navigate • Enter/F10: connect • Esc: cancel",
+        "↑/↓: focus • Enter: select • F10: connect • Esc: cancel",
         Style::default().fg(theme::MUTED),
     ));
 
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    let inner = block.inner(area);
+    let offset = super::layout::focused_lines_offset(&lines, inner.height);
+    if buttons_line >= offset && buttons_line < offset + inner.height as usize {
+        let y = inner.y + (buttons_line - offset) as u16;
+        let submit_width = if submit_active { 21 } else { 14 };
+        let cancel_x = submit_width + 4;
+        app.ui
+            .buttons
+            .push((Rect::new(inner.x, y, submit_width.min(inner.width), 1), 0));
+        if cancel_x < inner.width {
+            app.ui.buttons.push((
+                Rect::new(inner.x + cancel_x, y, inner.width - cancel_x, 1),
+                1,
+            ));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines.into_iter().skip(offset).collect::<Vec<_>>()).block(block),
+        area,
+    );
 }
 
 pub(crate) async fn load_wifi_data(app: &mut TuiApp, client: &ApiClient) {
@@ -2454,7 +2521,9 @@ pub(crate) async fn load_wifi_data(app: &mut TuiApp, client: &ApiClient) {
             app.wifi.client_disabled = false;
             interfaces
         }
-        Ok(Response::WifiClientError { .. }) => {
+        Ok(Response::WifiClientError {
+            detail: crate::api::model::WifiClientErrorDetail::WifiClientDisabled,
+        }) => {
             app.wifi.client_disabled = true;
             Vec::new()
         }
@@ -2480,7 +2549,14 @@ pub(crate) async fn load_wifi_data(app: &mut TuiApp, client: &ApiClient) {
                 config: Some(config),
                 ..
             }) => Some(config),
-            _ => None,
+            Ok(Response::InterfaceConfig { config: None, .. }) => None,
+            result => {
+                app.wifi.error = Some(format!(
+                    "Could not refresh {} configuration: {result:?}",
+                    row.interface
+                ));
+                return;
+            }
         };
         managed.insert(
             row.interface.clone(),
@@ -2496,23 +2572,8 @@ pub(crate) async fn load_wifi_data(app: &mut TuiApp, client: &ApiClient) {
             }
         }
     }
-    rows.retain(|row| {
-        managed.get(&row.interface).copied().unwrap_or(false)
-    });
-    let previous_radio = app.wifi.focused_radio().map(|row| row.interface.clone());
-    app.wifi.selected_radio = previous_radio
-        .as_ref()
-        .and_then(|name| rows.iter().position(|row| &row.interface == name))
-        .unwrap_or_else(|| {
-            app.wifi.actions_open = false;
-            0
-        });
-    app.wifi.rows = rows;
-    app.wifi.selected_radio = app
-        .wifi
-        .selected_radio
-        .min(app.wifi.rows.len().saturating_sub(1));
-    app.wifi.selected = app.wifi.selected.min(app.wifi.cursor_limit());
+    rows.retain(|row| managed.get(&row.interface).copied().unwrap_or(false));
+    app.wifi.replace_rows(rows);
 }
 
 pub(crate) fn build_rows(
@@ -2702,6 +2763,309 @@ fn report_unexpected(app: &mut TuiApp, response: Response) {
 mod tests {
     use super::*;
 
+    async fn mock_api(
+        responses: Vec<Response>,
+    ) -> (
+        tempfile::TempDir,
+        ApiClient,
+        tokio::task::JoinHandle<Vec<String>>,
+    ) {
+        use http_body_util::{BodyExt, Full};
+        use hyper::{body::Bytes, server::conn::http1, service::service_fn};
+        use hyper_util::rt::TokioIo;
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("api.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let paths = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+            for response in responses {
+                let (stream, _) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let body = serde_json::to_vec(&response).unwrap();
+                let paths = paths.clone();
+                http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(stream),
+                        service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                            let paths = paths.clone();
+                            let body = body.clone();
+                            async move {
+                                paths.lock().await.push(format!(
+                                    "{} {}",
+                                    request.method(),
+                                    request.uri().path()
+                                ));
+                                request.into_body().collect().await.unwrap();
+                                Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(
+                                    Bytes::from(body),
+                                )))
+                            }
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let result = paths.lock().await.clone();
+            result
+        });
+        (directory, ApiClient::new(socket), server)
+    }
+
+    fn radio(name: &str) -> WifiRow {
+        WifiRow {
+            interface: name.into(),
+            role: WifiRole::Client,
+            ap: None,
+            client: None,
+        }
+    }
+
+    #[test]
+    fn refresh_preserves_radio_and_action_identity() {
+        let mut app = TuiApp::default();
+        app.wifi.rows = vec![radio("wlan0"), radio("wlan1")];
+        open_radio(&mut app, 1);
+        focus_action(&mut app, 2);
+        app.wifi.replace_rows(vec![radio("wlan1")]);
+        assert_eq!(app.wifi.selected_radio, 0);
+        assert_eq!(app.wifi.selected, 3);
+        assert!(app.wifi.actions_open);
+        let mut changed_role = radio("wlan1");
+        changed_role.role = WifiRole::AccessPoint;
+        app.wifi.replace_rows(vec![changed_role]);
+        assert!(!app.wifi.actions_open);
+        assert_eq!(app.wifi.selected, 0);
+        app.wifi.replace_rows(Vec::new());
+        assert_eq!(app.wifi.selected, 0);
+    }
+
+    #[tokio::test]
+    async fn radio_actions_scroll_and_return_to_the_original_radio() {
+        let client = ApiClient::new("/nonexistent.sock");
+        let mut app = TuiApp {
+            screen: Screen::Wifi,
+            ..Default::default()
+        };
+        app.wifi.rows = (0..20).map(|i| radio(&format!("wlan{i}"))).collect();
+        app.wifi.selected = 19;
+        app.wifi.selected_radio = 19;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 15)).unwrap();
+        terminal
+            .draw(|frame| super::super::render(frame, &mut app, false))
+            .unwrap();
+        assert!(app.ui.list_scroll_offset > 0);
+        let area = app.ui.list_area.unwrap();
+        assert!(area.bottom() <= 11);
+        super::super::handle_key(&mut app, KeyCode::Tab, &client, false).await;
+        assert!(app.wifi.actions_open);
+        handle_wifi_key(&mut app, KeyCode::End, &client).await;
+        terminal
+            .draw(|frame| super::super::render(frame, &mut app, false))
+            .unwrap();
+        for (rect, _) in &app.ui.buttons {
+            assert!(rect.bottom() <= 10);
+        }
+        assert!(app
+            .ui
+            .buttons
+            .iter()
+            .any(|(_, slot)| *slot == actions(WifiRole::Client).len() - 1));
+        handle_wifi_key(&mut app, KeyCode::Esc, &client).await;
+        app.wifi.selected = 2;
+        app.wifi.selected_radio = 2;
+        handle_wifi_key(&mut app, KeyCode::Tab, &client).await;
+        handle_wifi_key(&mut app, KeyCode::Up, &client).await;
+        assert_eq!(app.wifi.selected, 2);
+        assert_eq!(app.wifi.selected_radio, 2);
+    }
+
+    #[tokio::test]
+    async fn connect_navigation_does_not_change_choice_or_submit() {
+        let mut app = TuiApp {
+            screen: Screen::WifiConnectPrompt,
+            wifi_connect: Some(WifiConnectPrompt::new(
+                "wlan0".into(),
+                "home".into(),
+                "Home".into(),
+                None,
+            )),
+            ..Default::default()
+        };
+        let client = ApiClient::new("/nonexistent.sock");
+        handle_wifi_connect_prompt_key(&mut app, KeyCode::Down, &client).await;
+        assert_eq!(
+            app.wifi_connect.as_ref().unwrap().choice,
+            WifiIpChoice::Dhcp
+        );
+        handle_wifi_connect_prompt_key(&mut app, KeyCode::Up, &client).await;
+        handle_wifi_connect_prompt_key(&mut app, KeyCode::Enter, &client).await;
+        assert_eq!(
+            app.wifi_connect.as_ref().unwrap().field,
+            WifiConnectField::Submit
+        );
+        assert!(app.message.is_none());
+        let prompt = app.wifi_connect.as_mut().unwrap();
+        prompt.choice = WifiIpChoice::NewStatic;
+        prompt.current_static_ip = Some("192.168.1.5/24".into());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 15)).unwrap();
+        terminal
+            .draw(|frame| super::super::render(frame, &mut app, false))
+            .unwrap();
+        assert_eq!(app.ui.buttons.len(), 2);
+        for (rect, _) in &app.ui.buttons {
+            assert!(rect.bottom() <= 10);
+        }
+        let (rect, _) = app.ui.buttons[1];
+        super::super::handle_mouse(
+            &mut app,
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: rect.x,
+                row: rect.y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            &client,
+            false,
+        )
+        .await;
+        assert!(app.wifi_connect.is_none());
+    }
+
+    #[tokio::test]
+    async fn dhcp_is_configured_before_profile_activation() {
+        use crate::api::model::{DhcpClientOperationalState, DhcpClientStatusView};
+        let (_directory, client, server) = mock_api(vec![
+            Response::DhcpClientInterface {
+                status: DhcpClientStatusView {
+                    interface: "wlan0".into(),
+                    state: DhcpClientOperationalState::Waiting,
+                    address: None,
+                    prefix_length: None,
+                    server: None,
+                    expires_at_unix: None,
+                    dns_servers: Vec::new(),
+                    degraded_reason: None,
+                    config: Default::default(),
+                },
+            },
+            Response::Error {
+                message: "activation failed".into(),
+            },
+        ])
+        .await;
+        let mut app = TuiApp {
+            screen: Screen::WifiConnectPrompt,
+            wifi_connect: Some(WifiConnectPrompt::new(
+                "wlan0".into(),
+                "home".into(),
+                "Home".into(),
+                None,
+            )),
+            ..Default::default()
+        };
+        submit_wifi_connect(&mut app, &client).await;
+        let paths = server.await.unwrap();
+        assert_eq!(paths[0], "PUT /api/v1/dhcp-client/wlan0");
+        assert!(paths[1].ends_with("/active-profile"));
+        assert!(app.wifi_connect.is_some());
+        assert!(app
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("IP configuration was updated"));
+    }
+
+    #[tokio::test]
+    async fn failed_dhcp_stop_blocks_static_edit_and_activation() {
+        let (_directory, client, server) = mock_api(vec![Response::DhcpClientError {
+            detail: crate::api::model::DhcpClientErrorDetail::OwnershipConflict {
+                message: "not owned".into(),
+            },
+        }])
+        .await;
+        let mut prompt = WifiConnectPrompt::new("wlan0".into(), "home".into(), "Home".into(), None);
+        prompt.choice = WifiIpChoice::NewStatic;
+        prompt.static_cidr = "192.168.1.5/24".into();
+        let mut app = TuiApp {
+            screen: Screen::WifiConnectPrompt,
+            wifi_connect: Some(prompt),
+            ..Default::default()
+        };
+        submit_wifi_connect(&mut app, &client).await;
+        assert_eq!(
+            server.await.unwrap(),
+            vec!["DELETE /api/v1/dhcp-client/wlan0"]
+        );
+        assert_eq!(app.screen, Screen::WifiConnectPrompt);
+        assert!(app.message.as_deref().unwrap().contains("not stopped"));
+    }
+
+    #[tokio::test]
+    async fn static_ip_is_committed_before_profile_activation() {
+        let change = crate::core::transaction::PendingNetworkChange {
+            token: "static-token".into(),
+            interface: "wlan0".into(),
+            rollback_timeout_seconds: 60,
+            expires_at_unix: super::super::current_unix_time() + 60,
+        };
+        let (_directory, client, server) = mock_api(vec![
+            Response::DhcpClientDisabled {
+                interface: "wlan0".into(),
+            },
+            Response::NetworkChangePending {
+                change: change.clone(),
+            },
+            Response::NetworkChangeCommitted { change },
+            Response::Error {
+                message: "activation failed".into(),
+            },
+        ])
+        .await;
+        let mut prompt = WifiConnectPrompt::new("wlan0".into(), "home".into(), "Home".into(), None);
+        prompt.choice = WifiIpChoice::NewStatic;
+        prompt.static_cidr = "192.168.1.5/24".into();
+        let mut app = TuiApp {
+            screen: Screen::WifiConnectPrompt,
+            wifi_connect: Some(prompt),
+            ..Default::default()
+        };
+        submit_wifi_connect(&mut app, &client).await;
+        let paths = server.await.unwrap();
+        assert_eq!(paths.len(), 4);
+        assert_eq!(paths[0], "DELETE /api/v1/dhcp-client/wlan0");
+        assert_eq!(paths[1], "POST /api/v1/interfaces/wlan0/edit/apply");
+        assert_eq!(paths[2], "POST /api/v1/network-transactions/commit");
+        assert!(paths[3].ends_with("/active-profile"));
+        assert!(app.wifi_connect.is_some());
+    }
+
+    #[tokio::test]
+    async fn failed_static_commit_retains_pending_transaction() {
+        let change = crate::core::transaction::PendingNetworkChange {
+            token: "pending-token".into(),
+            interface: "wlan0".into(),
+            rollback_timeout_seconds: 60,
+            expires_at_unix: super::super::current_unix_time() + 60,
+        };
+        let (_directory, client, server) = mock_api(vec![
+            Response::NetworkChangePending { change },
+            Response::Error {
+                message: "commit rejected".into(),
+            },
+        ])
+        .await;
+        let mut app = TuiApp::default();
+        assert!(!apply_wifi_static_ip(&mut app, &client, "wlan0", "192.168.1.5/24").await);
+        assert_eq!(server.await.unwrap().len(), 2);
+        assert_eq!(app.screen, Screen::PendingChange);
+        assert_eq!(app.pending.as_ref().unwrap().token, "pending-token");
+    }
+
     fn scan(
         ssid: &str,
         signal: i32,
@@ -2844,6 +3208,7 @@ mod tests {
             security: WifiClientSecurity::Wpa2,
             country: " pl ".into(),
             priority: "10".into(),
+            autoconnect: false,
             passphrase: String::new(),
             has_passphrase: true,
             cursor: 0,
@@ -2976,6 +3341,7 @@ mod tests {
                         country_code: None,
                         security: WifiClientSecurity::Open,
                         priority: 0,
+                        autoconnect: false,
                         created_at: 0,
                         modified_at: 0,
                         has_passphrase: false,
@@ -3043,6 +3409,7 @@ mod tests {
                     country_code: None,
                     security: WifiClientSecurity::Wpa2,
                     priority: 10,
+                    autoconnect: false,
                     created_at: 0,
                     modified_at: 0,
                     has_passphrase: true,
@@ -3253,6 +3620,7 @@ mod tests {
             security: WifiClientSecurity::Wpa2,
             country: String::new(),
             priority: "0".into(),
+            autoconnect: false,
             passphrase: String::new(),
             has_passphrase: false,
             cursor: 6,
@@ -3339,13 +3707,13 @@ mod tests {
         handle_wifi_connect_prompt_key(&mut app, KeyCode::Down, &client).await;
         let p = app.wifi_connect.as_ref().unwrap();
         assert_eq!(p.field, WifiConnectField::Choice(WifiIpChoice::KeepStatic));
-        assert_eq!(p.choice, WifiIpChoice::KeepStatic);
+        assert_eq!(p.choice, WifiIpChoice::Dhcp);
 
         // Move down to NewStatic
         handle_wifi_connect_prompt_key(&mut app, KeyCode::Down, &client).await;
         let p = app.wifi_connect.as_ref().unwrap();
         assert_eq!(p.field, WifiConnectField::Choice(WifiIpChoice::NewStatic));
-        assert_eq!(p.choice, WifiIpChoice::NewStatic);
+        assert_eq!(p.choice, WifiIpChoice::Dhcp);
 
         // Enter on NewStatic focuses StaticCidr
         handle_wifi_connect_prompt_key(&mut app, KeyCode::Enter, &client).await;
@@ -3415,6 +3783,7 @@ mod tests {
                     country_code: None,
                     security: WifiClientSecurity::Open,
                     priority: 0,
+                    autoconnect: false,
                     created_at: 0,
                     modified_at: 0,
                     has_passphrase: false,
@@ -3503,4 +3872,3 @@ mod tests {
         assert!(content.contains("sudo sv down iwd"));
     }
 }
-

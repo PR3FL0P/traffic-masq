@@ -128,9 +128,11 @@ address and a DHCP pool to a wireless interface alone does not create an AP.
 | **Settings** | Application and session preferences |
 
 In the Router tab, **1 / 2 / 3** selects Routes, Internet sharing or Topology.
-Use the arrow keys to select items, Tab to move between lists and actions,
-and Enter to activate an action. Esc leaves an editor; F1 opens the full
-operation message. Topology shows configuration and observed routes, not a
+Use arrows to select items and Tab/Shift+Tab to move focus forward/backward
+between fields, lists and actions. Enter activates the focused control; Esc
+returns to the list or leaves the editor. F2/F3 selects the previous/next main
+tab; Left/Right also switches tabs when no field or action uses those arrows.
+F1 opens the full operation message; Ctrl+C exits (an in-flight action finishes first). Topology shows configuration and observed routes, not a
 connectivity test.
 
 ### Applying and confirming changes

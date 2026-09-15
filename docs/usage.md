@@ -244,15 +244,17 @@ configured idle/absolute limits can require a password sooner.
 ### Navigation
 
 The TUI keeps operation messages visible; press F1 to read a full message and
-use Up/Down to scroll it. Finish a form or leave it with Esc before changing
+use Up/Down to scroll it. Tab/Shift+Tab moves focus forward/backward;
+F2/F3 selects the previous/next main tab. Ctrl+C exits after any in-flight
+action completes. Finish a form or leave it with Esc before changing
 tabs. Long Wi-Fi lists scroll with the selection; deleting a profile requires
 an explicit Y confirmation naming the profile.
 
 ### Routes and Internet sharing
 
-In **Router**, Down after the last route moves into **Actions**; Up/Down or
-Left/Right selects an action, and Enter or Space activates it. Up from the first
-action returns to the route list. Tab switches between routes and actions.
+In **Router**, Tab/Shift+Tab switches between routes and **Actions**. Up/Down
+or Left/Right selects an action, and Enter or Space activates it. Esc returns
+to the route list. Scrolling the route list keeps focus in the list.
 Buttons wrap to fit the terminal. For a route outside the static route editor,
 **Delete manually** (or Del on the selected route) displays an `ip -4 route del`
 command to run on the daemon's machine. The TUI never executes that command or
@@ -335,6 +337,17 @@ after the result. A timeout does not prove that a change failed: inspect the
 current state before retrying. An expired session offers login again without
 discarding drafts or extending rollback deadlines. Windows smaller than 60×15
 disable hidden controls; Q still exits.
+
+### Wi-Fi client connections
+
+Tab switches between wireless interfaces and their actions; Esc returns to the
+same interface. Lists and connection forms scroll to keep the selection visible.
+In the connection form, arrows move focus and Enter/Space selects an IP option.
+Use **Connect** or F10 to submit. IP configuration is applied before profile
+activation; activation alone does not confirm association or an assigned address.
+If activation fails after IP configuration, inspect the reported interface state
+before retrying. **Keep current static IP** uses the configured address, never a
+currently observed DHCP lease.
 
 ### Wi-Fi access points
 

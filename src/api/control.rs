@@ -3,6 +3,7 @@ mod dispatch;
 mod router;
 mod vpn;
 mod wifi;
+mod wifi_autoconnect;
 mod wifi_client;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -104,6 +105,7 @@ pub struct ControlService {
     wifi_client_profiles: WifiClientProfileStore,
 
     wifi_client_mutations: Arc<Mutex<()>>,
+    wifi_autoconnect: Arc<Mutex<wifi_autoconnect::AutoconnectState>>,
 }
 
 impl ControlService {
@@ -168,6 +170,7 @@ impl ControlService {
             wifi_client: None,
             wifi_client_profiles,
             wifi_client_mutations: Arc::new(Mutex::new(())),
+            wifi_autoconnect: Default::default(),
         }
     }
 
@@ -787,6 +790,7 @@ fn wifi_client_profile_input(request: WifiClientProfileWriteRequest) -> WifiClie
         country_code: request.country_code,
         security: request.security,
         priority: request.priority,
+        autoconnect: request.autoconnect,
     }
 }
 
@@ -4341,6 +4345,7 @@ mod tests {
                     country_code: Some("PL".to_string()),
                     security: WifiClientSecurity::Open,
                     priority: 10,
+                    autoconnect: false,
                     passphrase: None,
                     clear_passphrase: false,
                 },

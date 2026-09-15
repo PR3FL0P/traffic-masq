@@ -12,12 +12,7 @@ fn validate_wifi_client_interface(interface: &str, config: &InterfaceConfig) -> 
             config.role
         ));
     }
-    if !config
-        .dhcp_client
-        .as_ref()
-        .is_some_and(|c| c.enabled)
-        && config.ipv4.is_none()
-    {
+    if !config.dhcp_client.as_ref().is_some_and(|c| c.enabled) && config.ipv4.is_none() {
         return Err(format!(
             "a Wi-Fi client on '{interface}' requires an IP address: enable DHCP client (dhcp_client) or configure a static IPv4 address"
         ));
@@ -146,6 +141,7 @@ impl ControlService {
             return wifi_client_disabled();
         };
         let _mutation = self.wifi_client_mutations.lock().await;
+        self.wifi_autoconnect.lock().await.suspend(&interface);
         let _dhcp_mutation = if self.dhcp_client.is_some() {
             Some(self.dhcp_client_mutations.lock().await)
         } else {
@@ -426,10 +422,20 @@ impl ControlService {
         interface: String,
         profile_id: String,
     ) -> Response {
+        let _mutation = self.wifi_client_mutations.lock().await;
+        self.wifi_autoconnect.lock().await.resume(&interface);
+        self.activate_wifi_client_profile_locked(interface, profile_id)
+            .await
+    }
+
+    pub(super) async fn activate_wifi_client_profile_locked(
+        &self,
+        interface: String,
+        profile_id: String,
+    ) -> Response {
         let Some(wifi_client) = &self.wifi_client else {
             return wifi_client_profile_error(WifiClientProfileErrorDetail::WifiClientDisabled);
         };
-        let _mutation = self.wifi_client_mutations.lock().await;
         let profile = match self.wifi_client_profiles.get(&profile_id) {
             Ok(profile) => profile,
             Err(error) => return classify_wifi_client_profile_error(error),
@@ -573,6 +579,8 @@ impl ControlService {
         let Some(wifi_client) = &self.wifi_client else {
             return wifi_client_disabled();
         };
+        let _mutation = self.wifi_client_mutations.lock().await;
+        self.wifi_autoconnect.lock().await.resume(&interface);
         if let Err(error) = wifi_client.reconnect(&interface).await {
             return classify_wifi_client_error(error);
         }

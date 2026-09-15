@@ -6,8 +6,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, MouseButton, MouseEvent,
-    MouseEventKind,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -198,8 +198,19 @@ fn adjacent_section(current: Section, forward: bool, show_dhcp_client: bool) -> 
     sections[next_index]
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ViewIdentity {
+    screen: Screen,
+    message_open: bool,
+    router_pane: router::RouterPane,
+    topology_open: bool,
+    wifi_actions_open: bool,
+    wifi_profiles_mode: Option<wifi::WifiProfilesMode>,
+}
+
 struct TuiApp {
     screen: Screen,
+    last_drawn_view: Option<ViewIdentity>,
     dashboard: DashboardData,
     selected_interface: usize,
 
@@ -244,6 +255,7 @@ impl Default for TuiApp {
     fn default() -> Self {
         Self {
             screen: Screen::Dashboard,
+            last_drawn_view: None,
             dashboard: DashboardData::default(),
             selected_interface: 0,
             dashboard_focus: dashboard::DashboardFocus::default(),
@@ -462,6 +474,7 @@ async fn run_loop(
             {
                 break;
             }
+            app.last_drawn_view = None;
             has_authenticated = true;
             last_refresh = None;
             match session::remember(client).await {
@@ -485,10 +498,7 @@ async fn run_loop(
         let should_refresh = last_refresh.is_none_or(|t| t.elapsed() >= refresh_interval);
 
         if should_refresh {
-            let snapshot = terminal
-                .draw(|frame| render(frame, &mut app, direct))?
-                .buffer
-                .clone();
+            let snapshot = draw_app(terminal, &mut app, direct)?.buffer.clone();
             let deadline = pending_deadline(&app);
             let refresh = async {
                 app.dashboard = if direct {
@@ -530,7 +540,7 @@ async fn run_loop(
                 queued_input = interrupted;
             } else {
                 last_refresh = Some(Instant::now());
-                terminal.draw(|frame| render(frame, &mut app, direct))?;
+                draw_app(terminal, &mut app, direct)?;
             }
         }
 
@@ -551,15 +561,12 @@ async fn run_loop(
             None
         };
         if let Some(input) = input {
-            let snapshot = terminal
-                .draw(|frame| render(frame, &mut app, direct))?
-                .buffer
-                .clone();
+            let snapshot = draw_app(terminal, &mut app, direct)?.buffer.clone();
             let deadline = pending_deadline(&app);
             let action = async {
                 match input {
                     Event::Key(key) if key.kind == event::KeyEventKind::Press => {
-                        handle_key(&mut app, key.code, client, direct).await;
+                        handle_key_event(&mut app, key, client, direct).await;
                     }
                     Event::Mouse(mouse) => {
                         handle_mouse(&mut app, mouse, client, direct).await;
@@ -573,7 +580,7 @@ async fn run_loop(
             {
                 app.should_quit = true;
             }
-            terminal.draw(|frame| render(frame, &mut app, direct))?;
+            draw_app(terminal, &mut app, direct)?;
         }
 
         if terminal::size().is_err() {
@@ -628,7 +635,7 @@ async fn drive_ui(
                     if matches!(input, Event::Key(k) if k.kind != event::KeyEventKind::Press) { continue; }
                     if matches!(input, Event::Mouse(m) if matches!(m.kind, MouseEventKind::Moved)) { continue; }
                     if cancellable { return Ok(Some(input)); }
-                    if matches!(input, Event::Key(k) if k.code == KeyCode::Char('q')) { exit_requested = Some(input); }
+                    if matches!(input, Event::Key(k) if is_quit_key(k)) { exit_requested = Some(input); }
                 }
             }
         }
@@ -694,6 +701,7 @@ async fn reauthenticate(
     deadline: Option<u64>,
     initial: bool,
 ) -> Result<bool> {
+    terminal.clear()?;
     let mut password = zeroize::Zeroizing::new(String::new());
     let mut cursor = 0;
     let mut message = if initial {
@@ -727,6 +735,15 @@ async fn reauthenticate(
         if event::poll(Duration::ZERO)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != event::KeyEventKind::Press {
+                    continue;
+                }
+                if is_quit_key(key) {
+                    return Ok(false);
+                }
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+                {
                     continue;
                 }
                 match key.code {
@@ -1051,8 +1068,56 @@ pub(crate) fn format_message_lines(text: &str) -> Vec<Line<'_>> {
         .collect()
 }
 
+/// Invalidate both the physical screen and ratatui's diff buffer once per view
+/// transition. Ordinary updates retain incremental rendering.
+fn draw_app<'a, B: ratatui::backend::Backend>(
+    terminal: &'a mut Terminal<B>,
+    app: &mut TuiApp,
+    direct: bool,
+) -> io::Result<ratatui::CompletedFrame<'a>> {
+    let view = ViewIdentity {
+        screen: app.screen,
+        message_open: app.message_open,
+        router_pane: app.router.pane,
+        topology_open: app.router.topology.open,
+        wifi_actions_open: app.wifi.actions_open,
+        wifi_profiles_mode: app.wifi_profiles.as_ref().map(|view| view.mode),
+    };
+    if app.last_drawn_view != Some(view) {
+        terminal.clear()?;
+    }
+    let frame = terminal.draw(|frame| render(frame, app, direct))?;
+    app.last_drawn_view = Some(view);
+    Ok(frame)
+}
+
+fn is_quit_key(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+async fn handle_key_event(app: &mut TuiApp, key: KeyEvent, client: &ApiClient, direct: bool) {
+    if is_quit_key(key) {
+        app.should_quit = true;
+        return;
+    }
+    // Modified letters must never be inserted into a text field as plain text.
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+    {
+        return;
+    }
+    let code = if key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT) {
+        KeyCode::BackTab
+    } else {
+        key.code
+    };
+    handle_key(app, code, client, direct).await;
+}
+
 fn render(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp, direct: bool) {
     let area = frame.area();
+    frame.render_widget(ratatui::widgets::Clear, area);
     app.ui = UiLayout::default();
     if area.width < MIN_TERMINAL_WIDTH || area.height < MIN_TERMINAL_HEIGHT {
         frame.render_widget(
@@ -1139,6 +1204,15 @@ fn focus_action_slot(app: &mut TuiApp, slot: usize) {
         Screen::Vpn => vpn::focus_action(app, slot),
         Screen::VpnPolicy => vpn_policy::focus_action(app, slot),
         Screen::Wifi => wifi::focus_action(app, slot),
+        Screen::WifiConnectPrompt => {
+            if let Some(prompt) = app.wifi_connect.as_mut() {
+                prompt.field = if slot == 0 {
+                    wifi::WifiConnectField::Submit
+                } else {
+                    wifi::WifiConnectField::Cancel
+                };
+            }
+        }
         Screen::Settings => settings::focus_action(app, slot),
         Screen::Log => logs::focus_action(app, slot),
         _ => {}
@@ -1167,6 +1241,33 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
         return;
     }
 
+    if matches!(key, KeyCode::F(2) | KeyCode::F(3)) {
+        let target = adjacent_section(
+            section_of(app.screen),
+            key == KeyCode::F(3),
+            app.show_dhcp_client,
+        );
+        navigate_to_section(app, target, client, direct).await;
+        return;
+    }
+
+    // Forms and simple lists share forward/backward focus navigation. Screens
+    // with separate panes handle Tab themselves so it skips the whole list.
+    let key = match (app.screen, key) {
+        (
+            Screen::Dashboard
+            | Screen::Vpn
+            | Screen::Log
+            | Screen::Router
+            | Screen::Forwarding
+            | Screen::Wifi,
+            _,
+        ) => key,
+        (_, KeyCode::Tab) => KeyCode::Down,
+        (_, KeyCode::BackTab) => KeyCode::Up,
+        _ => key,
+    };
+
     if matches!(
         app.screen,
         Screen::Dashboard
@@ -1179,38 +1280,28 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
             | Screen::Settings
             | Screen::Log
     ) {
-        match key {
-            KeyCode::Left => {
-                let is_editing_settings_text = app.screen == Screen::Settings
-                    && app.settings.as_ref().is_some_and(|s| s.is_editing());
-                let is_router_actions_focused = app.screen == Screen::Router
-                    && (app.router.focus == RouterFocus::Actions
-                        || (app.router.pane == router::RouterPane::Sharing
-                            && app.router.sharing_actions_focused)
-                        || app.router.topology.open);
-                if !is_editing_settings_text && !is_router_actions_focused {
-                    let target =
-                        adjacent_section(section_of(app.screen), false, app.show_dhcp_client);
-                    navigate_to_section(app, target, client, direct).await;
-                    return;
-                }
+        let horizontal_focus = match app.screen {
+            Screen::Settings => app.settings.as_ref().is_some_and(|s| s.is_editing()),
+            Screen::Dashboard => app.dashboard_focus != dashboard::DashboardFocus::List,
+            Screen::Vpn => app.vpn.focus != vpn::VpnFocus::List,
+            Screen::Log => app.logs_focus != logs::LogFocus::Scroll,
+            Screen::Wifi => app.wifi.actions_open,
+            Screen::Router => {
+                app.router.focus == RouterFocus::Actions
+                    || (app.router.pane == router::RouterPane::Sharing
+                        && app.router.sharing_actions_focused)
+                    || app.router.topology.open
             }
-            KeyCode::Right => {
-                let is_editing_settings_text = app.screen == Screen::Settings
-                    && app.settings.as_ref().is_some_and(|s| s.is_editing());
-                let is_router_actions_focused = app.screen == Screen::Router
-                    && (app.router.focus == RouterFocus::Actions
-                        || (app.router.pane == router::RouterPane::Sharing
-                            && app.router.sharing_actions_focused)
-                        || app.router.topology.open);
-                if !is_editing_settings_text && !is_router_actions_focused {
-                    let target =
-                        adjacent_section(section_of(app.screen), true, app.show_dhcp_client);
-                    navigate_to_section(app, target, client, direct).await;
-                    return;
-                }
-            }
-            _ => {}
+            _ => false,
+        };
+        if !horizontal_focus && matches!(key, KeyCode::Left | KeyCode::Right) {
+            let target = adjacent_section(
+                section_of(app.screen),
+                key == KeyCode::Right,
+                app.show_dhcp_client,
+            );
+            navigate_to_section(app, target, client, direct).await;
+            return;
         }
     }
 
@@ -1619,6 +1710,102 @@ mod tests {
             .collect();
         assert!(text.contains("Scan networks"));
         assert!(!text.contains("Configure access point"));
+    }
+
+    #[test]
+    fn switching_views_clears_physical_artifacts_once() {
+        use ratatui::backend::Backend;
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let mut app = TuiApp::default();
+        draw_app(&mut terminal, &mut app, false).unwrap();
+        // Simulate terminal content unknown to ratatui's previous-frame buffer.
+        let mut artifact = ratatui::buffer::Cell::default();
+        artifact.set_symbol("X");
+        terminal
+            .backend_mut()
+            .draw([(40, 10, &artifact)].into_iter())
+            .unwrap();
+        draw_app(&mut terminal, &mut app, false).unwrap();
+        assert_eq!(terminal.backend().buffer()[(40, 10)].symbol(), "X");
+        app.screen = Screen::Settings;
+        draw_app(&mut terminal, &mut app, false).unwrap();
+        let mut clean = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        clean.draw(|frame| render(frame, &mut app, false)).unwrap();
+        assert_eq!(terminal.backend().buffer(), clean.backend().buffer());
+        terminal
+            .backend_mut()
+            .draw([(40, 10, &artifact)].into_iter())
+            .unwrap();
+        app.message_open = true;
+        draw_app(&mut terminal, &mut app, false).unwrap();
+        assert_ne!(terminal.backend().buffer()[(40, 10)].symbol(), "X");
+    }
+
+    #[tokio::test]
+    async fn tab_focus_and_modified_keys_are_consistent() {
+        let client = ApiClient::new("/nonexistent.sock");
+        let mut app = TuiApp::default();
+        app.ui.input_enabled = true;
+        handle_key(&mut app, KeyCode::Tab, &client, false).await;
+        assert_eq!(app.dashboard_focus, dashboard::DashboardFocus::Interfaces);
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT),
+            &client,
+            false,
+        )
+        .await;
+        assert_eq!(app.dashboard_focus, dashboard::DashboardFocus::List);
+        app.screen = Screen::Vpn;
+        handle_key(&mut app, KeyCode::Tab, &client, false).await;
+        assert_eq!(app.vpn.focus, vpn::VpnFocus::Connect);
+        handle_key(&mut app, KeyCode::Right, &client, false).await;
+        assert_eq!(app.screen, Screen::Vpn);
+        assert_eq!(app.vpn.focus, vpn::VpnFocus::Disconnect);
+        handle_key(&mut app, KeyCode::Left, &client, false).await;
+        handle_key(&mut app, KeyCode::BackTab, &client, false).await;
+        assert_eq!(app.vpn.focus, vpn::VpnFocus::List);
+        app.screen = Screen::Log;
+        handle_key(&mut app, KeyCode::Tab, &client, false).await;
+        assert_eq!(app.logs_focus, logs::LogFocus::Export);
+        handle_key(&mut app, KeyCode::BackTab, &client, false).await;
+        assert_eq!(app.logs_focus, logs::LogFocus::Scroll);
+
+        app.screen = Screen::VpnImport;
+        app.vpn_import = Some(VpnImportEditor {
+            field: vpn::VpnImportField::Name,
+            name: String::new(),
+            path: String::new(),
+            cursor: 0,
+        });
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            &client,
+            false,
+        )
+        .await;
+        assert!(app.vpn_import.as_ref().unwrap().name.is_empty());
+        handle_key(&mut app, KeyCode::Tab, &client, false).await;
+        assert_eq!(
+            app.vpn_import.as_ref().unwrap().field,
+            vpn::VpnImportField::Path
+        );
+        handle_key(&mut app, KeyCode::BackTab, &client, false).await;
+        assert_eq!(
+            app.vpn_import.as_ref().unwrap().field,
+            vpn::VpnImportField::Name
+        );
+        handle_key(&mut app, KeyCode::F(3), &client, false).await;
+        assert_eq!(app.screen, Screen::VpnImport);
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &client,
+            false,
+        )
+        .await;
+        assert!(app.should_quit);
     }
 
     #[test]

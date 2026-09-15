@@ -293,7 +293,36 @@ pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
 }
 
 pub(crate) async fn handle_vpn_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
+    let key = match key {
+        KeyCode::Left if app.vpn.focus != VpnFocus::List => KeyCode::Up,
+        KeyCode::Right if app.vpn.focus != VpnFocus::List => KeyCode::Down,
+        _ => key,
+    };
     match key {
+        KeyCode::Tab | KeyCode::BackTab => {
+            let fields = [
+                VpnFocus::List,
+                VpnFocus::Connect,
+                VpnFocus::Disconnect,
+                VpnFocus::Import,
+                VpnFocus::Delete,
+                VpnFocus::Policy,
+                VpnFocus::Refresh,
+            ];
+            let index = fields
+                .iter()
+                .position(|field| *field == app.vpn.focus)
+                .unwrap_or(0);
+            let step = if key == KeyCode::Tab {
+                1
+            } else {
+                fields.len() - 1
+            };
+            app.vpn.focus = fields[(index + step) % fields.len()];
+        }
+        KeyCode::Esc if app.vpn.focus != VpnFocus::List => {
+            app.vpn.focus = VpnFocus::List;
+        }
         KeyCode::Esc => app.screen = Screen::Dashboard,
         KeyCode::Up => match app.vpn.focus {
             VpnFocus::List => {
@@ -356,7 +385,7 @@ pub(crate) async fn handle_vpn_import_key(app: &mut TuiApp, key: KeyCode, client
             app.vpn_import = None;
             app.screen = Screen::Vpn;
         }
-        KeyCode::Up | KeyCode::Down | KeyCode::Tab => {
+        KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab => {
             editor.field = toggle_vpn_import_field(editor.field);
             editor.reset_cursor();
         }

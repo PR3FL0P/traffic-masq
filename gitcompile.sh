@@ -61,7 +61,7 @@ USE_CACHE=true
 
 # CLI usage documentation
 usage() {
-  echo "Usage: $0 [options] [commit_message]"
+  echo "Usage: $0 [options] [debug|release] [commit_message]"
   echo ""
   echo "Options:"
   echo "  -n, --no-commit           Compile current working tree (including dirty/uncommitted files)"
@@ -133,6 +133,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     -h|--help)
       usage
+      ;;
+    debug|release)
+      BUILD_PROFILE="$1"
+      shift
       ;;
     *)
       if [ -z "$COMMIT_MSG" ]; then

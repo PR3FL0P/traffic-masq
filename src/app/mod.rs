@@ -846,6 +846,28 @@ async fn check_process_liveness<D, W, C, L>(
 ///
 /// Kept at its previous cadence so restart latency does not change; it no
 /// longer delays network convergence, which is what the interval used to gate.
+fn spawn_wifi_autoconnect(
+    control: ControlService,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = time::interval(Duration::from_secs(15));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => break,
+                _ = interval.tick() => {
+                    if *shutdown.borrow() { break; }
+                    if let Err(error) = control.autoconnect_wifi_once().await {
+                        tracing::warn!(%error, "Wi-Fi autoconnect pass failed");
+                    }
+                }
+            }
+        }
+    })
+}
+
 fn spawn_process_liveness_checks(
     dhcp: DhcpSupervisor,
     wifi: Option<HostapdSupervisor>,
@@ -1322,6 +1344,7 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     let transactions = control.transactions();
     let socket_path = bindings.socket_path().to_path_buf();
     let session_reaper = spawn_session_reaper(auth.clone(), shutdown.clone());
+    let autoconnect_control = control.clone();
     let server = bindings.into_server(control, auth);
 
     tracing::info!(
@@ -1383,7 +1406,12 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         shutdown.clone(),
     );
 
+    let (autoconnect_stop, autoconnect_shutdown) = tokio::sync::watch::channel(false);
+    let autoconnect_task = spawn_wifi_autoconnect(autoconnect_control, autoconnect_shutdown);
     let api_result = server.run(shutdown.clone()).await;
+    let _ = autoconnect_stop.send(true);
+    // Finish any in-flight scan/activation before rolling back and stopping runtimes.
+    let _ = autoconnect_task.await;
 
     // Before the converger is stopped, not after: an unconfirmed change is
     // abandoned by dropping it from the desired state, and only the converger

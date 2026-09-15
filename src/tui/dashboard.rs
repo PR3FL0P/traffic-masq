@@ -58,7 +58,32 @@ pub(crate) async fn handle_dashboard_key(
     _client: &ApiClient,
     direct: bool,
 ) {
+    let key = match key {
+        KeyCode::Left if app.dashboard_focus != DashboardFocus::List => KeyCode::Up,
+        KeyCode::Right if app.dashboard_focus != DashboardFocus::List => KeyCode::Down,
+        _ => key,
+    };
     match key {
+        KeyCode::Tab | KeyCode::BackTab => {
+            let fields = [
+                DashboardFocus::List,
+                DashboardFocus::Interfaces,
+                DashboardFocus::PendingChanges,
+            ];
+            let index = fields
+                .iter()
+                .position(|field| *field == app.dashboard_focus)
+                .unwrap_or(0);
+            let step = if key == KeyCode::Tab {
+                1
+            } else {
+                fields.len() - 1
+            };
+            app.dashboard_focus = fields[(index + step) % fields.len()];
+        }
+        KeyCode::Esc if app.dashboard_focus != DashboardFocus::List => {
+            app.dashboard_focus = DashboardFocus::List;
+        }
         KeyCode::Esc => app.should_quit = true,
         KeyCode::Up => match app.dashboard_focus {
             DashboardFocus::List => {

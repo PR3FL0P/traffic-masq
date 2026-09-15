@@ -49,6 +49,7 @@ pub struct WifiClientProfileInput {
     pub country_code: Option<String>,
     pub security: WifiClientSecurity,
     pub priority: i32,
+    pub autoconnect: bool,
 }
 
 impl WifiClientProfileInput {
@@ -76,6 +77,8 @@ pub struct WifiClientProfileMetadata {
     pub country_code: Option<String>,
     pub security: WifiClientSecurity,
     pub priority: i32,
+    #[serde(default)]
+    pub autoconnect: bool,
     pub created_at: i64,
     pub modified_at: i64,
 }
@@ -87,6 +90,8 @@ pub struct WifiClientProfileSummary {
     pub country_code: Option<String>,
     pub security: WifiClientSecurity,
     pub priority: i32,
+    #[serde(default)]
+    pub autoconnect: bool,
     pub created_at: i64,
     pub modified_at: i64,
     pub has_passphrase: bool,
@@ -190,6 +195,7 @@ impl WifiClientProfileStore {
             country_code: input.country_code,
             security: input.security,
             priority: input.priority,
+            autoconnect: input.autoconnect,
             created_at: now,
             modified_at: now,
         };
@@ -239,6 +245,7 @@ impl WifiClientProfileStore {
             country_code: input.country_code,
             security: input.security,
             priority: input.priority,
+            autoconnect: input.autoconnect,
             created_at: old.created_at,
             modified_at: unix_timestamp()?,
         };
@@ -269,6 +276,7 @@ impl WifiClientProfileStore {
             country_code: metadata.country_code,
             security: metadata.security,
             priority: metadata.priority,
+            autoconnect: metadata.autoconnect,
             created_at: metadata.created_at,
             modified_at: metadata.modified_at,
             has_passphrase,
@@ -476,6 +484,7 @@ mod tests {
             country_code: Some("PL".to_string()),
             security: WifiClientSecurity::Wpa2,
             priority: 10,
+            autoconnect: false,
         }
     }
 
