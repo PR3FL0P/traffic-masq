@@ -51,20 +51,31 @@ BUILD_PROFILE="release"
 COMMIT_MSG=""
 DOWNLOAD_ONLY=false
 AUTO_COMMIT=false
+RUN_TESTS=false
+TESTS_ONLY=false
+TEST_FILTER=""
+USE_CACHE=true
 
 # CLI usage documentation
 usage() {
   echo "Usage: $0 [options] [commit_message]"
   echo ""
   echo "Options:"
-  echo "  -m, --message <text>    Commit uncommitted changes with message before triggering build"
-  echo "  -o, --dir <path>        Output directory for binaries (default: ./binaries)"
-  echo "  -p, --profile <profile> Cargo profile: release (default) or debug"
-  echo "  -d, --download-only     Download artifacts from the last successful build without compiling"
-  echo "  -h, --help              Show this help message"
+  echo "  -m, --message <text>      Commit uncommitted changes with message before triggering build"
+  echo "  -o, --dir <path>          Output directory for binaries (default: ./binaries)"
+  echo "  -p, --profile <profile>   Cargo profile: release (default) or debug"
+  echo "  -t, --test, --tests       Run test suite on GitHub Actions before building"
+  echo "      --test-filter <str>   Run only tests matching pattern (e.g. wifi, config, implies -t)"
+  echo "      --test-only           Run tests on GitHub Actions without packaging/downloading binaries"
+  echo "      --no-cache            Disable compilation cache on remote runner"
+  echo "  -d, --download-only       Download artifacts from the last successful build without compiling"
+  echo "  -h, --help                Show this help message"
   echo ""
   echo "Examples:"
-  echo "  $0                                   # Compile current state of active branch"
+  echo "  $0                                   # Compile with cache on active branch"
+  echo "  $0 -t                                # Run tests on CI, then build binaries"
+  echo "  $0 -t --test-filter wifi             # Run wifi tests, then build binaries"
+  echo "  $0 --test-only                       # Run tests only on CI"
   echo "  $0 \"fix: update configuration\"       # Commit, push, and trigger build"
   echo "  $0 -d                                # Quickly download prebuilt binaries"
   echo "  $0 -o ./my-binaries                  # Save binaries to custom path"
@@ -86,6 +97,24 @@ while [[ $# -gt 0 ]]; do
     -p|--profile)
       BUILD_PROFILE="$2"
       shift 2
+      ;;
+    -t|--test|--tests)
+      RUN_TESTS=true
+      shift
+      ;;
+    --test-filter)
+      TEST_FILTER="$2"
+      RUN_TESTS=true
+      shift 2
+      ;;
+    --test-only|--tests-only)
+      RUN_TESTS=true
+      TESTS_ONLY=true
+      shift
+      ;;
+    --no-cache)
+      USE_CACHE=false
+      shift
       ;;
     -d|--download-only)
       DOWNLOAD_ONLY=true
@@ -241,10 +270,32 @@ git push origin "$BRANCH"
 PREV_RUN_ID=$(gh run list --workflow="$WORKFLOW_FILE" --limit 1 --json databaseId -q '.[0].databaseId' 2>/dev/null || true)
 
 # Trigger remote workflow on GitHub Actions (with retry in case GitHub is indexing a newly pushed workflow)
-log_info "Triggering remote compilation ($BUILD_PROFILE) on GitHub Actions..."
+if [ "$TESTS_ONLY" = true ]; then
+  log_info "Triggering remote test suite on GitHub Actions..."
+else
+  log_info "Triggering remote compilation ($BUILD_PROFILE) on GitHub Actions..."
+fi
+if [ "$RUN_TESTS" = true ]; then
+  if [ -n "$TEST_FILTER" ]; then
+    log_info "Remote tests: enabled (filter: '$TEST_FILTER')"
+  else
+    log_info "Remote tests: enabled (full suite)"
+  fi
+fi
+if [ "$USE_CACHE" = true ]; then
+  log_info "Remote compilation cache: enabled (Swatinem/rust-cache)"
+else
+  log_warn "Remote compilation cache: disabled (--no-cache)"
+fi
+
 TRIGGERED=false
 for attempt in {1..10}; do
-  if gh workflow run "$WORKFLOW_FILE" --ref "$BRANCH" -f profile="$BUILD_PROFILE" 2>/dev/null; then
+  if gh workflow run "$WORKFLOW_FILE" --ref "$BRANCH" \
+      -f profile="$BUILD_PROFILE" \
+      -f run_tests="$RUN_TESTS" \
+      -f tests_only="$TESTS_ONLY" \
+      -f test_filter="$TEST_FILTER" \
+      -f cache="$USE_CACHE" 2>/dev/null; then
     TRIGGERED=true
     break
   fi
@@ -292,6 +343,18 @@ if ! gh run watch "$RUN_ID" --exit-status; then
     echo "Or visit: $RUN_URL"
   fi
   exit 1
+fi
+
+if [ "$TESTS_ONLY" = true ]; then
+  echo ""
+  echo -e "${COLOR_GREEN}${COLOR_BOLD}================================================================${COLOR_RESET}"
+  echo -e "${COLOR_GREEN}${COLOR_BOLD}  Remote tests passed successfully on GitHub Actions!${COLOR_RESET}"
+  if [ -n "$TEST_FILTER" ]; then
+    echo -e "  Filter: ${COLOR_BOLD}$TEST_FILTER${COLOR_RESET}"
+  fi
+  echo -e "${COLOR_GREEN}${COLOR_BOLD}================================================================${COLOR_RESET}"
+  echo ""
+  exit 0
 fi
 
 # Download compiled binaries
