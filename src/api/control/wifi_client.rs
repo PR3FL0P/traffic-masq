@@ -66,13 +66,43 @@ impl ControlService {
             return wifi_client_error(WifiClientErrorDetail::InterfaceNotFound);
         };
 
+        if !interface_config.managed {
+            return wifi_client_error(WifiClientErrorDetail::InvalidSpec {
+                message: format!(
+                    "interface '{interface}' is unmanaged; traffic-masq does not modify unmanaged interfaces. Enable 'managed' first."
+                ),
+            });
+        }
+        if interface_config.role != InterfaceRole::Input {
+            return wifi_client_error(WifiClientErrorDetail::InvalidSpec {
+                message: format!(
+                    "a Wi-Fi client requires an input interface, but '{interface}' has role '{:?}'",
+                    interface_config.role
+                ),
+            });
+        }
+        if !interface_config
+            .dhcp_client
+            .as_ref()
+            .is_some_and(|c| c.enabled)
+            && interface_config.ipv4.is_none()
+        {
+            return wifi_client_error(WifiClientErrorDetail::InvalidSpec {
+                message: format!(
+                    "a Wi-Fi client on '{interface}' requires an IP address: enable DHCP client (dhcp_client) or configure a static IPv4 address"
+                ),
+            });
+        }
+
         interface_config.wifi_client = Some(wifi_client_edit_request_to_config(settings));
 
         let spec = match WifiClientSpec::from_interface_config(&interface, &interface_config) {
             Ok(Some(spec)) => spec,
             Ok(None) => {
                 return wifi_client_error(WifiClientErrorDetail::InvalidSpec {
-                    message: "a Wi-Fi client requires an unmanaged input interface".to_string(),
+                    message: format!(
+                        "a Wi-Fi client requires a managed input interface on '{interface}'"
+                    ),
                 })
             }
             Err(error) => {
@@ -413,6 +443,35 @@ impl ControlService {
         else {
             return wifi_client_profile_error(WifiClientProfileErrorDetail::InterfaceNotFound);
         };
+
+        if !interface_config.managed {
+            return wifi_client_profile_error(WifiClientProfileErrorDetail::InvalidProfile {
+                message: format!(
+                    "interface '{interface}' is unmanaged; traffic-masq does not modify unmanaged interfaces. Enable 'managed' first."
+                ),
+            });
+        }
+        if interface_config.role != InterfaceRole::Input {
+            return wifi_client_profile_error(WifiClientProfileErrorDetail::InvalidProfile {
+                message: format!(
+                    "a Wi-Fi client requires an input interface, but '{interface}' has role '{:?}'",
+                    interface_config.role
+                ),
+            });
+        }
+        if !interface_config
+            .dhcp_client
+            .as_ref()
+            .is_some_and(|c| c.enabled)
+            && interface_config.ipv4.is_none()
+        {
+            return wifi_client_profile_error(WifiClientProfileErrorDetail::InvalidProfile {
+                message: format!(
+                    "a Wi-Fi client on '{interface}' requires an IP address: enable DHCP client (dhcp_client) or configure a static IPv4 address"
+                ),
+            });
+        }
+
         interface_config.wifi_client = Some(WifiClientConfig {
             ssid: profile.ssid.clone(),
             country_code: profile.country_code.clone(),
@@ -421,9 +480,16 @@ impl ControlService {
         });
         let spec = match WifiClientSpec::from_interface_config(&interface, &interface_config) {
             Ok(Some(spec)) => spec,
-            Ok(None) | Err(_) => {
+            Ok(None) => {
                 return wifi_client_profile_error(WifiClientProfileErrorDetail::InvalidProfile {
-                    message: "profile activation requires an unmanaged input interface".to_string(),
+                    message: format!(
+                        "profile activation requires a managed input interface on '{interface}'"
+                    ),
+                })
+            }
+            Err(error) => {
+                return wifi_client_profile_error(WifiClientProfileErrorDetail::InvalidProfile {
+                    message: error.to_string(),
                 })
             }
         };

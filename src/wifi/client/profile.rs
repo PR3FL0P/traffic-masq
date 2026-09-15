@@ -310,10 +310,13 @@ fn validate_fields(
 ) -> Result<(), WifiClientProfileError> {
     let config = InterfaceConfig {
         role: InterfaceRole::Input,
-        managed: false,
+        managed: true,
         ipv4: None,
         dhcp: None,
-        dhcp_client: None,
+        dhcp_client: Some(crate::config::DhcpClientInterfaceConfig {
+            enabled: true,
+            ..Default::default()
+        }),
         wifi: None,
         wifi_client: Some(WifiClientConfig {
             ssid: ssid.to_string(),

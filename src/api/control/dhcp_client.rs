@@ -134,7 +134,6 @@ impl ControlService {
         if previous.is_none() {
             return dhcp_client_error(DhcpClientErrorDetail::Disabled);
         }
-        config.managed = false;
         config.dhcp_client = Some(dhcp_client_request_to_config(
             &DhcpClientConfigRequest::default(),
             false,

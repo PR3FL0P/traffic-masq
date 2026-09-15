@@ -192,7 +192,14 @@ fn send_signal(pid: u32, signal: Signal) -> Result<(), ProcessError> {
 /// its own instances of both, so their presence on the machine is normal, not
 /// evidence of a foreign manager, and including them here would make the scan
 /// report itself as the competitor on almost every restart.
-const COMPETING_DAEMONS: &[&str] = &["iwd", "NetworkManager", "connman"];
+const COMPETING_DAEMONS: &[&str] = &[
+    "iwd",
+    "NetworkManager",
+    "systemd-network",
+    "systemd-networkd",
+    "connman",
+    "connmand",
+];
 
 /// Scans /proc for running processes whose comm matches a known network-management
 /// daemon. Used to enrich restart diagnostics: when our supervised daemon keeps
@@ -213,13 +220,147 @@ pub async fn find_competing_network_managers() -> Vec<String> {
         let comm_path = entry.path().join("comm");
         if let Ok(comm) = tokio::fs::read_to_string(&comm_path).await {
             let comm = comm.trim_end_matches('\n');
-            if COMPETING_DAEMONS.contains(&comm) && !found.iter().any(|existing| existing == comm) {
-                found.push(comm.to_string());
+            if COMPETING_DAEMONS.contains(&comm) {
+                let canonical = match comm {
+                    "systemd-network" | "systemd-networkd" => "systemd-networkd",
+                    "connmand" | "connman" => "connman",
+                    other => other,
+                };
+                if !found.iter().any(|existing| existing == canonical) {
+                    found.push(canonical.to_string());
+                }
             }
         }
     }
     found.sort();
     found
+}
+
+/// Detected init system used to tailor service management commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitSystem {
+    Runit,
+    Systemd,
+    OpenRc,
+    Unknown,
+}
+
+pub fn detect_init_system() -> InitSystem {
+    if let Ok(comm) = std::fs::read_to_string("/proc/1/comm") {
+        let comm = comm.trim();
+        if comm == "runit" {
+            return InitSystem::Runit;
+        }
+        if comm == "systemd" {
+            return InitSystem::Systemd;
+        }
+    }
+    if std::path::Path::new("/run/systemd/system").exists() {
+        return InitSystem::Systemd;
+    }
+    if std::path::Path::new("/run/runit").exists() {
+        return InitSystem::Runit;
+    }
+    if std::path::Path::new("/run/openrc").exists() {
+        return InitSystem::OpenRc;
+    }
+    InitSystem::Unknown
+}
+
+/// Generates clear, actionable advice on how to stop/disable competing network managers
+/// (or isolate the specific interface from them) adapted to the current operating environment.
+pub fn format_competing_manager_advice(managers: &[String], interface: &str) -> String {
+    let init = detect_init_system();
+    let mut lines = Vec::new();
+
+    for manager in managers {
+        match manager.as_str() {
+            "iwd" => {
+                lines.push(format!("• Manager '{manager}' is running:"));
+                match init {
+                    InitSystem::Runit => {
+                        lines.push("  - Stop service:      sudo sv down iwd".to_string());
+                        lines.push("  - Disable service:   sudo touch /etc/sv/iwd/down".to_string());
+                    }
+                    InitSystem::Systemd => {
+                        lines.push("  - Stop service:      sudo systemctl stop iwd".to_string());
+                        lines.push("  - Disable service:   sudo systemctl disable --now iwd".to_string());
+                    }
+                    _ => {
+                        lines.push("  - Stop service:      sudo sv down iwd   (or: sudo systemctl stop iwd)".to_string());
+                        lines.push("  - Disable service:   sudo touch /etc/sv/iwd/down   (or: sudo systemctl disable --now iwd)".to_string());
+                    }
+                }
+                lines.push(format!("  - Release '{interface}' only: add to /etc/iwd/main.conf:"));
+                lines.push("      [Blacklist]".to_string());
+                lines.push(format!("      Interfaces={interface}"));
+            }
+            "NetworkManager" => {
+                lines.push(format!("• Manager '{manager}' is running:"));
+                match init {
+                    InitSystem::Runit => {
+                        lines.push("  - Stop service:      sudo sv down NetworkManager".to_string());
+                        lines.push("  - Disable service:   sudo touch /etc/sv/NetworkManager/down".to_string());
+                    }
+                    InitSystem::Systemd => {
+                        lines.push("  - Stop service:      sudo systemctl stop NetworkManager".to_string());
+                        lines.push("  - Disable service:   sudo systemctl disable --now NetworkManager".to_string());
+                    }
+                    _ => {
+                        lines.push("  - Stop service:      sudo sv down NetworkManager   (or: sudo systemctl stop NetworkManager)".to_string());
+                        lines.push("  - Disable service:   sudo touch /etc/sv/NetworkManager/down   (or: sudo systemctl disable --now NetworkManager)".to_string());
+                    }
+                }
+                lines.push(format!("  - Release '{interface}' only: sudo nmcli device set {interface} managed no"));
+                lines.push(format!("    (or in /etc/NetworkManager/conf.d/99-traffic-masq.conf: [keyfile] unmanaged-devices=interface-name:{interface})"));
+            }
+            "systemd-network" | "systemd-networkd" | "networkd" => {
+                lines.push("• Manager 'systemd-networkd' is running:".to_string());
+                lines.push("  - Stop service:      sudo systemctl stop systemd-networkd".to_string());
+                lines.push("  - Disable service:   sudo systemctl disable --now systemd-networkd".to_string());
+                lines.push(format!("  - Release '{interface}' only: create /etc/systemd/network/99-{interface}-unmanaged.network:"));
+                lines.push("      [Match]".to_string());
+                lines.push(format!("      Name={interface}"));
+                lines.push("      [Link]".to_string());
+                lines.push("      Unmanaged=yes".to_string());
+            }
+            "connman" | "connmand" => {
+                lines.push("• Manager 'connman' is running:".to_string());
+                match init {
+                    InitSystem::Runit => {
+                        lines.push("  - Stop service:      sudo sv down connman".to_string());
+                        lines.push("  - Disable service:   sudo touch /etc/sv/connman/down".to_string());
+                    }
+                    InitSystem::Systemd => {
+                        lines.push("  - Stop service:      sudo systemctl stop connman".to_string());
+                        lines.push("  - Disable service:   sudo systemctl disable --now connman".to_string());
+                    }
+                    _ => {
+                        lines.push("  - Stop service:      sudo sv down connman   (or: sudo systemctl stop connman)".to_string());
+                        lines.push("  - Disable service:   sudo touch /etc/sv/connman/down   (or: sudo systemctl disable --now connman)".to_string());
+                    }
+                }
+                lines.push(format!("  - Release '{interface}' only: add to /etc/connman/main.conf:"));
+                lines.push(format!("      NetworkInterfaceBlacklist = {interface}"));
+            }
+            other => {
+                lines.push(format!("• Manager '{other}' is running:"));
+                match init {
+                    InitSystem::Runit => {
+                        lines.push(format!("  - Stop service:      sudo sv down {other}"));
+                    }
+                    InitSystem::Systemd => {
+                        lines.push(format!("  - Stop service:      sudo systemctl stop {other}"));
+                    }
+                    _ => {
+                        lines.push(format!("  - Stop service:      sudo sv down {other}   (or: sudo systemctl stop {other})"));
+                    }
+                }
+            }
+        }
+    }
+
+    lines.join("\n")
 }
 
 fn probe_pid_exists(pid: u32) -> bool {
@@ -316,4 +457,21 @@ mod tests {
         assert!(!super::COMPETING_DAEMONS.contains(&"hostapd"));
         assert!(!super::COMPETING_DAEMONS.contains(&"wpa_supplicant"));
     }
+
+    #[test]
+    fn advice_formatting_contains_relevant_commands_for_managers() {
+        let managers = vec![
+            "iwd".to_string(),
+            "NetworkManager".to_string(),
+            "systemd-networkd".to_string(),
+            "connman".to_string(),
+        ];
+        let advice = super::format_competing_manager_advice(&managers, "wlp1s0");
+        assert!(advice.contains("iwd"));
+        assert!(advice.contains("NetworkManager"));
+        assert!(advice.contains("systemd-networkd"));
+        assert!(advice.contains("connman"));
+        assert!(advice.contains("wlp1s0"));
+    }
 }
+

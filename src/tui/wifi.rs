@@ -650,7 +650,54 @@ pub(crate) fn render_wifi(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
                 ));
             }
             if row.role == WifiRole::Unknown {
-                lines.push(Line::styled("Role is unknown; configure the interface as managed output (AP) or unmanaged input (client) first.", Style::default().fg(theme::WARN)));
+                lines.push(Line::styled("Role is unknown; configure the interface as managed output (AP) or managed input (client) first.", Style::default().fg(theme::WARN)));
+            }
+        }
+    }
+    if let Some(row) = app.wifi.focused_radio() {
+        let (competing, advice_opt) = match (&row.ap, &row.client) {
+            (Some(ap), _) => match &ap.health {
+                WifiHealth::Retrying {
+                    competing_managers,
+                    advice,
+                    ..
+                } if !competing_managers.is_empty() => {
+                    (Some(competing_managers), advice.as_deref())
+                }
+                _ => (None, None),
+            },
+            (_, Some(client)) => match &client.health {
+                WifiHealth::Retrying {
+                    competing_managers,
+                    advice,
+                    ..
+                } if !competing_managers.is_empty() => {
+                    (Some(competing_managers), advice.as_deref())
+                }
+                _ => (None, None),
+            },
+            _ => (None, None),
+        };
+
+        if let Some(competing) = competing {
+            lines.push(Line::from(""));
+            lines.push(Line::styled(
+                format!(
+                    "⚠ Conflict: {} may be controlling {}",
+                    competing.join(" + "),
+                    row.interface
+                ),
+                Style::default().fg(theme::WARN).add_modifier(Modifier::BOLD),
+            ));
+            lines.push(Line::styled(
+                "How to release this interface:",
+                Style::default().fg(theme::TEXT),
+            ));
+            let advice_text = advice_opt
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| crate::wifi::process::format_competing_manager_advice(competing, &row.interface));
+            for line in advice_text.lines() {
+                lines.push(Line::styled(format!("  {line}"), Style::default().fg(theme::MUTED)));
             }
         }
     }
@@ -2440,7 +2487,7 @@ pub(crate) async fn load_wifi_data(app: &mut TuiApp, client: &ApiClient) {
             config.as_ref().is_some_and(|c| c.managed),
         );
         if let Some(config) = &config {
-            if config.role == InterfaceRole::Input {
+            if config.role == InterfaceRole::Input && config.managed {
                 row.role = WifiRole::Client;
             } else if config.role == InterfaceRole::Output && config.managed {
                 row.role = WifiRole::AccessPoint;
@@ -2450,7 +2497,7 @@ pub(crate) async fn load_wifi_data(app: &mut TuiApp, client: &ApiClient) {
         }
     }
     rows.retain(|row| {
-        managed.get(&row.interface).copied().unwrap_or(false) || row.role == WifiRole::Client
+        managed.get(&row.interface).copied().unwrap_or(false)
     });
     let previous_radio = app.wifi.focused_radio().map(|row| row.interface.clone());
     app.wifi.selected_radio = previous_radio
@@ -2503,7 +2550,7 @@ pub(crate) fn build_rows(
 fn role_from_interface(role: InterfaceRole, managed: bool) -> WifiRole {
     match (role, managed) {
         (InterfaceRole::Output, true) => WifiRole::AccessPoint,
-        (InterfaceRole::Input, _) => WifiRole::Client,
+        (InterfaceRole::Input, true) => WifiRole::Client,
         _ => WifiRole::Unknown,
     }
 }
@@ -2625,6 +2672,7 @@ fn describe_health(health: &WifiHealth, ok_description: &str) -> String {
             attempts,
             retry_in_secs,
             competing_managers,
+            ..
         } => {
             let mut message = format!(
                 "✗ not working — {error} (attempt {attempts}{}",
@@ -3125,7 +3173,7 @@ mod tests {
         );
         assert_eq!(
             role_from_interface(InterfaceRole::Input, false),
-            WifiRole::Client
+            WifiRole::Unknown
         );
         assert_eq!(
             role_from_interface(InterfaceRole::Input, true),
@@ -3386,4 +3434,70 @@ mod tests {
         // Header height is 2 lines, panel top border is 1 line, so list_area starts at y = 3
         assert_eq!(list_area.y, 3);
     }
+
+    #[test]
+    fn render_wifi_displays_conflict_advice_when_competing_managers_present() {
+        let mut app = TuiApp {
+            wifi: WifiData {
+                rows: vec![WifiRow {
+                    interface: "wlp1s0".to_string(),
+                    role: WifiRole::AccessPoint,
+                    ap: Some(WifiApStatus {
+                        interface: "wlp1s0".to_string(),
+                        spec: WifiApSpec {
+                            interface: "wlp1s0".to_string(),
+                            ssid: "TestAP".to_string(),
+                            passphrase: None,
+                            band: crate::config::WifiBand::TwoPointFourGigahertz,
+                            channel: 6,
+                            channel_width: crate::config::WifiChannelWidth::TwentyMegahertz,
+                            country_code: "US".to_string(),
+                            isolate: false,
+                            hidden: false,
+                            security: crate::config::WifiSecurity::Open,
+                        },
+                        pid: 0,
+                        hostapd_state: HostapdState::Disabled,
+                        num_stations: None,
+                        health: WifiHealth::Retrying {
+                            error: "ctrl socket timeout".to_string(),
+                            attempts: 3,
+                            retry_in_secs: Some(10),
+                            competing_managers: vec!["iwd".to_string()],
+                            advice: Some("Stop service: sudo sv down iwd".to_string()),
+                        },
+                    }),
+                    client: None,
+                }],
+                selected: 0,
+                selected_radio: 0,
+                actions_open: false,
+                ap_disabled: false,
+                client_disabled: false,
+                error: None,
+            },
+            ..Default::default()
+        };
+
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| render_wifi(frame, frame.area(), &mut app))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let content = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.get(x, y).symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(content.contains("Conflict"));
+        assert!(content.contains("iwd"));
+        assert!(content.contains("sudo sv down iwd"));
+    }
 }
+

@@ -853,6 +853,10 @@ impl InterfaceConfig {
             );
         }
 
+        if self.wifi.is_some() && self.wifi_client.is_some() {
+            bail!("an interface cannot be both a Wi-Fi access point and a Wi-Fi client (non-goal: concurrent AP+STA)");
+        }
+
         if self.dhcp_client.is_some() && self.role != InterfaceRole::Input {
             bail!("a DHCP client can only be configured on an input interface");
         }
@@ -875,10 +879,6 @@ impl InterfaceConfig {
             bail!("an interface cannot have both a static IPv4 address and an enabled DHCP client");
         }
 
-        if self.wifi.is_some() && self.wifi_client.is_some() {
-            bail!("an interface cannot be both a Wi-Fi access point and a Wi-Fi client (non-goal: concurrent AP+STA)");
-        }
-
         if self.wifi.is_some() && !self.managed {
             bail!("a Wi-Fi access point cannot be enabled on an unmanaged interface");
         }
@@ -891,21 +891,12 @@ impl InterfaceConfig {
             wifi.validate(name)?;
         }
 
-        if self.wifi_client.is_some() && self.role != InterfaceRole::Input {
-            bail!("a Wi-Fi client can only be enabled on an input interface");
+        if self.wifi_client.is_some() && !self.managed {
+            bail!("a Wi-Fi client cannot be enabled on an unmanaged interface; traffic-masq does not modify unmanaged interfaces. Enable 'managed' first.");
         }
 
-        if self.wifi_client.is_some()
-            && self.managed
-            && !self
-                .dhcp_client
-                .as_ref()
-                .is_some_and(|dhcp_client| dhcp_client.enabled)
-            && self.ipv4.is_none()
-        {
-            bail!(
-                "a managed Wi-Fi client requires an enabled dhcp_client block or a static IPv4 address; otherwise leave it unmanaged for external L3 ownership"
-            );
+        if self.wifi_client.is_some() && self.role != InterfaceRole::Input {
+            bail!("a Wi-Fi client can only be enabled on an input interface (current role: {:?})", self.role);
         }
 
         if let Some(wifi_client) = &self.wifi_client {
@@ -2196,10 +2187,13 @@ mod tests {
         InterfaceConfig {
             nat: true,
             role: InterfaceRole::Input,
-            managed: false,
+            managed: true,
             ipv4: None,
             dhcp: None,
-            dhcp_client: None,
+            dhcp_client: Some(DhcpClientInterfaceConfig {
+                enabled: true,
+                ..Default::default()
+            }),
             wifi: None,
             wifi_client: Some(wifi_client),
         }
@@ -2215,21 +2209,21 @@ mod tests {
     }
 
     #[test]
-    fn accepts_a_wifi_client_on_an_unmanaged_input_interface() {
+    fn accepts_a_wifi_client_on_a_managed_input_interface() {
         config_with_wifi_client(client_association("upstream"))
             .validate()
             .expect("valid wifi client");
     }
 
     #[test]
-    fn rejects_a_wifi_client_on_a_managed_or_non_input_interface() {
+    fn rejects_a_wifi_client_on_an_unmanaged_or_non_input_interface() {
         let mut config = config_with_wifi_client(client_association("upstream"));
         config
             .network
             .interfaces
             .get_mut("wan_wifi")
             .expect("interface")
-            .managed = true;
+            .managed = false;
         assert!(config.validate().is_err());
 
         let mut config = config_with_wifi_client(client_association("upstream"));
@@ -2354,15 +2348,17 @@ mod tests {
 
     #[test]
     fn accepts_external_and_managed_dhcp_input_matrix() {
-        let external_wifi = client_interface(client_association("upstream"));
-        external_wifi.validate("wlan0").expect("legacy external L3");
+        let external_wired = input_interface();
+        external_wired.validate("wan0").expect("external unmanaged wired");
 
-        let mut managed_wifi = external_wifi.clone();
-        managed_wifi.managed = true;
-        managed_wifi.dhcp_client = Some(dhcp_client());
+        let managed_wifi = client_interface(client_association("upstream"));
         managed_wifi
             .validate("wlan0")
             .expect("managed Wi-Fi DHCP input");
+
+        let mut unmanaged_wifi = managed_wifi.clone();
+        unmanaged_wifi.managed = false;
+        assert!(unmanaged_wifi.validate("wlan0").is_err());
 
         let mut managed_wired = input_interface();
         managed_wired.managed = true;
@@ -2370,7 +2366,10 @@ mod tests {
         managed_wired
             .validate("wan0")
             .expect("managed wired DHCP input");
+    }
 
+    #[test]
+    fn accepts_existing_static_input_semantics() {
         let mut existing_static_owner = input_interface();
         existing_static_owner.managed = true;
         existing_static_owner.ipv4 = Some("192.0.2.2/24".parse().unwrap());
@@ -2378,8 +2377,8 @@ mod tests {
             .validate("wan0")
             .expect("existing managed static input semantics remain valid");
 
-        let mut managed_wifi_static = external_wifi;
-        managed_wifi_static.managed = true;
+        let mut managed_wifi_static = client_interface(client_association("upstream"));
+        managed_wifi_static.dhcp_client = None;
         managed_wifi_static.ipv4 = Some("192.0.2.50/24".parse().unwrap());
         managed_wifi_static
             .validate("wlan0")

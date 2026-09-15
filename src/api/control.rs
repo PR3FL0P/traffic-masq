@@ -4198,10 +4198,10 @@ mod tests {
             "wlan1".to_string(),
             InterfaceConfig {
                 role: InterfaceRole::Input,
-                managed: false,
+                managed: true,
                 ipv4: None,
                 dhcp: None,
-                dhcp_client: None,
+                dhcp_client: Some(DhcpClientInterfaceConfig::default()),
                 wifi: None,
                 wifi_client: Some(crate::config::WifiClientConfig {
                     ssid: "upstream".to_string(),
@@ -4782,7 +4782,7 @@ mod tests {
             "wan0".to_string(),
             InterfaceConfig {
                 role: InterfaceRole::Input,
-                managed: enabled,
+                managed: true,
                 ipv4: None,
                 dhcp: None,
                 dhcp_client: enabled.then(DhcpClientInterfaceConfig::default),
@@ -4927,8 +4927,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            !persisted.managed,
-            "disabled client returns the input to external-L3 semantics"
+            persisted.managed,
+            "managed interface remains managed when dhcp client is disabled"
         );
         assert!(!persisted.dhcp_client.unwrap().enabled);
         assert_eq!(persisted.wifi_client.unwrap().ssid, "upstream");

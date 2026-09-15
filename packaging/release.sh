@@ -24,8 +24,16 @@ for binary in traffic-masq traffic-masqd; do
     test -x "$binary_dir/$binary"
     cp "$binary_dir/$binary" "$stage/$name/$binary"
 done
-cp "$project_dir/README.md" "$project_dir/LICENSE" "$project_dir/CHANGELOG.md" "$project_dir/SECURITY.md" "$project_dir/CONTRIBUTING.md" "$project_dir/Cargo.toml" "$stage/$name/"
-cp -R "$project_dir/docs" "$project_dir/examples" "$project_dir/packaging" "$stage/$name/"
+for doc in README.md LICENSE CHANGELOG.md SECURITY.md CONTRIBUTING.md Cargo.toml; do
+    if [ -f "$project_dir/$doc" ]; then
+        cp "$project_dir/$doc" "$stage/$name/"
+    fi
+done
+for dir in docs examples packaging; do
+    if [ -d "$project_dir/$dir" ]; then
+        cp -R "$project_dir/$dir" "$stage/$name/"
+    fi
+done
 tar -czf "$output_dir/$name.tar.gz" -C "$stage" "$name"
 (cd "$output_dir" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
 printf 'Created %s/%s.tar.gz\n' "$output_dir" "$name"

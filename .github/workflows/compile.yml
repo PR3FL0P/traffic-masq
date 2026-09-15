@@ -1,0 +1,67 @@
+name: Compile Binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'Build profile'
+        required: false
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    name: Build Binaries (Linux x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        run: |
+          rustup show active-toolchain
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build binaries
+        run: |
+          if [ "${{ github.event.inputs.profile }}" = "debug" ]; then
+            cargo build --bins
+            BUILD_DIR="target/debug"
+          else
+            cargo build --release --bins
+            BUILD_DIR="target/release"
+          fi
+
+          mkdir -p release-binaries
+          cp "$BUILD_DIR/traffic-masq" release-binaries/
+          cp "$BUILD_DIR/traffic-masqd" release-binaries/
+          strip release-binaries/traffic-masq release-binaries/traffic-masqd || true
+          chmod +x release-binaries/traffic-masq release-binaries/traffic-masqd
+
+          tar -czf release-binaries/traffic-masq-linux-x86_64.tar.gz -C release-binaries traffic-masq traffic-masqd
+
+      - name: Upload compiled binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: traffic-masq-binaries
+          path: release-binaries/*
+          if-no-files-found: error

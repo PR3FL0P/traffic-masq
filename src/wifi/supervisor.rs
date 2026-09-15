@@ -95,6 +95,9 @@ pub enum WifiHealth {
         /// Other network managers detected on this machine that may be
         /// holding the interface (iwd, NetworkManager, ...).
         competing_managers: Vec<String>,
+        /// Guidance on how to disable or isolate competing managers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        advice: Option<String>,
     },
 }
 
@@ -524,11 +527,21 @@ impl HostapdSupervisor {
             let retry_in_secs = task
                 .next_restart_earliest
                 .map(|earliest| earliest.saturating_duration_since(Instant::now()).as_secs());
+            let competing_managers = find_competing_network_managers().await;
+            let advice = if competing_managers.is_empty() {
+                None
+            } else {
+                Some(crate::wifi::process::format_competing_manager_advice(
+                    &competing_managers,
+                    interface,
+                ))
+            };
             WifiHealth::Retrying {
                 error: error.clone(),
                 attempts: task.consecutive_failures,
                 retry_in_secs,
-                competing_managers: find_competing_network_managers().await,
+                competing_managers,
+                advice,
             }
         } else if hostapd_state == HostapdState::Enabled {
             WifiHealth::Healthy
@@ -680,11 +693,13 @@ impl HostapdSupervisor {
                 "hostapd is not responding; restarting it"
             );
         } else {
+            let advice = crate::wifi::process::format_competing_manager_advice(&competitors, interface);
             tracing::warn!(
                 %interface,
                 pid = task.record.pid,
                 competing = ?competitors,
-                "hostapd is not responding; restarting it; other network managers are running and may be controlling this interface"
+                %advice,
+                "hostapd is not responding; restarting it; other network managers are running and may be controlling this interface. Resolution advice:\n{advice}"
             );
         }
         let rendered = self.render_for(&task.spec).await?;

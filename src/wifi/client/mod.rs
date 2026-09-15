@@ -38,7 +38,7 @@ impl WifiClientSpec {
     ) -> Result<Option<Self>> {
         config.validate(interface)?;
 
-        if config.role != InterfaceRole::Input {
+        if !config.managed || config.role != InterfaceRole::Input {
             return Ok(None);
         }
         let Some(wifi_client) = config.wifi_client.as_ref() else {
@@ -65,10 +65,13 @@ impl WifiClientSpec {
 
         let config = InterfaceConfig {
             role: InterfaceRole::Input,
-            managed: false,
+            managed: true,
             ipv4: None,
             dhcp: None,
-            dhcp_client: None,
+            dhcp_client: Some(crate::config::DhcpClientInterfaceConfig {
+                enabled: true,
+                ..Default::default()
+            }),
             wifi: None,
             wifi_client: Some(self.wifi_client_config()),
             nat: true,
@@ -107,10 +110,13 @@ mod tests {
     fn interface(wifi_client: Option<ClientConfig>) -> InterfaceConfig {
         InterfaceConfig {
             role: InterfaceRole::Input,
-            managed: false,
+            managed: true,
             ipv4: None,
             dhcp: None,
-            dhcp_client: None,
+            dhcp_client: Some(crate::config::DhcpClientInterfaceConfig {
+                enabled: true,
+                ..Default::default()
+            }),
             wifi: None,
             wifi_client,
             nat: true,
@@ -118,7 +124,7 @@ mod tests {
     }
 
     #[test]
-    fn derives_a_spec_from_an_unmanaged_input_interface() {
+    fn derives_a_spec_from_a_managed_input_interface() {
         let spec =
             WifiClientSpec::from_interface_config("wlan0", &interface(Some(client_config("home"))))
                 .expect("valid")
@@ -136,13 +142,13 @@ mod tests {
     }
 
     #[test]
-    fn output_or_managed_interface_is_rejected_rather_than_skipped() {
+    fn output_or_unmanaged_interface_is_rejected_rather_than_skipped() {
         let mut config = interface(Some(client_config("home")));
         config.role = InterfaceRole::Output;
         assert!(WifiClientSpec::from_interface_config("wlan0", &config).is_err());
 
         let mut config = interface(Some(client_config("home")));
-        config.managed = true;
+        config.managed = false;
         assert!(WifiClientSpec::from_interface_config("wlan0", &config).is_err());
     }
 

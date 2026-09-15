@@ -509,11 +509,21 @@ impl WifiClientSupervisor {
             let retry_in_secs = task
                 .next_restart_earliest
                 .map(|earliest| earliest.saturating_duration_since(Instant::now()).as_secs());
+            let competing_managers = find_competing_network_managers().await;
+            let advice = if competing_managers.is_empty() {
+                None
+            } else {
+                Some(crate::wifi::process::format_competing_manager_advice(
+                    &competing_managers,
+                    interface,
+                ))
+            };
             crate::wifi::supervisor::WifiHealth::Retrying {
                 error: error.clone(),
                 attempts: task.consecutive_failures,
                 retry_in_secs,
-                competing_managers: find_competing_network_managers().await,
+                competing_managers,
+                advice,
             }
         } else if wpa_state.is_connected() {
             crate::wifi::supervisor::WifiHealth::Healthy
@@ -745,12 +755,17 @@ impl WifiClientSupervisor {
 
         let competitors = crate::wifi::process::find_competing_network_managers().await;
         if stuck {
+            let advice = if competitors.is_empty() {
+                String::new()
+            } else {
+                format!("\n{}", crate::wifi::process::format_competing_manager_advice(&competitors, interface))
+            };
             tracing::warn!(
                 %interface,
                 pid = task.record.pid,
                 grace = ?ASSOCIATION_GRACE,
                 competing = ?competitors,
-                "wpa_supplicant is alive but has not associated; restarting it"
+                "wpa_supplicant is alive but has not associated; restarting it; competing managers: {competitors:?}{advice}"
             );
         } else if competitors.is_empty() {
             tracing::warn!(
@@ -759,11 +774,13 @@ impl WifiClientSupervisor {
                 "wpa_supplicant is not responding; restarting it"
             );
         } else {
+            let advice = crate::wifi::process::format_competing_manager_advice(&competitors, interface);
             tracing::warn!(
                 %interface,
                 pid = task.record.pid,
                 competing = ?competitors,
-                "wpa_supplicant is not responding; restarting it; other network managers are running and may be controlling this interface"
+                %advice,
+                "wpa_supplicant is not responding; restarting it; other network managers are running and may be controlling this interface. Resolution advice:\n{advice}"
             );
         }
 
@@ -1176,10 +1193,13 @@ mod tests {
     fn spec(interface: &str, ssid: &str) -> WifiClientSpec {
         let config = InterfaceConfig {
             role: InterfaceRole::Input,
-            managed: false,
+            managed: true,
             ipv4: None,
             dhcp: None,
-            dhcp_client: None,
+            dhcp_client: Some(crate::config::DhcpClientInterfaceConfig {
+                enabled: true,
+                ..Default::default()
+            }),
             wifi: None,
             wifi_client: Some(client_config(ssid)),
             nat: true,
