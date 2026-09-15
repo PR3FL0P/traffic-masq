@@ -56,6 +56,12 @@ jobs:
           cache-all-crates: "true"
           save-if: "true"
 
+      - name: Install test runtime dependencies
+        if: ${{ inputs.run_tests == true || inputs.run_tests == 'true' }}
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends hostapd wpasupplicant iw
+
       - name: Run tests
         if: ${{ inputs.run_tests == true || inputs.run_tests == 'true' }}
         run: |
@@ -63,12 +69,15 @@ jobs:
           if [ "${{ inputs.profile }}" = "release" ]; then
             TEST_FLAGS="--release"
           fi
-          if [ -n "${{ inputs.test_filter }}" ]; then
+          if [ -n "${{ inputs.test_filter }}" ] && [ "${{ inputs.test_filter }}" != "all" ]; then
             echo "==> Running targeted tests matching: ${{ inputs.test_filter }}"
             cargo test $TEST_FLAGS -- ${{ inputs.test_filter }}
-          else
-            echo "==> Running full test suite"
+          elif [ "${{ inputs.test_filter }}" = "all" ]; then
+            echo "==> Running complete test suite (unit + integration)"
             cargo test $TEST_FLAGS
+          else
+            echo "==> Running library unit test suite"
+            cargo test --lib $TEST_FLAGS
           fi
 
       - name: Build binaries

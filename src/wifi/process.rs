@@ -415,10 +415,19 @@ mod tests {
             .expect("spawn");
 
         assert!(process.is_alive(pid).await.expect("is_alive"));
-        assert!(process
-            .cmdline_contains(pid, Path::new("300"))
-            .await
-            .expect("cmdline_contains"));
+        let mut found = false;
+        for _ in 0..50 {
+            if process
+                .cmdline_contains(pid, Path::new("300"))
+                .await
+                .unwrap_or(false)
+            {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(found, "cmdline should contain '300'");
 
         process.kill(pid).await.expect("kill");
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -432,6 +441,20 @@ mod tests {
             .spawn(Path::new("/bin/sleep"), Path::new("300"))
             .await
             .expect("spawn");
+
+        let mut ready = false;
+        for _ in 0..50 {
+            if process
+                .cmdline_contains(pid, Path::new("300"))
+                .await
+                .unwrap_or(false)
+            {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ready, "spawned process should be visible in proc cmdline");
 
         assert!(!process
             .cmdline_contains(pid, Path::new("600"))
