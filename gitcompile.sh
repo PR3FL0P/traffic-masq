@@ -290,14 +290,26 @@ fi
 
 TRIGGERED=false
 for attempt in {1..10}; do
-  if gh workflow run "$WORKFLOW_FILE" --ref "$BRANCH" \
-      -f profile="$BUILD_PROFILE" \
-      -f run_tests="$RUN_TESTS" \
-      -f tests_only="$TESTS_ONLY" \
-      -f test_filter="$TEST_FILTER" \
-      -f cache="$USE_CACHE" 2>/dev/null; then
-    TRIGGERED=true
-    break
+  if [ "$attempt" -lt 10 ]; then
+    if gh workflow run "$WORKFLOW_FILE" --ref "$BRANCH" \
+        -f profile="$BUILD_PROFILE" \
+        -f run_tests="$RUN_TESTS" \
+        -f tests_only="$TESTS_ONLY" \
+        -f test_filter="$TEST_FILTER" \
+        -f cache="$USE_CACHE" 2>/dev/null; then
+      TRIGGERED=true
+      break
+    fi
+  else
+    if gh workflow run "$WORKFLOW_FILE" --ref "$BRANCH" \
+        -f profile="$BUILD_PROFILE" \
+        -f run_tests="$RUN_TESTS" \
+        -f tests_only="$TESTS_ONLY" \
+        -f test_filter="$TEST_FILTER" \
+        -f cache="$USE_CACHE"; then
+      TRIGGERED=true
+      break
+    fi
   fi
   sleep 2
 done
