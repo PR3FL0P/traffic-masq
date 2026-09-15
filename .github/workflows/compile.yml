@@ -65,19 +65,16 @@ jobs:
       - name: Run tests
         if: ${{ inputs.run_tests == true || inputs.run_tests == 'true' }}
         run: |
-          TEST_FLAGS=""
-          if [ "${{ inputs.profile }}" = "release" ]; then
-            TEST_FLAGS="--release"
-          fi
+          # Always compile and run tests in fast debug mode (no release optimizations)
           if [ -n "${{ inputs.test_filter }}" ] && [ "${{ inputs.test_filter }}" != "all" ]; then
-            echo "==> Running targeted tests matching: ${{ inputs.test_filter }}"
-            cargo test $TEST_FLAGS -- ${{ inputs.test_filter }}
+            echo "==> Running targeted tests (debug) matching: ${{ inputs.test_filter }}"
+            cargo test -- ${{ inputs.test_filter }}
           elif [ "${{ inputs.test_filter }}" = "all" ]; then
-            echo "==> Running complete test suite (unit + integration)"
-            cargo test $TEST_FLAGS
+            echo "==> Running complete test suite (debug)"
+            cargo test
           else
-            echo "==> Running library unit test suite"
-            cargo test --lib $TEST_FLAGS
+            echo "==> Running library unit test suite (debug)"
+            cargo test --lib
           fi
 
       - name: Build binaries
