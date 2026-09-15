@@ -1,5 +1,30 @@
 use super::*;
 
+fn validate_wifi_client_interface(interface: &str, config: &InterfaceConfig) -> Result<(), String> {
+    if !config.managed {
+        return Err(format!(
+            "interface '{interface}' is unmanaged; traffic-masq does not modify unmanaged interfaces. Enable 'managed' first."
+        ));
+    }
+    if config.role != InterfaceRole::Input {
+        return Err(format!(
+            "a Wi-Fi client requires an input interface, but '{interface}' has role '{:?}'",
+            config.role
+        ));
+    }
+    if !config
+        .dhcp_client
+        .as_ref()
+        .is_some_and(|c| c.enabled)
+        && config.ipv4.is_none()
+    {
+        return Err(format!(
+            "a Wi-Fi client on '{interface}' requires an IP address: enable DHCP client (dhcp_client) or configure a static IPv4 address"
+        ));
+    }
+    Ok(())
+}
+
 impl ControlService {
     pub(super) async fn wifi_client_status(&self) -> Response {
         let Some(wifi_client) = &self.wifi_client else {
@@ -66,32 +91,8 @@ impl ControlService {
             return wifi_client_error(WifiClientErrorDetail::InterfaceNotFound);
         };
 
-        if !interface_config.managed {
-            return wifi_client_error(WifiClientErrorDetail::InvalidSpec {
-                message: format!(
-                    "interface '{interface}' is unmanaged; traffic-masq does not modify unmanaged interfaces. Enable 'managed' first."
-                ),
-            });
-        }
-        if interface_config.role != InterfaceRole::Input {
-            return wifi_client_error(WifiClientErrorDetail::InvalidSpec {
-                message: format!(
-                    "a Wi-Fi client requires an input interface, but '{interface}' has role '{:?}'",
-                    interface_config.role
-                ),
-            });
-        }
-        if !interface_config
-            .dhcp_client
-            .as_ref()
-            .is_some_and(|c| c.enabled)
-            && interface_config.ipv4.is_none()
-        {
-            return wifi_client_error(WifiClientErrorDetail::InvalidSpec {
-                message: format!(
-                    "a Wi-Fi client on '{interface}' requires an IP address: enable DHCP client (dhcp_client) or configure a static IPv4 address"
-                ),
-            });
+        if let Err(message) = validate_wifi_client_interface(&interface, &interface_config) {
+            return wifi_client_error(WifiClientErrorDetail::InvalidSpec { message });
         }
 
         interface_config.wifi_client = Some(wifi_client_edit_request_to_config(settings));
@@ -444,31 +445,9 @@ impl ControlService {
             return wifi_client_profile_error(WifiClientProfileErrorDetail::InterfaceNotFound);
         };
 
-        if !interface_config.managed {
+        if let Err(message) = validate_wifi_client_interface(&interface, &interface_config) {
             return wifi_client_profile_error(WifiClientProfileErrorDetail::InvalidProfile {
-                message: format!(
-                    "interface '{interface}' is unmanaged; traffic-masq does not modify unmanaged interfaces. Enable 'managed' first."
-                ),
-            });
-        }
-        if interface_config.role != InterfaceRole::Input {
-            return wifi_client_profile_error(WifiClientProfileErrorDetail::InvalidProfile {
-                message: format!(
-                    "a Wi-Fi client requires an input interface, but '{interface}' has role '{:?}'",
-                    interface_config.role
-                ),
-            });
-        }
-        if !interface_config
-            .dhcp_client
-            .as_ref()
-            .is_some_and(|c| c.enabled)
-            && interface_config.ipv4.is_none()
-        {
-            return wifi_client_profile_error(WifiClientProfileErrorDetail::InvalidProfile {
-                message: format!(
-                    "a Wi-Fi client on '{interface}' requires an IP address: enable DHCP client (dhcp_client) or configure a static IPv4 address"
-                ),
+                message,
             });
         }
 

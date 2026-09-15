@@ -3437,6 +3437,8 @@ mod tests {
 
     #[test]
     fn render_wifi_displays_conflict_advice_when_competing_managers_present() {
+        use crate::wifi::{HostapdState, WifiApSpec};
+
         let mut app = TuiApp {
             wifi: WifiData {
                 rows: vec![WifiRow {
@@ -3447,14 +3449,15 @@ mod tests {
                         spec: WifiApSpec {
                             interface: "wlp1s0".to_string(),
                             ssid: "TestAP".to_string(),
-                            passphrase: None,
-                            band: crate::config::WifiBand::TwoPointFourGigahertz,
+                            country_code: Some("US".to_string()),
+                            band: crate::config::WifiBand::Ghz2,
                             channel: 6,
-                            channel_width: crate::config::WifiChannelWidth::TwentyMegahertz,
-                            country_code: "US".to_string(),
-                            isolate: false,
-                            hidden: false,
+                            channel_width: crate::config::WifiChannelWidth::Ht20,
                             security: crate::config::WifiSecurity::Open,
+                            hidden: false,
+                            client_isolation: false,
+                            max_stations: 32,
+                            passphrase_file: None,
                         },
                         pid: 0,
                         hostapd_state: HostapdState::Disabled,
@@ -3489,7 +3492,7 @@ mod tests {
         let content = (0..buffer.area.height)
             .map(|y| {
                 (0..buffer.area.width)
-                    .map(|x| buffer.get(x, y).symbol())
+                    .map(|x| buffer[(x, y)].symbol())
                     .collect::<String>()
             })
             .collect::<Vec<_>>()

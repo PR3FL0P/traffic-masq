@@ -219,7 +219,7 @@ pub async fn find_competing_network_managers() -> Vec<String> {
         }
         let comm_path = entry.path().join("comm");
         if let Ok(comm) = tokio::fs::read_to_string(&comm_path).await {
-            let comm = comm.trim_end_matches('\n');
+            let comm = comm.trim();
             if COMPETING_DAEMONS.contains(&comm) {
                 let canonical = match comm {
                     "systemd-network" | "systemd-networkd" => "systemd-networkd",
@@ -245,6 +245,7 @@ pub enum InitSystem {
     Unknown,
 }
 
+/// Detects the active init system on Linux.
 pub fn detect_init_system() -> InitSystem {
     if let Ok(comm) = std::fs::read_to_string("/proc/1/comm") {
         let comm = comm.trim();
@@ -270,7 +271,14 @@ pub fn detect_init_system() -> InitSystem {
 /// Generates clear, actionable advice on how to stop/disable competing network managers
 /// (or isolate the specific interface from them) adapted to the current operating environment.
 pub fn format_competing_manager_advice(managers: &[String], interface: &str) -> String {
-    let init = detect_init_system();
+    format_competing_manager_advice_for_init(managers, interface, detect_init_system())
+}
+
+pub fn format_competing_manager_advice_for_init(
+    managers: &[String],
+    interface: &str,
+    init: InitSystem,
+) -> String {
     let mut lines = Vec::new();
 
     for manager in managers {
@@ -285,6 +293,10 @@ pub fn format_competing_manager_advice(managers: &[String], interface: &str) -> 
                     InitSystem::Systemd => {
                         lines.push("  - Stop service:      sudo systemctl stop iwd".to_string());
                         lines.push("  - Disable service:   sudo systemctl disable --now iwd".to_string());
+                    }
+                    InitSystem::OpenRc => {
+                        lines.push("  - Stop service:      sudo rc-service iwd stop".to_string());
+                        lines.push("  - Disable service:   sudo rc-update del iwd default".to_string());
                     }
                     _ => {
                         lines.push("  - Stop service:      sudo sv down iwd   (or: sudo systemctl stop iwd)".to_string());
@@ -305,6 +317,10 @@ pub fn format_competing_manager_advice(managers: &[String], interface: &str) -> 
                     InitSystem::Systemd => {
                         lines.push("  - Stop service:      sudo systemctl stop NetworkManager".to_string());
                         lines.push("  - Disable service:   sudo systemctl disable --now NetworkManager".to_string());
+                    }
+                    InitSystem::OpenRc => {
+                        lines.push("  - Stop service:      sudo rc-service NetworkManager stop".to_string());
+                        lines.push("  - Disable service:   sudo rc-update del NetworkManager default".to_string());
                     }
                     _ => {
                         lines.push("  - Stop service:      sudo sv down NetworkManager   (or: sudo systemctl stop NetworkManager)".to_string());
@@ -335,6 +351,10 @@ pub fn format_competing_manager_advice(managers: &[String], interface: &str) -> 
                         lines.push("  - Stop service:      sudo systemctl stop connman".to_string());
                         lines.push("  - Disable service:   sudo systemctl disable --now connman".to_string());
                     }
+                    InitSystem::OpenRc => {
+                        lines.push("  - Stop service:      sudo rc-service connman stop".to_string());
+                        lines.push("  - Disable service:   sudo rc-update del connman default".to_string());
+                    }
                     _ => {
                         lines.push("  - Stop service:      sudo sv down connman   (or: sudo systemctl stop connman)".to_string());
                         lines.push("  - Disable service:   sudo touch /etc/sv/connman/down   (or: sudo systemctl disable --now connman)".to_string());
@@ -348,12 +368,19 @@ pub fn format_competing_manager_advice(managers: &[String], interface: &str) -> 
                 match init {
                     InitSystem::Runit => {
                         lines.push(format!("  - Stop service:      sudo sv down {other}"));
+                        lines.push(format!("  - Disable service:   sudo touch /etc/sv/{other}/down"));
                     }
                     InitSystem::Systemd => {
                         lines.push(format!("  - Stop service:      sudo systemctl stop {other}"));
+                        lines.push(format!("  - Disable service:   sudo systemctl disable --now {other}"));
+                    }
+                    InitSystem::OpenRc => {
+                        lines.push(format!("  - Stop service:      sudo rc-service {other} stop"));
+                        lines.push(format!("  - Disable service:   sudo rc-update del {other} default"));
                     }
                     _ => {
                         lines.push(format!("  - Stop service:      sudo sv down {other}   (or: sudo systemctl stop {other})"));
+                        lines.push(format!("  - Disable service:   sudo touch /etc/sv/{other}/down   (or: sudo systemctl disable --now {other})"));
                     }
                 }
             }
@@ -472,6 +499,23 @@ mod tests {
         assert!(advice.contains("systemd-networkd"));
         assert!(advice.contains("connman"));
         assert!(advice.contains("wlp1s0"));
+    }
+
+    #[test]
+    fn advice_formatting_respects_init_systems() {
+        let managers = vec!["iwd".to_string(), "NetworkManager".to_string()];
+        
+        let runit_advice = super::format_competing_manager_advice_for_init(&managers, "wlan0", super::InitSystem::Runit);
+        assert!(runit_advice.contains("sv down iwd"));
+        assert!(runit_advice.contains("/etc/sv/iwd/down"));
+
+        let systemd_advice = super::format_competing_manager_advice_for_init(&managers, "wlan0", super::InitSystem::Systemd);
+        assert!(systemd_advice.contains("systemctl stop iwd"));
+        assert!(systemd_advice.contains("systemctl disable --now iwd"));
+
+        let openrc_advice = super::format_competing_manager_advice_for_init(&managers, "wlan0", super::InitSystem::OpenRc);
+        assert!(openrc_advice.contains("rc-service iwd stop"));
+        assert!(openrc_advice.contains("rc-update del iwd default"));
     }
 }
 
