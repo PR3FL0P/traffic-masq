@@ -38,10 +38,16 @@ impl TopologyView {
             KeyCode::Up => self.scroll.0 = self.scroll.0.saturating_sub(1),
             KeyCode::Down => self.scroll.0 = self.scroll.0.saturating_add(1).min(self.max_scroll.0),
             KeyCode::Left => self.scroll.1 = self.scroll.1.saturating_sub(4),
-            KeyCode::Right => self.scroll.1 = self.scroll.1.saturating_add(4).min(self.max_scroll.1),
+            KeyCode::Right => {
+                self.scroll.1 = self.scroll.1.saturating_add(4).min(self.max_scroll.1)
+            }
             KeyCode::PageUp => self.scroll.0 = self.scroll.0.saturating_sub(self.page_height),
             KeyCode::PageDown => {
-                self.scroll.0 = self.scroll.0.saturating_add(self.page_height).min(self.max_scroll.0);
+                self.scroll.0 = self
+                    .scroll
+                    .0
+                    .saturating_add(self.page_height)
+                    .min(self.max_scroll.0);
             }
             KeyCode::Home => self.scroll = (0, 0),
             KeyCode::End => self.scroll.0 = self.max_scroll.0,
@@ -59,7 +65,10 @@ fn node(label: impl Into<String>, owned: Option<bool>, selected: bool) -> Line<'
     if selected {
         style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
     }
-    Line::styled(format!("{}{}", if selected { "▶ " } else { "  " }, label.into()), style)
+    Line::styled(
+        format!("{}{}", if selected { "▶ " } else { "  " }, label.into()),
+        style,
+    )
 }
 
 fn note(text: impl Into<String>) -> Line<'static> {
@@ -72,32 +81,63 @@ fn arrow() -> Line<'static> {
 
 fn topology_lines(router: &RouterData, expanded: bool) -> Vec<Line<'static>> {
     let selected = router.routes.get(router.selected_route);
-    let related = |name: &str| selected.is_some_and(|route| route.output_interface.as_deref() == Some(name));
+    let related =
+        |name: &str| selected.is_some_and(|route| route.output_interface.as_deref() == Some(name));
     let desired = router.plan.as_ref().map(|plan| &plan.desired);
     let interfaces = desired.map_or(&[][..], |desired| desired.interfaces.as_slice());
     let mut lines = Vec::new();
     if !router.topology.loaded {
-        lines.push(Line::styled("Refresh incomplete / no data", Style::default().fg(theme::WARN)));
+        lines.push(Line::styled(
+            "Refresh incomplete / no data",
+            Style::default().fg(theme::WARN),
+        ));
     }
     if router.staged {
-        lines.push(Line::styled("Includes staged configuration edits", Style::default().fg(theme::WARN)));
+        lines.push(Line::styled(
+            "Includes staged configuration edits",
+            Style::default().fg(theme::WARN),
+        ));
     }
 
     if let Some(connections) = &router.proposed_router_config.forwarding {
         lines.push(note("IPv4 forwarding connections"));
         for connection in connections {
-            lines.push(node(format!("{} → {}", connection.from, connection.to), None,
-                related(&connection.from) || related(&connection.to)));
-            lines.push(note(format!("    {} · source {}", if connection.masquerade { "Masquerade" } else { "No NAT" },
-                connection.source_subnet.map_or("any".into(), |subnet| subnet.to_string()))));
+            lines.push(node(
+                format!("{} → {}", connection.from, connection.to),
+                None,
+                related(&connection.from) || related(&connection.to),
+            ));
+            lines.push(note(format!(
+                "    {} · source {}",
+                if connection.masquerade {
+                    "Masquerade"
+                } else {
+                    "No NAT"
+                },
+                connection
+                    .source_subnet
+                    .map_or("any".into(), |subnet| subnet.to_string())
+            )));
         }
-        if connections.is_empty() { lines.push(note("  No forwarding connections")); }
+        if connections.is_empty() {
+            lines.push(note("  No forwarding connections"));
+        }
         lines.push(note("Routes determine the packet path."));
         if expanded {
             lines.push(note("Observed default routes"));
-            for route in router.routes.iter().filter(|route| route.destination.prefix_len() == 0) {
-                lines.push(note(format!("  {} via {} (table {})", route.output_interface.as_deref().unwrap_or("unknown"),
-                    route.gateway.map_or("on-link".into(), |gateway| gateway.to_string()), route.table)));
+            for route in router
+                .routes
+                .iter()
+                .filter(|route| route.destination.prefix_len() == 0)
+            {
+                lines.push(note(format!(
+                    "  {} via {} (table {})",
+                    route.output_interface.as_deref().unwrap_or("unknown"),
+                    route
+                        .gateway
+                        .map_or("on-link".into(), |gateway| gateway.to_string()),
+                    route.table
+                )));
             }
         }
         return lines;
@@ -105,28 +145,65 @@ fn topology_lines(router: &RouterData, expanded: bool) -> Vec<Line<'static>> {
 
     lines.push(note("Local networks / Wi-Fi"));
     let mut has_lan = false;
-    for interface in interfaces.iter().filter(|interface| interface.config.role == InterfaceRole::Output) {
+    for interface in interfaces
+        .iter()
+        .filter(|interface| interface.config.role == InterfaceRole::Output)
+    {
         has_lan = true;
         lines.push(node(
-            format!("{}{}", interface.name, if interface.config.managed { "" } else { " [ext]" }),
+            format!(
+                "{}{}",
+                interface.name,
+                if interface.config.managed {
+                    ""
+                } else {
+                    " [ext]"
+                }
+            ),
             Some(interface.config.managed),
             related(&interface.name),
         ));
         if let Some(address) = interface.config.ipv4 {
-            lines.push(note(format!("    {}{}", address.trunc(), if interface.config.nat { " NAT" } else { " no NAT" })));
+            lines.push(note(format!(
+                "    {}{}",
+                address.trunc(),
+                if interface.config.nat {
+                    " NAT"
+                } else {
+                    " no NAT"
+                }
+            )));
         }
     }
     if !has_lan {
-        lines.push(note(if desired.is_some() { "  No configured LAN" } else { "  LAN data unavailable" }));
+        lines.push(note(if desired.is_some() {
+            "  No configured LAN"
+        } else {
+            "  LAN data unavailable"
+        }));
     }
     lines.push(arrow());
     lines.push(node(
-        format!("Router: {}", if router.enabled { "enabled" } else { "disabled" }),
+        format!(
+            "Router: {}",
+            if router.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ),
         None,
         false,
     ));
     lines.push(note(match &router.plan {
-        Some(plan) => format!("  Forwarding: {} (snapshot)", if plan.dataplane.snapshot.ipv4_forwarding { "on" } else { "off" }),
+        Some(plan) => format!(
+            "  Forwarding: {} (snapshot)",
+            if plan.dataplane.snapshot.ipv4_forwarding {
+                "on"
+            } else {
+                "off"
+            }
+        ),
         None => "  Forwarding: unknown".into(),
     }));
 
@@ -139,50 +216,94 @@ fn topology_lines(router: &RouterData, expanded: bool) -> Vec<Line<'static>> {
         for (index, hop) in chain.iter().enumerate().rev() {
             lines.push(arrow());
             let interface = hop_interface_name(index as u32);
-            lines.push(node(format!("VPN: {interface}"), Some(true), related(&interface)));
+            lines.push(node(
+                format!("VPN: {interface}"),
+                Some(true),
+                related(&interface),
+            ));
             if expanded {
                 lines.push(note(format!("    Profile: {}", hop.profile_name)));
             }
         }
     }
     lines.push(arrow());
-    let uplink = router.proposed_router_config.uplink.as_ref().map(|uplink| uplink.interface.as_str());
+    let uplink = router
+        .proposed_router_config
+        .uplink
+        .as_ref()
+        .map(|uplink| uplink.interface.as_str());
     if let Some(uplink) = uplink {
-        let managed = interfaces.iter().find(|interface| interface.name == uplink).map(|interface| interface.config.managed);
+        let managed = interfaces
+            .iter()
+            .find(|interface| interface.name == uplink)
+            .map(|interface| interface.config.managed);
         lines.push(node(
-            format!("Uplink: {uplink}{}", match managed { Some(true) => "", Some(false) => " [ext]", None => " [?]" }),
+            format!(
+                "Uplink: {uplink}{}",
+                match managed {
+                    Some(true) => "",
+                    Some(false) => " [ext]",
+                    None => " [?]",
+                }
+            ),
             Some(managed.unwrap_or(false)),
             related(uplink),
         ));
-        let gateways: Vec<_> = router.routes.iter().filter(|route| {
-            route.destination.prefix_len() == 0 && route.output_interface.as_deref() == Some(uplink)
-        }).collect();
+        let gateways: Vec<_> = router
+            .routes
+            .iter()
+            .filter(|route| {
+                route.destination.prefix_len() == 0
+                    && route.output_interface.as_deref() == Some(uplink)
+            })
+            .collect();
         lines.push(note(format!("  Default candidates: {}", gateways.len())));
         for route in gateways {
             lines.push(node(
-                route.gateway.map_or_else(|| "Direct (no gateway)".into(), |gateway| format!("Gateway: {gateway}")),
+                route.gateway.map_or_else(
+                    || "Direct (no gateway)".into(),
+                    |gateway| format!("Gateway: {gateway}"),
+                ),
                 Some(route.owner.is_owned()),
                 selected == Some(route),
             ));
-            lines.push(note(format!("    table {} / metric {}", route.table, route.metric.unwrap_or(0))));
+            lines.push(note(format!(
+                "    table {} / metric {}",
+                route.table,
+                route.metric.unwrap_or(0)
+            )));
         }
     } else {
         lines.push(node("Uplink: not configured", Some(false), false));
         lines.push(note("  Observed default routes:"));
         let mut found = false;
-        for route in router.routes.iter().filter(|route| route.destination.prefix_len() == 0) {
+        for route in router
+            .routes
+            .iter()
+            .filter(|route| route.destination.prefix_len() == 0)
+        {
             found = true;
             lines.push(node(
-                format!("dev {}", route.output_interface.as_deref().unwrap_or("unknown")),
+                format!(
+                    "dev {}",
+                    route.output_interface.as_deref().unwrap_or("unknown")
+                ),
                 Some(route.owner.is_owned()),
                 selected == Some(route),
             ));
             lines.push(node(
-                route.gateway.map_or_else(|| "Direct (no gateway)".into(), |gateway| format!("Gateway: {gateway}")),
+                route.gateway.map_or_else(
+                    || "Direct (no gateway)".into(),
+                    |gateway| format!("Gateway: {gateway}"),
+                ),
                 Some(route.owner.is_owned()),
                 selected == Some(route),
             ));
-            lines.push(note(format!("    table {} / metric {}", route.table, route.metric.unwrap_or(0))));
+            lines.push(note(format!(
+                "    table {} / metric {}",
+                route.table,
+                route.metric.unwrap_or(0)
+            )));
         }
         if !found {
             lines.push(note("    None in route list"));
@@ -194,11 +315,29 @@ fn topology_lines(router: &RouterData, expanded: bool) -> Vec<Line<'static>> {
     lines.push(Line::default());
     lines.push(note("Selected route (route list)"));
     if let Some(route) = selected {
-        lines.push(node(route.destination.to_string(), Some(route.owner.is_owned()), true));
-        lines.push(node(format!("{}", route.owner), Some(route.owner.is_owned()), false));
-        lines.push(note(format!("  dev {}", route.output_interface.as_deref().unwrap_or("unknown"))));
-        lines.push(note(route.gateway.map_or_else(|| "  Direct / on-link".into(), |gateway| format!("  via {gateway}"))));
-        lines.push(note(format!("  table {} / metric {}", route.table, route.metric.unwrap_or(0))));
+        lines.push(node(
+            route.destination.to_string(),
+            Some(route.owner.is_owned()),
+            true,
+        ));
+        lines.push(node(
+            format!("{}", route.owner),
+            Some(route.owner.is_owned()),
+            false,
+        ));
+        lines.push(note(format!(
+            "  dev {}",
+            route.output_interface.as_deref().unwrap_or("unknown")
+        )));
+        lines.push(note(route.gateway.map_or_else(
+            || "  Direct / on-link".into(),
+            |gateway| format!("  via {gateway}"),
+        )));
+        lines.push(note(format!(
+            "  table {} / metric {}",
+            route.table,
+            route.metric.unwrap_or(0)
+        )));
     } else {
         lines.push(note("  No route selected"));
     }
@@ -214,9 +353,19 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
         Paragraph::new("Configured links; not a probe\n▶ related; yellow: external"),
         Rect::new(inner.x, inner.y, inner.width, inner.height.min(2)),
     );
-    let content = Rect::new(inner.x, inner.y.saturating_add(2), inner.width, inner.height.saturating_sub(3));
+    let content = Rect::new(
+        inner.x,
+        inner.y.saturating_add(2),
+        inner.width,
+        inner.height.saturating_sub(3),
+    );
     let lines = topology_lines(&app.router, expanded);
-    let max_width = lines.iter().map(Line::width).max().unwrap_or(0).min(u16::MAX as usize) as u16;
+    let max_width = lines
+        .iter()
+        .map(Line::width)
+        .max()
+        .unwrap_or(0)
+        .min(u16::MAX as usize) as u16;
     let view = &mut app.router.topology;
     view.page_height = content.height.max(1);
     view.max_scroll = (
@@ -224,7 +373,11 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
         max_width.saturating_sub(content.width),
     );
     view.scroll.0 = view.scroll.0.min(view.max_scroll.0);
-    view.scroll.1 = if expanded { view.scroll.1.min(view.max_scroll.1) } else { 0 };
+    view.scroll.1 = if expanded {
+        view.scroll.1.min(view.max_scroll.1)
+    } else {
+        0
+    };
     frame.render_widget(Paragraph::new(lines).scroll(view.scroll), content);
     if inner.height > 2 {
         let footer = Rect::new(inner.x, inner.bottom() - 1, inner.width, 1);
@@ -235,9 +388,15 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
             let button_text = "[t: expand]";
             ("[t: expand] PgUp/PgDn: scroll", button_text.len() as u16)
         };
-        frame.render_widget(Paragraph::new(label).style(Style::default().fg(theme::ACCENT)), footer);
+        frame.render_widget(
+            Paragraph::new(label).style(Style::default().fg(theme::ACCENT)),
+            footer,
+        );
         // The topology action is also the close action in the expanded view.
-        app.ui.buttons.push((Rect::new(footer.x, footer.y, button_len.min(footer.width), 1), 6));
+        app.ui.buttons.push((
+            Rect::new(footer.x, footer.y, button_len.min(footer.width), 1),
+            6,
+        ));
     }
 }
 
@@ -249,8 +408,10 @@ mod tests {
 
     #[test]
     fn topology_view_key_navigation_and_clamping() {
-        let mut view = TopologyView::default();
-        view.loaded = true;
+        let mut view = TopologyView {
+            loaded: true,
+            ..Default::default()
+        };
         assert!(!view.open);
         assert!(view.loaded);
         assert_eq!(view.scroll, (0, 0));

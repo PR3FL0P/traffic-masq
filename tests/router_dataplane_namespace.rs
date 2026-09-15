@@ -1,6 +1,5 @@
 use std::fs;
 use std::process::{Command, Output, Stdio};
-use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -10,7 +9,7 @@ use traffic_masq::firewall::{
 };
 use traffic_masq::netlink::RtnetlinkNetworkProvider;
 
-static NAMESPACE_TEST_LOCK: Mutex<()> = Mutex::new(());
+static NAMESPACE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const IPV4_FORWARDING_PATH: &str = "/proc/sys/net/ipv4/ip_forward";
 
 struct RouterDataplaneFixture {
@@ -130,9 +129,7 @@ async fn explicit_interface_forwarding_masquerades_and_rolls_back() -> Result<()
 }
 
 async fn exercise_forwarding(explicit: bool) -> Result<()> {
-    let _test_guard = NAMESPACE_TEST_LOCK
-        .lock()
-        .map_err(|_| anyhow::anyhow!("namespace test lock is poisoned"))?;
+    let _test_guard = NAMESPACE_TEST_LOCK.lock().await;
     let fixture = RouterDataplaneFixture::new()?;
     let provider = LinuxRouterDataplaneProvider::new(
         Ipv4ForwardingBackend::new(ProcSysIpv4ForwardingIo),

@@ -69,6 +69,7 @@ pub enum CoordinatorStatus {
 
 #[derive(Debug, Clone)]
 pub struct RollbackFailure {
+    pub token: String,
     pub candidate: RouterCandidate,
     pub snapshot: RouterSnapshot,
     pub failures: Vec<String>,
@@ -93,11 +94,20 @@ enum RollbackTrigger {
     Timeout,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct TransactionJournal {
+    version: u32,
+    base_revision: u64,
+    token: String,
+    snapshot: RouterSnapshot,
+}
+
 struct Inner {
     manager: RouterManager,
     overrides: RuntimeOverrideManager,
     rollback_timeout: Duration,
     state: Mutex<CoordinatorState>,
+    journal: std::path::PathBuf,
     token_counter: AtomicU64,
 }
 
@@ -114,6 +124,7 @@ impl RouterTransactionCoordinator {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
+                journal: overrides.path().with_file_name("router-transaction.json"),
                 manager,
                 overrides,
                 rollback_timeout,
@@ -162,9 +173,38 @@ impl RouterTransactionCoordinator {
             return Err(StalePlanError.into());
         }
 
-        self.inner.manager.apply(&plan.plan).await?;
-
         let token = self.next_token();
+        self.write_journal(plan.candidate.base_revision(), &token, &current_snapshot)
+            .await?;
+        if let Err(error) = self.inner.manager.apply(&plan.plan).await {
+            // Retry the complete snapshot: a failed apply may also have failed
+            // its compensation. Keep the journal until restoration succeeds.
+            let failures = self.inner.manager.rollback_to(&current_snapshot).await;
+            if failures.is_empty() {
+                if let Err(cleanup_error) = self.clear_journal().await {
+                    *state = CoordinatorState::RollbackFailed(RollbackFailure {
+                        token: token.clone(),
+                        candidate: plan.candidate,
+                        snapshot: current_snapshot,
+                        failures: vec![format!(
+                            "failed to clear rollback journal: {cleanup_error:#}"
+                        )],
+                    });
+                    return Err(error.context(format!(
+                        "rollback journal cleanup failed: {cleanup_error:#}"
+                    )));
+                }
+            } else {
+                *state = CoordinatorState::RollbackFailed(RollbackFailure {
+                    token: token.clone(),
+                    candidate: plan.candidate,
+                    snapshot: current_snapshot,
+                    failures,
+                });
+            }
+            return Err(error);
+        }
+
         *state = CoordinatorState::Pending(PendingTransaction {
             token: token.clone(),
             candidate: plan.candidate,
@@ -191,7 +231,7 @@ impl RouterTransactionCoordinator {
         self.inner.manager.apply(&plan).await
     }
 
-    pub async fn commit(&self) -> Result<u64> {
+    pub async fn commit(&self, token: &str) -> Result<u64> {
         let mut state = self.inner.state.lock().await;
         let pending = match &*state {
             CoordinatorState::Pending(pending) => pending.clone(),
@@ -201,10 +241,14 @@ impl RouterTransactionCoordinator {
             }
         };
 
+        anyhow::ensure!(
+            pending.token == token,
+            "router transaction token does not match pending transaction"
+        );
         let revision = self
             .inner
             .overrides
-            .commit_candidate(&pending.candidate)
+            .commit_candidate_with_token(&pending.candidate, Some(&pending.token))
             .await?;
 
         // Ownership now matches the intent that is in force. Interfaces this
@@ -221,11 +265,39 @@ impl RouterTransactionCoordinator {
         self.inner.manager.retain_router_interfaces(&owned).await;
 
         *state = CoordinatorState::Idle;
+        // The persisted revision is authoritative if removal fails or the
+        // process dies here. Recovery must never undo a committed revision.
+        if let Err(error) = self.clear_journal().await {
+            tracing::warn!(%error, "failed to remove committed transaction journal");
+        }
         Ok(revision)
     }
 
     pub async fn rollback(&self) -> Result<()> {
         let mut state = self.inner.state.lock().await;
+        self.rollback_locked(&mut state, RollbackTrigger::Manual)
+            .await
+    }
+
+    pub async fn pending_token(&self) -> Option<String> {
+        match &*self.inner.state.lock().await {
+            CoordinatorState::Pending(pending) => Some(pending.token.clone()),
+            CoordinatorState::RollbackFailed(failure) => Some(failure.token.clone()),
+            CoordinatorState::Idle => None,
+        }
+    }
+
+    pub async fn rollback_with_token(&self, token: &str) -> Result<()> {
+        let mut state = self.inner.state.lock().await;
+        let expected = match &*state {
+            CoordinatorState::Pending(pending) => &pending.token,
+            CoordinatorState::RollbackFailed(failure) => &failure.token,
+            CoordinatorState::Idle => return Err(NoPendingTransactionError.into()),
+        };
+        anyhow::ensure!(
+            expected == token,
+            "router transaction token does not match pending transaction"
+        );
         self.rollback_locked(&mut state, RollbackTrigger::Manual)
             .await
     }
@@ -250,13 +322,17 @@ impl RouterTransactionCoordinator {
         state: &mut MutexGuard<'_, CoordinatorState>,
         trigger: RollbackTrigger,
     ) -> Result<()> {
-        let (candidate, snapshot) = match &**state {
-            CoordinatorState::Pending(pending) => {
-                (pending.candidate.clone(), pending.snapshot.clone())
-            }
-            CoordinatorState::RollbackFailed(failure) => {
-                (failure.candidate.clone(), failure.snapshot.clone())
-            }
+        let (token, candidate, snapshot) = match &**state {
+            CoordinatorState::Pending(pending) => (
+                pending.token.clone(),
+                pending.candidate.clone(),
+                pending.snapshot.clone(),
+            ),
+            CoordinatorState::RollbackFailed(failure) => (
+                failure.token.clone(),
+                failure.candidate.clone(),
+                failure.snapshot.clone(),
+            ),
             CoordinatorState::Idle => return Err(NoPendingTransactionError.into()),
         };
 
@@ -274,6 +350,15 @@ impl RouterTransactionCoordinator {
                 .collect();
             self.inner.manager.retain_router_interfaces(&owned).await;
 
+            if let Err(error) = self.clear_journal().await {
+                **state = CoordinatorState::RollbackFailed(RollbackFailure {
+                    token,
+                    candidate,
+                    snapshot,
+                    failures: vec![format!("failed to clear rollback journal: {error:#}")],
+                });
+                return Err(error.context("network restored but rollback journal cleanup failed"));
+            }
             **state = CoordinatorState::Idle;
             if trigger == RollbackTrigger::Timeout {
                 tracing::warn!("router transaction automatically rolled back after timeout");
@@ -282,6 +367,7 @@ impl RouterTransactionCoordinator {
         } else {
             let message = failures.join("; ");
             **state = CoordinatorState::RollbackFailed(RollbackFailure {
+                token,
                 candidate,
                 snapshot,
                 failures,
@@ -312,6 +398,91 @@ impl RouterTransactionCoordinator {
             tokio::time::sleep(timeout).await;
             coordinator.rollback_timeout_fired(&token).await;
         });
+    }
+
+    async fn write_journal(
+        &self,
+        base_revision: u64,
+        token: &str,
+        snapshot: &RouterSnapshot,
+    ) -> Result<()> {
+        let journal = TransactionJournal {
+            version: 1,
+            base_revision,
+            token: token.to_owned(),
+            snapshot: snapshot.clone(),
+        };
+        let bytes = serde_json::to_vec(&journal)?;
+        if let Some(parent) = self.inner.journal.parent() {
+            let parent = parent.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                crate::atomic_file::ensure_private_dir(
+                    &parent,
+                    crate::atomic_file::PRIVATE_DIR_MODE,
+                )
+            })
+            .await??;
+        }
+        crate::atomic_file::replace_async(&self.inner.journal, &bytes, 0o600).await?;
+        Ok(())
+    }
+
+    async fn clear_journal(&self) -> Result<()> {
+        let path = self.inner.journal.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            crate::atomic_file::reject_symlink(&path)?;
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    std::fs::File::open(path.parent().context("journal parent")?)?.sync_all()?
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    /// Restore an interrupted transaction before accepting control requests.
+    pub async fn recover(&self) -> Result<bool> {
+        let _state = self.inner.state.lock().await;
+        crate::atomic_file::reject_symlink(&self.inner.journal)?;
+        let bytes = match tokio::fs::read(&self.inner.journal).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let journal: TransactionJournal =
+            serde_json::from_slice(&bytes).context("invalid router transaction journal")?;
+        anyhow::ensure!(
+            journal.version == 1,
+            "unsupported router transaction journal version"
+        );
+        let revision = self.inner.overrides.committed_revision().await;
+        anyhow::ensure!(
+            revision >= journal.base_revision,
+            "transaction journal is newer than committed configuration"
+        );
+        let committed = self
+            .inner
+            .overrides
+            .snapshot()
+            .await
+            .committed_router_transaction
+            .as_deref()
+            == Some(journal.token.as_str());
+        if !committed {
+            let failures = self.inner.manager.rollback_to(&journal.snapshot).await;
+            anyhow::ensure!(
+                failures.is_empty(),
+                "interrupted router transaction recovery failed: {}",
+                failures.join("; ")
+            );
+            tracing::warn!("restored interrupted router transaction");
+        }
+        self.clear_journal().await?;
+        Ok(!committed)
     }
 
     fn next_token(&self) -> String {
@@ -585,6 +756,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovery_restores_a_snapshot_left_before_apply() {
+        let fake = FakeSubsystems::new();
+        let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
+        let candidate = build_candidate(&overrides).await;
+        let snapshot = coordinator
+            .manager()
+            .snapshot_for(candidate.desired())
+            .await
+            .unwrap();
+        coordinator
+            .write_journal(candidate.base_revision(), "test-transaction", &snapshot)
+            .await
+            .unwrap();
+        let restored = RouterTransactionCoordinator::new(
+            coordinator.manager(),
+            overrides,
+            Duration::from_secs(60),
+        );
+        restored.recover().await.unwrap();
+        assert!(fake
+            .events()
+            .iter()
+            .any(|event| event == "rollback_interfaces"));
+        assert!(!restored.inner.journal.exists());
+    }
+
+    #[tokio::test]
+    async fn recovery_does_not_undo_a_persisted_commit() {
+        let fake = FakeSubsystems::new();
+        let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
+        let candidate = build_candidate(&overrides).await;
+        let snapshot = coordinator
+            .manager()
+            .snapshot_for(candidate.desired())
+            .await
+            .unwrap();
+        coordinator
+            .write_journal(candidate.base_revision(), "test-transaction", &snapshot)
+            .await
+            .unwrap();
+        overrides
+            .commit_candidate_with_token(&candidate, Some("test-transaction"))
+            .await
+            .unwrap();
+        let restored = RouterTransactionCoordinator::new(
+            coordinator.manager(),
+            overrides,
+            Duration::from_secs(60),
+        );
+        restored.recover().await.unwrap();
+        assert!(!fake
+            .events()
+            .iter()
+            .any(|event| event.starts_with("rollback_")));
+        assert!(!restored.inner.journal.exists());
+    }
+
+    #[tokio::test]
+    async fn failed_recovery_preserves_the_journal_for_retry() {
+        let fake = FakeSubsystems::new();
+        let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
+        let candidate = build_candidate(&overrides).await;
+        let snapshot = coordinator
+            .manager()
+            .snapshot_for(candidate.desired())
+            .await
+            .unwrap();
+        coordinator
+            .write_journal(candidate.base_revision(), "test-transaction", &snapshot)
+            .await
+            .unwrap();
+        fake.fail_rollback("rollback_routes");
+        assert!(coordinator.recover().await.is_err());
+        assert!(coordinator.inner.journal.exists());
+        *fake.rollback_fail.lock().unwrap() = None;
+        coordinator.recover().await.unwrap();
+        assert!(!coordinator.inner.journal.exists());
+    }
+
+    #[tokio::test]
+    async fn unrelated_saved_settings_do_not_confirm_router_transaction() {
+        let fake = FakeSubsystems::new();
+        let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
+        let candidate = build_candidate(&overrides).await;
+        let snapshot = coordinator
+            .manager()
+            .snapshot_for(candidate.desired())
+            .await
+            .unwrap();
+        coordinator
+            .write_journal(candidate.base_revision(), "unconfirmed", &snapshot)
+            .await
+            .unwrap();
+        overrides
+            .set_vpn_mode(crate::config::VpnPolicyMode::Direct)
+            .await
+            .unwrap();
+        assert!(coordinator.recover().await.unwrap());
+        assert!(fake
+            .events()
+            .iter()
+            .any(|event| event == "rollback_interfaces"));
+    }
+
+    #[tokio::test]
+    async fn invalid_recovery_record_is_not_discarded() {
+        let (coordinator, _, _directory) = coordinator_with(FakeSubsystems::new()).await;
+        tokio::fs::write(&coordinator.inner.journal, b"invalid")
+            .await
+            .unwrap();
+        assert!(coordinator.recover().await.is_err());
+        assert!(coordinator.inner.journal.exists());
+    }
+
+    #[tokio::test]
+    async fn write_journal_creates_missing_parent_directory() {
+        let fake = FakeSubsystems::new();
+        let (coordinator, overrides, directory) = coordinator_with(fake.clone()).await;
+        let nested_dir = directory.path().join("nested_missing_state_dir");
+        let non_existent_journal = nested_dir.join("router-transaction.json");
+        assert!(!nested_dir.exists());
+
+        let candidate = build_candidate(&overrides).await;
+        let snapshot = coordinator
+            .manager()
+            .snapshot_for(candidate.desired())
+            .await
+            .unwrap();
+
+        let isolated_coordinator = RouterTransactionCoordinator {
+            inner: Arc::new(Inner {
+                journal: non_existent_journal.clone(),
+                manager: coordinator.manager(),
+                overrides,
+                rollback_timeout: Duration::from_secs(60),
+                state: Mutex::new(CoordinatorState::Idle),
+                token_counter: AtomicU64::new(0),
+            }),
+        };
+
+        isolated_coordinator
+            .write_journal(candidate.base_revision(), "token-1", &snapshot)
+            .await
+            .unwrap();
+
+        assert!(non_existent_journal.exists());
+    }
+
+    #[tokio::test]
     async fn full_lifecycle_applies_and_commits() {
         let fake = FakeSubsystems::new();
         let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
@@ -594,7 +914,10 @@ mod tests {
         coordinator.apply(plan).await.expect("apply");
         assert_eq!(coordinator.status().await, CoordinatorStatus::Pending);
 
-        let revision = coordinator.commit().await.expect("commit");
+        let revision = coordinator
+            .commit(&coordinator.pending_token().await.unwrap_or_default())
+            .await
+            .expect("commit");
         assert_eq!(revision, 1);
         assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
         assert_eq!(overrides.committed_revision().await, 1);
@@ -746,7 +1069,7 @@ mod tests {
             .expect("conflicting target directory");
 
         let error = coordinator
-            .commit()
+            .commit(&coordinator.pending_token().await.unwrap_or_default())
             .await
             .expect_err("commit persistence must fail");
         assert!(!error.to_string().is_empty());
@@ -756,9 +1079,61 @@ mod tests {
         tokio::fs::remove_dir(overrides.path())
             .await
             .expect("cleanup");
-        let revision = coordinator.commit().await.expect("retry commit");
+        let revision = coordinator
+            .commit(&coordinator.pending_token().await.unwrap_or_default())
+            .await
+            .expect("retry commit");
         assert_eq!(revision, 1);
         let _ = directory;
+    }
+
+    #[tokio::test]
+    async fn stale_confirmation_cannot_commit_or_rollback_a_new_transaction() {
+        let (coordinator, overrides, _directory) = coordinator_with(FakeSubsystems::new()).await;
+        let plan = coordinator
+            .plan(build_candidate(&overrides).await)
+            .await
+            .unwrap();
+        let old = coordinator.apply(plan).await.unwrap();
+        coordinator.rollback_with_token(&old).await.unwrap();
+        let plan = coordinator
+            .plan(build_candidate(&overrides).await)
+            .await
+            .unwrap();
+        let current = coordinator.apply(plan).await.unwrap();
+        assert_ne!(old, current);
+        assert!(coordinator.commit(&old).await.is_err());
+        assert!(coordinator.rollback_with_token(&old).await.is_err());
+        assert_eq!(coordinator.status().await, CoordinatorStatus::Pending);
+        assert_eq!(overrides.committed_revision().await, 0);
+        coordinator.commit(&current).await.unwrap();
+        assert_eq!(overrides.committed_revision().await, 1);
+    }
+
+    #[tokio::test]
+    async fn rollback_journal_cleanup_failure_cannot_be_committed() {
+        let (coordinator, overrides, _directory) = coordinator_with(FakeSubsystems::new()).await;
+        let plan = coordinator
+            .plan(build_candidate(&overrides).await)
+            .await
+            .unwrap();
+        coordinator.apply(plan).await.unwrap();
+        let journal = &coordinator.inner.journal;
+        tokio::fs::remove_file(journal).await.unwrap();
+        tokio::fs::create_dir(journal).await.unwrap();
+        assert!(coordinator.rollback().await.is_err());
+        assert_eq!(
+            coordinator.status().await,
+            CoordinatorStatus::RollbackFailed
+        );
+        assert!(coordinator
+            .commit(&coordinator.pending_token().await.unwrap_or_default())
+            .await
+            .is_err());
+        assert_eq!(overrides.committed_revision().await, 0);
+        tokio::fs::remove_dir(journal).await.unwrap();
+        coordinator.rollback().await.unwrap();
+        assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
     }
 
     #[tokio::test]
@@ -806,7 +1181,10 @@ mod tests {
         let candidate = build_candidate(&overrides).await;
         let plan = coordinator.plan(candidate).await.expect("plan");
         coordinator.apply(plan).await.expect("apply");
-        coordinator.commit().await.expect("commit before timeout");
+        coordinator
+            .commit(&coordinator.pending_token().await.unwrap_or_default())
+            .await
+            .expect("commit before timeout");
 
         tokio::time::sleep(Duration::from_millis(150)).await;
 

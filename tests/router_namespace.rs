@@ -2,7 +2,6 @@ use std::fs;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -17,7 +16,7 @@ use traffic_masq::config::{
     UplinkConfig, UplinkMode,
 };
 
-static NAMESPACE_TEST_LOCK: Mutex<()> = Mutex::new(());
+static NAMESPACE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -393,9 +392,7 @@ fn write_lease_script(script_path: &std::path::Path, result_path: &std::path::Pa
 #[tokio::test]
 #[ignore = "requires root, Linux, iproute2, nftables, udhcpc and python3; spawns a real traffic-masqd process; run only on a disposable test host"]
 async fn daemon_serves_dhcp_forwards_and_masquerades_client_traffic() -> Result<()> {
-    let _test_guard = NAMESPACE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _test_guard = NAMESPACE_TEST_LOCK.lock().await;
 
     let mut fixture = RouterNamespaceFixture::new().await?;
     if let Err(error) = run_happy_path(&mut fixture).await {

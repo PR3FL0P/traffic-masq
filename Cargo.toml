@@ -3,7 +3,10 @@
 name = "traffic-masq"
 version = "0.1.0"
 edition = "2021"
-license = "LICENSED"
+license-file = "LICENSE"
+rust-version = "1.95"
+description = "Linux router, Wi-Fi and VPN management with confirmed network changes"
+repository = "https://github.com/bpseditor/traffic-masq"
 
 [lib]
 name = "traffic_masq"

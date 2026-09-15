@@ -59,8 +59,11 @@ pub(crate) fn select_pane(app: &mut TuiApp, pane: RouterPane) {
     app.router.pane = pane;
     app.router.focus = RouterFocus::RouteTable;
     app.router.sharing_actions_focused = false;
-    if pane == RouterPane::Topology { app.router.topology.show(); }
-    else { app.router.topology.open = false; }
+    if pane == RouterPane::Topology {
+        app.router.topology.show();
+    } else {
+        app.router.topology.open = false;
+    }
     app.ui.buttons.clear();
     app.ui.list_area = None;
 }
@@ -503,7 +506,12 @@ fn delete_selected_route(app: &mut TuiApp) {
     }
     if app.router.proposed_router_config.owned_routes.is_empty()
         && app.router.proposed_router_config.uplink.is_none()
-        && app.router.proposed_router_config.forwarding.as_ref().is_none_or(Vec::is_empty)
+        && app
+            .router
+            .proposed_router_config
+            .forwarding
+            .as_ref()
+            .is_none_or(Vec::is_empty)
     {
         app.router.proposed_router_config.enabled = false;
     }
@@ -658,12 +666,23 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
     let sections = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
     app.router.pane_tabs.clear();
     let mut x = sections[0].x;
-    for (label, pane) in [("[1 Routes]", RouterPane::Routes), ("[2 Internet sharing]", RouterPane::Sharing), ("[3 Topology]", RouterPane::Topology)] {
+    for (label, pane) in [
+        ("[1 Routes]", RouterPane::Routes),
+        ("[2 Internet sharing]", RouterPane::Sharing),
+        ("[3 Topology]", RouterPane::Topology),
+    ] {
         let rect = Rect::new(x, sections[0].y, label.len() as u16, 1);
         app.router.pane_tabs.push((rect, pane));
-        frame.render_widget(Paragraph::new(label).style(if app.router.pane == pane {
-            Style::default().fg(theme::SELECTED_FG).bg(theme::SELECTED_BG)
-        } else { Style::default().fg(theme::MUTED) }), rect);
+        frame.render_widget(
+            Paragraph::new(label).style(if app.router.pane == pane {
+                Style::default()
+                    .fg(theme::SELECTED_FG)
+                    .bg(theme::SELECTED_BG)
+            } else {
+                Style::default().fg(theme::MUTED)
+            }),
+            rect,
+        );
         x += rect.width + 1;
     }
     let area = sections[1];
@@ -760,7 +779,8 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
     let buttons = router_action_buttons(router);
     let button_positions = router_button_positions(&buttons, area.width.saturating_sub(2));
     let base_actions_height = button_positions.last().map_or(0, |(_, y)| y + 1) + 2;
-    let warning_rows = u16::from(router.warning_message.is_some() && area.height >= base_actions_height + 4);
+    let warning_rows =
+        u16::from(router.warning_message.is_some() && area.height >= base_actions_height + 4);
     let actions_height = base_actions_height + warning_rows;
     let status_height = (status_lines.len() as u16 + 2)
         .clamp(3, 8)
@@ -782,7 +802,7 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
 
     let table_title = match router.focus {
         RouterFocus::RouteTable => "Routes | n: share via selected interface; Tab: actions",
-        RouterFocus::Actions => "Routes [Tab: focus table]",
+        RouterFocus::Actions => "Routes [Esc/Tab: focus table]",
     };
     let table_block = panel(table_title);
     let table_inner = table_block.inner(chunks[1]);
@@ -899,7 +919,7 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         );
     }
 
-    let actions_block = panel("Actions | Arrows: move; Enter: activate; Tab: routes");
+    let actions_block = panel("Actions | Arrows: move; Enter: activate; Esc/Tab: routes");
     let actions_inner = actions_block.inner(chunks[2]);
     frame.render_widget(actions_block, chunks[2]);
 
@@ -1110,9 +1130,19 @@ pub(crate) fn render_router_plan(frame: &mut ratatui::Frame<'_>, area: Rect, app
     if let RouterDataplaneTarget::Enabled(desired) = &plan.dataplane.target {
         if let Some(connections) = &desired.forwarding {
             for connection in connections {
-                lines.push(Line::from(format!("Share: {} → {} ({}, source {})", connection.from, connection.to,
-                    if connection.masquerade { "masquerade" } else { "no NAT" },
-                    connection.source_subnet.map_or("any".into(), |subnet| subnet.to_string()))));
+                lines.push(Line::from(format!(
+                    "Share: {} → {} ({}, source {})",
+                    connection.from,
+                    connection.to,
+                    if connection.masquerade {
+                        "masquerade"
+                    } else {
+                        "no NAT"
+                    },
+                    connection
+                        .source_subnet
+                        .map_or("any".into(), |subnet| subnet.to_string())
+                )));
             }
         }
     }
@@ -1351,11 +1381,27 @@ pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
 
 pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
     match key {
-        KeyCode::Char('1') => { select_pane(app, RouterPane::Routes); return; }
-        KeyCode::Char('2') => { select_pane(app, RouterPane::Sharing); return; }
-        KeyCode::Char('3') => { select_pane(app, RouterPane::Topology); return; }
+        KeyCode::Char('1') => {
+            select_pane(app, RouterPane::Routes);
+            return;
+        }
+        KeyCode::Char('2') => {
+            select_pane(app, RouterPane::Sharing);
+            return;
+        }
+        KeyCode::Char('3') => {
+            select_pane(app, RouterPane::Topology);
+            return;
+        }
         KeyCode::Char('t') => {
-            select_pane(app, if app.router.pane == RouterPane::Topology { RouterPane::Routes } else { RouterPane::Topology });
+            select_pane(
+                app,
+                if app.router.pane == RouterPane::Topology {
+                    RouterPane::Routes
+                } else {
+                    RouterPane::Topology
+                },
+            );
             return;
         }
         _ => {}
@@ -1366,13 +1412,22 @@ pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &A
     }
     if app.router.topology.open {
         app.router.topology.handle_key(key);
-        if !app.router.topology.open { select_pane(app, RouterPane::Routes); }
+        if !app.router.topology.open {
+            select_pane(app, RouterPane::Routes);
+        }
         return;
     }
     match key {
         KeyCode::Char('n') => super::forwarding::open_from_route(app, client).await,
         KeyCode::PageUp | KeyCode::PageDown => app.router.topology.handle_key(key),
-        KeyCode::Esc => app.screen = Screen::Dashboard,
+        KeyCode::Esc => {
+            if app.router.focus == RouterFocus::Actions {
+                app.router.focus = RouterFocus::RouteTable;
+                app.router.warning_message = None;
+            } else {
+                app.screen = Screen::Dashboard;
+            }
+        }
         KeyCode::Tab => {
             app.router.focus = match app.router.focus {
                 RouterFocus::RouteTable => RouterFocus::Actions,
@@ -1435,7 +1490,9 @@ pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &A
                     RouterAction::EditRoute => open_route_editor_for_selected(app, client).await,
                     RouterAction::DeleteRoute => delete_selected_route(app),
                     RouterAction::PlanApply => open_router_plan(app, client).await,
-                    RouterAction::ShareViaRoute => super::forwarding::open_from_route(app, client).await,
+                    RouterAction::ShareViaRoute => {
+                        super::forwarding::open_from_route(app, client).await
+                    }
                     RouterAction::Refresh => refresh_router_data(app, client).await,
                     RouterAction::Topology => select_pane(app, RouterPane::Topology),
                 },
@@ -1736,15 +1793,15 @@ async fn router_apply_current_plan(app: &mut TuiApp, client: &ApiClient) {
 }
 
 async fn finish_router_pending(app: &mut TuiApp, client: &ApiClient, commit: bool) {
-    if app.router_pending.is_none() {
+    let Some(pending) = app.router_pending.as_ref() else {
         app.screen = Screen::Router;
         return;
-    }
-
+    };
+    let token = pending.token.clone();
     let request = if commit {
-        Request::RouterCommit
+        Request::RouterCommit { token }
     } else {
-        Request::RouterRollback
+        Request::RouterRollback { token }
     };
 
     match client.request(&request).await {
@@ -1771,6 +1828,7 @@ async fn finish_router_pending(app: &mut TuiApp, client: &ApiClient, commit: boo
         Ok(Response::RouterPendingTransaction {
             status: CoordinatorStatus::RollbackFailed,
             rollback_failure,
+            ..
         }) => {
             if let Some(view) = app.router_pending.as_mut() {
                 view.rollback_failure = rollback_failure;
@@ -1807,6 +1865,7 @@ pub(crate) async fn refresh_router_pending_screen(app: &mut TuiApp, client: &Api
         Ok(Response::RouterPendingTransaction {
             status: CoordinatorStatus::RollbackFailed,
             rollback_failure,
+            ..
         }) => {
             if let Some(view) = app.router_pending.as_mut() {
                 view.rollback_failure = rollback_failure;
@@ -1998,7 +2057,10 @@ mod tests {
         assert_eq!(action.next(), RouterAction::EditRoute);
         assert_eq!(action.next().next(), RouterAction::DeleteRoute);
         assert_eq!(action.next().next().next(), RouterAction::PlanApply);
-        assert_eq!(action.next().next().next().next(), RouterAction::ShareViaRoute);
+        assert_eq!(
+            action.next().next().next().next(),
+            RouterAction::ShareViaRoute
+        );
         assert_eq!(
             action.next().next().next().next().next(),
             RouterAction::Refresh
@@ -2498,6 +2560,17 @@ mod tests {
         assert_eq!(app.router.focus, RouterFocus::Actions);
         super::super::handle_key(&mut app, KeyCode::BackTab, &client, false).await;
         assert_eq!(app.router.focus, RouterFocus::RouteTable);
+
+        // Esc in Actions returns to RouteTable without leaving Router screen
+        super::super::handle_key(&mut app, KeyCode::Tab, &client, false).await;
+        assert_eq!(app.router.focus, RouterFocus::Actions);
+        super::super::handle_key(&mut app, KeyCode::Esc, &client, false).await;
+        assert_eq!(app.router.focus, RouterFocus::RouteTable);
+        assert_eq!(app.screen, Screen::Router);
+
+        // Esc in RouteTable returns to Dashboard
+        super::super::handle_key(&mut app, KeyCode::Esc, &client, false).await;
+        assert_eq!(app.screen, Screen::Dashboard);
     }
 
     #[tokio::test]

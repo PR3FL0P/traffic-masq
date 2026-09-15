@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+binary_dir=${BINARY_DIR:-"$project_dir/target/release"}
+output_dir=${OUTPUT_DIR:-"$project_dir/release"}
+target=${TARGET:-$(rustc -vV | sed -n 's/^host: //p')}
+version=$(python3 -c 'import sys, tomllib; print(tomllib.load(open(sys.argv[1], "rb"))["package"]["version"])' "$project_dir/Cargo.toml")
+case "$target" in
+    ''|*[!a-zA-Z0-9_-]*) printf '%s\n' 'Invalid target name' >&2; exit 1 ;;
+esac
+case "$version" in
+    ''|*[!a-zA-Z0-9._-]*) printf '%s\n' 'Invalid package version' >&2; exit 1 ;;
+esac
+if [ "${GITHUB_REF_TYPE:-}" = tag ] && [ "${GITHUB_REF_NAME:-}" != "v$version" ]; then
+    printf '%s\n' 'Release tag does not match Cargo.toml version' >&2
+    exit 1
+fi
+name="traffic-masq-$version-$target"
+stage=$(mktemp -d)
+trap 'rm -rf -- "$stage"' EXIT HUP INT TERM
+mkdir -p "$stage/$name" "$output_dir"
+for binary in traffic-masq traffic-masqd; do
+    test -x "$binary_dir/$binary"
+    cp "$binary_dir/$binary" "$stage/$name/$binary"
+done
+cp "$project_dir/README.md" "$project_dir/LICENSE" "$project_dir/CHANGELOG.md" "$project_dir/SECURITY.md" "$project_dir/CONTRIBUTING.md" "$project_dir/Cargo.toml" "$stage/$name/"
+cp -R "$project_dir/docs" "$project_dir/examples" "$project_dir/packaging" "$stage/$name/"
+tar -czf "$output_dir/$name.tar.gz" -C "$stage" "$name"
+(cd "$output_dir" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+printf 'Created %s/%s.tar.gz\n' "$output_dir" "$name"

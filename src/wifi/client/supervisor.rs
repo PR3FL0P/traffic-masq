@@ -482,10 +482,7 @@ impl WifiClientSupervisor {
     /// is built unconditionally, so a client configured at runtime needs the
     /// same diagnosis of a missing binary that startup gives.
     pub async fn preflight_binary(&self) -> Result<(), ClientSupervisorError> {
-        tokio::process::Command::new(&self.inner.wpa_supplicant_binary)
-            .arg("-v")
-            .output()
-            .await
+        crate::command::probe(&self.inner.wpa_supplicant_binary).await
             .map_err(|error| {
                 ClientSupervisorError::Configuration(anyhow::anyhow!(
                     "wpa_supplicant binary {} is not runnable ({error}) — install wpa_supplicant or fix wifi_client.wpa_supplicant_binary",

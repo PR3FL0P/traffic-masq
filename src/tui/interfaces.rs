@@ -240,7 +240,10 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         Style::default().fg(theme::ACCENT)
     };
     let cidr_marker = if active { "▶ " } else { "  " };
-    let mut cidr_spans = vec![Span::styled(format!("{cidr_marker}IPv4 CIDR: "), cidr_label_style)];
+    let mut cidr_spans = vec![Span::styled(
+        format!("{cidr_marker}IPv4 CIDR: "),
+        cidr_label_style,
+    )];
     cidr_spans.extend(super::input::render_value_with_cursor(
         &editor.cidr,
         editor.cursor,
@@ -1030,8 +1033,10 @@ mod tests {
 
     #[tokio::test]
     async fn interface_editor_cursor_navigation_and_editing() {
-        let mut app = TuiApp::default();
-        app.screen = Screen::InterfaceEditor;
+        let mut app = TuiApp {
+            screen: Screen::InterfaceEditor,
+            ..Default::default()
+        };
         let mut editor = default_route_editor(true);
         editor.field = InterfaceEditorField::Cidr;
         editor.cidr = "192.168.1.1/24".into();
@@ -1131,18 +1136,20 @@ mod rendering_tests {
 
     #[test]
     fn preview_buttons_are_visible_and_cancel_has_a_click_target() {
-        let mut app = TuiApp::default();
-        app.preview = Some(crate::core::interface::InterfaceChangePlan {
-            interface: "eth0".into(),
-            delete_ipv4: vec![],
-            retag_ipv4: None,
-            add_ipv4: None,
-            set_link_up: false,
-            management_change: false,
-            dhcp_action: crate::core::interface::DhcpChangeAction::Unchanged,
-            releasing_management: false,
-        });
-        app.preview_apply_selected = false;
+        let mut app = TuiApp {
+            preview: Some(crate::core::interface::InterfaceChangePlan {
+                interface: "eth0".into(),
+                delete_ipv4: vec![],
+                retag_ipv4: None,
+                add_ipv4: None,
+                set_link_up: false,
+                management_change: false,
+                dhcp_action: crate::core::interface::DhcpChangeAction::Unchanged,
+                releasing_management: false,
+            }),
+            preview_apply_selected: false,
+            ..Default::default()
+        };
         let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
         terminal
             .draw(|frame| render_preview(frame, frame.area(), &mut app))

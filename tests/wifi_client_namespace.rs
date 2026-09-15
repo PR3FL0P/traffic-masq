@@ -2,7 +2,6 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -17,7 +16,7 @@ use traffic_masq::config::{
 };
 use traffic_masq::wifi::WpaState;
 
-static NAMESPACE_TEST_LOCK: Mutex<()> = Mutex::new(());
+static NAMESPACE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const STOP_GRACE: Duration = Duration::from_secs(5);
 const SSID: &str = "traffic-masq-hwsim-e2e";
@@ -364,9 +363,7 @@ impl Drop for WifiClientNamespaceFixture {
 #[tokio::test]
 #[ignore = "requires root, Linux, mac80211_hwsim, iproute2, iw, hostapd and wpa_supplicant; mutates kernel radio state; run only on a disposable test host"]
 async fn wpa2_client_associates_survives_shutdown_and_is_adopted() -> Result<()> {
-    let _guard = NAMESPACE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = NAMESPACE_TEST_LOCK.lock().await;
     let mut fixture = WifiClientNamespaceFixture::new()?;
     let result = async {
         fixture.start_hostapd().await?;

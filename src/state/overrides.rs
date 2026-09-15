@@ -12,10 +12,9 @@ use crate::config::{
     VpnPolicyMode,
 };
 
-/// Bumped to 2 when the derived `dhcp`/`wifi`/`wifi_client` maps left the
-/// persisted format. A version-1 file is refused rather than migrated: it holds
-/// nothing a version-2 file cannot recompute, so there is nothing to carry over.
-pub const CURRENT_RUNTIME_OVERRIDES_SCHEMA: u32 = 2;
+/// Version 3 records router commit identity atomically with committed intent.
+/// Version 2 is readable; version 1 contained obsolete derived service maps.
+pub const CURRENT_RUNTIME_OVERRIDES_SCHEMA: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -24,6 +23,10 @@ pub struct RuntimeOverrides {
     pub schema_version: u32,
     #[serde(default)]
     pub revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_router_transaction: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub committed_interface_transactions: BTreeMap<String, String>,
     #[serde(default)]
     pub router: Option<RouterConfig>,
     #[serde(default)]
@@ -43,6 +46,8 @@ impl Default for RuntimeOverrides {
         Self {
             schema_version: CURRENT_RUNTIME_OVERRIDES_SCHEMA,
             revision: 0,
+            committed_router_transaction: None,
+            committed_interface_transactions: BTreeMap::new(),
             router: None,
             api: None,
             security: None,
@@ -145,7 +150,7 @@ impl RuntimeOverrideStore {
                     CURRENT_RUNTIME_OVERRIDES_SCHEMA
                 );
             }
-            if version != u64::from(CURRENT_RUNTIME_OVERRIDES_SCHEMA) {
+            if version != 2 && version != u64::from(CURRENT_RUNTIME_OVERRIDES_SCHEMA) {
                 bail!(
                     "runtime overrides {} use unsupported schema version {version}",
                     self.path.display()
@@ -160,6 +165,7 @@ impl RuntimeOverrideStore {
             overrides.schema_version = CURRENT_RUNTIME_OVERRIDES_SCHEMA;
             overrides.revision = 0;
         }
+        overrides.schema_version = CURRENT_RUNTIME_OVERRIDES_SCHEMA;
         Ok(overrides)
     }
 

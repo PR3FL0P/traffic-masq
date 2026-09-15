@@ -53,7 +53,10 @@ impl AccessEditor {
             AccessField::Enabled | AccessField::Save | AccessField::Reset | AccessField::Reload => {
                 None
             }
-            AccessField::Listen => Some(super::input::TextEditor::new(&mut self.desired.listen, cursor)),
+            AccessField::Listen => Some(super::input::TextEditor::new(
+                &mut self.desired.listen,
+                cursor,
+            )),
             AccessField::CertificatePath => Some(super::input::TextEditor::new(
                 self.desired
                     .certificate_path
@@ -476,8 +479,10 @@ mod tests {
 
     #[tokio::test]
     async fn access_editor_cursor_navigation_and_editing() {
-        let mut app = TuiApp::default();
-        app.screen = Screen::Access;
+        let mut app = TuiApp {
+            screen: Screen::Access,
+            ..Default::default()
+        };
         let settings = ApiHttpsSettings {
             enabled: false,
             listen: "127.0.0.1:8443".into(),
@@ -505,18 +510,26 @@ mod tests {
         assert_eq!(app.api_access.as_ref().unwrap().cursor, 0);
 
         handle_access_key(&mut app, KeyCode::Char('a'), &client).await;
-        assert_eq!(app.api_access.as_ref().unwrap().desired.listen, "a127.0.0.1:8443");
+        assert_eq!(
+            app.api_access.as_ref().unwrap().desired.listen,
+            "a127.0.0.1:8443"
+        );
         assert_eq!(app.api_access.as_ref().unwrap().cursor, 1);
 
         handle_access_key(&mut app, KeyCode::Backspace, &client).await;
-        assert_eq!(app.api_access.as_ref().unwrap().desired.listen, "127.0.0.1:8443");
+        assert_eq!(
+            app.api_access.as_ref().unwrap().desired.listen,
+            "127.0.0.1:8443"
+        );
         assert_eq!(app.api_access.as_ref().unwrap().cursor, 0);
     }
 
     #[tokio::test]
     async fn esc_returns_to_settings_screen() {
-        let mut app = TuiApp::default();
-        app.screen = Screen::Access;
+        let mut app = TuiApp {
+            screen: Screen::Access,
+            ..Default::default()
+        };
         let client = ApiClient::new("/socket-that-must-not-be-opened");
         handle_access_key(&mut app, KeyCode::Esc, &client).await;
         assert_eq!(app.screen, Screen::Settings);

@@ -1281,8 +1281,20 @@ mod tests {
     #[test]
     fn route_owner_classification_and_display() {
         let cases = [
-            (TRAFFIC_MASQ_ROUTE_PROTOCOL, RouteOwner::TrafficMasqStatic, true, true, "traffic-masq"),
-            (TRAFFIC_MASQ_DHCP_ROUTE_PROTOCOL, RouteOwner::TrafficMasqDhcp, true, false, "traffic-masq (dhcp)"),
+            (
+                TRAFFIC_MASQ_ROUTE_PROTOCOL,
+                RouteOwner::TrafficMasqStatic,
+                true,
+                true,
+                "traffic-masq",
+            ),
+            (
+                TRAFFIC_MASQ_DHCP_ROUTE_PROTOCOL,
+                RouteOwner::TrafficMasqDhcp,
+                true,
+                false,
+                "traffic-masq (dhcp)",
+            ),
             (2, RouteOwner::Kernel, false, false, "[ext:kernel]"),
             (3, RouteOwner::Boot, false, false, "[ext:boot]"),
             (4, RouteOwner::Static, false, false, "[ext:static]"),

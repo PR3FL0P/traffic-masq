@@ -1,13 +1,13 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use tempfile::tempdir;
+use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 use traffic_masq::api::client::ApiClient;
 use traffic_masq::api::model::{Request, Response};
@@ -16,7 +16,7 @@ use traffic_masq::config::{
     UplinkMode, VpnPolicyMode,
 };
 
-static NAMESPACE_TEST_LOCK: Mutex<()> = Mutex::new(());
+static NAMESPACE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -518,9 +518,7 @@ fn build_config(temp: &tempfile::TempDir, lan_if: &str, uplink_if: &str) -> AppC
 #[tokio::test]
 #[ignore = "requires root, Linux, iproute2, nftables and wireguard-tools (wg); spawns a real traffic-masqd process and creates real kernel network/WireGuard state; run only on a disposable test host"]
 async fn vpn_traffic_policy_direct_vpn_failclosed_and_reconnect() -> Result<()> {
-    let _test_guard = NAMESPACE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _test_guard = NAMESPACE_TEST_LOCK.lock().await;
 
     let mut fixture = VpnPolicyNamespaceFixture::new().await?;
     if let Err(error) = run_scenario(&mut fixture).await {
@@ -592,6 +590,20 @@ async fn run_scenario(fixture: &mut VpnPolicyNamespaceFixture) -> Result<()> {
     assert_vpn_policy_status(&client, VpnPolicyMode::Vpn, true, true).await?;
     assert_management_path_reachable(&client).await?;
 
+    timeout(
+        WAIT_TIMEOUT,
+        probe_echo_fails(
+            &fixture.upstream_ns,
+            UPSTREAM_ADDR,
+            ECHO_PORT_DIRECT,
+            &fixture.client_ns,
+            UPSTREAM_ADDR,
+            ECHO_PORT_DIRECT,
+        ),
+    )
+    .await
+    .context("direct uplink bypassed active VPN policy")??;
+
     let (rx_before, tx_before) = wg_transfer_bytes("tm-wg0")?;
     timeout(
         WAIT_TIMEOUT,
@@ -645,6 +657,20 @@ async fn run_scenario(fixture: &mut VpnPolicyNamespaceFixture) -> Result<()> {
     )
     .await
     .context("timed out on fail-closed VPN-target probe")??;
+
+    timeout(
+        WAIT_TIMEOUT,
+        probe_echo_fails(
+            &fixture.upstream_ns,
+            UPSTREAM_ADDR,
+            ECHO_PORT_DIRECT,
+            &fixture.client_ns,
+            UPSTREAM_ADDR,
+            ECHO_PORT_DIRECT,
+        ),
+    )
+    .await
+    .context("direct uplink leaked traffic while the VPN tunnel was down")??;
 
     let status_during_outage = fetch_vpn_policy_status(&client).await?;
     if status_during_outage.tunnel_healthy {
@@ -854,23 +880,16 @@ async fn probe_echo_succeeds(
     target_port: u16,
     expected_peer_addr: &str,
 ) -> Result<()> {
-    let server = spawn_echo_server_in(server_ns, bind_addr, port)?;
-
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
-    let echoed =
-        connect_and_echo(client_ns, target_addr, target_port, WAIT_TIMEOUT.as_secs()).await?;
+    let server = spawn_echo_server_in(server_ns, bind_addr, port).await?;
+    let echoed = connect_and_echo(client_ns, target_addr, target_port, WAIT_TIMEOUT.as_secs())
+        .await?
+        .context("expected echo connection was blocked")?;
     if echoed != ECHO_PAYLOAD {
-        let _ = tokio::task::spawn_blocking(move || {
-            let _ = server.wait_with_output();
-        })
-        .await;
         bail!("echo server returned unexpected payload: {echoed:?}");
     }
-
-    let server_output = tokio::task::spawn_blocking(move || server.wait_with_output())
+    let server_output = server
+        .wait_with_output()
         .await
-        .context("echo server task panicked")?
         .context("failed to wait for echo server")?;
     if !server_output.status.success() {
         bail!(
@@ -897,40 +916,53 @@ async fn probe_echo_fails(
     target_addr: &str,
     target_port: u16,
 ) -> Result<()> {
-    let mut server = spawn_echo_server_in(server_ns, bind_addr, port)?;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
+    let mut server = spawn_echo_server_in(server_ns, bind_addr, port).await?;
     let result = connect_and_echo(
         client_ns,
         target_addr,
         target_port,
         EXPECTED_FAILURE_CONNECT_SECS,
     )
-    .await;
-
-    let _ = server.kill();
-    let _ = server.wait();
-
-    if result.is_ok() {
-        bail!(
-            "connection to {target_addr}:{target_port} unexpectedly succeeded — expected it to be \
-             blocked (no VPN policy active, or tunnel down / fail closed)"
-        );
+    .await?;
+    if result.is_some() {
+        bail!("connection to {target_addr}:{target_port} unexpectedly succeeded — traffic bypassed VPN isolation");
     }
+    if let Some(status) = server.try_wait()? {
+        bail!("echo server exited before the blocked probe completed: {status}");
+    }
+    server.kill().await.context("failed to stop echo server")?;
     Ok(())
 }
 
-fn spawn_echo_server_in(ns: &str, bind_addr: &str, port: u16) -> Result<std::process::Child> {
+async fn spawn_echo_server_in(
+    ns: &str,
+    bind_addr: &str,
+    port: u16,
+) -> Result<tokio::process::Child> {
     let script = format!(
-        "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.settimeout(25)\ns.bind(('{bind_addr}', {port}))\ns.listen(1)\nconn, addr = s.accept()\nconn.settimeout(25)\ndata = conn.recv(4096)\nconn.sendall(data)\nconn.close()\nprint(addr[0], flush=True)\n"
+        "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.settimeout(25)\ns.bind(('{bind_addr}', {port}))\ns.listen(1)\nprint('READY', flush=True)\nconn, addr = s.accept()\nconn.settimeout(25)\ndata = conn.recv(4096)\nconn.sendall(data)\nconn.close()\nprint(addr[0], flush=True)\n"
     );
-    Command::new("ip")
+    let mut server = tokio::process::Command::new("ip")
         .args(["netns", "exec", ns, "python3", "-c", &script])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
-        .context("failed to spawn TCP echo server")
+        .context("failed to spawn TCP echo server")?;
+    let mut ready = [0; 6];
+    timeout(
+        WAIT_TIMEOUT,
+        server
+            .stdout
+            .as_mut()
+            .context("echo stdout unavailable")?
+            .read_exact(&mut ready),
+    )
+    .await
+    .context("echo server readiness timed out")??;
+    anyhow::ensure!(&ready == b"READY\n", "echo server did not signal readiness");
+    Ok(server)
 }
 
 async fn connect_and_echo(
@@ -938,22 +970,50 @@ async fn connect_and_echo(
     target_addr: &str,
     port: u16,
     connect_timeout_secs: u64,
-) -> Result<String> {
+) -> Result<Option<String>> {
     let script = format!(
-        "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.settimeout({connect_timeout_secs})\ns.connect(('{target_addr}', {port}))\ns.sendall(b'{ECHO_PAYLOAD}')\ndata = s.recv(4096)\ns.close()\nprint(data.decode(), end='')\n"
+        "import errno, socket, sys\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.settimeout({connect_timeout_secs})\ntry:\n s.connect(('{target_addr}', {port}))\nexcept OSError as error:\n if isinstance(error, TimeoutError) or error.errno in (errno.ECONNREFUSED, errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ETIMEDOUT):\n  sys.exit(42)\n raise\ns.sendall(b'{ECHO_PAYLOAD}')\ndata = s.recv(4096)\ns.close()\nprint(data.decode(), end='')\n"
     );
     let output = tokio::process::Command::new("ip")
         .args(["netns", "exec", ns, "python3", "-c", &script])
+        .kill_on_drop(true)
         .output()
         .await
         .context("failed to execute client echo probe")?;
+    decode_echo_output(output)
+        .with_context(|| format!("client probe in {ns} to {target_addr}:{port} failed"))
+}
+
+fn decode_echo_output(output: std::process::Output) -> Result<Option<String>> {
+    if output.status.code() == Some(42) {
+        return Ok(None);
+    }
     if !output.status.success() {
         bail!(
-            "client in {ns} failed to reach {target_addr}:{port}: {}",
+            "echo probe failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(Some(
+        String::from_utf8_lossy(&output.stdout).trim().to_string(),
+    ))
+}
+
+#[test]
+fn broken_probe_is_not_evidence_of_blocked_traffic() {
+    use std::os::unix::process::ExitStatusExt;
+    let output = |code| std::process::Output {
+        status: std::process::ExitStatus::from_raw(code << 8),
+        stdout: ECHO_PAYLOAD.as_bytes().to_vec(),
+        stderr: b"probe failure".to_vec(),
+    };
+    assert_eq!(decode_echo_output(output(42)).unwrap(), None);
+    assert!(decode_echo_output(output(1)).is_err());
+    assert!(decode_echo_output(output(127)).is_err());
+    assert_eq!(
+        decode_echo_output(output(0)).unwrap().as_deref(),
+        Some(ECHO_PAYLOAD)
+    );
 }
 
 async fn wait_for_handshake() -> Result<()> {

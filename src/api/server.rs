@@ -51,6 +51,7 @@ const HTTP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 const MAX_CONCURRENT_TLS_CONNECTIONS: usize = 128;
+const MAX_CONCURRENT_UNIX_CONNECTIONS: usize = 128;
 
 const WEAK_PASSWORD_MESSAGE: &str = "password must contain at least 12 characters";
 const _: () = assert!(
@@ -70,9 +71,16 @@ impl HttpApiBindings {
     pub fn bind(config: &AppConfig) -> Result<Self> {
         let (tcp_listener, tls_acceptor) = bind_tls_listener(config.api.tcp.as_ref())?;
         let socket_path = config.runtime.socket_path.clone();
-        let socket_group = config.runtime.socket_group.as_deref().map(|name| {
-            Group::from_name(name)?.ok_or_else(|| anyhow::anyhow!("socket group {name} does not exist"))
-        }).transpose()?.map(|group| group.gid);
+        let socket_group = config
+            .runtime
+            .socket_group
+            .as_deref()
+            .map(|name| {
+                Group::from_name(name)?
+                    .ok_or_else(|| anyhow::anyhow!("socket group {name} does not exist"))
+            })
+            .transpose()?
+            .map(|group| group.gid);
         crate::app::runtime::prepare_socket_directory(&socket_path, socket_group)?;
         prepare_socket_path(&socket_path)?;
         let unix_listener = StdUnixListener::bind(&socket_path)
@@ -101,6 +109,7 @@ impl HttpApiBindings {
             unix_listener: self.unix_listener,
             tcp_listener: self.tcp_listener,
             tls_acceptor: self.tls_acceptor,
+            control: control.clone(),
             router: build_router(AppState { control, auth }),
             socket_path: self.socket_path,
             socket_cleanup: self.socket_cleanup,
@@ -113,6 +122,7 @@ pub struct HttpApiServer {
     tcp_listener: Option<StdTcpListener>,
     tls_acceptor: Option<TlsAcceptor>,
     router: Router,
+    control: ControlService,
     socket_path: PathBuf,
     socket_cleanup: OwnedSocketPath,
 }
@@ -140,6 +150,7 @@ impl HttpApiServer {
             tcp_listener,
             tls_acceptor,
             router,
+            control,
             socket_path: _,
             socket_cleanup: _socket_cleanup,
         } = self;
@@ -147,20 +158,20 @@ impl HttpApiServer {
         let unix_listener = UnixListener::from_std(unix_listener)
             .context("failed to register the HTTP API Unix listener with Tokio")?;
 
-        if let (Some(tcp_listener), Some(tls_acceptor)) = (tcp_listener, tls_acceptor) {
+        let result = if let (Some(tcp_listener), Some(tls_acceptor)) = (tcp_listener, tls_acceptor)
+        {
             let tcp_listener = TcpListener::from_std(tcp_listener)
                 .context("failed to register the HTTPS listener with Tokio")?;
             let (unix_result, tls_result) = tokio::join!(
                 run_unix_accept_loop(unix_listener, router.clone(), shutdown.clone()),
                 run_tls_accept_loop(tcp_listener, tls_acceptor, router, shutdown),
             );
-            unix_result?;
-            tls_result?;
+            unix_result.and(tls_result)
         } else {
-            run_unix_accept_loop(unix_listener, router, shutdown).await?;
-        }
-
-        Ok(())
+            run_unix_accept_loop(unix_listener, router, shutdown).await
+        };
+        control.finish_operations().await;
+        result
     }
 }
 
@@ -449,6 +460,7 @@ async fn initialize_password(
             AuthError::AlreadyInitialized => {
                 ApiError::Conflict("device password is already initialized")
             }
+            AuthError::Busy => ApiError::Busy,
             AuthError::WeakPassword => ApiError::BadRequest(WEAK_PASSWORD_MESSAGE),
             other => {
                 tracing::error!(error = %other, "device password initialization failed");
@@ -479,6 +491,7 @@ async fn login(
     {
         Ok(session) => Ok(Json(session)),
         Err(AuthError::InvalidCredentials) => Err(ApiError::Unauthorized("invalid credentials")),
+        Err(AuthError::Busy) => Err(ApiError::Busy),
         Err(error) => {
             tracing::error!(%error, "login failed");
             Err(ApiError::Internal)
@@ -515,6 +528,7 @@ async fn change_password(
         .await
         .map_err(|error| match error {
             AuthError::InvalidCredentials => ApiError::Unauthorized("invalid credentials"),
+            AuthError::Busy => ApiError::Busy,
             AuthError::WeakPassword => ApiError::BadRequest(WEAK_PASSWORD_MESSAGE),
             other => {
                 tracing::error!(error = %other, "device password change failed");
@@ -899,15 +913,31 @@ async fn router_apply(
 async fn router_commit(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    Json(request): Json<TransactionRequest>,
 ) -> Result<Json<Response>, ApiError> {
-    dispatch_control(&state, &principal, Request::RouterCommit).await
+    dispatch_control(
+        &state,
+        &principal,
+        Request::RouterCommit {
+            token: request.token,
+        },
+    )
+    .await
 }
 
 async fn router_rollback(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
+    Json(request): Json<TransactionRequest>,
 ) -> Result<Json<Response>, ApiError> {
-    dispatch_control(&state, &principal, Request::RouterRollback).await
+    dispatch_control(
+        &state,
+        &principal,
+        Request::RouterRollback {
+            token: request.token,
+        },
+    )
+    .await
 }
 
 async fn router_pending_transaction(
@@ -1364,8 +1394,8 @@ fn control_request_requires_administrator(request: &Request) -> bool {
             | Request::CommitNetworkChange { .. }
             | Request::RollbackNetworkChange { .. }
             | Request::RouterApply { .. }
-            | Request::RouterCommit
-            | Request::RouterRollback
+            | Request::RouterCommit { .. }
+            | Request::RouterRollback { .. }
             | Request::RouterProvisioningApply { .. }
             | Request::RouterProvisioningRepair
             | Request::VpnImportProfile { .. }
@@ -1402,6 +1432,7 @@ enum ApiError {
     Forbidden,
     ForbiddenMessage(&'static str),
     Conflict(&'static str),
+    Busy,
     Internal,
 }
 
@@ -1418,6 +1449,10 @@ impl IntoResponse for ApiError {
             Self::Forbidden => (StatusCode::FORBIDDEN, "administrator role required"),
             Self::ForbiddenMessage(message) => (StatusCode::FORBIDDEN, message),
             Self::Conflict(message) => (StatusCode::CONFLICT, message),
+            Self::Busy => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many authentication attempts; retry later",
+            ),
             Self::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal server error"),
         };
         (status, Json(ErrorResponse { error: message })).into_response()
@@ -1522,7 +1557,12 @@ async fn run_unix_accept_loop(
                         break;
                     }
                 }
-                accepted = listener.accept() => {
+                completed = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(error)) = completed {
+                        tracing::warn!(%error, "HTTP connection task failed");
+                    }
+                }
+                accepted = listener.accept(), if connections.len() < MAX_CONCURRENT_UNIX_CONNECTIONS => {
                     let (stream, _) = match accepted {
                         Ok(accepted) => accepted,
                         Err(error) => {
@@ -1534,8 +1574,9 @@ async fn run_unix_accept_loop(
                     let connection = unix_connection_info(&stream);
                     log_connection_accepted(&connection);
                     let service = router.clone().layer(Extension(connection.clone()));
+                    let connection_shutdown = shutdown.clone();
                     connections.spawn(async move {
-                        if let Err(error) = serve_unix_connection(stream, service).await {
+                        if let Err(error) = until_shutdown(serve_unix_connection(stream, service), connection_shutdown).await {
                             tracing::debug!(%error, ?connection, "Unix HTTP connection ended with an error");
                         }
                     });
@@ -1578,18 +1619,18 @@ async fn run_tls_accept_loop(
         loop {
             reap_finished_connections(&mut connections, "HTTPS");
 
-            if connections.len() >= MAX_CONCURRENT_TLS_CONNECTIONS {
-                if let Some(Err(error)) = connections.join_next().await {
-                    tracing::warn!(%error, listener = "HTTPS", "HTTP connection task failed");
-                }
-            }
             tokio::select! {
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
                         break;
                     }
                 }
-                accepted = listener.accept() => {
+                completed = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(error)) = completed {
+                        tracing::warn!(%error, "HTTP connection task failed");
+                    }
+                }
+                accepted = listener.accept(), if connections.len() < MAX_CONCURRENT_TLS_CONNECTIONS => {
                     let (stream, peer) = match accepted {
                         Ok(accepted) => accepted,
                         Err(error) => {
@@ -1602,7 +1643,9 @@ async fn run_tls_accept_loop(
                     log_connection_accepted(&connection);
                     let acceptor = acceptor.clone();
                     let service = router.clone().layer(Extension(connection.clone()));
+                    let connection_shutdown = shutdown.clone();
                     connections.spawn(async move {
+                        let serving = async move {
                         match timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
                             Ok(Ok(stream)) => {
                                 if let Err(error) = serve_tls_connection(stream, service).await {
@@ -1616,6 +1659,9 @@ async fn run_tls_accept_loop(
                                 tracing::warn!(?connection, "TLS handshake timed out");
                             }
                         }
+                        Ok(())
+                        };
+                        let _ = until_shutdown(serving, connection_shutdown).await;
                     });
                 }
             }
@@ -1624,6 +1670,24 @@ async fn run_tls_accept_loop(
 
     drain_connections(&mut connections, "HTTPS").await;
     Ok(())
+}
+
+async fn until_shutdown(
+    serving: impl std::future::Future<Output = Result<()>>,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<()> {
+    if *shutdown.borrow() {
+        return Ok(());
+    }
+    tokio::select! {
+        biased;
+        _ = async {
+            loop {
+                if shutdown.changed().await.is_err() || *shutdown.borrow() { break; }
+            }
+        } => Ok(()),
+        result = serving => result,
+    }
 }
 
 fn log_connection_accepted(connection: &ConnectionInfo) {
@@ -1813,6 +1877,47 @@ impl Drop for OwnedSocketPath {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn saturated_unix_listener_stops_with_idle_clients() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (stop, shutdown) = watch::channel(false);
+        let server = tokio::spawn(run_unix_accept_loop(listener, Router::new(), shutdown));
+        let mut clients = Vec::new();
+        for _ in 0..MAX_CONCURRENT_UNIX_CONNECTIONS {
+            clients.push(UnixStream::connect(&path).await.unwrap());
+        }
+        let mut excess = UnixStream::connect(&path).await.unwrap();
+        excess
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut byte = [0];
+        assert!(timeout(Duration::from_millis(50), excess.read(&mut byte))
+            .await
+            .is_err());
+        stop.send(true).unwrap();
+        timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_an_incomplete_handshake() {
+        let (stop, shutdown) = watch::channel(false);
+        let task = tokio::spawn(until_shutdown(std::future::pending(), shutdown));
+        stop.send(true).unwrap();
+        timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
     use std::net::Ipv4Addr;
 
     use super::*;

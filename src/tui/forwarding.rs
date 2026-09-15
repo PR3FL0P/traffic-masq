@@ -138,7 +138,9 @@ async fn load_rules(app: &mut TuiApp, client: &ApiClient) -> Option<Vec<Forwardi
         set_router: Some(legacy),
         ..Default::default()
     };
-    if let Ok(Response::RouterPlan { plan }) = client.request(&Request::RouterPlan { proposal }).await {
+    if let Ok(Response::RouterPlan { plan }) =
+        client.request(&Request::RouterPlan { proposal }).await
+    {
         if let RouterDataplaneTarget::Enabled(desired) = plan.dataplane.target {
             return Some(
                 desired
@@ -402,8 +404,7 @@ pub(crate) async fn handle_list_key(app: &mut TuiApp, key: KeyCode, client: &Api
             app.router.selected_connection = app.router.selected_connection.saturating_sub(1)
         }
         KeyCode::Down
-            if !app.router.sharing_actions_focused
-                && app.router.selected_connection + 1 < len =>
+            if !app.router.sharing_actions_focused && app.router.selected_connection + 1 < len =>
         {
             app.router.selected_connection += 1;
         }
@@ -735,8 +736,10 @@ mod tests {
     async fn section_keys_mouse_and_action_arrows_preserve_the_shared_draft() {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         use ratatui::{backend::TestBackend, Terminal};
-        let mut app = TuiApp::default();
-        app.screen = Screen::Router;
+        let mut app = TuiApp {
+            screen: Screen::Router,
+            ..Default::default()
+        };
         app.ui.input_enabled = true;
         app.router.staged = true;
         app.router.proposed_router_config.forwarding = Some(vec![connection("lan0", "wan0")]);
@@ -777,8 +780,10 @@ mod tests {
     fn sharing_sections_and_controls_fit_small_and_large_terminals() {
         use ratatui::{backend::TestBackend, Terminal};
         for (width, height) in [(60, 15), (80, 24), (120, 30)] {
-            let mut app = TuiApp::default();
-            app.screen = Screen::Router;
+            let mut app = TuiApp {
+                screen: Screen::Router,
+                ..Default::default()
+            };
             app.router.pane = RouterPane::Sharing;
             app.router.proposed_router_config.forwarding =
                 Some(vec![connection("lan0", "wg0"); 20]);

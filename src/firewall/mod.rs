@@ -13,8 +13,6 @@ use std::fs;
 
 use crate::config::{networks_overlap, validate_interface_name};
 use crate::netlink::NetworkProvider;
-use std::io::Write;
-use std::process::{Command, Stdio};
 
 pub mod vpn;
 
@@ -153,7 +151,7 @@ impl RouterDataplaneDesired {
     }
 }
 
-pub trait NftExecutor: Send + Sync {
+pub trait NftExecutor: Send + Sync + 'static {
     fn execute(&self, arguments: &[&str], input: &[u8]) -> Result<Vec<u8>>;
 }
 
@@ -168,28 +166,16 @@ pub struct NftCommandExecutor;
 
 impl NftExecutor for NftCommandExecutor {
     fn execute(&self, arguments: &[&str], input: &[u8]) -> Result<Vec<u8>> {
-        let mut child = Command::new("nft")
-            .args(arguments)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("failed to start nft")?;
-        child
-            .stdin
-            .take()
-            .context("nft stdin was not available")?
-            .write_all(input)
-            .context("failed to write nft batch")?;
-        let output = child.wait_with_output().context("failed to wait for nft")?;
-        if !output.status.success() {
-            bail!(
-                "nft exited with status {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Ok(output.stdout)
+        // Production async callers run the backend on the blocking pool.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(crate::command::run(
+                std::path::Path::new("nft"),
+                arguments,
+                input,
+                crate::command::COMMAND_TIMEOUT,
+            ))
     }
 }
 
@@ -204,6 +190,29 @@ where
 {
     pub fn new(executor: E) -> Self {
         Self { executor }
+    }
+
+    pub async fn observe_async(self: &std::sync::Arc<Self>) -> Result<OwnedFirewallObservation> {
+        let backend = self.clone();
+        tokio::task::spawn_blocking(move || backend.observe()).await?
+    }
+
+    pub async fn apply_async(
+        self: &std::sync::Arc<Self>,
+        desired: &RouterDataplaneDesired,
+    ) -> Result<()> {
+        let backend = self.clone();
+        let desired = desired.clone();
+        tokio::task::spawn_blocking(move || backend.apply(&desired)).await?
+    }
+
+    pub async fn restore_async(
+        self: &std::sync::Arc<Self>,
+        snapshot: Option<&RouterDataplaneDesired>,
+    ) -> Result<()> {
+        let backend = self.clone();
+        let snapshot = snapshot.cloned();
+        tokio::task::spawn_blocking(move || backend.restore(snapshot.as_ref())).await?
     }
 
     pub fn observe(&self) -> Result<OwnedFirewallObservation> {
@@ -825,7 +834,7 @@ pub trait RouterDataplaneProvider: Send + Sync {
 #[derive(Debug)]
 pub struct LinuxRouterDataplaneProvider<F, N, L> {
     forwarding: Ipv4ForwardingBackend<F>,
-    nftables: NftablesBackend<N>,
+    nftables: std::sync::Arc<NftablesBackend<N>>,
     network: L,
 }
 
@@ -842,7 +851,7 @@ where
     ) -> Self {
         Self {
             forwarding,
-            nftables,
+            nftables: std::sync::Arc::new(nftables),
             network,
         }
     }
@@ -880,7 +889,7 @@ where
     L: NetworkProvider,
 {
     async fn observe(&self) -> Result<RouterDataplaneSnapshot> {
-        let firewall = self.nftables.observe()?;
+        let firewall = self.nftables.observe_async().await?;
         Ok(RouterDataplaneSnapshot {
             ipv4_forwarding: self.forwarding.observe()?,
             owned: firewall.desired,
@@ -891,7 +900,8 @@ where
     async fn apply_owned(&self, desired: &RouterDataplaneDesired) -> Result<()> {
         self.preflight_interfaces(desired).await?;
         self.nftables
-            .apply(desired)
+            .apply_async(desired)
+            .await
             .context("failed to activate owned firewall policy before enabling forwarding")?;
         self.forwarding
             .enable()
@@ -900,7 +910,8 @@ where
 
     async fn disable_owned(&self) -> Result<()> {
         self.nftables
-            .restore(None)
+            .restore_async(None)
+            .await
             .context("failed to remove owned firewall state")
     }
 
@@ -908,7 +919,8 @@ where
         let (firewall_result, forwarding_result) = if snapshot.ipv4_forwarding {
             let firewall = self
                 .nftables
-                .restore(snapshot.owned.as_ref())
+                .restore_async(snapshot.owned.as_ref())
+                .await
                 .context("failed to restore owned firewall state");
             let forwarding = self
                 .forwarding
@@ -922,7 +934,8 @@ where
                 .context("failed to restore IPv4 forwarding state");
             let firewall = self
                 .nftables
-                .restore(snapshot.owned.as_ref())
+                .restore_async(snapshot.owned.as_ref())
+                .await
                 .context("failed to restore owned firewall state");
             (firewall, forwarding)
         };
@@ -1582,7 +1595,9 @@ mod tests {
         assert!(rendered.contains("table inet traffic_masq"));
         assert!(rendered.contains("chain forward"));
         assert!(rendered.contains("chain postrouting"));
-        assert!(rendered.contains("meta nfproto ipv4 iifname \"lan0\" oifname \"wan0\" ip saddr 192.168.10.0/24 accept"));
+        assert!(rendered.contains(
+            "meta nfproto ipv4 iifname \"lan0\" oifname \"wan0\" ip saddr 192.168.10.0/24 accept"
+        ));
         assert!(rendered.contains("meta nfproto ipv4 iifname \"wan0\" oifname \"lan0\" ip daddr 192.168.10.0/24 ct state established,related accept"));
         assert!(rendered.contains("meta nfproto ipv4 iifname \"lan0\" oifname \"wan0\" ip saddr 192.168.10.0/24 masquerade"));
         assert!(rendered.contains("meta nfproto ipv4 iifname \"lan1\" oifname \"wg0\" accept"));
@@ -1601,87 +1616,89 @@ mod tests {
         let wanted = forwarding_desired();
         let connections = wanted.forwarding.as_ref().unwrap();
 
-        let make_rules = || vec![
-            serde_json::json!({
-                "chain": "forward",
-                "expr": [
-                    { "match": { "op": "==", "left": { "meta": { "key": "iifname" } }, "right": "lan0" } },
-                    { "match": { "op": "==", "left": { "meta": { "key": "oifname" } }, "right": "wan0" } },
-                    { "match": { "op": "==", "left": { "payload": { "protocol": "ip", "field": "saddr" } }, "right": { "prefix": { "addr": "192.168.10.0", "len": 24 } } } },
-                    { "accept": null }
-                ]
-            }),
-            serde_json::json!({
-                "chain": "forward",
-                "expr": [
-                    { "match": { "op": "==", "left": { "meta": { "key": "iifname" } }, "right": "wan0" } },
-                    { "match": { "op": "==", "left": { "meta": { "key": "oifname" } }, "right": "lan0" } },
-                    { "match": { "op": "==", "left": { "payload": { "protocol": "ip", "field": "daddr" } }, "right": { "prefix": { "addr": "192.168.10.0", "len": 24 } } } },
-                    { "match": { "op": "in", "left": { "ct": { "key": "state" } }, "right": ["established", "related"] } },
-                    { "accept": null }
-                ]
-            }),
-            serde_json::json!({
-                "chain": "forward",
-                "expr": [
-                    { "match": { "op": "==", "left": { "meta": { "key": "nfproto" } }, "right": "ipv4" } },
-                    { "match": { "op": "==", "left": { "meta": { "key": "iifname" } }, "right": "lan1" } },
-                    { "match": { "op": "==", "left": { "meta": { "key": "oifname" } }, "right": "wg0" } },
-                    { "accept": null }
-                ]
-            }),
-            serde_json::json!({
-                "chain": "forward",
-                "expr": [
-                    { "match": { "op": "==", "left": { "meta": { "key": "nfproto" } }, "right": "ipv4" } },
-                    { "match": { "op": "==", "left": { "meta": { "key": "iifname" } }, "right": "wg0" } },
-                    { "match": { "op": "==", "left": { "meta": { "key": "oifname" } }, "right": "lan1" } },
-                    { "match": { "op": "in", "left": { "ct": { "key": "state" } }, "right": ["established", "related"] } },
-                    { "accept": null }
-                ]
-            }),
-            serde_json::json!({
-                "chain": "forward",
-                "expr": [
-                    { "match": { "op": "==", "left": { "meta": { "key": "nfproto" } }, "right": "ipv4" } },
-                    { "match": { "op": "==", "left": { "meta": { "key": "iifname" } }, "right": "lan0" } },
-                    { "drop": null }
-                ]
-            }),
-            serde_json::json!({
-                "chain": "forward",
-                "expr": [
-                    { "match": { "op": "==", "left": { "meta": { "key": "nfproto" } }, "right": "ipv4" } },
-                    { "match": { "op": "==", "left": { "meta": { "key": "oifname" } }, "right": "lan0" } },
-                    { "drop": null }
-                ]
-            }),
-            serde_json::json!({
-                "chain": "forward",
-                "expr": [
-                    { "match": { "op": "==", "left": { "meta": { "key": "nfproto" } }, "right": "ipv4" } },
-                    { "match": { "op": "==", "left": { "meta": { "key": "iifname" } }, "right": "lan1" } },
-                    { "drop": null }
-                ]
-            }),
-            serde_json::json!({
-                "chain": "forward",
-                "expr": [
-                    { "match": { "op": "==", "left": { "meta": { "key": "nfproto" } }, "right": "ipv4" } },
-                    { "match": { "op": "==", "left": { "meta": { "key": "oifname" } }, "right": "lan1" } },
-                    { "drop": null }
-                ]
-            }),
-            serde_json::json!({
-                "chain": "postrouting",
-                "expr": [
-                    { "match": { "op": "==", "left": { "meta": { "key": "iifname" } }, "right": "lan0" } },
-                    { "match": { "op": "==", "left": { "meta": { "key": "oifname" } }, "right": "wan0" } },
-                    { "match": { "op": "==", "left": { "payload": { "protocol": "ip", "field": "saddr" } }, "right": { "prefix": { "addr": "192.168.10.0", "len": 24 } } } },
-                    { "masquerade": null }
-                ]
-            }),
-        ];
+        let make_rules = || {
+            vec![
+                serde_json::json!({
+                    "chain": "forward",
+                    "expr": [
+                        { "match": { "op": "==", "left": { "meta": { "key": "iifname" } }, "right": "lan0" } },
+                        { "match": { "op": "==", "left": { "meta": { "key": "oifname" } }, "right": "wan0" } },
+                        { "match": { "op": "==", "left": { "payload": { "protocol": "ip", "field": "saddr" } }, "right": { "prefix": { "addr": "192.168.10.0", "len": 24 } } } },
+                        { "accept": null }
+                    ]
+                }),
+                serde_json::json!({
+                    "chain": "forward",
+                    "expr": [
+                        { "match": { "op": "==", "left": { "meta": { "key": "iifname" } }, "right": "wan0" } },
+                        { "match": { "op": "==", "left": { "meta": { "key": "oifname" } }, "right": "lan0" } },
+                        { "match": { "op": "==", "left": { "payload": { "protocol": "ip", "field": "daddr" } }, "right": { "prefix": { "addr": "192.168.10.0", "len": 24 } } } },
+                        { "match": { "op": "in", "left": { "ct": { "key": "state" } }, "right": ["established", "related"] } },
+                        { "accept": null }
+                    ]
+                }),
+                serde_json::json!({
+                    "chain": "forward",
+                    "expr": [
+                        { "match": { "op": "==", "left": { "meta": { "key": "nfproto" } }, "right": "ipv4" } },
+                        { "match": { "op": "==", "left": { "meta": { "key": "iifname" } }, "right": "lan1" } },
+                        { "match": { "op": "==", "left": { "meta": { "key": "oifname" } }, "right": "wg0" } },
+                        { "accept": null }
+                    ]
+                }),
+                serde_json::json!({
+                    "chain": "forward",
+                    "expr": [
+                        { "match": { "op": "==", "left": { "meta": { "key": "nfproto" } }, "right": "ipv4" } },
+                        { "match": { "op": "==", "left": { "meta": { "key": "iifname" } }, "right": "wg0" } },
+                        { "match": { "op": "==", "left": { "meta": { "key": "oifname" } }, "right": "lan1" } },
+                        { "match": { "op": "in", "left": { "ct": { "key": "state" } }, "right": ["established", "related"] } },
+                        { "accept": null }
+                    ]
+                }),
+                serde_json::json!({
+                    "chain": "forward",
+                    "expr": [
+                        { "match": { "op": "==", "left": { "meta": { "key": "nfproto" } }, "right": "ipv4" } },
+                        { "match": { "op": "==", "left": { "meta": { "key": "iifname" } }, "right": "lan0" } },
+                        { "drop": null }
+                    ]
+                }),
+                serde_json::json!({
+                    "chain": "forward",
+                    "expr": [
+                        { "match": { "op": "==", "left": { "meta": { "key": "nfproto" } }, "right": "ipv4" } },
+                        { "match": { "op": "==", "left": { "meta": { "key": "oifname" } }, "right": "lan0" } },
+                        { "drop": null }
+                    ]
+                }),
+                serde_json::json!({
+                    "chain": "forward",
+                    "expr": [
+                        { "match": { "op": "==", "left": { "meta": { "key": "nfproto" } }, "right": "ipv4" } },
+                        { "match": { "op": "==", "left": { "meta": { "key": "iifname" } }, "right": "lan1" } },
+                        { "drop": null }
+                    ]
+                }),
+                serde_json::json!({
+                    "chain": "forward",
+                    "expr": [
+                        { "match": { "op": "==", "left": { "meta": { "key": "nfproto" } }, "right": "ipv4" } },
+                        { "match": { "op": "==", "left": { "meta": { "key": "oifname" } }, "right": "lan1" } },
+                        { "drop": null }
+                    ]
+                }),
+                serde_json::json!({
+                    "chain": "postrouting",
+                    "expr": [
+                        { "match": { "op": "==", "left": { "meta": { "key": "iifname" } }, "right": "lan0" } },
+                        { "match": { "op": "==", "left": { "meta": { "key": "oifname" } }, "right": "wan0" } },
+                        { "match": { "op": "==", "left": { "payload": { "protocol": "ip", "field": "saddr" } }, "right": { "prefix": { "addr": "192.168.10.0", "len": 24 } } } },
+                        { "masquerade": null }
+                    ]
+                }),
+            ]
+        };
 
         let rules = make_rules();
         let rule_refs: Vec<&Value> = rules.iter().collect();
@@ -2361,16 +2378,17 @@ mod tests {
             RouterDataplaneManager::with_event_sink(apply_failure, RecordingEventSink::default());
         let plan = failed_apply.plan(desired()).await.expect("plan");
         failed_apply.apply(&plan).await.expect_err("apply failure");
-        let events = failed_apply.events.events.lock().expect("events lock");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].operation, RouterDataplaneOperation::Apply);
-        assert_eq!(events[0].outcome, RouterDataplaneOutcome::Failed);
-        assert!(events[0]
-            .error
-            .as_deref()
-            .expect("failure context")
-            .contains("original snapshot restored"));
-        drop(events);
+        {
+            let events = failed_apply.events.events.lock().expect("events lock");
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].operation, RouterDataplaneOperation::Apply);
+            assert_eq!(events[0].outcome, RouterDataplaneOutcome::Failed);
+            assert!(events[0]
+                .error
+                .as_deref()
+                .expect("failure context")
+                .contains("original snapshot restored"));
+        }
 
         let rollback_failure = FakeProvider::new(empty_snapshot());
         rollback_failure.fail_restore.store(true, Ordering::SeqCst);

@@ -448,7 +448,10 @@ mod tests {
 
         assert!(candidate.desired().enabled);
         assert_eq!(candidate.desired().routes.len(), 1);
-        assert_eq!(candidate.desired().dataplane, RouterDataplaneTarget::Disabled);
+        assert_eq!(
+            candidate.desired().dataplane,
+            RouterDataplaneTarget::Disabled
+        );
     }
 
     #[test]

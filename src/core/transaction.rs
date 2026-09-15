@@ -31,6 +31,52 @@ pub struct PendingNetworkChange {
     pub expires_at_unix: u64,
 }
 
+#[derive(Serialize, Deserialize)]
+struct InterfaceJournal {
+    version: u32,
+    token: String,
+    snapshot: InterfaceSnapshot,
+}
+
+/// Restore unconfirmed interface snapshots before applying startup configuration.
+/// In particular, startup otherwise skips interfaces that were previously unmanaged.
+pub async fn recover_interface_transactions(
+    state_dir: &std::path::Path,
+    manager: &InterfaceManager,
+    committed: &crate::state::overrides::RuntimeOverrides,
+) -> Result<()> {
+    let root = state_dir.to_path_buf();
+    let (store, records) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let store = crate::state::private_store::PrivateJsonDirectory::open(
+            root,
+            "interface-transactions",
+        )?;
+        let mut records = Vec::new();
+        for name in store.keys()? {
+            let bytes = store
+                .read(&name)?
+                .ok_or_else(|| anyhow::anyhow!("interface journal disappeared"))?;
+            let record: InterfaceJournal = serde_json::from_slice(&bytes)?;
+            anyhow::ensure!(
+                record.version == 1 && record.snapshot.name == name,
+                "invalid interface transaction journal"
+            );
+            records.push((name, record));
+        }
+        Ok((store, records))
+    })
+    .await??;
+    for (name, record) in records {
+        if committed.committed_interface_transactions.get(&name) != Some(&record.token) {
+            manager.rollback(&record.snapshot).await?;
+            tracing::warn!(interface = %name, "restored interrupted interface transaction");
+        }
+        let store = store.clone();
+        tokio::task::spawn_blocking(move || store.remove(&name)).await??;
+    }
+    Ok(())
+}
+
 /// Applies interface changes by proposing them as desired state.
 ///
 /// The manager does not write to the kernel. It puts a change into the
@@ -290,9 +336,10 @@ impl NetworkTransactionManager {
             .lock()
             .await
             .entry(interface.to_string())
-            .or_insert(snapshot);
+            .or_insert(snapshot.clone());
 
         let token = self.next_token();
+        self.write_journal(&token, snapshot).await?;
         let desired = self.desired();
         desired
             .propose(&token, interface, config.clone(), allow_management_change)
@@ -300,6 +347,9 @@ impl NetworkTransactionManager {
 
         if let Err(error) = self.await_convergence(&desired, interface).await {
             desired.withdraw(&token).await;
+            if self.await_convergence(&desired, interface).await.is_ok() {
+                self.clear_journal(interface).await?;
+            }
             return Err(error);
         }
 
@@ -359,6 +409,9 @@ impl NetworkTransactionManager {
             ),
         };
 
+        if let Some(error) = pass.error {
+            bail!("convergence failed: {error}");
+        }
         match pass.failures.get(interface) {
             Some(error) => bail!("{error}"),
             None => Ok(()),
@@ -402,6 +455,9 @@ impl NetworkTransactionManager {
             .remove(token)
             .expect("pending transaction cannot change while operation lock is held");
 
+        if let Err(error) = self.clear_journal(&interface).await {
+            tracing::warn!(%error, "failed to remove committed interface journal");
+        }
         tracing::info!(
             interface = %interface,
             %token,
@@ -447,6 +503,8 @@ impl NetworkTransactionManager {
                 %error,
                 "rolled-back interface has not converged back to its committed configuration yet"
             );
+        } else {
+            self.clear_journal(&pending.info.interface).await?;
         }
         Ok(pending.info)
     }
@@ -473,6 +531,8 @@ impl NetworkTransactionManager {
                     %error,
                     "interface has not converged back to its committed configuration yet"
                 );
+            } else {
+                self.clear_journal(&transaction.info.interface).await?;
             }
         }
 
@@ -518,6 +578,44 @@ impl NetworkTransactionManager {
             .collect();
         pending.sort_by(|left, right| left.token.cmp(&right.token));
         pending
+    }
+
+    async fn write_journal(&self, token: &str, snapshot: InterfaceSnapshot) -> Result<()> {
+        let root = self.desired().state_dir().to_path_buf();
+        let record = InterfaceJournal {
+            version: 1,
+            token: token.to_owned(),
+            snapshot,
+        };
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let store = crate::state::private_store::PrivateJsonDirectory::open(
+                root,
+                "interface-transactions",
+            )?;
+            anyhow::ensure!(
+                store.read(&record.snapshot.name)?.is_none(),
+                "interface has an unresolved recovery journal; restart the daemon to recover it"
+            );
+            store.write(&record.snapshot.name, &serde_json::to_vec(&record)?)?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+
+    async fn clear_journal(&self, interface: &str) -> Result<()> {
+        let root = self.desired().state_dir().to_path_buf();
+        let interface = interface.to_owned();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let store = crate::state::private_store::PrivateJsonDirectory::open(
+                root,
+                "interface-transactions",
+            )?;
+            store.remove(&interface)?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
     }
 
     fn spawn_rollback_timer(&self, token: String) {
@@ -710,6 +808,98 @@ mod tests {
             .iter()
             .map(|address| address.address)
             .collect()
+    }
+
+    #[tokio::test]
+    async fn a_global_convergence_failure_is_not_success_for_an_interface() {
+        let directory = tempdir().unwrap();
+        let desired = desired_state(directory.path()).await;
+        desired.attach_converger();
+        desired
+            .propose("pending", "test0", interface_config(PROPOSED), false)
+            .await;
+        desired.report_result(
+            desired.version(),
+            Err(anyhow::anyhow!("failed to list interfaces")),
+        );
+        let manager = NetworkTransactionManager::new(
+            InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory()),
+            Duration::from_secs(60),
+            desired.clone(),
+        );
+        let error = manager
+            .await_convergence(&desired, "test0")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("failed to list interfaces"));
+    }
+
+    #[tokio::test]
+    async fn restart_removes_unconfirmed_address_on_previously_unmanaged_interface() {
+        let directory = tempdir().unwrap();
+        let provider = fake_network();
+        let interfaces =
+            InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
+        let desired = desired_state(directory.path()).await;
+        let transactions =
+            NetworkTransactionManager::new(interfaces.clone(), Duration::from_secs(60), desired);
+        let snapshot = interfaces.snapshot("test0").await.unwrap();
+        transactions
+            .write_journal("interrupted", snapshot)
+            .await
+            .unwrap();
+        interfaces
+            .apply_interface(
+                "test0",
+                &interface_config(PROPOSED),
+                Some(InterfaceRole::Output),
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(addresses(&provider)
+            .await
+            .contains(&interface_config(PROPOSED).ipv4.unwrap().addr()));
+        recover_interface_transactions(directory.path(), &interfaces, &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            addresses(&provider).await,
+            vec![Ipv4Addr::new(192, 168, 1, 10)]
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_keeps_address_whose_commit_token_was_persisted() {
+        let directory = tempdir().unwrap();
+        let provider = fake_network();
+        let interfaces =
+            InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
+        let desired = desired_state(directory.path()).await;
+        let transactions =
+            NetworkTransactionManager::new(interfaces.clone(), Duration::from_secs(60), desired);
+        transactions
+            .write_journal("confirmed", interfaces.snapshot("test0").await.unwrap())
+            .await
+            .unwrap();
+        interfaces
+            .apply_interface(
+                "test0",
+                &interface_config(PROPOSED),
+                Some(InterfaceRole::Output),
+                true,
+            )
+            .await
+            .unwrap();
+        let before = addresses(&provider).await;
+        let mut committed = crate::state::overrides::RuntimeOverrides::default();
+        committed
+            .committed_interface_transactions
+            .insert("test0".into(), "confirmed".into());
+        recover_interface_transactions(directory.path(), &interfaces, &committed)
+            .await
+            .unwrap();
+        assert_eq!(addresses(&provider).await, before);
     }
 
     #[tokio::test]

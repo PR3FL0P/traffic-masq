@@ -17,6 +17,7 @@ pub mod api;
 pub mod app;
 pub mod atomic_file;
 pub mod auth;
+mod command;
 pub mod config;
 pub mod core;
 pub mod dhcp;

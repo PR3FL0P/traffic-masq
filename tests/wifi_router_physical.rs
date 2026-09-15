@@ -6,7 +6,6 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::str::FromStr;
-use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -27,7 +26,7 @@ use traffic_masq::config::{
 use traffic_masq::dhcp::client::{DhcpClientLease, DhcpClientLeaseState, DhcpClientLeaseStore};
 use traffic_masq::wifi::{HostapdState, WpaState};
 
-static PHYSICAL_WIFI_TEST_LOCK: Mutex<()> = Mutex::new(());
+static PHYSICAL_WIFI_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 const STATION_TIMEOUT: Duration = Duration::from_secs(120);
 const OPERATOR_USB_TIMEOUT: Duration = Duration::from_secs(180);
@@ -802,7 +801,7 @@ impl PhysicalWifiFixture {
     }
 
     async fn commit_router(&self, client: &ApiClient, router: RouterConfig) -> Result<()> {
-        match client
+        let token = match client
             .request(&Request::RouterApply {
                 proposal: RouterProposalRequest {
                     set_router: Some(router),
@@ -811,10 +810,10 @@ impl PhysicalWifiFixture {
             })
             .await?
         {
-            Response::RouterTransactionPending { .. } => {}
+            Response::RouterTransactionPending { token, .. } => token,
             response => bail!("router apply returned unexpected response: {response:?}"),
-        }
-        match client.request(&Request::RouterCommit).await? {
+        };
+        match client.request(&Request::RouterCommit { token }).await? {
             Response::RouterCommitted { .. } => Ok(()),
             response => bail!("router commit returned unexpected response: {response:?}"),
         }
@@ -1497,9 +1496,7 @@ impl Inputs {
 #[tokio::test]
 #[ignore = "moves two physical Wi-Fi PHYs and requires root, real hardware, Internet, and a phone"]
 async fn physical_wifi_router_serves_phone_through_upstream_sta() -> Result<()> {
-    let _guard = PHYSICAL_WIFI_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = PHYSICAL_WIFI_TEST_LOCK.lock().await;
     let mut fixture = PhysicalWifiFixture::new()?;
     let result = fixture.run_test().await;
     if let Err(error) = result {
@@ -1512,9 +1509,7 @@ async fn physical_wifi_router_serves_phone_through_upstream_sta() -> Result<()> 
 #[tokio::test]
 #[ignore = "long natural DHCP T1 wait; moves two physical Wi-Fi PHYs and requires explicit opt-in, root, real hardware, and Internet"]
 async fn physical_wifi_router_natural_t1_renews_dhcp_lease() -> Result<()> {
-    let _guard = PHYSICAL_WIFI_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = PHYSICAL_WIFI_TEST_LOCK.lock().await;
     verify_long_t1_guard(env::var("TRAFFIC_MASQ_LONG_T1").ok().as_deref())?;
     let max_wait = long_t1_max_wait(
         env::var("TRAFFIC_MASQ_LONG_T1_MAX_WAIT_SECONDS")
@@ -1533,9 +1528,7 @@ async fn physical_wifi_router_natural_t1_renews_dhcp_lease() -> Result<()> {
 #[tokio::test]
 #[ignore = "moves two physical Wi-Fi PHYs and requires root, real hardware, and Internet"]
 async fn physical_wifi_router_explicit_renew_revalidates_dhcp_lease() -> Result<()> {
-    let _guard = PHYSICAL_WIFI_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = PHYSICAL_WIFI_TEST_LOCK.lock().await;
     let mut fixture = PhysicalWifiFixture::new()?;
     let result = fixture.run_explicit_renew_test().await;
     if let Err(error) = result {
@@ -1549,9 +1542,7 @@ async fn physical_wifi_router_explicit_renew_revalidates_dhcp_lease() -> Result<
 #[ignore = "moves two physical Wi-Fi PHYs and requires root, real hardware, Internet, and a phone"]
 async fn physical_wifi_router_ap_restart_reassociates_phone_without_disrupting_uplink() -> Result<()>
 {
-    let _guard = PHYSICAL_WIFI_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = PHYSICAL_WIFI_TEST_LOCK.lock().await;
     let mut fixture = PhysicalWifiFixture::new()?;
     let result = fixture.run_ap_restart_reassociation_test().await;
     if let Err(error) = result {
@@ -1564,9 +1555,7 @@ async fn physical_wifi_router_ap_restart_reassociates_phone_without_disrupting_u
 #[tokio::test]
 #[ignore = "moves two physical Wi-Fi PHYs and requires root, real hardware, and Internet"]
 async fn physical_wifi_router_foreign_address_and_route_survive_owned_cleanup() -> Result<()> {
-    let _guard = PHYSICAL_WIFI_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = PHYSICAL_WIFI_TEST_LOCK.lock().await;
     let mut fixture = PhysicalWifiFixture::new()?;
     let result = fixture.run_foreign_state_survival_test().await;
     if let Err(error) = result {
@@ -1579,9 +1568,7 @@ async fn physical_wifi_router_foreign_address_and_route_survive_owned_cleanup() 
 #[tokio::test]
 #[ignore = "moves two physical Wi-Fi PHYs and requires root, real hardware, and Internet"]
 async fn physical_wifi_router_preserve_restart_adopts_dhcp_lease() -> Result<()> {
-    let _guard = PHYSICAL_WIFI_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = PHYSICAL_WIFI_TEST_LOCK.lock().await;
     let mut fixture = PhysicalWifiFixture::new()?;
     let result = fixture.run_preserve_restart_test().await;
     if let Err(error) = result {
@@ -1594,9 +1581,7 @@ async fn physical_wifi_router_preserve_restart_adopts_dhcp_lease() -> Result<()>
 #[tokio::test]
 #[ignore = "operator must physically unplug/replug the USB uplink; requires root, real hardware, and Internet"]
 async fn physical_wifi_router_usb_uplink_unplug_replug_recovers() -> Result<()> {
-    let _guard = PHYSICAL_WIFI_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = PHYSICAL_WIFI_TEST_LOCK.lock().await;
     verify_operator_usb_replug_guard(env::var("TRAFFIC_MASQ_OPERATOR_USB_REPLUG").ok().as_deref())?;
     let mut fixture = PhysicalWifiFixture::new()?;
     let result = fixture.run_usb_replug_test().await;

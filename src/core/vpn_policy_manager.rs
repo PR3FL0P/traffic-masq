@@ -35,7 +35,9 @@ pub struct VpnPolicyDesired {
 /// to reach into `app` to ask the question, which closed a cycle between the
 /// two.
 pub fn vpn_policy_desired(config: &AppConfig) -> Option<VpnPolicyDesired> {
-    if config.router.forwarding.is_some() { return None; }
+    if config.router.forwarding.is_some() {
+        return None;
+    }
     let uplink = config.router.uplink.as_ref()?;
     let protected_subnets: Vec<Ipv4Net> = config
         .network
@@ -90,7 +92,7 @@ impl VpnPolicySnapshot {
 pub struct VpnPolicyManager<D: VpnDriver, E: NftExecutor> {
     network: Arc<dyn NetworkProvider>,
     conflicts: VpnPolicyResourceConflictDetector,
-    firewall: VpnPolicyFirewallBackend<E>,
+    firewall: Arc<VpnPolicyFirewallBackend<E>>,
     tunnel: Arc<VpnManager<D>>,
     reserved: VpnPolicyReservedIds,
 }
@@ -119,7 +121,7 @@ impl<D: VpnDriver, E: NftExecutor> VpnPolicyManager<D, E> {
         Self {
             conflicts: VpnPolicyResourceConflictDetector::new(network.clone()),
             network,
-            firewall,
+            firewall: Arc::new(firewall),
             tunnel,
             reserved,
         }
@@ -137,7 +139,8 @@ impl<D: VpnDriver, E: NftExecutor> VpnPolicyManager<D, E> {
         }
         let firewall = self
             .firewall
-            .observe()
+            .observe_async()
+            .await
             .context("failed to observe VPN policy firewall state")?;
 
         let mut routes = observation.owned_routes;
@@ -165,7 +168,8 @@ impl<D: VpnDriver, E: NftExecutor> VpnPolicyManager<D, E> {
 
         let firewall_before = self
             .firewall
-            .observe()
+            .observe_async()
+            .await
             .context("failed to observe VPN policy firewall state before activation")?;
         let mut snapshot_routes = observation.owned_routes.clone();
         snapshot_routes.extend(observation.unexpected_owned_routes.clone());
@@ -182,7 +186,8 @@ impl<D: VpnDriver, E: NftExecutor> VpnPolicyManager<D, E> {
 
         if let Err(error) = self
             .firewall
-            .apply(&desired.firewall())
+            .apply_async(&desired.firewall())
+            .await
             .context("failed to apply VPN policy firewall marking/NAT/kill switch")
         {
             let _ = self.rollback(desired, &snapshot).await;
@@ -195,7 +200,7 @@ impl<D: VpnDriver, E: NftExecutor> VpnPolicyManager<D, E> {
     pub async fn deactivate(&self, desired: &VpnPolicyDesired) -> Result<()> {
         let mut errors = Vec::new();
 
-        if let Err(error) = self.firewall.restore(None) {
+        if let Err(error) = self.firewall.restore_async(None).await {
             errors.push(format!(
                 "failed to remove VPN policy firewall state: {error:#}"
             ));
@@ -243,7 +248,11 @@ impl<D: VpnDriver, E: NftExecutor> VpnPolicyManager<D, E> {
     ) -> Result<()> {
         let mut errors = Vec::new();
 
-        if let Err(error) = self.firewall.restore(snapshot.firewall.as_ref()) {
+        if let Err(error) = self
+            .firewall
+            .restore_async(snapshot.firewall.as_ref())
+            .await
+        {
             errors.push(format!("firewall rollback failed: {error:#}"));
         }
 

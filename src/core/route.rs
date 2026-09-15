@@ -82,7 +82,7 @@ impl RouteHealth {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteSnapshot {
     owned_routes: Vec<Ipv4RouteInfo>,
 }

@@ -195,17 +195,20 @@ pub fn validate_forwarding(rules: &[ForwardingConfig]) -> Result<()> {
         if rule.from == rule.to {
             bail!("forwarding requires different ingress and egress interfaces");
         }
-        if rule.source_subnet.is_some_and(|subnet| subnet != subnet.trunc()) {
+        if rule
+            .source_subnet
+            .is_some_and(|subnet| subnet != subnet.trunc())
+        {
             bail!("source subnet must be a network address (no host bits)");
         }
-        if rules[..index]
-            .iter()
-            .any(|prior| prior.from == rule.from && prior.to == rule.to &&
-                match (prior.source_subnet, rule.source_subnet) {
+        if rules[..index].iter().any(|prior| {
+            prior.from == rule.from
+                && prior.to == rule.to
+                && match (prior.source_subnet, rule.source_subnet) {
                     (Some(a), Some(b)) => a.contains(&b.addr()) || b.contains(&a.addr()),
                     _ => true,
-                })
-        {
+                }
+        }) {
             bail!(
                 "duplicate or overlapping forwarding connection: {} -> {}",
                 rule.from,
@@ -788,7 +791,10 @@ impl OwnedIpv4RouteConfig {
             bail!("IPv4 route table must not be RT_TABLE_LOCAL (255)");
         }
         if self.destination.prefix_len() > 32 {
-            bail!("invalid IPv4 prefix length {}", self.destination.prefix_len());
+            bail!(
+                "invalid IPv4 prefix length {}",
+                self.destination.prefix_len()
+            );
         }
         if self.destination.addr() != self.destination.network() {
             bail!(
@@ -1675,7 +1681,9 @@ mod tests {
             },
         );
         config.router.owned_routes[0].output_interface = Some("unmanaged0".to_string());
-        config.validate().expect("unmanaged interface should be valid for static route");
+        config
+            .validate()
+            .expect("unmanaged interface should be valid for static route");
 
         let mut config = valid_router_config();
         config
@@ -1683,7 +1691,9 @@ mod tests {
             .interfaces
             .insert("other-wan".to_string(), input_interface());
         config.router.owned_routes[0].output_interface = Some("other-wan".to_string());
-        config.validate().expect("unselected input interface should be valid for static route");
+        config
+            .validate()
+            .expect("unselected input interface should be valid for static route");
 
         let mut config = valid_router_config();
         config.router.owned_routes[0].output_interface = Some("eth9".to_string());
@@ -1716,11 +1726,15 @@ mod tests {
         let error = config
             .validate()
             .expect_err("duplicate routes with None and Some(0) metrics must be rejected");
-        assert!(error.to_string().contains("duplicate router owned IPv4 route"));
+        assert!(error
+            .to_string()
+            .contains("duplicate router owned IPv4 route"));
 
         // Valid single route without uplink
         config.router.owned_routes.pop();
-        config.validate().expect("valid router without uplink should validate");
+        config
+            .validate()
+            .expect("valid router without uplink should validate");
 
         // Reject host bits in CIDR
         config.router.owned_routes[0].destination = "192.168.100.5/24".parse().unwrap();
@@ -1732,9 +1746,7 @@ mod tests {
         // Reject RT_TABLE_LOCAL (255)
         config.router.owned_routes[0].destination = "192.168.100.0/24".parse().unwrap();
         config.router.owned_routes[0].table = 255;
-        let error = config
-            .validate()
-            .expect_err("table 255 must be rejected");
+        let error = config.validate().expect_err("table 255 must be rejected");
         assert!(error.to_string().contains("RT_TABLE_LOCAL (255)"));
     }
 

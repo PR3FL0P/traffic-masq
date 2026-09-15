@@ -2,7 +2,6 @@ use std::fs;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -17,7 +16,7 @@ use traffic_masq::config::{
     UplinkConfig, UplinkMode,
 };
 
-static NAMESPACE_TEST_LOCK: Mutex<()> = Mutex::new(());
+static NAMESPACE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -291,18 +290,21 @@ impl RouterNamespaceFixture {
         let ready = timeout(WAIT_TIMEOUT, async {
             loop {
                 if client.request(&Request::Ping).await.is_ok() {
-                    return;
+                    return Ok::<(), anyhow::Error>(());
                 }
                 if let Some(child) = &mut self.daemon {
-                    if let Ok(Some(status)) = child.try_wait() {
-                        panic!("traffic-masqd exited during startup with status {status}");
+                    if let Some(status) = child
+                        .try_wait()
+                        .context("failed to inspect daemon status")?
+                    {
+                        bail!("traffic-masqd exited during startup with status {status}");
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         })
         .await;
-        ready.context("traffic-masqd did not become ready in time")?;
+        ready.context("traffic-masqd did not become ready in time")??;
         Ok(())
     }
 
@@ -712,15 +714,9 @@ fn route_exists(destination: &str) -> Result<bool> {
 #[tokio::test]
 #[ignore = "requires root, Linux, iproute2, nftables, udhcpc and python3; spawns a real traffic-masqd process; run only on a disposable test host"]
 async fn uplink_down_blocks_new_flows_without_crashing_daemon() -> Result<()> {
-    let _test_guard = NAMESPACE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _test_guard = NAMESPACE_TEST_LOCK.lock().await;
 
-    let mut fixture = RouterNamespaceFixture::new(FixtureOptions {
-        bring_uplink_up: false,
-        ..FixtureOptions::default()
-    })
-    .await?;
+    let mut fixture = RouterNamespaceFixture::new(FixtureOptions::default()).await?;
 
     let result: Result<()> = async {
         timeout(WAIT_TIMEOUT, fixture.start_daemon())
@@ -732,18 +728,15 @@ async fn uplink_down_blocks_new_flows_without_crashing_daemon() -> Result<()> {
 
         let server = spawn_echo_server(&fixture)?;
         tokio::time::sleep(Duration::from_millis(300)).await;
+        let echoed = timeout(WAIT_TIMEOUT, connect_and_echo(&fixture, 20))
+            .await
+            .context("timed out checking traffic before uplink failure")??;
+        assert_eq!(echoed, "traffic-masq-e2e");
+        let output = tokio::task::spawn_blocking(move || server.wait_with_output()).await??;
+        assert!(output.status.success(), "baseline echo server failed");
 
-
-
-
-
-
-
-
-
-
-
-
+        let mut server = spawn_echo_server(&fixture)?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
         run("ip", &["link", "set", &fixture.uplink_if, "down"])?;
 
@@ -752,11 +745,7 @@ async fn uplink_down_blocks_new_flows_without_crashing_daemon() -> Result<()> {
             Ok(Ok(_)) => false,
             Ok(Err(_)) | Err(_) => true,
         };
-        let _ = Command::new("ip")
-            .args(["netns", "exec", &fixture.upstream_ns, "kill", "-9", "1"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let _ = server.kill();
         let _ = server.wait_with_output();
 
         assert!(
@@ -790,9 +779,7 @@ async fn uplink_down_blocks_new_flows_without_crashing_daemon() -> Result<()> {
 #[tokio::test]
 #[ignore = "requires root and Linux/iproute2; spawns a real traffic-masqd process; run only on a disposable test host"]
 async fn invalid_overlapping_output_subnet_is_rejected_before_any_mutation() -> Result<()> {
-    let _test_guard = NAMESPACE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _test_guard = NAMESPACE_TEST_LOCK.lock().await;
 
     require_root()?;
     require_command("ip", &["-V"])?;
@@ -882,9 +869,7 @@ async fn invalid_overlapping_output_subnet_is_rejected_before_any_mutation() -> 
 #[tokio::test]
 #[ignore = "requires root, Linux, iproute2 and nftables; spawns a real traffic-masqd process; run only on a disposable test host"]
 async fn firewall_apply_failure_rolls_back_interfaces_routes_and_forwarding() -> Result<()> {
-    let _test_guard = NAMESPACE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _test_guard = NAMESPACE_TEST_LOCK.lock().await;
 
     let mut fixture = RouterNamespaceFixture::new(FixtureOptions {
         bogus_uplink: true,
@@ -930,9 +915,7 @@ async fn firewall_apply_failure_rolls_back_interfaces_routes_and_forwarding() ->
 #[tokio::test]
 #[ignore = "requires root, Linux, iproute2, nftables, udhcpc and python3; spawns real traffic-masqd processes; run only on a disposable test host"]
 async fn restart_does_not_duplicate_state_and_client_gets_a_lease_again() -> Result<()> {
-    let _test_guard = NAMESPACE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _test_guard = NAMESPACE_TEST_LOCK.lock().await;
 
     let mut fixture = RouterNamespaceFixture::new(FixtureOptions::default()).await?;
 
@@ -1010,9 +993,7 @@ async fn restart_does_not_duplicate_state_and_client_gets_a_lease_again() -> Res
 #[tokio::test]
 #[ignore = "requires root, Linux, iproute2, nftables, udhcpc and python3; spawns a real traffic-masqd process; run only on a disposable test host"]
 async fn foreign_route_and_nftables_table_survive_apply_rollback_and_shutdown() -> Result<()> {
-    let _test_guard = NAMESPACE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _test_guard = NAMESPACE_TEST_LOCK.lock().await;
 
     let mut fixture = RouterNamespaceFixture::new(FixtureOptions {
         foreign_state: true,
@@ -1100,9 +1081,7 @@ async fn foreign_route_and_nftables_table_survive_apply_rollback_and_shutdown() 
 #[tokio::test]
 #[ignore = "requires root, Linux, iproute2, nftables, udhcpc and python3; spawns a real traffic-masqd process; run only on a disposable test host"]
 async fn new_inbound_from_upstream_is_blocked_established_reply_is_allowed() -> Result<()> {
-    let _test_guard = NAMESPACE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _test_guard = NAMESPACE_TEST_LOCK.lock().await;
 
     let mut fixture = RouterNamespaceFixture::new(FixtureOptions::default()).await?;
 
@@ -1153,7 +1132,7 @@ async fn new_inbound_from_upstream_is_blocked_established_reply_is_allowed() -> 
             ],
         )?;
 
-        let client_server = spawn_client_listener(&fixture)?;
+        let mut client_server = spawn_client_listener(&fixture)?;
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         let probe = timeout(
@@ -1167,11 +1146,7 @@ async fn new_inbound_from_upstream_is_blocked_established_reply_is_allowed() -> 
             "a new inbound connection from upstream directly to the client's private address must be blocked"
         );
 
-        let _ = Command::new("ip")
-            .args(["netns", "exec", &fixture.client_ns, "kill", "-9", "1"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let _ = client_server.kill();
         let _ = client_server.wait_with_output();
 
         Ok(())
@@ -1228,9 +1203,7 @@ async fn connect_from_upstream(
 #[tokio::test]
 #[ignore = "requires root and Linux/iproute2; spawns a real traffic-masqd process; run only on a disposable test host"]
 async fn management_interface_is_never_touched_without_explicit_allow() -> Result<()> {
-    let _test_guard = NAMESPACE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _test_guard = NAMESPACE_TEST_LOCK.lock().await;
 
     let mut fixture = RouterNamespaceFixture::new(FixtureOptions {
         management_interface: true,

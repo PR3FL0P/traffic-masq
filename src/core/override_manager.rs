@@ -102,10 +102,21 @@ impl RuntimeOverrideManager {
     }
 
     pub async fn commit_candidate(&self, candidate: &RouterCandidate) -> Result<u64> {
+        self.commit_candidate_with_token(candidate, None).await
+    }
+
+    pub async fn commit_candidate_with_token(
+        &self,
+        candidate: &RouterCandidate,
+        token: Option<&str>,
+    ) -> Result<u64> {
         let mut state = self.state.lock().await;
         candidate.ensure_base_revision(state.revision)?;
-        self.save_locked(&mut state, candidate.document().clone())
-            .await?;
+        let mut document = candidate.document().clone();
+        if let Some(token) = token {
+            document.committed_router_transaction = Some(token.to_owned());
+        }
+        self.save_locked(&mut state, document).await?;
         Ok(state.revision)
     }
 
@@ -129,16 +140,14 @@ impl RuntimeOverrideManager {
         *state = candidate;
         // Every mutation funnels through here, so this is the one place that
         // has to announce that the desired state moved.
-        self.changed.notify_waiters();
+        self.changed.notify_one();
         Ok(())
     }
 
     /// Wait until the overrides change.
     ///
-    /// Uses `notify_waiters`, so a change that happens while nobody is waiting
-    /// is not buffered. That is the correct semantics for a converger: it reads
-    /// the current state when it runs, so it only needs to know that *something*
-    /// moved since it last looked, and it looks once before it starts waiting.
+    /// One convergence consumer waits here. Retain a notification if it is
+    /// still applying the previous snapshot; multiple changes coalesce.
     pub async fn changed(&self) {
         self.changed.notified().await;
     }
@@ -194,6 +203,28 @@ impl RuntimeOverrideManager {
         config.validate(&interface)?;
         let mut state = self.state.lock().await;
         let mut candidate = state.clone();
+        candidate.interfaces.insert(
+            interface,
+            InterfaceOverride {
+                config,
+                allow_management_change,
+            },
+        );
+        self.save_locked(&mut state, candidate).await
+    }
+
+    pub async fn commit_interface(
+        &self,
+        interface: String,
+        config: InterfaceConfig,
+        allow_management_change: bool,
+        token: &str,
+    ) -> Result<()> {
+        let mut state = self.state.lock().await;
+        let mut candidate = state.clone();
+        candidate
+            .committed_interface_transactions
+            .insert(interface.clone(), token.to_owned());
         candidate.interfaces.insert(
             interface,
             InterfaceOverride {
@@ -279,8 +310,7 @@ mod tests {
             tokio::spawn(async move { manager.changed().await })
         };
         // Let the waiter reach the wait before the change happens: `changed`
-        // deliberately does not buffer, because the converger reads current
-        // state and only needs to know that something moved.
+        // also retains a notification if convergence is still running.
         tokio::task::yield_now().await;
 
         manager
@@ -633,17 +663,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn version_two_records_upgrade_without_losing_revision() {
+        let directory = tempdir().unwrap();
+        let store = RuntimeOverrideStore::in_state_dir(directory.path());
+        tokio::fs::write(store.path(), br#"{"schema_version":2,"revision":7}"#)
+            .await
+            .unwrap();
+        let manager = RuntimeOverrideManager::load(directory.path(), &base_config())
+            .await
+            .unwrap();
+        let snapshot = manager.snapshot().await;
+        assert_eq!(snapshot.schema_version, 3);
+        assert_eq!(snapshot.revision, 7);
+        assert!(snapshot.committed_router_transaction.is_none());
+    }
+
+    #[tokio::test]
     async fn rejects_future_schema_version() {
         let directory = tempdir().expect("tempdir");
         let store = RuntimeOverrideStore::in_state_dir(directory.path());
-        tokio::fs::write(store.path(), br#"{"schema_version":3,"revision":0}"#)
+        tokio::fs::write(store.path(), br#"{"schema_version":4,"revision":0}"#)
             .await
             .unwrap();
 
         let error = RuntimeOverrideManager::load(directory.path(), &base_config())
             .await
             .expect_err("future schema");
-        assert!(error.to_string().contains("future schema version 3"));
+        assert!(error.to_string().contains("future schema version 4"));
     }
 
     #[tokio::test]

@@ -777,8 +777,12 @@ pub enum Request {
     RouterApply {
         proposal: RouterProposalRequest,
     },
-    RouterCommit,
-    RouterRollback,
+    RouterCommit {
+        token: String,
+    },
+    RouterRollback {
+        token: String,
+    },
     RouterPendingTransaction,
     ListRoutes {
         #[serde(default)]
@@ -976,6 +980,7 @@ pub enum Response {
     },
     RouterRolledBack,
     RouterPendingTransaction {
+        token: Option<String>,
         status: CoordinatorStatus,
         rollback_failure: Option<Vec<String>>,
     },
@@ -1188,8 +1193,7 @@ mod tests {
             }],
         };
         let json_resp = serde_json::to_string(&resp).expect("serialize response");
-        let parsed_resp: Response =
-            serde_json::from_str(&json_resp).expect("deserialize response");
+        let parsed_resp: Response = serde_json::from_str(&json_resp).expect("deserialize response");
         match parsed_resp {
             Response::Routes { routes } => {
                 assert_eq!(routes.len(), 1);

@@ -909,22 +909,24 @@ mod tests {
             next_settings_field(SettingsField::SaveSession),
             SettingsField::ChangePassword
         );
-        let mut app = TuiApp::default();
-        app.settings = Some(SecurityEditor {
-            field: SettingsField::SaveSession,
-            active: SecuritySettings {
-                rollback_timeout_seconds: 30,
-            },
-            rollback_timeout_input: "30".into(),
-            override_active: false,
-            restart_required: false,
-            remember_session: true,
-            remember_minutes_input: "5".into(),
-            show_dhcp_client: false,
-            confirmation: None,
-            cursor: 0,
-            editing: false,
-        });
+        let mut app = TuiApp {
+            settings: Some(SecurityEditor {
+                field: SettingsField::SaveSession,
+                active: SecuritySettings {
+                    rollback_timeout_seconds: 30,
+                },
+                rollback_timeout_input: "30".into(),
+                override_active: false,
+                restart_required: false,
+                remember_session: true,
+                remember_minutes_input: "5".into(),
+                show_dhcp_client: false,
+                confirmation: None,
+                cursor: 0,
+                editing: false,
+            }),
+            ..Default::default()
+        };
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 10)).unwrap();
         terminal
@@ -949,22 +951,24 @@ mod tests {
             SettingsField::Reset,
             SettingsField::Save,
         ] {
-            let mut app = TuiApp::default();
-            app.settings = Some(SecurityEditor {
-                field,
-                active: SecuritySettings {
-                    rollback_timeout_seconds: 30,
-                },
-                rollback_timeout_input: "30".into(),
-                override_active: false,
-                restart_required: false,
-                remember_session: true,
-                remember_minutes_input: "5".into(),
-                show_dhcp_client: false,
-                confirmation: None,
-                cursor: 0,
-                editing: false,
-            });
+            let mut app = TuiApp {
+                settings: Some(SecurityEditor {
+                    field,
+                    active: SecuritySettings {
+                        rollback_timeout_seconds: 30,
+                    },
+                    rollback_timeout_input: "30".into(),
+                    override_active: false,
+                    restart_required: false,
+                    remember_session: true,
+                    remember_minutes_input: "5".into(),
+                    show_dhcp_client: false,
+                    confirmation: None,
+                    cursor: 0,
+                    editing: false,
+                }),
+                ..Default::default()
+            };
 
             handle_settings_key(
                 &mut app,
@@ -1044,44 +1048,48 @@ mod tests {
 
     #[test]
     fn clicking_access_action_focuses_access_field() {
-        let mut app = TuiApp::default();
-        app.settings = Some(SecurityEditor {
-            field: SettingsField::RollbackTimeout,
-            active: SecuritySettings {
-                rollback_timeout_seconds: 30,
-            },
-            rollback_timeout_input: "30".into(),
-            override_active: false,
-            restart_required: false,
-            remember_session: true,
-            remember_minutes_input: "5".into(),
-            show_dhcp_client: false,
-            confirmation: None,
-            cursor: 0,
-            editing: false,
-        });
+        let mut app = TuiApp {
+            settings: Some(SecurityEditor {
+                field: SettingsField::RollbackTimeout,
+                active: SecuritySettings {
+                    rollback_timeout_seconds: 30,
+                },
+                rollback_timeout_input: "30".into(),
+                override_active: false,
+                restart_required: false,
+                remember_session: true,
+                remember_minutes_input: "5".into(),
+                show_dhcp_client: false,
+                confirmation: None,
+                cursor: 0,
+                editing: false,
+            }),
+            ..Default::default()
+        };
         focus_action(&mut app, 7);
         assert_eq!(app.settings.as_ref().unwrap().field, SettingsField::Access);
     }
 
     #[test]
     fn clicking_dhcp_client_action_focuses_show_dhcp_client_field() {
-        let mut app = TuiApp::default();
-        app.settings = Some(SecurityEditor {
-            field: SettingsField::RollbackTimeout,
-            active: SecuritySettings {
-                rollback_timeout_seconds: 30,
-            },
-            rollback_timeout_input: "30".into(),
-            override_active: false,
-            restart_required: false,
-            remember_session: true,
-            remember_minutes_input: "5".into(),
-            show_dhcp_client: false,
-            confirmation: None,
-            cursor: 0,
-            editing: false,
-        });
+        let mut app = TuiApp {
+            settings: Some(SecurityEditor {
+                field: SettingsField::RollbackTimeout,
+                active: SecuritySettings {
+                    rollback_timeout_seconds: 30,
+                },
+                rollback_timeout_input: "30".into(),
+                override_active: false,
+                restart_required: false,
+                remember_session: true,
+                remember_minutes_input: "5".into(),
+                show_dhcp_client: false,
+                confirmation: None,
+                cursor: 0,
+                editing: false,
+            }),
+            ..Default::default()
+        };
         focus_action(&mut app, 8);
         assert_eq!(
             app.settings.as_ref().unwrap().field,
@@ -1091,23 +1099,25 @@ mod tests {
 
     #[tokio::test]
     async fn enter_on_access_setting_attempts_to_open_access_editor() {
-        let mut app = TuiApp::default();
-        app.screen = Screen::Settings;
-        app.settings = Some(SecurityEditor {
-            field: SettingsField::Access,
-            active: SecuritySettings {
-                rollback_timeout_seconds: 30,
-            },
-            rollback_timeout_input: "30".into(),
-            override_active: false,
-            restart_required: false,
-            remember_session: true,
-            remember_minutes_input: "5".into(),
-            show_dhcp_client: false,
-            confirmation: None,
-            cursor: 0,
-            editing: false,
-        });
+        let mut app = TuiApp {
+            screen: Screen::Settings,
+            settings: Some(SecurityEditor {
+                field: SettingsField::Access,
+                active: SecuritySettings {
+                    rollback_timeout_seconds: 30,
+                },
+                rollback_timeout_input: "30".into(),
+                override_active: false,
+                restart_required: false,
+                remember_session: true,
+                remember_minutes_input: "5".into(),
+                show_dhcp_client: false,
+                confirmation: None,
+                cursor: 0,
+                editing: false,
+            }),
+            ..Default::default()
+        };
 
         handle_settings_key(
             &mut app,
@@ -1176,23 +1186,25 @@ mod tests {
 
     #[tokio::test]
     async fn settings_editor_cursor_navigation_and_editing() {
-        let mut app = TuiApp::default();
-        app.screen = Screen::Settings;
-        app.settings = Some(SecurityEditor {
-            field: SettingsField::RollbackTimeout,
-            active: SecuritySettings {
-                rollback_timeout_seconds: 30,
-            },
-            rollback_timeout_input: "30".into(),
-            override_active: false,
-            restart_required: false,
-            remember_session: true,
-            remember_minutes_input: "5".into(),
-            show_dhcp_client: false,
-            confirmation: None,
-            cursor: 2,
-            editing: true,
-        });
+        let mut app = TuiApp {
+            screen: Screen::Settings,
+            settings: Some(SecurityEditor {
+                field: SettingsField::RollbackTimeout,
+                active: SecuritySettings {
+                    rollback_timeout_seconds: 30,
+                },
+                rollback_timeout_input: "30".into(),
+                override_active: false,
+                restart_required: false,
+                remember_session: true,
+                remember_minutes_input: "5".into(),
+                show_dhcp_client: false,
+                confirmation: None,
+                cursor: 2,
+                editing: true,
+            }),
+            ..Default::default()
+        };
         let client = ApiClient::new("/socket-that-must-not-be-opened");
 
         handle_settings_key(&mut app, KeyCode::Left, &client).await;
@@ -1262,8 +1274,10 @@ mod tests {
 
     #[tokio::test]
     async fn password_editor_cursor_navigation_and_editing() {
-        let mut app = TuiApp::default();
-        app.screen = Screen::SettingsPassword;
+        let mut app = TuiApp {
+            screen: Screen::SettingsPassword,
+            ..Default::default()
+        };
         let mut editor = PasswordChangeEditor::new();
         editor.current = "secret".into();
         editor.cursor = 6;

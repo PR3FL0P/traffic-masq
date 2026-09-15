@@ -1045,18 +1045,20 @@ mod tests {
         }
     }
 
+    type SentPackets = Arc<std::sync::Mutex<Vec<(Vec<u8>, SendKind)>>>;
+
     #[derive(Default)]
     struct FakeLauncher {
         launches: std::sync::Mutex<Vec<String>>,
         remembered: std::sync::Mutex<Vec<Option<Ipv4Addr>>>,
         sinks: std::sync::Mutex<Vec<Box<dyn DhcpClientActionSink>>>,
-        sends: Arc<std::sync::Mutex<Vec<(Vec<u8>, SendKind)>>>,
+        sends: SentPackets,
         fail_next: AtomicUsize,
 
         exit_immediately: AtomicUsize,
     }
 
-    struct FakeTransport(Arc<std::sync::Mutex<Vec<(Vec<u8>, SendKind)>>>);
+    struct FakeTransport(SentPackets);
 
     #[async_trait]
     impl DhcpClientTransport for FakeTransport {
@@ -1303,7 +1305,7 @@ mod tests {
         network.attach("wan0", 11).await;
         assert!(supervisor.ensure_alive().await.expect("ensure alive"));
         assert_eq!(launcher.launch_count(), 2);
-        assert!(supervisor.ensure_alive().await.expect("ensure alive") == false);
+        assert!(!supervisor.ensure_alive().await.expect("ensure alive"));
     }
 
     #[tokio::test]

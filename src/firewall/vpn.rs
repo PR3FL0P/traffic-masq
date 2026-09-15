@@ -83,6 +83,29 @@ where
         Self { executor }
     }
 
+    pub async fn observe_async(self: &std::sync::Arc<Self>) -> Result<VpnFirewallObservation> {
+        let backend = self.clone();
+        tokio::task::spawn_blocking(move || backend.observe()).await?
+    }
+
+    pub async fn apply_async(
+        self: &std::sync::Arc<Self>,
+        desired: &VpnPolicyFirewallDesired,
+    ) -> Result<()> {
+        let backend = self.clone();
+        let desired = desired.clone();
+        tokio::task::spawn_blocking(move || backend.apply(&desired)).await?
+    }
+
+    pub async fn restore_async(
+        self: &std::sync::Arc<Self>,
+        snapshot: Option<&VpnPolicyFirewallDesired>,
+    ) -> Result<()> {
+        let backend = self.clone();
+        let snapshot = snapshot.cloned();
+        tokio::task::spawn_blocking(move || backend.restore(snapshot.as_ref())).await?
+    }
+
     pub fn observe(&self) -> Result<VpnFirewallObservation> {
         let output = self
             .executor

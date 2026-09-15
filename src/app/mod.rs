@@ -1,9 +1,9 @@
 //! Installation, startup, and process lifecycle management.
 
-pub mod installer;
 pub mod init;
-pub(crate) mod runtime;
+pub mod installer;
 mod process;
+pub(crate) mod runtime;
 pub mod service;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -760,7 +760,7 @@ fn spawn_runtime_network_reconcile(
             // caller cannot mistake an older pass for an answer about its own
             // change.
             let version = desired.version();
-            let failures = match reconcile_network_runtime_once(
+            let result = reconcile_network_runtime_once(
                 &desired,
                 &journal,
                 network.clone(),
@@ -769,15 +769,11 @@ fn spawn_runtime_network_reconcile(
                 wifi_client.as_ref(),
                 Some(&dhcp_client),
             )
-            .await
-            {
-                Ok(failures) => failures,
-                Err(error) => {
-                    tracing::warn!(%error, "runtime interface reconcile pass failed");
-                    BTreeMap::new()
-                }
-            };
-            desired.report_pass(version, failures);
+            .await;
+            if let Err(error) = &result {
+                tracing::warn!(%error, "runtime interface reconcile pass failed");
+            }
+            desired.report_result(version, result);
 
             tokio::select! {
                 event = kernel_events.recv() => match event {
@@ -886,16 +882,12 @@ fn spawn_process_liveness_checks(
 }
 
 async fn preflight_hostapd_binary(binary: &Path) -> Result<()> {
-    tokio::process::Command::new(binary)
-        .arg("-v")
-        .output()
-        .await
-        .with_context(|| {
-            format!(
-                "hostapd binary {} is not runnable — install hostapd or fix wifi.hostapd_binary",
-                binary.display()
-            )
-        })?;
+    crate::command::probe(binary).await.with_context(|| {
+        format!(
+            "hostapd binary {} is not runnable — install hostapd or fix wifi.hostapd_binary",
+            binary.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -916,10 +908,7 @@ async fn build_wifi_supervisor(effective_config: &AppConfig) -> Result<Option<Ho
 }
 
 async fn preflight_wpa_supplicant_binary(binary: &Path) -> Result<()> {
-    tokio::process::Command::new(binary)
-        .arg("-v")
-        .output()
-        .await
+    crate::command::probe(binary).await
         .with_context(|| {
             format!(
                 "wpa_supplicant binary {} is not runnable — install wpa_supplicant or fix wifi_client.wpa_supplicant_binary",
@@ -1011,7 +1000,10 @@ impl<'a> StartupRollback<'a> {
 /// anything derived from it, including `RuntimeOverrideManager`'s base), so
 /// a config file inspected by hand won't yet show the migrated chain.
 async fn migrate_vpn_policy_mode_to_chain(config: &mut AppConfig) {
-    if config.router.forwarding.is_some() || config.vpn.policy.default_mode != VpnPolicyMode::Vpn || !config.router.vpn_chain.is_empty() {
+    if config.router.forwarding.is_some()
+        || config.vpn.policy.default_mode != VpnPolicyMode::Vpn
+        || !config.router.vpn_chain.is_empty()
+    {
         return;
     }
     let active_profile_store =
@@ -1050,7 +1042,7 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     config.validate()?;
     let shutdown = install_shutdown_signal()?;
     let _process_guard = ProcessGuard::acquire(&config.runtime.pid_path)?;
-    init_logging(&config)?;
+    let _logging_guard = init_logging(&config)?;
 
     let overrides = RuntimeOverrideManager::load(&config.runtime.state_dir, &config).await?;
     let override_snapshot = overrides.snapshot().await;
@@ -1079,6 +1071,13 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
 
     let interface_manager =
         InterfaceManager::new(network_provider.clone(), ownership_journal.clone());
+    crate::core::transaction::recover_interface_transactions(
+        &config.runtime.state_dir,
+        &interface_manager,
+        &override_snapshot,
+    )
+    .await
+    .context("failed to recover interrupted interface transactions")?;
     let startup_baselines = interface_manager
         .apply_network_with_management_allowlist(&effective_config.network, &management_allowlist)
         .await?;
@@ -1235,7 +1234,20 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         overrides.clone(),
         Duration::from_secs(config.security.rollback_timeout_seconds),
     ) {
-        Ok(coordinator) => Some(coordinator),
+        Ok(coordinator) => {
+            let recovered = async {
+                if coordinator.recover().await? {
+                    coordinator.repair(desired.clone()).await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            if let Err(error) = recovered {
+                stack.unwind().await;
+                return Err(error).context("failed to recover interrupted router transaction");
+            }
+            Some(coordinator)
+        }
         Err(error) => {
             stack.unwind().await;
             return Err(error);
@@ -1281,7 +1293,7 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         ownership_journal.clone(),
     )
     .with_base_config(config.clone());
-    if let Some(coordinator) = router_coordinator {
+    if let Some(coordinator) = router_coordinator.clone() {
         control = control.with_router_coordinator(coordinator);
     }
 
@@ -1379,6 +1391,14 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     // leave a change nobody ever confirmed on the box for good.
     if let Err(error) = transactions.rollback_all_pending().await {
         tracing::error!(%error, "failed to abandon unconfirmed network changes during shutdown");
+    }
+
+    if let Some(coordinator) = &router_coordinator {
+        if coordinator.status().await != crate::core::router_transaction::CoordinatorStatus::Idle {
+            if let Err(error) = coordinator.rollback().await {
+                tracing::error!(%error, "failed to roll back router transaction during shutdown");
+            }
+        }
     }
 
     reconcile_task.abort();

@@ -203,8 +203,10 @@ mod tests {
             (DhcpClientOperationalState::Running, "running"),
             (DhcpClientOperationalState::Degraded, "degraded"),
         ] {
-            let mut app = TuiApp::default();
-            app.dhcp_clients = vec![status(state)];
+            let mut app = TuiApp {
+                dhcp_clients: vec![status(state)],
+                ..Default::default()
+            };
             let backend = TestBackend::new(100, 10);
             let mut terminal = Terminal::new(backend).unwrap();
             terminal

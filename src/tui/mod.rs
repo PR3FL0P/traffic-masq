@@ -30,11 +30,11 @@ mod access;
 mod dashboard;
 mod dhcp;
 mod dhcp_client;
+mod forwarding;
 mod input;
 mod interfaces;
 mod layout;
 mod logs;
-mod forwarding;
 mod router;
 mod router_topology;
 mod session;
@@ -587,15 +587,12 @@ async fn run_loop(
 // Reads may be cancelled to prioritize input. Actions are never cancelled or
 // retried: a lost response does not imply that a mutation was not applied.
 fn pending_deadline(app: &TuiApp) -> Option<u64> {
-    app.pending
-        .as_ref()
-        .map(|p| p.expires_at_unix)
-        .or_else(|| {
-            app.router_pending.as_ref().map(|p| {
-                p.applied_at_unix
-                    .saturating_add(app.router_rollback_timeout_seconds)
-            })
+    app.pending.as_ref().map(|p| p.expires_at_unix).or_else(|| {
+        app.router_pending.as_ref().map(|p| {
+            p.applied_at_unix
+                .saturating_add(app.router_rollback_timeout_seconds)
         })
+    })
 }
 
 async fn drive_ui(
@@ -800,10 +797,7 @@ async fn navigate_to_section(app: &mut TuiApp, section: Section, client: &ApiCli
         }
         Section::DhcpClient => {
             if !app.show_dhcp_client {
-                app.push_message(
-                    LogLevel::Warn,
-                    "DHCP Client tab is disabled in Settings",
-                );
+                app.push_message(LogLevel::Warn, "DHCP Client tab is disabled in Settings");
             } else if direct {
                 app.push_message(
                     LogLevel::Warn,
@@ -890,7 +884,13 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                 return;
             }
             if app.screen == Screen::Router {
-                if let Some((_, pane)) = app.router.pane_tabs.iter().find(|(rect, _)| layout::point_in_rect(point, *rect)).copied() {
+                if let Some((_, pane)) = app
+                    .router
+                    .pane_tabs
+                    .iter()
+                    .find(|(rect, _)| layout::point_in_rect(point, *rect))
+                    .copied()
+                {
                     router::select_pane(app, pane);
                     return;
                 }
@@ -1039,10 +1039,7 @@ pub(crate) fn format_message_lines(text: &str) -> Vec<Line<'_>> {
                 if !before.is_empty() {
                     spans.push(Span::raw(before));
                 }
-                spans.push(Span::styled(
-                    matched,
-                    Style::default().fg(theme::BAD),
-                ));
+                spans.push(Span::styled(matched, Style::default().fg(theme::BAD)));
                 if !after.is_empty() {
                     spans.push(Span::raw(after));
                 }
@@ -1188,7 +1185,8 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
                     && app.settings.as_ref().is_some_and(|s| s.is_editing());
                 let is_router_actions_focused = app.screen == Screen::Router
                     && (app.router.focus == RouterFocus::Actions
-                        || (app.router.pane == router::RouterPane::Sharing && app.router.sharing_actions_focused)
+                        || (app.router.pane == router::RouterPane::Sharing
+                            && app.router.sharing_actions_focused)
                         || app.router.topology.open);
                 if !is_editing_settings_text && !is_router_actions_focused {
                     let target =
@@ -1202,7 +1200,8 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
                     && app.settings.as_ref().is_some_and(|s| s.is_editing());
                 let is_router_actions_focused = app.screen == Screen::Router
                     && (app.router.focus == RouterFocus::Actions
-                        || (app.router.pane == router::RouterPane::Sharing && app.router.sharing_actions_focused)
+                        || (app.router.pane == router::RouterPane::Sharing
+                            && app.router.sharing_actions_focused)
                         || app.router.topology.open);
                 if !is_editing_settings_text && !is_router_actions_focused {
                     let target =
@@ -1529,14 +1528,16 @@ mod tests {
             stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
             String::from_utf8(request).unwrap()
         });
-        let mut app = TuiApp::default();
-        app.screen = Screen::PendingChange;
-        app.pending = Some(crate::core::transaction::PendingNetworkChange {
-            token: "test-token".into(),
-            interface: "eth0".into(),
-            rollback_timeout_seconds: 30,
-            expires_at_unix: current_unix_time() + 30,
-        });
+        let mut app = TuiApp {
+            screen: Screen::PendingChange,
+            pending: Some(crate::core::transaction::PendingNetworkChange {
+                token: "test-token".into(),
+                interface: "eth0".into(),
+                rollback_timeout_seconds: 30,
+                expires_at_unix: current_unix_time() + 30,
+            }),
+            ..Default::default()
+        };
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(60, 15)).unwrap();
         terminal
             .draw(|frame| render(frame, &mut app, false))
@@ -1567,8 +1568,10 @@ mod tests {
 
     #[tokio::test]
     async fn wifi_click_opens_actions_for_clicked_interface() {
-        let mut app = TuiApp::default();
-        app.screen = Screen::Wifi;
+        let mut app = TuiApp {
+            screen: Screen::Wifi,
+            ..Default::default()
+        };
         app.wifi.rows = vec![
             wifi::WifiRow {
                 interface: "wlan0".into(),
@@ -1702,8 +1705,10 @@ mod tests {
     #[tokio::test]
     async fn resize_clears_hit_regions_and_blocks_hidden_actions() {
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
-        let mut app = TuiApp::default();
-        app.screen = Screen::Preview;
+        let mut app = TuiApp {
+            screen: Screen::Preview,
+            ..Default::default()
+        };
         app.ui
             .buttons
             .push((ratatui::layout::Rect::new(0, 0, 10, 2), 0));
@@ -1725,14 +1730,16 @@ mod tests {
 
     #[test]
     fn disconnected_dashboard_does_not_claim_rollback() {
-        let mut app = TuiApp::default();
-        app.screen = Screen::PendingChange;
-        app.pending = Some(PendingNetworkChange {
-            token: "keep".into(),
-            interface: "eth0".into(),
-            rollback_timeout_seconds: 60,
-            expires_at_unix: 0,
-        });
+        let mut app = TuiApp {
+            screen: Screen::PendingChange,
+            pending: Some(PendingNetworkChange {
+                token: "keep".into(),
+                interface: "eth0".into(),
+                rollback_timeout_seconds: 60,
+                expires_at_unix: 0,
+            }),
+            ..Default::default()
+        };
         app.dashboard.error = Some("connection lost".into());
         refresh_pending_screen(&mut app);
         assert_eq!(app.pending.as_ref().unwrap().token, "keep");
@@ -1744,8 +1751,10 @@ mod tests {
 
     #[tokio::test]
     async fn tabs_do_not_discard_editor_and_navigation_preserves_message() {
-        let mut app = TuiApp::default();
-        app.screen = Screen::WifiEditor;
+        let mut app = TuiApp {
+            screen: Screen::WifiEditor,
+            ..Default::default()
+        };
         navigate_to_section(
             &mut app,
             Section::Dashboard,
@@ -1773,17 +1782,38 @@ mod tests {
             Section::Interfaces
         );
         assert_eq!(adjacent_section(Section::Vpn, true, true), Section::Wifi);
-        assert_eq!(adjacent_section(Section::Wifi, true, true), Section::Settings);
-        assert_eq!(adjacent_section(Section::Settings, true, true), Section::Log);
-        assert_eq!(adjacent_section(Section::Log, true, true), Section::Dashboard);
-        assert_eq!(adjacent_section(Section::Dashboard, false, true), Section::Log);
+        assert_eq!(
+            adjacent_section(Section::Wifi, true, true),
+            Section::Settings
+        );
+        assert_eq!(
+            adjacent_section(Section::Settings, true, true),
+            Section::Log
+        );
+        assert_eq!(
+            adjacent_section(Section::Log, true, true),
+            Section::Dashboard
+        );
+        assert_eq!(
+            adjacent_section(Section::Dashboard, false, true),
+            Section::Log
+        );
         assert_eq!(
             adjacent_section(Section::Interfaces, false, true),
             Section::Dashboard
         );
-        assert_eq!(adjacent_section(Section::Interfaces, true, true), Section::Dhcp);
-        assert_eq!(adjacent_section(Section::Dhcp, true, true), Section::DhcpClient);
-        assert_eq!(adjacent_section(Section::DhcpClient, true, true), Section::Router);
+        assert_eq!(
+            adjacent_section(Section::Interfaces, true, true),
+            Section::Dhcp
+        );
+        assert_eq!(
+            adjacent_section(Section::Dhcp, true, true),
+            Section::DhcpClient
+        );
+        assert_eq!(
+            adjacent_section(Section::DhcpClient, true, true),
+            Section::Router
+        );
     }
 
     #[test]

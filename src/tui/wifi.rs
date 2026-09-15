@@ -1586,11 +1586,7 @@ pub(crate) async fn handle_wifi_profiles_key(app: &mut TuiApp, key: KeyCode, cli
     }
 }
 
-async fn activate_profile_action(
-    app: &mut TuiApp,
-    client: &ApiClient,
-    action: WifiProfileAction,
-) {
+async fn activate_profile_action(app: &mut TuiApp, client: &ApiClient, action: WifiProfileAction) {
     match action {
         WifiProfileAction::Back => {
             if let Some(current) = app.wifi_profiles.as_mut() {
@@ -1624,14 +1620,8 @@ async fn activate_profile_action(
 
             match action {
                 WifiProfileAction::Activate => {
-                    open_wifi_connect_prompt(
-                        app,
-                        client,
-                        interface,
-                        profile.id,
-                        profile.ssid,
-                    )
-                    .await;
+                    open_wifi_connect_prompt(app, client, interface, profile.id, profile.ssid)
+                        .await;
                 }
                 WifiProfileAction::Edit => {
                     app.wifi_profile_editor =
@@ -1668,24 +1658,22 @@ async fn activate_profile_row(app: &mut TuiApp, client: &ApiClient) {
         return;
     };
     match mode {
-        WifiProfilesMode::Menu => {
-            match WifiProfilesMenuAction::from_index(selected) {
-                Some(WifiProfilesMenuAction::Management) => {
-                    if let Some(current) = app.wifi_profiles.as_mut() {
-                        current.mode = WifiProfilesMode::Management;
-                        current.selected = if current.profiles.is_empty() {
-                            0
-                        } else {
-                            current.selected_profile.min(current.profiles.len() - 1)
-                        };
-                    }
+        WifiProfilesMode::Menu => match WifiProfilesMenuAction::from_index(selected) {
+            Some(WifiProfilesMenuAction::Management) => {
+                if let Some(current) = app.wifi_profiles.as_mut() {
+                    current.mode = WifiProfilesMode::Management;
+                    current.selected = if current.profiles.is_empty() {
+                        0
+                    } else {
+                        current.selected_profile.min(current.profiles.len() - 1)
+                    };
                 }
-                Some(WifiProfilesMenuAction::CreateNew) => {
-                    open_create_profile(app, interface);
-                }
-                None => {}
             }
-        }
+            Some(WifiProfilesMenuAction::CreateNew) => {
+                open_create_profile(app, interface);
+            }
+            None => {}
+        },
         WifiProfilesMode::Management => {
             if is_empty {
                 open_create_profile(app, interface);
@@ -2891,21 +2879,23 @@ mod tests {
 
     #[test]
     fn scan_scrolls_selected_network_into_view() {
-        let mut app = TuiApp::default();
-        app.wifi_scan = Some(WifiScanPicker {
-            interface: "wlan0".into(),
-            networks: (0..40)
-                .map(|i| {
-                    scan(
-                        &format!("network-{i}"),
-                        -40,
-                        WpaSupplicantScanSecurity::Open,
-                        "00:00:00:00:00:01",
-                    )
-                })
-                .collect(),
-            selected: 39,
-        });
+        let mut app = TuiApp {
+            wifi_scan: Some(WifiScanPicker {
+                interface: "wlan0".into(),
+                networks: (0..40)
+                    .map(|i| {
+                        scan(
+                            &format!("network-{i}"),
+                            -40,
+                            WpaSupplicantScanSecurity::Open,
+                            "00:00:00:00:00:01",
+                        )
+                    })
+                    .collect(),
+                selected: 39,
+            }),
+            ..Default::default()
+        };
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 15)).unwrap();
         terminal
@@ -2924,26 +2914,28 @@ mod tests {
 
     #[tokio::test]
     async fn long_profile_list_keeps_delete_visible_and_requires_confirmation() {
-        let mut app = TuiApp::default();
-        app.wifi_profiles = Some(WifiProfilesView {
-            interface: "wlan0".into(),
-            mode: WifiProfilesMode::Management,
-            selected: 39,
-            selected_profile: 39,
-            delete_confirmation: None,
-            profiles: (0..40)
-                .map(|i| WifiClientProfileSummary {
-                    id: format!("p{i}"),
-                    ssid: format!("network{i}"),
-                    country_code: None,
-                    security: WifiClientSecurity::Open,
-                    priority: 0,
-                    created_at: 0,
-                    modified_at: 0,
-                    has_passphrase: false,
-                })
-                .collect(),
-        });
+        let mut app = TuiApp {
+            wifi_profiles: Some(WifiProfilesView {
+                interface: "wlan0".into(),
+                mode: WifiProfilesMode::Management,
+                selected: 39,
+                selected_profile: 39,
+                delete_confirmation: None,
+                profiles: (0..40)
+                    .map(|i| WifiClientProfileSummary {
+                        id: format!("p{i}"),
+                        ssid: format!("network{i}"),
+                        country_code: None,
+                        security: WifiClientSecurity::Open,
+                        priority: 0,
+                        created_at: 0,
+                        modified_at: 0,
+                        has_passphrase: false,
+                    })
+                    .collect(),
+            }),
+            ..Default::default()
+        };
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 15)).unwrap();
         terminal
@@ -2990,24 +2982,26 @@ mod tests {
 
     #[tokio::test]
     async fn wifi_profiles_menu_shows_management_and_create_new() {
-        let mut app = TuiApp::default();
-        app.wifi_profiles = Some(WifiProfilesView {
-            interface: "wlan0".into(),
-            mode: WifiProfilesMode::Menu,
-            selected: 0,
-            selected_profile: 0,
-            delete_confirmation: None,
-            profiles: vec![WifiClientProfileSummary {
-                id: "home".into(),
-                ssid: "HomeNet".into(),
-                country_code: None,
-                security: WifiClientSecurity::Wpa2,
-                priority: 10,
-                created_at: 0,
-                modified_at: 0,
-                has_passphrase: true,
-            }],
-        });
+        let mut app = TuiApp {
+            wifi_profiles: Some(WifiProfilesView {
+                interface: "wlan0".into(),
+                mode: WifiProfilesMode::Menu,
+                selected: 0,
+                selected_profile: 0,
+                delete_confirmation: None,
+                profiles: vec![WifiClientProfileSummary {
+                    id: "home".into(),
+                    ssid: "HomeNet".into(),
+                    country_code: None,
+                    security: WifiClientSecurity::Wpa2,
+                    priority: 10,
+                    created_at: 0,
+                    modified_at: 0,
+                    has_passphrase: true,
+                }],
+            }),
+            ..Default::default()
+        };
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 15)).unwrap();
         terminal

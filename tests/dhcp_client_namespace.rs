@@ -3,7 +3,6 @@
 use std::io::{BufRead, BufReader as StdBufReader};
 use std::net::{Ipv4Addr, UdpSocket};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -22,7 +21,7 @@ use traffic_masq::dhcp::packet::{
     OPTION_SERVER_IDENTIFIER, OPTION_SUBNET_MASK,
 };
 
-static NAMESPACE_TEST_LOCK: Mutex<()> = Mutex::new(());
+static NAMESPACE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const TEST_TIMEOUT: Duration = Duration::from_secs(15);
 const SERVER_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
 const LIFECYCLE_LEASE: u32 = 8;
@@ -151,7 +150,7 @@ impl Segment {
                 }
             }
         });
-        let ready = timeout(TEST_TIMEOUT, async {
+        timeout(TEST_TIMEOUT, async {
             while let Some(line) = report_rx.recv().await {
                 if line.trim() == "FAKE_DHCP_READY" {
                     return Ok(());
@@ -161,7 +160,6 @@ impl Segment {
         })
         .await
         .context("fake DHCP server did not become ready")??;
-        let _ = ready;
         self.server = Some(child);
         self.reports = Some(report_rx);
         self.report_reader = Some(reader);
@@ -317,7 +315,7 @@ impl DhcpClientActionSink for LifecycleSink {
 #[ignore = "requires Linux root and iproute2; run explicitly on a disposable host"]
 async fn real_port_68_acquisition_is_parallel_and_interface_isolated() -> Result<()> {
     require_root_and_ip()?;
-    let _guard = namespace_guard()?;
+    let _guard = namespace_guard().await?;
     let suffix = unique_suffix();
     let mut first = Segment::new('a', &suffix)?;
     let mut second = Segment::new('b', &suffix)?;
@@ -437,14 +435,14 @@ async fn start_lifecycle_fixture(
     tag: char,
     mode: ServerMode,
 ) -> Result<(
-    std::sync::MutexGuard<'static, ()>,
+    tokio::sync::MutexGuard<'static, ()>,
     Segment,
     ClientTask,
     watch::Sender<bool>,
     mpsc::UnboundedReceiver<LifecycleEvent>,
 )> {
     require_root_and_ip()?;
-    let guard = namespace_guard()?;
+    let guard = namespace_guard().await?;
     let mut segment = Segment::new(tag, &unique_suffix())?;
     segment
         .start_server(Ipv4Addr::new(192, 0, 2, 110), mode)
@@ -630,10 +628,8 @@ fn reply(
     Ok(packet)
 }
 
-fn namespace_guard() -> Result<std::sync::MutexGuard<'static, ()>> {
-    NAMESPACE_TEST_LOCK
-        .lock()
-        .map_err(|_| anyhow::anyhow!("namespace lock poisoned"))
+async fn namespace_guard() -> Result<tokio::sync::MutexGuard<'static, ()>> {
+    Ok(NAMESPACE_TEST_LOCK.lock().await)
 }
 
 fn require_root_and_ip() -> Result<()> {
@@ -660,13 +656,18 @@ fn require_isolated_network_namespace() -> Result<()> {
     }
     let ours =
         std::fs::read_link("/proc/self/ns/net").context("failed to read this network namespace")?;
-    let host = std::fs::read_link("/proc/1/ns/net")
-        .context("failed to read the host network namespace")?;
+    // In the isolated runner PID 1 is also isolated. Compare with the namespace
+    // captured outside unshare, rather than mistaking that private PID 1 for the host.
+    let host = match std::env::var_os("TRAFFIC_MASQ_TEST_HOST_NETNS") {
+        Some(namespace) => std::path::PathBuf::from(namespace),
+        None => std::fs::read_link("/proc/1/ns/net")
+            .context("failed to read the host network namespace")?,
+    };
     if ours == host {
         bail!(
             "refusing to run in the host network namespace: a host DHCP client would claim the \
              test veth and inject DHCPDISCOVER traffic onto the segment. Re-run under \
-             `ip netns exec <name> ...` (see this file's module header), or set \
+             `sh packaging/test-namespaces.sh dhcp_client_namespace`, or set \
              TRAFFIC_MASQ_ALLOW_HOST_NETNS=1 if nothing can manage the test interfaces."
         );
     }

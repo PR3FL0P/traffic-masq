@@ -47,6 +47,8 @@ pub struct ConvergencePass {
     pub version: u64,
     /// Interfaces the pass could not bring to the desired state, and why.
     pub failures: BTreeMap<String, String>,
+    /// Failure before individual interfaces could be reconciled.
+    pub error: Option<String>,
 }
 
 /// Committed configuration with any unconfirmed changes layered on top.
@@ -102,7 +104,20 @@ impl DesiredNetworkState {
     /// `version` is the desired-state version the pass read when it started —
     /// not the current one, which may have moved while it ran.
     pub fn report_pass(&self, version: u64, failures: BTreeMap<String, String>) {
-        let _ = self.passes.send(ConvergencePass { version, failures });
+        self.report_result(version, Ok(failures));
+    }
+
+    pub fn report_result(&self, version: u64, result: Result<BTreeMap<String, String>>) {
+        let (failures, error) = match result {
+            Ok(failures) => (failures, None),
+            Err(error) => (BTreeMap::new(), Some(format!("{error:#}"))),
+        };
+        // Keep the latest result even if the caller has not subscribed yet.
+        self.passes.send_replace(ConvergencePass {
+            version,
+            failures,
+            error,
+        });
     }
 
     /// Wait for a convergence pass that had already seen version `version`.
@@ -122,12 +137,20 @@ impl DesiredNetworkState {
                 return ConvergencePass {
                     version,
                     failures: BTreeMap::new(),
+                    error: Some("convergence stopped".into()),
                 };
             }
         }
     }
 
     /// The configuration to converge towards right now.
+    pub(crate) fn state_dir(&self) -> &std::path::Path {
+        self.overrides
+            .path()
+            .parent()
+            .expect("override store has a parent")
+    }
+
     pub async fn effective(&self) -> Result<AppConfig> {
         let mut effective = self
             .overrides
@@ -201,7 +224,7 @@ impl DesiredNetworkState {
         // Bumped after the layer is in place, never before: a converger that
         // reads this version has to be able to see what it stands for.
         self.version.fetch_add(1, Ordering::SeqCst);
-        self.tentative_changed.notify_waiters();
+        self.tentative_changed.notify_one();
     }
 
     /// Drop everything a transaction proposed.
@@ -226,15 +249,15 @@ impl DesiredNetworkState {
 
         if !released.is_empty() {
             self.version.fetch_add(1, Ordering::SeqCst);
-            self.tentative_changed.notify_waiters();
+            self.tentative_changed.notify_one();
         }
         released
     }
 
     /// Wait until the desired state moves, from either layer.
     ///
-    /// One place to wait, because "the desired state changed" is one fact
-    /// regardless of which layer it came from.
+    /// There is one convergence consumer. Each layer retains one notification
+    /// while a pass runs, so changes between reading state and waiting are not lost.
     pub async fn changed(&self) {
         tokio::select! {
             () = self.overrides.changed() => {}
@@ -288,6 +311,49 @@ mod tests {
             .ipv4
             .expect("ipv4")
             .to_string()
+    }
+
+    #[tokio::test]
+    async fn changes_during_a_pass_are_retained_until_the_next_wait() {
+        let (state, _dir) = desired_state().await;
+        // A pass has read the old snapshot and is busy applying it.
+        assert_eq!(lan0_address(&state).await, "192.168.10.1/24");
+        state
+            .propose("pending", "lan0", interface("10.1.1.1/24"), false)
+            .await;
+        tokio::time::timeout(Duration::from_secs(1), state.changed())
+            .await
+            .unwrap();
+        assert_eq!(lan0_address(&state).await, "10.1.1.1/24");
+        state.withdraw("pending").await;
+        tokio::time::timeout(Duration::from_secs(1), state.changed())
+            .await
+            .unwrap();
+        assert_eq!(lan0_address(&state).await, "192.168.10.1/24");
+        state
+            .overrides
+            .set_interface("lan0".into(), interface("172.16.0.1/24"), false)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), state.changed())
+            .await
+            .unwrap();
+        assert_eq!(lan0_address(&state).await, "172.16.0.1/24");
+    }
+
+    #[tokio::test]
+    async fn pass_result_is_retained_before_a_waiter_subscribes() {
+        let (state, _dir) = desired_state().await;
+        state.report_result(7, Err(anyhow::anyhow!("netlink unavailable")));
+        let pass = tokio::time::timeout(Duration::from_secs(1), state.pass_covering(7))
+            .await
+            .unwrap();
+        assert_eq!(pass.error.as_deref(), Some("netlink unavailable"));
+        state.report_pass(8, BTreeMap::new());
+        let pass = tokio::time::timeout(Duration::from_secs(1), state.pass_covering(8))
+            .await
+            .unwrap();
+        assert!(pass.error.is_none());
     }
 
     #[tokio::test]

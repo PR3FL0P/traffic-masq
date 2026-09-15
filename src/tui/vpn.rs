@@ -702,10 +702,7 @@ mod tests {
         assert_eq!(app.vpn_import.as_ref().unwrap().cursor, 3);
 
         handle_vpn_import_key(&mut app, KeyCode::Down, &client).await;
-        assert_eq!(
-            app.vpn_import.as_ref().unwrap().field,
-            VpnImportField::Path
-        );
+        assert_eq!(app.vpn_import.as_ref().unwrap().field, VpnImportField::Path);
         assert_eq!(
             app.vpn_import.as_ref().unwrap().cursor,
             "/tmp/vpn.conf".len()

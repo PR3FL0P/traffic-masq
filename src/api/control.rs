@@ -1,3 +1,10 @@
+mod dhcp_client;
+mod dispatch;
+mod router;
+mod vpn;
+mod wifi;
+mod wifi_client;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,13 +16,12 @@ use crate::api::model::{
     ApiHttpsSettings, DhcpClientConfigRequest, DhcpClientErrorDetail, DhcpClientOperationalState,
     DhcpClientStatusView, DhcpEditRequest, InterfaceEditRequest, InterfaceStatus,
     ProvisioningDownstreamView, ProvisioningOutputView, ProvisioningStage, ProvisioningUplinkView,
-    ProvisioningWarning, Request, Response, RouterErrorDetail, RouterProposalRequest,
+    ProvisioningWarning, Request, Response, RouteStatus, RouterErrorDetail, RouterProposalRequest,
     RouterProvisioningApplyRequest, RouterProvisioningErrorDetail,
     RouterProvisioningPreviewRequest, RouterProvisioningPreviewView, RouterProvisioningRequest,
     RouterProvisioningStatusView, SecuritySettings, VpnErrorDetail, VpnPolicyErrorDetail,
     VpnPolicyStatusView, WifiClientEditRequest, WifiClientErrorDetail,
     WifiClientProfileErrorDetail, WifiClientProfileWriteRequest, WifiEditRequest, WifiErrorDetail,
-    RouteStatus,
 };
 use crate::config::{
     ApiConfig, AppConfig, DhcpClientInterfaceConfig, DhcpInterfaceConfig, InterfaceConfig,
@@ -64,6 +70,7 @@ use crate::wifi::{
 
 #[derive(Clone)]
 pub struct ControlService {
+    operations: crate::api::operations::Operations,
     /// The configuration that is actually running, as it was when the daemon
     /// started. Reported as "active" so the UI can tell the user which settings
     /// need a restart to take effect.
@@ -143,6 +150,7 @@ impl ControlService {
             WifiClientProfileStore::new(config.runtime.state_dir.join("wifi/client-profiles"));
 
         Self {
+            operations: Default::default(),
             base_config: config.clone(),
             config,
             network,
@@ -271,511 +279,21 @@ impl ControlService {
         self.security_config_response().await
     }
 
-    pub async fn dispatch(&self, request: Request) -> Response {
-        match request {
-            Request::Ping => Response::Pong,
-            Request::GetApiHttpsConfig => match self.api_https_config_response().await {
-                Ok(response) => response,
-                Err(error) => Response::Error {
-                    message: error.to_string(),
-                },
-            },
-            Request::ConfigureApiHttpsSettings { settings } => {
-                match self.configure_api_https_settings(settings).await {
-                    Ok(response) => response,
-                    Err(error) => Response::Error {
-                        message: error.to_string(),
-                    },
-                }
-            }
-            Request::ResetApiHttpsSettings => match self.reset_api_https_settings().await {
-                Ok(response) => response,
-                Err(error) => Response::Error {
-                    message: error.to_string(),
-                },
-            },
-            Request::GetSecurityConfig => match self.security_config_response().await {
-                Ok(response) => response,
-                Err(error) => Response::Error {
-                    message: error.to_string(),
-                },
-            },
-            Request::ConfigureSecuritySettings { settings } => {
-                match self.configure_security_settings(settings).await {
-                    Ok(response) => response,
-                    Err(error) => Response::Error {
-                        message: error.to_string(),
-                    },
-                }
-            }
-            Request::ResetSecuritySettings => match self.reset_security_settings().await {
-                Ok(response) => response,
-                Err(error) => Response::Error {
-                    message: error.to_string(),
-                },
-            },
-            Request::ListInterfaces => {
-                match interface_statuses(self.network.as_ref(), &self.transactions).await {
-                    Ok(interfaces) => Response::Interfaces { interfaces },
-                    Err(error) => Response::Error {
-                        message: error.to_string(),
-                    },
-                }
-            }
-            Request::GetInterfaceConfig { interface } => {
-                match self.interface_config_response(interface).await {
-                    Ok(response) => response,
-                    Err(error) => Response::Error {
-                        message: error.to_string(),
-                    },
-                }
-            }
-            Request::DhcpStatus => Response::DhcpStatus {
-                running_interfaces: self.dhcp.running_interfaces().await,
-                unhealthy_interfaces: self.dhcp.unhealthy_interfaces().await,
-            },
-            Request::DhcpClientStatus => self.dhcp_client_status().await,
-            Request::GetDhcpClient { interface } => self.get_dhcp_client(interface).await,
-            Request::ConfigureDhcpClient { interface, config } => {
-                self.configure_dhcp_client(interface, config).await
-            }
-            Request::DisableDhcpClient { interface } => self.disable_dhcp_client(interface).await,
-            Request::RenewDhcpClient { interface } => self.renew_dhcp_client(interface).await,
-            Request::ReleaseDhcpClient { interface } => self.release_dhcp_client(interface).await,
-            Request::GetDhcpConfig { interface } => Response::DhcpConfig {
-                spec: self.dhcp.spec(&interface).await,
-                interface,
-            },
-            Request::ConfigureDhcp {
-                interface,
-                config: dhcp_config,
-            } => match build_effective_dhcp_service(
-                &interface,
-                dhcp_config,
-                &self.overrides,
-                self.network.as_ref(),
-                self.base_config.dhcp.default_lease_seconds,
-            )
-            .await
-            {
-                Ok(spec) => {
-                    let _mutation = self.dhcp_mutations.lock().await;
-                    match configure_dhcp_persisted(&self.dhcp, &self.overrides, spec.clone()).await
-                    {
-                        Ok(()) => Response::DhcpConfigured { spec },
-                        Err(error) => Response::Error {
-                            message: error.to_string(),
-                        },
-                    }
-                }
-                Err(error) => Response::Error {
-                    message: error.to_string(),
-                },
-            },
-            Request::ConfigureDhcpSettings {
-                interface,
-                settings,
-            } => match build_effective_dhcp_service(
-                &interface,
-                dhcp_edit_request_to_config(settings),
-                &self.overrides,
-                self.network.as_ref(),
-                self.base_config.dhcp.default_lease_seconds,
-            )
-            .await
-            {
-                Ok(spec) => {
-                    let _mutation = self.dhcp_mutations.lock().await;
-                    match configure_dhcp_persisted(&self.dhcp, &self.overrides, spec.clone()).await
-                    {
-                        Ok(()) => Response::DhcpConfigured { spec },
-                        Err(error) => Response::Error {
-                            message: error.to_string(),
-                        },
-                    }
-                }
-                Err(error) => Response::Error {
-                    message: error.to_string(),
-                },
-            },
-            Request::DisableDhcp { interface } => {
-                let _mutation = self.dhcp_mutations.lock().await;
-                match disable_dhcp_persisted(&self.dhcp, &self.overrides, &interface).await {
-                    Ok(()) => Response::DhcpDisabled { interface },
-                    Err(error) => Response::Error {
-                        message: error.to_string(),
-                    },
-                }
-            }
-            Request::ListLeases { interface } => {
-                if self.dhcp.spec(&interface).await.is_none() {
-                    return Response::Error {
-                        message: format!("DHCP is not configured for interface {interface}"),
-                    };
-                }
+    pub async fn finish_operations(&self) {
+        self.operations.close().await;
+    }
 
-                let store =
-                    LeaseStore::for_interface(&self.base_config.dhcp.leases_dir, &interface);
-                match store.load().await {
-                    Ok(leases) => Response::Leases { interface, leases },
-                    Err(error) => Response::Error {
-                        message: error.to_string(),
-                    },
-                }
-            }
-            Request::DryRunInterface {
-                interface,
-                config,
-                allow_management_change,
-            } => {
-                let current = match self.overrides.effective_interface(&interface).await {
-                    Ok(current) => current,
-                    Err(error) => {
-                        return Response::Error {
-                            message: error.to_string(),
-                        }
-                    }
-                };
-                let current_role = current.as_ref().map(|config| config.role);
-                if let Err(error) = self
-                    .validate_default_route_management(&interface, &config, allow_management_change)
-                    .await
-                {
-                    return Response::Error {
-                        message: error.to_string(),
-                    };
-                }
-                if let Err(error) = Self::validate_router_service_management(
-                    &interface,
-                    current.as_ref(),
-                    &config,
-                    allow_management_change,
-                ) {
-                    return Response::Error {
-                        message: error.to_string(),
-                    };
-                }
-                match self
-                    .transactions
-                    .dry_run_transition(
-                        &interface,
-                        &config,
-                        current.as_ref(),
-                        current_role,
-                        allow_management_change,
-                    )
-                    .await
-                {
-                    Ok(plan) => Response::InterfacePlan { plan },
-                    Err(error) => Response::Error {
-                        message: error.to_string(),
-                    },
-                }
-            }
-            Request::DryRunInterfaceEdit { interface, edit } => {
-                let current = match self.overrides.effective_interface(&interface).await {
-                    Ok(current) => current,
-                    Err(error) => {
-                        return Response::Error {
-                            message: error.to_string(),
-                        }
-                    }
-                };
-                let current_role = current.as_ref().map(|config| config.role);
-                match interface_edit_request_to_config(edit, current.as_ref()) {
-                    Ok((config, allow_management_change)) => {
-                        if let Err(error) = self
-                            .validate_default_route_management(
-                                &interface,
-                                &config,
-                                allow_management_change,
-                            )
-                            .await
-                        {
-                            return Response::Error {
-                                message: error.to_string(),
-                            };
-                        }
-                        if let Err(error) = Self::validate_router_service_management(
-                            &interface,
-                            current.as_ref(),
-                            &config,
-                            allow_management_change,
-                        ) {
-                            return Response::Error {
-                                message: error.to_string(),
-                            };
-                        }
-                        match self
-                            .transactions
-                            .dry_run_transition(
-                                &interface,
-                                &config,
-                                current.as_ref(),
-                                current_role,
-                                allow_management_change,
-                            )
-                            .await
-                        {
-                            Ok(plan) => Response::InterfacePlan { plan },
-                            Err(error) => Response::Error {
-                                message: error.to_string(),
-                            },
-                        }
-                    }
-                    Err(error) => Response::Error {
-                        message: error.to_string(),
-                    },
-                }
-            }
-            Request::ApplyInterface {
-                interface,
-                config,
-                allow_management_change,
-            } => {
-                let current = match self.overrides.effective_interface(&interface).await {
-                    Ok(current) => current,
-                    Err(error) => {
-                        return Response::Error {
-                            message: error.to_string(),
-                        }
-                    }
-                };
-                let current_role = current.as_ref().map(|config| config.role);
-                if let Err(error) = self
-                    .validate_default_route_management(&interface, &config, allow_management_change)
-                    .await
-                {
-                    return Response::Error {
-                        message: error.to_string(),
-                    };
-                }
-                if let Err(error) = Self::validate_router_service_management(
-                    &interface,
-                    current.as_ref(),
-                    &config,
-                    allow_management_change,
-                ) {
-                    return Response::Error {
-                        message: error.to_string(),
-                    };
-                }
-                match self
-                    .transactions
-                    .apply_transition(
-                        &interface,
-                        &config,
-                        current.as_ref(),
-                        current_role,
-                        allow_management_change,
-                    )
-                    .await
-                {
-                    Ok(change) => {
-                        if config.role != InterfaceRole::Output || config.wifi.is_none() {
-                            if let Some(wifi) = &self.wifi {
-                                let _ = wifi.disable(&interface).await;
-                            }
-                        }
-                        Response::NetworkChangePending { change }
-                    }
-                    Err(error) => Response::Error {
-                        message: error.to_string(),
-                    },
-                }
-            }
-            Request::ApplyInterfaceEdit { interface, edit } => {
-                let current = match self.overrides.effective_interface(&interface).await {
-                    Ok(current) => current,
-                    Err(error) => {
-                        return Response::Error {
-                            message: error.to_string(),
-                        }
-                    }
-                };
-                let current_role = current.as_ref().map(|config| config.role);
-                match interface_edit_request_to_config(edit, current.as_ref()) {
-                    Ok((config, allow_management_change)) => {
-                        if let Err(error) = self
-                            .validate_default_route_management(
-                                &interface,
-                                &config,
-                                allow_management_change,
-                            )
-                            .await
-                        {
-                            return Response::Error {
-                                message: error.to_string(),
-                            };
-                        }
-                        if let Err(error) = Self::validate_router_service_management(
-                            &interface,
-                            current.as_ref(),
-                            &config,
-                            allow_management_change,
-                        ) {
-                            return Response::Error {
-                                message: error.to_string(),
-                            };
-                        }
-                        match self
-                            .transactions
-                            .apply_transition(
-                                &interface,
-                                &config,
-                                current.as_ref(),
-                                current_role,
-                                allow_management_change,
-                            )
-                            .await
-                        {
-                            Ok(change) => {
-                                if config.role != InterfaceRole::Output || config.wifi.is_none() {
-                                    if let Some(wifi) = &self.wifi {
-                                        let _ = wifi.disable(&interface).await;
-                                    }
-                                }
-                                Response::NetworkChangePending { change }
-                            }
-                            Err(error) => Response::Error {
-                                message: error.to_string(),
-                            },
-                        }
-                    }
-                    Err(error) => Response::Error {
-                        message: error.to_string(),
-                    },
-                }
-            }
-            Request::CommitNetworkChange { token } => match self
-                .transactions
-                .commit_with(&token, |interface, config, allow_management_change| {
-                    self.overrides
-                        .set_interface(interface, config, allow_management_change)
-                })
-                .await
-            {
-                Ok(change) => {
-                    let committed = self
-                        .overrides
-                        .effective_interface(&change.interface)
-                        .await
-                        .ok()
-                        .flatten();
-                    if let Some(config) = committed {
-                        if config.role != InterfaceRole::Output || config.wifi.is_none() {
-                            if let Some(wifi) = &self.wifi {
-                                let _ = wifi.disable(&change.interface).await;
-                            }
-                        }
-                    }
-                    Response::NetworkChangeCommitted { change }
-                }
-                Err(error) => Response::Error {
-                    message: error.to_string(),
-                },
+    pub async fn dispatch(&self, request: Request) -> Response {
+        let service = self.clone();
+        match self
+            .operations
+            .run(async move { service.dispatch_inner(request).await })
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => Response::Error {
+                message: error.to_string(),
             },
-            Request::RollbackNetworkChange { token } => {
-                match self.transactions.rollback(&token).await {
-                    Ok(change) => Response::NetworkChangeRolledBack { change },
-                    Err(error) => Response::Error {
-                        message: error.to_string(),
-                    },
-                }
-            }
-            Request::PendingNetworkChanges => Response::PendingNetworkChanges {
-                changes: self.transactions.pending().await,
-            },
-            Request::RouterStatus => self.router_status().await,
-            Request::RouterPlan { proposal } => self.router_plan(proposal).await,
-            Request::RouterApply { proposal } => self.router_apply(proposal).await,
-            Request::RouterCommit => self.router_commit().await,
-            Request::RouterRollback => self.router_rollback().await,
-            Request::RouterPendingTransaction => self.router_pending_transaction().await,
-            Request::ListRoutes { include_local_table } => {
-                self.list_routes(include_local_table).await
-            }
-            Request::GetRouterConfig => self.get_router_config().await,
-            Request::RouterProvisioningPreview { request } => {
-                self.router_provisioning_preview(request).await
-            }
-            Request::RouterProvisioningApply { request } => {
-                self.router_provisioning_apply(request).await
-            }
-            Request::RouterProvisioningStatus => self.router_provisioning_status().await,
-            Request::RouterProvisioningRepair => self.router_provisioning_repair().await,
-            Request::VpnListProfiles => self.vpn_list_profiles().await,
-            Request::VpnImportProfile { name, contents } => {
-                self.vpn_import_profile(name, contents).await
-            }
-            Request::VpnDeleteProfile { name } => self.vpn_delete_profile(name).await,
-            Request::VpnStatus => self.vpn_status().await,
-            Request::VpnActivate { name } => self.vpn_activate(name).await,
-            Request::VpnDeactivate => self.vpn_deactivate().await,
-            Request::VpnPolicyStatus => self.vpn_policy_status().await,
-            Request::VpnPolicySetMode { mode } => self.vpn_policy_set_mode(mode).await,
-            Request::VpnPolicyClearMode => self.vpn_policy_clear_mode().await,
-            Request::WifiStatus => self.wifi_status().await,
-            Request::GetWifiConfig { interface } => self.get_wifi_config(interface).await,
-            Request::ConfigureWifi {
-                interface,
-                settings,
-            } => self.configure_wifi(interface, settings).await,
-            Request::ProvisionWifiAccessPoint {
-                interface,
-                settings,
-                passphrase,
-                configure_dhcp,
-            } => {
-                self.provision_wifi_access_point(interface, settings, passphrase, configure_dhcp)
-                    .await
-            }
-            Request::DisableWifi { interface } => self.disable_wifi(interface).await,
-            Request::WifiSetPassphrase {
-                interface,
-                passphrase,
-            } => self.wifi_set_passphrase(interface, passphrase).await,
-            Request::ListWifiStations { interface } => self.list_wifi_stations(interface).await,
-            Request::WifiDeauthStation { interface, mac } => {
-                self.wifi_deauth_station(interface, mac).await
-            }
-            Request::WifiReload { interface } => self.wifi_reload(interface).await,
-            Request::WifiClientStatus => self.wifi_client_status().await,
-            Request::GetWifiClientConfig { interface } => {
-                self.get_wifi_client_config(interface).await
-            }
-            Request::ConfigureWifiClient {
-                interface,
-                settings,
-            } => self.configure_wifi_client(interface, settings).await,
-            Request::DisableWifiClient { interface } => self.disable_wifi_client(interface).await,
-            Request::WifiClientSetPassphrase {
-                interface,
-                passphrase,
-            } => self.wifi_client_set_passphrase(interface, passphrase).await,
-            Request::WifiClientReconnect { interface } => {
-                self.wifi_client_reconnect(interface).await
-            }
-            Request::WifiClientScan { interface } => self.wifi_client_scan(interface).await,
-            Request::ListWifiClientProfiles => self.list_wifi_client_profiles().await,
-            Request::GetWifiClientProfile { id } => self.get_wifi_client_profile(id).await,
-            Request::CreateWifiClientProfile { profile } => {
-                self.create_wifi_client_profile(profile).await
-            }
-            Request::UpdateWifiClientProfile { id, profile } => {
-                self.update_wifi_client_profile(id, profile).await
-            }
-            Request::DeleteWifiClientProfile { id } => self.delete_wifi_client_profile(id).await,
-            Request::ActivateWifiClientProfile {
-                interface,
-                profile_id,
-            } => {
-                self.activate_wifi_client_profile(interface, profile_id)
-                    .await
-            }
-            Request::DeactivateWifiClientProfile { interface } => {
-                self.disable_wifi_client(interface).await
-            }
         }
     }
 
@@ -876,1900 +394,12 @@ impl ControlService {
         })
     }
 
-    async fn vpn_list_profiles(&self) -> Response {
-        let Some(vpn) = &self.vpn else {
-            return vpn_disabled();
-        };
-        match vpn.list_profiles() {
-            Ok(profiles) => Response::VpnProfiles {
-                profiles: profiles.into_iter().map(Into::into).collect(),
-            },
-            Err(error) => classify_vpn_error(error),
-        }
-    }
-
-    async fn vpn_import_profile(&self, name: String, contents: String) -> Response {
-        let Some(vpn) = &self.vpn else {
-            return vpn_disabled();
-        };
-        match vpn.import_profile(&name, contents.as_bytes()) {
-            Ok(name) => Response::VpnProfileImported { name },
-            Err(error) => classify_vpn_error(error),
-        }
-    }
-
-    async fn vpn_delete_profile(&self, name: String) -> Response {
-        let Some(vpn) = &self.vpn else {
-            return vpn_disabled();
-        };
-        match vpn.delete_profile(&name) {
-            Ok(()) => Response::VpnProfileDeleted { name },
-            Err(error) => classify_vpn_error(error),
-        }
-    }
-
-    async fn vpn_status(&self) -> Response {
-        let Some(vpn) = &self.vpn else {
-            return vpn_disabled();
-        };
-        match vpn.status().await {
-            Ok(active) => Response::VpnStatus {
-                active: active.map(Into::into),
-            },
-            Err(error) => classify_vpn_error(error),
-        }
-    }
-
-    async fn vpn_activate(&self, name: String) -> Response {
-        let Some(vpn) = &self.vpn else {
-            return vpn_disabled();
-        };
-        if let Err(error) = vpn.activate(&name).await {
-            return classify_vpn_error(error);
-        }
-        match vpn.status().await {
-            Ok(Some(active)) => Response::VpnActivated {
-                active: active.into(),
-            },
-            Ok(None) => {
-                tracing::error!("VPN activation reported success but no interface is active");
-                Response::Error {
-                    message: "VPN activation succeeded but left no active interface".to_string(),
-                }
-            }
-            Err(error) => classify_vpn_error(error),
-        }
-    }
-
-    async fn vpn_deactivate(&self) -> Response {
-        let Some(vpn) = &self.vpn else {
-            return vpn_disabled();
-        };
-        match vpn.deactivate().await {
-            Ok(()) => Response::VpnDeactivated,
-            Err(error) => classify_vpn_error(error),
-        }
-    }
-
-    async fn vpn_policy_status(&self) -> Response {
-        let (Some(policy), Some(vpn)) = (&self.vpn_policy, &self.vpn) else {
-            return vpn_policy_disabled();
-        };
-        let effective = match self.effective_config().await {
-            Ok(effective) => effective,
-            Err(error) => return vpn_policy_error(VpnPolicyErrorDetail::Other { message: error }),
-        };
-        self.vpn_policy_status_for(policy, vpn, &effective).await
-    }
-
-    async fn vpn_policy_status_for(
-        &self,
-        policy: &VpnPolicyManager<WireGuardVpnDriver, Arc<dyn NftExecutor>>,
-        vpn: &ProductionVpnManager,
-        effective: &AppConfig,
-    ) -> Response {
-        let tunnel = match vpn.status().await {
-            Ok(active) => active,
-            Err(error) => return classify_vpn_error(error),
-        };
-        let tunnel_healthy = tunnel
-            .as_ref()
-            .is_some_and(|status| status.up && status.interface == OWNED_INTERFACE_NAME);
-
-        let snapshot = match policy.snapshot(&vpn_policy_teardown_target()).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => return vpn_policy_error(classify_vpn_policy_error(&error)),
-        };
-        let policy_active = snapshot.is_active();
-
-        let desired = vpn_policy_desired(effective);
-        let mode = self.overrides.effective_vpn_mode().await;
-        let mode_override_active = self.overrides.snapshot().await.vpn_mode.is_some();
-
-        Response::VpnPolicyStatus {
-            status: VpnPolicyStatusView {
-                mode,
-                mode_override_active,
-                tunnel: tunnel.map(Into::into),
-                tunnel_healthy,
-                policy_active,
-                kill_switch_active: policy_active,
-                protected_subnets: desired
-                    .as_ref()
-                    .map(|desired| desired.protected_subnets.clone())
-                    .unwrap_or_default(),
-                physical_uplink: desired.map(|desired| desired.physical_uplink),
-            },
-        }
-    }
-
-    async fn vpn_policy_apply_mode(
-        &self,
-        policy: &VpnPolicyManager<WireGuardVpnDriver, Arc<dyn NftExecutor>>,
-        effective: &AppConfig,
-        target: VpnPolicyMode,
-    ) -> Result<(), Response> {
-        match target {
-            VpnPolicyMode::Vpn => {
-                let Some(desired) = vpn_policy_desired(effective) else {
-                    return Err(vpn_policy_error(VpnPolicyErrorDetail::NoProtectedSubnets));
-                };
-                policy
-                    .activate(&desired)
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| vpn_policy_error(classify_vpn_policy_error(&error)))
-            }
-            VpnPolicyMode::Direct => {
-                let desired =
-                    vpn_policy_desired(effective).unwrap_or_else(vpn_policy_teardown_target);
-                policy.deactivate(&desired).await.map_err(|error| {
-                    vpn_policy_error(VpnPolicyErrorDetail::Other {
-                        message: error.to_string(),
-                    })
-                })
-            }
-        }
-    }
-
-    async fn vpn_policy_set_mode(&self, mode: VpnPolicyMode) -> Response {
-        let (Some(policy), Some(_vpn)) = (&self.vpn_policy, &self.vpn) else {
-            return vpn_policy_disabled();
-        };
-        // Coexistence-window guard (Landing 1): `vpn_policy_set_mode` bypasses
-        // `RouterTransactionCoordinator` entirely, so it must not race a
-        // pending chain-length-1 transaction over the same hop-0
-        // interface/reserved-ID band. Refuse outright while a transaction is
-        // pending or stuck in a failed rollback rather than letting the two
-        // non-coordinated mutation paths touch the same resources at once.
-        if let Some(router) = &self.router {
-            match router.status().await {
-                crate::core::router_transaction::CoordinatorStatus::Idle => {}
-                crate::core::router_transaction::CoordinatorStatus::Pending
-                | crate::core::router_transaction::CoordinatorStatus::RollbackFailed => {
-                    return vpn_policy_error(VpnPolicyErrorDetail::Other {
-                        message: "a router transaction is pending; refusing to change VPN mode \
-                                  until it commits or rolls back"
-                            .to_string(),
-                    });
-                }
-            }
-        }
-        let effective = match self.effective_config().await {
-            Ok(effective) => effective,
-            Err(error) => return vpn_policy_error(VpnPolicyErrorDetail::Other { message: error }),
-        };
-        if let Err(response) = self.vpn_policy_apply_mode(policy, &effective, mode).await {
-            return response;
-        }
-        if let Err(error) = self.overrides.set_vpn_mode(mode).await {
-            if mode == VpnPolicyMode::Vpn {
-                let _ = self
-                    .vpn_policy_apply_mode(policy, &effective, VpnPolicyMode::Direct)
-                    .await;
-            }
-            return vpn_policy_error(VpnPolicyErrorDetail::Other {
-                message: error.to_string(),
-            });
-        }
-        self.vpn_policy_status().await
-    }
-
-    async fn vpn_policy_clear_mode(&self) -> Response {
-        let (Some(policy), Some(_vpn)) = (&self.vpn_policy, &self.vpn) else {
-            return vpn_policy_disabled();
-        };
-        let effective = match self.effective_config().await {
-            Ok(effective) => effective,
-            Err(error) => return vpn_policy_error(VpnPolicyErrorDetail::Other { message: error }),
-        };
-        let target = effective.vpn.policy.default_mode;
-        if let Err(response) = self.vpn_policy_apply_mode(policy, &effective, target).await {
-            return response;
-        }
-        if let Err(error) = self.overrides.clear_vpn_mode().await {
-            if target == VpnPolicyMode::Vpn {
-                let _ = self
-                    .vpn_policy_apply_mode(policy, &effective, VpnPolicyMode::Direct)
-                    .await;
-            }
-            return vpn_policy_error(VpnPolicyErrorDetail::Other {
-                message: error.to_string(),
-            });
-        }
-        self.vpn_policy_status().await
-    }
-
-    async fn wifi_status(&self) -> Response {
-        let Some(wifi) = &self.wifi else {
-            return wifi_disabled();
-        };
-        let effective = match self.effective_config().await {
-            Ok(effective) => effective,
-            Err(message) => return wifi_error(WifiErrorDetail::Other { message }),
-        };
-        let mut interfaces = Vec::new();
-        for (name, config) in &effective.network.interfaces {
-            if config.wifi.is_some() {
-                if let Some(status) = wifi.status(name).await {
-                    interfaces.push(status);
-                }
-            }
-        }
-        Response::WifiStatus { interfaces }
-    }
-
-    async fn get_wifi_config(&self, interface: String) -> Response {
-        if self.wifi.is_none() {
-            return wifi_disabled();
-        }
-        let effective = match self.effective_config().await {
-            Ok(effective) => effective,
-            Err(message) => return wifi_error(WifiErrorDetail::Other { message }),
-        };
-        let spec = match effective.network.interfaces.get(&interface) {
-            Some(config) => match WifiApSpec::from_interface_config(&interface, config) {
-                Ok(spec) => spec,
-                Err(error) => {
-                    return wifi_error(WifiErrorDetail::InvalidSpec {
-                        message: error.to_string(),
-                    })
-                }
-            },
-            None => None,
-        };
-        Response::WifiConfig { interface, spec }
-    }
-
-    async fn configure_wifi(&self, interface: String, settings: WifiEditRequest) -> Response {
-        let Some(wifi) = &self.wifi else {
-            return wifi_disabled();
-        };
-        // The supervisor exists even when the daemon started with
-        // `wifi.enabled = false`, so the binary has not necessarily been checked
-        // yet. Check it here rather than letting the first spawn fail obscurely.
-        if let Err(error) = wifi.preflight_binary().await {
-            return wifi_error(WifiErrorDetail::Other {
-                message: error.to_string(),
-            });
-        }
-        let effective = match self.effective_config().await {
-            Ok(effective) => effective,
-            Err(message) => return wifi_error(WifiErrorDetail::Other { message }),
-        };
-        let Some(mut interface_config) = effective.network.interfaces.get(&interface).cloned()
-        else {
-            return wifi_error(WifiErrorDetail::InterfaceNotFound);
-        };
-
-        interface_config.wifi = Some(wifi_edit_request_to_config(settings));
-
-        let spec = match WifiApSpec::from_interface_config(&interface, &interface_config) {
-            Ok(Some(spec)) => spec,
-            Ok(None) => {
-                return wifi_error(WifiErrorDetail::InvalidSpec {
-                    message: "a Wi-Fi access point requires a managed output interface".to_string(),
-                })
-            }
-            Err(error) => {
-                return wifi_error(WifiErrorDetail::InvalidSpec {
-                    message: error.to_string(),
-                })
-            }
-        };
-
-        let _mutation = self.wifi_mutations.lock().await;
-        let previous = wifi.status(&interface).await.map(|status| status.spec);
-        if let Err(error) = wifi.configure(spec.clone()).await {
-            return classify_wifi_error(error);
-        }
-        if let Err(error) = self
-            .overrides
-            .set_interface(interface.clone(), interface_config, false)
-            .await
-        {
-            match previous {
-                Some(previous) => {
-                    let _ = wifi.configure(previous).await;
-                }
-                None => {
-                    let _ = wifi.disable(&interface).await;
-                }
-            }
-            return wifi_error(WifiErrorDetail::Other {
-                message: format!(
-                    "failed to persist Wi-Fi override; runtime state was restored: {error}"
-                ),
-            });
-        }
-        Response::WifiConfigured { spec }
-    }
-
-    async fn provision_wifi_access_point(
-        &self,
-        interface: String,
-        settings: WifiEditRequest,
-        passphrase: Option<String>,
-        configure_dhcp: bool,
-    ) -> Response {
-        let Some(wifi) = &self.wifi else {
-            return wifi_disabled();
-        };
-        let staged_passphrase = match passphrase {
-            Some(value) => match WifiPassphrase::new(value) {
-                Ok(value) => Some(value),
-                Err(error) => {
-                    return wifi_error(WifiErrorDetail::InvalidSpec {
-                        message: error.to_string(),
-                    })
-                }
-            },
-            None => None,
-        };
-        let effective = match self.effective_config().await {
-            Ok(effective) => effective,
-            Err(message) => return wifi_error(WifiErrorDetail::Other { message }),
-        };
-        let Some(previous_interface) = effective.network.interfaces.get(&interface).cloned() else {
-            return wifi_error(WifiErrorDetail::InterfaceNotFound);
-        };
-        let Some(cidr) = previous_interface.ipv4 else {
-            return wifi_error(WifiErrorDetail::InvalidSpec {
-                message: "AP provisioning requires a configured IPv4 CIDR".to_string(),
-            });
-        };
-        if !previous_interface.managed || previous_interface.role != InterfaceRole::Output {
-            return wifi_error(WifiErrorDetail::InvalidSpec {
-                message: "AP provisioning requires a managed output interface".to_string(),
-            });
-        }
-
-        let mut desired_interface = previous_interface.clone();
-        desired_interface.wifi = Some(wifi_edit_request_to_config(settings));
-        if let (Some(next), Some(previous)) = (
-            desired_interface.wifi.as_mut(),
-            previous_interface.wifi.as_ref(),
-        ) {
-            next.passphrase_file = previous.passphrase_file.clone();
-        }
-        let spec = match WifiApSpec::from_interface_config(&interface, &desired_interface) {
-            Ok(Some(spec)) => spec,
-            Ok(None) => unreachable!("managed output checked above"),
-            Err(error) => {
-                return wifi_error(WifiErrorDetail::InvalidSpec {
-                    message: error.to_string(),
-                })
-            }
-        };
-        let dhcp_settings = if configure_dhcp {
-            match default_dhcp_settings(cidr) {
-                Ok(settings) => Some(settings),
-                Err(message) => return wifi_error(WifiErrorDetail::InvalidSpec { message }),
-            }
-        } else {
-            None
-        };
-
-        let _wifi_mutation = self.wifi_mutations.lock().await;
-        let _dhcp_mutation = self.dhcp_mutations.lock().await;
-        let previous_ap = wifi.status(&interface).await.map(|status| status.spec);
-        let previous_secret = match wifi.stored_passphrase(&interface).await {
-            Ok(secret) => secret,
-            Err(error) => return classify_wifi_error(error),
-        };
-        let previous_dhcp = self.dhcp.spec(&interface).await;
-
-        if let Some(secret) = staged_passphrase.as_ref() {
-            if let Err(error) = wifi.set_passphrase(&interface, secret).await {
-                return classify_wifi_error(error);
-            }
-        }
-        if let Err(error) = wifi.configure(spec.clone()).await {
-            compensate_ap(wifi, &interface, previous_ap, previous_secret).await;
-            return classify_wifi_error(error);
-        }
-        if let Err(error) = self
-            .overrides
-            .set_interface(interface.clone(), desired_interface.clone(), false)
-            .await
-        {
-            compensate_ap(wifi, &interface, previous_ap, previous_secret).await;
-            return wifi_error(WifiErrorDetail::Other {
-                message: format!("AP provisioning failed to persist Wi-Fi settings; prior AP and secret were restored where possible: {error}"),
-            });
-        }
-
-        let configured_dhcp = if let Some(settings) = dhcp_settings {
-            let mut dhcp_interface = desired_interface;
-            dhcp_interface.dhcp = Some(dhcp_edit_request_to_config(settings));
-            let result = match DhcpServiceSpec::from_interface_config(
-                &interface,
-                &dhcp_interface,
-                self.base_config.dhcp.default_lease_seconds,
-            ) {
-                Ok(Some(spec)) => {
-                    configure_dhcp_persisted(&self.dhcp, &self.overrides, spec.clone())
-                        .await
-                        .map(|()| spec)
-                }
-                Ok(None) => unreachable!("managed output was checked before provisioning"),
-                Err(error) => Err(error),
-            };
-            match result {
-                Ok(spec) => Some(spec),
-                Err(error) => {
-                    let _ = self
-                        .overrides
-                        .set_interface(interface.clone(), previous_interface, false)
-                        .await;
-                    match previous_dhcp {
-                        Some(spec) => {
-                            let _ = self.dhcp.configure(spec).await;
-                        }
-                        None => {
-                            let _ = self.dhcp.disable(&interface).await;
-                        }
-                    }
-                    compensate_ap(wifi, &interface, previous_ap, previous_secret).await;
-                    return wifi_error(WifiErrorDetail::Other {
-                        message: format!("AP provisioning failed while configuring DHCP; prior AP, secret, DHCP, and interface override were restored where possible: {error}"),
-                    });
-                }
-            }
-        } else {
-            None
-        };
-
-        Response::WifiAccessPointProvisioned {
-            spec,
-            dhcp: configured_dhcp,
-        }
-    }
-
-    async fn disable_wifi(&self, interface: String) -> Response {
-        let Some(wifi) = &self.wifi else {
-            return wifi_disabled();
-        };
-        let _mutation = self.wifi_mutations.lock().await;
-        let previous = wifi.status(&interface).await.map(|status| status.spec);
-
-        if let Err(error) = wifi.disable(&interface).await {
-            return classify_wifi_error(error);
-        }
-
-        let committed = match self.overrides.effective_interface(&interface).await {
-            Ok(config) => config,
-            Err(error) => {
-                return wifi_error(WifiErrorDetail::Other {
-                    message: error.to_string(),
-                })
-            }
-        };
-        let Some(mut interface_config) = committed else {
-            return Response::WifiDisabled { interface };
-        };
-        interface_config.wifi = None;
-        if let Err(error) = self
-            .overrides
-            .set_interface(interface.clone(), interface_config, false)
-            .await
-        {
-            if let Some(previous) = previous {
-                let _ = wifi.configure(previous).await;
-            }
-            return wifi_error(WifiErrorDetail::Other {
-                message: format!(
-                    "failed to persist Wi-Fi disable; runtime state was restored: {error}"
-                ),
-            });
-        }
-        Response::WifiDisabled { interface }
-    }
-
-    async fn wifi_set_passphrase(&self, interface: String, passphrase: String) -> Response {
-        let Some(wifi) = &self.wifi else {
-            return wifi_disabled();
-        };
-        let passphrase = match WifiPassphrase::new(passphrase) {
-            Ok(passphrase) => passphrase,
-            Err(error) => {
-                return wifi_error(WifiErrorDetail::InvalidSpec {
-                    message: error.to_string(),
-                })
-            }
-        };
-        if let Err(error) = wifi.set_passphrase(&interface, &passphrase).await {
-            return classify_wifi_error(error);
-        }
-
-        let Some(status) = wifi.status(&interface).await else {
-            return wifi_error(WifiErrorDetail::InterfaceNotFound);
-        };
-        let spec = status.spec;
-        match wifi.configure(spec.clone()).await {
-            Ok(()) => Response::WifiConfigured { spec },
-            Err(error) => classify_wifi_error(error),
-        }
-    }
-
-    async fn list_wifi_stations(&self, interface: String) -> Response {
-        let Some(wifi) = &self.wifi else {
-            return wifi_disabled();
-        };
-        match wifi.stations(&interface).await {
-            Ok(stations) => Response::WifiStations {
-                interface,
-                stations,
-            },
-            Err(error) => classify_wifi_error(error),
-        }
-    }
-
-    async fn wifi_deauth_station(&self, interface: String, mac: String) -> Response {
-        let Some(wifi) = &self.wifi else {
-            return wifi_disabled();
-        };
-        let mac: MacAddr = match mac.parse() {
-            Ok(mac) => mac,
-            Err(error) => {
-                return wifi_error(WifiErrorDetail::InvalidSpec {
-                    message: format!("{error}"),
-                })
-            }
-        };
-        if let Err(error) = wifi.deauthenticate(&interface, mac).await {
-            return classify_wifi_error(error);
-        }
-        match wifi.stations(&interface).await {
-            Ok(stations) => Response::WifiStations {
-                interface,
-                stations,
-            },
-            Err(error) => classify_wifi_error(error),
-        }
-    }
-
-    async fn wifi_reload(&self, interface: String) -> Response {
-        let Some(wifi) = &self.wifi else {
-            return wifi_disabled();
-        };
-        match wifi.reload(&interface).await {
-            Ok(spec) => Response::WifiConfigured { spec },
-            Err(error) => classify_wifi_error(error),
-        }
-    }
-
-    async fn dhcp_client_status(&self) -> Response {
-        let Some(supervisor) = &self.dhcp_client else {
-            return dhcp_client_error(DhcpClientErrorDetail::DhcpClientDisabled);
-        };
-        Response::DhcpClientStatus {
-            interfaces: supervisor
-                .statuses()
-                .await
-                .into_iter()
-                .map(dhcp_client_status_view)
-                .collect(),
-        }
-    }
-
-    async fn get_dhcp_client(&self, interface: String) -> Response {
-        let Some(supervisor) = &self.dhcp_client else {
-            return dhcp_client_error(DhcpClientErrorDetail::DhcpClientDisabled);
-        };
-        match supervisor.status(&interface).await {
-            Some(status) => Response::DhcpClientInterface {
-                status: dhcp_client_status_view(status),
-            },
-            None => {
-                let effective = match self.effective_config().await {
-                    Ok(config) => config,
-                    Err(message) => {
-                        return dhcp_client_error(DhcpClientErrorDetail::RuntimeFailure { message })
-                    }
-                };
-                match effective.network.interfaces.get(&interface) {
-                    None => dhcp_client_error(DhcpClientErrorDetail::InterfaceNotFound),
-                    Some(config) if config.dhcp_client.is_some() => {
-                        dhcp_client_error(DhcpClientErrorDetail::Disabled)
-                    }
-                    Some(_) => dhcp_client_error(DhcpClientErrorDetail::Disabled),
-                }
-            }
-        }
-    }
-
-    async fn configure_dhcp_client(
-        &self,
-        interface: String,
-        request: DhcpClientConfigRequest,
-    ) -> Response {
-        let Some(supervisor) = &self.dhcp_client else {
-            return dhcp_client_error(DhcpClientErrorDetail::DhcpClientDisabled);
-        };
-        let _mutation = self.dhcp_client_mutations.lock().await;
-        let effective = match self.effective_config().await {
-            Ok(config) => config,
-            Err(message) => {
-                return dhcp_client_error(DhcpClientErrorDetail::RuntimeFailure { message })
-            }
-        };
-        let Some(mut interface_config) = effective.network.interfaces.get(&interface).cloned()
-        else {
-            return dhcp_client_error(DhcpClientErrorDetail::InterfaceNotFound);
-        };
-        interface_config.role = InterfaceRole::Input;
-        interface_config.managed = true;
-        interface_config.ipv4 = None;
-        interface_config.dhcp = None;
-        interface_config.wifi = None;
-        if let Some(wifi) = &self.wifi {
-            let _ = wifi.disable(&interface).await;
-        }
-        interface_config.dhcp_client = Some(dhcp_client_request_to_config(&request, true));
-        let spec = match DhcpClientSpec::from_interface_config(&interface, &interface_config) {
-            Ok(Some(spec)) => spec,
-            Ok(None) => return dhcp_client_error(DhcpClientErrorDetail::Disabled),
-            Err(error) => {
-                return dhcp_client_error(DhcpClientErrorDetail::InvalidConfig {
-                    message: error.to_string(),
-                })
-            }
-        };
-
-        if let Err(error) = self
-            .overrides
-            .check_interface(&interface, &interface_config, false)
-            .await
-        {
-            return dhcp_client_error(DhcpClientErrorDetail::InvalidConfig {
-                message: error.to_string(),
-            });
-        }
-        let previous = supervisor.spec(&interface).await;
-        supervisor.configure(spec.clone()).await;
-        if let Err(error) = self
-            .overrides
-            .set_interface(interface.clone(), interface_config, false)
-            .await
-        {
-            if let Some(previous) = previous {
-                supervisor.configure(previous).await;
-            } else {
-                let _ = supervisor.disable(&interface).await;
-            }
-            return dhcp_client_error(DhcpClientErrorDetail::PersistenceFailure {
-                message: format!(
-                    "failed to persist DHCP client intent; runtime state was restored: {error}"
-                ),
-            });
-        }
-        match supervisor.status(&interface).await {
-            Some(status) => Response::DhcpClientInterface {
-                status: dhcp_client_status_view(status),
-            },
-            None => dhcp_client_error(DhcpClientErrorDetail::RuntimeFailure {
-                message: "DHCP client disappeared after configuration".to_string(),
-            }),
-        }
-    }
-
-    async fn disable_dhcp_client(&self, interface: String) -> Response {
-        let Some(supervisor) = &self.dhcp_client else {
-            return dhcp_client_error(DhcpClientErrorDetail::DhcpClientDisabled);
-        };
-        let _mutation = self.dhcp_client_mutations.lock().await;
-        let effective = match self.effective_config().await {
-            Ok(config) => config,
-            Err(message) => {
-                return dhcp_client_error(DhcpClientErrorDetail::RuntimeFailure { message })
-            }
-        };
-        let Some(mut config) = effective.network.interfaces.get(&interface).cloned() else {
-            return dhcp_client_error(DhcpClientErrorDetail::InterfaceNotFound);
-        };
-        let previous = supervisor.spec(&interface).await;
-        if previous.is_none() {
-            return dhcp_client_error(DhcpClientErrorDetail::Disabled);
-        }
-        config.managed = false;
-        config.dhcp_client = Some(dhcp_client_request_to_config(
-            &DhcpClientConfigRequest::default(),
-            false,
-        ));
-
-        if let Err(error) = self
-            .overrides
-            .check_interface(&interface, &config, false)
-            .await
-        {
-            return dhcp_client_error(DhcpClientErrorDetail::InvalidConfig {
-                message: error.to_string(),
-            });
-        }
-        if let Err(error) = supervisor.disable(&interface).await {
-            return dhcp_client_error(DhcpClientErrorDetail::OwnershipConflict {
-                message: error.to_string(),
-            });
-        }
-        if let Err(error) = self
-            .overrides
-            .set_interface(interface.clone(), config, false)
-            .await
-        {
-            if let Some(previous) = previous {
-                supervisor.configure(previous).await;
-            }
-            return dhcp_client_error(DhcpClientErrorDetail::PersistenceFailure {
-                message: format!(
-                    "failed to persist DHCP client disable; runtime state was restored: {error}"
-                ),
-            });
-        }
-        Response::DhcpClientDisabled { interface }
-    }
-
-    async fn renew_dhcp_client(&self, interface: String) -> Response {
-        let Some(supervisor) = &self.dhcp_client else {
-            return dhcp_client_error(DhcpClientErrorDetail::DhcpClientDisabled);
-        };
-        match supervisor.renew_now(&interface).await {
-            Ok(status) => Response::DhcpClientInterface {
-                status: dhcp_client_status_view(status),
-            },
-            Err(_) => dhcp_client_error(DhcpClientErrorDetail::Disabled),
-        }
-    }
-
-    async fn release_dhcp_client(&self, interface: String) -> Response {
-        let Some(supervisor) = &self.dhcp_client else {
-            return dhcp_client_error(DhcpClientErrorDetail::DhcpClientDisabled);
-        };
-        match supervisor.release_and_reacquire(&interface).await {
-            Ok(status) => Response::DhcpClientInterface {
-                status: dhcp_client_status_view(status),
-            },
-            Err(error) => dhcp_client_error(DhcpClientErrorDetail::RuntimeFailure {
-                message: error.to_string(),
-            }),
-        }
-    }
-
-    async fn wifi_client_status(&self) -> Response {
-        let Some(wifi_client) = &self.wifi_client else {
-            return wifi_client_disabled();
-        };
-        let effective = match self.effective_config().await {
-            Ok(effective) => effective,
-            Err(message) => return wifi_client_error(WifiClientErrorDetail::Other { message }),
-        };
-        let mut interfaces = Vec::new();
-        for (name, config) in &effective.network.interfaces {
-            if config.wifi_client.is_some() {
-                if let Some(status) = wifi_client.status(name).await {
-                    interfaces.push(status);
-                }
-            }
-        }
-        Response::WifiClientStatus { interfaces }
-    }
-
-    async fn get_wifi_client_config(&self, interface: String) -> Response {
-        if self.wifi_client.is_none() {
-            return wifi_client_disabled();
-        }
-        let effective = match self.effective_config().await {
-            Ok(effective) => effective,
-            Err(message) => return wifi_client_error(WifiClientErrorDetail::Other { message }),
-        };
-        let spec = match effective.network.interfaces.get(&interface) {
-            Some(config) => match WifiClientSpec::from_interface_config(&interface, config) {
-                Ok(spec) => spec,
-                Err(error) => {
-                    return wifi_client_error(WifiClientErrorDetail::InvalidSpec {
-                        message: error.to_string(),
-                    })
-                }
-            },
-            None => None,
-        };
-        Response::WifiClientConfig { interface, spec }
-    }
-
-    async fn configure_wifi_client(
-        &self,
-        interface: String,
-        settings: WifiClientEditRequest,
-    ) -> Response {
-        let Some(wifi_client) = &self.wifi_client else {
-            return wifi_client_disabled();
-        };
-        // See `configure_wifi`: the supervisor is built unconditionally, so the
-        // binary is verified at the point of use.
-        if let Err(error) = wifi_client.preflight_binary().await {
-            return wifi_client_error(WifiClientErrorDetail::Other {
-                message: error.to_string(),
-            });
-        }
-        let effective = match self.effective_config().await {
-            Ok(effective) => effective,
-            Err(message) => return wifi_client_error(WifiClientErrorDetail::Other { message }),
-        };
-        let Some(mut interface_config) = effective.network.interfaces.get(&interface).cloned()
-        else {
-            return wifi_client_error(WifiClientErrorDetail::InterfaceNotFound);
-        };
-
-        interface_config.wifi_client = Some(wifi_client_edit_request_to_config(settings));
-
-        let spec = match WifiClientSpec::from_interface_config(&interface, &interface_config) {
-            Ok(Some(spec)) => spec,
-            Ok(None) => {
-                return wifi_client_error(WifiClientErrorDetail::InvalidSpec {
-                    message: "a Wi-Fi client requires an unmanaged input interface".to_string(),
-                })
-            }
-            Err(error) => {
-                return wifi_client_error(WifiClientErrorDetail::InvalidSpec {
-                    message: error.to_string(),
-                })
-            }
-        };
-
-        let _mutation = self.wifi_client_mutations.lock().await;
-        let previous = wifi_client
-            .status(&interface)
-            .await
-            .map(|status| status.spec);
-        if let Err(error) = wifi_client.configure(spec.clone()).await {
-            return classify_wifi_client_error(error);
-        }
-        if let Err(error) = self
-            .overrides
-            .set_interface(interface.clone(), interface_config, false)
-            .await
-        {
-            match previous {
-                Some(previous) => {
-                    let _ = wifi_client.configure(previous).await;
-                }
-                None => {
-                    let _ = wifi_client.disable(&interface).await;
-                }
-            }
-            return wifi_client_error(WifiClientErrorDetail::Other {
-                message: format!(
-                    "failed to persist Wi-Fi client override; runtime state was restored: {error}"
-                ),
-            });
-        }
-        Response::WifiClientConfigured { spec }
-    }
-
-    async fn disable_wifi_client(&self, interface: String) -> Response {
-        let Some(wifi_client) = &self.wifi_client else {
-            return wifi_client_disabled();
-        };
-        let _mutation = self.wifi_client_mutations.lock().await;
-        let _dhcp_mutation = if self.dhcp_client.is_some() {
-            Some(self.dhcp_client_mutations.lock().await)
-        } else {
-            None
-        };
-
-        let committed = match self.overrides.effective_interface(&interface).await {
-            Ok(config) => config,
-            Err(error) => {
-                return wifi_client_error(WifiClientErrorDetail::Other {
-                    message: error.to_string(),
-                });
-            }
-        };
-        let Some(mut interface_config) = committed else {
-            let mut previous_dhcp = None;
-            if let Some(dhcp_client) = &self.dhcp_client {
-                match dhcp_client.disable(&interface).await {
-                    Ok(spec) => previous_dhcp = spec,
-                    Err(error) => {
-                        return wifi_client_error(WifiClientErrorDetail::Other {
-                            message: format!("failed to disable DHCP client: {error}"),
-                        });
-                    }
-                }
-            }
-            if let Err(error) = wifi_client.disable(&interface).await {
-                if let (Some(dhcp_client), Some(previous_dhcp)) = (&self.dhcp_client, previous_dhcp) {
-                    let _ = dhcp_client.configure_with_link_ready(previous_dhcp, false).await;
-                }
-                return classify_wifi_client_error(error);
-            }
-            return Response::WifiClientDisabled { interface };
-        };
-
-        let had_enabled_dhcp = interface_config
-            .dhcp_client
-            .as_ref()
-            .is_some_and(|c| c.enabled);
-        let previous_dhcp_spec = if had_enabled_dhcp {
-            DhcpClientSpec::from_interface_config(&interface, &interface_config)
-                .ok()
-                .flatten()
-        } else {
-            None
-        };
-
-        interface_config.wifi_client = None;
-
-        let mut previous_dhcp = None;
-        if let Some(dhcp_client) = &self.dhcp_client {
-            match dhcp_client.disable(&interface).await {
-                Ok(disabled_spec) => {
-                    previous_dhcp = disabled_spec.or(previous_dhcp_spec.clone());
-                }
-                Err(error) => {
-                    tracing::warn!(%interface, %error, "failed to disable DHCP client during Wi-Fi disable");
-                    if let Some(previous_dhcp) = previous_dhcp_spec {
-                        let _ = dhcp_client.configure_with_link_ready(previous_dhcp, false).await;
-                    }
-                    return wifi_client_error(WifiClientErrorDetail::Other {
-                        message: format!("failed to disable DHCP client: {error}"),
-                    });
-                }
-            }
-        }
-        if had_enabled_dhcp {
-            interface_config.dhcp_client = Some(dhcp_client_request_to_config(
-                &DhcpClientConfigRequest::default(),
-                false,
-            ));
-            interface_config.managed = false;
-        }
-
-        let previous = wifi_client
-            .status(&interface)
-            .await
-            .map(|status| status.spec);
-
-        if let Err(error) = wifi_client.disable(&interface).await {
-            if let (Some(dhcp_client), Some(previous_dhcp)) = (&self.dhcp_client, previous_dhcp) {
-                let _ = dhcp_client.configure_with_link_ready(previous_dhcp, false).await;
-            }
-            return classify_wifi_client_error(error);
-        }
-
-        if let Err(error) = self
-            .overrides
-            .set_interface(interface.clone(), interface_config, false)
-            .await
-        {
-            if let Some(previous) = previous {
-                let _ = wifi_client.configure(previous).await;
-            }
-            if let (Some(dhcp_client), Some(previous_dhcp)) = (&self.dhcp_client, previous_dhcp) {
-                let _ = dhcp_client.configure_with_link_ready(previous_dhcp, false).await;
-            }
-            return wifi_client_error(WifiClientErrorDetail::Other {
-                message: format!(
-                    "failed to persist Wi-Fi client disable; runtime state was restored: {error}"
-                ),
-            });
-        }
-        Response::WifiClientDisabled { interface }
-    }
-
-    async fn wifi_client_set_passphrase(&self, interface: String, passphrase: String) -> Response {
-        let Some(wifi_client) = &self.wifi_client else {
-            return wifi_client_disabled();
-        };
-        let passphrase = match WifiPassphrase::new(passphrase) {
-            Ok(passphrase) => passphrase,
-            Err(error) => {
-                return wifi_client_error(WifiClientErrorDetail::InvalidSpec {
-                    message: error.to_string(),
-                })
-            }
-        };
-        if let Err(error) = wifi_client.set_passphrase(&interface, &passphrase).await {
-            return classify_wifi_client_error(error);
-        }
-
-        let Some(status) = wifi_client.status(&interface).await else {
-            return wifi_client_error(WifiClientErrorDetail::InterfaceNotFound);
-        };
-        let spec = status.spec;
-        match wifi_client.configure(spec.clone()).await {
-            Ok(()) => Response::WifiClientConfigured { spec },
-            Err(error) => classify_wifi_client_error(error),
-        }
-    }
-
-    async fn list_wifi_client_profiles(&self) -> Response {
-        if self.wifi_client.is_none() {
-            return wifi_client_profile_error(WifiClientProfileErrorDetail::WifiClientDisabled);
-        }
-        match self.wifi_client_profiles.list() {
-            Ok(profiles) => Response::WifiClientProfiles { profiles },
-            Err(error) => classify_wifi_client_profile_error(error),
-        }
-    }
-
-    async fn get_wifi_client_profile(&self, id: String) -> Response {
-        if self.wifi_client.is_none() {
-            return wifi_client_profile_error(WifiClientProfileErrorDetail::WifiClientDisabled);
-        }
-        match self.wifi_client_profiles.get(&id) {
-            Ok(profile) => Response::WifiClientProfile { profile },
-            Err(error) => classify_wifi_client_profile_error(error),
-        }
-    }
-
-    async fn create_wifi_client_profile(
-        &self,
-        mut request: WifiClientProfileWriteRequest,
-    ) -> Response {
-        if self.wifi_client.is_none() {
-            return wifi_client_profile_error(WifiClientProfileErrorDetail::WifiClientDisabled);
-        }
-        let _mutation = self.wifi_client_mutations.lock().await;
-        let passphrase = match request.passphrase.take() {
-            Some(raw) => match WifiPassphrase::new(&raw) {
-                Ok(passphrase) => Some(passphrase),
-                Err(error) => {
-                    return wifi_client_profile_error(
-                        WifiClientProfileErrorDetail::InvalidProfile {
-                            message: error.to_string(),
-                        },
-                    )
-                }
-            },
-            None => None,
-        };
-        let input = wifi_client_profile_input(request);
-        match self.wifi_client_profiles.create(input, passphrase) {
-            Ok(profile) => Response::WifiClientProfile { profile },
-            Err(error) => classify_wifi_client_profile_error(error),
-        }
-    }
-
-    async fn update_wifi_client_profile(
-        &self,
-        id: String,
-        mut request: WifiClientProfileWriteRequest,
-    ) -> Response {
-        if self.wifi_client.is_none() {
-            return wifi_client_profile_error(WifiClientProfileErrorDetail::WifiClientDisabled);
-        }
-        if request.id != id {
-            return wifi_client_profile_error(WifiClientProfileErrorDetail::InvalidProfile {
-                message: "profile id in the path and body must match".to_string(),
-            });
-        }
-        if request.clear_passphrase && request.passphrase.is_some() {
-            return wifi_client_profile_error(WifiClientProfileErrorDetail::InvalidProfile {
-                message: "passphrase and clear_passphrase are mutually exclusive".to_string(),
-            });
-        }
-        let _mutation = self.wifi_client_mutations.lock().await;
-        let secret_update = if request.clear_passphrase {
-            WifiClientProfileSecretUpdate::Clear
-        } else if let Some(raw) = request.passphrase.take() {
-            match WifiPassphrase::new(&raw) {
-                Ok(passphrase) => WifiClientProfileSecretUpdate::Replace(passphrase),
-                Err(error) => {
-                    return wifi_client_profile_error(
-                        WifiClientProfileErrorDetail::InvalidProfile {
-                            message: error.to_string(),
-                        },
-                    )
-                }
-            }
-        } else {
-            WifiClientProfileSecretUpdate::Unchanged
-        };
-        let input = wifi_client_profile_input(request);
-        match self.wifi_client_profiles.update(input, secret_update) {
-            Ok(profile) => Response::WifiClientProfile { profile },
-            Err(error) => classify_wifi_client_profile_error(error),
-        }
-    }
-
-    async fn delete_wifi_client_profile(&self, id: String) -> Response {
-        let Some(wifi_client) = &self.wifi_client else {
-            return wifi_client_profile_error(WifiClientProfileErrorDetail::WifiClientDisabled);
-        };
-        let _mutation = self.wifi_client_mutations.lock().await;
-        let profile = match self.wifi_client_profiles.get(&id) {
-            Ok(profile) => profile,
-            Err(error) => return classify_wifi_client_profile_error(error),
-        };
-        let effective = match self.effective_config().await {
-            Ok(effective) => effective,
-            Err(message) => {
-                return wifi_client_profile_error(WifiClientProfileErrorDetail::Other { message })
-            }
-        };
-        let mut active = Vec::new();
-        for interface in effective.network.interfaces.keys() {
-            if let Some(status) = wifi_client.status(interface).await {
-                if status.spec.ssid == profile.ssid
-                    && status.spec.country_code == profile.country_code
-                    && status.spec.security == profile.security
-                {
-                    active.push(interface.clone());
-                }
-            }
-        }
-        if !active.is_empty() {
-            return wifi_client_profile_error(WifiClientProfileErrorDetail::ProfileActive {
-                interfaces: active,
-            });
-        }
-        match self.wifi_client_profiles.delete(&id) {
-            Ok(()) => Response::WifiClientProfileDeleted { id },
-            Err(error) => classify_wifi_client_profile_error(error),
-        }
-    }
-
-    async fn activate_wifi_client_profile(
-        &self,
-        interface: String,
-        profile_id: String,
-    ) -> Response {
-        let Some(wifi_client) = &self.wifi_client else {
-            return wifi_client_profile_error(WifiClientProfileErrorDetail::WifiClientDisabled);
-        };
-        let _mutation = self.wifi_client_mutations.lock().await;
-        let profile = match self.wifi_client_profiles.get(&profile_id) {
-            Ok(profile) => profile,
-            Err(error) => return classify_wifi_client_profile_error(error),
-        };
-        let effective = match self.effective_config().await {
-            Ok(effective) => effective,
-            Err(message) => {
-                return wifi_client_profile_error(WifiClientProfileErrorDetail::Other { message })
-            }
-        };
-        let Some(mut interface_config) = effective.network.interfaces.get(&interface).cloned()
-        else {
-            return wifi_client_profile_error(WifiClientProfileErrorDetail::InterfaceNotFound);
-        };
-        interface_config.wifi_client = Some(WifiClientConfig {
-            ssid: profile.ssid.clone(),
-            country_code: profile.country_code.clone(),
-            security: profile.security,
-            passphrase_file: None,
-        });
-        let spec = match WifiClientSpec::from_interface_config(&interface, &interface_config) {
-            Ok(Some(spec)) => spec,
-            Ok(None) | Err(_) => {
-                return wifi_client_profile_error(WifiClientProfileErrorDetail::InvalidProfile {
-                    message: "profile activation requires an unmanaged input interface".to_string(),
-                })
-            }
-        };
-
-        let previous_status = wifi_client.status(&interface).await;
-        let previous_secret = match wifi_client.stored_passphrase(&interface).await {
-            Ok(secret) => secret,
-            Err(error) => {
-                return wifi_client_profile_error(WifiClientProfileErrorDetail::ActivationFailed {
-                    message: error.to_string(),
-                })
-            }
-        };
-        let profile_secret = match self.wifi_client_profiles.get_passphrase(&profile_id) {
-            Ok(secret) => secret,
-            Err(error) => return classify_wifi_client_profile_error(error),
-        };
-        let secret_result = match profile_secret.as_ref() {
-            Some(secret) => wifi_client.set_passphrase(&interface, secret).await,
-            None => wifi_client.clear_passphrase(&interface).await,
-        };
-        if let Err(error) = secret_result {
-            return wifi_client_profile_error(WifiClientProfileErrorDetail::ActivationFailed {
-                message: error.to_string(),
-            });
-        }
-        if let Err(error) = wifi_client.configure(spec).await {
-            restore_wifi_client_secret(wifi_client, &interface, previous_secret.as_ref()).await;
-            return wifi_client_profile_error(WifiClientProfileErrorDetail::ActivationFailed {
-                message: error.to_string(),
-            });
-        }
-        if let Err(error) = self
-            .overrides
-            .set_interface(interface.clone(), interface_config, false)
-            .await
-        {
-            restore_wifi_client_secret(wifi_client, &interface, previous_secret.as_ref()).await;
-            match previous_status {
-                Some(previous) => {
-                    let _ = wifi_client.configure(previous.spec).await;
-                }
-                None => {
-                    let _ = wifi_client.disable(&interface).await;
-                }
-            }
-            return wifi_client_profile_error(WifiClientProfileErrorDetail::PersistenceFailed {
-                message: error.to_string(),
-            });
-        }
-        match wifi_client.status(&interface).await {
-            Some(status) => Response::WifiClientProfileActivated {
-                interface,
-                profile,
-                status,
-            },
-            None => wifi_client_profile_error(WifiClientProfileErrorDetail::ActivationFailed {
-                message: "supplicant disappeared after profile activation".to_string(),
-            }),
-        }
-    }
-
-    async fn wifi_client_scan(&self, interface: String) -> Response {
-        let Some(wifi_client) = &self.wifi_client else {
-            return wifi_client_disabled();
-        };
-        if let Err(error) = wifi_client.preflight_binary().await {
-            return classify_wifi_client_error(error);
-        }
-        let interfaces = match self.network.list_interfaces().await {
-            Ok(interfaces) => interfaces,
-            Err(error) => {
-                return Response::Error {
-                    message: error.to_string(),
-                };
-            }
-        };
-        if !interfaces.is_empty() {
-            let Some(target) = interfaces.iter().find(|i| i.name == interface) else {
-                return wifi_client_error(WifiClientErrorDetail::InterfaceNotFound);
-            };
-            if !target.is_wireless {
-                return wifi_client_error(WifiClientErrorDetail::NotWireless);
-            }
-        }
-        if let Some(wifi) = &self.wifi {
-            if wifi.status(&interface).await.is_some() {
-                return wifi_client_error(WifiClientErrorDetail::InvalidSpec {
-                    message: format!(
-                        "interface {interface} is currently operating as an access point"
-                    ),
-                });
-            }
-        }
-        match wifi_client.scan(&interface).await {
-            Ok(results) => Response::WifiClientScanResults { interface, results },
-            Err(error) => classify_wifi_client_error(error),
-        }
-    }
-
-    async fn wifi_client_reconnect(&self, interface: String) -> Response {
-        let Some(wifi_client) = &self.wifi_client else {
-            return wifi_client_disabled();
-        };
-        if let Err(error) = wifi_client.reconnect(&interface).await {
-            return classify_wifi_client_error(error);
-        }
-
-        match wifi_client.status(&interface).await {
-            Some(status) => Response::WifiClientConfigured { spec: status.spec },
-            None => wifi_client_error(WifiClientErrorDetail::InterfaceNotFound),
-        }
-    }
-
     async fn effective_config(&self) -> Result<AppConfig, String> {
         self.overrides
             .snapshot()
             .await
             .effective_config(&self.base_config)
             .map_err(|error| error.to_string())
-    }
-
-    async fn router_status(&self) -> Response {
-        let Some(router) = &self.router else {
-            return router_disabled();
-        };
-        let desired = match self.current_router_desired().await {
-            Ok(desired) => desired,
-            Err(response) => return response,
-        };
-        let health = router.manager().health(&desired).await;
-        let coordinator_status = router.status().await;
-        Response::RouterStatus {
-            enabled: desired.enabled,
-            ready: desired.enabled && health.ready(),
-            coordinator_status,
-            health,
-        }
-    }
-
-    async fn list_routes(&self, include_local_table: bool) -> Response {
-        let routes = match self.network.list_ipv4_routes().await {
-            Ok(routes) => routes,
-            Err(error) => {
-                return Response::Error {
-                    message: error.to_string(),
-                };
-            }
-        };
-        let interfaces = self.network.list_interfaces().await.unwrap_or_default();
-        let if_map: std::collections::HashMap<u32, String> = interfaces
-            .into_iter()
-            .map(|iface| (iface.index, iface.name))
-            .collect();
-
-        let mut status_routes: Vec<RouteStatus> = routes
-            .into_iter()
-            .filter(|route| include_local_table || route.table != 255)
-            .map(|route| {
-                let output_interface = route
-                    .output_interface_index
-                    .and_then(|idx| if_map.get(&idx).cloned());
-                RouteStatus::from_info(&route, output_interface)
-            })
-            .collect();
-
-        status_routes.sort_by(|a, b| {
-            let table_rank = |table: u32| -> (u8, u32) {
-                if table == 254 {
-                    (0, 0)
-                } else if table == 255 {
-                    (2, 255)
-                } else {
-                    (1, table)
-                }
-            };
-            table_rank(a.table)
-                .cmp(&table_rank(b.table))
-                .then_with(|| b.destination.prefix_len().cmp(&a.destination.prefix_len()))
-                .then_with(|| a.destination.network().cmp(&b.destination.network()))
-                .then_with(|| a.metric.unwrap_or(0).cmp(&b.metric.unwrap_or(0)))
-        });
-
-        Response::Routes {
-            routes: status_routes,
-        }
-    }
-
-    async fn get_router_config(&self) -> Response {
-        match self.effective_config().await {
-            Ok(effective) => Response::RouterConfig {
-                config: effective.router,
-            },
-            Err(message) => Response::Error { message },
-        }
-    }
-
-    async fn router_plan(&self, proposal: RouterProposalRequest) -> Response {
-        let Some(router) = &self.router else {
-            return router_disabled();
-        };
-        let candidate = match self
-            .overrides
-            .build_candidate(&build_router_proposal(proposal))
-            .await
-        {
-            Ok(candidate) => candidate,
-            Err(error) => return classify_router_error(error),
-        };
-        match router.plan(candidate).await {
-            Ok(plan) => Response::RouterPlan {
-                plan: plan.plan().clone(),
-            },
-            Err(error) => classify_router_error(error),
-        }
-    }
-
-    async fn router_apply(&self, proposal: RouterProposalRequest) -> Response {
-        let Some(router) = &self.router else {
-            return router_disabled();
-        };
-        let candidate = match self
-            .overrides
-            .build_candidate(&build_router_proposal(proposal))
-            .await
-        {
-            Ok(candidate) => candidate,
-            Err(error) => return classify_router_error(error),
-        };
-        let transaction_plan = match router.plan(candidate).await {
-            Ok(plan) => plan,
-            Err(error) => return classify_router_error(error),
-        };
-        let plan_preview = transaction_plan.plan().clone();
-        match router.apply(transaction_plan).await {
-            Ok(token) => Response::RouterTransactionPending {
-                token,
-                plan: plan_preview,
-            },
-            Err(error) => classify_router_error(error),
-        }
-    }
-
-    async fn router_commit(&self) -> Response {
-        let Some(router) = &self.router else {
-            return router_disabled();
-        };
-        match router.commit().await {
-            Ok(revision) => Response::RouterCommitted { revision },
-            Err(error) => classify_router_error(error),
-        }
-    }
-
-    async fn router_rollback(&self) -> Response {
-        let Some(router) = &self.router else {
-            return router_disabled();
-        };
-        match router.rollback().await {
-            Ok(()) => Response::RouterRolledBack,
-            Err(error) => {
-                if let Some(failure) = router.rollback_failure().await {
-                    Response::RouterError {
-                        detail: RouterErrorDetail::RollbackFailed {
-                            failures: failure.failures,
-                        },
-                    }
-                } else {
-                    classify_router_error(error)
-                }
-            }
-        }
-    }
-
-    async fn router_pending_transaction(&self) -> Response {
-        let Some(router) = &self.router else {
-            return router_disabled();
-        };
-        let status = router.status().await;
-        let rollback_failure = router
-            .rollback_failure()
-            .await
-            .map(|failure| failure.failures);
-        Response::RouterPendingTransaction {
-            status,
-            rollback_failure,
-        }
-    }
-
-    async fn router_provisioning_preview(
-        &self,
-        request: RouterProvisioningPreviewRequest,
-    ) -> Response {
-        if self.router.is_none() {
-            return provisioning_error(RouterProvisioningErrorDetail::RouterDisabled);
-        }
-
-        let desired = provisioning_desired(&request.provisioning);
-        let secrets = ProvisioningSecretAvailability {
-            uplink_pending: request.uplink_secret_pending,
-            output_pending: request.output_secret_pending,
-        };
-        let context = match self.provisioning_context(&desired, secrets).await {
-            Ok(context) => context,
-            Err(detail) => return provisioning_error(detail),
-        };
-
-        match derive_router_provisioning(&desired, &context) {
-            Ok(effective) => Response::RouterProvisioningPreview {
-                preview: provisioning_preview_view(
-                    &request.provisioning,
-                    &effective,
-                    &context,
-                    secrets,
-                ),
-            },
-            Err(error) => provisioning_error(classify_provisioning_derivation_error(error)),
-        }
-    }
-
-    async fn router_provisioning_apply(&self, request: RouterProvisioningApplyRequest) -> Response {
-        let Some(router) = &self.router else {
-            return provisioning_error(RouterProvisioningErrorDetail::RouterDisabled);
-        };
-
-        let uplink_passphrase = match parse_optional_passphrase(request.uplink_passphrase.clone()) {
-            Ok(passphrase) => passphrase,
-            Err(detail) => return provisioning_error(detail),
-        };
-        let output_passphrase = match parse_optional_passphrase(request.output_passphrase.clone()) {
-            Ok(passphrase) => passphrase,
-            Err(detail) => return provisioning_error(detail),
-        };
-
-        let desired = provisioning_desired(&request.provisioning);
-        let context = match self
-            .provisioning_context(
-                &desired,
-                ProvisioningSecretAvailability {
-                    uplink_pending: uplink_passphrase.is_some(),
-                    output_pending: output_passphrase.is_some(),
-                },
-            )
-            .await
-        {
-            Ok(context) => context,
-            Err(detail) => return provisioning_error(detail),
-        };
-        let effective = match derive_router_provisioning(&desired, &context) {
-            Ok(effective) => effective,
-            Err(error) => return provisioning_error(classify_provisioning_derivation_error(error)),
-        };
-
-        let preview = provisioning_preview_view(
-            &request.provisioning,
-            &effective,
-            &context,
-            ProvisioningSecretAvailability::default(),
-        );
-
-        let _wifi_mutation = self.wifi_mutations.lock().await;
-        let _wifi_client_mutation = self.wifi_client_mutations.lock().await;
-
-        let uplink_interface = desired.uplink.interface.clone();
-        let output_interface = desired.output.interface.clone();
-        let mut staged_uplink = None;
-        let mut staged_output = None;
-
-        if let Some(passphrase) = &output_passphrase {
-            let Some(supervisor) = &self.wifi else {
-                return provisioning_error(RouterProvisioningErrorDetail::GlobalServiceDisabled {
-                    service: "wifi".to_owned(),
-                });
-            };
-            let previous = match supervisor.stored_passphrase(&output_interface).await {
-                Ok(previous) => previous,
-                Err(error) => {
-                    return provisioning_error(RouterProvisioningErrorDetail::Other {
-                        message: error.to_string(),
-                    })
-                }
-            };
-            if let Err(error) = supervisor
-                .set_passphrase(&output_interface, passphrase)
-                .await
-            {
-                return provisioning_error(RouterProvisioningErrorDetail::InvalidSecret {
-                    message: error.to_string(),
-                });
-            }
-            staged_output = Some(previous);
-        }
-
-        if let Some(passphrase) = &uplink_passphrase {
-            let Some(supervisor) = &self.wifi_client else {
-                self.restore_staged_provisioning_secrets(
-                    &uplink_interface,
-                    staged_uplink,
-                    &output_interface,
-                    staged_output,
-                )
-                .await;
-                return provisioning_error(RouterProvisioningErrorDetail::GlobalServiceDisabled {
-                    service: "wifi_client".to_owned(),
-                });
-            };
-            let previous = match supervisor.stored_passphrase(&uplink_interface).await {
-                Ok(previous) => previous,
-                Err(error) => {
-                    self.restore_staged_provisioning_secrets(
-                        &uplink_interface,
-                        staged_uplink,
-                        &output_interface,
-                        staged_output,
-                    )
-                    .await;
-                    return provisioning_error(RouterProvisioningErrorDetail::Other {
-                        message: error.to_string(),
-                    });
-                }
-            };
-            if let Err(error) = supervisor
-                .set_passphrase(&uplink_interface, passphrase)
-                .await
-            {
-                self.restore_staged_provisioning_secrets(
-                    &uplink_interface,
-                    staged_uplink,
-                    &output_interface,
-                    staged_output,
-                )
-                .await;
-                return provisioning_error(RouterProvisioningErrorDetail::InvalidSecret {
-                    message: error.to_string(),
-                });
-            }
-            staged_uplink = Some(previous);
-        }
-
-        let proposal = effective.into_router_intent_proposal();
-        let candidate = match self.overrides.build_candidate(&proposal).await {
-            Ok(candidate) => candidate,
-            Err(error) => {
-                self.restore_staged_provisioning_secrets(
-                    &uplink_interface,
-                    staged_uplink,
-                    &output_interface,
-                    staged_output,
-                )
-                .await;
-                return provisioning_error(classify_provisioning_transaction_error(&error));
-            }
-        };
-        let transaction_plan = match router.plan(candidate).await {
-            Ok(plan) => plan,
-            Err(error) => {
-                self.restore_staged_provisioning_secrets(
-                    &uplink_interface,
-                    staged_uplink,
-                    &output_interface,
-                    staged_output,
-                )
-                .await;
-                return provisioning_error(classify_provisioning_transaction_error(&error));
-            }
-        };
-        match router.apply(transaction_plan).await {
-            Ok(token) => Response::RouterProvisioningApplied { token, preview },
-            Err(error) => {
-                self.restore_staged_provisioning_secrets(
-                    &uplink_interface,
-                    staged_uplink,
-                    &output_interface,
-                    staged_output,
-                )
-                .await;
-                provisioning_error(classify_provisioning_transaction_error(&error))
-            }
-        }
-    }
-
-    async fn router_provisioning_status(&self) -> Response {
-        let Some(router) = &self.router else {
-            return provisioning_error(RouterProvisioningErrorDetail::RouterDisabled);
-        };
-        let effective = match self.effective_config().await {
-            Ok(effective) => effective,
-            Err(message) => {
-                return provisioning_error(RouterProvisioningErrorDetail::Other { message })
-            }
-        };
-        let unconfigured = effective.router.enabled
-            && effective.router.uplink.is_none()
-            && effective.router.owned_routes.is_empty();
-        let desired = match RouterDesired::from_effective_config(&effective) {
-            Ok(desired) => desired,
-            Err(error) => {
-                return provisioning_error(RouterProvisioningErrorDetail::InvalidConfiguration {
-                    message: error.to_string(),
-                })
-            }
-        };
-
-        let readiness = router.manager().health(&desired).await;
-        let coordinator = router.status().await;
-        let failures = router
-            .rollback_failure()
-            .await
-            .map(|failure| failure.failures)
-            .unwrap_or_default();
-        let ready = desired.enabled && readiness.ready() && !unconfigured;
-        let stage = match coordinator {
-            CoordinatorStatus::RollbackFailed => ProvisioningStage::RollbackFailed,
-            CoordinatorStatus::Pending => ProvisioningStage::AwaitingConfirmation,
-            CoordinatorStatus::Idle if unconfigured => ProvisioningStage::Unconfigured,
-            CoordinatorStatus::Idle if !desired.enabled => ProvisioningStage::Inactive,
-            CoordinatorStatus::Idle if ready => ProvisioningStage::Ready,
-            CoordinatorStatus::Idle => ProvisioningStage::Degraded,
-        };
-
-        Response::RouterProvisioningStatus {
-            status: RouterProvisioningStatusView {
-                stage,
-                enabled: desired.enabled,
-                ready,
-                coordinator,
-                readiness,
-                failures,
-            },
-        }
-    }
-
-    async fn router_provisioning_repair(&self) -> Response {
-        let Some(router) = &self.router else {
-            return provisioning_error(RouterProvisioningErrorDetail::RouterDisabled);
-        };
-        let effective = match self.effective_config().await {
-            Ok(effective) => effective,
-            Err(message) => {
-                return provisioning_error(RouterProvisioningErrorDetail::Other { message })
-            }
-        };
-        let desired = match RouterDesired::from_effective_config(&effective) {
-            Ok(desired) if desired.enabled => desired,
-            Ok(_) => return provisioning_error(RouterProvisioningErrorDetail::RouterDisabled),
-            Err(error) => {
-                return provisioning_error(RouterProvisioningErrorDetail::InvalidConfiguration {
-                    message: error.to_string(),
-                })
-            }
-        };
-
-        if let Err(error) = router.repair(desired).await {
-            return provisioning_error(classify_provisioning_transaction_error(&error));
-        }
-        match self.router_provisioning_status().await {
-            Response::RouterProvisioningStatus { status } => {
-                Response::RouterProvisioningRepaired { status }
-            }
-            response => response,
-        }
-    }
-
-    async fn provisioning_context(
-        &self,
-        desired: &RouterProvisioningDesired,
-        secrets: ProvisioningSecretAvailability,
-    ) -> Result<RouterProvisioningContext, RouterProvisioningErrorDetail> {
-        let effective_config = self
-            .effective_config()
-            .await
-            .map_err(|message| RouterProvisioningErrorDetail::Other { message })?;
-        let observed = self.network.list_interfaces().await.map_err(|error| {
-            RouterProvisioningErrorDetail::Other {
-                message: error.to_string(),
-            }
-        })?;
-
-        let provisioned = [
-            desired.uplink.interface.as_str(),
-            desired.output.interface.as_str(),
-        ];
-        let mut interfaces = BTreeMap::new();
-        let mut known_networks = Vec::new();
-
-        for interface in &observed {
-            interfaces.insert(
-                interface.name.clone(),
-                ProvisioningInterfaceObservation {
-                    role: effective_config
-                        .network
-                        .interfaces
-                        .get(&interface.name)
-                        .map(|config| config.role),
-                    wireless_phy: if interface.is_wireless {
-                        crate::netlink::wireless_phy(&interface.name)
-                    } else {
-                        None
-                    },
-                },
-            );
-
-            if provisioned.contains(&interface.name.as_str()) {
-                continue;
-            }
-            let addresses = self
-                .network
-                .list_ipv4_addresses(&interface.name)
-                .await
-                .map_err(|error| RouterProvisioningErrorDetail::Other {
-                    message: error.to_string(),
-                })?;
-            for address in addresses {
-                if let Ok(network) = ipnet::Ipv4Net::new(address.address, address.prefix_len) {
-                    known_networks.push(ProvisioningKnownNetwork {
-                        network: network.trunc(),
-                        source: format!("observed {}", interface.name),
-                    });
-                }
-            }
-        }
-
-        for (name, config) in &effective_config.network.interfaces {
-            if provisioned.contains(&name.as_str()) {
-                continue;
-            }
-            if let Some(ipv4) = config.ipv4 {
-                known_networks.push(ProvisioningKnownNetwork {
-                    network: ipv4.trunc(),
-                    source: format!("configured {name}"),
-                });
-            }
-        }
-
-        let mut runtime_sta_secrets = BTreeSet::new();
-        if secrets.uplink_pending
-            || self
-                .stored_uplink_secret(&desired.uplink.interface)
-                .await
-                .map_err(|message| RouterProvisioningErrorDetail::Other { message })?
-        {
-            runtime_sta_secrets.insert(desired.uplink.interface.clone());
-        }
-        let mut runtime_ap_secrets = BTreeSet::new();
-        if secrets.output_pending
-            || self
-                .stored_output_secret(&desired.output.interface)
-                .await
-                .map_err(|message| RouterProvisioningErrorDetail::Other { message })?
-        {
-            runtime_ap_secrets.insert(desired.output.interface.clone());
-        }
-
-        Ok(RouterProvisioningContext {
-            effective_config,
-            wifi_runtime_available: self.wifi.is_some(),
-            wifi_client_runtime_available: self.wifi_client.is_some(),
-            interfaces,
-            known_networks,
-            runtime_ap_secrets,
-            runtime_sta_secrets,
-        })
-    }
-
-    async fn stored_uplink_secret(&self, interface: &str) -> Result<bool, String> {
-        let Some(supervisor) = &self.wifi_client else {
-            return Ok(false);
-        };
-        supervisor
-            .stored_passphrase(interface)
-            .await
-            .map(|secret| secret.is_some())
-            .map_err(|error| error.to_string())
-    }
-
-    async fn stored_output_secret(&self, interface: &str) -> Result<bool, String> {
-        let Some(supervisor) = &self.wifi else {
-            return Ok(false);
-        };
-        supervisor
-            .stored_passphrase(interface)
-            .await
-            .map(|secret| secret.is_some())
-            .map_err(|error| error.to_string())
-    }
-
-    async fn restore_staged_provisioning_secrets(
-        &self,
-        uplink_interface: &str,
-        staged_uplink: Option<Option<WifiPassphrase>>,
-        output_interface: &str,
-        staged_output: Option<Option<WifiPassphrase>>,
-    ) {
-        if let (Some(previous), Some(supervisor)) = (staged_uplink, self.wifi_client.as_ref()) {
-            restore_wifi_client_secret(supervisor, uplink_interface, previous.as_ref()).await;
-        }
-        if let (Some(previous), Some(supervisor)) = (staged_output, self.wifi.as_ref()) {
-            restore_wifi_secret(supervisor, output_interface, previous.as_ref()).await;
-        }
-    }
-
-    async fn current_router_desired(&self) -> Result<RouterDesired, Response> {
-        let snapshot = self.overrides.snapshot().await;
-        let effective = snapshot
-            .effective_config(&self.base_config)
-            .map_err(classify_router_error)?;
-        RouterDesired::from_effective_config(&effective).map_err(classify_router_error)
     }
 }
 
@@ -3504,6 +1134,22 @@ fn build_router_proposal(request: RouterProposalRequest) -> RouterIntentProposal
         proposal = proposal.remove_interface(interface);
     }
     proposal
+}
+
+fn compensation_message(
+    action: &str,
+    original: &anyhow::Error,
+    restoration: std::result::Result<(), impl std::fmt::Display>,
+) -> String {
+    match restoration {
+        Ok(()) => format!("{action}; runtime state was restored: {original:#}"),
+        Err(error) => {
+            tracing::error!(%original, rollback_error = %error, "runtime restoration failed");
+            format!(
+                "{action}: {original:#}; runtime restoration failed: {error}; recovery required"
+            )
+        }
+    }
 }
 
 fn classify_router_error(error: anyhow::Error) -> Response {
@@ -4556,8 +2202,12 @@ mod tests {
             Request::RouterApply {
                 proposal: router_proposal(),
             },
-            Request::RouterCommit,
-            Request::RouterRollback,
+            Request::RouterCommit {
+                token: String::new(),
+            },
+            Request::RouterRollback {
+                token: String::new(),
+            },
             Request::RouterPendingTransaction,
         ] {
             let response = service.dispatch(request).await;
@@ -4656,7 +2306,18 @@ mod tests {
             other => panic!("unexpected response: {other:?}"),
         }
 
-        match service.dispatch(Request::RouterCommit).await {
+        match service
+            .dispatch(Request::RouterCommit {
+                token: service
+                    .router
+                    .as_ref()
+                    .unwrap()
+                    .pending_token()
+                    .await
+                    .unwrap_or_default(),
+            })
+            .await
+        {
             Response::RouterCommitted { revision } => assert_eq!(revision, 1),
             other => panic!("unexpected response: {other:?}"),
         }
@@ -4684,7 +2345,18 @@ mod tests {
             other => panic!("unexpected response: {other:?}"),
         }
 
-        match service.dispatch(Request::RouterRollback).await {
+        match service
+            .dispatch(Request::RouterRollback {
+                token: service
+                    .router
+                    .as_ref()
+                    .unwrap()
+                    .pending_token()
+                    .await
+                    .unwrap_or_default(),
+            })
+            .await
+        {
             Response::RouterRolledBack => {}
             other => panic!("unexpected response: {other:?}"),
         }
@@ -4699,7 +2371,18 @@ mod tests {
             other => panic!("unexpected response: {other:?}"),
         }
 
-        match service.dispatch(Request::RouterRollback).await {
+        match service
+            .dispatch(Request::RouterRollback {
+                token: service
+                    .router
+                    .as_ref()
+                    .unwrap()
+                    .pending_token()
+                    .await
+                    .unwrap_or_default(),
+            })
+            .await
+        {
             Response::RouterError {
                 detail: RouterErrorDetail::NoPendingTransaction,
             } => {}
@@ -5639,6 +3322,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeWifiProcess {
+        fail_spawn: std::sync::atomic::AtomicBool,
         responders: StdMutex<HashMap<u32, FakeWifiHostapd>>,
         configs: StdMutex<HashMap<u32, std::path::PathBuf>>,
         next_pid: AtomicU32,
@@ -5660,6 +3344,12 @@ mod tests {
             _binary: &std::path::Path,
             config_path: &std::path::Path,
         ) -> Result<u32, WifiProcessError> {
+            if self.fail_spawn.load(WifiOrdering::SeqCst) {
+                return Err(WifiProcessError::Spawn {
+                    binary: _binary.to_path_buf(),
+                    source: std::io::Error::other("injected restoration spawn failure"),
+                });
+            }
             let pid = self.next_pid.fetch_add(1, WifiOrdering::Relaxed);
             let ctrl_path = config_path.with_extension("");
             let responder = FakeWifiHostapd::spawn(ctrl_path, config_path.to_path_buf());
@@ -5782,6 +3472,33 @@ mod tests {
             service,
             process,
             _directory: directory,
+        }
+    }
+
+    #[tokio::test]
+    async fn wifi_disable_reports_both_persistence_and_restoration_failure() {
+        let fixture = wifi_enabled_fixture().await;
+        std::fs::create_dir(fixture.service.overrides.path()).unwrap();
+        fixture.process.fail_spawn.store(true, WifiOrdering::SeqCst);
+        let response = fixture
+            .service
+            .dispatch(Request::DisableWifi {
+                interface: "wlan0".into(),
+            })
+            .await;
+        match response {
+            Response::WifiError {
+                detail: WifiErrorDetail::Other { message },
+            } => {
+                assert!(
+                    message.contains("failed to persist Wi-Fi disable"),
+                    "{message}"
+                );
+                assert!(message.contains("runtime restoration failed"), "{message}");
+                assert!(message.contains("recovery required"), "{message}");
+                assert!(!message.contains("runtime state was restored"));
+            }
+            other => panic!("unexpected response: {other:?}"),
         }
     }
 
@@ -6383,6 +4100,7 @@ mod tests {
 
     #[derive(Default)]
     struct FakeSupplicantProcess {
+        fail_spawn: std::sync::atomic::AtomicBool,
         responders: StdMutex<HashMap<u32, FakeSupplicant>>,
         configs: StdMutex<HashMap<u32, std::path::PathBuf>>,
         next_pid: AtomicU32,
@@ -6417,6 +4135,12 @@ mod tests {
             interface: &str,
             config_path: &std::path::Path,
         ) -> Result<u32, WifiProcessError> {
+            if self.fail_spawn.load(WifiOrdering::SeqCst) {
+                return Err(WifiProcessError::Spawn {
+                    binary: _binary.to_path_buf(),
+                    source: std::io::Error::other("injected restoration spawn failure"),
+                });
+            }
             let pid = self.next_pid.fetch_add(1, WifiOrdering::Relaxed);
             let ctrl_path = config_path
                 .parent()
@@ -6492,6 +4216,7 @@ mod tests {
     }
 
     struct WifiClientFixture {
+        process: Arc<FakeSupplicantProcess>,
         service: ControlService,
         _directory: tempfile::TempDir,
     }
@@ -6508,10 +4233,10 @@ mod tests {
         let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
             addresses: Vec::new(),
         });
-        let wifi_client =
-            ClientSupervisor::start_with_process(&config, FakeSupplicantProcess::new())
-                .await
-                .expect("wifi client supervisor");
+        let process = FakeSupplicantProcess::new();
+        let wifi_client = ClientSupervisor::start_with_process(&config, process.clone())
+            .await
+            .expect("wifi client supervisor");
 
         let interface_config = config
             .network
@@ -6526,8 +4251,35 @@ mod tests {
         let service = ControlService::new(config, network, dhcp, overrides)
             .with_wifi_client_supervisor(wifi_client);
         WifiClientFixture {
+            process,
             service,
             _directory: directory,
+        }
+    }
+
+    #[tokio::test]
+    async fn wifi_client_disable_reports_both_persistence_and_restoration_failure() {
+        let fixture = wifi_client_enabled_fixture().await;
+        std::fs::create_dir(fixture.service.overrides.path()).unwrap();
+        fixture.process.fail_spawn.store(true, WifiOrdering::SeqCst);
+        let response = fixture
+            .service
+            .dispatch(Request::DisableWifiClient {
+                interface: "wlan1".into(),
+            })
+            .await;
+        match response {
+            Response::WifiClientError {
+                detail: WifiClientErrorDetail::Other { message },
+            } => {
+                assert!(
+                    message.contains("failed to persist Wi-Fi client disable"),
+                    "{message}"
+                );
+                assert!(message.contains("runtime restoration failed"), "{message}");
+                assert!(!message.contains("runtime state was restored"));
+            }
+            other => panic!("unexpected response: {other:?}"),
         }
     }
 
@@ -7432,8 +5184,9 @@ mod tests {
         dhcp_client.configure(dhcp_spec).await;
         assert!(dhcp_client.spec("wlan1").await.is_some());
 
-        let store = crate::dhcp::client::store::DhcpClientLeaseStore::new(&config.runtime.state_dir)
-            .expect("store");
+        let store =
+            crate::dhcp::client::store::DhcpClientLeaseStore::new(&config.runtime.state_dir)
+                .expect("store");
         let lease = crate::dhcp::client::lease::DhcpClientLease {
             schema_version: crate::dhcp::client::lease::DHCP_CLIENT_LEASE_SCHEMA_VERSION,
             state: crate::dhcp::client::lease::DhcpClientLeaseState::Bound,
@@ -8103,7 +5856,19 @@ mod tests {
         }
 
         assert!(matches!(
-            fixture.service.dispatch(Request::RouterCommit).await,
+            fixture
+                .service
+                .dispatch(Request::RouterCommit {
+                    token: fixture
+                        .service
+                        .router
+                        .as_ref()
+                        .unwrap()
+                        .pending_token()
+                        .await
+                        .unwrap_or_default()
+                })
+                .await,
             Response::RouterCommitted { revision: 1 }
         ));
 
@@ -8145,7 +5910,19 @@ mod tests {
             Response::RouterProvisioningApplied { .. }
         ));
         assert!(matches!(
-            fixture.service.dispatch(Request::RouterCommit).await,
+            fixture
+                .service
+                .dispatch(Request::RouterCommit {
+                    token: fixture
+                        .service
+                        .router
+                        .as_ref()
+                        .unwrap()
+                        .pending_token()
+                        .await
+                        .unwrap_or_default()
+                })
+                .await,
             Response::RouterCommitted { .. }
         ));
 
@@ -8236,7 +6013,19 @@ mod tests {
             Response::RouterProvisioningApplied { .. }
         ));
         assert!(matches!(
-            fixture.service.dispatch(Request::RouterCommit).await,
+            fixture
+                .service
+                .dispatch(Request::RouterCommit {
+                    token: fixture
+                        .service
+                        .router
+                        .as_ref()
+                        .unwrap()
+                        .pending_token()
+                        .await
+                        .unwrap_or_default()
+                })
+                .await,
             Response::RouterCommitted { .. }
         ));
         *fixture.subsystems.unhealthy_dataplane.lock().unwrap() = true;
@@ -8369,7 +6158,19 @@ mod tests {
             Response::RouterProvisioningApplied { .. }
         ));
         assert!(matches!(
-            fixture.service.dispatch(Request::RouterCommit).await,
+            fixture
+                .service
+                .dispatch(Request::RouterCommit {
+                    token: fixture
+                        .service
+                        .router
+                        .as_ref()
+                        .unwrap()
+                        .pending_token()
+                        .await
+                        .unwrap_or_default()
+                })
+                .await,
             Response::RouterCommitted { .. }
         ));
         let output = fixture
@@ -8551,7 +6352,10 @@ mod tests {
                 assert_eq!(routes.len(), 2);
                 assert_eq!(routes[0].destination, "10.0.0.0/24".parse().unwrap());
                 assert_eq!(routes[0].output_interface.as_deref(), Some("wlan0"));
-                assert_eq!(routes[0].owner, crate::netlink::RouteOwner::TrafficMasqStatic);
+                assert_eq!(
+                    routes[0].owner,
+                    crate::netlink::RouteOwner::TrafficMasqStatic
+                );
 
                 assert_eq!(routes[1].destination, "0.0.0.0/0".parse().unwrap());
                 assert_eq!(routes[1].output_interface.as_deref(), Some("eth0"));

@@ -88,6 +88,9 @@ pub enum AuthError {
     #[error("password hashing operation failed")]
     PasswordHash,
 
+    #[error("too many authentication attempts; retry later")]
+    Busy,
+
     #[error("authentication worker failed")]
     Worker,
 
@@ -96,6 +99,34 @@ pub enum AuthError {
 
     #[error("filesystem error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+struct LoginBudget {
+    remaining: u32,
+    refill_at: tokio::time::Instant,
+}
+
+impl LoginBudget {
+    fn new() -> Self {
+        Self {
+            remaining: 20,
+            refill_at: tokio::time::Instant::now(),
+        }
+    }
+
+    fn take(&mut self) -> Result<(), AuthError> {
+        let now = tokio::time::Instant::now();
+        let refill = now.duration_since(self.refill_at).as_secs();
+        if refill > 0 {
+            self.remaining = self.remaining.saturating_add(refill.min(20) as u32).min(20);
+            self.refill_at += Duration::from_secs(refill);
+        }
+        if self.remaining == 0 {
+            return Err(AuthError::Busy);
+        }
+        self.remaining -= 1;
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -108,6 +139,7 @@ struct AuthServiceInner {
     argon2_params: Params,
     dummy_password_hash: String,
     login_semaphore: Arc<Semaphore>,
+    login_budget: tokio::sync::Mutex<LoginBudget>,
     session_idle_seconds: i64,
     session_absolute_seconds: i64,
 }
@@ -178,6 +210,7 @@ impl AuthService {
                 argon2_params,
                 dummy_password_hash,
                 login_semaphore: Arc::new(Semaphore::new(max_concurrent_logins)),
+                login_budget: tokio::sync::Mutex::new(LoginBudget::new()),
                 session_idle_seconds,
                 session_absolute_seconds,
             }),
@@ -308,6 +341,7 @@ impl AuthService {
         client_name: Option<&str>,
         peer: Option<&str>,
     ) -> Result<LoginSession, AuthError> {
+        self.inner.login_budget.lock().await.take()?;
         let user = sqlx::query(
             "SELECT id, username, password_hash, role, enabled \
              FROM users WHERE username = ?",
@@ -321,20 +355,11 @@ impl AuthService {
             .map(|row| row.get::<String, _>("password_hash"))
             .unwrap_or_else(|| self.inner.dummy_password_hash.clone());
 
-        let permit = self
-            .inner
-            .login_semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| AuthError::Worker)?;
-        let supplied_password = password.to_owned();
-        let password_matches = tokio::task::spawn_blocking(move || {
+        let supplied_password = zeroize::Zeroizing::new(password.to_owned());
+        let password_matches = password_worker(self.inner.login_semaphore.clone(), move || {
             verify_password(&candidate_hash, &supplied_password)
         })
-        .await
-        .map_err(|_| AuthError::Worker)?;
-        drop(permit);
+        .await?;
 
         let Some(user) = user else {
             return Err(AuthError::InvalidCredentials);
@@ -541,6 +566,19 @@ fn validate_password(password: &str) -> Result<(), AuthError> {
     }
 }
 
+async fn password_worker<T: Send + 'static>(
+    semaphore: Arc<Semaphore>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, AuthError> {
+    let permit = semaphore.try_acquire_owned().map_err(|_| AuthError::Busy)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|_| AuthError::Worker)
+}
+
 async fn hash_password(params: Params, password: String) -> Result<String, AuthError> {
     tokio::task::spawn_blocking(move || {
         let salt = SaltString::generate(&mut OsRng);
@@ -608,6 +646,47 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn cancelled_password_waiter_keeps_worker_permit() {
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = {
+            let semaphore = semaphore.clone();
+            tokio::spawn(async move {
+                super::password_worker(semaphore, move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+                .await
+            })
+        };
+        started_rx.await.unwrap();
+        worker.abort();
+        let _ = worker.await;
+        let busy = super::password_worker(semaphore.clone(), || ()).await;
+        release_tx.send(()).unwrap();
+        assert!(matches!(busy, Err(super::AuthError::Busy)));
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(5), semaphore.acquire())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(permit);
+        super::password_worker(semaphore, || ()).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn login_budget_replenishes_without_an_unbounded_queue() {
+        let mut budget = super::LoginBudget::new();
+        for _ in 0..20 {
+            budget.take().unwrap();
+        }
+        assert!(matches!(budget.take(), Err(super::AuthError::Busy)));
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        budget.take().unwrap();
+        assert!(matches!(budget.take(), Err(super::AuthError::Busy)));
+    }
+
     use sqlx::Row;
     use tempfile::TempDir;
 

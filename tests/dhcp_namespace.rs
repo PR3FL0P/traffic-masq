@@ -2,7 +2,6 @@ use std::net::Ipv4Addr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -12,7 +11,7 @@ use traffic_masq::config::AppConfig;
 use traffic_masq::dhcp::supervisor::{DhcpServiceSpec, DhcpSupervisor};
 use traffic_masq::netlink::{AddressOwnership, NetworkProvider, RtnetlinkNetworkProvider};
 
-static NAMESPACE_TEST_LOCK: Mutex<()> = Mutex::new(());
+static NAMESPACE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct DhcpNetnsFixture {
     ns: String,
@@ -101,9 +100,7 @@ impl Drop for DhcpNetnsFixture {
 #[ignore = "requires root, iproute2 and udhcpc; run only on a disposable Linux test host"]
 async fn two_output_interfaces_serve_isolated_dhcp_pools_concurrently() -> Result<()> {
     init_test_logging();
-    let _test_guard = NAMESPACE_TEST_LOCK
-        .lock()
-        .map_err(|_| anyhow::anyhow!("namespace test lock is poisoned"))?;
+    let _test_guard = NAMESPACE_TEST_LOCK.lock().await;
     let first = DhcpNetnsFixture::new()?;
     let second = DhcpNetnsFixture::new()?;
     let network = RtnetlinkNetworkProvider::connect()?;
@@ -279,9 +276,7 @@ fn assert_client_subnet(fixture: &DhcpNetnsFixture, expected: &str) -> Result<()
 #[ignore = "requires root, iproute2 and udhcpc; run only on a disposable Linux test host"]
 async fn embedded_dhcp_assigns_lease_to_namespace_client() -> Result<()> {
     init_test_logging();
-    let _test_guard = NAMESPACE_TEST_LOCK
-        .lock()
-        .map_err(|_| anyhow::anyhow!("namespace test lock is poisoned"))?;
+    let _test_guard = NAMESPACE_TEST_LOCK.lock().await;
     let fixture = DhcpNetnsFixture::new()?;
     let network = RtnetlinkNetworkProvider::connect()?;
     let server_ip = Ipv4Addr::new(192, 168, 88, 1);

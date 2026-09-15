@@ -944,6 +944,19 @@ async fn router_transaction_workflow_plan_apply_commit_over_http() -> Result<()>
         response => panic!("unexpected response: {response:?}"),
     };
     assert!(!token.is_empty());
+    for request in [
+        Request::RouterCommit {
+            token: "stale-token".into(),
+        },
+        Request::RouterRollback {
+            token: "stale-token".into(),
+        },
+    ] {
+        assert!(matches!(
+            admin.request(&request).await?,
+            Response::RouterError { .. }
+        ));
+    }
 
     match admin.request(&Request::RouterPendingTransaction).await? {
         Response::RouterPendingTransaction { status, .. } => {
@@ -952,7 +965,12 @@ async fn router_transaction_workflow_plan_apply_commit_over_http() -> Result<()>
         response => panic!("unexpected response: {response:?}"),
     }
 
-    match admin.request(&Request::RouterCommit).await? {
+    match admin
+        .request(&Request::RouterCommit {
+            token: pending_router_token(&admin).await?,
+        })
+        .await?
+    {
         Response::RouterCommitted { revision } => assert_eq!(revision, 1),
         response => panic!("unexpected response: {response:?}"),
     }
@@ -987,7 +1005,11 @@ async fn router_transaction_workflow_plan_apply_rollback_over_http() -> Result<(
     }
 
     assert!(matches!(
-        admin.request(&Request::RouterRollback).await?,
+        admin
+            .request(&Request::RouterRollback {
+                token: pending_router_token(&admin).await?
+            })
+            .await?,
         Response::RouterRolledBack
     ));
 
@@ -998,7 +1020,12 @@ async fn router_transaction_workflow_plan_apply_rollback_over_http() -> Result<(
         response => panic!("unexpected response: {response:?}"),
     }
 
-    match admin.request(&Request::RouterRollback).await? {
+    match admin
+        .request(&Request::RouterRollback {
+            token: pending_router_token(&admin).await?,
+        })
+        .await?
+    {
         Response::RouterError {
             detail: RouterErrorDetail::NoPendingTransaction,
         } => {}
@@ -2000,7 +2027,12 @@ async fn provisioning_minimal_request_previews_applies_and_commits_over_http() -
     }
 
     assert!(matches!(
-        server.admin.request(&Request::RouterCommit).await?,
+        server
+            .admin
+            .request(&Request::RouterCommit {
+                token: pending_router_token(&server.admin).await?
+            })
+            .await?,
         Response::RouterCommitted { revision: 1 }
     ));
 
@@ -2130,7 +2162,12 @@ async fn provisioning_conflicts_and_rollback_are_typed_over_http() -> Result<()>
     ));
 
     assert!(matches!(
-        server.admin.request(&Request::RouterRollback).await?,
+        server
+            .admin
+            .request(&Request::RouterRollback {
+                token: pending_router_token(&server.admin).await?
+            })
+            .await?,
         Response::RouterRolledBack
     ));
     match server
@@ -2163,7 +2200,12 @@ async fn provisioning_responses_never_carry_key_material_over_http() -> Result<(
     assert!(!encoded.contains("passphrase"), "{encoded}");
 
     assert!(matches!(
-        server.admin.request(&Request::RouterCommit).await?,
+        server
+            .admin
+            .request(&Request::RouterCommit {
+                token: pending_router_token(&server.admin).await?
+            })
+            .await?,
         Response::RouterCommitted { .. }
     ));
 
@@ -2210,7 +2252,12 @@ async fn provisioning_applies_advanced_overrides_over_http() -> Result<()> {
         response => panic!("unexpected response: {response:?}"),
     }
     assert!(matches!(
-        server.admin.request(&Request::RouterCommit).await?,
+        server
+            .admin
+            .request(&Request::RouterCommit {
+                token: pending_router_token(&server.admin).await?
+            })
+            .await?,
         Response::RouterCommitted { .. }
     ));
 
@@ -2279,4 +2326,11 @@ async fn http_routes_list_and_router_config_endpoints_work() -> Result<()> {
     }
 
     server.shutdown().await
+}
+
+async fn pending_router_token(client: &ApiClient) -> Result<String> {
+    match client.request(&Request::RouterPendingTransaction).await? {
+        Response::RouterPendingTransaction { token, .. } => Ok(token.unwrap_or_default()),
+        other => anyhow::bail!("unexpected pending response: {other:?}"),
+    }
 }

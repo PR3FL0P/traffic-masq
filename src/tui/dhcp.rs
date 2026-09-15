@@ -96,18 +96,15 @@ impl DhcpEditor {
             DhcpField::PoolStart => {
                 Some(super::input::TextEditor::new(&mut self.pool_start, cursor))
             }
-            DhcpField::PoolEnd => {
-                Some(super::input::TextEditor::new(&mut self.pool_end, cursor))
-            }
-            DhcpField::Router => {
-                Some(super::input::TextEditor::new(&mut self.router, cursor))
-            }
+            DhcpField::PoolEnd => Some(super::input::TextEditor::new(&mut self.pool_end, cursor)),
+            DhcpField::Router => Some(super::input::TextEditor::new(&mut self.router, cursor)),
             DhcpField::DnsServers => {
                 Some(super::input::TextEditor::new(&mut self.dns_servers, cursor))
             }
-            DhcpField::LeaseSeconds => {
-                Some(super::input::TextEditor::new(&mut self.lease_seconds, cursor))
-            }
+            DhcpField::LeaseSeconds => Some(super::input::TextEditor::new(
+                &mut self.lease_seconds,
+                cursor,
+            )),
             DhcpField::Save | DhcpField::Leases | DhcpField::Disable => None,
         }
     }
@@ -388,7 +385,9 @@ fn is_candidate_ipv4(addr: Ipv4Addr, prefix_len: u8) -> bool {
     true
 }
 
-fn candidate_cidr_from_status(status: &crate::api::model::InterfaceStatus) -> Option<ipnet::Ipv4Net> {
+fn candidate_cidr_from_status(
+    status: &crate::api::model::InterfaceStatus,
+) -> Option<ipnet::Ipv4Net> {
     let owned = status.owned_ipv4_addresses.as_deref().unwrap_or(&[]);
     let addresses = if !owned.is_empty() {
         owned
@@ -997,25 +996,30 @@ mod tests {
 
     #[tokio::test]
     async fn dhcp_editor_cursor_navigation_and_editing() {
-        let mut app = TuiApp::default();
-        app.screen = Screen::DhcpEditor;
-        app.dhcp_editor = Some(DhcpEditor {
-            interface: "lan0".to_string(),
-            field: DhcpField::PoolStart,
-            pool_start: "192.168.1.10".to_string(),
-            pool_end: "192.168.1.100".to_string(),
-            router: "192.168.1.1".to_string(),
-            dns_servers: "8.8.8.8".to_string(),
-            lease_seconds: "86400".to_string(),
-            cursor: 12,
-        });
+        let mut app = TuiApp {
+            screen: Screen::DhcpEditor,
+            dhcp_editor: Some(DhcpEditor {
+                interface: "lan0".to_string(),
+                field: DhcpField::PoolStart,
+                pool_start: "192.168.1.10".to_string(),
+                pool_end: "192.168.1.100".to_string(),
+                router: "192.168.1.1".to_string(),
+                dns_servers: "8.8.8.8".to_string(),
+                lease_seconds: "86400".to_string(),
+                cursor: 12,
+            }),
+            ..Default::default()
+        };
         let client = ApiClient::new("/socket-that-must-not-be-opened");
 
         handle_dhcp_editor_key(&mut app, KeyCode::Left, &client).await;
         assert_eq!(app.dhcp_editor.as_ref().unwrap().cursor, 11);
 
         handle_dhcp_editor_key(&mut app, KeyCode::Char('5'), &client).await;
-        assert_eq!(app.dhcp_editor.as_ref().unwrap().pool_start, "192.168.1.150");
+        assert_eq!(
+            app.dhcp_editor.as_ref().unwrap().pool_start,
+            "192.168.1.150"
+        );
         assert_eq!(app.dhcp_editor.as_ref().unwrap().cursor, 12);
 
         handle_dhcp_editor_key(&mut app, KeyCode::Backspace, &client).await;

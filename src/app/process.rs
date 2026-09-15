@@ -58,8 +58,8 @@ impl ProcessGuard {
     }
 }
 
-impl Drop for ProcessGuard {
-    fn drop(&mut self) {
+impl ProcessGuard {
+    fn remove_owned_pid(&self) {
         let Ok(metadata) = fs::symlink_metadata(&self.pid_path) else {
             return;
         };
@@ -74,6 +74,18 @@ impl Drop for ProcessGuard {
                 %error,
                 "failed to remove owned PID file"
             );
+        }
+    }
+}
+
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        // Keep ownership until PID cleanup finishes. Closing only this fd is
+        // insufficient: a concurrently forked child may hold the same open
+        // file description until exec, extending the flock lifetime.
+        self.remove_owned_pid();
+        if let Err(error) = FileExt::unlock(&self._lock) {
+            tracing::warn!(%error, "failed to release process lock");
         }
     }
 }
@@ -143,6 +155,23 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    fn releasing_owner_unlocks_even_while_a_duplicate_descriptor_exists() {
+        let directory = tempdir().unwrap();
+        let pid_path = directory.path().join("traffic-masqd.pid");
+        let owner = ProcessGuard::acquire(&pid_path).unwrap();
+        // dup and fork share the open file description that owns the flock.
+        let inherited = owner._lock.try_clone().unwrap();
+        assert!(process_lock_is_held(&pid_path).unwrap());
+        drop(owner);
+        assert!(!pid_path.exists());
+        assert!(!process_lock_is_held(&pid_path).unwrap());
+        let next_owner = ProcessGuard::acquire(&pid_path).unwrap();
+        drop(inherited);
+        assert!(process_lock_is_held(&pid_path).unwrap());
+        drop(next_owner);
+    }
 
     #[test]
     fn prevents_second_owner_and_cleans_only_pid_file() {

@@ -27,4 +27,13 @@ DESTDIR="$stage/opt-root" PREFIX=/opt/traffic-masq "$project_dir/packaging/unins
 
 test ! -e "$stage/root/usr/local/sbin/traffic-masqd"
 test ! -e "$stage/root/usr/local/bin/traffic-masq"
+BINARY_DIR="$fake_bin" OUTPUT_DIR="$stage/releases" TARGET=x86_64-unknown-linux-gnu \
+    "$project_dir/packaging/release.sh"
+archive=$(find "$stage/releases" -name '*.tar.gz' -type f)
+test -n "$archive"
+(cd "$stage/releases" && sha256sum -c ./*.sha256)
+mkdir "$stage/unpacked"
+tar -xzf "$archive" -C "$stage/unpacked"
+test -x "$stage/unpacked/$(basename "$archive" .tar.gz)/traffic-masq"
+test -x "$stage/unpacked/$(basename "$archive" .tar.gz)/traffic-masqd"
 printf '%s\n' "packaging staging smoke test passed"

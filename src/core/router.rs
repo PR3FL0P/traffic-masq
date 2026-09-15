@@ -389,7 +389,7 @@ impl VpnChainPlan {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default, Deserialize)]
 pub struct VpnChainSnapshot {
     /// The interfaces (by name) that were active hops before this
     /// transaction started, in the same order they were applied.
@@ -407,7 +407,7 @@ impl VpnChainSnapshot {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouterSnapshot {
     pub interfaces: Vec<InterfaceSnapshot>,
     pub uplink_wifi: Vec<WifiSnapshot<WifiClientSpec>>,

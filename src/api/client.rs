@@ -177,7 +177,18 @@ impl ApiClient {
     }
 
     async fn send(&self, method: Method, path: &str, body: Option<Vec<u8>>) -> Result<RawResponse> {
-        let response = tokio::time::timeout(std::time::Duration::from_secs(10), self.send_inner(method, path, body))
+        self.send_with_timeout(method, path, body, std::time::Duration::from_secs(10))
+            .await
+    }
+
+    async fn send_with_timeout(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Vec<u8>>,
+        deadline: std::time::Duration,
+    ) -> Result<RawResponse> {
+        let response = tokio::time::timeout(deadline, self.send_inner(method, path, body))
             .await
             .context("API request timed out; operation outcome may be unknown. Inspect current state before retrying")??;
         if response.status == StatusCode::UNAUTHORIZED {
@@ -568,16 +579,16 @@ fn map_request(request: &crate::api::model::Request) -> Result<RestRequest> {
             body: Some(serialize_json(proposal)?),
             synthesize_pong: false,
         },
-        Request::RouterCommit => RestRequest {
+        Request::RouterCommit { token } => RestRequest {
             method: Method::POST,
             path: format!("{API_PREFIX}/router/commit"),
-            body: None,
+            body: Some(serialize_json(&serde_json::json!({ "token": token }))?),
             synthesize_pong: false,
         },
-        Request::RouterRollback => RestRequest {
+        Request::RouterRollback { token } => RestRequest {
             method: Method::POST,
             path: format!("{API_PREFIX}/router/rollback"),
-            body: None,
+            body: Some(serialize_json(&serde_json::json!({ "token": token }))?),
             synthesize_pong: false,
         },
         Request::RouterPendingTransaction => RestRequest {
@@ -586,7 +597,9 @@ fn map_request(request: &crate::api::model::Request) -> Result<RestRequest> {
             body: None,
             synthesize_pong: false,
         },
-        Request::ListRoutes { include_local_table } => RestRequest {
+        Request::ListRoutes {
+            include_local_table,
+        } => RestRequest {
             method: Method::GET,
             path: format!("{API_PREFIX}/routes?include_local_table={include_local_table}"),
             body: None,
@@ -948,20 +961,29 @@ mod tests {
     use super::*;
     use crate::api::model::Request;
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn silent_api_times_out_and_closes_connection() {
         use tokio::io::AsyncReadExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("api.sock");
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let client = ApiClient::new(path);
-        let request = tokio::spawn(async move { client.request(&Request::Ping).await });
+        let request = tokio::spawn(async move {
+            client
+                .send_with_timeout(
+                    Method::GET,
+                    "/api/v1/status",
+                    None,
+                    std::time::Duration::from_millis(50),
+                )
+                .await
+        });
         let (mut peer, _) = listener.accept().await.unwrap();
-        tokio::time::advance(std::time::Duration::from_secs(11)).await;
         assert!(request
             .await
             .unwrap()
-            .unwrap_err()
+            .err()
+            .expect("request timeout")
             .to_string()
             .contains("timed out"));
         tokio::task::yield_now().await;

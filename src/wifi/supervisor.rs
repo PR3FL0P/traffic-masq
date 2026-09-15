@@ -497,10 +497,7 @@ impl HostapdSupervisor {
     /// on a daemon that started with `wifi.enabled = false`, and that path needs
     /// the same clear diagnosis of a missing binary that startup gives.
     pub async fn preflight_binary(&self) -> Result<(), SupervisorError> {
-        tokio::process::Command::new(&self.inner.hostapd_binary)
-            .arg("-v")
-            .output()
-            .await
+        crate::command::probe(&self.inner.hostapd_binary).await
             .map_err(|error| {
                 SupervisorError::Configuration(anyhow::anyhow!(
                     "hostapd binary {} is not runnable ({error}) — install hostapd or fix wifi.hostapd_binary",

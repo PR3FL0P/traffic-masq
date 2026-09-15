@@ -25,15 +25,10 @@ pub(crate) enum DashboardFocus {
     PendingChanges,
 }
 
-pub(crate) const DASHBOARD_ACTIONS: [DashboardFocus; 2] = [
-    DashboardFocus::Interfaces,
-    DashboardFocus::PendingChanges,
-];
+pub(crate) const DASHBOARD_ACTIONS: [DashboardFocus; 2] =
+    [DashboardFocus::Interfaces, DashboardFocus::PendingChanges];
 
-pub(crate) const DASHBOARD_ACTION_LABELS: [&str; 2] = [
-    "Interfaces",
-    "Pending network changes",
-];
+pub(crate) const DASHBOARD_ACTION_LABELS: [&str; 2] = ["Interfaces", "Pending network changes"];
 
 fn next_dashboard_action(focus: DashboardFocus) -> DashboardFocus {
     let index = DASHBOARD_ACTIONS
@@ -491,12 +486,8 @@ fn render_traffic_row(
     header.spans.extend(format_addresses(status));
     frame.render_widget(Paragraph::new(header), rows[0]);
 
-    let rx_slice = history
-        .map(|history| history.rx_rates())
-        .unwrap_or(&[]);
-    let tx_slice = history
-        .map(|history| history.tx_rates())
-        .unwrap_or(&[]);
+    let rx_slice = history.map(|history| history.rx_rates()).unwrap_or(&[]);
+    let tx_slice = history.map(|history| history.tx_rates()).unwrap_or(&[]);
 
     frame.render_widget(
         Sparkline::default()

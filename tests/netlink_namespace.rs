@@ -440,7 +440,7 @@ async fn the_journal_and_the_kernel_tag_agree_about_who_owns_an_address() -> Res
     // machine, with the daemon's in-memory state gone.
     let reopened = AddressOwnershipJournal::open(state_dir.path())?;
     let outcome = reopened
-        .reconcile(&fixture.host_if, &[observed.clone()])
+        .reconcile(&fixture.host_if, std::slice::from_ref(&observed))
         .await?;
     assert!(
         outcome.dropped.is_empty(),

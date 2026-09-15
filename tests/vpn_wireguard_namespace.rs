@@ -1,7 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -13,7 +12,7 @@ use traffic_masq::api::client::ApiClient;
 use traffic_masq::api::model::{Request, Response};
 use traffic_masq::config::AppConfig;
 
-static NAMESPACE_TEST_LOCK: Mutex<()> = Mutex::new(());
+static NAMESPACE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -349,9 +348,7 @@ fn build_config(temp: &tempfile::TempDir) -> AppConfig {
 #[tokio::test]
 #[ignore = "requires root, Linux, iproute2 and wireguard-tools (wg); spawns a real traffic-masqd process and creates a real kernel WireGuard interface; run only on a disposable test host"]
 async fn daemon_establishes_real_wireguard_handshake_and_tunnels_traffic() -> Result<()> {
-    let _test_guard = NAMESPACE_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _test_guard = NAMESPACE_TEST_LOCK.lock().await;
 
     let mut fixture = VpnNamespaceFixture::new().await?;
     if let Err(error) = run_happy_path(&mut fixture).await {

@@ -3,7 +3,6 @@ use std::fs;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
@@ -18,7 +17,7 @@ use traffic_masq::config::{
 };
 use traffic_masq::wifi::WpaState;
 
-static PHYSICAL_WIFI_TEST_LOCK: Mutex<()> = Mutex::new(());
+static PHYSICAL_WIFI_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const WAIT_TIMEOUT: Duration = Duration::from_secs(60);
 const STOP_GRACE: Duration = Duration::from_secs(5);
 
@@ -366,9 +365,7 @@ impl Inputs {
 #[tokio::test]
 #[ignore = "moves a user-selected physical Wi-Fi PHY; requires explicit root execution and a separate management uplink"]
 async fn physical_wpa2_client_associates_without_touching_management_uplink() -> Result<()> {
-    let _guard = PHYSICAL_WIFI_TEST_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = PHYSICAL_WIFI_TEST_LOCK.lock().await;
     let mut fixture = PhysicalWifiFixture::new()?;
     let result = fixture.run_test().await;
     if let Err(error) = result {
