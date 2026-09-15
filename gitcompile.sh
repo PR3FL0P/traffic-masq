@@ -150,14 +150,19 @@ download_artifacts_for_run() {
   log_info "Downloading build artifacts from run #$run_id into '$target_dir'..."
   mkdir -p "$target_dir"
 
-  # Download artifact archive
-  gh run download "$run_id" --name "$ARTIFACT_NAME" --dir "$target_dir"
+  local tmp_dir
+  tmp_dir=$(mktemp -d)
 
-  # If gh extracted files inside a subfolder matching the artifact name, flatten it
-  if [ -d "$target_dir/$ARTIFACT_NAME" ]; then
-    cp -r "$target_dir/$ARTIFACT_NAME"/* "$target_dir"/ 2>/dev/null || true
-    rm -rf "$target_dir/$ARTIFACT_NAME"
+  # Download artifact archive into temporary directory
+  gh run download "$run_id" --name "$ARTIFACT_NAME" --dir "$tmp_dir"
+
+  # Flatten or copy files from temporary directory
+  if [ -d "$tmp_dir/$ARTIFACT_NAME" ]; then
+    cp -rf "$tmp_dir/$ARTIFACT_NAME"/* "$target_dir"/ 2>/dev/null || true
+  else
+    cp -rf "$tmp_dir"/* "$target_dir"/ 2>/dev/null || true
   fi
+  rm -rf "$tmp_dir"
 
   # Ensure binaries have execution permissions
   chmod +x "$target_dir"/traffic-masq "$target_dir"/traffic-masqd 2>/dev/null || true
