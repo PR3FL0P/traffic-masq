@@ -199,6 +199,7 @@ const COMPETING_DAEMONS: &[&str] = &[
     "systemd-networkd",
     "connman",
     "connmand",
+    "dhcpcd",
 ];
 
 /// Scans /proc for running processes whose comm matches a known network-management
@@ -363,6 +364,29 @@ pub fn format_competing_manager_advice_for_init(
                 lines.push(format!("  - Release '{interface}' only: add to /etc/connman/main.conf:"));
                 lines.push(format!("      NetworkInterfaceBlacklist = {interface}"));
             }
+            "dhcpcd" => {
+                lines.push("• Manager 'dhcpcd' is running:".to_string());
+                match init {
+                    InitSystem::Runit => {
+                        lines.push("  - Stop service:      sudo sv down dhcpcd".to_string());
+                        lines.push("  - Disable service:   sudo touch /etc/sv/dhcpcd/down".to_string());
+                    }
+                    InitSystem::Systemd => {
+                        lines.push("  - Stop service:      sudo systemctl stop dhcpcd".to_string());
+                        lines.push("  - Disable service:   sudo systemctl disable --now dhcpcd".to_string());
+                    }
+                    InitSystem::OpenRc => {
+                        lines.push("  - Stop service:      sudo rc-service dhcpcd stop".to_string());
+                        lines.push("  - Disable service:   sudo rc-update del dhcpcd default".to_string());
+                    }
+                    _ => {
+                        lines.push("  - Stop service:      sudo sv down dhcpcd   (or: sudo systemctl stop dhcpcd)".to_string());
+                        lines.push("  - Disable service:   sudo touch /etc/sv/dhcpcd/down   (or: sudo systemctl disable --now dhcpcd)".to_string());
+                    }
+                }
+                lines.push(format!("  - Release '{interface}' only: add to /etc/dhcpcd.conf:"));
+                lines.push(format!("      denyinterfaces {interface}"));
+            }
             other => {
                 lines.push(format!("• Manager '{other}' is running:"));
                 match init {
@@ -515,12 +539,15 @@ mod tests {
             "NetworkManager".to_string(),
             "systemd-networkd".to_string(),
             "connman".to_string(),
+            "dhcpcd".to_string(),
         ];
         let advice = super::format_competing_manager_advice(&managers, "wlp1s0");
         assert!(advice.contains("iwd"));
         assert!(advice.contains("NetworkManager"));
         assert!(advice.contains("systemd-networkd"));
         assert!(advice.contains("connman"));
+        assert!(advice.contains("dhcpcd"));
+        assert!(advice.contains("denyinterfaces wlp1s0"));
         assert!(advice.contains("wlp1s0"));
     }
 

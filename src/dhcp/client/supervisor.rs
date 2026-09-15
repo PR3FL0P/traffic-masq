@@ -237,6 +237,17 @@ struct Inner {
     operation_lock: Mutex<()>,
 }
 
+impl Inner {
+    async fn record_success(&self, interface: &str) {
+        let mut tasks = self.tasks.lock().await;
+        if let Some(task) = tasks.get_mut(interface) {
+            task.consecutive_failures = 0;
+            task.next_attempt_earliest = None;
+            task.last_error = None;
+        }
+    }
+}
+
 impl DhcpClientSupervisor {
     #[cfg(target_os = "linux")]
     pub async fn start(config: &AppConfig, network: Arc<dyn NetworkProvider>) -> Result<Self> {
@@ -519,20 +530,23 @@ impl DhcpClientSupervisor {
 
             (Some(observed), true) if identity == Some(observed) && !finished => false,
             (Some(observed), _) => {
-                if backed_off {
-                    return false;
-                }
                 if has_running && identity == Some(observed) {
                     let reason = self.reap_finished(interface).await;
                     tracing::warn!(
                         %interface,
                         reason = %reason.as_deref().unwrap_or("task exited"),
-                        "DHCP client task stopped; restarting it"
+                        "DHCP client task stopped; will retry with backoff"
                     );
+                    return false;
                 } else if has_running {
                     tracing::info!(%interface, "DHCP client interface identity changed; restarting its client");
                     self.stop_task(interface).await;
                 }
+
+                if backed_off {
+                    return false;
+                }
+
                 self.start_task(interface).await;
                 true
             }
@@ -629,6 +643,7 @@ impl DhcpClientSupervisor {
             identity,
             applier: self.inner.applier.clone(),
             shared: shared.clone(),
+            inner: Arc::downgrade(&self.inner),
         };
         let launch = DhcpClientLaunch {
             interface: interface.to_string(),
@@ -644,7 +659,9 @@ impl DhcpClientSupervisor {
                 if let Some(task) = tasks.get_mut(interface) {
                     task.running = Some(running);
                     task.identity = Some(identity);
-                    task.consecutive_failures = 0;
+                    if remembered.is_some() {
+                        task.consecutive_failures = 0;
+                    }
                     task.next_attempt_earliest = None;
                     task.last_error = None;
                 }
@@ -741,6 +758,7 @@ struct OwnershipSink {
     identity: InterfaceIdentity,
     applier: Arc<DhcpClientOwnershipApplier>,
     shared: Arc<Mutex<SharedState>>,
+    inner: std::sync::Weak<Inner>,
 }
 
 #[async_trait]
@@ -752,6 +770,9 @@ impl DhcpClientActionSink for OwnershipSink {
                 let mut shared = self.shared.lock().await;
                 shared.lease = Some(applied);
                 shared.failure = None;
+                if let Some(inner) = self.inner.upgrade() {
+                    inner.record_success(&self.spec.interface).await;
+                }
                 Ok(())
             }
             Err(error) => {
@@ -1278,13 +1299,29 @@ mod tests {
         let state_dir = TempDir::new().expect("state dir");
         let network = FakeNetwork::present(7).await;
         let launcher = Arc::new(FakeLauncher::default());
-        launcher.exit_immediately.store(1, Ordering::SeqCst);
+        launcher.exit_immediately.store(2, Ordering::SeqCst);
         let supervisor = supervisor_with(&state_dir, network, launcher.clone()).await;
         assert_eq!(launcher.launch_count(), 1);
 
         tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!supervisor.ensure_alive().await.expect("ensure alive"));
+        assert_eq!(launcher.launch_count(), 1);
+
+        tokio::time::advance(RESTART_BACKOFF_BASE + Duration::from_millis(1)).await;
         assert!(supervisor.ensure_alive().await.expect("ensure alive"));
         assert_eq!(launcher.launch_count(), 2);
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!supervisor.ensure_alive().await.expect("ensure alive"));
+        assert_eq!(launcher.launch_count(), 2);
+
+        tokio::time::advance(RESTART_BACKOFF_BASE).await;
+        assert!(!supervisor.ensure_alive().await.expect("ensure alive"));
+        assert_eq!(launcher.launch_count(), 2);
+
+        tokio::time::advance(RESTART_BACKOFF_BASE + Duration::from_millis(1)).await;
+        assert!(supervisor.ensure_alive().await.expect("ensure alive"));
+        assert_eq!(launcher.launch_count(), 3);
     }
 
     #[tokio::test]
