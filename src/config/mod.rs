@@ -896,7 +896,10 @@ impl InterfaceConfig {
         }
 
         if self.wifi_client.is_some() && self.role != InterfaceRole::Input {
-            bail!("a Wi-Fi client can only be enabled on an input interface (current role: {:?})", self.role);
+            bail!(
+                "a Wi-Fi client can only be enabled on an input interface (current role: {:?})",
+                self.role
+            );
         }
 
         if let Some(wifi_client) = &self.wifi_client {
@@ -2349,7 +2352,9 @@ mod tests {
     #[test]
     fn accepts_external_and_managed_dhcp_input_matrix() {
         let external_wired = input_interface();
-        external_wired.validate("wan0").expect("external unmanaged wired");
+        external_wired
+            .validate("wan0")
+            .expect("external unmanaged wired");
 
         let managed_wifi = client_interface(client_association("upstream"));
         managed_wifi

@@ -2123,11 +2123,8 @@ pub(crate) async fn handle_wifi_connect_prompt_key(
             if let Some(pos) = focusable.iter().position(|f| *f == prompt.field) {
                 if pos > 0 {
                     prompt.field = focusable[pos - 1];
-                    match prompt.field {
-                        WifiConnectField::StaticCidr => {
-                            prompt.cursor = prompt.static_cidr.len();
-                        }
-                        _ => {}
+                    if prompt.field == WifiConnectField::StaticCidr {
+                        prompt.cursor = prompt.static_cidr.len();
                     }
                 }
             }
@@ -2137,11 +2134,8 @@ pub(crate) async fn handle_wifi_connect_prompt_key(
             if let Some(pos) = focusable.iter().position(|f| *f == prompt.field) {
                 if pos + 1 < focusable.len() {
                     prompt.field = focusable[pos + 1];
-                    match prompt.field {
-                        WifiConnectField::StaticCidr => {
-                            prompt.cursor = prompt.static_cidr.len();
-                        }
-                        _ => {}
+                    if prompt.field == WifiConnectField::StaticCidr {
+                        prompt.cursor = prompt.static_cidr.len();
                     }
                 }
             }
