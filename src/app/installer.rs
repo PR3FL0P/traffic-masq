@@ -88,9 +88,16 @@ pub struct UninstallArgs {
 }
 
 pub async fn uninstall(args: UninstallArgs, config_override: Option<PathBuf>) -> Result<()> {
+    uninstall_with_store(args, config_override, ServiceStore::host()).await
+}
+
+pub(crate) async fn uninstall_with_store(
+    args: UninstallArgs,
+    config_override: Option<PathBuf>,
+    store: ServiceStore,
+) -> Result<()> {
     let files = uninstall_files(&args.prefix)?;
     let resolved = crate::config::ResolvedConfig::load(config_override)?;
-    let store = ServiceStore::host();
     let registration = store.load()?;
     if let Some(registration) = &registration {
         if registration.daemon != init::absolute_path(&args.prefix.join("sbin/traffic-masqd"))?
@@ -1082,7 +1089,7 @@ mod tests {
         config.runtime.pid_path = dir.path().join("runtime/daemon.pid");
         let config_path = dir.path().join("config.toml");
         fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
-        uninstall(
+        uninstall_with_store(
             UninstallArgs {
                 prefix: dir.path().to_path_buf(),
                 dry_run: true,
@@ -1090,6 +1097,7 @@ mod tests {
                 timeout_seconds: 1,
             },
             Some(config_path.clone()),
+            ServiceStore::with_root(dir.path()),
         )
         .await
         .unwrap();

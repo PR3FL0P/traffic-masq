@@ -20,6 +20,9 @@ impl ServiceStore {
     pub fn host() -> Self {
         Self { root: "/".into() }
     }
+    pub fn with_root(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
     pub(super) fn path(&self, path: impl AsRef<Path>) -> PathBuf {
         self.root.join(
             path.as_ref()
