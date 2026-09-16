@@ -758,7 +758,10 @@ impl WifiClientSupervisor {
             let advice = if competitors.is_empty() {
                 String::new()
             } else {
-                format!("\n{}", crate::wifi::process::format_competing_manager_advice(&competitors, interface))
+                format!(
+                    "\n{}",
+                    crate::wifi::process::format_competing_manager_advice(&competitors, interface)
+                )
             };
             tracing::warn!(
                 %interface,
@@ -774,7 +777,8 @@ impl WifiClientSupervisor {
                 "wpa_supplicant is not responding; restarting it"
             );
         } else {
-            let advice = crate::wifi::process::format_competing_manager_advice(&competitors, interface);
+            let advice =
+                crate::wifi::process::format_competing_manager_advice(&competitors, interface);
             tracing::warn!(
                 %interface,
                 pid = task.record.pid,

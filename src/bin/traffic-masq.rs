@@ -46,7 +46,13 @@ async fn main() -> Result<()> {
             println!("No competing network managers detected.");
         } else {
             println!("Detected competing network manager(s) that may control wireless interfaces:");
-            println!("{}", traffic_masq::wifi::process::format_competing_manager_advice(&managers, "<interface>"));
+            println!(
+                "{}",
+                traffic_masq::wifi::process::format_competing_manager_advice(
+                    &managers,
+                    "<interface>"
+                )
+            );
         }
         Ok(())
     } else if args.change_password {

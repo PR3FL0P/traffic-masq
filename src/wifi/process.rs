@@ -200,6 +200,9 @@ const COMPETING_DAEMONS: &[&str] = &[
     "connman",
     "connmand",
     "dhcpcd",
+    "dhclient",
+    "dhcpd",
+    "udhcpc",
 ];
 
 /// Scans /proc for running processes whose comm matches a known network-management
@@ -289,22 +292,29 @@ pub fn format_competing_manager_advice_for_init(
                 match init {
                     InitSystem::Runit => {
                         lines.push("  - Stop service:      sudo sv down iwd".to_string());
-                        lines.push("  - Disable service:   sudo touch /etc/sv/iwd/down".to_string());
+                        lines
+                            .push("  - Disable service:   sudo touch /etc/sv/iwd/down".to_string());
                     }
                     InitSystem::Systemd => {
                         lines.push("  - Stop service:      sudo systemctl stop iwd".to_string());
-                        lines.push("  - Disable service:   sudo systemctl disable --now iwd".to_string());
+                        lines.push(
+                            "  - Disable service:   sudo systemctl disable --now iwd".to_string(),
+                        );
                     }
                     InitSystem::OpenRc => {
                         lines.push("  - Stop service:      sudo rc-service iwd stop".to_string());
-                        lines.push("  - Disable service:   sudo rc-update del iwd default".to_string());
+                        lines.push(
+                            "  - Disable service:   sudo rc-update del iwd default".to_string(),
+                        );
                     }
                     _ => {
                         lines.push("  - Stop service:      sudo sv down iwd   (or: sudo systemctl stop iwd)".to_string());
                         lines.push("  - Disable service:   sudo touch /etc/sv/iwd/down   (or: sudo systemctl disable --now iwd)".to_string());
                     }
                 }
-                lines.push(format!("  - Release '{interface}' only: add to /etc/iwd/main.conf:"));
+                lines.push(format!(
+                    "  - Release '{interface}' only: add to /etc/iwd/main.conf:"
+                ));
                 lines.push("      [Blacklist]".to_string());
                 lines.push(format!("      Interfaces={interface}"));
             }
@@ -312,29 +322,51 @@ pub fn format_competing_manager_advice_for_init(
                 lines.push(format!("• Manager '{manager}' is running:"));
                 match init {
                     InitSystem::Runit => {
-                        lines.push("  - Stop service:      sudo sv down NetworkManager".to_string());
-                        lines.push("  - Disable service:   sudo touch /etc/sv/NetworkManager/down".to_string());
+                        lines
+                            .push("  - Stop service:      sudo sv down NetworkManager".to_string());
+                        lines.push(
+                            "  - Disable service:   sudo touch /etc/sv/NetworkManager/down"
+                                .to_string(),
+                        );
                     }
                     InitSystem::Systemd => {
-                        lines.push("  - Stop service:      sudo systemctl stop NetworkManager".to_string());
-                        lines.push("  - Disable service:   sudo systemctl disable --now NetworkManager".to_string());
+                        lines.push(
+                            "  - Stop service:      sudo systemctl stop NetworkManager".to_string(),
+                        );
+                        lines.push(
+                            "  - Disable service:   sudo systemctl disable --now NetworkManager"
+                                .to_string(),
+                        );
                     }
                     InitSystem::OpenRc => {
-                        lines.push("  - Stop service:      sudo rc-service NetworkManager stop".to_string());
-                        lines.push("  - Disable service:   sudo rc-update del NetworkManager default".to_string());
+                        lines.push(
+                            "  - Stop service:      sudo rc-service NetworkManager stop"
+                                .to_string(),
+                        );
+                        lines.push(
+                            "  - Disable service:   sudo rc-update del NetworkManager default"
+                                .to_string(),
+                        );
                     }
                     _ => {
                         lines.push("  - Stop service:      sudo sv down NetworkManager   (or: sudo systemctl stop NetworkManager)".to_string());
                         lines.push("  - Disable service:   sudo touch /etc/sv/NetworkManager/down   (or: sudo systemctl disable --now NetworkManager)".to_string());
                     }
                 }
-                lines.push(format!("  - Release '{interface}' only: sudo nmcli device set {interface} managed no"));
+                lines.push(format!(
+                    "  - Release '{interface}' only: sudo nmcli device set {interface} managed no"
+                ));
                 lines.push(format!("    (or in /etc/NetworkManager/conf.d/99-traffic-masq.conf: [keyfile] unmanaged-devices=interface-name:{interface})"));
             }
             "systemd-network" | "systemd-networkd" | "networkd" => {
                 lines.push("• Manager 'systemd-networkd' is running:".to_string());
-                lines.push("  - Stop service:      sudo systemctl stop systemd-networkd".to_string());
-                lines.push("  - Disable service:   sudo systemctl disable --now systemd-networkd".to_string());
+                lines.push(
+                    "  - Stop service:      sudo systemctl stop systemd-networkd".to_string(),
+                );
+                lines.push(
+                    "  - Disable service:   sudo systemctl disable --now systemd-networkd"
+                        .to_string(),
+                );
                 lines.push(format!("  - Release '{interface}' only: create /etc/systemd/network/99-{interface}-unmanaged.network:"));
                 lines.push("      [Match]".to_string());
                 lines.push(format!("      Name={interface}"));
@@ -346,22 +378,34 @@ pub fn format_competing_manager_advice_for_init(
                 match init {
                     InitSystem::Runit => {
                         lines.push("  - Stop service:      sudo sv down connman".to_string());
-                        lines.push("  - Disable service:   sudo touch /etc/sv/connman/down".to_string());
+                        lines.push(
+                            "  - Disable service:   sudo touch /etc/sv/connman/down".to_string(),
+                        );
                     }
                     InitSystem::Systemd => {
-                        lines.push("  - Stop service:      sudo systemctl stop connman".to_string());
-                        lines.push("  - Disable service:   sudo systemctl disable --now connman".to_string());
+                        lines
+                            .push("  - Stop service:      sudo systemctl stop connman".to_string());
+                        lines.push(
+                            "  - Disable service:   sudo systemctl disable --now connman"
+                                .to_string(),
+                        );
                     }
                     InitSystem::OpenRc => {
-                        lines.push("  - Stop service:      sudo rc-service connman stop".to_string());
-                        lines.push("  - Disable service:   sudo rc-update del connman default".to_string());
+                        lines.push(
+                            "  - Stop service:      sudo rc-service connman stop".to_string(),
+                        );
+                        lines.push(
+                            "  - Disable service:   sudo rc-update del connman default".to_string(),
+                        );
                     }
                     _ => {
                         lines.push("  - Stop service:      sudo sv down connman   (or: sudo systemctl stop connman)".to_string());
                         lines.push("  - Disable service:   sudo touch /etc/sv/connman/down   (or: sudo systemctl disable --now connman)".to_string());
                     }
                 }
-                lines.push(format!("  - Release '{interface}' only: add to /etc/connman/main.conf:"));
+                lines.push(format!(
+                    "  - Release '{interface}' only: add to /etc/connman/main.conf:"
+                ));
                 lines.push(format!("      NetworkInterfaceBlacklist = {interface}"));
             }
             "dhcpcd" => {
@@ -369,22 +413,32 @@ pub fn format_competing_manager_advice_for_init(
                 match init {
                     InitSystem::Runit => {
                         lines.push("  - Stop service:      sudo sv down dhcpcd".to_string());
-                        lines.push("  - Disable service:   sudo touch /etc/sv/dhcpcd/down".to_string());
+                        lines.push(
+                            "  - Disable service:   sudo touch /etc/sv/dhcpcd/down".to_string(),
+                        );
                     }
                     InitSystem::Systemd => {
                         lines.push("  - Stop service:      sudo systemctl stop dhcpcd".to_string());
-                        lines.push("  - Disable service:   sudo systemctl disable --now dhcpcd".to_string());
+                        lines.push(
+                            "  - Disable service:   sudo systemctl disable --now dhcpcd"
+                                .to_string(),
+                        );
                     }
                     InitSystem::OpenRc => {
-                        lines.push("  - Stop service:      sudo rc-service dhcpcd stop".to_string());
-                        lines.push("  - Disable service:   sudo rc-update del dhcpcd default".to_string());
+                        lines
+                            .push("  - Stop service:      sudo rc-service dhcpcd stop".to_string());
+                        lines.push(
+                            "  - Disable service:   sudo rc-update del dhcpcd default".to_string(),
+                        );
                     }
                     _ => {
                         lines.push("  - Stop service:      sudo sv down dhcpcd   (or: sudo systemctl stop dhcpcd)".to_string());
                         lines.push("  - Disable service:   sudo touch /etc/sv/dhcpcd/down   (or: sudo systemctl disable --now dhcpcd)".to_string());
                     }
                 }
-                lines.push(format!("  - Release '{interface}' only: add to /etc/dhcpcd.conf:"));
+                lines.push(format!(
+                    "  - Release '{interface}' only: add to /etc/dhcpcd.conf:"
+                ));
                 lines.push(format!("      denyinterfaces {interface}"));
             }
             other => {
@@ -392,15 +446,25 @@ pub fn format_competing_manager_advice_for_init(
                 match init {
                     InitSystem::Runit => {
                         lines.push(format!("  - Stop service:      sudo sv down {other}"));
-                        lines.push(format!("  - Disable service:   sudo touch /etc/sv/{other}/down"));
+                        lines.push(format!(
+                            "  - Disable service:   sudo touch /etc/sv/{other}/down"
+                        ));
                     }
                     InitSystem::Systemd => {
-                        lines.push(format!("  - Stop service:      sudo systemctl stop {other}"));
-                        lines.push(format!("  - Disable service:   sudo systemctl disable --now {other}"));
+                        lines.push(format!(
+                            "  - Stop service:      sudo systemctl stop {other}"
+                        ));
+                        lines.push(format!(
+                            "  - Disable service:   sudo systemctl disable --now {other}"
+                        ));
                     }
                     InitSystem::OpenRc => {
-                        lines.push(format!("  - Stop service:      sudo rc-service {other} stop"));
-                        lines.push(format!("  - Disable service:   sudo rc-update del {other} default"));
+                        lines.push(format!(
+                            "  - Stop service:      sudo rc-service {other} stop"
+                        ));
+                        lines.push(format!(
+                            "  - Disable service:   sudo rc-update del {other} default"
+                        ));
                     }
                     _ => {
                         lines.push(format!("  - Stop service:      sudo sv down {other}   (or: sudo systemctl stop {other})"));
@@ -554,18 +618,29 @@ mod tests {
     #[test]
     fn advice_formatting_respects_init_systems() {
         let managers = vec!["iwd".to_string(), "NetworkManager".to_string()];
-        
-        let runit_advice = super::format_competing_manager_advice_for_init(&managers, "wlan0", super::InitSystem::Runit);
+
+        let runit_advice = super::format_competing_manager_advice_for_init(
+            &managers,
+            "wlan0",
+            super::InitSystem::Runit,
+        );
         assert!(runit_advice.contains("sv down iwd"));
         assert!(runit_advice.contains("/etc/sv/iwd/down"));
 
-        let systemd_advice = super::format_competing_manager_advice_for_init(&managers, "wlan0", super::InitSystem::Systemd);
+        let systemd_advice = super::format_competing_manager_advice_for_init(
+            &managers,
+            "wlan0",
+            super::InitSystem::Systemd,
+        );
         assert!(systemd_advice.contains("systemctl stop iwd"));
         assert!(systemd_advice.contains("systemctl disable --now iwd"));
 
-        let openrc_advice = super::format_competing_manager_advice_for_init(&managers, "wlan0", super::InitSystem::OpenRc);
+        let openrc_advice = super::format_competing_manager_advice_for_init(
+            &managers,
+            "wlan0",
+            super::InitSystem::OpenRc,
+        );
         assert!(openrc_advice.contains("rc-service iwd stop"));
         assert!(openrc_advice.contains("rc-update del iwd default"));
     }
 }
-

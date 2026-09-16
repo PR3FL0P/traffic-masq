@@ -693,7 +693,8 @@ impl HostapdSupervisor {
                 "hostapd is not responding; restarting it"
             );
         } else {
-            let advice = crate::wifi::process::format_competing_manager_advice(&competitors, interface);
+            let advice =
+                crate::wifi::process::format_competing_manager_advice(&competitors, interface);
             tracing::warn!(
                 %interface,
                 pid = task.record.pid,
