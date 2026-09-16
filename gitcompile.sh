@@ -44,6 +44,7 @@ if [ -d "$HOME/.local/bin" ] && [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
 WORKFLOW_FILE="compile.yml"
 ARTIFACT_NAME="traffic-masq-binaries"
 OUTPUT_DIR="${SCRIPT_DIR}/binaries"
