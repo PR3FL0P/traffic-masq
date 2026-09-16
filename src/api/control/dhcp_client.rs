@@ -89,14 +89,25 @@ impl ControlService {
             });
         }
         let previous = supervisor.spec(&interface).await;
-        supervisor.configure(spec.clone()).await;
+        let link_ready = match &self.wifi_client {
+            Some(wifi) => match wifi.status(&interface).await {
+                Some(status) => status.wpa_state.is_connected(),
+                None => true,
+            },
+            None => true,
+        };
+        supervisor
+            .configure_with_link_ready(spec.clone(), link_ready)
+            .await;
         if let Err(error) = self
             .overrides
             .set_interface(interface.clone(), interface_config, false)
             .await
         {
             if let Some(previous) = previous {
-                supervisor.configure(previous).await;
+                supervisor
+                    .configure_with_link_ready(previous, link_ready)
+                    .await;
             } else {
                 let _ = supervisor.disable(&interface).await;
             }

@@ -13,9 +13,9 @@ const RETRY_DELAY: Duration = Duration::from_secs(120);
 
 #[derive(Default)]
 pub(super) struct AutoconnectState {
-    suspended: HashSet<String>,
-    connecting_since: HashMap<String, Instant>,
-    attempts: HashMap<String, HashMap<String, Instant>>,
+    pub(super) suspended: HashSet<String>,
+    pub(super) connecting_since: HashMap<String, Instant>,
+    pub(super) attempts: HashMap<String, HashMap<String, Instant>>,
 }
 
 impl AutoconnectState {
@@ -88,13 +88,12 @@ impl ControlService {
             .into_iter()
             .filter(|interface| interface.is_wireless)
         {
-            // Share the mutation lock with manual connect/disconnect and profile
-            // edits. No automatic activation can race a manual disconnect.
-            let _mutation = self.wifi_client_mutations.lock().await;
             let name = &interface.name;
-            let mut state = self.wifi_autoconnect.lock().await;
-            if state.suspended.contains(name) {
-                continue;
+            {
+                let state = self.wifi_autoconnect.lock().await;
+                if state.suspended.contains(name) {
+                    continue;
+                }
             }
             if self
                 .transactions
@@ -121,20 +120,40 @@ impl ControlService {
             let now = Instant::now();
             if let Some(status) = wifi.status(name).await {
                 if status.wpa_state == WpaState::Completed {
+                    self.wifi_autoconnect.lock().await.connecting_since.remove(name);
+                    continue;
+                }
+                let mut state = self.wifi_autoconnect.lock().await;
+                if let Some(since) = state.connecting_since.get(name) {
+                    if now.saturating_duration_since(*since) < ASSOCIATION_GRACE {
+                        continue;
+                    }
                     state.connecting_since.remove(name);
+                    drop(state);
+                    tracing::warn!(interface = %name, "Wi-Fi autoconnect association timed out; clearing stalled profile");
+                    let _mutation = self.wifi_client_mutations.lock().await;
+                    let _ = self.disable_wifi_client_locked(name.clone()).await;
+                    continue;
+                } else if matches!(
+                    status.wpa_state,
+                    WpaState::Authenticating
+                        | WpaState::Associating
+                        | WpaState::Associated
+                        | WpaState::FourWayHandshake
+                        | WpaState::GroupHandshake
+                ) {
                     continue;
                 }
-                // Let the current supplicant reconnect/finish authentication
-                // before considering another saved network.
-                let since = state.connecting_since.entry(name.clone()).or_insert(now);
-                if now.saturating_duration_since(*since) < ASSOCIATION_GRACE {
-                    continue;
-                }
+            } else {
+                self.wifi_autoconnect.lock().await.connecting_since.remove(name);
             }
-            state.attempts.retain(|_, attempts| {
-                attempts.retain(|_, at| now.saturating_duration_since(*at) < RETRY_DELAY);
-                !attempts.is_empty()
-            });
+            {
+                let mut state = self.wifi_autoconnect.lock().await;
+                state.attempts.retain(|_, attempts| {
+                    attempts.retain(|_, at| now.saturating_duration_since(*at) < RETRY_DELAY);
+                    !attempts.is_empty()
+                });
+            }
             let networks = match wifi.scan(name).await {
                 Ok(networks) => networks,
                 Err(error) => {
@@ -143,31 +162,37 @@ impl ControlService {
                 }
             };
             let profiles = self.wifi_client_profiles.list()?;
-            let Some(profile) = choose_profile(&profiles, &networks, name, &state, Instant::now())
-            else {
-                continue;
+            let id = {
+                let state = self.wifi_autoconnect.lock().await;
+                let Some(profile) = choose_profile(&profiles, &networks, name, &state, Instant::now())
+                else {
+                    continue;
+                };
+                profile.id.clone()
             };
-            let id = profile.id.clone();
-            state
-                .attempts
-                .entry(name.clone())
-                .or_default()
-                .insert(id.clone(), Instant::now());
-            state.connecting_since.insert(name.clone(), Instant::now());
-            if config.ipv4.is_none()
-                && !config.dhcp_client.as_ref().is_some_and(|dhcp| dhcp.enabled)
+
+            // Acquire mutation lock only during activation
+            let _mutation = self.wifi_client_mutations.lock().await;
             {
-                match self
-                    .configure_dhcp_client(name.clone(), DhcpClientConfigRequest::default())
-                    .await
-                {
-                    Response::DhcpClientInterface { .. } => {}
-                    response => {
-                        tracing::warn!(interface = %name, ?response, "Wi-Fi autoconnect could not configure DHCP");
+                let mut state = self.wifi_autoconnect.lock().await;
+                if state.suspended.contains(name) {
+                    continue;
+                }
+                // Verify interface didn't finish connecting while scanning
+                if let Some(status) = wifi.status(name).await {
+                    if status.wpa_state == WpaState::Completed {
+                        state.connecting_since.remove(name);
                         continue;
                     }
                 }
+                state
+                    .attempts
+                    .entry(name.clone())
+                    .or_default()
+                    .insert(id.clone(), Instant::now());
+                state.connecting_since.insert(name.clone(), Instant::now());
             }
+
             match self
                 .activate_wifi_client_profile_locked(name.clone(), id.clone())
                 .await
@@ -177,6 +202,7 @@ impl ControlService {
                 }
                 response => {
                     tracing::warn!(interface = %name, profile = %id, ?response, "Wi-Fi autoconnect activation failed");
+                    self.wifi_autoconnect.lock().await.connecting_since.remove(name);
                 }
             }
         }
@@ -226,24 +252,60 @@ mod tests {
         use WpaSupplicantScanSecurity as Scan;
 
         let p_open = sample_profile("p1", "Net", WifiClientSecurity::Open, 0, true, false);
-        assert!(matching_network(&p_open, &sample_network("Net", Scan::Open)));
-        assert!(!matching_network(&p_open, &sample_network("Net", Scan::Wpa2Psk)));
-        assert!(!matching_network(&p_open, &sample_network("Net", Scan::Wpa3Sae)));
+        assert!(matching_network(
+            &p_open,
+            &sample_network("Net", Scan::Open)
+        ));
+        assert!(!matching_network(
+            &p_open,
+            &sample_network("Net", Scan::Wpa2Psk)
+        ));
+        assert!(!matching_network(
+            &p_open,
+            &sample_network("Net", Scan::Wpa3Sae)
+        ));
 
         let p_wpa2 = sample_profile("p2", "Net", WifiClientSecurity::Wpa2, 0, true, true);
-        assert!(matching_network(&p_wpa2, &sample_network("Net", Scan::Wpa2Psk)));
-        assert!(matching_network(&p_wpa2, &sample_network("Net", Scan::Wpa2Wpa3Transition)));
-        assert!(!matching_network(&p_wpa2, &sample_network("Net", Scan::Open)));
-        assert!(!matching_network(&p_wpa2, &sample_network("Net", Scan::Wpa3Sae)));
+        assert!(matching_network(
+            &p_wpa2,
+            &sample_network("Net", Scan::Wpa2Psk)
+        ));
+        assert!(matching_network(
+            &p_wpa2,
+            &sample_network("Net", Scan::Wpa2Wpa3Transition)
+        ));
+        assert!(!matching_network(
+            &p_wpa2,
+            &sample_network("Net", Scan::Open)
+        ));
+        assert!(!matching_network(
+            &p_wpa2,
+            &sample_network("Net", Scan::Wpa3Sae)
+        ));
 
         let p_wpa3 = sample_profile("p3", "Net", WifiClientSecurity::Wpa3, 0, true, true);
-        assert!(matching_network(&p_wpa3, &sample_network("Net", Scan::Wpa3Sae)));
-        assert!(matching_network(&p_wpa3, &sample_network("Net", Scan::Wpa2Wpa3Transition)));
-        assert!(!matching_network(&p_wpa3, &sample_network("Net", Scan::Open)));
-        assert!(!matching_network(&p_wpa3, &sample_network("Net", Scan::Wpa2Psk)));
+        assert!(matching_network(
+            &p_wpa3,
+            &sample_network("Net", Scan::Wpa3Sae)
+        ));
+        assert!(matching_network(
+            &p_wpa3,
+            &sample_network("Net", Scan::Wpa2Wpa3Transition)
+        ));
+        assert!(!matching_network(
+            &p_wpa3,
+            &sample_network("Net", Scan::Open)
+        ));
+        assert!(!matching_network(
+            &p_wpa3,
+            &sample_network("Net", Scan::Wpa2Psk)
+        ));
 
         // SSID mismatch
-        assert!(!matching_network(&p_open, &sample_network("Other", Scan::Open)));
+        assert!(!matching_network(
+            &p_open,
+            &sample_network("Other", Scan::Open)
+        ));
     }
 
     #[test]
@@ -290,7 +352,14 @@ mod tests {
         let now = Instant::now();
         let mut state = AutoconnectState::default();
         let networks = vec![sample_network("Net", WpaSupplicantScanSecurity::Open)];
-        let profiles = vec![sample_profile("p1", "Net", WifiClientSecurity::Open, 10, true, false)];
+        let profiles = vec![sample_profile(
+            "p1",
+            "Net",
+            WifiClientSecurity::Open,
+            10,
+            true,
+            false,
+        )];
 
         // Recent attempt (30 seconds ago) -> skipped
         state

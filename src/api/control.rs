@@ -3998,7 +3998,11 @@ mod tests {
     }
 
     impl FakeSupplicant {
-        fn spawn(ctrl_path: std::path::PathBuf, config_path: std::path::PathBuf) -> Self {
+        fn spawn(
+            ctrl_path: std::path::PathBuf,
+            config_path: std::path::PathBuf,
+            wpa_state: Arc<StdMutex<String>>,
+        ) -> Self {
             let socket =
                 std::os::unix::net::UnixDatagram::bind(&ctrl_path).expect("bind fake ctrl socket");
             socket
@@ -4046,7 +4050,8 @@ mod tests {
                     let reply = match command.as_str() {
                         "PING" => "PONG\n".to_string(),
                         "STATUS" => {
-                            let mut reply = "wpa_state=COMPLETED\n".to_string();
+                            let state = wpa_state.lock().unwrap().clone();
+                            let mut reply = format!("wpa_state={state}\n");
                             if let Some(ssid) = &ssid {
                                 reply.push_str(&format!("ssid={ssid}\n"));
                             }
@@ -4102,20 +4107,33 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
     struct FakeSupplicantProcess {
         fail_spawn: std::sync::atomic::AtomicBool,
         responders: StdMutex<HashMap<u32, FakeSupplicant>>,
         configs: StdMutex<HashMap<u32, std::path::PathBuf>>,
         next_pid: AtomicU32,
+        wpa_state: Arc<StdMutex<String>>,
+    }
+
+    impl Default for FakeSupplicantProcess {
+        fn default() -> Self {
+            Self {
+                fail_spawn: std::sync::atomic::AtomicBool::new(false),
+                responders: StdMutex::new(HashMap::new()),
+                configs: StdMutex::new(HashMap::new()),
+                next_pid: AtomicU32::new(3000),
+                wpa_state: Arc::new(StdMutex::new("COMPLETED".to_string())),
+            }
+        }
     }
 
     impl FakeSupplicantProcess {
         fn new() -> Arc<Self> {
-            Arc::new(Self {
-                next_pid: AtomicU32::new(3000),
-                ..Default::default()
-            })
+            Arc::new(Self::default())
+        }
+
+        fn set_wpa_state(&self, state: &str) {
+            *self.wpa_state.lock().unwrap() = state.to_string();
         }
     }
 
@@ -4150,7 +4168,8 @@ mod tests {
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new(""))
                 .join(interface);
-            let responder = FakeSupplicant::spawn(ctrl_path, config_path.to_path_buf());
+            let responder =
+                FakeSupplicant::spawn(ctrl_path, config_path.to_path_buf(), self.wpa_state.clone());
             self.responders.lock().unwrap().insert(pid, responder);
             self.configs
                 .lock()
@@ -4225,6 +4244,48 @@ mod tests {
         _directory: tempfile::TempDir,
     }
 
+    struct FakeWirelessNetwork {
+        interfaces: Vec<NetworkInterface>,
+    }
+
+    #[async_trait]
+    impl NetworkProvider for FakeWirelessNetwork {
+        async fn list_interfaces(&self) -> Result<Vec<NetworkInterface>> {
+            Ok(self.interfaces.clone())
+        }
+
+        async fn list_ipv4_addresses(&self, _interface: &str) -> Result<Vec<Ipv4AddressInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn set_link_up(&self, _name: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn set_link_down(&self, _name: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn add_ipv4_address(
+            &self,
+            _interface: &str,
+            _address: Ipv4Addr,
+            _prefix_len: u8,
+            _ownership: AddressOwnership,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn delete_ipv4_address(
+            &self,
+            _interface: &str,
+            _address: Ipv4Addr,
+            _prefix_len: u8,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
     async fn wifi_client_enabled_fixture() -> WifiClientFixture {
         let directory = tempdir().expect("tempdir");
         let config = wifi_client_base_config(directory.path());
@@ -4234,8 +4295,25 @@ mod tests {
         let dhcp = DhcpSupervisor::start(&config)
             .await
             .expect("dhcp supervisor");
-        let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
-            addresses: Vec::new(),
+        let network: Arc<dyn NetworkProvider> = Arc::new(FakeWirelessNetwork {
+            interfaces: vec![
+                NetworkInterface {
+                    name: "wlan1".to_string(),
+                    index: 1,
+                    is_up: true,
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    is_wireless: true,
+                },
+                NetworkInterface {
+                    name: "wlan2".to_string(),
+                    index: 2,
+                    is_up: true,
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    is_wireless: true,
+                },
+            ],
         });
         let process = FakeSupplicantProcess::new();
         let wifi_client = ClientSupervisor::start_with_process(&config, process.clone())
@@ -4410,6 +4488,127 @@ mod tests {
                 .await,
             Response::WifiClientProfileDeleted { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn wifi_client_deactivate_preserves_managed_and_allows_subsequent_reactivation() {
+        let fixture = wifi_client_enabled_fixture().await;
+        let deactivated = fixture
+            .service
+            .dispatch(Request::DeactivateWifiClientProfile {
+                interface: "wlan1".to_string(),
+            })
+            .await;
+        assert!(matches!(deactivated, Response::WifiClientDisabled { .. }));
+
+        // Interface must remain managed
+        let effective = fixture.service.effective_config().await.unwrap();
+        let iface = effective.network.interfaces.get("wlan1").unwrap();
+        assert!(
+            iface.managed,
+            "interface must remain managed after deactivation"
+        );
+
+        // Reactivating a profile must succeed and auto-enable DHCP client
+        let created = fixture
+            .service
+            .dispatch(Request::CreateWifiClientProfile {
+                profile: WifiClientProfileWriteRequest {
+                    id: "home".to_string(),
+                    ssid: "home-wifi".to_string(),
+                    country_code: Some("US".to_string()),
+                    security: WifiClientSecurity::Open,
+                    priority: 0,
+                    autoconnect: false,
+                    passphrase: None,
+                    clear_passphrase: false,
+                },
+            })
+            .await;
+        assert!(matches!(created, Response::WifiClientProfile { .. }));
+
+        let activated = fixture
+            .service
+            .dispatch(Request::ActivateWifiClientProfile {
+                interface: "wlan1".to_string(),
+                profile_id: "home".to_string(),
+            })
+            .await;
+        assert!(matches!(
+            activated,
+            Response::WifiClientProfileActivated { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn autoconnect_timeout_clears_stalled_profile_without_deadlock() {
+        let fixture = wifi_client_enabled_fixture().await;
+        let created = fixture
+            .service
+            .dispatch(Request::CreateWifiClientProfile {
+                profile: WifiClientProfileWriteRequest {
+                    id: "saved".to_string(),
+                    ssid: "saved-wifi".to_string(),
+                    country_code: Some("US".to_string()),
+                    security: WifiClientSecurity::Open,
+                    priority: 0,
+                    autoconnect: true,
+                    passphrase: None,
+                    clear_passphrase: false,
+                },
+            })
+            .await;
+        assert!(matches!(created, Response::WifiClientProfile { .. }));
+
+        let activated = fixture
+            .service
+            .dispatch(Request::ActivateWifiClientProfile {
+                interface: "wlan1".to_string(),
+                profile_id: "saved".to_string(),
+            })
+            .await;
+        assert!(matches!(
+            activated,
+            Response::WifiClientProfileActivated { .. }
+        ));
+
+        // Simulate connecting_since exceeded ASSOCIATION_GRACE and wpa_state is not Completed
+        fixture.process.set_wpa_state("ASSOCIATING");
+        {
+            let mut state = fixture.service.wifi_autoconnect.lock().await;
+            state.connecting_since.insert(
+                "wlan1".to_string(),
+                std::time::Instant::now() - std::time::Duration::from_secs(45),
+            );
+        }
+
+        // Must complete within 5 seconds without deadlocking
+        let run = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fixture.service.autoconnect_wifi_once(),
+        )
+        .await;
+        assert!(run.is_ok(), "autoconnect_wifi_once deadlocked!");
+        assert!(run.unwrap().is_ok());
+
+        // Interface must remain managed and stalled wifi_client cleared
+        let effective = fixture.service.effective_config().await.unwrap();
+        let iface = effective.network.interfaces.get("wlan1").unwrap();
+        assert!(iface.managed, "interface must remain managed");
+        assert!(
+            iface.wifi_client.is_none(),
+            "stalled wifi_client must be cleared"
+        );
+
+        let state = fixture.service.wifi_autoconnect.lock().await;
+        assert!(
+            !state.suspended.contains("wlan1"),
+            "autoconnect must not be suspended"
+        );
+        assert!(
+            !state.connecting_since.contains_key("wlan1"),
+            "connecting_since must be cleared"
+        );
     }
 
     #[tokio::test]
@@ -5060,8 +5259,50 @@ mod tests {
             .expect("overrides")
             .expect("interface wlan1 exists");
         assert!(persisted.wifi_client.is_none());
-        assert!(!persisted.managed);
+        assert!(persisted.managed);
         assert!(!persisted.dhcp_client.expect("dhcp_client block").enabled);
+
+        // Reactivating a profile re-configures DHCP client in supervisor
+        let created = service
+            .dispatch(Request::CreateWifiClientProfile {
+                profile: WifiClientProfileWriteRequest {
+                    id: "reactivate".to_string(),
+                    ssid: "reactivate-wifi".to_string(),
+                    country_code: Some("US".to_string()),
+                    security: WifiClientSecurity::Open,
+                    priority: 0,
+                    autoconnect: false,
+                    passphrase: None,
+                    clear_passphrase: false,
+                },
+            })
+            .await;
+        assert!(matches!(created, Response::WifiClientProfile { .. }));
+
+        let activated = service
+            .dispatch(Request::ActivateWifiClientProfile {
+                interface: "wlan1".to_string(),
+                profile_id: "reactivate".to_string(),
+            })
+            .await;
+        assert!(matches!(
+            activated,
+            Response::WifiClientProfileActivated { .. }
+        ));
+
+        // DHCP client supervisor must now be re-configured
+        assert!(dhcp_client.spec("wlan1").await.is_some());
+        let persisted_again = overrides
+            .effective_interface("wlan1")
+            .await
+            .expect("overrides")
+            .expect("interface wlan1 exists");
+        assert!(
+            persisted_again
+                .dhcp_client
+                .expect("dhcp_client block")
+                .enabled
+        );
     }
 
     #[tokio::test]

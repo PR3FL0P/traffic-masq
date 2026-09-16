@@ -137,11 +137,15 @@ impl ControlService {
     }
 
     pub(super) async fn disable_wifi_client(&self, interface: String) -> Response {
+        let _mutation = self.wifi_client_mutations.lock().await;
+        self.wifi_autoconnect.lock().await.suspend(&interface);
+        self.disable_wifi_client_locked(interface).await
+    }
+
+    pub(super) async fn disable_wifi_client_locked(&self, interface: String) -> Response {
         let Some(wifi_client) = &self.wifi_client else {
             return wifi_client_disabled();
         };
-        let _mutation = self.wifi_client_mutations.lock().await;
-        self.wifi_autoconnect.lock().await.suspend(&interface);
         let _dhcp_mutation = if self.dhcp_client.is_some() {
             Some(self.dhcp_client_mutations.lock().await)
         } else {
@@ -218,7 +222,6 @@ impl ControlService {
                 &DhcpClientConfigRequest::default(),
                 false,
             ));
-            interface_config.managed = false;
         }
 
         let previous = wifi_client
@@ -451,6 +454,16 @@ impl ControlService {
             return wifi_client_profile_error(WifiClientProfileErrorDetail::InterfaceNotFound);
         };
 
+        let auto_enabled_dhcp = interface_config.ipv4.is_none()
+            && !interface_config
+                .dhcp_client
+                .as_ref()
+                .is_some_and(|c| c.enabled);
+        if auto_enabled_dhcp {
+            interface_config.dhcp_client =
+                Some(crate::config::DhcpClientInterfaceConfig::default());
+        }
+
         if let Err(message) = validate_wifi_client_interface(&interface, &interface_config) {
             return wifi_client_profile_error(WifiClientProfileErrorDetail::InvalidProfile {
                 message,
@@ -497,6 +510,7 @@ impl ControlService {
             None => wifi_client.clear_passphrase(&interface).await,
         };
         if let Err(error) = secret_result {
+            restore_wifi_client_secret(wifi_client, &interface, previous_secret.as_ref()).await;
             return wifi_client_profile_error(WifiClientProfileErrorDetail::ActivationFailed {
                 message: error.to_string(),
             });
@@ -507,11 +521,35 @@ impl ControlService {
                 message: error.to_string(),
             });
         }
+
+        let mut previous_dhcp = None;
+        if auto_enabled_dhcp {
+            if let Some(dhcp_client) = &self.dhcp_client {
+                if let Ok(Some(dhcp_spec)) =
+                    DhcpClientSpec::from_interface_config(&interface, &interface_config)
+                {
+                    previous_dhcp = dhcp_client.spec(&interface).await;
+                    dhcp_client
+                        .configure_with_link_ready(dhcp_spec, false)
+                        .await;
+                }
+            }
+        }
+
         if let Err(error) = self
             .overrides
             .set_interface(interface.clone(), interface_config, false)
             .await
         {
+            if auto_enabled_dhcp {
+                if let Some(dhcp_client) = &self.dhcp_client {
+                    if let Some(previous) = previous_dhcp {
+                        let _ = dhcp_client.configure_with_link_ready(previous, false).await;
+                    } else {
+                        let _ = dhcp_client.disable(&interface).await;
+                    }
+                }
+            }
             restore_wifi_client_secret(wifi_client, &interface, previous_secret.as_ref()).await;
             match previous_status {
                 Some(previous) => {
