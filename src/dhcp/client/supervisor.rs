@@ -659,9 +659,6 @@ impl DhcpClientSupervisor {
                 if let Some(task) = tasks.get_mut(interface) {
                     task.running = Some(running);
                     task.identity = Some(identity);
-                    if remembered.is_some() {
-                        task.consecutive_failures = 0;
-                    }
                     task.next_attempt_earliest = None;
                     task.last_error = None;
                 }
@@ -1786,5 +1783,50 @@ mod tests {
         assert!(remembered.renewal_at < remembered.rebinding_at);
         assert!(remembered.rebinding_at < remembered.expires_at);
         assert_eq!(remembered.subnet_mask, Ipv4Addr::new(255, 255, 255, 0));
+    }
+
+    #[tokio::test]
+    async fn consecutive_failures_and_backoff_are_preserved_across_restarts_with_remembered_lease()
+    {
+        let state_dir = TempDir::new().expect("state dir");
+        let network = FakeNetwork::present(7).await;
+        let launcher = Arc::new(FakeLauncher::default());
+        let supervisor = supervisor_with(&state_dir, network.clone(), launcher.clone()).await;
+        let mut sink = launcher.take_sink();
+        let address = Ipv4Addr::new(192, 0, 2, 42);
+        sink.lease_acquired(lease(address))
+            .await
+            .expect("apply lease");
+
+        // Fail first time
+        supervisor
+            .record_failure("wan0", "first failure".into())
+            .await;
+        {
+            let tasks = supervisor.inner.tasks.lock().await;
+            assert_eq!(tasks.get("wan0").unwrap().consecutive_failures, 1);
+        }
+
+        // Clear next_attempt_earliest so start_task is allowed to run
+        {
+            let mut tasks = supervisor.inner.tasks.lock().await;
+            tasks.get_mut("wan0").unwrap().next_attempt_earliest = None;
+        }
+        supervisor.ensure_interface_alive("wan0").await;
+
+        // Verify task restarted but failures were NOT wiped to 0
+        {
+            let tasks = supervisor.inner.tasks.lock().await;
+            assert_eq!(tasks.get("wan0").unwrap().consecutive_failures, 1);
+        }
+
+        // Fail second time: must increment to 2
+        supervisor
+            .record_failure("wan0", "second failure".into())
+            .await;
+        {
+            let tasks = supervisor.inner.tasks.lock().await;
+            assert_eq!(tasks.get("wan0").unwrap().consecutive_failures, 2);
+        }
     }
 }
