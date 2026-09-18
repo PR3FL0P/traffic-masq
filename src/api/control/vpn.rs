@@ -1,4 +1,5 @@
 use super::*;
+use super::runtime::compensation_message;
 
 impl ControlService {
     pub(super) async fn vpn_list_profiles(&self) -> Response {
@@ -17,6 +18,11 @@ impl ControlService {
         let Some(vpn) = &self.vpn else {
             return vpn_disabled();
         };
+        match self.vpn_profile_referenced_by_router(&name).await {
+            Ok(true) => return vpn_error(VpnErrorDetail::ProfileInUse { name }),
+            Ok(false) => {}
+            Err(message) => return vpn_error(VpnErrorDetail::Other { message }),
+        }
         match vpn.import_profile(&name, contents.as_bytes()) {
             Ok(name) => Response::VpnProfileImported { name },
             Err(error) => classify_vpn_error(error),
@@ -27,10 +33,30 @@ impl ControlService {
         let Some(vpn) = &self.vpn else {
             return vpn_disabled();
         };
+
+        match self.vpn_profile_referenced_by_router(&name).await {
+            Ok(true) => return vpn_error(VpnErrorDetail::ProfileInUse { name }),
+            Ok(false) => {}
+            Err(message) => return vpn_error(VpnErrorDetail::Other { message }),
+        }
+
         match vpn.delete_profile(&name) {
             Ok(()) => Response::VpnProfileDeleted { name },
             Err(error) => classify_vpn_error(error),
         }
+    }
+
+    async fn vpn_profile_referenced_by_router(&self, name: &str) -> Result<bool, String> {
+        if self.router.is_none() {
+            return Ok(false);
+        }
+        let desired = self.current_router_desired().await.map_err(|error| {
+            format!("cannot verify whether VPN profile '{name}' is used by the router: {error:?}")
+        })?;
+        Ok(desired
+            .vpn_chain
+            .iter()
+            .any(|hop| hop.profile_name == name))
     }
 
     pub(super) async fn vpn_status(&self) -> Response {
@@ -184,17 +210,25 @@ impl ControlService {
             Ok(effective) => effective,
             Err(error) => return vpn_policy_error(VpnPolicyErrorDetail::Other { message: error }),
         };
+        let rollback_desired = match vpn_policy_desired_for_mode(&effective, mode) {
+            Ok(desired) => desired,
+            Err(detail) => return vpn_policy_error(detail),
+        };
+        let snapshot = match policy.snapshot(&rollback_desired).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return vpn_policy_error(classify_vpn_policy_error(&error)),
+        };
         if let Err(response) = self.vpn_policy_apply_mode(policy, &effective, mode).await {
             return response;
         }
         if let Err(error) = self.overrides.set_vpn_mode(mode).await {
-            if mode == VpnPolicyMode::Vpn {
-                let _ = self
-                    .vpn_policy_apply_mode(policy, &effective, VpnPolicyMode::Direct)
-                    .await;
-            }
+            let rollback = policy.rollback(&rollback_desired, &snapshot).await;
             return vpn_policy_error(VpnPolicyErrorDetail::Other {
-                message: error.to_string(),
+                message: compensation_message(
+                    "failed to persist VPN policy mode",
+                    &error,
+                    rollback,
+                ),
             });
         }
         self.vpn_policy_status().await
@@ -209,19 +243,95 @@ impl ControlService {
             Err(error) => return vpn_policy_error(VpnPolicyErrorDetail::Other { message: error }),
         };
         let target = effective.vpn.policy.default_mode;
+        let rollback_desired = match vpn_policy_desired_for_mode(&effective, target) {
+            Ok(desired) => desired,
+            Err(detail) => return vpn_policy_error(detail),
+        };
+        let snapshot = match policy.snapshot(&rollback_desired).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => return vpn_policy_error(classify_vpn_policy_error(&error)),
+        };
         if let Err(response) = self.vpn_policy_apply_mode(policy, &effective, target).await {
             return response;
         }
         if let Err(error) = self.overrides.clear_vpn_mode().await {
-            if target == VpnPolicyMode::Vpn {
-                let _ = self
-                    .vpn_policy_apply_mode(policy, &effective, VpnPolicyMode::Direct)
-                    .await;
-            }
+            let rollback = policy.rollback(&rollback_desired, &snapshot).await;
             return vpn_policy_error(VpnPolicyErrorDetail::Other {
-                message: error.to_string(),
+                message: compensation_message(
+                    "failed to clear VPN policy mode override",
+                    &error,
+                    rollback,
+                ),
             });
         }
         self.vpn_policy_status().await
     }
+}
+
+fn vpn_policy_desired_for_mode(
+    effective: &AppConfig,
+    target: VpnPolicyMode,
+) -> Result<crate::core::vpn_policy_manager::VpnPolicyDesired, VpnPolicyErrorDetail> {
+    match target {
+        VpnPolicyMode::Vpn => vpn_policy_desired(effective)
+            .ok_or(VpnPolicyErrorDetail::NoProtectedSubnets),
+        VpnPolicyMode::Direct => Ok(
+            vpn_policy_desired(effective).unwrap_or_else(vpn_policy_teardown_target),
+        ),
+    }
+}
+
+pub(super) fn vpn_disabled() -> Response {
+    vpn_error(VpnErrorDetail::VpnDisabled)
+}
+
+pub(super) fn vpn_error(detail: VpnErrorDetail) -> Response {
+    Response::VpnError { detail }
+}
+
+pub(super) fn vpn_policy_disabled() -> Response {
+    vpn_policy_error(VpnPolicyErrorDetail::VpnDisabled)
+}
+
+pub(super) fn vpn_policy_error(detail: VpnPolicyErrorDetail) -> Response {
+    Response::VpnPolicyError { detail }
+}
+
+pub(super) fn classify_vpn_policy_error(error: &anyhow::Error) -> VpnPolicyErrorDetail {
+    let message = error.to_string();
+    tracing::warn!(error = %message, "VPN policy request failed");
+    if message.contains("no active VPN tunnel")
+        || message.contains("does not match the expected VPN policy interface")
+    {
+        VpnPolicyErrorDetail::TunnelUnhealthy { message }
+    } else if message.contains("foreign objects occupy the reserved namespace") {
+        VpnPolicyErrorDetail::ReservedNamespaceConflict { message }
+    } else {
+        VpnPolicyErrorDetail::Other { message }
+    }
+}
+
+pub(super) fn classify_vpn_error(error: ManagerError) -> Response {
+    tracing::warn!(error = %error, "VPN request failed");
+    let detail = match error {
+        ManagerError::Driver(VpnDriverError::Store(StoreError::NotFound(name))) => {
+            VpnErrorDetail::NotFound { name }
+        }
+        ManagerError::Driver(VpnDriverError::Store(StoreError::Profile(profile_error)))
+        | ManagerError::Driver(VpnDriverError::Profile(profile_error)) => {
+            VpnErrorDetail::InvalidProfile {
+                message: profile_error.to_string(),
+            }
+        }
+        ManagerError::AlreadyActive => VpnErrorDetail::AlreadyActive,
+        ManagerError::NotActive => VpnErrorDetail::NotActive,
+        ManagerError::ProfileInUse(name) => VpnErrorDetail::ProfileInUse { name },
+        ManagerError::ForeignInterfaceConflict(_) | ManagerError::OwnershipProofFailed(_) => {
+            VpnErrorDetail::ForeignInterfaceConflict
+        }
+        other => VpnErrorDetail::Other {
+            message: other.to_string(),
+        },
+    };
+    Response::VpnError { detail }
 }

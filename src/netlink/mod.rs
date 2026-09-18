@@ -84,6 +84,8 @@ impl Ipv4AddressInfo {
 pub const TRAFFIC_MASQ_ADDRESS_PROTOCOL: u8 = 201;
 pub const TRAFFIC_MASQ_DHCP_ADDRESS_PROTOCOL: u8 = 202;
 const IFA_PROTO: u16 = 11;
+const IFA_FLAGS: u16 = 8;
+const IFA_F_NOPREFIXROUTE: u32 = 0x200;
 
 pub const TRAFFIC_MASQ_ROUTE_PROTOCOL: u8 = 201;
 
@@ -786,6 +788,11 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
             .handle
             .address()
             .add(index, IpAddr::V4(address), prefix_len);
+        if ownership == AddressOwnership::DhcpClient {
+            request.message_mut().attributes.push(AddressAttribute::Other(
+                DefaultNla::new(IFA_FLAGS, IFA_F_NOPREFIXROUTE.to_ne_bytes().to_vec()),
+            ));
+        }
         if let Some(attribute) = Self::ownership_attribute(ownership) {
             request.message_mut().attributes.push(attribute);
         }

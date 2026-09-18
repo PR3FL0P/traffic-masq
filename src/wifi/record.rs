@@ -140,17 +140,16 @@ impl WifiRecordStore {
             .expect("PersistedWifiRecordDocument serialization is infallible");
         content.push(b'\n');
 
-        atomic_file::replace_async(&self.path, &content, PRIVATE_FILE_MODE)
+        atomic_file::replace_preserving_on_error_async(&self.path, &content, PRIVATE_FILE_MODE)
             .await
             .map_err(|error| WifiRecordError::Write(self.path.clone(), error))
     }
 
     pub async fn clear(&self) -> Result<(), WifiRecordError> {
-        match fs::remove_file(&self.path).await {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(WifiRecordError::Write(self.path.clone(), error)),
-        }
+        atomic_file::remove_preserving_on_error_async(&self.path, PRIVATE_FILE_MODE)
+            .await
+            .map(|_| ())
+            .map_err(|error| WifiRecordError::Write(self.path.clone(), error))
     }
 }
 

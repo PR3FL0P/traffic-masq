@@ -161,6 +161,8 @@ pub enum VpnErrorDetail {
 
     NotActive,
 
+    ProfileInUse { name: String },
+
     ForeignInterfaceConflict,
 
     Other { message: String },

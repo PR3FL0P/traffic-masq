@@ -1,4 +1,8 @@
 use super::*;
+use super::dhcp::{
+    configure_dhcp_persisted, default_dhcp_settings, dhcp_edit_request_to_config,
+};
+use super::runtime::compensation_message;
 
 impl ControlService {
     pub(super) async fn wifi_status(&self) -> Response {
@@ -86,6 +90,17 @@ impl ControlService {
         let _mutation = self.wifi_mutations.lock().await;
         let previous = wifi.status(&interface).await.map(|status| status.spec);
         if let Err(error) = wifi.configure(spec.clone()).await {
+            let restoration = match previous.clone() {
+                Some(previous) => wifi.configure(previous).await.map(|_| ()),
+                None => wifi.disable(&interface).await.map(|_| ()),
+            };
+            if let Err(rollback_error) = restoration {
+                return wifi_error(WifiErrorDetail::Other {
+                    message: format!(
+                        "failed to configure Wi-Fi: {error}; runtime restoration failed: {rollback_error}; recovery required"
+                    ),
+                });
+            }
             return classify_wifi_error(error);
         }
         if let Err(error) = self
@@ -136,6 +151,13 @@ impl ControlService {
         let Some(previous_interface) = effective.network.interfaces.get(&interface).cloned() else {
             return wifi_error(WifiErrorDetail::InterfaceNotFound);
         };
+        let previous_override = self
+            .overrides
+            .snapshot()
+            .await
+            .interfaces
+            .get(&interface)
+            .cloned();
         let Some(cidr) = previous_interface.ipv4 else {
             return wifi_error(WifiErrorDetail::InvalidSpec {
                 message: "AP provisioning requires a configured IPv4 CIDR".to_string(),
@@ -188,17 +210,27 @@ impl ControlService {
             }
         }
         if let Err(error) = wifi.configure(spec.clone()).await {
-            compensate_ap(wifi, &interface, previous_ap, previous_secret).await;
-            return classify_wifi_error(error);
+            return match compensate_ap(wifi, &interface, previous_ap, previous_secret).await {
+                Ok(()) => classify_wifi_error(error),
+                Err(rollback) => wifi_error(WifiErrorDetail::Other {
+                    message: format!(
+                        "failed to configure access point: {error}; rollback also failed: {rollback:#}; recovery required"
+                    ),
+                }),
+            };
         }
         if let Err(error) = self
             .overrides
             .set_interface(interface.clone(), desired_interface.clone(), false)
             .await
         {
-            compensate_ap(wifi, &interface, previous_ap, previous_secret).await;
+            let restoration = compensate_ap(wifi, &interface, previous_ap, previous_secret).await;
             return wifi_error(WifiErrorDetail::Other {
-                message: format!("AP provisioning failed to persist Wi-Fi settings; prior AP and secret were restored where possible: {error}"),
+                message: compensation_message(
+                    "AP provisioning failed to persist Wi-Fi settings",
+                    &error,
+                    restoration,
+                ),
             });
         }
 
@@ -221,22 +253,37 @@ impl ControlService {
             match result {
                 Ok(spec) => Some(spec),
                 Err(error) => {
-                    let _ = self
+                    let mut rollback_failures = Vec::new();
+                    if let Err(rollback) = self
                         .overrides
-                        .set_interface(interface.clone(), previous_interface, false)
-                        .await;
-                    match previous_dhcp {
-                        Some(spec) => {
-                            let _ = self.dhcp.configure(spec).await;
-                        }
-                        None => {
-                            let _ = self.dhcp.disable(&interface).await;
-                        }
+                        .restore_interface_override(&interface, previous_override)
+                        .await
+                    {
+                        rollback_failures.push(format!("interface override: {rollback:#}"));
                     }
-                    compensate_ap(wifi, &interface, previous_ap, previous_secret).await;
-                    return wifi_error(WifiErrorDetail::Other {
-                        message: format!("AP provisioning failed while configuring DHCP; prior AP, secret, DHCP, and interface override were restored where possible: {error}"),
-                    });
+                    let dhcp_restore = match previous_dhcp {
+                        Some(spec) => self.dhcp.configure(spec).await,
+                        None => self.dhcp.disable(&interface).await.map(|_| ()),
+                    };
+                    if let Err(rollback) = dhcp_restore {
+                        rollback_failures.push(format!("DHCP: {rollback:#}"));
+                    }
+                    if let Err(rollback) =
+                        compensate_ap(wifi, &interface, previous_ap, previous_secret).await
+                    {
+                        rollback_failures.push(format!("access point: {rollback:#}"));
+                    }
+                    let message = if rollback_failures.is_empty() {
+                        format!(
+                            "AP provisioning failed while configuring DHCP; prior state was restored: {error:#}"
+                        )
+                    } else {
+                        format!(
+                            "AP provisioning failed while configuring DHCP: {error:#}; rollback was incomplete: {}; recovery required",
+                            rollback_failures.join("; ")
+                        )
+                    };
+                    return wifi_error(WifiErrorDetail::Other { message });
                 }
             }
         } else {
@@ -255,11 +302,6 @@ impl ControlService {
         };
         let _mutation = self.wifi_mutations.lock().await;
         let previous = wifi.status(&interface).await.map(|status| status.spec);
-
-        if let Err(error) = wifi.disable(&interface).await {
-            return classify_wifi_error(error);
-        }
-
         let committed = match self.overrides.effective_interface(&interface).await {
             Ok(config) => config,
             Err(error) => {
@@ -268,6 +310,21 @@ impl ControlService {
                 })
             }
         };
+
+        if let Err(error) = wifi.disable(&interface).await {
+            let restoration = match previous.clone() {
+                Some(previous) => wifi.configure(previous).await.map(|_| ()),
+                None => Ok(()),
+            };
+            return wifi_error(WifiErrorDetail::Other {
+                message: compensation_message(
+                    "failed to disable Wi-Fi access point",
+                    &error,
+                    restoration,
+                ),
+            });
+        }
+
         let Some(mut interface_config) = committed else {
             return Response::WifiDisabled { interface };
         };
@@ -308,17 +365,42 @@ impl ControlService {
                 })
             }
         };
-        if let Err(error) = wifi.set_passphrase(&interface, &passphrase).await {
-            return classify_wifi_error(error);
-        }
-
         let Some(status) = wifi.status(&interface).await else {
             return wifi_error(WifiErrorDetail::InterfaceNotFound);
         };
         let spec = status.spec;
+        let previous_secret = match wifi.stored_passphrase(&interface).await {
+            Ok(previous) => previous,
+            Err(error) => return classify_wifi_error(error),
+        };
+
+        if let Err(error) = wifi.set_passphrase(&interface, &passphrase).await {
+            return classify_wifi_error(error);
+        }
+
         match wifi.configure(spec.clone()).await {
             Ok(()) => Response::WifiConfigured { spec },
-            Err(error) => classify_wifi_error(error),
+            Err(error) => {
+                let secret_restore = match previous_secret.as_ref() {
+                    Some(previous) => wifi.set_passphrase(&interface, previous).await,
+                    None => wifi.clear_passphrase(&interface).await,
+                };
+                if let Err(restore_error) = secret_restore {
+                    return wifi_error(WifiErrorDetail::Other {
+                        message: format!(
+                            "failed to apply Wi-Fi passphrase: {error}; failed to restore previous secret: {restore_error}; recovery required"
+                        ),
+                    });
+                }
+                if let Err(restore_error) = wifi.configure(spec).await {
+                    return wifi_error(WifiErrorDetail::Other {
+                        message: format!(
+                            "failed to apply Wi-Fi passphrase: {error}; previous secret was restored but hostapd restoration failed: {restore_error}; recovery required"
+                        ),
+                    });
+                }
+                classify_wifi_error(error)
+            }
         }
     }
 
@@ -367,5 +449,106 @@ impl ControlService {
             Ok(spec) => Response::WifiConfigured { spec },
             Err(error) => classify_wifi_error(error),
         }
+    }
+}
+
+pub(super) fn wifi_disabled() -> Response {
+    Response::WifiError {
+        detail: WifiErrorDetail::WifiDisabled,
+    }
+}
+
+pub(super) fn wifi_error(detail: WifiErrorDetail) -> Response {
+    Response::WifiError { detail }
+}
+
+pub(super) fn classify_wifi_error(error: SupervisorError) -> Response {
+    tracing::warn!(error = %error, "Wi-Fi request failed");
+    let detail = match error {
+        SupervisorError::NotConfigured { .. } => WifiErrorDetail::InterfaceNotFound,
+        SupervisorError::NotOwned { .. } => WifiErrorDetail::NotOwned,
+        SupervisorError::StartupTimeout { .. } => WifiErrorDetail::CtrlTimeout,
+        SupervisorError::Ctrl(CtrlError::Timeout(_)) => WifiErrorDetail::CtrlTimeout,
+        SupervisorError::Ctrl(error) => WifiErrorDetail::HostapdFailed {
+            message: error.to_string(),
+        },
+        SupervisorError::Process(ProcessError::Spawn { source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            WifiErrorDetail::HostapdMissing
+        }
+        SupervisorError::Process(error) => WifiErrorDetail::HostapdFailed {
+            message: error.to_string(),
+        },
+        SupervisorError::Render(RenderError::PassphraseRequired { .. }) => {
+            WifiErrorDetail::PassphraseMissing
+        }
+        SupervisorError::Render(error) => WifiErrorDetail::InvalidSpec {
+            message: error.to_string(),
+        },
+        SupervisorError::ResolvePassphrase(ResolvePassphraseError::Empty(_)) => {
+            WifiErrorDetail::PassphraseMissing
+        }
+        SupervisorError::ResolvePassphrase(error) => WifiErrorDetail::Other {
+            message: error.to_string(),
+        },
+        SupervisorError::Record(error) => WifiErrorDetail::Other {
+            message: error.to_string(),
+        },
+        SupervisorError::Configuration(error) => WifiErrorDetail::InvalidSpec {
+            message: error.to_string(),
+        },
+    };
+    Response::WifiError { detail }
+}
+
+pub(super) fn wifi_edit_request_to_config(settings: WifiEditRequest) -> WifiApConfig {
+    WifiApConfig {
+        ssid: settings.ssid,
+        country_code: settings.country_code,
+        band: settings.band,
+        channel: settings.channel,
+        channel_width: settings.channel_width,
+        security: settings.security,
+        hidden: settings.hidden,
+        client_isolation: settings.client_isolation,
+        max_stations: settings.max_stations,
+        passphrase_file: None,
+    }
+}
+
+pub(super) async fn restore_wifi_secret(
+    wifi: &HostapdSupervisor,
+    interface: &str,
+    previous: Option<&WifiPassphrase>,
+) -> Result<()> {
+    match previous {
+        Some(secret) => wifi.set_passphrase(interface, secret).await?,
+        None => wifi.clear_passphrase(interface).await?,
+    }
+    Ok(())
+}
+
+pub(super) async fn compensate_ap(
+    wifi: &HostapdSupervisor,
+    interface: &str,
+    previous_ap: Option<WifiApSpec>,
+    previous_secret: Option<WifiPassphrase>,
+) -> Result<()> {
+    let mut failures = Vec::new();
+    if let Err(error) = restore_wifi_secret(wifi, interface, previous_secret.as_ref()).await {
+        failures.push(format!("secret restoration failed: {error:#}"));
+    }
+    let runtime = match previous_ap {
+        Some(spec) => wifi.configure(spec).await,
+        None => wifi.disable(interface).await.map(|_| ()),
+    };
+    if let Err(error) = runtime {
+        failures.push(format!("hostapd restoration failed: {error:#}"));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(failures.join("; "))
     }
 }

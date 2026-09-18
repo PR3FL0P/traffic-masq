@@ -715,19 +715,11 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
 }
 
 fn previous_editor_field(field: InterfaceEditorField) -> InterfaceEditorField {
-    let index = INTERFACE_EDITOR_FIELDS
-        .iter()
-        .position(|candidate| *candidate == field)
-        .unwrap_or(0);
-    INTERFACE_EDITOR_FIELDS[index.saturating_sub(1)]
+    super::input::move_clamped(&INTERFACE_EDITOR_FIELDS, field, false)
 }
 
 fn next_editor_field(field: InterfaceEditorField) -> InterfaceEditorField {
-    let index = INTERFACE_EDITOR_FIELDS
-        .iter()
-        .position(|candidate| *candidate == field)
-        .unwrap_or(0);
-    INTERFACE_EDITOR_FIELDS[(index + 1).min(INTERFACE_EDITOR_FIELDS.len() - 1)]
+    super::input::move_clamped(&INTERFACE_EDITOR_FIELDS, field, true)
 }
 
 pub(crate) async fn submit_dry_run(app: &mut TuiApp, client: &ApiClient) {

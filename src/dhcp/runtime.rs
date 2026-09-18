@@ -95,23 +95,32 @@ impl DhcpRuntime {
     async fn process_next_datagram(&mut self, socket: &UdpSocket) -> Result<()> {
         let mut buffer = vec![0_u8; self.config.max_packet_size];
         let (len, source) = socket.recv_from(&mut buffer).await?;
-        let handled = match self.handler.handle_packet(&buffer[..len]) {
-            Ok(Some(response)) => {
-                let destination =
-                    SocketAddrV4::new(self.config.response_address, self.config.client_port);
-                socket.send_to(&response, destination).await?;
-                true
-            }
-            Ok(None) => true,
+        let before = self.handler.clone();
+        let response = match self.handler.handle_packet(&buffer[..len]) {
+            Ok(response) => response,
             Err(error) => {
+                self.handler = before;
                 tracing::warn!(%source, %error, "failed to handle DHCP packet");
-                false
+                return Ok(());
             }
         };
-        if handled {
-            if let Some(store) = &self.lease_store {
-                store.save(&self.handler.lease_snapshot()).await?;
+
+        // Persist the lease mutation before acknowledging it on the wire. If
+        // persistence fails, restore the exact in-memory state and send no
+        // response, so a crash can never forget a lease the client was told it
+        // owns.
+        if let Some(store) = &self.lease_store {
+            if let Err(error) = store.save(&self.handler.lease_snapshot()).await {
+                self.handler = before;
+                tracing::warn!(%source, %error, "failed to persist DHCP leases; response suppressed and lease state rolled back");
+                return Ok(());
             }
+        }
+
+        if let Some(response) = response {
+            let destination =
+                SocketAddrV4::new(self.config.response_address, self.config.client_port);
+            socket.send_to(&response, destination).await?;
         }
         Ok(())
     }
@@ -160,6 +169,22 @@ impl SharedDhcpService {
         self.lease_store.save(&current).await?;
         self.persisted_leases = current;
         Ok(())
+    }
+
+    async fn handle_and_persist(&mut self, packet: &[u8]) -> Result<Option<Vec<u8>>> {
+        let before = self.handler.clone();
+        let response = match self.handler.handle_packet(packet) {
+            Ok(response) => response,
+            Err(error) => {
+                self.handler = before;
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.persist_if_changed().await {
+            self.handler = before;
+            return Err(error).context("failed to persist DHCP leases; in-memory lease state rolled back");
+        }
+        Ok(response)
     }
 }
 
@@ -274,22 +299,22 @@ impl SharedDhcpRuntime {
             tracing::debug!(ifindex, "ignoring DHCP packet from unconfigured interface");
             return;
         };
-        let response = match service.handler.handle_packet(packet) {
+        // Commit lease ownership to disk before sending OFFER/ACK. On a disk
+        // failure, restore the exact pre-packet lease manager (including the
+        // decline quarantine) and suppress the response.
+        let response = match service.handle_and_persist(packet).await {
             Ok(response) => response,
             Err(error) => {
-                tracing::warn!(ifindex, %error, "failed to handle DHCP packet");
+                tracing::warn!(ifindex, %error, "failed to commit DHCP packet transaction; response suppressed");
                 return;
             }
         };
+
         if let Some(response) = response {
             let server_ip = service.server_ip;
             if let Err(error) = self.send(ifindex, server_ip, &response).await {
                 tracing::warn!(ifindex, %error, "failed to send DHCP response");
-                return;
             }
-        }
-        if let Err(error) = service.persist_if_changed().await {
-            tracing::warn!(ifindex, %error, "failed to persist DHCP leases");
         }
     }
 
@@ -331,6 +356,56 @@ impl SharedDhcpRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use crate::dhcp::packet::DhcpMessageType;
+    #[cfg(target_os = "linux")]
+    use crate::dhcp::server::DhcpServerConfig;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn shared_dhcp_persistence_failure_rolls_back_lease_allocation() {
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let blocked_parent = directory.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, b"block").expect("block parent");
+        let leases = crate::dhcp::lease::LeaseManager::new(crate::dhcp::lease::LeasePoolConfig {
+            start: Ipv4Addr::new(192, 168, 50, 100),
+            end: Ipv4Addr::new(192, 168, 50, 110),
+            lease_time: Duration::from_secs(3600),
+        })
+        .expect("lease pool");
+        let mut service = SharedDhcpService {
+            handler: DhcpHandler::new(
+                DhcpServerConfig {
+                    server_ip: Ipv4Addr::new(192, 168, 50, 1),
+                    router: Ipv4Addr::new(192, 168, 50, 1),
+                    subnet_mask: Ipv4Addr::new(255, 255, 255, 0),
+                    dns_servers: vec![],
+                },
+                leases,
+            ),
+            lease_store: LeaseStore::for_interface(&blocked_parent, "wlan0"),
+            server_ip: Ipv4Addr::new(192, 168, 50, 1),
+            persisted_leases: vec![],
+        };
+        let before = service.handler.lease_snapshot();
+        let mut discover = vec![0_u8; 240];
+        discover[0] = 1;
+        discover[1] = 1;
+        discover[2] = 6;
+        discover[4..8].copy_from_slice(&1_u32.to_be_bytes());
+        discover[28..34].copy_from_slice(&[2, 0, 0, 0, 0, 1]);
+        discover[236..240].copy_from_slice(&crate::dhcp::packet::DHCP_MAGIC_COOKIE);
+        discover.extend_from_slice(&[53, 1, DhcpMessageType::Discover.as_u8(), 255]);
+
+        service
+            .handle_and_persist(&discover)
+            .await
+            .expect_err("invalid lease store must abort the DHCP packet transaction");
+        assert_eq!(service.handler.lease_snapshot(), before);
+        assert!(service.persisted_leases.is_empty());
+    }
 
     #[test]
     fn default_runtime_config_uses_dhcp_ports() {

@@ -1,12 +1,10 @@
-use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use nix::sys::signal::{kill, Signal};
-use nix::unistd::Pid;
+use nix::sys::signal::Signal;
 use tempfile::tempdir;
 use tokio::time::{sleep, timeout};
 use traffic_masq::api::client::ApiClient;
@@ -16,9 +14,17 @@ use traffic_masq::config::{
 };
 use traffic_masq::wifi::WpaState;
 
+mod support;
+
+use support::wifi::{
+    command_path, ensure_child_running, list_interfaces, list_phys, output_ns, output_text, path_str,
+    pid_alive, rename_interface, run, run_ns, spawn_ns, stop_child, stop_child_blocking,
+    stop_pid_blocking,
+    unique_suffix,
+};
+
 static NAMESPACE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const WAIT_TIMEOUT: Duration = Duration::from_secs(30);
-const STOP_GRACE: Duration = Duration::from_secs(5);
 const SSID: &str = "traffic-masq-hwsim-e2e";
 const PASSPHRASE: &str = "traffic-masq-test-only-psk";
 const AP_IF: &str = "tm-ap0";
@@ -264,7 +270,7 @@ impl WifiClientNamespaceFixture {
 
     async fn stop_daemon_gracefully(&mut self) -> Result<()> {
         let child = self.daemon.take().context("daemon was not running")?;
-        stop_tracked_child(child, Signal::SIGTERM, WAIT_TIMEOUT, "traffic-masqd").await
+        stop_child(child, Signal::SIGTERM, WAIT_TIMEOUT, "traffic-masqd").await
     }
 
     async fn assert_supplicant_survives_and_is_adopted(&mut self, original_pid: u32) -> Result<()> {
@@ -330,13 +336,13 @@ impl WifiClientNamespaceFixture {
 
     fn cleanup(&mut self) {
         if let Some(child) = self.daemon.take() {
-            stop_tracked_child_blocking(child, "traffic-masqd");
+            stop_child_blocking(child, "traffic-masqd");
         }
         if let Some(pid) = self.supplicant_pid.take() {
-            stop_tracked_pid_blocking(pid, "wpa_supplicant");
+            stop_pid_blocking(pid, "wpa_supplicant");
         }
         if let Some(child) = self.hostapd.take() {
-            stop_tracked_child_blocking(child, "hostapd");
+            stop_child_blocking(child, "hostapd");
         }
         let _ = Command::new("ip")
             .args(["netns", "del", &self.namespace])
@@ -434,189 +440,6 @@ fn require_linux_root_and_tools() -> Result<()> {
     Ok(())
 }
 
-fn command_path(program: &str) -> Result<PathBuf> {
-    let output = Command::new("sh")
-        .args(["-c", &format!("command -v {program}")])
-        .output()
-        .with_context(|| format!("failed to resolve {program}"))?;
-    if !output.status.success() {
-        bail!("could not resolve required command {program}");
-    }
-    Ok(PathBuf::from(String::from_utf8(output.stdout)?.trim()))
-}
-
-fn list_phys(namespace: Option<&str>) -> Result<BTreeSet<String>> {
-    let output = match namespace {
-        Some(ns) => output_ns(ns, "iw", &["phy"]),
-        None => Command::new("iw")
-            .arg("phy")
-            .output()
-            .context("failed to run iw phy"),
-    }?;
-    if !output.status.success() {
-        bail!("iw phy failed: {}", output_text(&output));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("Wiphy "))
-        .map(str::to_string)
-        .collect())
-}
-
-fn list_interfaces(namespace: Option<&str>) -> Result<Vec<String>> {
-    let output = match namespace {
-        Some(ns) => output_ns(ns, "iw", &["dev"]),
-        None => Command::new("iw")
-            .arg("dev")
-            .output()
-            .context("failed to run iw dev"),
-    }?;
-    if !output.status.success() {
-        bail!("iw dev failed: {}", output_text(&output));
-    }
-    let mut interfaces: Vec<_> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("Interface "))
-        .map(str::to_string)
-        .collect();
-    interfaces.sort();
-    Ok(interfaces)
-}
-
-fn rename_interface(namespace: &str, old: &str, new: &str) -> Result<()> {
-    run_ns(namespace, "ip", &["link", "set", old, "down"])?;
-    run_ns(namespace, "ip", &["link", "set", old, "name", new])
-}
-
-fn spawn_ns(
-    namespace: &str,
-    program: &str,
-    args: &[&str],
-    stdout: fs::File,
-    stderr: fs::File,
-) -> Result<Child> {
-    Command::new("ip")
-        .args(["netns", "exec", namespace, program])
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .with_context(|| format!("failed to spawn {program} in namespace {namespace}"))
-}
-
-fn output_ns(namespace: &str, program: &str, args: &[&str]) -> Result<Output> {
-    Command::new("ip")
-        .args(["netns", "exec", namespace, program])
-        .args(args)
-        .output()
-        .with_context(|| format!("failed to run {program} in namespace {namespace}"))
-}
-
-fn run_ns(namespace: &str, program: &str, args: &[&str]) -> Result<()> {
-    let output = output_ns(namespace, program, args)?;
-    if !output.status.success() {
-        bail!(
-            "{program} failed in namespace {namespace}: {}",
-            output_text(&output)
-        );
-    }
-    Ok(())
-}
-
-fn run(program: &str, args: &[&str]) -> Result<()> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .with_context(|| format!("failed to run {program}"))?;
-    if !output.status.success() {
-        bail!("{program} failed: {}", output_text(&output));
-    }
-    Ok(())
-}
-
-fn ensure_child_running(child: Option<&mut Child>, name: &str) -> Result<()> {
-    let child = child.with_context(|| format!("{name} child is not tracked"))?;
-    if let Some(status) = child.try_wait()? {
-        bail!("{name} exited unexpectedly with status {status}");
-    }
-    Ok(())
-}
-
-async fn stop_tracked_child(
-    mut child: Child,
-    signal: Signal,
-    wait: Duration,
-    name: &str,
-) -> Result<()> {
-    let pid = i32::try_from(child.id()).context("child PID exceeds pid_t range")?;
-    kill(Pid::from_raw(pid), signal)
-        .with_context(|| format!("failed to signal {name} PID {pid}"))?;
-    timeout(wait, async {
-        loop {
-            if let Some(status) = child.try_wait()? {
-                if !status.success() {
-                    bail!("{name} exited with non-zero status {status}");
-                }
-                return Ok(());
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .with_context(|| format!("{name} did not stop within {wait:?}"))?
-}
-
-fn stop_tracked_child_blocking(mut child: Child, name: &str) {
-    let pid = child.id();
-    stop_tracked_pid_blocking(pid, name);
-    let _ = child.try_wait();
-}
-
-fn stop_tracked_pid_blocking(pid: u32, name: &str) {
-    let Ok(raw_pid) = i32::try_from(pid) else {
-        return;
-    };
-    let pid = Pid::from_raw(raw_pid);
-    let _ = kill(pid, Signal::SIGTERM);
-    let deadline = std::time::Instant::now() + STOP_GRACE;
-    while std::time::Instant::now() < deadline {
-        if !pid_alive(raw_pid as u32) {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    eprintln!("cleanup: {name} PID {raw_pid} ignored SIGTERM; sending SIGKILL");
-    let _ = kill(pid, Signal::SIGKILL);
-}
-
-fn pid_alive(pid: u32) -> bool {
-    PathBuf::from(format!("/proc/{pid}")).exists()
-}
-
-fn output_text(output: &Output) -> String {
-    format!(
-        "stdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
-}
-
 fn redact(text: &str) -> String {
     text.replace(PASSPHRASE, "<redacted-passphrase>")
-}
-
-fn path_str(path: &Path) -> Result<&str> {
-    path.to_str().context("test path is not valid UTF-8")
-}
-
-fn unique_suffix() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after Unix epoch")
-        .as_nanos();
-    format!(
-        "{:08x}",
-        (nanos as u64 ^ u64::from(std::process::id())) as u32
-    )
 }

@@ -12,6 +12,7 @@ pub const DHCP_CLIENT_LEASE_SCHEMA_VERSION: u32 = 1;
 pub enum DhcpClientLeaseState {
     PendingApply,
     Bound,
+    Suspended,
     CleanupNeeded,
 }
 

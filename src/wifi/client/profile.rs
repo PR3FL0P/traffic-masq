@@ -36,6 +36,8 @@ pub enum WifiClientProfileError {
     Io(#[from] std::io::Error),
     #[error("invalid Wi-Fi client profile metadata: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("{operation}; rollback failed: {rollback}")]
+    RollbackFailed { operation: String, rollback: String },
     #[error("low-level file operation failed: {0}")]
     Errno(#[from] Errno),
     #[error(transparent)]
@@ -199,16 +201,24 @@ impl WifiClientProfileStore {
             created_at: now,
             modified_at: now,
         };
+        let encoded = serde_json::to_vec_pretty(&metadata)?;
+        let has_passphrase = passphrase.is_some();
 
         if let Some(passphrase) = passphrase.as_ref() {
-            write_atomic(&secret_target, passphrase.expose().as_bytes())?;
+            if let Err(error) = write_atomic(&secret_target, passphrase.expose().as_bytes()) {
+                return Err(with_profile_rollback(
+                    error,
+                    cleanup_created_profile(&dirs, &metadata_target, &secret_target),
+                ));
+            }
         }
-        let encoded = serde_json::to_vec_pretty(&metadata)?;
         if let Err(error) = write_atomic(&metadata_target, &encoded) {
-            let _ = fs::remove_file(&secret_target);
-            return Err(error);
+            return Err(with_profile_rollback(
+                error,
+                cleanup_created_profile(&dirs, &metadata_target, &secret_target),
+            ));
         }
-        self.summary(&dirs, metadata)
+        Ok(summary_from_metadata(metadata, has_passphrase))
     }
 
     pub fn update(
@@ -219,25 +229,19 @@ impl WifiClientProfileStore {
         input.validate()?;
         let dirs = self.ensure_directories()?;
         let metadata_target = metadata_path(&dirs, &input.id);
-        let old = read_metadata(&metadata_target).map_err(map_not_found)?;
+        let old_metadata_bytes = read_regular_bytes(&metadata_target).map_err(map_not_found)?;
+        let old: WifiClientProfileMetadata = serde_json::from_slice(&old_metadata_bytes)?;
         validate_metadata(&old)?;
         let secret_target = secret_path(&dirs, &input.id);
-        let existing_secret = target_exists_regular(&secret_target)?;
+        let old_secret = read_passphrase(&secret_target)?;
         let resulting_secret = match &secret_update {
-            WifiClientProfileSecretUpdate::Unchanged => existing_secret,
+            WifiClientProfileSecretUpdate::Unchanged => old_secret.is_some(),
             WifiClientProfileSecretUpdate::Replace(_) => true,
             WifiClientProfileSecretUpdate::Clear => false,
         };
         validate_secret_for_security(input.security, resulting_secret)?;
 
-        match &secret_update {
-            WifiClientProfileSecretUpdate::Unchanged => {}
-            WifiClientProfileSecretUpdate::Replace(passphrase) => {
-                write_atomic(&secret_target, passphrase.expose().as_bytes())?;
-            }
-            WifiClientProfileSecretUpdate::Clear => remove_regular(&secret_target, false)?,
-        }
-
+        // Finish every fallible preparation step before mutating either file.
         let metadata = WifiClientProfileMetadata {
             version: PROFILE_VERSION,
             id: input.id,
@@ -250,17 +254,73 @@ impl WifiClientProfileStore {
             modified_at: unix_timestamp()?,
         };
         let encoded = serde_json::to_vec_pretty(&metadata)?;
-        write_atomic(&metadata_target, &encoded)?;
-        self.summary(&dirs, metadata)
+
+        let secret_result = match &secret_update {
+            WifiClientProfileSecretUpdate::Unchanged => Ok(()),
+            WifiClientProfileSecretUpdate::Replace(passphrase) => {
+                write_atomic(&secret_target, passphrase.expose().as_bytes())
+            }
+            WifiClientProfileSecretUpdate::Clear => {
+                remove_regular(&secret_target, false).and_then(|()| {
+                    sync_directory(&dirs.secrets).map_err(WifiClientProfileError::from)
+                })
+            }
+        };
+        if let Err(error) = secret_result {
+            return Err(with_profile_rollback(
+                error,
+                restore_profile_state(
+                    &dirs,
+                    &metadata_target,
+                    &old_metadata_bytes,
+                    &secret_target,
+                    old_secret.as_ref(),
+                ),
+            ));
+        }
+
+        if let Err(error) = write_atomic(&metadata_target, &encoded) {
+            return Err(with_profile_rollback(
+                error,
+                restore_profile_state(
+                    &dirs,
+                    &metadata_target,
+                    &old_metadata_bytes,
+                    &secret_target,
+                    old_secret.as_ref(),
+                ),
+            ));
+        }
+        Ok(summary_from_metadata(metadata, resulting_secret))
     }
 
     pub fn delete(&self, id: &str) -> Result<(), WifiClientProfileError> {
         validate_id(id)?;
         let dirs = self.ensure_directories()?;
-        remove_regular(&metadata_path(&dirs, id), true)?;
-        sync_directory(&dirs.metadata)?;
-        remove_regular(&secret_path(&dirs, id), false)?;
-        sync_directory(&dirs.secrets)?;
+        let metadata_target = metadata_path(&dirs, id);
+        let secret_target = secret_path(&dirs, id);
+        let old_metadata_bytes = read_regular_bytes(&metadata_target).map_err(map_not_found)?;
+        // Validate before mutating so corrupt state is never silently deleted.
+        let old: WifiClientProfileMetadata = serde_json::from_slice(&old_metadata_bytes)?;
+        validate_metadata(&old)?;
+        let old_secret = read_passphrase(&secret_target)?;
+
+        let operation = remove_regular(&metadata_target, true)
+            .and_then(|()| sync_directory(&dirs.metadata).map_err(WifiClientProfileError::from))
+            .and_then(|()| remove_regular(&secret_target, false))
+            .and_then(|()| sync_directory(&dirs.secrets).map_err(WifiClientProfileError::from));
+        if let Err(error) = operation {
+            return Err(with_profile_rollback(
+                error,
+                restore_profile_state(
+                    &dirs,
+                    &metadata_target,
+                    &old_metadata_bytes,
+                    &secret_target,
+                    old_secret.as_ref(),
+                ),
+            ));
+        }
         Ok(())
     }
 
@@ -270,17 +330,7 @@ impl WifiClientProfileStore {
         metadata: WifiClientProfileMetadata,
     ) -> Result<WifiClientProfileSummary, WifiClientProfileError> {
         let has_passphrase = target_exists_regular(&secret_path(dirs, &metadata.id))?;
-        Ok(WifiClientProfileSummary {
-            id: metadata.id,
-            ssid: metadata.ssid,
-            country_code: metadata.country_code,
-            security: metadata.security,
-            priority: metadata.priority,
-            autoconnect: metadata.autoconnect,
-            created_at: metadata.created_at,
-            modified_at: metadata.modified_at,
-            has_passphrase,
-        })
+        Ok(summary_from_metadata(metadata, has_passphrase))
     }
 
     fn ensure_directories(&self) -> Result<StoreDirectories, WifiClientProfileError> {
@@ -297,6 +347,94 @@ impl WifiClientProfileStore {
 struct StoreDirectories {
     metadata: PathBuf,
     secrets: PathBuf,
+}
+
+fn summary_from_metadata(
+    metadata: WifiClientProfileMetadata,
+    has_passphrase: bool,
+) -> WifiClientProfileSummary {
+    WifiClientProfileSummary {
+        id: metadata.id,
+        ssid: metadata.ssid,
+        country_code: metadata.country_code,
+        security: metadata.security,
+        priority: metadata.priority,
+        autoconnect: metadata.autoconnect,
+        created_at: metadata.created_at,
+        modified_at: metadata.modified_at,
+        has_passphrase,
+    }
+}
+
+fn with_profile_rollback(
+    operation: WifiClientProfileError,
+    rollback: Result<(), String>,
+) -> WifiClientProfileError {
+    match rollback {
+        Ok(()) => operation,
+        Err(rollback) => WifiClientProfileError::RollbackFailed {
+            operation: operation.to_string(),
+            rollback,
+        },
+    }
+}
+
+fn cleanup_created_profile(
+    dirs: &StoreDirectories,
+    metadata_target: &Path,
+    secret_target: &Path,
+) -> Result<(), String> {
+    let mut failures = Vec::new();
+    if let Err(error) = remove_regular(metadata_target, false) {
+        failures.push(format!("metadata cleanup: {error}"));
+    }
+    if let Err(error) = sync_directory(&dirs.metadata) {
+        failures.push(format!("metadata directory sync: {error}"));
+    }
+    if let Err(error) = remove_regular(secret_target, false) {
+        failures.push(format!("secret cleanup: {error}"));
+    }
+    if let Err(error) = sync_directory(&dirs.secrets) {
+        failures.push(format!("secret directory sync: {error}"));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+fn restore_profile_state(
+    dirs: &StoreDirectories,
+    metadata_target: &Path,
+    metadata: &[u8],
+    secret_target: &Path,
+    secret: Option<&WifiPassphrase>,
+) -> Result<(), String> {
+    let mut failures = Vec::new();
+    if let Err(error) = write_atomic(metadata_target, metadata) {
+        failures.push(format!("metadata restore: {error}"));
+    }
+    match secret {
+        Some(secret) => {
+            if let Err(error) = write_atomic(secret_target, secret.expose().as_bytes()) {
+                failures.push(format!("secret restore: {error}"));
+            }
+        }
+        None => {
+            if let Err(error) = remove_regular(secret_target, false) {
+                failures.push(format!("secret restore cleanup: {error}"));
+            }
+            if let Err(error) = sync_directory(&dirs.secrets) {
+                failures.push(format!("secret restore directory sync: {error}"));
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
 }
 
 fn validate_id(id: &str) -> Result<(), WifiClientProfileError> {
@@ -396,6 +534,13 @@ fn target_exists_regular(path: &Path) -> Result<bool, WifiClientProfileError> {
     }
 }
 
+fn read_regular_bytes(path: &Path) -> Result<Vec<u8>, WifiClientProfileError> {
+    let mut file = open_read(path)?;
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)?;
+    Ok(contents)
+}
+
 fn read_metadata(path: &Path) -> Result<WifiClientProfileMetadata, WifiClientProfileError> {
     let mut file = open_read(path)?;
     let mut contents = String::new();
@@ -427,7 +572,7 @@ fn open_read(path: &Path) -> Result<File, WifiClientProfileError> {
 
 fn write_atomic(path: &Path, contents: &[u8]) -> Result<(), WifiClientProfileError> {
     reject_existing_target(path, false)?;
-    atomic_file::replace(path, contents, PRIVATE_FILE_MODE)?;
+    atomic_file::replace_preserving_on_error(path, contents, PRIVATE_FILE_MODE)?;
     Ok(())
 }
 
@@ -440,7 +585,10 @@ fn remove_regular(path: &Path, required: bool) -> Result<(), WifiClientProfileEr
         Ok(metadata) if metadata.file_type().is_symlink() => {
             Err(WifiClientProfileError::SymlinkRejected(path.to_path_buf()))
         }
-        Ok(metadata) if metadata.is_file() => Ok(fs::remove_file(path)?),
+        Ok(metadata) if metadata.is_file() => {
+            atomic_file::remove_preserving_on_error(path, PRIVATE_FILE_MODE)?;
+            Ok(())
+        },
         Ok(_) => Err(WifiClientProfileError::UnsafeDirectory(path.to_path_buf())),
         Err(error) if error.kind() == ErrorKind::NotFound && required => {
             Err(WifiClientProfileError::NotFound)

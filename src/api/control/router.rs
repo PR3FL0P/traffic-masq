@@ -1,4 +1,6 @@
 use super::*;
+use super::provisioning::*;
+use crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore;
 
 impl ControlService {
     pub(super) async fn router_status(&self) -> Response {
@@ -100,6 +102,13 @@ impl ControlService {
         let Some(router) = &self.router else {
             return router_disabled();
         };
+        if !self.transactions.pending().await.is_empty() {
+            return Response::RouterError {
+                detail: RouterErrorDetail::Other {
+                    message: "an interface transaction is pending; commit or roll it back before starting a router transaction".to_owned(),
+                },
+            };
+        }
         let candidate = match self
             .overrides
             .build_candidate(&build_router_proposal(proposal))
@@ -127,7 +136,18 @@ impl ControlService {
             return router_disabled();
         };
         match router.commit(&token).await {
-            Ok(revision) => Response::RouterCommitted { revision },
+            Ok(revision) => {
+                // The router commit is authoritative. If journal cleanup fails,
+                // startup recovery sees the committed token and discards the
+                // old secrets rather than restoring them.
+                let secrets = ProvisioningSecretTransactionStore::in_state_dir(
+                    &self.config.runtime.state_dir,
+                );
+                if let Err(error) = secrets.discard_for_token(&token).await {
+                    tracing::warn!(%error, %token, "failed to clean committed provisioning secret journal");
+                }
+                Response::RouterCommitted { revision }
+            }
             Err(error) => classify_router_error(error),
         }
     }
@@ -137,8 +157,91 @@ impl ControlService {
             return router_disabled();
         };
         match router.rollback_with_token(&token).await {
-            Ok(()) => Response::RouterRolledBack,
+            Ok(()) => {
+                let secrets = ProvisioningSecretTransactionStore::in_state_dir(
+                    &self.config.runtime.state_dir,
+                );
+                match secrets
+                    .restore_for_token_or_unbound_for_reconvergence(&token)
+                    .await
+                {
+                    Ok(true) => {
+                        // The snapshot rollback ran while the staged secret was
+                        // still installed. Keep the journal until the old secret
+                        // is also active in hostapd/wpa_supplicant.
+                        let desired = match self.current_router_desired().await {
+                            Ok(desired) => desired,
+                            Err(response) => return response,
+                        };
+                        if let Err(error) = router.repair(desired).await {
+                            return classify_router_error(error.context(
+                                "router state restored but Wi-Fi secret re-convergence failed; recovery journal retained",
+                            ));
+                        }
+                        if let Err(error) = secrets.complete_reconvergence().await {
+                            return classify_router_error(error.context(
+                                "router state and Wi-Fi secrets were restored but recovery journal cleanup failed",
+                            ));
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        return Response::RouterError {
+                            detail: RouterErrorDetail::Other {
+                                message: format!(
+                                    "router state restored but provisioning secrets could not be restored: {error:#}"
+                                ),
+                            },
+                        }
+                    }
+                }
+                Response::RouterRolledBack
+            }
             Err(error) => {
+                if error.downcast_ref::<NoPendingTransactionError>().is_some() {
+                    let committed_token = self
+                        .overrides
+                        .snapshot()
+                        .await
+                        .committed_router_transaction;
+                    if committed_token.as_deref() != Some(token.as_str()) {
+                        let secrets = ProvisioningSecretTransactionStore::in_state_dir(
+                            &self.config.runtime.state_dir,
+                        );
+                        match secrets
+                            .restore_for_token_or_unbound_for_reconvergence(&token)
+                            .await
+                        {
+                            Ok(true) => {
+                                let desired = match self.current_router_desired().await {
+                                    Ok(desired) => desired,
+                                    Err(response) => return response,
+                                };
+                                if let Err(repair_error) = router.repair(desired).await {
+                                    return classify_router_error(repair_error.context(
+                                        "router rollback completed but Wi-Fi secret re-convergence failed; recovery journal retained",
+                                    ));
+                                }
+                                if let Err(cleanup_error) = secrets.complete_reconvergence().await {
+                                    return classify_router_error(cleanup_error.context(
+                                        "router rollback and Wi-Fi secret re-convergence completed but recovery journal cleanup failed",
+                                    ));
+                                }
+                                return Response::RouterRolledBack;
+                            }
+                            Ok(false) => {}
+                            Err(secret_error) => {
+                                return Response::RouterError {
+                                    detail: RouterErrorDetail::Other {
+                                        message: format!(
+                                            "router rollback completed but provisioning secrets could not be restored: {secret_error:#}"
+                                        ),
+                                    },
+                                };
+                            }
+                        }
+                    }
+                }
                 if let Some(failure) = router.rollback_failure().await {
                     Response::RouterError {
                         detail: RouterErrorDetail::RollbackFailed {
@@ -206,6 +309,22 @@ impl ControlService {
         let Some(router) = &self.router else {
             return provisioning_error(RouterProvisioningErrorDetail::RouterDisabled);
         };
+        match router.status().await {
+            CoordinatorStatus::Idle => {}
+            CoordinatorStatus::Pending => {
+                return provisioning_error(RouterProvisioningErrorDetail::TransactionPending);
+            }
+            CoordinatorStatus::RollbackFailed => {
+                return provisioning_error(
+                    RouterProvisioningErrorDetail::RollbackRecoveryRequired,
+                );
+            }
+        }
+        if !self.transactions.pending().await.is_empty() {
+            return provisioning_error(RouterProvisioningErrorDetail::Other {
+                message: "an interface transaction is pending; commit or roll it back before provisioning the router".to_owned(),
+            });
+        }
 
         let uplink_passphrase = match parse_optional_passphrase(request.uplink_passphrase.clone()) {
             Ok(passphrase) => passphrase,
@@ -247,120 +366,221 @@ impl ControlService {
 
         let uplink_interface = desired.uplink.interface.clone();
         let output_interface = desired.output.interface.clone();
-        let mut staged_uplink = None;
-        let mut staged_output = None;
+        let output_supervisor = if output_passphrase.is_some() {
+            match self.wifi.as_ref() {
+                Some(supervisor) => Some(supervisor),
+                None => {
+                    return provisioning_error(
+                        RouterProvisioningErrorDetail::GlobalServiceDisabled {
+                            service: "wifi".to_owned(),
+                        },
+                    )
+                }
+            }
+        } else {
+            None
+        };
+        let uplink_supervisor = if uplink_passphrase.is_some() {
+            match self.wifi_client.as_ref() {
+                Some(supervisor) => Some(supervisor),
+                None => {
+                    return provisioning_error(
+                        RouterProvisioningErrorDetail::GlobalServiceDisabled {
+                            service: "wifi_client".to_owned(),
+                        },
+                    )
+                }
+            }
+        } else {
+            None
+        };
 
-        if let Some(passphrase) = &output_passphrase {
-            let Some(supervisor) = &self.wifi else {
-                return provisioning_error(RouterProvisioningErrorDetail::GlobalServiceDisabled {
-                    service: "wifi".to_owned(),
-                });
-            };
-            let previous = match supervisor.stored_passphrase(&output_interface).await {
-                Ok(previous) => previous,
+        // Persist the old values *before* changing either secret. The journal
+        // is the secret half of the router transaction and lets startup recover
+        // a crash anywhere between staging and commit.
+        let mut previous = BTreeMap::new();
+        if let Some(supervisor) = output_supervisor {
+            match supervisor.stored_passphrase(&output_interface).await {
+                Ok(secret) => {
+                    previous.insert(output_interface.clone(), secret);
+                }
                 Err(error) => {
                     return provisioning_error(RouterProvisioningErrorDetail::Other {
                         message: error.to_string(),
                     })
                 }
-            };
-            if let Err(error) = supervisor
-                .set_passphrase(&output_interface, passphrase)
-                .await
-            {
-                return provisioning_error(RouterProvisioningErrorDetail::InvalidSecret {
-                    message: error.to_string(),
-                });
             }
-            staged_output = Some(previous);
         }
-
-        if let Some(passphrase) = &uplink_passphrase {
-            let Some(supervisor) = &self.wifi_client else {
-                self.restore_staged_provisioning_secrets(
-                    &uplink_interface,
-                    staged_uplink,
-                    &output_interface,
-                    staged_output,
-                )
-                .await;
-                return provisioning_error(RouterProvisioningErrorDetail::GlobalServiceDisabled {
-                    service: "wifi_client".to_owned(),
-                });
-            };
-            let previous = match supervisor.stored_passphrase(&uplink_interface).await {
-                Ok(previous) => previous,
+        if let Some(supervisor) = uplink_supervisor {
+            match supervisor.stored_passphrase(&uplink_interface).await {
+                Ok(secret) => {
+                    previous.insert(uplink_interface.clone(), secret);
+                }
                 Err(error) => {
-                    self.restore_staged_provisioning_secrets(
-                        &uplink_interface,
-                        staged_uplink,
-                        &output_interface,
-                        staged_output,
-                    )
-                    .await;
                     return provisioning_error(RouterProvisioningErrorDetail::Other {
                         message: error.to_string(),
-                    });
+                    })
                 }
-            };
-            if let Err(error) = supervisor
-                .set_passphrase(&uplink_interface, passphrase)
-                .await
-            {
-                self.restore_staged_provisioning_secrets(
-                    &uplink_interface,
-                    staged_uplink,
-                    &output_interface,
-                    staged_output,
-                )
-                .await;
+            }
+        }
+
+        let secret_tx = ProvisioningSecretTransactionStore::in_state_dir(
+            &self.config.runtime.state_dir,
+        );
+        if let Err(error) = secret_tx.stage(previous).await {
+            return provisioning_error(RouterProvisioningErrorDetail::Other {
+                message: format!("failed to open provisioning secret transaction: {error:#}"),
+            });
+        }
+
+        if let (Some(supervisor), Some(passphrase)) = (output_supervisor, output_passphrase.as_ref()) {
+            if let Err(error) = supervisor.set_passphrase(&output_interface, passphrase).await {
+                let restore = secret_tx.restore_staged().await;
                 return provisioning_error(RouterProvisioningErrorDetail::InvalidSecret {
-                    message: error.to_string(),
+                    message: match restore {
+                        Ok(_) => error.to_string(),
+                        Err(restore_error) => format!(
+                            "{error}; restoring prior provisioning secrets also failed: {restore_error:#}"
+                        ),
+                    },
                 });
             }
-            staged_uplink = Some(previous);
+        }
+        if let (Some(supervisor), Some(passphrase)) = (uplink_supervisor, uplink_passphrase.as_ref()) {
+            if let Err(error) = supervisor.set_passphrase(&uplink_interface, passphrase).await {
+                let restore = secret_tx.restore_staged().await;
+                return provisioning_error(RouterProvisioningErrorDetail::InvalidSecret {
+                    message: match restore {
+                        Ok(_) => error.to_string(),
+                        Err(restore_error) => format!(
+                            "{error}; restoring prior provisioning secrets also failed: {restore_error:#}"
+                        ),
+                    },
+                });
+            }
         }
 
         let proposal = effective.into_router_intent_proposal();
         let candidate = match self.overrides.build_candidate(&proposal).await {
             Ok(candidate) => candidate,
             Err(error) => {
-                self.restore_staged_provisioning_secrets(
-                    &uplink_interface,
-                    staged_uplink,
-                    &output_interface,
-                    staged_output,
-                )
-                .await;
+                let restore = secret_tx.restore_staged().await;
+                if let Err(restore_error) = restore {
+                    return provisioning_error(RouterProvisioningErrorDetail::Other {
+                        message: format!(
+                            "{error:#}; restoring prior provisioning secrets also failed: {restore_error:#}"
+                        ),
+                    });
+                }
                 return provisioning_error(classify_provisioning_transaction_error(&error));
             }
         };
         let transaction_plan = match router.plan(candidate).await {
             Ok(plan) => plan,
             Err(error) => {
-                self.restore_staged_provisioning_secrets(
-                    &uplink_interface,
-                    staged_uplink,
-                    &output_interface,
-                    staged_output,
-                )
-                .await;
+                let restore = secret_tx.restore_staged().await;
+                if let Err(restore_error) = restore {
+                    return provisioning_error(RouterProvisioningErrorDetail::Other {
+                        message: format!(
+                            "{error:#}; restoring prior provisioning secrets also failed: {restore_error:#}"
+                        ),
+                    });
+                }
                 return provisioning_error(classify_provisioning_transaction_error(&error));
             }
         };
-        match router.apply(transaction_plan).await {
-            Ok(token) => Response::RouterProvisioningApplied { token, preview },
+
+        let token = match router.apply(transaction_plan).await {
+            Ok(token) => token,
             Err(error) => {
-                self.restore_staged_provisioning_secrets(
-                    &uplink_interface,
-                    staged_uplink,
-                    &output_interface,
-                    staged_output,
-                )
-                .await;
-                provisioning_error(classify_provisioning_transaction_error(&error))
+                // A clean coordinator rollback means the network is back at its
+                // snapshot and it is safe to restore the staged secret. The
+                // rollback itself ran while the new secret was still present,
+                // so reconcile once more after restoring it to ensure running
+                // Wi-Fi daemons also use the committed secret.
+                if router.status().await != CoordinatorStatus::RollbackFailed {
+                    match secret_tx.restore_staged_for_reconvergence().await {
+                        Ok(true) => {
+                            let committed = match self.current_router_desired().await {
+                                Ok(desired) => desired,
+                                Err(response) => return response,
+                            };
+                            if let Err(repair_error) = router.repair(committed).await {
+                                return provisioning_error(RouterProvisioningErrorDetail::Other {
+                                    message: format!(
+                                        "{error:#}; prior secrets were restored but Wi-Fi re-convergence failed: {repair_error:#}; recovery journal retained"
+                                    ),
+                                });
+                            }
+                            if let Err(cleanup_error) = secret_tx.complete_reconvergence().await {
+                                return provisioning_error(RouterProvisioningErrorDetail::Other {
+                                    message: format!(
+                                        "{error:#}; prior secrets and runtime were restored but recovery journal cleanup failed: {cleanup_error:#}; recovery required"
+                                    ),
+                                });
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(restore_error) => {
+                            return provisioning_error(RouterProvisioningErrorDetail::Other {
+                                message: format!(
+                                    "{error:#}; restoring prior provisioning secrets also failed: {restore_error:#}"
+                                ),
+                            });
+                        }
+                    }
+                }
+                return provisioning_error(classify_provisioning_transaction_error(&error));
+            }
+        };
+
+        if let Err(error) = secret_tx.bind_token(&token).await {
+            match router.rollback_with_token(&token).await {
+                Ok(()) => {
+                    let message = match secret_tx
+                        .restore_for_token_or_unbound_for_reconvergence(&token)
+                        .await
+                    {
+                        Ok(true) => {
+                            let committed = match self.current_router_desired().await {
+                                Ok(desired) => desired,
+                                Err(response) => return response,
+                            };
+                            match router.repair(committed).await {
+                                Ok(()) => match secret_tx.complete_reconvergence().await {
+                                    Ok(()) => format!(
+                                        "failed to bind provisioning secrets to router transaction {token}: {error:#}; router state and prior secrets were restored"
+                                    ),
+                                    Err(cleanup_error) => format!(
+                                        "failed to bind provisioning secrets to router transaction {token}: {error:#}; router state and prior secrets were restored but recovery journal cleanup failed: {cleanup_error:#}; recovery required"
+                                    ),
+                                },
+                                Err(repair_error) => format!(
+                                    "failed to bind provisioning secrets to router transaction {token}: {error:#}; prior secrets were restored but Wi-Fi re-convergence failed: {repair_error:#}; recovery journal retained"
+                                ),
+                            }
+                        }
+                        Ok(false) => format!(
+                            "failed to bind provisioning secrets to router transaction {token}: {error:#}"
+                        ),
+                        Err(restore_error) => format!(
+                            "failed to bind provisioning secrets to router transaction {token}: {error:#}; restoring prior secrets also failed: {restore_error:#}"
+                        ),
+                    };
+                    return provisioning_error(RouterProvisioningErrorDetail::Other { message });
+                }
+                Err(rollback_error) => {
+                    return provisioning_error(RouterProvisioningErrorDetail::Other {
+                        message: format!(
+                            "failed to bind provisioning secrets to router transaction {token}: {error:#}; router rollback also failed: {rollback_error:#}; recovery journal retained"
+                        ),
+                    });
+                }
             }
         }
+
+        self.spawn_provisioning_secret_timeout_recovery(token.clone());
+        Response::RouterProvisioningApplied { token, preview }
     }
 
     pub(super) async fn router_provisioning_status(&self) -> Response {
@@ -418,6 +638,11 @@ impl ControlService {
         let Some(router) = &self.router else {
             return provisioning_error(RouterProvisioningErrorDetail::RouterDisabled);
         };
+        if !self.transactions.pending().await.is_empty() {
+            return provisioning_error(RouterProvisioningErrorDetail::Other {
+                message: "an interface transaction is pending; commit or roll it back before repairing router state".to_owned(),
+            });
+        }
         let effective = match self.effective_config().await {
             Ok(effective) => effective,
             Err(message) => {
@@ -568,19 +793,85 @@ impl ControlService {
             .map_err(|error| error.to_string())
     }
 
-    pub(super) async fn restore_staged_provisioning_secrets(
-        &self,
-        uplink_interface: &str,
-        staged_uplink: Option<Option<WifiPassphrase>>,
-        output_interface: &str,
-        staged_output: Option<Option<WifiPassphrase>>,
-    ) {
-        if let (Some(previous), Some(supervisor)) = (staged_uplink, self.wifi_client.as_ref()) {
-            restore_wifi_client_secret(supervisor, uplink_interface, previous.as_ref()).await;
-        }
-        if let (Some(previous), Some(supervisor)) = (staged_output, self.wifi.as_ref()) {
-            restore_wifi_secret(supervisor, output_interface, previous.as_ref()).await;
-        }
+    fn spawn_provisioning_secret_timeout_recovery(&self, token: String) {
+        let Some(router) = self.router.clone() else {
+            return;
+        };
+        let timeout = Duration::from_secs(self.config.security.rollback_timeout_seconds);
+        let state_dir = self.config.runtime.state_dir.clone();
+        let overrides = self.overrides.clone();
+        let base_config = self.base_config.clone();
+        let network_mutations = self.network_mutations.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(timeout).await;
+            let _network_mutation = network_mutations.write().await;
+
+            // Race safely with the coordinator's own timer/commit path. Both
+            // router operations serialize on the coordinator state lock.
+            let committed = overrides
+                .snapshot()
+                .await
+                .committed_router_transaction
+                .as_deref()
+                == Some(token.as_str());
+            let secrets = ProvisioningSecretTransactionStore::in_state_dir(&state_dir);
+            if committed {
+                if let Err(error) = secrets.discard_for_token(&token).await {
+                    tracing::warn!(%error, %token, "failed to clean committed provisioning secret journal");
+                }
+                return;
+            }
+
+            if router.status().await == CoordinatorStatus::Pending {
+                if let Err(error) = router.rollback_with_token(&token).await {
+                    tracing::error!(%error, %token, "router provisioning timeout rollback failed; secret journal retained");
+                    return;
+                }
+            }
+            if router.status().await != CoordinatorStatus::Idle {
+                return;
+            }
+
+            let committed = overrides
+                .snapshot()
+                .await
+                .committed_router_transaction
+                .as_deref()
+                == Some(token.as_str());
+            if committed {
+                if let Err(error) = secrets.discard_for_token(&token).await {
+                    tracing::warn!(%error, %token, "failed to clean committed provisioning secret journal");
+                }
+                return;
+            }
+
+            match secrets
+                .restore_for_token_or_unbound_for_reconvergence(&token)
+                .await
+            {
+                Ok(true) => {
+                    let snapshot = overrides.snapshot().await;
+                    match snapshot
+                        .effective_config(&base_config)
+                        .and_then(|effective| RouterDesired::from_effective_config(&effective))
+                    {
+                        Ok(desired) => match router.repair(desired).await {
+                            Ok(()) => {
+                                if let Err(error) = secrets.complete_reconvergence().await {
+                                    tracing::error!(%error, %token, "provisioning timeout recovery converged but journal cleanup failed; recovery remains blocked");
+                                }
+                            }
+                            Err(error) => {
+                                tracing::error!(%error, %token, "provisioning secrets restored after timeout but router re-convergence failed; recovery journal retained");
+                            }
+                        },
+                        Err(error) => tracing::error!(%error, %token, "could not derive committed router state after provisioning timeout; recovery journal retained"),
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => tracing::error!(%error, %token, "failed to restore provisioning secrets after timeout"),
+            }
+        });
     }
 
     pub(super) async fn current_router_desired(&self) -> Result<RouterDesired, Response> {
@@ -590,4 +881,54 @@ impl ControlService {
             .map_err(classify_router_error)?;
         RouterDesired::from_effective_config(&effective).map_err(classify_router_error)
     }
+}
+
+pub(super) fn router_disabled() -> Response {
+    Response::RouterError {
+        detail: RouterErrorDetail::RouterDisabled,
+    }
+}
+
+pub(super) fn build_router_proposal(request: RouterProposalRequest) -> RouterIntentProposal {
+    let mut proposal = RouterIntentProposal::new();
+    if request.clear_router {
+        proposal = proposal.clear_router();
+    } else if let Some(router) = request.set_router {
+        proposal = proposal.set_router(router);
+    }
+    for (interface, over) in request.set_interfaces {
+        proposal = proposal.set_interface(interface, over.config, over.allow_management_change);
+    }
+    for interface in request.remove_interfaces {
+        proposal = proposal.remove_interface(interface);
+    }
+    proposal
+}
+
+pub(super) fn classify_router_error(error: anyhow::Error) -> Response {
+    let detail = if let Some(conflict) = error.downcast_ref::<CoordinatorConflict>() {
+        match conflict {
+            CoordinatorConflict::TransactionPending => RouterErrorDetail::TransactionPending,
+            CoordinatorConflict::RollbackRecoveryRequired => {
+                RouterErrorDetail::RollbackRecoveryRequired
+            }
+        }
+    } else if let Some(stale) = error.downcast_ref::<StaleCandidateError>() {
+        RouterErrorDetail::StaleCandidate {
+            candidate_revision: stale.candidate,
+            current_revision: stale.current,
+        }
+    } else if error
+        .downcast_ref::<crate::core::router_transaction::StalePlanError>()
+        .is_some()
+    {
+        RouterErrorDetail::StalePlan
+    } else if error.downcast_ref::<NoPendingTransactionError>().is_some() {
+        RouterErrorDetail::NoPendingTransaction
+    } else {
+        RouterErrorDetail::Other {
+            message: error.to_string(),
+        }
+    };
+    Response::RouterError { detail }
 }

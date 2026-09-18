@@ -21,7 +21,7 @@ pub struct DhcpServerConfig {
     pub dns_servers: Vec<Ipv4Addr>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DhcpHandler {
     config: DhcpServerConfig,
     leases: LeaseManager,

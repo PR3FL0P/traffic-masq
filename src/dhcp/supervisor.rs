@@ -90,6 +90,7 @@ impl DhcpServiceSpec {
     }
 }
 
+#[derive(Clone)]
 struct DhcpTask {
     spec: DhcpServiceSpec,
     ifindex: u32,
@@ -177,17 +178,36 @@ impl DhcpSupervisor {
         let _operation = self.inner.operation_lock.lock().await;
         let interface = spec.interface.clone();
         let service = service_from_spec(&spec, &self.inner.leases_dir).await?;
-        let services = self.ensure_runtime().await?;
+        let services = self.ensure_runtime_locked().await?;
         let ifindex = services
             .replace(&interface, service)
             .await
             .with_context(|| format!("failed to configure DHCP on {interface}"))?;
+
+        // Do not publish the new intent if the shared runtime died while the
+        // service was being registered.  The service map belongs to that dead
+        // runtime and will be discarded by the next recovery attempt.
+        self.require_runtime_alive(&interface).await?;
+
         let previous = self
             .inner
             .tasks
             .lock()
             .await
             .insert(interface.clone(), DhcpTask { spec, ifindex });
+
+        // Close the small window between registration and publishing the task.
+        // If the runtime died there, restore the previous intent so rollback or
+        // liveness recovery can rebuild the exact pre-operation state.
+        if let Err(error) = self.require_runtime_alive(&interface).await {
+            let mut tasks = self.inner.tasks.lock().await;
+            tasks.remove(&interface);
+            if let Some(previous) = previous {
+                tasks.insert(interface.clone(), previous);
+            }
+            return Err(error);
+        }
+
         if let Some(previous) = previous.filter(|previous| previous.ifindex != ifindex) {
             services.remove(previous.ifindex).await;
         }
@@ -197,12 +217,13 @@ impl DhcpSupervisor {
 
     pub async fn disable(&self, interface: &str) -> Result<Option<DhcpServiceSpec>> {
         let _operation = self.inner.operation_lock.lock().await;
-        let Some(task) = self.inner.tasks.lock().await.remove(interface) else {
+        let Some(task) = self.inner.tasks.lock().await.get(interface).cloned() else {
             return Ok(None);
         };
         if let Some(runtime) = self.inner.runtime.lock().await.as_ref() {
             runtime.services.remove(task.ifindex).await;
         }
+        self.inner.tasks.lock().await.remove(interface);
         tracing::info!(%interface, "DHCP service disabled");
         Ok(Some(task.spec))
     }
@@ -282,50 +303,30 @@ impl DhcpSupervisor {
 
     pub async fn ensure_runtime_alive(&self) -> Result<bool> {
         let _operation = self.inner.operation_lock.lock().await;
-        {
+        let has_tasks = !self.inner.tasks.lock().await.is_empty();
+        let runtime_state = {
             let runtime = self.inner.runtime.lock().await;
-            match runtime.as_ref() {
-                None => return Ok(false),
-                Some(runtime) if !runtime.task.is_finished() => return Ok(false),
-                Some(_) => {}
+            runtime.as_ref().map(|runtime| runtime.task.is_finished())
+        };
+
+        match (runtime_state, has_tasks) {
+            (Some(false), _) | (None, false) => return Ok(false),
+            (Some(true), false) => {
+                if let Some(runtime) = self.inner.runtime.lock().await.take() {
+                    let _ = runtime.task.await;
+                }
+                return Ok(false);
+            }
+            (Some(true), true) => {
+                tracing::warn!("shared DHCP runtime task has stopped; restarting it");
+            }
+            (None, true) => {
+                tracing::warn!("shared DHCP runtime is absent; rebuilding configured services");
             }
         }
 
-        tracing::warn!("shared DHCP runtime task has stopped; restarting it");
-        let specs: Vec<DhcpServiceSpec> = self
-            .inner
-            .tasks
-            .lock()
-            .await
-            .values()
-            .map(|task| task.spec.clone())
-            .collect();
-
-        self.inner.runtime.lock().await.take();
-        let services = self.ensure_runtime().await?;
-
-        let mut rebound = HashMap::new();
-        for spec in specs {
-            let interface = spec.interface.clone();
-            let service = match service_from_spec(&spec, &self.inner.leases_dir).await {
-                Ok(service) => service,
-                Err(error) => {
-                    tracing::warn!(%interface, %error, "failed to rebuild DHCP service during runtime restart");
-                    continue;
-                }
-            };
-            match services.replace(&interface, service).await {
-                Ok(ifindex) => {
-                    rebound.insert(interface, DhcpTask { spec, ifindex });
-                }
-                Err(error) => {
-                    tracing::warn!(%interface, %error, "failed to re-register DHCP service during runtime restart");
-                }
-            }
-        }
-
-        let restored = rebound.len();
-        *self.inner.tasks.lock().await = rebound;
+        self.ensure_runtime_locked().await?;
+        let restored = self.inner.tasks.lock().await.len();
         tracing::info!(restored, "shared DHCP runtime restarted");
         Ok(true)
     }
@@ -342,26 +343,85 @@ impl DhcpSupervisor {
         }
     }
 
-    async fn ensure_runtime(&self) -> Result<SharedDhcpServices> {
-        let mut slot = self.inner.runtime.lock().await;
-        if let Some(runtime) = slot.as_ref() {
-            if runtime.task.is_finished() {
-                anyhow::bail!("shared DHCP runtime has stopped");
+    async fn ensure_runtime_locked(&self) -> Result<SharedDhcpServices> {
+        let stale = {
+            let mut slot = self.inner.runtime.lock().await;
+            match slot.as_ref() {
+                Some(runtime) if !runtime.task.is_finished() => {
+                    return Ok(runtime.services.clone());
+                }
+                Some(_) => slot.take(),
+                None => None,
             }
-            return Ok(runtime.services.clone());
+        };
+        if let Some(runtime) = stale {
+            let _ = runtime.task.await;
         }
+
+        let previous_tasks = self.inner.tasks.lock().await.clone();
         let services = SharedDhcpServices::new();
+        let mut rebound = HashMap::with_capacity(previous_tasks.len());
+
+        // Rebuild the complete service map before exposing a replacement UDP
+        // runtime. Starting the socket first would create a window where only
+        // a subset of the pre-crash/pre-failure DHCP services can answer.
+        for task in previous_tasks.values() {
+            let spec = task.spec.clone();
+            let interface = spec.interface.clone();
+            let service = service_from_spec(&spec, &self.inner.leases_dir)
+                .await
+                .with_context(|| {
+                    format!("failed to rebuild DHCP service on {interface}")
+                })?;
+            let ifindex = services
+                .replace(&interface, service)
+                .await
+                .with_context(|| format!("failed to re-register DHCP service on {interface}"))?;
+            rebound.insert(interface, DhcpTask { spec, ifindex });
+        }
+
+        let runtime = Self::spawn_runtime_with_services(services.clone())?;
+        if runtime.task.is_finished() {
+            let _ = runtime.task.await;
+            anyhow::bail!(
+                "shared DHCP runtime stopped while configured services were being restored"
+            );
+        }
+
+        *self.inner.runtime.lock().await = Some(runtime);
+        if !previous_tasks.is_empty() {
+            *self.inner.tasks.lock().await = rebound;
+        }
+        Ok(services)
+    }
+
+    fn spawn_runtime() -> Result<RuntimeTask> {
+        Self::spawn_runtime_with_services(SharedDhcpServices::new())
+    }
+
+    fn spawn_runtime_with_services(services: SharedDhcpServices) -> Result<RuntimeTask> {
         let runtime = SharedDhcpRuntime::bind(runtime_config(), services.clone())?;
         let task = tokio::spawn(async move {
             if let Err(error) = runtime.run().await {
                 tracing::error!(%error, "shared DHCP runtime stopped with an error");
             }
         });
-        *slot = Some(RuntimeTask {
-            services: services.clone(),
-            task,
-        });
-        Ok(services)
+        Ok(RuntimeTask { services, task })
+    }
+
+    async fn require_runtime_alive(&self, interface: &str) -> Result<()> {
+        let alive = self
+            .inner
+            .runtime
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|runtime| !runtime.task.is_finished());
+        if alive {
+            Ok(())
+        } else {
+            anyhow::bail!("shared DHCP runtime stopped while configuring {interface}")
+        }
     }
 }
 

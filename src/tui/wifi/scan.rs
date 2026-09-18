@@ -1,0 +1,71 @@
+use super::*;
+
+pub(crate) fn render_wifi_scan(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
+    let Some(scan) = &app.wifi_scan else { return };
+    let block = panel(&format!("Scan results on {}", scan.interface));
+    let inner = block.inner(area);
+    let offset = scan
+        .selected
+        .saturating_sub(inner.height.saturating_sub(1) as usize);
+    app.ui.list_area = Some(inner);
+    app.ui.list_count = scan.networks.len();
+    app.ui.list_row_height = 1;
+    app.ui.list_scroll_offset = offset;
+    let lines = scan
+        .networks
+        .iter()
+        .enumerate()
+        .map(|(index, network)| {
+            Line::styled(
+                format!(
+                    "{}{:>4} dBm  {:<32} {}",
+                    if index == scan.selected { "▶ " } else { "  " },
+                    network.signal_dbm,
+                    if network.ssid.is_empty() {
+                        "<hidden>"
+                    } else {
+                        &network.ssid
+                    },
+                    scan_security_label(network.security)
+                ),
+                selected_style(index == scan.selected),
+            )
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        Paragraph::new(lines.into_iter().skip(offset).collect::<Vec<_>>()).block(block),
+        area,
+    );
+}
+
+pub(crate) fn handle_wifi_scan_key(app: &mut TuiApp, key: KeyCode) {
+    let Some(scan) = app.wifi_scan.as_mut() else {
+        app.screen = Screen::Wifi;
+        return;
+    };
+    match key {
+        KeyCode::Esc => {
+            app.wifi_scan = None;
+            app.screen = Screen::Wifi;
+        }
+        KeyCode::Up => scan.selected = scan.selected.saturating_sub(1),
+        KeyCode::Down => {
+            scan.selected = (scan.selected + 1).min(scan.networks.len().saturating_sub(1))
+        }
+        KeyCode::Home => scan.selected = 0,
+        KeyCode::End => scan.selected = scan.networks.len().saturating_sub(1),
+        KeyCode::Enter => {
+            let Some(network) = scan.networks.get(scan.selected) else {
+                return;
+            };
+            match WifiProfileEditor::from_scan(scan.interface.clone(), network) {
+                Ok(editor) => {
+                    app.wifi_profile_editor = Some(editor);
+                    app.screen = Screen::WifiProfileEditor;
+                }
+                Err(message) => app.push_message(LogLevel::Warn, message),
+            }
+        }
+        _ => {}
+    }
+}

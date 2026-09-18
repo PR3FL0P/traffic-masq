@@ -177,16 +177,8 @@ pub(crate) fn handle_log_key(app: &mut TuiApp, key: KeyCode) {
     match key {
         KeyCode::Tab | KeyCode::BackTab => {
             let fields = [LogFocus::Scroll, LogFocus::Export, LogFocus::Clear];
-            let index = fields
-                .iter()
-                .position(|field| *field == app.logs_focus)
-                .unwrap_or(0);
-            let step = if key == KeyCode::Tab {
-                1
-            } else {
-                fields.len() - 1
-            };
-            app.logs_focus = fields[(index + step) % fields.len()];
+            app.logs_focus =
+                super::input::move_wrapped(&fields, app.logs_focus, key == KeyCode::Tab);
         }
         KeyCode::Esc if app.logs_focus != LogFocus::Scroll => {
             app.logs_focus = LogFocus::Scroll;

@@ -707,19 +707,11 @@ const DHCP_EDITOR_FIELDS: [DhcpField; 8] = [
 ];
 
 fn next_dhcp_field(field: DhcpField) -> DhcpField {
-    let index = DHCP_EDITOR_FIELDS
-        .iter()
-        .position(|candidate| *candidate == field)
-        .unwrap_or(0);
-    DHCP_EDITOR_FIELDS[(index + 1).min(DHCP_EDITOR_FIELDS.len() - 1)]
+    super::input::move_clamped(&DHCP_EDITOR_FIELDS, field, true)
 }
 
 fn previous_dhcp_field(field: DhcpField) -> DhcpField {
-    let index = DHCP_EDITOR_FIELDS
-        .iter()
-        .position(|candidate| *candidate == field)
-        .unwrap_or(0);
-    DHCP_EDITOR_FIELDS[index.saturating_sub(1)]
+    super::input::move_clamped(&DHCP_EDITOR_FIELDS, field, false)
 }
 
 fn format_mac_address(mac: [u8; 6]) -> String {

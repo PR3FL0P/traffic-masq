@@ -423,6 +423,13 @@ pub struct RouterSnapshot {
 
 #[async_trait]
 pub trait RouterSubsystems: Send + Sync {
+    /// Rebuild volatile ownership/runtime bookkeeping from durable proofs
+    /// before crash recovery or startup repair touches the data plane.
+    /// Implementations must not adopt resources without an ownership proof.
+    async fn prepare_recovery(&self, _current: &RouterDesired) -> Result<()> {
+        Ok(())
+    }
+
     async fn plan_interfaces(&self, desired: &RouterDesired) -> Result<Vec<InterfaceChangePlan>>;
     async fn plan_uplink_wifi(
         &self,
@@ -707,6 +714,10 @@ impl RouterManager {
 
     pub async fn snapshot_for(&self, desired: &RouterDesired) -> Result<RouterSnapshot> {
         self.subsystems.snapshot_for(desired).await
+    }
+
+    pub async fn prepare_recovery(&self, current: &RouterDesired) -> Result<()> {
+        self.subsystems.prepare_recovery(current).await
     }
 
     pub async fn retain_router_interfaces(&self, interfaces: &[String]) {

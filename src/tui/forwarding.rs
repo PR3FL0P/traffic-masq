@@ -563,15 +563,8 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, _client: &ApiClie
         }
         KeyCode::Up | KeyCode::BackTab | KeyCode::Down | KeyCode::Tab => {
             let fields = editor.fields();
-            let index = fields
-                .iter()
-                .position(|field| *field == editor.field)
-                .unwrap_or(0);
-            editor.field = fields[if matches!(key, KeyCode::Up | KeyCode::BackTab) {
-                index.saturating_sub(1)
-            } else {
-                (index + 1).min(fields.len() - 1)
-            }];
+            let forward = !matches!(key, KeyCode::Up | KeyCode::BackTab);
+            editor.field = super::input::move_clamped(&fields, editor.field, forward);
         }
         KeyCode::Enter if editor.field == Field::Save => match editor.save() {
             Ok(rules) => {

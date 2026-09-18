@@ -49,7 +49,7 @@ impl LeaseStore {
         let mut content = serde_json::to_vec_pretty(leases)?;
         content.push(b'\n');
 
-        atomic_file::replace_async(&self.path, &content, PRIVATE_FILE_MODE)
+        atomic_file::replace_preserving_on_error_async(&self.path, &content, PRIVATE_FILE_MODE)
             .await
             .with_context(|| format!("failed to replace lease file {}", self.path.display()))
     }

@@ -194,6 +194,24 @@ impl RuntimeOverrideManager {
         self.save_locked(&mut state, candidate).await
     }
 
+    pub async fn restore_interface_override(
+        &self,
+        interface: &str,
+        previous: Option<InterfaceOverride>,
+    ) -> Result<()> {
+        let mut state = self.state.lock().await;
+        let mut candidate = state.clone();
+        match previous {
+            Some(previous) => {
+                candidate.interfaces.insert(interface.to_string(), previous);
+            }
+            None => {
+                candidate.interfaces.remove(interface);
+            }
+        }
+        self.save_locked(&mut state, candidate).await
+    }
+
     pub async fn set_interface(
         &self,
         interface: String,
@@ -770,6 +788,38 @@ mod tests {
         assert!(error.to_string().contains("overlap"));
         assert_eq!(manager.snapshot().await, before_state);
         assert_eq!(tokio::fs::read(manager.path()).await.unwrap(), before_file);
+    }
+
+    #[tokio::test]
+    async fn restoring_an_absent_interface_override_removes_it_exactly() {
+        let directory = tempdir().expect("tempdir");
+        let base = base_config();
+        let manager = RuntimeOverrideManager::load(directory.path(), &base)
+            .await
+            .expect("manager");
+
+        manager
+            .set_interface(
+                "wlan0".into(),
+                interface_config("192.168.30.1/24"),
+                false,
+            )
+            .await
+            .expect("set interface override");
+        assert!(manager.snapshot().await.interfaces.contains_key("wlan0"));
+
+        manager
+            .restore_interface_override("wlan0", None)
+            .await
+            .expect("restore absent override");
+
+        let state = manager.snapshot().await;
+        assert!(!state.interfaces.contains_key("wlan0"));
+        let persisted = RuntimeOverrideStore::in_state_dir(directory.path())
+            .load()
+            .await
+            .expect("load persisted overrides");
+        assert!(!persisted.interfaces.contains_key("wlan0"));
     }
 
     #[tokio::test]

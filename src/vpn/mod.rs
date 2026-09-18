@@ -53,6 +53,15 @@ pub enum VpnDriverError {
     #[error("interface '{0}' not found or has no readable ownership proof")]
     NoOwnershipProof(String),
 
+    #[error(
+        "VPN activation failed for interface '{interface}': {activation}; cleanup also failed: {cleanup}"
+    )]
+    ActivationCleanupFailed {
+        interface: String,
+        activation: String,
+        cleanup: String,
+    },
+
     #[error("failed to decode a persisted ownership proof")]
     InvalidOwnershipProof,
 }

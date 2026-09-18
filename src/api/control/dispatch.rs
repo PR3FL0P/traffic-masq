@@ -1,63 +1,132 @@
 use super::*;
+use super::dhcp::{
+    build_effective_dhcp_service, configure_dhcp_persisted, dhcp_edit_request_to_config,
+    disable_dhcp_persisted,
+};
+use super::interfaces::{interface_edit_request_to_config, interface_statuses};
+use super::runtime::error_response;
 
 impl ControlService {
     pub(super) async fn dispatch_inner(&self, request: Request) -> Response {
+        // The lock closes the race between "router is idle" and the first
+        // mutation performed by either the direct API path or router.apply().
+        // Once router.apply() returns Pending, the status guard below protects
+        // the whole commit-confirm window without holding a mutex for minutes.
+        let (_network_read, _network_write) = if is_network_mutation(&request) {
+            if is_converged_network_transaction_request(&request) {
+                (Some(self.network_mutations.read().await), None)
+            } else {
+                (None, Some(self.network_mutations.write().await))
+            }
+        } else {
+            (None, None)
+        };
+        if is_network_mutation(&request) && !is_provisioning_secret_recovery_request(&request) {
+            if let Some(router) = &self.router {
+                // The provisioning-secret journal is an extra crash-recovery
+                // barrier only after the router coordinator itself is idle.
+                // Pending/RollbackFailed already serialize mutations and their
+                // request handlers provide the appropriate typed errors.
+                if router.status().await == CoordinatorStatus::Idle {
+                    let secrets = crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore::in_state_dir(
+                        &self.config.runtime.state_dir,
+                    );
+                    let committed_token = self
+                        .overrides
+                        .snapshot()
+                        .await
+                        .committed_router_transaction;
+                    match secrets
+                        .unresolved_after_committed_cleanup(committed_token.as_deref())
+                        .await
+                    {
+                        Ok(false) => {}
+                        Ok(true) => {
+                            return Response::Error {
+                                message: "router provisioning secret recovery is pending; roll back or commit the router transaction before starting another network mutation".to_owned(),
+                            };
+                        }
+                        Err(error) => {
+                            return Response::Error {
+                                message: format!(
+                                    "cannot verify router provisioning secret recovery state: {error:#}"
+                                ),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        if is_direct_network_mutation(&request) {
+            if !matches!(
+                &request,
+                Request::ApplyInterface { .. }
+                    | Request::ApplyInterfaceEdit { .. }
+                    | Request::CommitNetworkChange { .. }
+                    | Request::RollbackNetworkChange { .. }
+            ) && !self.transactions.pending().await.is_empty()
+            {
+                return Response::Error {
+                    message: "an interface transaction is pending; direct network mutations are blocked until it commits or rolls back".to_owned(),
+                };
+            }
+            if let Some(router) = &self.router {
+                match router.status().await {
+                    CoordinatorStatus::Idle => {}
+                    CoordinatorStatus::Pending => {
+                        return Response::Error {
+                            message: "a router transaction is pending; direct network mutations are blocked until it commits or rolls back".to_owned(),
+                        };
+                    }
+                    CoordinatorStatus::RollbackFailed => {
+                        return Response::Error {
+                            message: "router rollback recovery is required; direct network mutations are blocked until recovery completes".to_owned(),
+                        };
+                    }
+                }
+            }
+        }
+
         match request {
             Request::Ping => Response::Pong,
             Request::GetApiHttpsConfig => match self.api_https_config_response().await {
                 Ok(response) => response,
-                Err(error) => Response::Error {
-                    message: error.to_string(),
-                },
+                Err(error) => error_response(error),
             },
             Request::ConfigureApiHttpsSettings { settings } => {
                 match self.configure_api_https_settings(settings).await {
                     Ok(response) => response,
-                    Err(error) => Response::Error {
-                        message: error.to_string(),
-                    },
+                    Err(error) => error_response(error),
                 }
             }
             Request::ResetApiHttpsSettings => match self.reset_api_https_settings().await {
                 Ok(response) => response,
-                Err(error) => Response::Error {
-                    message: error.to_string(),
-                },
+                Err(error) => error_response(error),
             },
             Request::GetSecurityConfig => match self.security_config_response().await {
                 Ok(response) => response,
-                Err(error) => Response::Error {
-                    message: error.to_string(),
-                },
+                Err(error) => error_response(error),
             },
             Request::ConfigureSecuritySettings { settings } => {
                 match self.configure_security_settings(settings).await {
                     Ok(response) => response,
-                    Err(error) => Response::Error {
-                        message: error.to_string(),
-                    },
+                    Err(error) => error_response(error),
                 }
             }
             Request::ResetSecuritySettings => match self.reset_security_settings().await {
                 Ok(response) => response,
-                Err(error) => Response::Error {
-                    message: error.to_string(),
-                },
+                Err(error) => error_response(error),
             },
             Request::ListInterfaces => {
                 match interface_statuses(self.network.as_ref(), &self.transactions).await {
                     Ok(interfaces) => Response::Interfaces { interfaces },
-                    Err(error) => Response::Error {
-                        message: error.to_string(),
-                    },
+                    Err(error) => error_response(error),
                 }
             }
             Request::GetInterfaceConfig { interface } => {
                 match self.interface_config_response(interface).await {
                     Ok(response) => response,
-                    Err(error) => Response::Error {
-                        message: error.to_string(),
-                    },
+                    Err(error) => error_response(error),
                 }
             }
             Request::DhcpStatus => Response::DhcpStatus {
@@ -93,14 +162,10 @@ impl ControlService {
                     match configure_dhcp_persisted(&self.dhcp, &self.overrides, spec.clone()).await
                     {
                         Ok(()) => Response::DhcpConfigured { spec },
-                        Err(error) => Response::Error {
-                            message: error.to_string(),
-                        },
+                        Err(error) => error_response(error),
                     }
                 }
-                Err(error) => Response::Error {
-                    message: error.to_string(),
-                },
+                Err(error) => error_response(error),
             },
             Request::ConfigureDhcpSettings {
                 interface,
@@ -119,22 +184,16 @@ impl ControlService {
                     match configure_dhcp_persisted(&self.dhcp, &self.overrides, spec.clone()).await
                     {
                         Ok(()) => Response::DhcpConfigured { spec },
-                        Err(error) => Response::Error {
-                            message: error.to_string(),
-                        },
+                        Err(error) => error_response(error),
                     }
                 }
-                Err(error) => Response::Error {
-                    message: error.to_string(),
-                },
+                Err(error) => error_response(error),
             },
             Request::DisableDhcp { interface } => {
                 let _mutation = self.dhcp_mutations.lock().await;
                 match disable_dhcp_persisted(&self.dhcp, &self.overrides, &interface).await {
                     Ok(()) => Response::DhcpDisabled { interface },
-                    Err(error) => Response::Error {
-                        message: error.to_string(),
-                    },
+                    Err(error) => error_response(error),
                 }
             }
             Request::ListLeases { interface } => {
@@ -148,9 +207,7 @@ impl ControlService {
                     LeaseStore::for_interface(&self.base_config.dhcp.leases_dir, &interface);
                 match store.load().await {
                     Ok(leases) => Response::Leases { interface, leases },
-                    Err(error) => Response::Error {
-                        message: error.to_string(),
-                    },
+                    Err(error) => error_response(error),
                 }
             }
             Request::DryRunInterface {
@@ -197,9 +254,7 @@ impl ControlService {
                     .await
                 {
                     Ok(plan) => Response::InterfacePlan { plan },
-                    Err(error) => Response::Error {
-                        message: error.to_string(),
-                    },
+                    Err(error) => error_response(error),
                 }
             }
             Request::DryRunInterfaceEdit { interface, edit } => {
@@ -248,14 +303,10 @@ impl ControlService {
                             .await
                         {
                             Ok(plan) => Response::InterfacePlan { plan },
-                            Err(error) => Response::Error {
-                                message: error.to_string(),
-                            },
+                            Err(error) => error_response(error),
                         }
                     }
-                    Err(error) => Response::Error {
-                        message: error.to_string(),
-                    },
+                    Err(error) => error_response(error),
                 }
             }
             Request::ApplyInterface {
@@ -301,17 +352,8 @@ impl ControlService {
                     )
                     .await
                 {
-                    Ok(change) => {
-                        if config.role != InterfaceRole::Output || config.wifi.is_none() {
-                            if let Some(wifi) = &self.wifi {
-                                let _ = wifi.disable(&interface).await;
-                            }
-                        }
-                        Response::NetworkChangePending { change }
-                    }
-                    Err(error) => Response::Error {
-                        message: error.to_string(),
-                    },
+                    Ok(change) => Response::NetworkChangePending { change },
+                    Err(error) => error_response(error),
                 }
             }
             Request::ApplyInterfaceEdit { interface, edit } => {
@@ -359,22 +401,11 @@ impl ControlService {
                             )
                             .await
                         {
-                            Ok(change) => {
-                                if config.role != InterfaceRole::Output || config.wifi.is_none() {
-                                    if let Some(wifi) = &self.wifi {
-                                        let _ = wifi.disable(&interface).await;
-                                    }
-                                }
-                                Response::NetworkChangePending { change }
-                            }
-                            Err(error) => Response::Error {
-                                message: error.to_string(),
-                            },
+                            Ok(change) => Response::NetworkChangePending { change },
+                            Err(error) => error_response(error),
                         }
                     }
-                    Err(error) => Response::Error {
-                        message: error.to_string(),
-                    },
+                    Err(error) => error_response(error),
                 }
             }
             Request::CommitNetworkChange { token } => match self
@@ -389,32 +420,13 @@ impl ControlService {
                 })
                 .await
             {
-                Ok(change) => {
-                    let committed = self
-                        .overrides
-                        .effective_interface(&change.interface)
-                        .await
-                        .ok()
-                        .flatten();
-                    if let Some(config) = committed {
-                        if config.role != InterfaceRole::Output || config.wifi.is_none() {
-                            if let Some(wifi) = &self.wifi {
-                                let _ = wifi.disable(&change.interface).await;
-                            }
-                        }
-                    }
-                    Response::NetworkChangeCommitted { change }
-                }
-                Err(error) => Response::Error {
-                    message: error.to_string(),
-                },
+                Ok(change) => Response::NetworkChangeCommitted { change },
+                Err(error) => error_response(error),
             },
             Request::RollbackNetworkChange { token } => {
                 match self.transactions.rollback(&token).await {
                     Ok(change) => Response::NetworkChangeRolledBack { change },
-                    Err(error) => Response::Error {
-                        message: error.to_string(),
-                    },
+                    Err(error) => error_response(error),
                 }
             }
             Request::PendingNetworkChanges => Response::PendingNetworkChanges {
@@ -512,4 +524,81 @@ impl ControlService {
             }
         }
     }
+}
+
+
+fn is_network_mutation(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::ConfigureDhcpClient { .. }
+            | Request::DisableDhcpClient { .. }
+            | Request::RenewDhcpClient { .. }
+            | Request::ReleaseDhcpClient { .. }
+            | Request::ConfigureDhcpSettings { .. }
+            | Request::ConfigureDhcp { .. }
+            | Request::DisableDhcp { .. }
+            | Request::ApplyInterface { .. }
+            | Request::ApplyInterfaceEdit { .. }
+            | Request::CommitNetworkChange { .. }
+            | Request::RollbackNetworkChange { .. }
+            | Request::RouterApply { .. }
+            | Request::RouterCommit { .. }
+            | Request::RouterRollback { .. }
+            | Request::RouterProvisioningApply { .. }
+            | Request::RouterProvisioningRepair
+            | Request::VpnImportProfile { .. }
+            | Request::VpnDeleteProfile { .. }
+            | Request::VpnActivate { .. }
+            | Request::VpnDeactivate
+            | Request::VpnPolicySetMode { .. }
+            | Request::VpnPolicyClearMode
+            | Request::ConfigureWifi { .. }
+            | Request::ProvisionWifiAccessPoint { .. }
+            | Request::DisableWifi { .. }
+            | Request::WifiSetPassphrase { .. }
+            | Request::WifiDeauthStation { .. }
+            | Request::WifiReload { .. }
+            | Request::ConfigureWifiClient { .. }
+            | Request::DisableWifiClient { .. }
+            | Request::WifiClientSetPassphrase { .. }
+            | Request::WifiClientReconnect { .. }
+            | Request::WifiClientScan { .. }
+            | Request::CreateWifiClientProfile { .. }
+            | Request::UpdateWifiClientProfile { .. }
+            | Request::DeleteWifiClientProfile { .. }
+            | Request::ActivateWifiClientProfile { .. }
+            | Request::DeactivateWifiClientProfile { .. }
+    )
+}
+
+fn is_converged_network_transaction_request(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::ApplyInterface { .. }
+            | Request::ApplyInterfaceEdit { .. }
+            | Request::CommitNetworkChange { .. }
+            | Request::RollbackNetworkChange { .. }
+    )
+}
+
+fn is_direct_network_mutation(request: &Request) -> bool {
+    is_network_mutation(request)
+        && !matches!(
+            request,
+            Request::RouterApply { .. }
+                | Request::RouterCommit { .. }
+                | Request::RouterRollback { .. }
+                | Request::RouterProvisioningApply { .. }
+                | Request::RouterProvisioningRepair
+        )
+}
+
+
+fn is_provisioning_secret_recovery_request(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::RouterCommit { .. }
+            | Request::RouterRollback { .. }
+            | Request::RollbackNetworkChange { .. }
+    )
 }

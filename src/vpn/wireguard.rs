@@ -512,24 +512,37 @@ impl VpnDriver for WireGuardVpnDriver {
             )
             .await?;
 
-        self.provider
-            .set_addresses(interface, &profile.interface.addresses)
-            .await?;
+        let activation = async {
+            self.provider
+                .set_addresses(interface, &profile.interface.addresses)
+                .await?;
+            self.provider.set_peers(interface, &profile.peers).await?;
+            self.provider.set_link_up(interface).await?;
 
-        self.provider.set_peers(interface, &profile.peers).await?;
-
-        self.provider.set_link_up(interface).await?;
-
-        self.provider.public_key(interface).await?.ok_or_else(|| {
-            tracing::error!(
-                interface,
-                "kernel reported no public key for the interface immediately after \
+            self.provider.public_key(interface).await?.ok_or_else(|| {
+                tracing::error!(
+                    interface,
+                    "kernel reported no public key for the interface immediately after \
                      create_link/set_addresses/set_peers/set_link_up; refusing to report \
                      ownership (this means the interface has no private key configured, not \
                      that a foreign interface is present)"
-            );
-            VpnDriverError::NoOwnershipProof(interface.to_string())
-        })
+                );
+                VpnDriverError::NoOwnershipProof(interface.to_string())
+            })
+        }
+        .await;
+
+        match activation {
+            Ok(proof) => Ok(proof),
+            Err(error) => match self.provider.delete_link(interface).await {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(VpnDriverError::ActivationCleanupFailed {
+                    interface: interface.to_string(),
+                    activation: error.to_string(),
+                    cleanup: cleanup.to_string(),
+                }),
+            },
+        }
     }
 
     async fn deactivate(&self, interface: &str) -> Result<(), VpnDriverError> {

@@ -9,6 +9,7 @@ use nix::errno::Errno;
 use nix::fcntl::{open, OFlag};
 use nix::sys::stat::Mode;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 use crate::atomic_file::{self, PrivateDirError, PRIVATE_DIR_MODE, PRIVATE_FILE_MODE};
 use crate::vpn::wireguard::{
@@ -37,6 +38,9 @@ pub enum StoreError {
 
     #[error("low-level file operation failed: {0}")]
     Errno(#[from] Errno),
+
+    #[error("profile store operation failed: {operation}; rollback also failed: {rollback}")]
+    RollbackFailed { operation: String, rollback: String },
 }
 
 impl From<PrivateDirError> for StoreError {
@@ -106,10 +110,19 @@ impl WireGuardProfileStore {
             }
         }
 
-        // Atomic, where this used to open the target with O_TRUNC: a crash
-        // mid-import left a truncated profile that would fail to parse on the
-        // next read.
-        atomic_file::replace(&target, raw, PRIVATE_FILE_MODE)?;
+        // Snapshot the previous bytes because `replace` can fail after the
+        // rename (for example while fsyncing the parent directory). A failed
+        // API import must therefore restore the exact previous profile rather
+        // than assuming an error implies no mutation.
+        let previous = read_optional_regular(&target)?;
+        if let Err(error) = atomic_file::replace(&target, raw, PRIVATE_FILE_MODE) {
+            restore_profile_after_failure(
+                &target,
+                previous.as_ref().map(|value| value.as_slice()),
+                &error,
+            )?;
+            return Err(StoreError::Io(error));
+        }
 
         Ok(profile)
     }
@@ -132,7 +145,7 @@ impl WireGuardProfileStore {
 
         let mut file = unsafe { File::from_raw_fd(raw_fd) };
 
-        let mut raw = Vec::new();
+        let mut raw = Zeroizing::new(Vec::new());
         file.read_to_end(&mut raw)?;
 
         Ok(driver.parse_named_profile(name, &raw)?)
@@ -184,9 +197,43 @@ impl WireGuardProfileStore {
             Err(error) => return Err(error.into()),
         }
 
-        fs::remove_file(&target)?;
+        let previous = read_optional_regular(&target)?
+            .ok_or_else(|| StoreError::NotFound(name.to_string()))?;
+        if let Err(error) = atomic_file::remove_durable(&target) {
+            restore_profile_after_failure(&target, Some(previous.as_slice()), &error)?;
+            return Err(StoreError::Io(error));
+        }
         Ok(())
     }
+}
+
+fn read_optional_regular(path: &Path) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
+    let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let raw_fd = match open(path, flags, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(Errno::ENOENT) => return Ok(None),
+        Err(Errno::ELOOP) => return Err(StoreError::SymlinkRejected(path.to_path_buf())),
+        Err(error) => return Err(error.into()),
+    };
+    let mut file = unsafe { File::from_raw_fd(raw_fd) };
+    let mut raw = Zeroizing::new(Vec::new());
+    file.read_to_end(&mut raw)?;
+    Ok(Some(raw))
+}
+
+fn restore_profile_after_failure(
+    path: &Path,
+    previous: Option<&[u8]>,
+    operation: &std::io::Error,
+) -> Result<(), StoreError> {
+    let rollback = match previous {
+        Some(previous) => atomic_file::replace(path, previous, PRIVATE_FILE_MODE).map(|_| ()),
+        None => atomic_file::remove_durable(path).map(|_| ()),
+    };
+    rollback.map_err(|rollback| StoreError::RollbackFailed {
+        operation: operation.to_string(),
+        rollback: rollback.to_string(),
+    })
 }
 
 #[cfg(test)]

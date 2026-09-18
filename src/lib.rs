@@ -26,6 +26,8 @@ pub mod logging;
 
 pub mod netlink;
 pub mod state;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod tui;
 pub mod vpn;
 pub mod wifi;

@@ -1,13 +1,13 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv4Addr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{watch, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -27,6 +27,7 @@ use crate::netlink::{NetworkProvider, TRAFFIC_MASQ_DHCP_ROUTE_PROTOCOL};
 const MAIN_ROUTE_TABLE: u32 = 254;
 
 const GATEWAY_ROUTE_SCOPE: u8 = 0;
+const LINK_ROUTE_SCOPE: u8 = 253;
 
 const RESTART_BACKOFF_BASE: Duration = Duration::from_secs(2);
 const BACKOFF_CEILING: Duration = Duration::from_secs(120);
@@ -235,6 +236,7 @@ struct Inner {
     launcher: Arc<dyn DhcpClientLauncher>,
     tasks: Mutex<HashMap<String, ClientTask>>,
     operation_lock: Mutex<()>,
+    network_mutations: StdMutex<Option<Arc<RwLock<()>>>>,
 }
 
 impl Inner {
@@ -249,6 +251,17 @@ impl Inner {
 }
 
 impl DhcpClientSupervisor {
+    /// Share the process-wide network mutation gate with autonomous DHCP lease
+    /// callbacks. The actor only takes the read side while it changes owned
+    /// addresses/routes; API/router transactions take the write side.
+    pub fn set_network_mutation_gate(&self, gate: Arc<RwLock<()>>) {
+        *self
+            .inner
+            .network_mutations
+            .lock()
+            .expect("DHCP client mutation-gate mutex poisoned") = Some(gate);
+    }
+
     #[cfg(target_os = "linux")]
     pub async fn start(config: &AppConfig, network: Arc<dyn NetworkProvider>) -> Result<Self> {
         Self::start_with_launcher(config, network, Arc::new(LinuxDhcpClientLauncher)).await
@@ -268,6 +281,7 @@ impl DhcpClientSupervisor {
                 launcher,
                 tasks: Mutex::new(HashMap::new()),
                 operation_lock: Mutex::new(()),
+                network_mutations: StdMutex::new(None),
             }),
         };
 
@@ -325,6 +339,7 @@ impl DhcpClientSupervisor {
         if link_ready {
             self.start_task(&interface).await;
         } else {
+            self.suspend_owned_state(&interface).await;
             self.record_waiting(&interface).await;
             if readiness_changed {
                 tracing::info!(%interface, "DHCP client paused while Wi-Fi is not associated");
@@ -341,10 +356,24 @@ impl DhcpClientSupervisor {
             }
             return Ok(None);
         }
+        let previous_lease = self
+            .status(interface)
+            .await
+            .and_then(|status| status.lease);
         self.stop_task(interface).await;
         if let Err(error) = self.inner.applier.cleanup(interface).await {
-            tracing::warn!(%interface, %error, "failed to release owned DHCP client state while disabling it; cleanup will be retried");
-            return Err(error.into());
+            tracing::warn!(%interface, %error, "failed to release owned DHCP client state while disabling it; restoring the client runtime");
+            let restoration = self
+                .restore_runtime_after_interrupted_stop(interface, previous_lease)
+                .await;
+            return Err(match restoration {
+                Ok(()) => anyhow::anyhow!(error).context(
+                    "failed to release owned DHCP client state while disabling it; client runtime was restored",
+                ),
+                Err(rollback) => anyhow::anyhow!(error).context(format!(
+                    "failed to release owned DHCP client state while disabling it and client runtime restoration also failed: {rollback:#}; recovery required"
+                )),
+            });
         }
         let task = self.inner.tasks.lock().await.remove(interface);
         tracing::info!(%interface, "DHCP client disabled");
@@ -388,11 +417,11 @@ impl DhcpClientSupervisor {
         Some(DhcpClientStatus {
             interface: interface.to_string(),
             spec,
-            state: match (&state, &shared.failure) {
-                (DhcpClientRunState::Running, Some(reason)) => DhcpClientRunState::Degraded {
+            state: match &shared.failure {
+                Some(reason) => DhcpClientRunState::Degraded {
                     reason: reason.clone(),
                 },
-                _ => state,
+                None => state,
             },
             lease: shared.lease.clone(),
         })
@@ -434,9 +463,7 @@ impl DhcpClientSupervisor {
         } else {
             self.record_waiting(interface).await;
         }
-        self.status(interface)
-            .await
-            .context("DHCP client interface disappeared during renew")
+        self.status_after_manual_restart(interface, "renew").await
     }
 
     pub async fn release_and_reacquire(&self, interface: &str) -> Result<DhcpClientStatus> {
@@ -461,7 +488,19 @@ impl DhcpClientSupervisor {
         } else {
             None
         };
-        self.inner.applier.cleanup(interface).await?;
+        if let Err(error) = self.inner.applier.cleanup(interface).await {
+            let restoration = self
+                .restore_runtime_after_interrupted_stop(interface, lease.clone())
+                .await;
+            return Err(match restoration {
+                Ok(()) => anyhow::anyhow!(error).context(
+                    "failed to clean up DHCP client lease during release/reacquire; client runtime was restored",
+                ),
+                Err(rollback) => anyhow::anyhow!(error).context(format!(
+                    "failed to clean up DHCP client lease during release/reacquire and client runtime restoration also failed: {rollback:#}; recovery required"
+                )),
+            });
+        }
         {
             let mut state = shared.lock().await;
             state.lease = None;
@@ -475,9 +514,64 @@ impl DhcpClientSupervisor {
         if let Some(error) = release_error {
             tracing::warn!(%interface, %error, "DHCP RELEASE could not be delivered; owned state was still cleaned up");
         }
-        self.status(interface)
+        self.status_after_manual_restart(interface, "release/reacquire")
             .await
-            .context("DHCP client interface disappeared during release")
+    }
+
+    async fn restore_runtime_after_interrupted_stop(
+        &self,
+        interface: &str,
+        previous_lease: Option<DhcpClientLease>,
+    ) -> Result<()> {
+        let (link_ready, shared) = {
+            let tasks = self.inner.tasks.lock().await;
+            let task = tasks
+                .get(interface)
+                .context("DHCP client interface disappeared while restoring runtime")?;
+            (task.link_ready, task.shared.clone())
+        };
+
+        // `cleanup()` writes CleanupNeeded before touching kernel state and may
+        // fail after removing only part of the lease. Re-applying the snapshot
+        // restores the exact address/routes and returns the durable ownership
+        // record to Bound before the DHCP actor is restarted. Otherwise startup
+        // would adopt CleanupNeeded, retry cleanup, and accidentally complete
+        // the operation we are supposed to roll back.
+        if let Some(lease) = previous_lease {
+            let restored = self
+                .inner
+                .applier
+                .apply(lease)
+                .await
+                .context("failed to restore DHCP client owned lease state")?;
+            let mut state = shared.lock().await;
+            state.lease = Some(restored);
+            state.failure = None;
+        }
+
+        if link_ready {
+            self.start_task(interface).await;
+        } else {
+            self.record_waiting(interface).await;
+        }
+        self.status_after_manual_restart(interface, "runtime restoration")
+            .await
+            .map(|_| ())
+    }
+
+    async fn status_after_manual_restart(
+        &self,
+        interface: &str,
+        operation: &str,
+    ) -> Result<DhcpClientStatus> {
+        let status = self
+            .status(interface)
+            .await
+            .with_context(|| format!("DHCP client interface disappeared during {operation}"))?;
+        if let DhcpClientRunState::Degraded { reason } = &status.state {
+            bail!("DHCP client {operation} failed on {interface}: {reason}");
+        }
+        Ok(status)
     }
 
     pub async fn ensure_alive(&self) -> Result<bool> {
@@ -515,8 +609,7 @@ impl DhcpClientSupervisor {
             if has_running {
                 self.stop_task(interface).await;
             }
-
-            let _ = self.adopt_persisted_lease(interface).await;
+            self.suspend_owned_state(interface).await;
             return has_running;
         }
         match (observed, has_running) {
@@ -624,7 +717,14 @@ impl DhcpClientSupervisor {
         if !link_ready {
             return;
         }
-        let remembered = self.adopt_persisted_lease(interface).await;
+        let remembered = match self.adopt_persisted_lease(interface).await {
+            Ok(remembered) => remembered,
+            Err(error) => {
+                tracing::error!(%interface, %error, "unresolved persisted DHCP ownership blocks client start");
+                self.record_failure(interface, error.to_string()).await;
+                return;
+            }
+        };
         let (spec, shared) = {
             let tasks = self.inner.tasks.lock().await;
             let Some(task) = tasks.get(interface) else {
@@ -676,24 +776,26 @@ impl DhcpClientSupervisor {
         }
     }
 
-    async fn adopt_persisted_lease(&self, interface: &str) -> Option<DhcpClientLease> {
+    async fn adopt_persisted_lease(&self, interface: &str) -> Result<Option<DhcpClientLease>> {
         match self
             .inner
             .applier
             .adopt(interface, current_unix_time())
             .await
         {
-            Ok(lease) => lease,
+            Ok(lease) => Ok(lease),
             Err(error) => {
                 tracing::warn!(
                     %interface,
                     %error,
                     "persisted DHCP lease could not be adopted; releasing any state it still proves"
                 );
-                if let Err(error) = self.inner.applier.cleanup(interface).await {
-                    tracing::warn!(%interface, %error, "failed to clean up an unadoptable DHCP lease");
+                match self.inner.applier.cleanup(interface).await {
+                    Ok(()) => Ok(None),
+                    Err(cleanup) => Err(anyhow::anyhow!(
+                        "persisted DHCP ownership could not be adopted ({error}) and cleanup also failed ({cleanup}); recovery required"
+                    )),
                 }
-                None
             }
         }
     }
@@ -707,6 +809,36 @@ impl DhcpClientSupervisor {
         };
         if let Some(running) = running {
             stop_running(running).await;
+        }
+    }
+
+    async fn suspend_owned_state(&self, interface: &str) {
+        let shared = self
+            .inner
+            .tasks
+            .lock()
+            .await
+            .get(interface)
+            .map(|task| task.shared.clone());
+        match self
+            .inner
+            .applier
+            .suspend(interface, current_unix_time())
+            .await
+        {
+            Ok(lease) => {
+                if let Some(shared) = shared {
+                    let mut state = shared.lock().await;
+                    state.lease = lease;
+                    state.failure = None;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%interface, %error, "failed to suspend traffic-masq-owned DHCP state while link is not ready");
+                if let Some(shared) = shared {
+                    shared.lock().await.failure = Some(error.to_string());
+                }
+            }
         }
     }
 
@@ -758,9 +890,26 @@ struct OwnershipSink {
     inner: std::sync::Weak<Inner>,
 }
 
+impl OwnershipSink {
+    fn network_mutation_gate(&self) -> Option<Arc<RwLock<()>>> {
+        self.inner.upgrade().and_then(|inner| {
+            inner
+                .network_mutations
+                .lock()
+                .expect("DHCP client mutation-gate mutex poisoned")
+                .clone()
+        })
+    }
+}
+
 #[async_trait]
 impl DhcpClientActionSink for OwnershipSink {
     async fn lease_acquired(&mut self, lease: Lease) -> Result<()> {
+        let gate = self.network_mutation_gate();
+        let _network_mutation = match gate {
+            Some(gate) => Some(gate.read_owned().await),
+            None => None,
+        };
         let persisted = self.persisted_lease(&lease);
         match self.applier.apply(persisted).await {
             Ok(applied) => {
@@ -790,6 +939,11 @@ impl DhcpClientActionSink for OwnershipSink {
     }
 
     async fn cleanup_needed(&mut self, _lease: Lease) -> Result<()> {
+        let gate = self.network_mutation_gate();
+        let _network_mutation = match gate {
+            Some(gate) => Some(gate.read_owned().await),
+            None => None,
+        };
         let result = self.applier.cleanup(&self.spec.interface).await;
         let mut shared = self.shared.lock().await;
         shared.lease = None;
@@ -838,21 +992,32 @@ impl OwnershipSink {
     }
 
     fn owned_routes(&self, lease: &Lease) -> Vec<DhcpClientOwnedRoute> {
-        if !self.spec.install_default_route {
-            return Vec::new();
-        }
-        let Some(gateway) = lease.routers.first().copied() else {
-            return Vec::new();
-        };
-        vec![DhcpClientOwnedRoute {
-            destination: Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).expect("0.0.0.0/0 is valid"),
-            gateway: Some(gateway),
+        let mut routes = vec![DhcpClientOwnedRoute {
+            destination: Ipv4Net::new(lease.address, lease.prefix_len)
+                .expect("validated DHCP prefix")
+                .trunc(),
+            gateway: None,
             output_interface_index: Some(self.identity.index),
             table: MAIN_ROUTE_TABLE,
-            metric: Some(self.spec.route_metric),
+            metric: None,
             protocol: TRAFFIC_MASQ_DHCP_ROUTE_PROTOCOL,
-            scope: GATEWAY_ROUTE_SCOPE,
-        }]
+            scope: LINK_ROUTE_SCOPE,
+        }];
+        if self.spec.install_default_route {
+            if let Some(gateway) = lease.routers.first().copied() {
+                routes.push(DhcpClientOwnedRoute {
+                    destination: Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0)
+                        .expect("0.0.0.0/0 is valid"),
+                    gateway: Some(gateway),
+                    output_interface_index: Some(self.identity.index),
+                    table: MAIN_ROUTE_TABLE,
+                    metric: Some(self.spec.route_metric),
+                    protocol: TRAFFIC_MASQ_DHCP_ROUTE_PROTOCOL,
+                    scope: GATEWAY_ROUTE_SCOPE,
+                });
+            }
+        }
+        routes
     }
 }
 
@@ -906,12 +1071,33 @@ async fn send_release(transport: &dyn DhcpClientTransport, lease: &DhcpClientLea
 
 async fn stop_running(running: RunningDhcpClient) {
     let _ = running.cancel.send(true);
-    match tokio::time::timeout(TASK_STOP_TIMEOUT, running.task).await {
-        Ok(Ok(Ok(()))) | Err(_) => {}
+    let mut task = running.task;
+    match tokio::time::timeout(TASK_STOP_TIMEOUT, &mut task).await {
+        Ok(Ok(Ok(()))) => {}
         Ok(Ok(Err(error))) => {
+            // The actor returned an error, but it is conclusively stopped.
             tracing::debug!(%error, "DHCP client task returned an error while stopping")
         }
-        Ok(Err(error)) => tracing::debug!(%error, "DHCP client task did not join cleanly"),
+        Ok(Err(error)) => {
+            // A completed JoinHandle (including panic/cancellation) cannot keep
+            // mutating network state, so it is safe to continue cleanup.
+            tracing::debug!(%error, "DHCP client task did not join cleanly")
+        }
+        Err(_) => {
+            // Dropping a JoinHandle detaches the task.  A renew/rollback must
+            // never start a replacement while the old actor might still own
+            // the interface, so force cancellation and wait for completion.
+            tracing::warn!("DHCP client task did not stop in time; aborting it");
+            task.abort();
+            match task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::debug!(%error, "aborted DHCP client task returned an error")
+                }
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => tracing::debug!(%error, "aborted DHCP client task did not join cleanly"),
+            }
+        }
     }
 }
 
@@ -1359,11 +1545,19 @@ mod tests {
         let applied = status.lease.expect("lease");
         assert_eq!(applied.address, Ipv4Addr::new(192, 0, 2, 42));
         assert_eq!(applied.state, DhcpClientLeaseState::Bound);
-        assert_eq!(applied.owned_routes.len(), 1);
-        assert_eq!(applied.owned_routes[0].metric, Some(100));
+        assert_eq!(applied.owned_routes.len(), 2);
+        assert!(applied
+            .owned_routes
+            .iter()
+            .all(|route| route.protocol == TRAFFIC_MASQ_DHCP_ROUTE_PROTOCOL));
         assert_eq!(
-            applied.owned_routes[0].protocol,
-            TRAFFIC_MASQ_DHCP_ROUTE_PROTOCOL
+            applied
+                .owned_routes
+                .iter()
+                .find(|route| route.destination.prefix_len() == 0)
+                .expect("default route")
+                .metric,
+            Some(100)
         );
         assert_eq!(
             network
@@ -1395,6 +1589,48 @@ mod tests {
             .expect("status")
             .lease
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn unresolved_persisted_ownership_cleanup_blocks_a_new_actor() {
+        let state_dir = TempDir::new().expect("state dir");
+        let network = FakeNetwork::present(7).await;
+        let launcher = Arc::new(FakeLauncher::default());
+        let supervisor = supervisor_with(&state_dir, network.clone(), launcher.clone()).await;
+        let mut sink = launcher.take_sink();
+        sink.lease_acquired(lease(Ipv4Addr::new(192, 0, 2, 42)))
+            .await
+            .expect("lease applied");
+        supervisor.shutdown(ShutdownPolicy::PreserveInterfaces).await;
+
+        let store = DhcpClientLeaseStore::new(state_dir.path()).expect("store");
+        let mut persisted = store.load("wan0").expect("load").expect("lease");
+        persisted.state = DhcpClientLeaseState::CleanupNeeded;
+        store.save(&persisted).expect("save cleanup-needed state");
+        network.fail_address_deletes.store(1, Ordering::SeqCst);
+
+        let restarted = supervisor_with(&state_dir, network, launcher.clone()).await;
+        assert_eq!(
+            launcher.launch_count(),
+            1,
+            "a new DHCP actor must not start over unresolved owned kernel state"
+        );
+        assert!(matches!(
+            restarted.status("wan0").await.expect("status").state,
+            DhcpClientRunState::Degraded { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn statuses_reports_each_interface_once() {
+        let state_dir = TempDir::new().expect("state dir");
+        let network = FakeNetwork::present(7).await;
+        let launcher = Arc::new(FakeLauncher::default());
+        let supervisor = supervisor_with(&state_dir, network, launcher).await;
+
+        let statuses = supervisor.statuses().await;
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].interface, "wan0");
     }
 
     #[tokio::test]
@@ -1434,7 +1670,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wifi_gate_blocks_until_completed_and_disconnect_holds_valid_lease() {
+    async fn wifi_gate_blocks_until_completed_and_disconnect_removes_owned_state() {
         let state_dir = TempDir::new().expect("state dir");
         let network = FakeNetwork::present(7).await;
         let launcher = Arc::new(FakeLauncher::default());
@@ -1472,11 +1708,8 @@ mod tests {
             launcher.sends.lock().unwrap().is_empty(),
             "disconnect sends no RELEASE"
         );
-        assert_eq!(
-            network.addresses.lock().await.len(),
-            1,
-            "valid lease is held"
-        );
+        assert!(network.addresses.lock().await.is_empty(), "disconnect removes the DHCP address");
+        assert!(network.routes.lock().await.is_empty(), "disconnect removes every DHCP-owned route");
 
         supervisor.reconcile_with_link_ready(spec(), true).await;
         assert_eq!(launcher.launch_count(), 2);
@@ -1489,12 +1722,12 @@ mod tests {
                 .copied()
                 .flatten(),
             Some(Ipv4Addr::new(192, 0, 2, 42)),
-            "reconnect revalidates the remembered lease with INIT-REBOOT"
+            "reconnect revalidates the suspended lease without keeping its IP configured"
         );
     }
 
     #[tokio::test]
-    async fn lease_expiry_while_wifi_is_disconnected_cleans_owned_state() {
+    async fn link_not_ready_suspends_persisted_lease_but_removes_kernel_state() {
         let state_dir = TempDir::new().expect("state dir");
         let network = FakeNetwork::present(7).await;
         let launcher = Arc::new(FakeLauncher::default());
@@ -1506,16 +1739,21 @@ mod tests {
         supervisor.reconcile_with_link_ready(spec(), false).await;
 
         let store = DhcpClientLeaseStore::new(state_dir.path()).expect("store");
-        let mut persisted = store.load("wan0").expect("load").expect("lease");
-        persisted.expires_at_unix = current_unix_time();
-        store.save(&persisted).expect("expire lease");
-
-        supervisor.ensure_alive().await.expect("expiry check");
         assert!(network.addresses.lock().await.is_empty());
         assert!(network.routes.lock().await.is_empty());
-        assert!(store.load("wan0").expect("load").is_none());
+        assert_eq!(
+            store
+                .load("wan0")
+                .expect("load")
+                .expect("suspended lease")
+                .state,
+            DhcpClientLeaseState::Suspended
+        );
         supervisor.reconcile_with_link_ready(spec(), true).await;
-        assert_eq!(launcher.remembered.lock().unwrap().last(), Some(&None));
+        assert_eq!(
+            launcher.remembered.lock().unwrap().last(),
+            Some(&Some(Ipv4Addr::new(192, 0, 2, 42)))
+        );
     }
 
     #[tokio::test]
@@ -1543,7 +1781,7 @@ mod tests {
             1,
             "a preserved uplink must keep its address across a daemon restart"
         );
-        assert_eq!(network.list_ipv4_routes().await.expect("routes").len(), 1);
+        assert_eq!(network.list_ipv4_routes().await.expect("routes").len(), 2);
     }
 
     #[tokio::test]
@@ -1720,6 +1958,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn renew_now_reports_immediate_restart_failure() {
+        let state_dir = TempDir::new().expect("state dir");
+        let network = FakeNetwork::present(7).await;
+        let launcher = Arc::new(FakeLauncher::default());
+        let supervisor = supervisor_with(&state_dir, network, launcher.clone()).await;
+
+        launcher.fail_next.store(1, Ordering::SeqCst);
+        let error = supervisor
+            .renew_now("wan0")
+            .await
+            .expect_err("failed restart must not be reported as a successful renew");
+        assert!(error.to_string().contains("renew failed"));
+        assert!(matches!(
+            supervisor.status("wan0").await.expect("status").state,
+            DhcpClientRunState::Degraded { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn release_and_reacquire_sends_release_cleans_exact_state_and_keeps_intent() {
         let state_dir = TempDir::new().expect("state dir");
         let network = FakeNetwork::present(7).await;
@@ -1747,6 +2004,25 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(supervisor.spec("wan0").await, Some(spec()));
+    }
+
+    #[tokio::test]
+    async fn release_and_reacquire_reports_immediate_restart_failure() {
+        let state_dir = TempDir::new().expect("state dir");
+        let network = FakeNetwork::present(7).await;
+        let launcher = Arc::new(FakeLauncher::default());
+        let supervisor = supervisor_with(&state_dir, network, launcher.clone()).await;
+
+        launcher.fail_next.store(1, Ordering::SeqCst);
+        let error = supervisor
+            .release_and_reacquire("wan0")
+            .await
+            .expect_err("failed restart must not be reported as a successful release/reacquire");
+        assert!(error.to_string().contains("release/reacquire failed"));
+        assert!(matches!(
+            supervisor.status("wan0").await.expect("status").state,
+            DhcpClientRunState::Degraded { .. }
+        ));
     }
 
     #[test]

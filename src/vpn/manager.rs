@@ -46,12 +46,18 @@ pub enum ManagerError {
     #[error("no owned interface is currently active")]
     NotActive,
 
+    #[error("profile '{0}' is still used by an active owned VPN interface")]
+    ProfileInUse(String),
+
     #[error(
         "refusing to modify interface '{0}': it no longer matches the recorded ownership proof \
          (observed value differs from what this daemon created it with, or the interface is \
          missing) — treating it as foreign"
     )]
     OwnershipProofFailed(String),
+
+    #[error("operation failed: {operation}; rollback also failed: {rollback}")]
+    RollbackFailed { operation: String, rollback: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,12 +119,27 @@ impl<D: VpnDriver> VpnManager<D> {
     }
 
     pub fn import_profile(&self, name: &str, raw: &[u8]) -> Result<String, ManagerError> {
+        self.ensure_profile_not_active(name)?;
         self.driver.import_profile(name, raw)?;
         Ok(name.to_string())
     }
 
     pub fn delete_profile(&self, name: &str) -> Result<(), ManagerError> {
+        self.ensure_profile_not_active(name)?;
         Ok(self.driver.delete_profile(name)?)
+    }
+
+    fn ensure_profile_not_active(&self, name: &str) -> Result<(), ManagerError> {
+        if self
+            .owned
+            .lock()
+            .expect("owned mutex poisoned")
+            .values()
+            .any(|record| record.profile_name == name)
+        {
+            return Err(ManagerError::ProfileInUse(name.to_string()));
+        }
+        Ok(())
     }
 
     /// The legacy single-tunnel record, if `OWNED_INTERFACE_NAME` is active.
@@ -230,25 +251,47 @@ impl<D: VpnDriver> VpnManager<D> {
         let snapshot = self.snapshot_on(interface).await?;
 
         if let Err(error) = self.activate_inner(interface, name, &profile).await {
-            let _ = self.rollback(&snapshot).await;
-            return Err(error);
+            return match self.rollback(&snapshot).await {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(ManagerError::RollbackFailed {
+                    operation: error.to_string(),
+                    rollback: rollback.to_string(),
+                }),
+            };
         }
 
         let record = self
             .active_on(interface)
             .expect("activate_inner set the owned record");
-        let encoded = BASE64.encode(self.driver.encode_ownership_proof(&record.ownership_proof));
-        if let Err(error) = self
-            .active_profile_store
-            .save(&PersistedActiveProfile {
-                profile_name: record.profile_name.clone(),
-                interface: record.interface.clone(),
-                ownership_proof_base64: encoded,
-            })
-            .await
-        {
-            let _ = self.rollback(&snapshot).await;
-            return Err(ManagerError::ActiveProfile(error));
+        let persisted = PersistedActiveProfile {
+            profile_name: record.profile_name.clone(),
+            interface: record.interface.clone(),
+            ownership_proof_base64: BASE64
+                .encode(self.driver.encode_ownership_proof(&record.ownership_proof)),
+        };
+        if let Err(error) = self.active_profile_store.save(&persisted).await {
+            let operation = ManagerError::ActiveProfile(error);
+            return match self.rollback(&snapshot).await {
+                Ok(()) => Err(operation),
+                Err(rollback) => {
+                    // If runtime rollback itself failed, retain/re-create the
+                    // durable proof that lets the next process verify the
+                    // surviving interface before touching it. A second store
+                    // failure is reported explicitly; there is no safe way to
+                    // manufacture crash-recovery evidence when the state disk
+                    // itself is unavailable.
+                    let recovery_marker = self.active_profile_store.save(&persisted).await.err();
+                    Err(ManagerError::RollbackFailed {
+                        operation: operation.to_string(),
+                        rollback: match recovery_marker {
+                            Some(marker) => format!(
+                                "{rollback}; durable ownership recovery marker also failed: {marker}"
+                            ),
+                            None => rollback.to_string(),
+                        },
+                    })
+                }
+            };
         }
 
         Ok(())
@@ -286,19 +329,36 @@ impl<D: VpnDriver> VpnManager<D> {
             .lock()
             .expect("owned mutex poisoned")
             .get(interface)
-            .cloned()
-            .ok_or(ManagerError::NotActive)?;
+            .cloned();
 
-        self.assert_still_owned(&record).await?;
+        let Some(record) = record else {
+            if !self.driver.link_exists(interface).await?
+                && self
+                    .active_profile_store
+                    .load()
+                    .await?
+                    .as_ref()
+                    .is_some_and(|persisted| persisted.interface == interface)
+            {
+                self.active_profile_store.clear().await?;
+                return Ok(());
+            }
+            return Err(ManagerError::NotActive);
+        };
 
-        self.driver.deactivate(&record.interface).await?;
+        if self.driver.link_exists(interface).await? {
+            self.assert_still_owned(&record).await?;
+            self.driver.deactivate(&record.interface).await?;
+        }
 
+        // Keep the in-memory ownership proof until the durable marker is gone.
+        // If this clear fails, a retry sees the missing link and can finish the
+        // persistence cleanup without reporting a false-success deactivation.
+        self.active_profile_store.clear().await?;
         self.owned
             .lock()
             .expect("owned mutex poisoned")
             .remove(interface);
-
-        let _ = self.active_profile_store.clear().await;
         Ok(())
     }
 
@@ -312,6 +372,7 @@ impl<D: VpnDriver> VpnManager<D> {
 
         let currently_exists = self.driver.link_exists(&snapshot.interface).await?;
         if !currently_exists {
+            self.active_profile_store.clear().await?;
             self.owned
                 .lock()
                 .expect("owned mutex poisoned")
@@ -337,6 +398,7 @@ impl<D: VpnDriver> VpnManager<D> {
         self.assert_still_owned(&record).await?;
 
         self.driver.deactivate(&record.interface).await?;
+        self.active_profile_store.clear().await?;
         self.owned
             .lock()
             .expect("owned mutex poisoned")
@@ -353,6 +415,19 @@ impl<D: VpnDriver> VpnManager<D> {
         interface: &str,
     ) -> Result<ReconcileOutcome<D::OwnershipProof>, ManagerError> {
         if !self.driver.link_exists(interface).await? {
+            if self
+                .active_profile_store
+                .load()
+                .await?
+                .as_ref()
+                .is_some_and(|persisted| persisted.interface == interface)
+            {
+                self.active_profile_store.clear().await?;
+            }
+            self.owned
+                .lock()
+                .expect("owned mutex poisoned")
+                .remove(interface);
             return Ok(ReconcileOutcome::Absent);
         }
 
@@ -426,18 +501,13 @@ impl<D: VpnDriver> VpnManager<D> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::sync::Mutex as StdMutex;
-
-    use async_trait::async_trait;
-    use ipnet::IpNet;
-    use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
     use super::*;
+    use crate::test_support::{fake_vpn_public_key, FakeVpnProvider};
     use crate::vpn::store::WireGuardProfileStore;
-    use crate::vpn::wireguard::{WireGuardKey, WireGuardPeerConfig, WireGuardVpnDriver};
-    use crate::vpn::{ProviderError, VpnProvider};
+    use crate::vpn::wireguard::{WireGuardKey, WireGuardVpnDriver};
+    use crate::vpn::VpnProvider;
 
     const VALID_PRIVATE_KEY: &str = "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=";
     const VALID_PUBLIC_KEY: &str = "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=";
@@ -454,140 +524,6 @@ mod tests {
              AllowedIPs = 0.0.0.0/0\n\
              Endpoint = 203.0.113.1:51820\n"
         )
-    }
-
-    fn fake_public_key(private_key: &WireGuardKey) -> WireGuardKey {
-        let digest = Sha256::digest(private_key.0);
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(&digest[..32]);
-        WireGuardKey(bytes)
-    }
-
-    #[derive(Debug, Clone)]
-    struct FakeLink {
-        private_key: WireGuardKey,
-        up: bool,
-    }
-
-    #[derive(Default)]
-    struct FakeVpnProvider {
-        links: StdMutex<HashMap<String, FakeLink>>,
-    }
-
-    impl FakeVpnProvider {
-        fn seed_foreign_link(&self, name: &str, private_key: &str) {
-            let key = WireGuardKey::parse(private_key, "test").unwrap();
-            self.links.lock().unwrap().insert(
-                name.to_string(),
-                FakeLink {
-                    private_key: key,
-                    up: true,
-                },
-            );
-        }
-    }
-
-    #[async_trait]
-    impl VpnProvider for FakeVpnProvider {
-        async fn link_exists(&self, name: &str) -> Result<bool, ProviderError> {
-            Ok(self.links.lock().unwrap().contains_key(name))
-        }
-
-        async fn create_link(
-            &self,
-            name: &str,
-            private_key: &WireGuardKey,
-            _listen_port: Option<u16>,
-        ) -> Result<(), ProviderError> {
-            let mut links = self.links.lock().unwrap();
-            if links.contains_key(name) {
-                return Err(ProviderError::CommandFailed {
-                    command: "ip",
-                    status: "exit code: 1".to_string(),
-                    stderr: "link already exists".to_string(),
-                });
-            }
-            links.insert(
-                name.to_string(),
-                FakeLink {
-                    private_key: private_key.clone(),
-                    up: false,
-                },
-            );
-            Ok(())
-        }
-
-        async fn set_addresses(
-            &self,
-            name: &str,
-            _addresses: &[IpNet],
-        ) -> Result<(), ProviderError> {
-            self.require_link(name)
-        }
-
-        async fn set_peers(
-            &self,
-            name: &str,
-            _peers: &[WireGuardPeerConfig],
-        ) -> Result<(), ProviderError> {
-            self.require_link(name)
-        }
-
-        async fn set_link_up(&self, name: &str) -> Result<(), ProviderError> {
-            let mut links = self.links.lock().unwrap();
-            let link = links
-                .get_mut(name)
-                .ok_or_else(|| ProviderError::NotFound(name.to_string()))?;
-            link.up = true;
-            Ok(())
-        }
-
-        async fn set_link_down(&self, name: &str) -> Result<(), ProviderError> {
-            let mut links = self.links.lock().unwrap();
-            let link = links
-                .get_mut(name)
-                .ok_or_else(|| ProviderError::NotFound(name.to_string()))?;
-            link.up = false;
-            Ok(())
-        }
-
-        async fn delete_link(&self, name: &str) -> Result<(), ProviderError> {
-            self.links
-                .lock()
-                .unwrap()
-                .remove(name)
-                .map(|_| ())
-                .ok_or_else(|| ProviderError::NotFound(name.to_string()))
-        }
-
-        async fn public_key(&self, name: &str) -> Result<Option<WireGuardKey>, ProviderError> {
-            Ok(self
-                .links
-                .lock()
-                .unwrap()
-                .get(name)
-                .map(|link| fake_public_key(&link.private_key)))
-        }
-
-        async fn is_up(&self, name: &str) -> Result<bool, ProviderError> {
-            Ok(self
-                .links
-                .lock()
-                .unwrap()
-                .get(name)
-                .map(|link| link.up)
-                .unwrap_or(false))
-        }
-    }
-
-    impl FakeVpnProvider {
-        fn require_link(&self, name: &str) -> Result<(), ProviderError> {
-            if self.links.lock().unwrap().contains_key(name) {
-                Ok(())
-            } else {
-                Err(ProviderError::NotFound(name.to_string()))
-            }
-        }
     }
 
     type TestManager = VpnManager<WireGuardVpnDriver>;
@@ -638,6 +574,35 @@ mod tests {
         manager.deactivate().await.expect("deactivate");
         assert!(manager.active().is_none());
         assert!(!fake.link_exists(OWNED_INTERFACE_NAME).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn delete_refuses_profile_used_by_an_active_owned_interface() {
+        let (manager, _fake, _dir) = manager_with_store();
+        manager
+            .import_profile("home.conf", valid_config(VALID_PRIVATE_KEY).as_bytes())
+            .expect("import");
+        manager.activate("home.conf").await.expect("activate");
+
+        let error = manager
+            .delete_profile("home.conf")
+            .expect_err("active profile must not be deleted");
+        assert!(matches!(error, ManagerError::ProfileInUse(name) if name == "home.conf"));
+        assert_eq!(manager.list_profiles().expect("profiles").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn import_refuses_to_overwrite_profile_used_by_an_active_owned_interface() {
+        let (manager, _fake, _dir) = manager_with_store();
+        manager
+            .import_profile("home.conf", valid_config(VALID_PRIVATE_KEY).as_bytes())
+            .expect("import");
+        manager.activate("home.conf").await.expect("activate");
+
+        let error = manager
+            .import_profile("home.conf", valid_config(OTHER_PRIVATE_KEY).as_bytes())
+            .expect_err("active profile must not be overwritten");
+        assert!(matches!(error, ManagerError::ProfileInUse(name) if name == "home.conf"));
     }
 
     #[tokio::test]
@@ -986,7 +951,7 @@ mod tests {
     #[test]
     fn ownership_record_round_trip_matches_kernel_reported_key() {
         let private_key = WireGuardKey::parse(VALID_PRIVATE_KEY, "test").unwrap();
-        let expected_public = fake_public_key(&private_key);
+        let expected_public = fake_vpn_public_key(&private_key);
 
         let record = OwnedInterfaceRecord {
             interface: OWNED_INTERFACE_NAME.to_string(),

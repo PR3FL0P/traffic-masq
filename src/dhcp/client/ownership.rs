@@ -9,7 +9,7 @@ use crate::{
     },
     netlink::{
         AddressOwnership, Ipv4RouteInfo, Ipv4RouteSpec, NetworkProvider,
-        TRAFFIC_MASQ_DHCP_ROUTE_PROTOCOL,
+        TRAFFIC_MASQ_DHCP_ADDRESS_PROTOCOL, TRAFFIC_MASQ_DHCP_ROUTE_PROTOCOL,
     },
 };
 
@@ -91,7 +91,7 @@ impl DhcpClientOwnershipApplier {
                 }
                 .into());
             }
-            if !exact_recorded {
+            if !exact_recorded || address.protocol != Some(TRAFFIC_MASQ_DHCP_ADDRESS_PROTOCOL) {
                 return Err(OwnershipConflict::ForeignAddress {
                     address: lease.address,
                 }
@@ -183,9 +183,43 @@ impl DhcpClientOwnershipApplier {
             self.cleanup(interface).await?;
             return Err(OwnershipConflict::Expired.into());
         }
-        if lease.state != DhcpClientLeaseState::Bound || self.observe_exact(&lease).await.is_err() {
-            return Err(OwnershipConflict::ObservationMismatch.into());
+        match lease.state {
+            DhcpClientLeaseState::Bound => self.observe_exact(&lease).await?,
+            DhcpClientLeaseState::Suspended => self.verify_absent(&lease).await?,
+            DhcpClientLeaseState::PendingApply | DhcpClientLeaseState::CleanupNeeded => {
+                return Err(OwnershipConflict::ObservationMismatch.into())
+            }
         }
+        Ok(Some(lease))
+    }
+
+    pub async fn suspend(
+        &self,
+        interface: &str,
+        now_unix: u64,
+    ) -> Result<Option<DhcpClientLease>, OwnershipError> {
+        let Some(mut lease) = self.store.load(interface)? else {
+            return Ok(None);
+        };
+        match self.verify_identity(&lease).await {
+            Ok(()) => {}
+            Err(OwnershipError::Conflict(OwnershipConflict::InterfaceMissing { .. })) => {
+                self.store.remove(interface)?;
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        }
+        if lease.expires_at_unix <= now_unix {
+            self.cleanup(interface).await?;
+            return Ok(None);
+        }
+
+        lease.state = DhcpClientLeaseState::CleanupNeeded;
+        self.store.save(&lease)?;
+        self.remove_owned_kernel_state(&lease).await?;
+        self.verify_absent(&lease).await?;
+        lease.state = DhcpClientLeaseState::Suspended;
+        self.store.save(&lease)?;
         Ok(Some(lease))
     }
 
@@ -203,12 +237,22 @@ impl DhcpClientOwnershipApplier {
         }
         lease.state = DhcpClientLeaseState::CleanupNeeded;
         self.store.save(&lease)?;
+        self.remove_owned_kernel_state(&lease).await?;
+        self.verify_absent(&lease).await?;
+        self.store.remove(interface)?;
+        Ok(())
+    }
+
+    async fn remove_owned_kernel_state(
+        &self,
+        lease: &DhcpClientLease,
+    ) -> Result<(), OwnershipError> {
         let routes = self
             .network
             .list_ipv4_routes()
             .await
             .map_err(OwnershipError::Network)?;
-        for owned in &lease.owned_routes {
+        for owned in lease.owned_routes.iter().rev() {
             if let Some(route) = routes
                 .iter()
                 .find(|route| route_complete_matches(route, owned))
@@ -221,21 +265,18 @@ impl DhcpClientOwnershipApplier {
         }
         let addresses = self
             .network
-            .list_ipv4_addresses(interface)
+            .list_ipv4_addresses(&lease.interface)
             .await
             .map_err(OwnershipError::Network)?;
-        if addresses.iter().any(|item| {
-            item.interface_index == lease.interface_index
-                && item.address == lease.address
-                && item.prefix_len == lease.prefix_len
-        }) {
+        if addresses
+            .iter()
+            .any(|item| address_complete_matches(item, lease))
+        {
             self.network
-                .delete_ipv4_address(interface, lease.address, lease.prefix_len)
+                .delete_ipv4_address(&lease.interface, lease.address, lease.prefix_len)
                 .await
                 .map_err(OwnershipError::Network)?;
         }
-        self.verify_absent(&lease).await?;
-        self.store.remove(interface)?;
         Ok(())
     }
 
@@ -274,11 +315,7 @@ impl DhcpClientOwnershipApplier {
             .list_ipv4_addresses(&lease.interface)
             .await
             .map_err(OwnershipError::Network)?;
-        if !addresses.iter().any(|item| {
-            item.interface_index == lease.interface_index
-                && item.address == lease.address
-                && item.prefix_len == lease.prefix_len
-        }) {
+        if !addresses.iter().any(|item| address_complete_matches(item, lease)) {
             return Err(OwnershipConflict::ObservationMismatch.into());
         }
         let routes = self
@@ -307,11 +344,7 @@ impl DhcpClientOwnershipApplier {
             .list_ipv4_routes()
             .await
             .map_err(OwnershipError::Network)?;
-        if addresses.iter().any(|item| {
-            item.interface_index == lease.interface_index
-                && item.address == lease.address
-                && item.prefix_len == lease.prefix_len
-        }) || lease.owned_routes.iter().any(|owned| {
+        if addresses.iter().any(|item| address_complete_matches(item, lease)) || lease.owned_routes.iter().any(|owned| {
             routes
                 .iter()
                 .any(|route| route_complete_matches(route, owned))
@@ -351,11 +384,7 @@ impl DhcpClientOwnershipApplier {
                 .list_ipv4_addresses(&lease.interface)
                 .await
                 .map_err(OwnershipError::Network)?;
-            if observed.iter().any(|item| {
-                item.interface_index == lease.interface_index
-                    && item.address == lease.address
-                    && item.prefix_len == lease.prefix_len
-            }) {
+            if observed.iter().any(|item| address_complete_matches(item, lease)) {
                 self.network
                     .delete_ipv4_address(&lease.interface, lease.address, lease.prefix_len)
                     .await
@@ -373,11 +402,7 @@ impl DhcpClientOwnershipApplier {
             .await
             .map_err(OwnershipError::Network)?;
         if (address
-            && observed_addresses.iter().any(|item| {
-                item.interface_index == lease.interface_index
-                    && item.address == lease.address
-                    && item.prefix_len == lease.prefix_len
-            }))
+            && observed_addresses.iter().any(|item| address_complete_matches(item, lease)))
             || routes.iter().any(|owned| {
                 observed_routes
                     .iter()
@@ -390,6 +415,13 @@ impl DhcpClientOwnershipApplier {
         }
         Ok(())
     }
+}
+
+fn address_complete_matches(address: &crate::netlink::Ipv4AddressInfo, lease: &DhcpClientLease) -> bool {
+    address.interface_index == lease.interface_index
+        && address.address == lease.address
+        && address.prefix_len == lease.prefix_len
+        && address.protocol == Some(TRAFFIC_MASQ_DHCP_ADDRESS_PROTOCOL)
 }
 
 fn same_identity(left: &DhcpClientLease, right: &DhcpClientLease) -> bool {
@@ -437,7 +469,10 @@ mod tests {
     use super::*;
     use crate::{
         dhcp::client::lease::DHCP_CLIENT_LEASE_SCHEMA_VERSION,
-        netlink::{Ipv4AddressInfo, NetworkInterface, TRAFFIC_MASQ_ROUTE_PROTOCOL},
+        netlink::{
+            Ipv4AddressInfo, NetworkInterface, TRAFFIC_MASQ_ADDRESS_PROTOCOL,
+            TRAFFIC_MASQ_ROUTE_PROTOCOL,
+        },
     };
 
     #[derive(Default)]
@@ -615,6 +650,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn suspend_removes_kernel_state_but_keeps_lease_for_revalidation() {
+        let network = FakeNetwork::new();
+        let (_dir, store, applier) = fixture(network.clone());
+        let bound = applier.apply(lease()).await.unwrap();
+
+        let suspended = applier
+            .suspend("eth0", 5_000)
+            .await
+            .unwrap()
+            .expect("suspended lease");
+        assert_eq!(suspended.state, DhcpClientLeaseState::Suspended);
+        assert!(network.addresses.lock().unwrap().is_empty());
+        assert!(network.routes.lock().unwrap().is_empty());
+        assert_eq!(applier.adopt("eth0", 5_000).await.unwrap(), Some(suspended));
+        assert!(store.load("eth0").unwrap().is_some());
+        assert_eq!(bound.address, lease().address);
+    }
+
+    #[tokio::test]
     async fn unrecorded_identical_and_different_prefix_addresses_are_refused() {
         for prefix_len in [24, 25] {
             let network = FakeNetwork::new();
@@ -661,7 +715,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cleanup_never_removes_protocol_201_or_different_prefix() {
+    async fn cleanup_never_removes_foreign_address_or_route_state() {
         let network = FakeNetwork::new();
         let (_dir, store, applier) = fixture(network.clone());
         let mut record = lease();
@@ -672,7 +726,7 @@ mod tests {
                 interface_index: 2,
                 address: record.address,
                 prefix_len: 24,
-                protocol: None,
+                protocol: Some(TRAFFIC_MASQ_ADDRESS_PROTOCOL),
             },
             Ipv4AddressInfo {
                 interface_index: 2,
@@ -703,11 +757,36 @@ mod tests {
             },
         ]);
         applier.cleanup("eth0").await.unwrap();
-        assert_eq!(network.addresses.lock().unwrap()[0].prefix_len, 25);
+        assert_eq!(network.addresses.lock().unwrap().len(), 2);
+        assert_eq!(
+            network.addresses.lock().unwrap()[0].protocol,
+            Some(TRAFFIC_MASQ_ADDRESS_PROTOCOL)
+        );
         assert_eq!(
             network.routes.lock().unwrap()[0].protocol,
             TRAFFIC_MASQ_ROUTE_PROTOCOL
         );
+    }
+
+    #[tokio::test]
+    async fn recorded_address_retagged_away_from_dhcp_ownership_is_refused() {
+        let network = FakeNetwork::new();
+        let (_dir, store, applier) = fixture(network.clone());
+        let mut record = lease();
+        record.state = DhcpClientLeaseState::Bound;
+        store.save(&record).unwrap();
+        network.addresses.lock().unwrap().push(Ipv4AddressInfo {
+            interface_index: 2,
+            address: record.address,
+            prefix_len: record.prefix_len,
+            protocol: Some(TRAFFIC_MASQ_ADDRESS_PROTOCOL),
+        });
+
+        assert!(matches!(
+            applier.apply(lease()).await,
+            Err(OwnershipError::Conflict(OwnershipConflict::ForeignAddress { .. }))
+        ));
+        assert_eq!(network.addresses.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

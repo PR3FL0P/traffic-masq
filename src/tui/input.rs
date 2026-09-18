@@ -4,6 +4,23 @@ use ratatui::text::Span;
 
 use super::theme;
 
+/// Moves within an ordered set of focusable fields without wrapping.
+pub(crate) fn move_clamped<T: Copy + PartialEq>(items: &[T], current: T, forward: bool) -> T {
+    let index = items.iter().position(|item| *item == current).unwrap_or(0);
+    items[if forward {
+        (index + 1).min(items.len() - 1)
+    } else {
+        index.saturating_sub(1)
+    }]
+}
+
+/// Moves within an ordered set of focusable fields and wraps at both ends.
+pub(crate) fn move_wrapped<T: Copy + PartialEq>(items: &[T], current: T, forward: bool) -> T {
+    let index = items.iter().position(|item| *item == current).unwrap_or(0);
+    let step = if forward { 1 } else { items.len() - 1 };
+    items[(index + step) % items.len()]
+}
+
 /// Helper for editing text with a movable cursor, insertion, deletion, and navigation.
 pub(crate) struct TextEditor<'a> {
     pub value: &'a mut String,

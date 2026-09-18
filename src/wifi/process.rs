@@ -26,6 +26,9 @@ pub enum ProcessError {
 
     #[error("failed to signal process {pid}: {source}")]
     Signal { pid: u32, source: nix::errno::Errno },
+
+    #[error("{daemon} process {pid} remained alive after SIGKILL")]
+    StopTimeout { pid: u32, daemon: &'static str },
 }
 
 #[async_trait]

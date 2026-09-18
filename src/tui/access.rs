@@ -406,19 +406,11 @@ pub(crate) async fn reset_access_settings(app: &mut TuiApp, client: &ApiClient) 
 }
 
 fn next_field(current: AccessField) -> AccessField {
-    let index = ACCESS_FIELDS
-        .iter()
-        .position(|field| *field == current)
-        .unwrap_or(0);
-    ACCESS_FIELDS[(index + 1).min(ACCESS_FIELDS.len() - 1)]
+    super::input::move_clamped(&ACCESS_FIELDS, current, true)
 }
 
 fn previous_field(current: AccessField) -> AccessField {
-    let index = ACCESS_FIELDS
-        .iter()
-        .position(|field| *field == current)
-        .unwrap_or(0);
-    ACCESS_FIELDS[index.saturating_sub(1)]
+    super::input::move_clamped(&ACCESS_FIELDS, current, false)
 }
 
 #[cfg(test)]

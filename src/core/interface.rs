@@ -551,11 +551,11 @@ impl InterfaceManager {
                 address = %describe_address(address),
                 "applying interface plan: deleting IPv4 address"
             );
-            self.record_release(&plan.interface, address).await;
+            self.record_release(&plan.interface, address).await?;
             self.provider
                 .delete_ipv4_address(&plan.interface, address.address, address.prefix_len)
                 .await?;
-            self.record_released(&plan.interface, address).await;
+            self.record_released(&plan.interface, address).await?;
         }
 
         if let Some(address) = &plan.retag_ipv4 {
@@ -564,7 +564,7 @@ impl InterfaceManager {
                 address = %describe_address(address),
                 "applying interface plan: claiming existing IPv4 address in place"
             );
-            self.record_claim(&plan.interface, address).await;
+            self.record_claim(&plan.interface, address).await?;
             self.provider
                 .set_ipv4_address_ownership(
                     &plan.interface,
@@ -573,7 +573,7 @@ impl InterfaceManager {
                     address.owner().restore_as(),
                 )
                 .await?;
-            self.record_claimed(&plan.interface, address).await;
+            self.record_claimed(&plan.interface, address).await?;
         }
 
         if let Some(address) = &plan.add_ipv4 {
@@ -582,7 +582,7 @@ impl InterfaceManager {
                 address = %describe_address(address),
                 "applying interface plan: adding IPv4 address"
             );
-            self.record_claim(&plan.interface, address).await;
+            self.record_claim(&plan.interface, address).await?;
             self.provider
                 .add_ipv4_address(
                     &plan.interface,
@@ -591,7 +591,7 @@ impl InterfaceManager {
                     address.owner().restore_as(),
                 )
                 .await?;
-            self.record_claimed(&plan.interface, address).await;
+            self.record_claimed(&plan.interface, address).await?;
         }
 
         if plan.set_link_up {
@@ -612,68 +612,55 @@ impl InterfaceManager {
     /// address goes on untagged, and that is exactly when the journal is the
     /// only record there is.
     ///
-    /// A journal that cannot be written is logged and does not fail the
-    /// operation: the address still has to go on, and a machine that refuses to
-    /// configure its network because a bookkeeping file is unwritable is worse
-    /// than one whose bookkeeping is incomplete.
-    async fn record_claim(&self, interface: &str, address: &Ipv4AddressInfo) {
-        if let Err(error) = self
-            .journal
+    /// Ownership bookkeeping is part of the mutation protocol, not optional
+    /// telemetry. If it cannot be written, fail before touching the kernel so
+    /// crash recovery never loses the authority record for an address.
+    async fn record_claim(&self, interface: &str, address: &Ipv4AddressInfo) -> Result<()> {
+        self.journal
             .claim(interface, address.address, address.prefix_len)
             .await
-        {
-            tracing::warn!(
-                interface = %interface,
-                address = %describe_address(address),
-                %error,
-                "failed to record IPv4 address ownership before installing it"
-            );
-        }
+            .with_context(|| {
+                format!(
+                    "failed to record IPv4 address ownership before installing {} on {interface}",
+                    describe_address(address)
+                )
+            })
     }
 
-    async fn record_claimed(&self, interface: &str, address: &Ipv4AddressInfo) {
-        if let Err(error) = self
-            .journal
+    async fn record_claimed(&self, interface: &str, address: &Ipv4AddressInfo) -> Result<()> {
+        self.journal
             .confirm(interface, address.address, address.prefix_len)
             .await
-        {
-            tracing::warn!(
-                interface = %interface,
-                address = %describe_address(address),
-                %error,
-                "failed to confirm IPv4 address ownership after installing it"
-            );
-        }
+            .with_context(|| {
+                format!(
+                    "failed to confirm IPv4 address ownership after installing {} on {interface}",
+                    describe_address(address)
+                )
+            })
     }
 
-    async fn record_release(&self, interface: &str, address: &Ipv4AddressInfo) {
-        if let Err(error) = self
-            .journal
+    async fn record_release(&self, interface: &str, address: &Ipv4AddressInfo) -> Result<()> {
+        self.journal
             .releasing(interface, address.address, address.prefix_len)
             .await
-        {
-            tracing::warn!(
-                interface = %interface,
-                address = %describe_address(address),
-                %error,
-                "failed to record IPv4 address release before removing it"
-            );
-        }
+            .with_context(|| {
+                format!(
+                    "failed to record IPv4 address release before removing {} from {interface}",
+                    describe_address(address)
+                )
+            })
     }
 
-    async fn record_released(&self, interface: &str, address: &Ipv4AddressInfo) {
-        if let Err(error) = self
-            .journal
+    async fn record_released(&self, interface: &str, address: &Ipv4AddressInfo) -> Result<()> {
+        self.journal
             .release(interface, address.address, address.prefix_len)
             .await
-        {
-            tracing::warn!(
-                interface = %interface,
-                address = %describe_address(address),
-                %error,
-                "failed to drop the IPv4 address claim after removing it"
-            );
-        }
+            .with_context(|| {
+                format!(
+                    "failed to drop IPv4 address ownership after removing {} from {interface}",
+                    describe_address(address)
+                )
+            })
     }
 
     pub async fn rollback(&self, snapshot: &InterfaceSnapshot) -> Result<()> {
@@ -702,11 +689,11 @@ impl InterfaceManager {
                     address = %describe_address(address),
                     "rollback: deleting IPv4 address that was not in the snapshot"
                 );
-                self.record_release(&snapshot.name, address).await;
+                self.record_release(&snapshot.name, address).await?;
                 self.provider
                     .delete_ipv4_address(&snapshot.name, address.address, address.prefix_len)
                     .await?;
-                self.record_released(&snapshot.name, address).await;
+                self.record_released(&snapshot.name, address).await?;
             }
         }
 
@@ -727,7 +714,7 @@ impl InterfaceManager {
                         "rollback: restoring the ownership tag of an existing IPv4 address"
                     );
                     if ours {
-                        self.record_claim(&snapshot.name, address).await;
+                        self.record_claim(&snapshot.name, address).await?;
                     }
                     self.provider
                         .set_ipv4_address_ownership(
@@ -738,7 +725,7 @@ impl InterfaceManager {
                         )
                         .await?;
                     if ours {
-                        self.record_claimed(&snapshot.name, address).await;
+                        self.record_claimed(&snapshot.name, address).await?;
                     }
                 }
                 Some(_) => {}
@@ -749,7 +736,7 @@ impl InterfaceManager {
                         "rollback: re-adding an IPv4 address from the snapshot"
                     );
                     if ours {
-                        self.record_claim(&snapshot.name, address).await;
+                        self.record_claim(&snapshot.name, address).await?;
                     }
                     self.provider
                         .add_ipv4_address(
@@ -760,7 +747,7 @@ impl InterfaceManager {
                         )
                         .await?;
                     if ours {
-                        self.record_claimed(&snapshot.name, address).await;
+                        self.record_claimed(&snapshot.name, address).await?;
                     }
                 }
             }

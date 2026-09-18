@@ -107,11 +107,18 @@ struct Inner {
     desired: std::sync::Mutex<DesiredNetworkState>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingPhase {
+    AwaitingCommit,
+    RollbackRequired,
+}
+
 #[derive(Debug, Clone)]
 struct PendingTransaction {
     info: PendingNetworkChange,
     target: InterfaceConfig,
     allow_management_change: bool,
+    phase: PendingPhase,
 }
 
 impl NetworkTransactionManager {
@@ -347,8 +354,38 @@ impl NetworkTransactionManager {
 
         if let Err(error) = self.await_convergence(&desired, interface).await {
             desired.withdraw(&token).await;
-            if self.await_convergence(&desired, interface).await.is_ok() {
-                self.clear_journal(interface).await?;
+            let rollback = match self.await_convergence(&desired, interface).await {
+                Ok(()) => self.clear_journal(interface).await,
+                Err(error) => Err(error),
+            };
+            if let Err(rollback_error) = rollback {
+                // The requested state is no longer desired, but until a fresh
+                // convergence pass proves the committed state was restored the
+                // transaction must stay visible and block overlapping network
+                // mutations. The token is rollback-only: a failed candidate
+                // must never become committable merely because compensation
+                // also failed.
+                let rollback_timeout_seconds = self.inner.rollback_timeout.as_secs();
+                let info = PendingNetworkChange {
+                    token: token.clone(),
+                    interface: interface.to_string(),
+                    rollback_timeout_seconds,
+                    expires_at_unix: current_unix_time()
+                        .saturating_add(rollback_timeout_seconds),
+                };
+                self.inner.pending.lock().await.insert(
+                    token.clone(),
+                    PendingTransaction {
+                        info,
+                        target: config.clone(),
+                        allow_management_change,
+                        phase: PendingPhase::RollbackRequired,
+                    },
+                );
+                self.spawn_rollback_timer(token.clone());
+                bail!(
+                    "network change failed to converge: {error}; rollback also failed: {rollback_error}; recovery remains pending as token {token}"
+                );
             }
             return Err(error);
         }
@@ -370,6 +407,7 @@ impl NetworkTransactionManager {
                 info: info.clone(),
                 target: config.clone(),
                 allow_management_change,
+                phase: PendingPhase::AwaitingCommit,
             },
         );
 
@@ -433,6 +471,10 @@ impl NetworkTransactionManager {
             let pending = pending
                 .get(token)
                 .ok_or_else(|| anyhow::anyhow!("pending network change not found: {token}"))?;
+            anyhow::ensure!(
+                pending.phase == PendingPhase::AwaitingCommit,
+                "network change {token} failed during apply and is rollback-only"
+            );
             (
                 pending.info.interface.clone(),
                 pending.target.clone(),
@@ -488,24 +530,25 @@ impl NetworkTransactionManager {
             "network change is being rolled back; the committed configuration will be converged to"
         );
         let desired = self.desired();
-        desired.withdraw(token).await;
-        self.inner.pending.lock().await.remove(token);
+        if desired.withdraw(token).await.is_empty() {
+            desired.request_convergence();
+        }
         if let Err(error) = self
             .await_convergence(&desired, &pending.info.interface)
             .await
         {
-            // The change is gone from the desired state either way, so this is
-            // not a failed rollback — it is convergence not having caught up,
-            // and it will, on its own.
-            tracing::warn!(
-                interface = %pending.info.interface,
-                %token,
-                %error,
-                "rolled-back interface has not converged back to its committed configuration yet"
+            // Keep both the pending record and recovery journal. The desired
+            // state already points back at the committed configuration, so a
+            // later retry only needs to verify convergence; reporting success
+            // here would falsely claim the runtime had been restored.
+            bail!(
+                "failed to confirm rollback convergence for interface {}: {error}",
+                pending.info.interface
             );
-        } else {
-            self.clear_journal(&pending.info.interface).await?;
         }
+
+        self.clear_journal(&pending.info.interface).await?;
+        self.inner.pending.lock().await.remove(token);
         Ok(pending.info)
     }
 
@@ -514,29 +557,41 @@ impl NetworkTransactionManager {
         let pending: Vec<_> = self.inner.pending.lock().await.values().cloned().collect();
         let desired = self.desired();
 
+        let mut errors = Vec::new();
         for transaction in pending {
-            desired.withdraw(&transaction.info.token).await;
-            self.inner
-                .pending
-                .lock()
-                .await
-                .remove(&transaction.info.token);
-            if let Err(error) = self
+            if desired.withdraw(&transaction.info.token).await.is_empty() {
+                desired.request_convergence();
+            }
+            match self
                 .await_convergence(&desired, &transaction.info.interface)
                 .await
             {
-                tracing::warn!(
-                    interface = %transaction.info.interface,
-                    token = %transaction.info.token,
-                    %error,
-                    "interface has not converged back to its committed configuration yet"
-                );
-            } else {
-                self.clear_journal(&transaction.info.interface).await?;
+                Ok(()) => {
+                    if let Err(error) = self.clear_journal(&transaction.info.interface).await {
+                        errors.push(format!(
+                            "{}: failed to clear recovery journal: {error}",
+                            transaction.info.interface
+                        ));
+                    } else {
+                        self.inner
+                            .pending
+                            .lock()
+                            .await
+                            .remove(&transaction.info.token);
+                    }
+                }
+                Err(error) => errors.push(format!(
+                    "{}: rollback convergence failed: {error}",
+                    transaction.info.interface
+                )),
             }
         }
 
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            bail!("failed to roll back all pending network changes: {}", errors.join("; "))
+        }
     }
 
     pub async fn restore_baselines(&self) -> Result<()> {
@@ -1032,6 +1087,66 @@ mod tests {
                 .ipv4,
             Some(PROPOSED.parse().expect("network"))
         );
+    }
+
+    #[tokio::test]
+    async fn failed_apply_with_failed_compensation_stays_pending_and_rollback_only() {
+        let directory = tempdir().expect("tempdir");
+        let desired = desired_state(directory.path()).await;
+        desired.attach_converger();
+        let manager = NetworkTransactionManager::new(
+            InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory()),
+            Duration::from_secs(60),
+            desired.clone(),
+        );
+
+        let apply_manager = manager.clone();
+        let apply = tokio::spawn(async move {
+            apply_manager
+                .apply(
+                    "test0",
+                    &interface_config(PROPOSED),
+                    Some(InterfaceRole::Output),
+                    false,
+                )
+                .await
+        });
+
+        while desired.version() < 1 {
+            tokio::task::yield_now().await;
+        }
+        desired.report_result(1, Err(anyhow::anyhow!("candidate failed")));
+        while desired.version() < 2 {
+            tokio::task::yield_now().await;
+        }
+        desired.report_result(2, Err(anyhow::anyhow!("rollback failed")));
+
+        let error = apply.await.expect("apply task").expect_err("apply must fail");
+        assert!(error.to_string().contains("candidate failed"));
+        assert!(error.to_string().contains("rollback failed"));
+        assert!(!desired.is_tentative("test0").await);
+
+        let pending = manager.pending().await;
+        assert_eq!(pending.len(), 1, "failed compensation must remain recoverable");
+        let token = pending[0].token.clone();
+        let commit_error = manager
+            .commit(&token)
+            .await
+            .expect_err("a candidate that never converged cannot be committed");
+        assert!(commit_error.to_string().contains("rollback-only"));
+
+        let rollback_manager = manager.clone();
+        let rollback_token = token.clone();
+        let rollback = tokio::spawn(async move { rollback_manager.rollback(&rollback_token).await });
+        while desired.version() < 3 {
+            tokio::task::yield_now().await;
+        }
+        desired.report_pass(3, BTreeMap::new());
+        rollback
+            .await
+            .expect("rollback task")
+            .expect("retry rollback");
+        assert!(manager.pending().await.is_empty());
     }
 
     /// A change the planner refuses never becomes a proposal: the converger

@@ -254,6 +254,16 @@ impl DesiredNetworkState {
         released
     }
 
+    /// Ask the converger to make and report a fresh pass even though the
+    /// desired configuration itself did not change. This is used when a
+    /// rollback is retried after its tentative layer was already withdrawn:
+    /// waiting on the old version would otherwise immediately replay the
+    /// previous failed convergence result.
+    pub fn request_convergence(&self) {
+        self.version.fetch_add(1, Ordering::SeqCst);
+        self.tentative_changed.notify_one();
+    }
+
     /// Wait until the desired state moves, from either layer.
     ///
     /// There is one convergence consumer. Each layer retains one notification

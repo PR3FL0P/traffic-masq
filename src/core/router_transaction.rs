@@ -1,11 +1,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::{Mutex, MutexGuard, RwLock};
 
 use crate::core::override_manager::RuntimeOverrideManager;
 use crate::core::router::{RouterDesired, RouterManager, RouterPlan, RouterSnapshot};
@@ -100,6 +100,11 @@ struct TransactionJournal {
     base_revision: u64,
     token: String,
     snapshot: RouterSnapshot,
+    /// The state that may have been partially applied when the process died.
+    /// Version-1 journals do not have this field; recovery for those keeps the
+    /// historical snapshot-only behaviour.
+    #[serde(default)]
+    current_desired: Option<RouterDesired>,
 }
 
 struct Inner {
@@ -109,6 +114,7 @@ struct Inner {
     state: Mutex<CoordinatorState>,
     journal: std::path::PathBuf,
     token_counter: AtomicU64,
+    timeout_mutation_gate: StdRwLock<Option<Arc<RwLock<()>>>>,
 }
 
 #[derive(Clone)]
@@ -130,8 +136,20 @@ impl RouterTransactionCoordinator {
                 rollback_timeout,
                 state: Mutex::new(CoordinatorState::Idle),
                 token_counter: AtomicU64::new(0),
+                timeout_mutation_gate: StdRwLock::new(None),
             }),
         }
+    }
+
+    /// Gate used by the automatic timeout rollback. API-driven router
+    /// operations are already serialized by ControlService; the timer is the
+    /// one mutation path that otherwise has no request-level guard.
+    pub fn set_timeout_mutation_gate(&self, gate: Arc<RwLock<()>>) {
+        *self
+            .inner
+            .timeout_mutation_gate
+            .write()
+            .expect("router timeout mutation-gate lock poisoned") = Some(gate);
     }
 
     pub async fn plan(&self, candidate: RouterCandidate) -> Result<TransactionPlan> {
@@ -174,7 +192,12 @@ impl RouterTransactionCoordinator {
         }
 
         let token = self.next_token();
-        self.write_journal(plan.candidate.base_revision(), &token, &current_snapshot)
+        self.write_journal(
+            plan.candidate.base_revision(),
+            &token,
+            &current_snapshot,
+            plan.candidate.desired(),
+        )
             .await?;
         if let Err(error) = self.inner.manager.apply(&plan.plan).await {
             // Retry the complete snapshot: a failed apply may also have failed
@@ -227,6 +250,7 @@ impl RouterTransactionCoordinator {
             }
         }
 
+        self.inner.manager.prepare_recovery(&desired).await?;
         let plan = self.inner.manager.plan(desired).await?;
         self.inner.manager.apply(&plan).await
     }
@@ -377,6 +401,16 @@ impl RouterTransactionCoordinator {
     }
 
     async fn rollback_timeout_fired(&self, token: &str) {
+        let gate = self
+            .inner
+            .timeout_mutation_gate
+            .read()
+            .expect("router timeout mutation-gate lock poisoned")
+            .clone();
+        let _network_mutation = match gate {
+            Some(gate) => Some(gate.write_owned().await),
+            None => None,
+        };
         let mut state = self.inner.state.lock().await;
         match &*state {
             CoordinatorState::Pending(pending) if pending.token == token => {}
@@ -405,12 +439,14 @@ impl RouterTransactionCoordinator {
         base_revision: u64,
         token: &str,
         snapshot: &RouterSnapshot,
+        current_desired: &RouterDesired,
     ) -> Result<()> {
         let journal = TransactionJournal {
-            version: 1,
+            version: 2,
             base_revision,
             token: token.to_owned(),
             snapshot: snapshot.clone(),
+            current_desired: Some(current_desired.clone()),
         };
         let bytes = serde_json::to_vec(&journal)?;
         if let Some(parent) = self.inner.journal.parent() {
@@ -423,24 +459,14 @@ impl RouterTransactionCoordinator {
             })
             .await??;
         }
-        crate::atomic_file::replace_async(&self.inner.journal, &bytes, 0o600).await?;
+        crate::atomic_file::replace_preserving_on_error_async(&self.inner.journal, &bytes, 0o600)
+            .await?;
         Ok(())
     }
 
     async fn clear_journal(&self) -> Result<()> {
-        let path = self.inner.journal.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            crate::atomic_file::reject_symlink(&path)?;
-            match std::fs::remove_file(&path) {
-                Ok(()) => {
-                    std::fs::File::open(path.parent().context("journal parent")?)?.sync_all()?
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-            Ok(())
-        })
-        .await??;
+        crate::atomic_file::remove_preserving_on_error_async(&self.inner.journal, 0o600)
+            .await?;
         Ok(())
     }
 
@@ -456,7 +482,7 @@ impl RouterTransactionCoordinator {
         let journal: TransactionJournal =
             serde_json::from_slice(&bytes).context("invalid router transaction journal")?;
         anyhow::ensure!(
-            journal.version == 1,
+            matches!(journal.version, 1 | 2),
             "unsupported router transaction journal version"
         );
         let revision = self.inner.overrides.committed_revision().await;
@@ -473,6 +499,13 @@ impl RouterTransactionCoordinator {
             .as_deref()
             == Some(journal.token.as_str());
         if !committed {
+            if let Some(current_desired) = journal.current_desired.as_ref() {
+                self.inner
+                    .manager
+                    .prepare_recovery(current_desired)
+                    .await
+                    .context("failed to reconstruct partially-applied router state")?;
+            }
             let failures = self.inner.manager.rollback_to(&journal.snapshot).await;
             anyhow::ensure!(
                 failures.is_empty(),
@@ -766,7 +799,7 @@ mod tests {
             .await
             .unwrap();
         coordinator
-            .write_journal(candidate.base_revision(), "test-transaction", &snapshot)
+            .write_journal(candidate.base_revision(), "test-transaction", &snapshot, candidate.desired())
             .await
             .unwrap();
         let restored = RouterTransactionCoordinator::new(
@@ -793,7 +826,7 @@ mod tests {
             .await
             .unwrap();
         coordinator
-            .write_journal(candidate.base_revision(), "test-transaction", &snapshot)
+            .write_journal(candidate.base_revision(), "test-transaction", &snapshot, candidate.desired())
             .await
             .unwrap();
         overrides
@@ -824,7 +857,7 @@ mod tests {
             .await
             .unwrap();
         coordinator
-            .write_journal(candidate.base_revision(), "test-transaction", &snapshot)
+            .write_journal(candidate.base_revision(), "test-transaction", &snapshot, candidate.desired())
             .await
             .unwrap();
         fake.fail_rollback("rollback_routes");
@@ -846,7 +879,7 @@ mod tests {
             .await
             .unwrap();
         coordinator
-            .write_journal(candidate.base_revision(), "unconfirmed", &snapshot)
+            .write_journal(candidate.base_revision(), "unconfirmed", &snapshot, candidate.desired())
             .await
             .unwrap();
         overrides
@@ -893,11 +926,12 @@ mod tests {
                 rollback_timeout: Duration::from_secs(60),
                 state: Mutex::new(CoordinatorState::Idle),
                 token_counter: AtomicU64::new(0),
+                timeout_mutation_gate: StdRwLock::new(None),
             }),
         };
 
         isolated_coordinator
-            .write_journal(candidate.base_revision(), "token-1", &snapshot)
+            .write_journal(candidate.base_revision(), "token-1", &snapshot, candidate.desired())
             .await
             .unwrap();
 

@@ -38,21 +38,12 @@ const VPN_POLICY_FIELDS: [VpnPolicyField; 4] = [
     VpnPolicyField::Reload,
 ];
 
-fn vpn_policy_field_index(field: VpnPolicyField) -> usize {
-    VPN_POLICY_FIELDS
-        .iter()
-        .position(|candidate| *candidate == field)
-        .expect("field is always one of VPN_POLICY_FIELDS")
-}
-
 pub(crate) fn next_vpn_policy_field(field: VpnPolicyField) -> VpnPolicyField {
-    let index = vpn_policy_field_index(field).saturating_add(1);
-    VPN_POLICY_FIELDS[index.min(VPN_POLICY_FIELDS.len() - 1)]
+    super::input::move_clamped(&VPN_POLICY_FIELDS, field, true)
 }
 
 pub(crate) fn previous_vpn_policy_field(field: VpnPolicyField) -> VpnPolicyField {
-    let index = vpn_policy_field_index(field).saturating_sub(1);
-    VPN_POLICY_FIELDS[index]
+    super::input::move_clamped(&VPN_POLICY_FIELDS, field, false)
 }
 
 const VPN_POLICY_APPLY_LABEL: &str = "Apply selected mode";

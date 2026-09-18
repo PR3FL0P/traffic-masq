@@ -1,18 +1,21 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-use crate::atomic_file::{self, PRIVATE_FILE_MODE};
 use crate::config::{AppConfig, ShutdownPolicy};
 use crate::dhcp::supervisor::resolve_interface_index;
 use crate::wifi::ctrl::{CtrlError, HostapdCtrlClient, HostapdState, MacAddr, Station};
-use crate::wifi::process::{
-    find_competing_network_managers, ProcessError, SupervisedProcess, TokioSupervisedProcess,
+use crate::wifi::lifecycle::{
+    classify_ownership, graceful_stop, preflight_binary as preflight_daemon_binary, retry_health,
+    save_spawned_record,
+    wait_until_ready, write_private_config, OwnershipOutcome, RetryState, STARTUP_READY_TIMEOUT,
 };
+pub use crate::wifi::lifecycle::WifiHealth;
+use crate::wifi::process::{ProcessError, SupervisedProcess, TokioSupervisedProcess};
 use crate::wifi::record::{PersistedWifiRecord, WifiRecordError, WifiRecordStore};
 use crate::wifi::render::{
     self, render_hostapd_config, ApRenderInput, RenderError, RenderedApConfig, WifiDigest,
@@ -23,13 +26,6 @@ use crate::wifi::WifiApSpec;
 
 const DEFAULT_CTRL_TIMEOUT: Duration = Duration::from_secs(2);
 
-const STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(15);
-const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(20);
-
-const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(5);
-const GRACEFUL_STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-const BACKOFF_CEILING: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Error)]
 pub enum SupervisorError {
@@ -78,36 +74,11 @@ impl SupervisorError {
     }
 }
 
-/// Why an access point is or is not working, in user-facing terms.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case", tag = "state")]
-pub enum WifiHealth {
-    /// hostapd is running and its control socket answers.
-    Healthy,
-    /// A process is running but the control socket does not answer yet.
-    Starting,
-    /// Startup or a restart attempt failed; the supervisor keeps retrying.
-    Retrying {
-        error: String,
-        attempts: u32,
-        /// Seconds until the next restart attempt, when one is scheduled.
-        retry_in_secs: Option<u64>,
-        /// Other network managers detected on this machine that may be
-        /// holding the interface (iwd, NetworkManager, ...).
-        competing_managers: Vec<String>,
-        /// Guidance on how to disable or isolate competing managers.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        advice: Option<String>,
-    },
-}
-
 #[derive(Debug, Clone)]
 struct ApTask {
     spec: WifiApSpec,
     record: PersistedWifiRecord,
-    consecutive_failures: u32,
-    next_restart_earliest: Option<Instant>,
-    last_failure: Option<String>,
+    retry: RetryState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -137,16 +108,6 @@ struct Inner {
     operation_lock: Mutex<()>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum OwnershipOutcome {
-    Absent,
-
-    ForeignPresent,
-
-    Adopted(PersistedWifiRecord),
-
-    DigestMismatch(PersistedWifiRecord),
-}
 
 impl HostapdSupervisor {
     pub async fn start(config: &AppConfig) -> Result<Self, SupervisorError> {
@@ -249,11 +210,10 @@ impl HostapdSupervisor {
                     key_digest: WifiDigest::of(&[]),
                     ssid: spec.ssid.clone(),
                 },
-                consecutive_failures: 1,
-                next_restart_earliest: Some(
-                    Instant::now() + backoff_duration(self.inner.restart_backoff_seconds, 1),
+                retry: RetryState::failed_startup(
+                    self.inner.restart_backoff_seconds,
+                    error,
                 ),
-                last_failure: Some(error.to_string()),
             });
     }
 
@@ -279,11 +239,17 @@ impl HostapdSupervisor {
 
         let existing = self.inner.tasks.lock().await.get(&interface).cloned();
         let task = match existing {
-            Some(task)
+            Some(mut task)
                 if task.record.config_digest == rendered.config_digest
                     && task.record.key_digest == rendered.key_digest =>
             {
-                task
+                if self.task_process_matches(&task).await? {
+                    task
+                } else {
+                    self.restart_task(&mut task, &spec, &rendered, &ctrl_path)
+                        .await?;
+                    task
+                }
             }
             Some(mut task) => {
                 // A pid-0 task is the placeholder `record_failed_startup`
@@ -308,6 +274,31 @@ impl HostapdSupervisor {
         Ok(())
     }
 
+    async fn task_process_matches(&self, task: &ApTask) -> Result<bool, SupervisorError> {
+        if task.record.pid == 0 || !self.inner.process.is_alive(task.record.pid).await? {
+            return Ok(false);
+        }
+        if !self
+            .inner
+            .process
+            .cmdline_contains(task.record.pid, &task.record.config_path)
+            .await?
+        {
+            return Ok(false);
+        }
+
+        let client = match HostapdCtrlClient::connect(
+            &task.record.ctrl_path,
+            self.inner.ctrl_timeout,
+        )
+        .await
+        {
+            Ok(client) => client,
+            Err(_) => return Ok(false),
+        };
+        Ok(client.ping().await.is_ok())
+    }
+
     async fn reload_task(
         &self,
         task: &mut ApTask,
@@ -329,8 +320,8 @@ impl HostapdSupervisor {
 
         task.spec = spec.clone();
         task.record = record;
-        task.consecutive_failures = 0;
-        task.next_restart_earliest = None;
+        task.retry.consecutive_failures = 0;
+        task.retry.next_restart_earliest = None;
         Ok(())
     }
 
@@ -341,12 +332,12 @@ impl HostapdSupervisor {
         rendered: &RenderedApConfig,
         ctrl_path: &Path,
     ) -> Result<(), SupervisorError> {
-        self.graceful_stop(task.record.pid).await;
+        self.graceful_stop(task.record.pid).await?;
         let record = self.spawn_and_record(spec, rendered, ctrl_path).await?;
         task.spec = spec.clone();
         task.record = record;
-        task.consecutive_failures = 0;
-        task.next_restart_earliest = None;
+        task.retry.consecutive_failures = 0;
+        task.retry.next_restart_earliest = None;
         Ok(())
     }
 
@@ -360,8 +351,9 @@ impl HostapdSupervisor {
         let record = match outcome {
             OwnershipOutcome::Absent => self.spawn_and_record(spec, rendered, ctrl_path).await?,
             OwnershipOutcome::Adopted(record) => record,
-            OwnershipOutcome::DigestMismatch(record) => {
-                self.graceful_stop(record.pid).await;
+            OwnershipOutcome::DigestMismatch(record)
+            | OwnershipOutcome::UnreachableOwned(record) => {
+                self.graceful_stop(record.pid).await?;
                 self.spawn_and_record(spec, rendered, ctrl_path).await?
             }
             OwnershipOutcome::ForeignPresent => {
@@ -373,9 +365,7 @@ impl HostapdSupervisor {
         Ok(ApTask {
             spec: spec.clone(),
             record,
-            consecutive_failures: 0,
-            next_restart_earliest: None,
-            last_failure: None,
+            retry: RetryState::default(),
         })
     }
 
@@ -391,35 +381,21 @@ impl HostapdSupervisor {
             Ok(client) => client.status().await.ok(),
             Err(_) => None,
         };
-        let Some(status) = status else {
-            let _ = store.clear().await;
-            return Ok(OwnershipOutcome::Absent);
-        };
-
-        let Some(record) = store.load().await? else {
-            return Ok(OwnershipOutcome::ForeignPresent);
-        };
-
-        let process_factor = self
-            .inner
-            .process
-            .cmdline_contains(record.pid, &record.config_path)
-            .await
-            .unwrap_or(false);
-        let ctrl_factor = status.state == HostapdState::Enabled
-            && status.ssid.as_deref() == Some(record.ssid.as_str());
-
-        if !process_factor || !ctrl_factor {
-            return Ok(OwnershipOutcome::ForeignPresent);
-        }
-
-        if record.config_digest == rendered.config_digest
-            && record.key_digest == rendered.key_digest
-        {
-            Ok(OwnershipOutcome::Adopted(record))
-        } else {
-            Ok(OwnershipOutcome::DigestMismatch(record))
-        }
+        classify_ownership(
+            &store,
+            self.inner.process.as_ref(),
+            status.is_some(),
+            |record| {
+                status.as_ref().is_some_and(|status| {
+                    status.state == HostapdState::Enabled
+                        && status.ssid.as_deref() == Some(record.ssid.as_str())
+                })
+            },
+            rendered.config_digest,
+            rendered.key_digest,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn spawn_and_record(
@@ -438,58 +414,60 @@ impl HostapdSupervisor {
         let result = async {
             wait_for_ready(ctrl_path, self.inner.ctrl_timeout, &spec.interface).await?;
 
-            let record = PersistedWifiRecord {
+            Ok(save_spawned_record(
+                &self.record_store(&spec.interface),
                 pid,
-                started_at_unix: unix_now(),
-                ctrl_path: ctrl_path.to_path_buf(),
-                config_path: rendered.path.clone(),
-                config_digest: rendered.config_digest,
-                key_digest: rendered.key_digest,
-                ssid: spec.ssid.clone(),
-            };
-            self.record_store(&spec.interface).save(&record).await?;
-            Ok(record)
+                ctrl_path,
+                &rendered.path,
+                rendered.config_digest,
+                rendered.key_digest,
+                &spec.ssid,
+            )
+            .await?)
         }
         .await;
 
-        if result.is_err() {
-            self.graceful_stop(pid).await;
+        match result {
+            Ok(record) => Ok(record),
+            Err(error) => match self.graceful_stop(pid).await {
+                Ok(()) => match self.record_store(&spec.interface).clear().await {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(SupervisorError::Configuration(anyhow::anyhow!(
+                        "hostapd startup failed: {error}; process stopped but ownership-record cleanup failed: {cleanup}; recovery required"
+                    ))),
+                },
+                Err(cleanup) => Err(SupervisorError::Configuration(anyhow::anyhow!(
+                    "hostapd startup failed: {error}; cleanup also failed: {cleanup}; recovery required"
+                ))),
+            },
         }
-
-        result
     }
 
-    async fn graceful_stop(&self, pid: u32) {
-        if pid == 0 {
-            return;
-        }
-        if let Err(error) = self.inner.process.terminate(pid).await {
-            tracing::warn!(pid, %error, "failed to send SIGTERM to hostapd");
-        }
-
-        let deadline = Instant::now() + GRACEFUL_STOP_TIMEOUT;
-        loop {
-            match self.inner.process.is_alive(pid).await {
-                Ok(false) | Err(_) => return,
-                Ok(true) if Instant::now() >= deadline => break,
-                Ok(true) => tokio::time::sleep(GRACEFUL_STOP_POLL_INTERVAL).await,
-            }
-        }
-
-        tracing::warn!(pid, "hostapd did not exit after SIGTERM; sending SIGKILL");
-        let _ = self.inner.process.kill(pid).await;
+    async fn graceful_stop(&self, pid: u32) -> Result<(), SupervisorError> {
+        graceful_stop(self.inner.process.as_ref(), pid, "hostapd").await?;
+        Ok(())
     }
 
     pub async fn disable(&self, interface: &str) -> Result<Option<WifiApSpec>, SupervisorError> {
         let _operation = self.inner.operation_lock.lock().await;
-        let Some(task) = self.inner.tasks.lock().await.remove(interface) else {
+        let Some(task) = self.inner.tasks.lock().await.get(interface).cloned() else {
             return Ok(None);
         };
 
-        self.graceful_stop(task.record.pid).await;
-        let _ = self.record_store(interface).clear().await;
-        let _ =
-            tokio::fs::remove_file(render::config_path(&self.inner.runtime_dir, interface)).await;
+        self.graceful_stop(task.record.pid).await?;
+        self.record_store(interface).clear().await?;
+        let config_path = render::config_path(&self.inner.runtime_dir, interface);
+        match tokio::fs::remove_file(&config_path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(SupervisorError::Configuration(anyhow::anyhow!(
+                    "failed to remove hostapd config {}: {error}",
+                    config_path.display()
+                )))
+            }
+        }
+        self.inner.tasks.lock().await.remove(interface);
         Ok(Some(task.spec))
     }
 
@@ -500,14 +478,13 @@ impl HostapdSupervisor {
     /// on a daemon that started with `wifi.enabled = false`, and that path needs
     /// the same clear diagnosis of a missing binary that startup gives.
     pub async fn preflight_binary(&self) -> Result<(), SupervisorError> {
-        crate::command::probe(&self.inner.hostapd_binary).await
-            .map_err(|error| {
-                SupervisorError::Configuration(anyhow::anyhow!(
-                    "hostapd binary {} is not runnable ({error}) — install hostapd or fix wifi.hostapd_binary",
-                    self.inner.hostapd_binary.display()
-                ))
-            })?;
-        Ok(())
+        preflight_daemon_binary(
+            &self.inner.hostapd_binary,
+            "hostapd",
+            "wifi.hostapd_binary",
+        )
+        .await
+        .map_err(SupervisorError::Configuration)
     }
 
     pub async fn status(&self, interface: &str) -> Option<WifiApStatus> {
@@ -523,26 +500,14 @@ impl HostapdSupervisor {
                 Err(_) => (HostapdState::Other("unreachable".to_string()), None),
             };
 
-        let health = if let Some(error) = &task.last_failure {
-            let retry_in_secs = task
-                .next_restart_earliest
-                .map(|earliest| earliest.saturating_duration_since(Instant::now()).as_secs());
-            let competing_managers = find_competing_network_managers().await;
-            let advice = if competing_managers.is_empty() {
-                None
-            } else {
-                Some(crate::wifi::process::format_competing_manager_advice(
-                    &competing_managers,
-                    interface,
-                ))
-            };
-            WifiHealth::Retrying {
-                error: error.clone(),
-                attempts: task.consecutive_failures,
-                retry_in_secs,
-                competing_managers,
-                advice,
-            }
+        let health = if let Some(error) = task.retry.last_failure.as_deref() {
+            retry_health(
+                error,
+                task.retry.consecutive_failures,
+                task.retry.next_restart_earliest,
+                interface,
+            )
+            .await
         } else if hostapd_state == HostapdState::Enabled {
             WifiHealth::Healthy
         } else {
@@ -652,10 +617,8 @@ impl HostapdSupervisor {
             return Ok(false);
         };
 
-        if let Some(earliest) = task.next_restart_earliest {
-            if Instant::now() < earliest {
-                return Ok(false);
-            }
+        if task.retry.is_waiting() {
+            return Ok(false);
         }
 
         let ctrl_path = self.ctrl_path(interface);
@@ -672,10 +635,8 @@ impl HostapdSupervisor {
             };
 
         if ctrl_alive {
-            if task.consecutive_failures != 0 {
-                task.consecutive_failures = 0;
-                task.next_restart_earliest = None;
-                task.last_failure = None;
+            if task.retry.consecutive_failures != 0 {
+                task.retry = RetryState::default();
                 self.inner
                     .tasks
                     .lock()
@@ -709,7 +670,7 @@ impl HostapdSupervisor {
         // process to stop, and signalling pid 0 would signal the whole process
         // group — including this daemon.
         if task.record.pid != 0 {
-            self.graceful_stop(task.record.pid).await;
+            self.graceful_stop(task.record.pid).await?;
         }
 
         if let Ok(client) = HostapdCtrlClient::connect(&ctrl_path, self.inner.ctrl_timeout).await {
@@ -720,26 +681,20 @@ impl HostapdSupervisor {
             }
         }
 
-        task.consecutive_failures += 1;
+        task.retry.consecutive_failures += 1;
         match self
             .spawn_and_record(&task.spec, &rendered, &ctrl_path)
             .await
         {
             Ok(record) => {
                 task.record = record;
-                task.next_restart_earliest = None;
-                task.last_failure = None;
+                task.retry.next_restart_earliest = None;
+                task.retry.last_failure = None;
             }
             Err(error) => {
                 tracing::error!(%interface, %error, "failed to respawn hostapd");
-                task.last_failure = Some(error.to_string());
-                task.next_restart_earliest = Some(
-                    Instant::now()
-                        + backoff_duration(
-                            self.inner.restart_backoff_seconds,
-                            task.consecutive_failures,
-                        ),
-                );
+                task.retry
+                    .respawn_failed(self.inner.restart_backoff_seconds, &error.to_string());
             }
         }
         self.inner
@@ -756,13 +711,19 @@ impl HostapdSupervisor {
 
         for (interface, task) in tasks {
             if policy == ShutdownPolicy::RestoreInterfaces {
-                self.graceful_stop(task.record.pid).await;
-                let _ = self.record_store(&interface).clear().await;
-                let _ = tokio::fs::remove_file(render::config_path(
-                    &self.inner.runtime_dir,
-                    &interface,
-                ))
-                .await;
+                if let Err(error) = self.graceful_stop(task.record.pid).await {
+                    tracing::error!(%interface, %error, "failed to stop hostapd during shutdown; ownership record retained");
+                    continue;
+                }
+                if let Err(error) = self.record_store(&interface).clear().await {
+                    tracing::error!(%interface, %error, "hostapd stopped but ownership record cleanup failed");
+                }
+                let path = render::config_path(&self.inner.runtime_dir, &interface);
+                if let Err(error) = tokio::fs::remove_file(&path).await {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(%interface, path = %path.display(), %error, "failed to remove hostapd runtime config during shutdown");
+                    }
+                }
             }
         }
     }
@@ -777,30 +738,8 @@ fn requires_restart(old: &WifiApSpec, new: &WifiApSpec) -> bool {
         || old.max_stations != new.max_stations
 }
 
-fn backoff_duration(base_seconds: u64, consecutive_failures: u32) -> Duration {
-    let multiplier = 1u64.checked_shl(consecutive_failures.saturating_sub(1));
-    let seconds = multiplier
-        .and_then(|multiplier| base_seconds.checked_mul(multiplier))
-        .unwrap_or(u64::MAX);
-    Duration::from_secs(seconds).min(BACKOFF_CEILING)
-}
-
 async fn write_config_file(rendered: &RenderedApConfig) -> Result<(), SupervisorError> {
-    if let Some(parent) = rendered.path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|source| io_error(&rendered.path, source))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-                .await
-                .map_err(|source| io_error(&rendered.path, source))?;
-        }
-    }
-    let mut content = rendered.text.clone().into_bytes();
-    content.push(b'\n');
-    atomic_file::replace_async(&rendered.path, &content, PRIVATE_FILE_MODE)
+    write_private_config(&rendered.path, &rendered.text)
         .await
         .map_err(|source| io_error(&rendered.path, source))
 }
@@ -817,37 +756,30 @@ async fn wait_for_ready(
     timeout: Duration,
     interface: &str,
 ) -> Result<(), SupervisorError> {
-    let deadline = Instant::now() + STARTUP_READY_TIMEOUT.max(timeout);
-    loop {
-        if let Ok(client) = HostapdCtrlClient::connect(ctrl_path, timeout).await {
-            if client.ping().await.is_ok() {
-                return Ok(());
-            }
+    let ready = wait_until_ready(timeout, || async {
+        match HostapdCtrlClient::connect(ctrl_path, timeout).await {
+            Ok(client) => client.ping().await.is_ok(),
+            Err(_) => false,
         }
-        if Instant::now() >= deadline {
-            return Err(SupervisorError::StartupTimeout {
-                interface: interface.to_string(),
-                timeout: STARTUP_READY_TIMEOUT.max(timeout),
-            });
-        }
-        tokio::time::sleep(STARTUP_POLL_INTERVAL).await;
+    })
+    .await;
+    if ready {
+        Ok(())
+    } else {
+        Err(SupervisorError::StartupTimeout {
+            interface: interface.to_string(),
+            timeout: STARTUP_READY_TIMEOUT.max(timeout),
+        })
     }
 }
 
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
 
 pub(crate) use crate::netlink::interface_is_wireless;
 
 #[cfg(test)]
 mod tests {
     use std::os::unix::net::UnixDatagram as StdUnixDatagram;
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use tempfile::tempdir;
 
@@ -857,6 +789,7 @@ mod tests {
         SecurityConfig, ShutdownPolicy as ConfigShutdownPolicy, VpnConfig, WifiApConfig, WifiBand,
         WifiChannelWidth, WifiConfig, WifiSecurity,
     };
+    use crate::test_support::{FakeProcessCall as FakeCall, FakeSupervisedProcess};
     use crate::wifi::render::WifiDigest;
 
     enum SsidSource {
@@ -952,6 +885,34 @@ mod tests {
         fn spawn_for_config(ctrl_path: PathBuf, config_path: PathBuf) -> Self {
             Self::spawn(ctrl_path, SsidSource::ConfigFile(config_path))
         }
+
+        fn spawn_silent(ctrl_path: PathBuf) -> Self {
+            let socket = StdUnixDatagram::bind(&ctrl_path).expect("bind silent fake ctrl socket");
+            socket
+                .set_read_timeout(Some(Duration::from_millis(20)))
+                .expect("set read timeout");
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown_for_thread = shutdown.clone();
+            let join = std::thread::spawn(move || {
+                let mut buffer = [0u8; 4096];
+                while !shutdown_for_thread.load(Ordering::Relaxed) {
+                    match socket.recv_from(&mut buffer) {
+                        Ok(_) => {}
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) => {}
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                shutdown,
+                join: Some(join),
+                ctrl_path,
+            }
+        }
     }
 
     impl Drop for FakeHostapdCtrl {
@@ -964,109 +925,19 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    enum FakeCall {
-        Spawn(PathBuf),
-        Terminate(u32),
-        Kill(u32),
-    }
+    type FakeProcess = FakeSupervisedProcess<FakeHostapdCtrl>;
 
-    #[derive(Default)]
-    struct FakeProcess {
-        configs: StdMutex<HashMap<u32, PathBuf>>,
-        responders: StdMutex<HashMap<u32, FakeHostapdCtrl>>,
-        calls: StdMutex<Vec<FakeCall>>,
-        next_pid: AtomicU32,
-        fail_spawn: AtomicBool,
-        suppress_spawn_responder: AtomicBool,
-        persistent_responder: AtomicBool,
-    }
-
-    impl FakeProcess {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                next_pid: AtomicU32::new(1000),
-                ..Default::default()
-            })
-        }
-
-        fn calls(&self) -> Vec<FakeCall> {
-            self.calls.lock().unwrap().clone()
-        }
-
-        fn seed(&self, pid: u32, config_path: PathBuf, ssid: &str) {
+    fn fake_process() -> Arc<FakeProcess> {
+        FakeProcess::new("hostapd", 1000, "", |_interface, config_path, _profile| {
             let ctrl_path = config_path.with_extension("");
-            let responder = FakeHostapdCtrl::spawn_fixed(ctrl_path, ssid);
-            self.configs.lock().unwrap().insert(pid, config_path);
-            self.responders.lock().unwrap().insert(pid, responder);
-        }
-
-        fn kill_externally(&self, pid: u32) {
-            self.responders.lock().unwrap().remove(&pid);
-            self.configs.lock().unwrap().remove(&pid);
-        }
+            FakeHostapdCtrl::spawn_for_config(ctrl_path, config_path.to_path_buf())
+        })
     }
 
-    #[async_trait::async_trait]
-    impl SupervisedProcess for FakeProcess {
-        async fn spawn(&self, _binary: &Path, config_path: &Path) -> Result<u32, ProcessError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(FakeCall::Spawn(config_path.to_path_buf()));
-            if self.fail_spawn.load(Ordering::Relaxed) {
-                return Err(ProcessError::Spawn {
-                    binary: PathBuf::from("hostapd"),
-                    source: std::io::Error::other("fake spawn failure"),
-                });
-            }
-            let pid = self.next_pid.fetch_add(1, Ordering::Relaxed);
-            if !self.suppress_spawn_responder.load(Ordering::Relaxed) {
-                let ctrl_path = config_path.with_extension("");
-                let responder =
-                    FakeHostapdCtrl::spawn_for_config(ctrl_path, config_path.to_path_buf());
-                self.responders.lock().unwrap().insert(pid, responder);
-            }
-            self.configs
-                .lock()
-                .unwrap()
-                .insert(pid, config_path.to_path_buf());
-            Ok(pid)
-        }
-
-        async fn is_alive(&self, pid: u32) -> Result<bool, ProcessError> {
-            Ok(!self.persistent_responder.load(Ordering::Relaxed)
-                && self.responders.lock().unwrap().contains_key(&pid))
-        }
-
-        async fn cmdline_contains(
-            &self,
-            pid: u32,
-            config_path: &Path,
-        ) -> Result<bool, ProcessError> {
-            Ok(self
-                .configs
-                .lock()
-                .unwrap()
-                .get(&pid)
-                .is_some_and(|recorded| recorded == config_path))
-        }
-
-        async fn terminate(&self, pid: u32) -> Result<(), ProcessError> {
-            self.calls.lock().unwrap().push(FakeCall::Terminate(pid));
-            if !self.persistent_responder.load(Ordering::Relaxed) {
-                self.responders.lock().unwrap().remove(&pid);
-                self.configs.lock().unwrap().remove(&pid);
-            }
-            Ok(())
-        }
-
-        async fn kill(&self, pid: u32) -> Result<(), ProcessError> {
-            self.calls.lock().unwrap().push(FakeCall::Kill(pid));
-            self.responders.lock().unwrap().remove(&pid);
-            self.configs.lock().unwrap().remove(&pid);
-            Ok(())
-        }
+    fn seed_process(process: &FakeProcess, pid: u32, config_path: PathBuf, ssid: &str) {
+        let ctrl_path = config_path.with_extension("");
+        let responder = FakeHostapdCtrl::spawn_fixed(ctrl_path, ssid);
+        process.seed(pid, config_path, responder);
     }
 
     fn ap_config(ssid: &str) -> WifiApConfig {
@@ -1202,7 +1073,7 @@ mod tests {
     async fn configure_spawns_hostapd_and_persists_a_record() {
         let temp = tempdir().expect("tempdir");
         let runtime_dir = temp.path().join("hostapd");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = test_supervisor(temp.path(), &runtime_dir, process.clone()).await;
 
         supervisor
@@ -1230,7 +1101,7 @@ mod tests {
     async fn readiness_failure_stops_the_spawned_hostapd_without_recording_it() {
         let temp = tempdir().expect("tempdir");
         let runtime_dir = temp.path().join("hostapd");
-        let process = FakeProcess::new();
+        let process = fake_process();
         process
             .suppress_spawn_responder
             .store(true, Ordering::Relaxed);
@@ -1262,7 +1133,7 @@ mod tests {
     async fn configuring_the_same_spec_twice_is_a_no_op() {
         let temp = tempdir().expect("tempdir");
         let runtime_dir = temp.path().join("hostapd");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = test_supervisor(temp.path(), &runtime_dir, process.clone()).await;
 
         supervisor
@@ -1285,7 +1156,7 @@ mod tests {
     async fn configure_after_a_failed_startup_spawns_instead_of_reloading() {
         let temp = tempdir().expect("tempdir");
         let runtime_dir = temp.path().join("hostapd");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = test_supervisor(temp.path(), &runtime_dir, process.clone()).await;
         let spec = spec("wlan0", "net-a");
 
@@ -1309,7 +1180,7 @@ mod tests {
     async fn an_ssid_only_change_reloads_instead_of_restarting() {
         let temp = tempdir().expect("tempdir");
         let runtime_dir = temp.path().join("hostapd");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = test_supervisor(temp.path(), &runtime_dir, process.clone()).await;
 
         supervisor
@@ -1336,7 +1207,7 @@ mod tests {
     async fn a_channel_change_restarts_hostapd() {
         let temp = tempdir().expect("tempdir");
         let runtime_dir = temp.path().join("hostapd");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = test_supervisor(temp.path(), &runtime_dir, process.clone()).await;
 
         supervisor
@@ -1362,17 +1233,81 @@ mod tests {
         );
     }
 
+
+    #[tokio::test]
+    async fn unchanged_ap_with_unresponsive_ctrl_socket_is_restarted() {
+        let temp = tempdir().expect("tempdir");
+        let runtime_dir = temp.path().join("hostapd");
+        let process = fake_process();
+        let supervisor = test_supervisor(temp.path(), &runtime_dir, process.clone()).await;
+        let original = spec("wlan0", "net-a");
+
+        supervisor
+            .configure(original.clone())
+            .await
+            .expect("configure original");
+        let config_path = render::config_path(&runtime_dir, "wlan0");
+        process.kill_externally(1000);
+        process.seed(
+            1000,
+            config_path.clone(),
+            FakeHostapdCtrl::spawn_silent(supervisor.ctrl_path("wlan0")),
+        );
+
+        supervisor
+            .configure(original)
+            .await
+            .expect("unresponsive control socket must trigger restart");
+
+        assert_eq!(process.spawn_count(), 2);
+        assert!(process
+            .calls()
+            .iter()
+            .any(|call| matches!(call, FakeCall::Terminate(1000))));
+    }
+
+    #[tokio::test]
+    async fn failed_restart_can_be_rolled_back_to_the_previous_ap() {
+        let temp = tempdir().expect("tempdir");
+        let runtime_dir = temp.path().join("hostapd");
+        let process = fake_process();
+        let supervisor = test_supervisor(temp.path(), &runtime_dir, process.clone()).await;
+        let original = spec("wlan0", "net-a");
+
+        supervisor
+            .configure(original.clone())
+            .await
+            .expect("configure original");
+
+        process.fail_spawn.store(true, Ordering::Relaxed);
+        let mut changed = original.clone();
+        changed.channel = 11;
+        supervisor
+            .configure(changed)
+            .await
+            .expect_err("replacement spawn must fail");
+
+        process.fail_spawn.store(false, Ordering::Relaxed);
+        supervisor
+            .configure(original.clone())
+            .await
+            .expect("rollback must respawn original");
+
+        assert_eq!(supervisor.status("wlan0").await.expect("status").spec, original);
+        assert_eq!(process.spawn_count(), 3);
+    }
+
     #[tokio::test]
     async fn adopts_a_process_that_passes_the_two_factor_check() {
         let temp = tempdir().expect("tempdir");
         let runtime_dir = temp.path().join("hostapd");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = test_supervisor(temp.path(), &runtime_dir, process.clone()).await;
 
         let target = spec("wlan0", "net-a");
         let rendered = supervisor.render_for(&target).await.expect("render");
 
-        process.seed(4242, rendered.path.clone(), "net-a");
+        seed_process(&process, 4242, rendered.path.clone(), "net-a");
         supervisor
             .record_store("wlan0")
             .save(&PersistedWifiRecord {
@@ -1401,7 +1336,7 @@ mod tests {
     async fn refuses_a_live_ctrl_socket_with_no_matching_record() {
         let temp = tempdir().expect("tempdir");
         let runtime_dir = temp.path().join("hostapd");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = test_supervisor(temp.path(), &runtime_dir, process.clone()).await;
 
         let _foreign =
@@ -1422,13 +1357,13 @@ mod tests {
     async fn a_digest_mismatch_restarts_with_the_new_config() {
         let temp = tempdir().expect("tempdir");
         let runtime_dir = temp.path().join("hostapd");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = test_supervisor(temp.path(), &runtime_dir, process.clone()).await;
 
         let target = spec("wlan0", "net-a");
         let rendered = supervisor.render_for(&target).await.expect("render");
 
-        process.seed(4242, rendered.path.clone(), "net-a");
+        seed_process(&process, 4242, rendered.path.clone(), "net-a");
         supervisor
             .record_store("wlan0")
             .save(&PersistedWifiRecord {
@@ -1458,7 +1393,7 @@ mod tests {
     async fn absent_ctrl_socket_clears_any_stale_record_and_spawns_fresh() {
         let temp = tempdir().expect("tempdir");
         let runtime_dir = temp.path().join("hostapd");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = test_supervisor(temp.path(), &runtime_dir, process.clone()).await;
 
         supervisor
@@ -1499,7 +1434,7 @@ mod tests {
     async fn disable_stops_hostapd_and_forgets_the_interface() {
         let temp = tempdir().expect("tempdir");
         let runtime_dir = temp.path().join("hostapd");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = test_supervisor(temp.path(), &runtime_dir, process.clone()).await;
         supervisor
             .configure(spec("wlan0", "net-a"))
@@ -1523,7 +1458,7 @@ mod tests {
     async fn disable_on_an_unconfigured_interface_is_none_not_an_error() {
         let temp = tempdir().expect("tempdir");
         let runtime_dir = temp.path().join("hostapd");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = test_supervisor(temp.path(), &runtime_dir, process).await;
         assert_eq!(supervisor.disable("wlan0").await.expect("disable"), None);
     }
@@ -1532,7 +1467,7 @@ mod tests {
     async fn ensure_alive_respawns_a_dead_hostapd_and_backs_off_on_repeated_failure() {
         let temp = tempdir().expect("tempdir");
         let runtime_dir = temp.path().join("hostapd");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = test_supervisor(temp.path(), &runtime_dir, process.clone()).await;
         supervisor
             .configure(spec("wlan0", "net-a"))
@@ -1563,7 +1498,7 @@ mod tests {
     async fn ensure_alive_refuses_respawn_when_the_old_ctrl_socket_still_answers() {
         let temp = tempdir().expect("tempdir");
         let runtime_dir = temp.path().join("hostapd");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = test_supervisor(temp.path(), &runtime_dir, process.clone()).await;
         supervisor
             .configure(spec("wlan0", "net-a"))
@@ -1585,11 +1520,8 @@ mod tests {
         assert!(matches!(error, SupervisorError::NotOwned { .. }));
         assert_eq!(
             process.calls(),
-            vec![
-                FakeCall::Spawn(render::config_path(&runtime_dir, "wlan0")),
-                FakeCall::Terminate(1000),
-            ],
-            "ownership refusal must not spawn a replacement"
+            vec![FakeCall::Spawn(render::config_path(&runtime_dir, "wlan0"))],
+            "ownership refusal must not signal an already-dead PID or spawn a replacement"
         );
         assert_eq!(
             supervisor
@@ -1607,7 +1539,7 @@ mod tests {
     async fn ensure_alive_leaves_a_healthy_access_point_untouched() {
         let temp = tempdir().expect("tempdir");
         let runtime_dir = temp.path().join("hostapd");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = test_supervisor(temp.path(), &runtime_dir, process.clone()).await;
         supervisor
             .configure(spec("wlan0", "net-a"))
@@ -1623,7 +1555,7 @@ mod tests {
     async fn set_passphrase_then_reconfigure_takes_the_reload_path() {
         let temp = tempdir().expect("tempdir");
         let runtime_dir = temp.path().join("hostapd");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = test_supervisor(temp.path(), &runtime_dir, process.clone()).await;
         let mut secured = spec("wlan0", "net-a");
         secured.security = WifiSecurity::Wpa2;
@@ -1667,7 +1599,7 @@ mod tests {
     async fn reload_sends_reload_even_when_nothing_changed() {
         let temp = tempdir().expect("tempdir");
         let runtime_dir = temp.path().join("hostapd");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = test_supervisor(temp.path(), &runtime_dir, process.clone()).await;
         supervisor
             .configure(spec("wlan0", "net-a"))
@@ -1682,7 +1614,7 @@ mod tests {
     async fn reload_on_an_unconfigured_interface_is_not_configured() {
         let temp = tempdir().expect("tempdir");
         let runtime_dir = temp.path().join("hostapd");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = test_supervisor(temp.path(), &runtime_dir, process).await;
 
         let error = supervisor.reload("wlan0").await.unwrap_err();
@@ -1693,7 +1625,7 @@ mod tests {
     async fn deauthenticate_reaches_the_running_hostapd() {
         let temp = tempdir().expect("tempdir");
         let runtime_dir = temp.path().join("hostapd");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = test_supervisor(temp.path(), &runtime_dir, process).await;
         supervisor
             .configure(spec("wlan0", "net-a"))
@@ -1711,7 +1643,7 @@ mod tests {
     async fn deauthenticate_on_an_unconfigured_interface_is_not_configured() {
         let temp = tempdir().expect("tempdir");
         let runtime_dir = temp.path().join("hostapd");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = test_supervisor(temp.path(), &runtime_dir, process).await;
 
         let mac = MacAddr::new([0x02, 0, 0, 0, 0, 1]);
@@ -1723,7 +1655,7 @@ mod tests {
     async fn shutdown_with_preserve_interfaces_leaves_hostapd_and_its_record_alone() {
         let temp = tempdir().expect("tempdir");
         let runtime_dir = temp.path().join("hostapd");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = test_supervisor(temp.path(), &runtime_dir, process.clone()).await;
         supervisor
             .configure(spec("wlan0", "net-a"))
@@ -1755,7 +1687,7 @@ mod tests {
     async fn shutdown_with_restore_interfaces_stops_hostapd_and_clears_its_record() {
         let temp = tempdir().expect("tempdir");
         let runtime_dir = temp.path().join("hostapd");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = test_supervisor(temp.path(), &runtime_dir, process.clone()).await;
         supervisor
             .configure(spec("wlan0", "net-a"))
@@ -1776,10 +1708,13 @@ mod tests {
 
     #[test]
     fn backoff_doubles_up_to_the_five_minute_ceiling() {
-        assert_eq!(backoff_duration(5, 1), Duration::from_secs(5));
-        assert_eq!(backoff_duration(5, 2), Duration::from_secs(10));
-        assert_eq!(backoff_duration(5, 3), Duration::from_secs(20));
-        assert_eq!(backoff_duration(5, 20), BACKOFF_CEILING);
+        assert_eq!(crate::wifi::lifecycle::backoff_duration(5, 1), Duration::from_secs(5));
+        assert_eq!(crate::wifi::lifecycle::backoff_duration(5, 2), Duration::from_secs(10));
+        assert_eq!(crate::wifi::lifecycle::backoff_duration(5, 3), Duration::from_secs(20));
+        assert_eq!(
+            crate::wifi::lifecycle::backoff_duration(5, 20),
+            crate::wifi::lifecycle::BACKOFF_CEILING
+        );
     }
 
     #[test]

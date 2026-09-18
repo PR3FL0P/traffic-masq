@@ -169,6 +169,117 @@ pub async fn replace_async(path: &Path, contents: &[u8], mode: u32) -> io::Resul
         .map_err(io::Error::other)?
 }
 
+/// Replace a non-secret file with strong failure semantics: if the operation
+/// returns `Err`, the exact previous bytes are restored (or a newly-created
+/// target is removed). This is for stores whose callers compensate runtime on
+/// persistence failure and therefore require `Err` to mean "committed bytes
+/// did not change".
+pub fn replace_preserving_on_error(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
+    let previous = match OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(mut file) => {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            Some(bytes)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+
+    let Err(operation) = replace(path, contents, mode) else {
+        return Ok(());
+    };
+    let rollback = match previous.as_deref() {
+        Some(previous) => replace(path, previous, mode),
+        None => remove_durable(path).map(|_| ()),
+    };
+    match rollback {
+        Ok(()) => Err(operation),
+        Err(rollback) => Err(io::Error::other(format!(
+            "{operation}; rollback also failed: {rollback}"
+        ))),
+    }
+}
+
+/// Async wrapper for [`replace_preserving_on_error`].
+pub async fn replace_preserving_on_error_async(
+    path: &Path,
+    contents: &[u8],
+    mode: u32,
+) -> io::Result<()> {
+    let path = path.to_path_buf();
+    let contents = contents.to_vec();
+    tokio::task::spawn_blocking(move || replace_preserving_on_error(&path, &contents, mode))
+        .await
+        .map_err(io::Error::other)?
+}
+
+/// Remove `path` durably. A successful return means both the directory entry
+/// was removed and the parent directory was fsynced, so crash recovery cannot
+/// resurrect a record that callers already treated as cleared.
+pub fn remove_durable(path: &Path) -> io::Result<bool> {
+    reject_symlink(path)?;
+    match fs::remove_file(path) {
+        Ok(()) => {
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            File::open(parent)?.sync_all()?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Remove a regular file with strong failure semantics. If this returns
+/// `Err`, the exact previous bytes are restored unless that restoration also
+/// fails (in which case the combined error makes the ambiguity explicit).
+pub fn remove_preserving_on_error(path: &Path, mode: u32) -> io::Result<bool> {
+    let previous = match OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(mut file) => {
+            use std::io::Read;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            bytes
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+
+    let Err(operation) = remove_durable(path) else {
+        return Ok(true);
+    };
+    match replace(path, &previous, mode) {
+        Ok(()) => Err(operation),
+        Err(rollback) => Err(io::Error::other(format!(
+            "{operation}; rollback also failed: {rollback}"
+        ))),
+    }
+}
+
+/// Async wrapper for [`remove_preserving_on_error`].
+pub async fn remove_preserving_on_error_async(path: &Path, mode: u32) -> io::Result<bool> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || remove_preserving_on_error(&path, mode))
+        .await
+        .map_err(io::Error::other)?
+}
+
+/// Async wrapper for [`remove_durable`].
+pub async fn remove_durable_async(path: &Path) -> io::Result<bool> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || remove_durable(&path))
+        .await
+        .map_err(io::Error::other)?
+}
+
 /// Open a uniquely named temporary next to `path`.
 ///
 /// Retries on a name collision instead of failing: two writers to the same

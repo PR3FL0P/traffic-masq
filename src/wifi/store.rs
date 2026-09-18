@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::{ErrorKind, Read};
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::FromRawFd;
 use std::path::{Component, Path, PathBuf};
@@ -34,6 +34,9 @@ pub enum PassphraseStoreError {
 
     #[error("low-level file operation failed: {0}")]
     Errno(#[from] Errno),
+
+    #[error("passphrase store operation failed: {operation}; rollback also failed: {rollback}")]
+    RollbackFailed { operation: String, rollback: String },
 
     #[error(transparent)]
     Passphrase(#[from] PassphraseError),
@@ -94,8 +97,17 @@ impl PassphraseStore {
     ) -> Result<(), PassphraseStoreError> {
         let canonical_dir = self.ensure_directory()?;
         let target = self.safe_target(&canonical_dir, interface)?;
+        let previous = read_secret_bytes(&target)?;
 
-        atomic_file::replace(&target, passphrase.expose().as_bytes(), PRIVATE_FILE_MODE)?;
+        if let Err(error) =
+            atomic_file::replace(&target, passphrase.expose().as_bytes(), PRIVATE_FILE_MODE)
+        {
+            return restore_after_store_failure(
+                &target,
+                previous.as_ref().map(|value| value.as_slice()),
+                error,
+            );
+        }
         Ok(())
     }
 
@@ -121,18 +133,49 @@ impl PassphraseStore {
     pub fn clear(&self, interface: &str) -> Result<(), PassphraseStoreError> {
         let canonical_dir = self.ensure_directory()?;
         let target = self.safe_target(&canonical_dir, interface)?;
+        let Some(previous) = read_secret_bytes(&target)? else {
+            return Ok(());
+        };
 
-        match fs::symlink_metadata(&target) {
-            Ok(metadata) => {
-                if metadata.file_type().is_symlink() {
-                    return Err(PassphraseStoreError::SymlinkRejected(target));
-                }
-                fs::remove_file(&target)?;
-                Ok(())
-            }
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
+        if let Err(error) = atomic_file::remove_durable(&target) {
+            return restore_after_store_failure(&target, Some(previous.as_slice()), error);
         }
+        Ok(())
+    }
+}
+
+fn read_secret_bytes(path: &Path) -> Result<Option<Zeroizing<Vec<u8>>>, PassphraseStoreError> {
+    let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let raw_fd = match open(path, flags, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(Errno::ENOENT) => return Ok(None),
+        Err(Errno::ELOOP) => {
+            return Err(PassphraseStoreError::SymlinkRejected(path.to_path_buf()))
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    let mut file = unsafe { File::from_raw_fd(raw_fd) };
+    let mut bytes = Zeroizing::new(Vec::new());
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
+fn restore_after_store_failure(
+    path: &Path,
+    previous: Option<&[u8]>,
+    operation: std::io::Error,
+) -> Result<(), PassphraseStoreError> {
+    let rollback = match previous {
+        Some(previous) => atomic_file::replace(path, previous, PRIVATE_FILE_MODE).map(|_| ()),
+        None => atomic_file::remove_durable(path).map(|_| ()),
+    };
+    match rollback {
+        Ok(()) => Err(PassphraseStoreError::Io(operation)),
+        Err(rollback) => Err(PassphraseStoreError::RollbackFailed {
+            operation: operation.to_string(),
+            rollback: rollback.to_string(),
+        }),
     }
 }
 

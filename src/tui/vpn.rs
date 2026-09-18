@@ -44,19 +44,11 @@ const VPN_ACTION_FOCUS: [VpnFocus; 6] = [
 ];
 
 fn next_vpn_action_focus(focus: VpnFocus) -> VpnFocus {
-    let index = VPN_ACTION_FOCUS
-        .iter()
-        .position(|candidate| *candidate == focus)
-        .unwrap_or(0);
-    VPN_ACTION_FOCUS[(index + 1).min(VPN_ACTION_FOCUS.len() - 1)]
+    super::input::move_clamped(&VPN_ACTION_FOCUS, focus, true)
 }
 
 fn previous_vpn_action_focus(focus: VpnFocus) -> VpnFocus {
-    let index = VPN_ACTION_FOCUS
-        .iter()
-        .position(|candidate| *candidate == focus)
-        .unwrap_or(0);
-    VPN_ACTION_FOCUS[index.saturating_sub(1)]
+    super::input::move_clamped(&VPN_ACTION_FOCUS, focus, false)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,16 +301,8 @@ pub(crate) async fn handle_vpn_key(app: &mut TuiApp, key: KeyCode, client: &ApiC
                 VpnFocus::Policy,
                 VpnFocus::Refresh,
             ];
-            let index = fields
-                .iter()
-                .position(|field| *field == app.vpn.focus)
-                .unwrap_or(0);
-            let step = if key == KeyCode::Tab {
-                1
-            } else {
-                fields.len() - 1
-            };
-            app.vpn.focus = fields[(index + step) % fields.len()];
+            app.vpn.focus =
+                super::input::move_wrapped(&fields, app.vpn.focus, key == KeyCode::Tab);
         }
         KeyCode::Esc if app.vpn.focus != VpnFocus::List => {
             app.vpn.focus = VpnFocus::List;
@@ -576,6 +560,9 @@ fn describe_vpn_error(detail: &VpnErrorDetail) -> String {
                 .to_string()
         }
         VpnErrorDetail::NotActive => "No VPN tunnel is currently active".to_string(),
+        VpnErrorDetail::ProfileInUse { name } => {
+            format!("Profile '{name}' is in use; disconnect or remove it from the router VPN chain first")
+        }
         VpnErrorDetail::ForeignInterfaceConflict => {
             "tm-wg0 is occupied by an interface this daemon does not own; remove it manually"
                 .to_string()
@@ -641,6 +628,9 @@ mod tests {
             }),
             describe_vpn_error(&VpnErrorDetail::AlreadyActive),
             describe_vpn_error(&VpnErrorDetail::NotActive),
+            describe_vpn_error(&VpnErrorDetail::ProfileInUse {
+                name: "home.conf".to_string(),
+            }),
             describe_vpn_error(&VpnErrorDetail::ForeignInterfaceConflict),
             describe_vpn_error(&VpnErrorDetail::Other {
                 message: "boom".to_string(),
@@ -657,7 +647,7 @@ mod tests {
         }
         assert!(messages[1].contains("home.conf"));
         assert!(messages[2].contains("missing [Interface] section"));
-        assert_eq!(messages[6], "boom");
+        assert_eq!(messages[7], "boom");
     }
 
     #[test]

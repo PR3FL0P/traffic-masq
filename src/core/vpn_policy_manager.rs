@@ -180,8 +180,12 @@ impl<D: VpnDriver, E: NftExecutor> VpnPolicyManager<D, E> {
         };
 
         if let Err(error) = self.install_missing_rules_and_routes(&observation).await {
-            let _ = self.rollback(desired, &snapshot).await;
-            return Err(error);
+            return match self.rollback(desired, &snapshot).await {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(error.context(format!(
+                    "VPN policy activation failed and rollback was incomplete: {rollback:#}"
+                ))),
+            };
         }
 
         if let Err(error) = self
@@ -190,8 +194,12 @@ impl<D: VpnDriver, E: NftExecutor> VpnPolicyManager<D, E> {
             .await
             .context("failed to apply VPN policy firewall marking/NAT/kill switch")
         {
-            let _ = self.rollback(desired, &snapshot).await;
-            return Err(error);
+            return match self.rollback(desired, &snapshot).await {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(error.context(format!(
+                    "VPN policy firewall activation failed and rollback was incomplete: {rollback:#}"
+                ))),
+            };
         }
 
         Ok(snapshot)
@@ -200,12 +208,9 @@ impl<D: VpnDriver, E: NftExecutor> VpnPolicyManager<D, E> {
     pub async fn deactivate(&self, desired: &VpnPolicyDesired) -> Result<()> {
         let mut errors = Vec::new();
 
-        if let Err(error) = self.firewall.restore_async(None).await {
-            errors.push(format!(
-                "failed to remove VPN policy firewall state: {error:#}"
-            ));
-        }
-
+        // Remove policy routing first. If that cannot be completed, keep the
+        // firewall/kill-switch installed so a failed teardown remains
+        // fail-closed rather than silently exposing direct traffic.
         let expected = self.desired_state_best_effort(desired).await;
         match self.conflicts.observe(&expected).await {
             Ok(observation) => {
@@ -231,14 +236,17 @@ impl<D: VpnDriver, E: NftExecutor> VpnPolicyManager<D, E> {
             }
         }
 
-        if errors.is_empty() {
-            Ok(())
-        } else {
+        if !errors.is_empty() {
             bail!(
-                "VPN policy deactivation was incomplete: {}",
+                "VPN policy deactivation was incomplete; firewall retained fail-closed: {}",
                 errors.join("; ")
-            )
+            );
         }
+
+        self.firewall
+            .restore_async(None)
+            .await
+            .context("failed to remove VPN policy firewall state")
     }
 
     pub async fn rollback(
@@ -248,14 +256,9 @@ impl<D: VpnDriver, E: NftExecutor> VpnPolicyManager<D, E> {
     ) -> Result<()> {
         let mut errors = Vec::new();
 
-        if let Err(error) = self
-            .firewall
-            .restore_async(snapshot.firewall.as_ref())
-            .await
-        {
-            errors.push(format!("firewall rollback failed: {error:#}"));
-        }
-
+        // Restore routes/rules before relaxing the firewall. If network state
+        // cannot be restored exactly, leave the current firewall in place and
+        // surface an incomplete rollback.
         let expected = self.desired_state_best_effort(desired).await;
         match self.conflicts.observe(&expected).await {
             Ok(observation) => {
@@ -313,11 +316,17 @@ impl<D: VpnDriver, E: NftExecutor> VpnPolicyManager<D, E> {
             }
         }
 
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            bail!("VPN policy rollback was incomplete: {}", errors.join("; "))
+        if !errors.is_empty() {
+            bail!(
+                "VPN policy rollback was incomplete; firewall retained fail-closed: {}",
+                errors.join("; ")
+            );
         }
+
+        self.firewall
+            .restore_async(snapshot.firewall.as_ref())
+            .await
+            .context("failed to restore VPN policy firewall state during rollback")
     }
 
     async fn install_missing_rules_and_routes(
@@ -348,22 +357,30 @@ impl<D: VpnDriver, E: NftExecutor> VpnPolicyManager<D, E> {
     async fn ensure_tunnel_healthy(&self, vpn_interface: &str) -> Result<()> {
         let status = self
             .tunnel
-            .status()
+            .status_on(vpn_interface)
             .await
             .context("failed to read VPN tunnel status")?;
         match status {
-            Some(status) if status.up && status.interface == vpn_interface => Ok(()),
+            Some(status) if status.up => Ok(()),
             Some(status) => bail!(
-                "refusing to activate VPN policy: active tunnel interface '{}' (up={}) does not \
-                 match the expected VPN policy interface '{vpn_interface}' — fail closed, not \
-                 falling back to direct uplink",
-                status.interface,
-                status.up
+                "refusing to activate VPN policy: tunnel interface '{}' is not up — fail closed, \
+                 not falling back to direct uplink",
+                status.interface
             ),
-            None => bail!(
-                "refusing to activate VPN policy: no active VPN tunnel — fail closed, not \
-                 falling back to direct uplink"
-            ),
+            None => {
+                let active = self.tunnel.active_interfaces();
+                if let Some(record) = active.first() {
+                    bail!(
+                        "refusing to activate VPN policy: active tunnel interface '{}' does not match the expected VPN policy interface '{}' — fail closed, not falling back to direct uplink",
+                        record.interface,
+                        vpn_interface
+                    );
+                }
+                bail!(
+                    "refusing to activate VPN policy: no active VPN tunnel — fail closed, not \
+                     falling back to direct uplink"
+                )
+            }
         }
     }
 
@@ -456,7 +473,6 @@ fn rule_spec_from_info(info: &Ipv4RuleInfo) -> Ipv4RuleSpec {
 #[cfg(test)]
 mod tests {
     use crate::netlink::AddressOwnership;
-    use std::collections::HashMap;
     use std::sync::Mutex as StdMutex;
 
     use async_trait::async_trait;
@@ -467,7 +483,7 @@ mod tests {
     use crate::vpn::active_profile::ActiveProfileStore;
     use crate::vpn::manager::OWNED_INTERFACE_NAME;
     use crate::vpn::store::WireGuardProfileStore;
-    use crate::vpn::wireguard::{WireGuardKey, WireGuardPeerConfig, WireGuardVpnDriver};
+    use crate::vpn::wireguard::WireGuardVpnDriver;
 
     /// A router with one managed output subnet and an uplink — the minimum
     /// shape `vpn_policy_desired` needs to produce a policy.
@@ -536,7 +552,8 @@ mod tests {
         assert!(vpn_policy_desired(&config).is_none());
     }
 
-    use crate::vpn::{ProviderError, VpnProvider};
+    use crate::test_support::StaticKeyVpnProvider;
+    use crate::vpn::VpnProvider;
 
     const VALID_PRIVATE_KEY: &str = "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=";
     const VALID_PUBLIC_KEY: &str = "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=";
@@ -552,108 +569,6 @@ mod tests {
              AllowedIPs = 0.0.0.0/0\n\
              Endpoint = 203.0.113.1:51820\n"
         )
-    }
-
-    #[derive(Debug, Clone)]
-    struct FakeLink {
-        up: bool,
-    }
-
-    #[derive(Default)]
-    struct FakeVpnProvider {
-        links: StdMutex<HashMap<String, FakeLink>>,
-    }
-
-    #[async_trait]
-    impl VpnProvider for FakeVpnProvider {
-        async fn link_exists(&self, name: &str) -> Result<bool, ProviderError> {
-            Ok(self.links.lock().unwrap().contains_key(name))
-        }
-
-        async fn create_link(
-            &self,
-            name: &str,
-            _private_key: &WireGuardKey,
-            _listen_port: Option<u16>,
-        ) -> Result<(), ProviderError> {
-            self.links
-                .lock()
-                .unwrap()
-                .insert(name.to_string(), FakeLink { up: false });
-            Ok(())
-        }
-
-        async fn set_addresses(
-            &self,
-            name: &str,
-            _addresses: &[ipnet::IpNet],
-        ) -> Result<(), ProviderError> {
-            self.require_link(name)
-        }
-
-        async fn set_peers(
-            &self,
-            name: &str,
-            _peers: &[WireGuardPeerConfig],
-        ) -> Result<(), ProviderError> {
-            self.require_link(name)
-        }
-
-        async fn set_link_up(&self, name: &str) -> Result<(), ProviderError> {
-            let mut links = self.links.lock().unwrap();
-            let link = links
-                .get_mut(name)
-                .ok_or_else(|| ProviderError::NotFound(name.to_string()))?;
-            link.up = true;
-            Ok(())
-        }
-
-        async fn set_link_down(&self, name: &str) -> Result<(), ProviderError> {
-            let mut links = self.links.lock().unwrap();
-            let link = links
-                .get_mut(name)
-                .ok_or_else(|| ProviderError::NotFound(name.to_string()))?;
-            link.up = false;
-            Ok(())
-        }
-
-        async fn delete_link(&self, name: &str) -> Result<(), ProviderError> {
-            self.links
-                .lock()
-                .unwrap()
-                .remove(name)
-                .map(|_| ())
-                .ok_or_else(|| ProviderError::NotFound(name.to_string()))
-        }
-
-        async fn public_key(&self, name: &str) -> Result<Option<WireGuardKey>, ProviderError> {
-            Ok(self
-                .links
-                .lock()
-                .unwrap()
-                .get(name)
-                .map(|_| WireGuardKey::parse(VALID_PUBLIC_KEY, "test").unwrap()))
-        }
-
-        async fn is_up(&self, name: &str) -> Result<bool, ProviderError> {
-            Ok(self
-                .links
-                .lock()
-                .unwrap()
-                .get(name)
-                .map(|link| link.up)
-                .unwrap_or(false))
-        }
-    }
-
-    impl FakeVpnProvider {
-        fn require_link(&self, name: &str) -> Result<(), ProviderError> {
-            if self.links.lock().unwrap().contains_key(name) {
-                Ok(())
-            } else {
-                Err(ProviderError::NotFound(name.to_string()))
-            }
-        }
     }
 
     #[derive(Default)]
@@ -783,11 +698,11 @@ mod tests {
     fn manager_with(
         network: Arc<FakeNetwork>,
         firewall_executor: FakeNftExecutor,
-    ) -> (TestManager, Arc<FakeVpnProvider>, tempfile::TempDir) {
+    ) -> (TestManager, Arc<StaticKeyVpnProvider>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = WireGuardProfileStore::new(dir.path().join("wireguard"));
         let active_profile_store = ActiveProfileStore::new(dir.path().join("active-profile.json"));
-        let fake_provider = Arc::new(FakeVpnProvider::default());
+        let fake_provider = Arc::new(StaticKeyVpnProvider::default());
         let erased: Arc<dyn VpnProvider> = fake_provider.clone();
         let driver = WireGuardVpnDriver::new(erased, store);
         let tunnel = Arc::new(VpnManager::new(driver, active_profile_store));
@@ -962,7 +877,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deactivate_removes_firewall_before_rules_and_routes() {
+    async fn deactivate_removes_rules_and_routes_before_firewall() {
         let network = FakeNetwork::with_interface(OWNED_INTERFACE_NAME, 42);
         let firewall_desired = desired().firewall();
         let executor = FakeNftExecutor::with_responses(vec![

@@ -16,7 +16,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use tokio::signal;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior};
 
@@ -30,7 +30,7 @@ use crate::core::override_manager::RuntimeOverrideManager;
 use crate::core::ownership::AddressOwnershipJournal;
 use crate::core::route::{RouteManager, RouteSnapshot};
 use crate::core::router::{RouterDesired, RouterManager};
-use crate::core::router_subsystems::ProductionRouterSubsystems;
+use crate::core::router_subsystems::{ProductionRouterSubsystems, VpnChainDeps};
 use crate::core::router_transaction::RouterTransactionCoordinator;
 use crate::core::vpn_policy_manager::{
     vpn_policy_desired, vpn_policy_teardown_target, VpnPolicyManager,
@@ -52,7 +52,7 @@ use crate::vpn::{
     ActiveProfileStore, NetlinkVpnProvider, ProductionVpnManager, VpnManager, VpnProvider,
     WireGuardProfileStore, WireGuardVpnDriver,
 };
-use crate::wifi::{HostapdSupervisor, WifiClientSupervisor};
+use crate::wifi::{HostapdSupervisor, WifiApSpec, WifiClientSpec, WifiClientSupervisor};
 
 use process::ProcessGuard;
 
@@ -102,6 +102,7 @@ impl DhcpRuntimeReconciler for DhcpSupervisor {
 #[async_trait]
 trait DhcpClientRuntimeReconciler: Send + Sync {
     async fn spec(&self, interface: &str) -> Option<DhcpClientSpec>;
+    async fn specs(&self) -> Vec<DhcpClientSpec>;
     async fn disable(&self, interface: &str) -> Result<Option<DhcpClientSpec>>;
     async fn reconcile(&self, spec: DhcpClientSpec, link_ready: bool);
     async fn ensure_alive(&self) -> Result<bool>;
@@ -111,6 +112,10 @@ trait DhcpClientRuntimeReconciler: Send + Sync {
 impl DhcpClientRuntimeReconciler for DhcpClientSupervisor {
     async fn spec(&self, interface: &str) -> Option<DhcpClientSpec> {
         self.spec(interface).await
+    }
+
+    async fn specs(&self) -> Vec<DhcpClientSpec> {
+        self.statuses().await.into_iter().map(|status| status.spec).collect()
     }
 
     async fn disable(&self, interface: &str) -> Result<Option<DhcpClientSpec>> {
@@ -130,6 +135,10 @@ impl DhcpClientRuntimeReconciler for DhcpClientSupervisor {
 trait WifiRuntimeReconciler: Send + Sync {
     async fn ensure_alive(&self) -> Result<bool>;
 
+    async fn reconcile_interface(&self, _interface: &str, _config: &InterfaceConfig) -> Result<()> {
+        Ok(())
+    }
+
     async fn association_ready(&self, _interface: &str) -> Option<bool> {
         None
     }
@@ -140,12 +149,42 @@ impl WifiRuntimeReconciler for HostapdSupervisor {
     async fn ensure_alive(&self) -> Result<bool> {
         Ok(HostapdSupervisor::ensure_alive(self).await?)
     }
+
+    async fn reconcile_interface(&self, interface: &str, config: &InterfaceConfig) -> Result<()> {
+        let desired = WifiApSpec::from_interface_config(interface, config)?;
+        match desired {
+            Some(spec) => {
+                self.configure(spec).await?;
+                Ok(())
+            }
+            None if self.status(interface).await.is_some() => {
+                self.disable(interface).await?;
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
 }
 
 #[async_trait]
 impl WifiRuntimeReconciler for WifiClientSupervisor {
     async fn ensure_alive(&self) -> Result<bool> {
         Ok(WifiClientSupervisor::ensure_alive(self).await?)
+    }
+
+    async fn reconcile_interface(&self, interface: &str, config: &InterfaceConfig) -> Result<()> {
+        let desired = WifiClientSpec::from_interface_config(interface, config)?;
+        match desired {
+            Some(spec) => {
+                self.configure(spec).await?;
+                Ok(())
+            }
+            None if self.status(interface).await.is_some() => {
+                self.disable(interface).await?;
+                Ok(())
+            }
+            None => Ok(()),
+        }
     }
 
     async fn association_ready(&self, interface: &str) -> Option<bool> {
@@ -290,6 +329,9 @@ async fn reconcile_address_ownership(
 #[allow(clippy::too_many_arguments)]
 fn production_router_coordinator(
     desired: &RouterDesired,
+    vpn_enabled: bool,
+    vpn_store_dir: &Path,
+    state_dir: &Path,
     journal: AddressOwnershipJournal,
     dhcp: DhcpSupervisor,
     dhcp_client: DhcpClientSupervisor,
@@ -303,7 +345,7 @@ fn production_router_coordinator(
             .context("failed to open rtnetlink connection for router transaction coordinator")?,
     );
     let interfaces = InterfaceManager::new(network.clone(), journal);
-    let routes = RouteManager::new(network);
+    let routes = RouteManager::new(network.clone());
     let dataplane_provider = production_dataplane_provider()
         .context("failed to build router dataplane provider for transaction coordinator")?;
     let dataplane = RouterDataplaneManager::new(dataplane_provider);
@@ -325,9 +367,28 @@ fn production_router_coordinator(
     // known yet, and refusing now would judge it by the intent that happened to
     // exist at boot. `plan_uplink_wifi` / `plan_output_wifi` already reject a
     // Wi-Fi intent without a runtime, at the point where the intent is real.
-    if let (Some(wifi_client), Some(wifi)) = (wifi_client, wifi) {
-        subsystems = subsystems.with_wifi_runtimes(Arc::new(wifi_client), Arc::new(wifi));
+    if let Some(wifi_client) = wifi_client {
+        subsystems = subsystems.with_station_runtime(Arc::new(wifi_client));
     }
+    if let Some(wifi) = wifi {
+        subsystems = subsystems.with_access_point_runtime(Arc::new(wifi));
+    }
+
+    if vpn_enabled {
+        let vpn_provider: Arc<dyn VpnProvider> = Arc::new(
+            NetlinkVpnProvider::connect().context(
+                "failed to open VPN netlink connection for router transaction coordinator",
+            )?,
+        );
+        subsystems = subsystems.with_vpn_chain(VpnChainDeps {
+            vpn_provider,
+            wireguard_store: WireGuardProfileStore::new(vpn_store_dir.to_path_buf()),
+            state_dir: state_dir.to_path_buf(),
+            network,
+            nft_executor: Arc::new(NftCommandExecutor),
+        });
+    }
+
     let manager = RouterManager::new(Arc::new(subsystems));
     Ok(RouterTransactionCoordinator::new(
         manager,
@@ -575,7 +636,7 @@ async fn reconcile_network_runtime_once<
     journal: &AddressOwnershipJournal,
     network: Arc<dyn NetworkProvider>,
     dhcp: &D,
-    _wifi: Option<&W>,
+    wifi: Option<&W>,
     wifi_client: Option<&C>,
     dhcp_client: Option<&L>,
 ) -> Result<BTreeMap<String, String>> {
@@ -591,6 +652,13 @@ async fn reconcile_network_runtime_once<
         .collect();
 
     for (name, config) in &effective.network.interfaces {
+        if let Some(client) = wifi_client {
+            if let Err(error) = client.reconcile_interface(name, config).await {
+                tracing::warn!(interface = %name, %error, "failed to reconcile Wi-Fi client");
+                failures.insert(name.clone(), error.to_string());
+            }
+        }
+
         if let Some(dhcp_client) = dhcp_client {
             let link_ready = if config.wifi_client.is_some() {
                 match wifi_client {
@@ -679,6 +747,13 @@ async fn reconcile_network_runtime_once<
             (false, false)
         };
 
+        if let Some(access_point) = wifi {
+            if let Err(error) = access_point.reconcile_interface(name, config).await {
+                tracing::warn!(interface = %name, %error, "failed to reconcile Wi-Fi access point");
+                failures.insert(name.clone(), error.to_string());
+            }
+        }
+
         apply_dhcp_reconcile_action(
             dhcp,
             name,
@@ -740,6 +815,8 @@ fn spawn_runtime_network_reconcile(
     wifi: Option<HostapdSupervisor>,
     wifi_client: Option<WifiClientSupervisor>,
     dhcp_client: DhcpClientSupervisor,
+    network_mutations: Arc<RwLock<()>>,
+    router: Option<RouterTransactionCoordinator>,
     mut kernel_events: mpsc::UnboundedReceiver<KernelEvent>,
     mut shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -760,20 +837,43 @@ fn spawn_runtime_network_reconcile(
             // caller cannot mistake an older pass for an answer about its own
             // change.
             let version = desired.version();
-            let result = reconcile_network_runtime_once(
-                &desired,
-                &journal,
-                network.clone(),
-                &dhcp,
-                wifi.as_ref(),
-                wifi_client.as_ref(),
-                Some(&dhcp_client),
-            )
-            .await;
-            if let Err(error) = &result {
-                tracing::warn!(%error, "runtime interface reconcile pass failed");
+            let result = {
+                // Interface transactions are themselves driven by this
+                // converger, so both use a shared/read gate. Direct API and
+                // router mutations take the exclusive/write side. This keeps
+                // convergence alive for tentative interface state while
+                // preventing it from racing a direct mutation.
+                let _network_mutation = network_mutations.read().await;
+                let router_busy = match &router {
+                    Some(router) => router.status().await
+                        != crate::core::router_transaction::CoordinatorStatus::Idle,
+                    None => false,
+                };
+                if router_busy {
+                    None
+                } else {
+                    Some(
+                        reconcile_network_runtime_once(
+                            &desired,
+                            &journal,
+                            network.clone(),
+                            &dhcp,
+                            wifi.as_ref(),
+                            wifi_client.as_ref(),
+                            Some(&dhcp_client),
+                        )
+                        .await,
+                    )
+                }
+            };
+            if let Some(result) = result {
+                if let Err(error) = &result {
+                    tracing::warn!(%error, "runtime interface reconcile pass failed");
+                }
+                desired.report_result(version, result);
+            } else {
+                tracing::debug!("runtime reconcile suspended while a router transaction is pending recovery/confirmation");
             }
-            desired.report_result(version, result);
 
             tokio::select! {
                 event = kernel_events.recv() => match event {
@@ -829,6 +929,13 @@ async fn check_process_liveness<D, W, C, L>(
             tracing::warn!(%error, "failed to check Wi-Fi client liveness");
         }
     }
+    if let (Some(wifi_client), Some(dhcp_client)) = (wifi_client, dhcp_client) {
+        for spec in dhcp_client.specs().await {
+            if let Some(link_ready) = wifi_client.association_ready(&spec.interface).await {
+                dhcp_client.reconcile(spec, link_ready).await;
+            }
+        }
+    }
     if let Some(dhcp_client) = dhcp_client {
         if let Err(error) = dhcp_client.ensure_alive().await {
             tracing::warn!(%error, "failed to check DHCP client liveness");
@@ -873,6 +980,8 @@ fn spawn_process_liveness_checks(
     wifi: Option<HostapdSupervisor>,
     wifi_client: Option<WifiClientSupervisor>,
     dhcp_client: DhcpClientSupervisor,
+    network_mutations: Arc<RwLock<()>>,
+    router: Option<RouterTransactionCoordinator>,
     mut shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -884,6 +993,16 @@ fn spawn_process_liveness_checks(
                 _ = interval.tick() => {
                     if shutdown_requested(&shutdown) {
                         break;
+                    }
+                    let _network_mutation = network_mutations.read().await;
+                    let router_busy = match &router {
+                        Some(router) => router.status().await
+                            != crate::core::router_transaction::CoordinatorStatus::Idle,
+                        None => false,
+                    };
+                    if router_busy {
+                        tracing::debug!("process liveness mutations suspended while a router transaction is pending recovery/confirmation");
+                        continue;
                     }
                     check_process_liveness(
                         &dhcp,
@@ -1068,6 +1187,16 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
 
     let overrides = RuntimeOverrideManager::load(&config.runtime.state_dir, &config).await?;
     let override_snapshot = overrides.snapshot().await;
+    // Provisioning passphrases are journaled separately because they are
+    // intentionally not stored in runtime-overrides.json. Resolve that journal
+    // before starting either Wi-Fi supervisor so a crashed, uncommitted
+    // transaction can never boot with its staged credentials.
+    crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore::in_state_dir(
+        &config.runtime.state_dir,
+    )
+    .recover(override_snapshot.committed_router_transaction.as_deref())
+    .await
+    .context("failed to recover router provisioning secrets")?;
     let effective_config = override_snapshot.effective_config(&config)?;
     let bindings = HttpApiBindings::bind(&effective_config)?;
     let auth = AuthService::open(&config.auth).await?;
@@ -1193,6 +1322,12 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         }
     });
 
+    // Created before router recovery so autonomous DHCP lease callbacks cannot
+    // race startup reconciliation. The same gate is later installed in the
+    // ControlService and background reconcilers.
+    let network_mutations = Arc::new(RwLock::new(()));
+    dhcp_client.set_network_mutation_gate(network_mutations.clone());
+
     if shutdown_requested(&shutdown) {
         stack.unwind().await;
         tracing::info!("shutdown requested during DHCP client initialization");
@@ -1248,6 +1383,9 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     // wiring — it opens a netlink socket and touches no data plane.
     let router_coordinator = match production_router_coordinator(
         &desired,
+        effective_config.vpn.enabled,
+        &effective_config.vpn.wireguard_config_dir,
+        &effective_config.runtime.state_dir,
         ownership_journal.clone(),
         dhcp.clone(),
         dhcp_client.clone(),
@@ -1257,16 +1395,22 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         Duration::from_secs(config.security.rollback_timeout_seconds),
     ) {
         Ok(coordinator) => {
+            coordinator.set_timeout_mutation_gate(network_mutations.clone());
             let recovered = async {
-                if coordinator.recover().await? {
-                    coordinator.repair(desired.clone()).await?;
-                }
+                let _network_mutation = network_mutations.write().await;
+                coordinator.recover().await?;
+                // Reconcile the complete committed router intent through the
+                // same staged manager used by transactions. Startup's legacy
+                // bootstrap covers interfaces/routes/dataplane separately;
+                // this pass also brings up Wi-Fi and the VPN hop chain and is
+                // idempotent for stages already converged.
+                coordinator.repair(desired.clone()).await?;
                 Ok::<_, anyhow::Error>(())
             }
             .await;
             if let Err(error) = recovered {
                 stack.unwind().await;
-                return Err(error).context("failed to recover interrupted router transaction");
+                return Err(error).context("failed to recover/reconcile router state");
             }
             Some(coordinator)
         }
@@ -1314,7 +1458,8 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         startup_baselines,
         ownership_journal.clone(),
     )
-    .with_base_config(config.clone());
+    .with_base_config(config.clone())
+    .with_network_mutation_gate(network_mutations.clone());
     if let Some(coordinator) = router_coordinator.clone() {
         control = control.with_router_coordinator(coordinator);
     }
@@ -1347,8 +1492,9 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     let autoconnect_control = control.clone();
     let server = bindings.into_server(control, auth);
 
+    let dhcp_interfaces = dhcp.running_interfaces().await;
     tracing::info!(
-        dhcp_interfaces = ?dhcp.running_interfaces().await,
+        dhcp_interfaces = ?dhcp_interfaces,
         socket = %socket_path.display(),
         https = effective_config.api.tcp.as_ref().is_some_and(|tcp| tcp.enabled),
         router_enabled = desired.enabled,
@@ -1388,6 +1534,8 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         wifi_supervisor.clone(),
         wifi_client_supervisor.clone(),
         dhcp_client.clone(),
+        network_mutations.clone(),
+        router_coordinator.clone(),
         kernel_events,
         shutdown.clone(),
     );
@@ -1403,6 +1551,8 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         wifi_supervisor.clone(),
         wifi_client_supervisor.clone(),
         dhcp_client.clone(),
+        network_mutations.clone(),
+        router_coordinator.clone(),
         shutdown.clone(),
     );
 
@@ -1413,6 +1563,12 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     // Finish any in-flight scan/activation before rolling back and stopping runtimes.
     let _ = autoconnect_task.await;
 
+    // No new process restarts should be introduced while shutdown is trying
+    // to prove rollback. The desired-state converger stays alive a little
+    // longer because interface transaction rollback is expressed through it.
+    liveness_task.abort();
+    let _ = liveness_task.await;
+
     // Before the converger is stopped, not after: an unconfirmed change is
     // abandoned by dropping it from the desired state, and only the converger
     // can take the machine back to what was committed. Stopping it first would
@@ -1422,6 +1578,7 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     }
 
     if let Some(coordinator) = &router_coordinator {
+        let _network_mutation = network_mutations.write().await;
         if coordinator.status().await != crate::core::router_transaction::CoordinatorStatus::Idle {
             if let Err(error) = coordinator.rollback().await {
                 tracing::error!(%error, "failed to roll back router transaction during shutdown");
@@ -1431,8 +1588,6 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
 
     reconcile_task.abort();
     let _ = reconcile_task.await;
-    liveness_task.abort();
-    let _ = liveness_task.await;
     session_reaper.abort();
     let _ = session_reaper.await;
     let graceful_signal = shutdown_requested(&shutdown);
@@ -1557,15 +1712,16 @@ mod tests {
     use crate::firewall::vpn::test_support::{nft_ruleset, FakeNftExecutor};
     use crate::firewall::{OwnedFirewallIntegrity, RouterDataplaneDesired};
     use crate::netlink::{
-        Ipv4AddressInfo, Ipv4RouteInfo, Ipv4RouteSpec, Ipv4RuleInfo, Ipv4RuleSpec,
+        Ipv4AddressInfo, Ipv4RouteInfo, Ipv4RuleInfo,
     };
     use crate::vpn::active_profile::ActiveProfileStore;
     use crate::vpn::manager::OWNED_INTERFACE_NAME;
     use crate::vpn::store::WireGuardProfileStore;
-    use crate::vpn::wireguard::{WireGuardKey, WireGuardPeerConfig, WireGuardVpnDriver};
-    use crate::vpn::{ProviderError, VpnProvider};
+    use crate::vpn::wireguard::WireGuardVpnDriver;
+    use crate::vpn::VpnProvider;
 
     use super::*;
+    use crate::test_support::{FakeNetworkProvider, StaticKeyVpnProvider};
 
     #[tokio::test]
     async fn startup_rollback_unwind_runs_pushed_steps_in_lifo_order() {
@@ -1603,176 +1759,6 @@ mod tests {
         stack.push(async move { pushed.lock().await.push("interfaces") });
         stack.unwind().await;
         assert_eq!(*order.lock().await, vec!["interfaces"]);
-    }
-
-    #[derive(Debug, Default)]
-    struct FakeNetworkProvider {
-        interfaces: Mutex<HashMap<String, crate::netlink::NetworkInterface>>,
-        addresses: Mutex<HashMap<String, Vec<Ipv4AddressInfo>>>,
-        routes: Mutex<Vec<Ipv4RouteInfo>>,
-        rules: Mutex<Vec<Ipv4RuleInfo>>,
-        fail_next_add_route: Mutex<bool>,
-    }
-
-    impl FakeNetworkProvider {
-        async fn add_interface(&self, name: &str, index: u32) {
-            self.add_interface_with_state(name, index, true, Vec::new())
-                .await;
-        }
-
-        async fn add_interface_with_state(
-            &self,
-            name: &str,
-            index: u32,
-            is_up: bool,
-            addresses: Vec<Ipv4AddressInfo>,
-        ) {
-            self.interfaces.lock().await.insert(
-                name.to_string(),
-                crate::netlink::NetworkInterface {
-                    is_wireless: false,
-                    index,
-                    name: name.to_string(),
-                    is_up,
-                    rx_bytes: 0,
-                    tx_bytes: 0,
-                },
-            );
-            self.addresses
-                .lock()
-                .await
-                .insert(name.to_string(), addresses);
-        }
-    }
-
-    #[async_trait]
-    impl NetworkProvider for FakeNetworkProvider {
-        async fn list_interfaces(&self) -> Result<Vec<crate::netlink::NetworkInterface>> {
-            Ok(self.interfaces.lock().await.values().cloned().collect())
-        }
-
-        async fn list_ipv4_addresses(&self, interface: &str) -> Result<Vec<Ipv4AddressInfo>> {
-            Ok(self
-                .addresses
-                .lock()
-                .await
-                .get(interface)
-                .cloned()
-                .unwrap_or_default())
-        }
-
-        async fn set_link_up(&self, name: &str) -> Result<()> {
-            let mut interfaces = self.interfaces.lock().await;
-            let interface = interfaces
-                .get_mut(name)
-                .ok_or_else(|| anyhow::anyhow!("interface not found: {name}"))?;
-            interface.is_up = true;
-            Ok(())
-        }
-
-        async fn set_link_down(&self, name: &str) -> Result<()> {
-            let mut interfaces = self.interfaces.lock().await;
-            let interface = interfaces
-                .get_mut(name)
-                .ok_or_else(|| anyhow::anyhow!("interface not found: {name}"))?;
-            interface.is_up = false;
-            Ok(())
-        }
-
-        async fn add_ipv4_address(
-            &self,
-            interface: &str,
-            address: Ipv4Addr,
-            prefix_len: u8,
-            ownership: AddressOwnership,
-        ) -> Result<()> {
-            let interface_index = self
-                .interfaces
-                .lock()
-                .await
-                .get(interface)
-                .ok_or_else(|| anyhow::anyhow!("interface not found: {interface}"))?
-                .index;
-            let mut addresses = self.addresses.lock().await;
-            let entry = addresses.entry(interface.to_string()).or_default();
-            if !entry
-                .iter()
-                .any(|current| current.address == address && current.prefix_len == prefix_len)
-            {
-                entry.push(Ipv4AddressInfo {
-                    interface_index,
-                    address,
-                    prefix_len,
-                    protocol: ownership.protocol(),
-                });
-            }
-            Ok(())
-        }
-
-        async fn delete_ipv4_address(
-            &self,
-            interface: &str,
-            address: Ipv4Addr,
-            prefix_len: u8,
-        ) -> Result<()> {
-            if let Some(addresses) = self.addresses.lock().await.get_mut(interface) {
-                addresses.retain(|current| {
-                    !(current.address == address && current.prefix_len == prefix_len)
-                });
-            }
-            Ok(())
-        }
-
-        async fn list_ipv4_routes(&self) -> Result<Vec<Ipv4RouteInfo>> {
-            Ok(self.routes.lock().await.clone())
-        }
-
-        async fn add_ipv4_route(&self, route: &Ipv4RouteSpec) -> Result<()> {
-            let mut fail = self.fail_next_add_route.lock().await;
-            if *fail {
-                *fail = false;
-                anyhow::bail!("injected route add failure");
-            }
-            drop(fail);
-            self.routes.lock().await.push(Ipv4RouteInfo {
-                destination: route.destination,
-                gateway: route.gateway,
-                output_interface_index: route.output_interface_index,
-                table: route.table,
-                metric: route.metric,
-                protocol: route.protocol,
-                scope: if route.gateway.is_some() { 0 } else { 253 },
-            });
-            Ok(())
-        }
-
-        async fn delete_ipv4_route(&self, route: &Ipv4RouteInfo) -> Result<()> {
-            self.routes.lock().await.retain(|current| current != route);
-            Ok(())
-        }
-
-        async fn list_ipv4_rules(&self) -> Result<Vec<Ipv4RuleInfo>> {
-            Ok(self.rules.lock().await.clone())
-        }
-
-        async fn add_ipv4_rule(&self, rule: &Ipv4RuleSpec) -> Result<()> {
-            self.rules.lock().await.push(Ipv4RuleInfo {
-                source: rule.source,
-                destination: rule.destination,
-                table: rule.table,
-                priority: rule.priority,
-                fw_mark: rule.fw_mark,
-                fw_mask: rule.fw_mask,
-                input_interface: rule.input_interface.clone(),
-                output_interface: rule.output_interface.clone(),
-            });
-            Ok(())
-        }
-
-        async fn delete_ipv4_rule(&self, rule: &Ipv4RuleInfo) -> Result<()> {
-            self.rules.lock().await.retain(|current| current != rule);
-            Ok(())
-        }
     }
 
     #[derive(Debug, Default)]
@@ -1833,6 +1819,10 @@ mod tests {
     impl DhcpClientRuntimeReconciler for FakeDhcpClientReconciler {
         async fn spec(&self, interface: &str) -> Option<DhcpClientSpec> {
             self.specs.lock().await.get(interface).cloned()
+        }
+
+        async fn specs(&self) -> Vec<DhcpClientSpec> {
+            self.specs.lock().await.values().cloned().collect()
         }
 
         async fn disable(&self, interface: &str) -> Result<Option<DhcpClientSpec>> {
@@ -1940,113 +1930,11 @@ mod tests {
         )
     }
 
-    #[derive(Debug, Clone)]
-    struct FakeVpnLink {
-        up: bool,
-    }
-
-    #[derive(Default)]
-    struct FakeVpnProvider {
-        links: Mutex<HashMap<String, FakeVpnLink>>,
-    }
-
-    #[async_trait]
-    impl VpnProvider for FakeVpnProvider {
-        async fn link_exists(&self, name: &str) -> Result<bool, ProviderError> {
-            Ok(self.links.lock().await.contains_key(name))
-        }
-
-        async fn create_link(
-            &self,
-            name: &str,
-            _private_key: &WireGuardKey,
-            _listen_port: Option<u16>,
-        ) -> Result<(), ProviderError> {
-            self.links
-                .lock()
-                .await
-                .insert(name.to_string(), FakeVpnLink { up: false });
-            Ok(())
-        }
-
-        async fn set_addresses(
-            &self,
-            name: &str,
-            _addresses: &[ipnet::IpNet],
-        ) -> Result<(), ProviderError> {
-            self.require_link(name).await
-        }
-
-        async fn set_peers(
-            &self,
-            name: &str,
-            _peers: &[WireGuardPeerConfig],
-        ) -> Result<(), ProviderError> {
-            self.require_link(name).await
-        }
-
-        async fn set_link_up(&self, name: &str) -> Result<(), ProviderError> {
-            let mut links = self.links.lock().await;
-            let link = links
-                .get_mut(name)
-                .ok_or_else(|| ProviderError::NotFound(name.to_string()))?;
-            link.up = true;
-            Ok(())
-        }
-
-        async fn set_link_down(&self, name: &str) -> Result<(), ProviderError> {
-            let mut links = self.links.lock().await;
-            let link = links
-                .get_mut(name)
-                .ok_or_else(|| ProviderError::NotFound(name.to_string()))?;
-            link.up = false;
-            Ok(())
-        }
-
-        async fn delete_link(&self, name: &str) -> Result<(), ProviderError> {
-            self.links
-                .lock()
-                .await
-                .remove(name)
-                .map(|_| ())
-                .ok_or_else(|| ProviderError::NotFound(name.to_string()))
-        }
-
-        async fn public_key(&self, name: &str) -> Result<Option<WireGuardKey>, ProviderError> {
-            Ok(self
-                .links
-                .lock()
-                .await
-                .get(name)
-                .map(|_| WireGuardKey::parse(VALID_VPN_PUBLIC_KEY, "test").unwrap()))
-        }
-
-        async fn is_up(&self, name: &str) -> Result<bool, ProviderError> {
-            Ok(self
-                .links
-                .lock()
-                .await
-                .get(name)
-                .map(|link| link.up)
-                .unwrap_or(false))
-        }
-    }
-
-    impl FakeVpnProvider {
-        async fn require_link(&self, name: &str) -> Result<(), ProviderError> {
-            if self.links.lock().await.contains_key(name) {
-                Ok(())
-            } else {
-                Err(ProviderError::NotFound(name.to_string()))
-            }
-        }
-    }
-
     fn fake_vpn_manager() -> (Arc<ProductionVpnManager>, tempfile::TempDir) {
         let dir = tempdir().expect("tempdir");
         let store = WireGuardProfileStore::new(dir.path().join("wireguard"));
         let active_profile_store = ActiveProfileStore::new(dir.path().join("active-profile.json"));
-        let provider: Arc<dyn VpnProvider> = Arc::new(FakeVpnProvider::default());
+        let provider: Arc<dyn VpnProvider> = Arc::new(StaticKeyVpnProvider::default());
         let driver = WireGuardVpnDriver::new(provider, store);
         (Arc::new(VpnManager::new(driver, active_profile_store)), dir)
     }
@@ -2628,6 +2516,43 @@ mod tests {
             1,
             "every supervised runtime means every one: the DHCP client was the \
              one left behind in the convergence pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn liveness_resynchronizes_wifi_association_into_dhcp_link_ready() {
+        let dhcp = FakeDhcpReconciler::default();
+        let wifi_client = FakeWifiReconciler::default();
+        let dhcp_client = FakeDhcpClientReconciler::default();
+        let spec = DhcpClientSpec {
+            interface: "wlan0".into(),
+            route_metric: 100,
+            install_default_route: true,
+            request_dns: true,
+            send_release_on_shutdown: false,
+        };
+        dhcp_client
+            .specs
+            .lock()
+            .await
+            .insert(spec.interface.clone(), spec.clone());
+        wifi_client
+            .associations
+            .lock()
+            .await
+            .insert(spec.interface.clone(), true);
+
+        check_process_liveness(
+            &dhcp,
+            None::<&FakeWifiReconciler>,
+            Some(&wifi_client),
+            Some(&dhcp_client),
+        )
+        .await;
+
+        assert_eq!(
+            dhcp_client.readiness.lock().await.as_slice(),
+            &[("wlan0".to_string(), true)]
         );
     }
 

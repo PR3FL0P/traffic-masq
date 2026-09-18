@@ -181,7 +181,7 @@ impl RuntimeOverrideStore {
         let mut content = serde_json::to_vec_pretty(overrides)?;
         content.push(b'\n');
 
-        atomic_file::replace_async(&self.path, &content, PRIVATE_FILE_MODE)
+        atomic_file::replace_preserving_on_error_async(&self.path, &content, PRIVATE_FILE_MODE)
             .await
             .with_context(|| format!("failed to atomically replace {}", self.path.display()))
     }

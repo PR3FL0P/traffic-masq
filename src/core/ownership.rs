@@ -321,17 +321,26 @@ impl AddressOwnershipJournal {
         change: impl FnOnce(&mut Vec<AddressClaim>),
     ) -> Result<(), OwnershipJournalError> {
         let mut claims = self.inner.claims.lock().await;
-        let entry = claims.entry(interface.to_string()).or_default();
-        let before = entry.clone();
-        change(entry);
-        if *entry == before {
+        let before = claims.get(interface).cloned().unwrap_or_default();
+        let mut after = before.clone();
+        change(&mut after);
+        if after == before {
             return Ok(());
         }
-        let after = entry.clone();
         if after.is_empty() {
             claims.remove(interface);
+        } else {
+            claims.insert(interface.to_string(), after.clone());
         }
-        self.persist(interface, &after)
+        if let Err(error) = self.persist(interface, &after) {
+            if before.is_empty() {
+                claims.remove(interface);
+            } else {
+                claims.insert(interface.to_string(), before);
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     async fn write(
@@ -340,12 +349,24 @@ impl AddressOwnershipJournal {
         claims: Vec<AddressClaim>,
     ) -> Result<(), OwnershipJournalError> {
         let mut all = self.inner.claims.lock().await;
+        let previous = all.get(interface).cloned();
         if claims.is_empty() {
             all.remove(interface);
         } else {
             all.insert(interface.to_string(), claims.clone());
         }
-        self.persist(interface, &claims)
+        if let Err(error) = self.persist(interface, &claims) {
+            match previous {
+                Some(previous) => {
+                    all.insert(interface.to_string(), previous);
+                }
+                None => {
+                    all.remove(interface);
+                }
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn persist(

@@ -31,19 +31,11 @@ pub(crate) const DASHBOARD_ACTIONS: [DashboardFocus; 2] =
 pub(crate) const DASHBOARD_ACTION_LABELS: [&str; 2] = ["Interfaces", "Pending network changes"];
 
 fn next_dashboard_action(focus: DashboardFocus) -> DashboardFocus {
-    let index = DASHBOARD_ACTIONS
-        .iter()
-        .position(|candidate| *candidate == focus)
-        .unwrap_or(0);
-    DASHBOARD_ACTIONS[(index + 1).min(DASHBOARD_ACTIONS.len() - 1)]
+    super::input::move_clamped(&DASHBOARD_ACTIONS, focus, true)
 }
 
 fn previous_dashboard_action(focus: DashboardFocus) -> DashboardFocus {
-    let index = DASHBOARD_ACTIONS
-        .iter()
-        .position(|candidate| *candidate == focus)
-        .unwrap_or(0);
-    DASHBOARD_ACTIONS[index.saturating_sub(1)]
+    super::input::move_clamped(&DASHBOARD_ACTIONS, focus, false)
 }
 
 pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
@@ -70,16 +62,8 @@ pub(crate) async fn handle_dashboard_key(
                 DashboardFocus::Interfaces,
                 DashboardFocus::PendingChanges,
             ];
-            let index = fields
-                .iter()
-                .position(|field| *field == app.dashboard_focus)
-                .unwrap_or(0);
-            let step = if key == KeyCode::Tab {
-                1
-            } else {
-                fields.len() - 1
-            };
-            app.dashboard_focus = fields[(index + step) % fields.len()];
+            app.dashboard_focus =
+                super::input::move_wrapped(&fields, app.dashboard_focus, key == KeyCode::Tab);
         }
         KeyCode::Esc if app.dashboard_focus != DashboardFocus::List => {
             app.dashboard_focus = DashboardFocus::List;

@@ -5,7 +5,7 @@
 //! listed. The `0700`/`0600`/atomic-rename/no-symlink rules themselves live in
 //! `atomic_file`, shared with the stores that are not keyed this way.
 
-use std::fs::{self, File};
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -85,18 +85,14 @@ impl PrivateJsonDirectory {
     pub fn write(&self, key: &str, bytes: &[u8]) -> Result<(), PrivateStoreError> {
         let destination = self.path(key)?;
         reject_symlink(&destination)?;
-        atomic_file::replace(&destination, bytes, PRIVATE_FILE_MODE)?;
+        atomic_file::replace_preserving_on_error(&destination, bytes, PRIVATE_FILE_MODE)?;
         Ok(())
     }
 
     pub fn remove(&self, key: &str) -> Result<(), PrivateStoreError> {
         let path = self.path(key)?;
         reject_symlink(&path)?;
-        match fs::remove_file(path) {
-            Ok(()) => File::open(&self.directory)?.sync_all()?,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+        atomic_file::remove_preserving_on_error(&path, PRIVATE_FILE_MODE)?;
         Ok(())
     }
 

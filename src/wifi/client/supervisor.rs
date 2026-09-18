@@ -1,12 +1,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-use crate::atomic_file::{self, PRIVATE_FILE_MODE};
 use crate::config::{AppConfig, ShutdownPolicy};
 use crate::dhcp::supervisor::resolve_interface_index;
 use crate::wifi::client::ctrl::{
@@ -17,9 +16,13 @@ use crate::wifi::client::render::{
     config_path, render_scan_config, render_wpa_supplicant_config, scan_config_path,
     ClientRenderError, ClientRenderInput, RenderedClientConfig,
 };
-use crate::wifi::process::{
-    find_competing_network_managers, ProcessError, SupervisedProcess, TokioSupervisedProcess,
+use crate::wifi::lifecycle::{
+    classify_ownership, graceful_stop, preflight_binary as preflight_daemon_binary, retry_health,
+    save_spawned_record,
+    unix_now, wait_until_ready, write_private_config, OwnershipOutcome, RetryState, WifiHealth,
+    STARTUP_READY_TIMEOUT,
 };
+use crate::wifi::process::{ProcessError, SupervisedProcess, TokioSupervisedProcess};
 use crate::wifi::record::{PersistedWifiRecord, WifiRecordError, WifiRecordStore};
 use crate::wifi::render::WifiDigest;
 use crate::wifi::secret::WifiPassphrase;
@@ -29,13 +32,6 @@ use crate::wifi::WifiClientSpec;
 
 const DEFAULT_CTRL_TIMEOUT: Duration = Duration::from_secs(2);
 
-const STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(15);
-const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(20);
-
-const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(5);
-const GRACEFUL_STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-const BACKOFF_CEILING: Duration = Duration::from_secs(300);
 
 const ASSOCIATION_GRACE: Duration = Duration::from_secs(90);
 
@@ -101,11 +97,8 @@ impl ClientSupervisorError {
 struct ClientTask {
     spec: WifiClientSpec,
     record: PersistedWifiRecord,
-    consecutive_failures: u32,
-    next_restart_earliest: Option<Instant>,
-
+    retry: RetryState,
     associated_or_started_at: Instant,
-    last_failure: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -117,7 +110,7 @@ pub struct WifiClientStatus {
 
     pub bssid: Option<crate::wifi::MacAddr>,
     pub freq: Option<u32>,
-    pub health: crate::wifi::supervisor::WifiHealth,
+    pub health: WifiHealth,
 }
 
 #[derive(Clone)]
@@ -137,13 +130,6 @@ struct Inner {
     operation_lock: Mutex<()>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum OwnershipOutcome {
-    Absent,
-    ForeignPresent,
-    Adopted(PersistedWifiRecord),
-    DigestMismatch(PersistedWifiRecord),
-}
 
 impl WifiClientSupervisor {
     pub async fn start(config: &AppConfig) -> Result<Self, ClientSupervisorError> {
@@ -243,12 +229,11 @@ impl WifiClientSupervisor {
                     key_digest: WifiDigest::of(&[]),
                     ssid: spec.ssid.clone(),
                 },
-                consecutive_failures: 1,
-                next_restart_earliest: Some(
-                    Instant::now() + backoff_duration(self.inner.restart_backoff_seconds, 1),
+                retry: RetryState::failed_startup(
+                    self.inner.restart_backoff_seconds,
+                    error,
                 ),
                 associated_or_started_at: Instant::now(),
-                last_failure: Some(error.to_string()),
             });
     }
 
@@ -281,11 +266,17 @@ impl WifiClientSupervisor {
 
         let existing = self.inner.tasks.lock().await.get(&interface).cloned();
         let task = match existing {
-            Some(task)
+            Some(mut task)
                 if task.record.config_digest == rendered.config_digest
                     && task.record.key_digest == rendered.key_digest =>
             {
-                task
+                if self.task_process_matches(&task).await? {
+                    task
+                } else {
+                    self.restart_task(&mut task, &spec, &rendered, &ctrl_path)
+                        .await?;
+                    task
+                }
             }
             Some(mut task) => {
                 self.restart_task(&mut task, &spec, &rendered, &ctrl_path)
@@ -302,6 +293,34 @@ impl WifiClientSupervisor {
         Ok(())
     }
 
+    async fn task_process_matches(
+        &self,
+        task: &ClientTask,
+    ) -> Result<bool, ClientSupervisorError> {
+        if task.record.pid == 0 || !self.inner.process.is_alive(task.record.pid).await? {
+            return Ok(false);
+        }
+        if !self
+            .inner
+            .process
+            .cmdline_contains(task.record.pid, &task.record.config_path)
+            .await?
+        {
+            return Ok(false);
+        }
+
+        let client = match WpaSupplicantCtrlClient::connect(
+            &task.record.ctrl_path,
+            self.inner.ctrl_timeout,
+        )
+        .await
+        {
+            Ok(client) => client,
+            Err(_) => return Ok(false),
+        };
+        Ok(client.ping().await.is_ok())
+    }
+
     async fn restart_task(
         &self,
         task: &mut ClientTask,
@@ -309,12 +328,12 @@ impl WifiClientSupervisor {
         rendered: &RenderedClientConfig,
         ctrl_path: &Path,
     ) -> Result<(), ClientSupervisorError> {
-        self.graceful_stop(task.record.pid).await;
+        self.graceful_stop(task.record.pid).await?;
         let record = self.spawn_and_record(spec, rendered, ctrl_path).await?;
         task.spec = spec.clone();
         task.record = record;
-        task.consecutive_failures = 0;
-        task.next_restart_earliest = None;
+        task.retry.consecutive_failures = 0;
+        task.retry.next_restart_earliest = None;
         task.associated_or_started_at = Instant::now();
         Ok(())
     }
@@ -329,8 +348,9 @@ impl WifiClientSupervisor {
         let record = match outcome {
             OwnershipOutcome::Absent => self.spawn_and_record(spec, rendered, ctrl_path).await?,
             OwnershipOutcome::Adopted(record) => record,
-            OwnershipOutcome::DigestMismatch(record) => {
-                self.graceful_stop(record.pid).await;
+            OwnershipOutcome::DigestMismatch(record)
+            | OwnershipOutcome::UnreachableOwned(record) => {
+                self.graceful_stop(record.pid).await?;
                 self.spawn_and_record(spec, rendered, ctrl_path).await?
             }
             OwnershipOutcome::ForeignPresent => {
@@ -342,10 +362,8 @@ impl WifiClientSupervisor {
         Ok(ClientTask {
             spec: spec.clone(),
             record,
-            consecutive_failures: 0,
-            next_restart_earliest: None,
+            retry: RetryState::default(),
             associated_or_started_at: Instant::now(),
-            last_failure: None,
         })
     }
 
@@ -362,38 +380,21 @@ impl WifiClientSupervisor {
                 Ok(client) => client.status().await.ok(),
                 Err(_) => None,
             };
-        let Some(status) = status else {
-            let _ = store.clear().await;
-            return Ok(OwnershipOutcome::Absent);
-        };
-
-        let Some(record) = store.load().await? else {
-            return Ok(OwnershipOutcome::ForeignPresent);
-        };
-
-        let process_factor = self
-            .inner
-            .process
-            .cmdline_contains(record.pid, &record.config_path)
-            .await
-            .unwrap_or(false);
-
-        let ctrl_factor = match status.ssid.as_deref() {
-            Some(ssid) => ssid == record.ssid,
-            None => true,
-        };
-
-        if !process_factor || !ctrl_factor {
-            return Ok(OwnershipOutcome::ForeignPresent);
-        }
-
-        if record.config_digest == rendered.config_digest
-            && record.key_digest == rendered.key_digest
-        {
-            Ok(OwnershipOutcome::Adopted(record))
-        } else {
-            Ok(OwnershipOutcome::DigestMismatch(record))
-        }
+        classify_ownership(
+            &store,
+            self.inner.process.as_ref(),
+            status.is_some(),
+            |record| {
+                status.as_ref().is_some_and(|status| match status.ssid.as_deref() {
+                    Some(ssid) => ssid == record.ssid,
+                    None => true,
+                })
+            },
+            rendered.config_digest,
+            rendered.key_digest,
+        )
+        .await
+        .map_err(Into::into)
     }
 
     async fn spawn_and_record(
@@ -416,49 +417,38 @@ impl WifiClientSupervisor {
         let result = async {
             wait_for_ready(ctrl_path, self.inner.ctrl_timeout, &spec.interface).await?;
 
-            let record = PersistedWifiRecord {
+            Ok(save_spawned_record(
+                &self.record_store(&spec.interface),
                 pid,
-                started_at_unix: unix_now(),
-                ctrl_path: ctrl_path.to_path_buf(),
-                config_path: rendered.path.clone(),
-                config_digest: rendered.config_digest,
-                key_digest: rendered.key_digest,
-                ssid: spec.ssid.clone(),
-            };
-            self.record_store(&spec.interface).save(&record).await?;
-            Ok(record)
+                ctrl_path,
+                &rendered.path,
+                rendered.config_digest,
+                rendered.key_digest,
+                &spec.ssid,
+            )
+            .await?)
         }
         .await;
 
-        if result.is_err() {
-            self.graceful_stop(pid).await;
+        match result {
+            Ok(record) => Ok(record),
+            Err(error) => match self.graceful_stop(pid).await {
+                Ok(()) => match self.record_store(&spec.interface).clear().await {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(ClientSupervisorError::Configuration(anyhow::anyhow!(
+                        "wpa_supplicant startup failed: {error}; process stopped but ownership-record cleanup failed: {cleanup}; recovery required"
+                    ))),
+                },
+                Err(cleanup) => Err(ClientSupervisorError::Configuration(anyhow::anyhow!(
+                    "wpa_supplicant startup failed: {error}; cleanup also failed: {cleanup}; recovery required"
+                ))),
+            },
         }
-
-        result
     }
 
-    async fn graceful_stop(&self, pid: u32) {
-        if pid == 0 {
-            return;
-        }
-        if let Err(error) = self.inner.process.terminate(pid).await {
-            tracing::warn!(pid, %error, "failed to send SIGTERM to wpa_supplicant");
-        }
-
-        let deadline = Instant::now() + GRACEFUL_STOP_TIMEOUT;
-        loop {
-            match self.inner.process.is_alive(pid).await {
-                Ok(false) | Err(_) => return,
-                Ok(true) if Instant::now() >= deadline => break,
-                Ok(true) => tokio::time::sleep(GRACEFUL_STOP_POLL_INTERVAL).await,
-            }
-        }
-
-        tracing::warn!(
-            pid,
-            "wpa_supplicant did not exit after SIGTERM; sending SIGKILL"
-        );
-        let _ = self.inner.process.kill(pid).await;
+    async fn graceful_stop(&self, pid: u32) -> Result<(), ClientSupervisorError> {
+        graceful_stop(self.inner.process.as_ref(), pid, "wpa_supplicant").await?;
+        Ok(())
     }
 
     pub async fn disable(
@@ -466,13 +456,24 @@ impl WifiClientSupervisor {
         interface: &str,
     ) -> Result<Option<WifiClientSpec>, ClientSupervisorError> {
         let _operation = self.inner.operation_lock.lock().await;
-        let Some(task) = self.inner.tasks.lock().await.remove(interface) else {
+        let Some(task) = self.inner.tasks.lock().await.get(interface).cloned() else {
             return Ok(None);
         };
 
-        self.graceful_stop(task.record.pid).await;
-        let _ = self.record_store(interface).clear().await;
-        let _ = tokio::fs::remove_file(config_path(&self.inner.runtime_dir, interface)).await;
+        self.graceful_stop(task.record.pid).await?;
+        self.record_store(interface).clear().await?;
+        let runtime_config = config_path(&self.inner.runtime_dir, interface);
+        match tokio::fs::remove_file(&runtime_config).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ClientSupervisorError::Configuration(anyhow::anyhow!(
+                    "failed to remove wpa_supplicant config {}: {error}",
+                    runtime_config.display()
+                )))
+            }
+        }
+        self.inner.tasks.lock().await.remove(interface);
         Ok(Some(task.spec))
     }
 
@@ -482,14 +483,13 @@ impl WifiClientSupervisor {
     /// is built unconditionally, so a client configured at runtime needs the
     /// same diagnosis of a missing binary that startup gives.
     pub async fn preflight_binary(&self) -> Result<(), ClientSupervisorError> {
-        crate::command::probe(&self.inner.wpa_supplicant_binary).await
-            .map_err(|error| {
-                ClientSupervisorError::Configuration(anyhow::anyhow!(
-                    "wpa_supplicant binary {} is not runnable ({error}) — install wpa_supplicant or fix wifi_client.wpa_supplicant_binary",
-                    self.inner.wpa_supplicant_binary.display()
-                ))
-            })?;
-        Ok(())
+        preflight_daemon_binary(
+            &self.inner.wpa_supplicant_binary,
+            "wpa_supplicant",
+            "wifi_client.wpa_supplicant_binary",
+        )
+        .await
+        .map_err(ClientSupervisorError::Configuration)
     }
 
     pub async fn status(&self, interface: &str) -> Option<WifiClientStatus> {
@@ -505,30 +505,18 @@ impl WifiClientSupervisor {
                 Err(_) => (WpaState::Other("unreachable".to_string()), None, None),
             };
 
-        let health = if let Some(error) = &task.last_failure {
-            let retry_in_secs = task
-                .next_restart_earliest
-                .map(|earliest| earliest.saturating_duration_since(Instant::now()).as_secs());
-            let competing_managers = find_competing_network_managers().await;
-            let advice = if competing_managers.is_empty() {
-                None
-            } else {
-                Some(crate::wifi::process::format_competing_manager_advice(
-                    &competing_managers,
-                    interface,
-                ))
-            };
-            crate::wifi::supervisor::WifiHealth::Retrying {
-                error: error.clone(),
-                attempts: task.consecutive_failures,
-                retry_in_secs,
-                competing_managers,
-                advice,
-            }
+        let health = if let Some(error) = task.retry.last_failure.as_deref() {
+            retry_health(
+                error,
+                task.retry.consecutive_failures,
+                task.retry.next_restart_earliest,
+                interface,
+            )
+            .await
         } else if wpa_state.is_connected() {
-            crate::wifi::supervisor::WifiHealth::Healthy
+            WifiHealth::Healthy
         } else {
-            crate::wifi::supervisor::WifiHealth::Starting
+            WifiHealth::Starting
         };
 
         Some(WifiClientStatus {
@@ -613,11 +601,18 @@ impl WifiClientSupervisor {
             Err(err) => Err(err),
         };
 
-        self.graceful_stop(pid).await;
+        let stop_result = self.graceful_stop(pid).await;
         let _ = tokio::fs::remove_file(&scan_config_path).await;
         let _ = tokio::fs::remove_file(&ctrl_path).await;
 
-        scan_result
+        match (scan_result, stop_result) {
+            (Ok(results), Ok(())) => Ok(results),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(stop)) => Err(stop),
+            (Err(error), Err(stop)) => Err(ClientSupervisorError::Configuration(anyhow::anyhow!(
+                "Wi-Fi scan failed: {error}; stopping ephemeral supplicant also failed: {stop}; recovery required"
+            ))),
+        }
     }
 
     async fn perform_scan(
@@ -709,10 +704,8 @@ impl WifiClientSupervisor {
             return Ok(false);
         };
 
-        if let Some(earliest) = task.next_restart_earliest {
-            if Instant::now() < earliest {
-                return Ok(false);
-            }
+        if task.retry.is_waiting() {
+            return Ok(false);
         }
 
         let ctrl_path = self.ctrl_path(interface);
@@ -736,15 +729,28 @@ impl WifiClientSupervisor {
                 task.associated_or_started_at = Instant::now();
                 false
             }
-            Some(_) => task.associated_or_started_at.elapsed() > ASSOCIATION_GRACE,
+            Some(status)
+                if matches!(
+                    status.wpa_state,
+                    WpaState::Authenticating
+                        | WpaState::Associating
+                        | WpaState::Associated
+                        | WpaState::FourWayHandshake
+                        | WpaState::GroupHandshake
+                ) =>
+            {
+                task.associated_or_started_at.elapsed() > ASSOCIATION_GRACE
+            }
+            Some(_) => {
+                task.associated_or_started_at = Instant::now();
+                false
+            }
 
             None => false,
         };
 
         if status.is_some() && !stuck {
-            task.consecutive_failures = 0;
-            task.next_restart_earliest = None;
-            task.last_failure = None;
+            task.retry = RetryState::default();
             self.inner
                 .tasks
                 .lock()
@@ -792,7 +798,7 @@ impl WifiClientSupervisor {
         // Placeholder tasks (failed startup) have pid 0; signalling pid 0
         // would signal the whole process group, including this daemon.
         if task.record.pid != 0 {
-            self.graceful_stop(task.record.pid).await;
+            self.graceful_stop(task.record.pid).await?;
         }
 
         if let Ok(client) =
@@ -805,27 +811,21 @@ impl WifiClientSupervisor {
             }
         }
 
-        task.consecutive_failures += 1;
+        task.retry.consecutive_failures += 1;
         match self
             .spawn_and_record(&task.spec, &rendered, &ctrl_path)
             .await
         {
             Ok(record) => {
                 task.record = record;
-                task.next_restart_earliest = None;
+                task.retry.next_restart_earliest = None;
+                task.retry.last_failure = None;
                 task.associated_or_started_at = Instant::now();
-                task.last_failure = None;
             }
             Err(error) => {
                 tracing::error!(%interface, %error, "failed to respawn wpa_supplicant");
-                task.last_failure = Some(error.to_string());
-                task.next_restart_earliest = Some(
-                    Instant::now()
-                        + backoff_duration(
-                            self.inner.restart_backoff_seconds,
-                            task.consecutive_failures,
-                        ),
-                );
+                task.retry
+                    .respawn_failed(self.inner.restart_backoff_seconds, &error.to_string());
             }
         }
         self.inner
@@ -842,39 +842,26 @@ impl WifiClientSupervisor {
 
         for (interface, task) in tasks {
             if policy == ShutdownPolicy::RestoreInterfaces {
-                self.graceful_stop(task.record.pid).await;
-                let _ = self.record_store(&interface).clear().await;
-                let _ =
-                    tokio::fs::remove_file(config_path(&self.inner.runtime_dir, &interface)).await;
+                if let Err(error) = self.graceful_stop(task.record.pid).await {
+                    tracing::error!(%interface, %error, "failed to stop wpa_supplicant during shutdown; ownership record retained");
+                    continue;
+                }
+                if let Err(error) = self.record_store(&interface).clear().await {
+                    tracing::error!(%interface, %error, "wpa_supplicant stopped but ownership record cleanup failed");
+                }
+                let path = config_path(&self.inner.runtime_dir, &interface);
+                if let Err(error) = tokio::fs::remove_file(&path).await {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(%interface, path = %path.display(), %error, "failed to remove wpa_supplicant runtime config during shutdown");
+                    }
+                }
             }
         }
     }
 }
 
-fn backoff_duration(base_seconds: u64, consecutive_failures: u32) -> Duration {
-    let multiplier = 1u64.checked_shl(consecutive_failures.saturating_sub(1));
-    let seconds = multiplier
-        .and_then(|multiplier| base_seconds.checked_mul(multiplier))
-        .unwrap_or(u64::MAX);
-    Duration::from_secs(seconds).min(BACKOFF_CEILING)
-}
-
 async fn write_config_file(rendered: &RenderedClientConfig) -> Result<(), ClientSupervisorError> {
-    if let Some(parent) = rendered.path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|source| io_error(&rendered.path, source))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-                .await
-                .map_err(|source| io_error(&rendered.path, source))?;
-        }
-    }
-    let mut content = rendered.text.clone().into_bytes();
-    content.push(b'\n');
-    atomic_file::replace_async(&rendered.path, &content, PRIVATE_FILE_MODE)
+    write_private_config(&rendered.path, &rendered.text)
         .await
         .map_err(|source| io_error(&rendered.path, source))
 }
@@ -891,35 +878,28 @@ async fn wait_for_ready(
     timeout: Duration,
     interface: &str,
 ) -> Result<(), ClientSupervisorError> {
-    let deadline = Instant::now() + STARTUP_READY_TIMEOUT.max(timeout);
-    loop {
-        if let Ok(client) = WpaSupplicantCtrlClient::connect(ctrl_path, timeout).await {
-            if client.ping().await.is_ok() {
-                return Ok(());
-            }
+    let ready = wait_until_ready(timeout, || async {
+        match WpaSupplicantCtrlClient::connect(ctrl_path, timeout).await {
+            Ok(client) => client.ping().await.is_ok(),
+            Err(_) => false,
         }
-        if Instant::now() >= deadline {
-            return Err(ClientSupervisorError::StartupTimeout {
-                interface: interface.to_string(),
-                timeout: STARTUP_READY_TIMEOUT.max(timeout),
-            });
-        }
-        tokio::time::sleep(STARTUP_POLL_INTERVAL).await;
+    })
+    .await;
+    if ready {
+        Ok(())
+    } else {
+        Err(ClientSupervisorError::StartupTimeout {
+            interface: interface.to_string(),
+            timeout: STARTUP_READY_TIMEOUT.max(timeout),
+        })
     }
 }
 
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
 
 #[cfg(test)]
 mod tests {
     use std::os::unix::net::UnixDatagram as StdUnixDatagram;
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use tempfile::tempdir;
 
@@ -929,6 +909,7 @@ mod tests {
         SecurityConfig, ShutdownPolicy as ConfigShutdownPolicy, VpnConfig, WifiClientConfig,
         WifiClientGlobalConfig, WifiClientSecurity, WifiConfig,
     };
+    use crate::test_support::{FakeProcessCall as FakeCall, FakeSupervisedProcess};
     use crate::wifi::render::WifiDigest;
 
     fn read_ssid_from_config(path: &Path) -> Option<String> {
@@ -1035,6 +1016,35 @@ mod tests {
                 ctrl_path,
             }
         }
+
+        fn spawn_silent(ctrl_path: PathBuf) -> Self {
+            let socket = StdUnixDatagram::bind(&ctrl_path).expect("bind silent fake ctrl socket");
+            socket
+                .set_read_timeout(Some(Duration::from_millis(20)))
+                .expect("set read timeout");
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown_for_thread = shutdown.clone();
+            let join = std::thread::spawn(move || {
+                let mut buffer = [0u8; 4096];
+                while !shutdown_for_thread.load(Ordering::Relaxed) {
+                    match socket.recv_from(&mut buffer) {
+                        Ok(_) => {}
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) => {}
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                shutdown,
+                join: Some(join),
+                ctrl_path,
+            }
+        }
+
     }
 
     impl Drop for FakeSupplicantCtrl {
@@ -1047,141 +1057,27 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    enum FakeCall {
-        Spawn(PathBuf),
-        Terminate(u32),
-        Kill(u32),
-    }
+    type FakeProcess = FakeSupervisedProcess<FakeSupplicantCtrl>;
 
-    #[derive(Default)]
-    struct FakeProcess {
-        configs: StdMutex<HashMap<u32, PathBuf>>,
-        responders: StdMutex<HashMap<u32, FakeSupplicantCtrl>>,
-        calls: StdMutex<Vec<FakeCall>>,
-        next_pid: AtomicU32,
-        fail_spawn: AtomicBool,
-        suppress_spawn_responder: AtomicBool,
-        persistent_responder: AtomicBool,
-
-        spawn_state: StdMutex<String>,
-    }
-
-    impl FakeProcess {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                next_pid: AtomicU32::new(2000),
-                spawn_state: StdMutex::new("COMPLETED".to_string()),
-                ..Default::default()
-            })
-        }
-
-        fn spawning_in_state(self: &Arc<Self>, state: &str) {
-            *self.spawn_state.lock().unwrap() = state.to_string();
-        }
-
-        fn calls(&self) -> Vec<FakeCall> {
-            self.calls.lock().unwrap().clone()
-        }
-
-        fn spawn_count(&self) -> usize {
-            self.calls
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|call| matches!(call, FakeCall::Spawn(_)))
-                .count()
-        }
-
-        fn seed(&self, pid: u32, config_path: PathBuf, state: &str) {
-            let ctrl_path = config_path.with_extension("");
-            let responder = FakeSupplicantCtrl::spawn(ctrl_path, state, &config_path);
-            self.configs.lock().unwrap().insert(pid, config_path);
-            self.responders.lock().unwrap().insert(pid, responder);
-        }
-
-        fn kill_externally(&self, pid: u32) {
-            self.responders.lock().unwrap().remove(&pid);
-            self.configs.lock().unwrap().remove(&pid);
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl SupervisedProcess for FakeProcess {
-        async fn spawn(&self, binary: &Path, config_path: &Path) -> Result<u32, ProcessError> {
-            let interface = config_path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .unwrap_or("wlan0");
-            self.spawn_wifi_client(binary, interface, config_path).await
-        }
-
-        async fn spawn_wifi_client(
-            &self,
-            _binary: &Path,
-            interface: &str,
-            config_path: &Path,
-        ) -> Result<u32, ProcessError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(FakeCall::Spawn(config_path.to_path_buf()));
-            if self.fail_spawn.load(Ordering::Relaxed) {
-                return Err(ProcessError::Spawn {
-                    binary: PathBuf::from("wpa_supplicant"),
-                    source: std::io::Error::other("fake spawn failure"),
-                });
-            }
-            let pid = self.next_pid.fetch_add(1, Ordering::Relaxed);
-            if !self.suppress_spawn_responder.load(Ordering::Relaxed) {
+    fn fake_process() -> Arc<FakeProcess> {
+        FakeProcess::new(
+            "wpa_supplicant",
+            2000,
+            "COMPLETED",
+            |interface, config_path, state| {
                 let ctrl_path = config_path
                     .parent()
                     .unwrap_or_else(|| Path::new(""))
                     .join(interface);
-                let state = self.spawn_state.lock().unwrap().clone();
-                let responder = FakeSupplicantCtrl::spawn(ctrl_path, &state, config_path);
-                self.responders.lock().unwrap().insert(pid, responder);
-            }
-            self.configs
-                .lock()
-                .unwrap()
-                .insert(pid, config_path.to_path_buf());
-            Ok(pid)
-        }
+                FakeSupplicantCtrl::spawn(ctrl_path, state, config_path)
+            },
+        )
+    }
 
-        async fn is_alive(&self, pid: u32) -> Result<bool, ProcessError> {
-            Ok(!self.persistent_responder.load(Ordering::Relaxed)
-                && self.responders.lock().unwrap().contains_key(&pid))
-        }
-
-        async fn cmdline_contains(
-            &self,
-            pid: u32,
-            config_path: &Path,
-        ) -> Result<bool, ProcessError> {
-            Ok(self
-                .configs
-                .lock()
-                .unwrap()
-                .get(&pid)
-                .is_some_and(|recorded| recorded == config_path))
-        }
-
-        async fn terminate(&self, pid: u32) -> Result<(), ProcessError> {
-            self.calls.lock().unwrap().push(FakeCall::Terminate(pid));
-            if !self.persistent_responder.load(Ordering::Relaxed) {
-                self.responders.lock().unwrap().remove(&pid);
-                self.configs.lock().unwrap().remove(&pid);
-            }
-            Ok(())
-        }
-
-        async fn kill(&self, pid: u32) -> Result<(), ProcessError> {
-            self.calls.lock().unwrap().push(FakeCall::Kill(pid));
-            self.responders.lock().unwrap().remove(&pid);
-            self.configs.lock().unwrap().remove(&pid);
-            Ok(())
-        }
+    fn seed_process(process: &FakeProcess, pid: u32, config_path: PathBuf, state: &str) {
+        let ctrl_path = config_path.with_extension("");
+        let responder = FakeSupplicantCtrl::spawn(ctrl_path, state, &config_path);
+        process.seed(pid, config_path, responder);
     }
 
     fn client_config(ssid: &str) -> WifiClientConfig {
@@ -1263,7 +1159,7 @@ mod tests {
     async fn configure_spawns_and_records_ownership() {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
 
         supervisor
@@ -1285,7 +1181,7 @@ mod tests {
     async fn readiness_failure_stops_the_spawned_supplicant_without_recording_it() {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
-        let process = FakeProcess::new();
+        let process = fake_process();
         process
             .suppress_spawn_responder
             .store(true, Ordering::Relaxed);
@@ -1320,7 +1216,7 @@ mod tests {
     async fn the_client_record_does_not_collide_with_an_access_point_one() {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
 
         supervisor
@@ -1348,7 +1244,7 @@ mod tests {
     async fn reconfiguring_with_an_identical_spec_is_a_no_op() {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
 
         supervisor
@@ -1374,7 +1270,7 @@ mod tests {
     async fn changing_the_network_restarts_rather_than_reloading() {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
 
         supervisor
@@ -1401,11 +1297,73 @@ mod tests {
         assert_eq!(record.pid, 2001);
     }
 
+
+    #[tokio::test]
+    async fn unchanged_client_with_unresponsive_ctrl_socket_is_restarted() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = temp.path().join("run");
+        let process = fake_process();
+        let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
+        let original = spec("wlan0", "upstream");
+
+        supervisor
+            .configure(original.clone())
+            .await
+            .expect("configure original");
+        let config = config_path(&runtime, "wlan0");
+        process.kill_externally(2000);
+        process.seed(
+            2000,
+            config,
+            FakeSupplicantCtrl::spawn_silent(runtime.join("wlan0")),
+        );
+
+        supervisor
+            .configure(original)
+            .await
+            .expect("unresponsive control socket must trigger restart");
+
+        assert_eq!(process.spawn_count(), 2);
+        assert!(process
+            .calls()
+            .iter()
+            .any(|call| matches!(call, FakeCall::Terminate(2000))));
+    }
+
+    #[tokio::test]
+    async fn failed_restart_can_be_rolled_back_to_the_previous_network() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = temp.path().join("run");
+        let process = fake_process();
+        let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
+        let original = spec("wlan0", "upstream");
+
+        supervisor
+            .configure(original.clone())
+            .await
+            .expect("configure original");
+
+        process.fail_spawn.store(true, Ordering::Relaxed);
+        supervisor
+            .configure(spec("wlan0", "somewhere-else"))
+            .await
+            .expect_err("replacement spawn must fail");
+
+        process.fail_spawn.store(false, Ordering::Relaxed);
+        supervisor
+            .configure(original.clone())
+            .await
+            .expect("rollback must respawn original");
+
+        assert_eq!(supervisor.status("wlan0").await.expect("status").spec, original);
+        assert_eq!(process.spawn_count(), 3);
+    }
+
     #[tokio::test]
     async fn a_passphrase_only_change_still_restarts() {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
 
         let mut secured = spec("wlan0", "upstream");
@@ -1444,13 +1402,13 @@ mod tests {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
         let records = temp.path().join("wifi");
-        let process = FakeProcess::new();
+        let process = fake_process();
 
         let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
         let target = spec("wlan0", "upstream");
         let rendered = supervisor.render_for(&target).await.expect("render");
         write_config_file(&rendered).await.expect("write config");
-        process.seed(4242, rendered.path.clone(), "COMPLETED");
+        seed_process(&process, 4242, rendered.path.clone(), "COMPLETED");
         WifiRecordStore::for_client(&records, "wlan0")
             .save(&PersistedWifiRecord {
                 pid: 4242,
@@ -1483,14 +1441,14 @@ mod tests {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
         let records = temp.path().join("wifi");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
 
         let target = spec("wlan0", "upstream");
         let rendered = supervisor.render_for(&target).await.expect("render");
         write_config_file(&rendered).await.expect("write config");
 
-        process.seed(4243, rendered.path.clone(), "SCANNING");
+        seed_process(&process, 4243, rendered.path.clone(), "SCANNING");
         WifiRecordStore::for_client(&records, "wlan0")
             .save(&PersistedWifiRecord {
                 pid: 4243,
@@ -1515,13 +1473,13 @@ mod tests {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
         let records = temp.path().join("wifi");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
 
         let target = spec("wlan0", "upstream");
         let rendered = supervisor.render_for(&target).await.expect("render");
         write_config_file(&rendered).await.expect("write config");
-        process.seed(4244, rendered.path.clone(), "COMPLETED");
+        seed_process(&process, 4244, rendered.path.clone(), "COMPLETED");
 
         WifiRecordStore::for_client(&records, "wlan0")
             .save(&PersistedWifiRecord {
@@ -1548,13 +1506,13 @@ mod tests {
     async fn a_live_supplicant_with_no_record_is_refused_never_taken_over() {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
 
         let target = spec("wlan0", "upstream");
         let rendered = supervisor.render_for(&target).await.expect("render");
         write_config_file(&rendered).await.expect("write config");
-        process.seed(4245, rendered.path.clone(), "COMPLETED");
+        seed_process(&process, 4245, rendered.path.clone(), "COMPLETED");
 
         let error = supervisor.configure(target).await.expect_err("must refuse");
         assert!(
@@ -1568,7 +1526,7 @@ mod tests {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
         let records = temp.path().join("wifi");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
 
         WifiRecordStore::for_client(&records, "wlan0")
@@ -1596,13 +1554,13 @@ mod tests {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
         let records = temp.path().join("wifi");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
 
         let target = spec("wlan0", "upstream");
         let rendered = supervisor.render_for(&target).await.expect("render");
         write_config_file(&rendered).await.expect("write config");
-        process.seed(4246, rendered.path.clone(), "COMPLETED");
+        seed_process(&process, 4246, rendered.path.clone(), "COMPLETED");
 
         WifiRecordStore::for_client(&records, "wlan0")
             .save(&PersistedWifiRecord {
@@ -1630,7 +1588,7 @@ mod tests {
     async fn ensure_alive_respawns_a_supplicant_that_died() {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
 
         supervisor
@@ -1647,7 +1605,7 @@ mod tests {
     async fn ensure_alive_refuses_respawn_when_the_old_ctrl_socket_still_answers() {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
         supervisor
             .configure(spec("wlan0", "upstream"))
@@ -1669,11 +1627,8 @@ mod tests {
         assert!(matches!(error, ClientSupervisorError::NotOwned { .. }));
         assert_eq!(
             process.calls(),
-            vec![
-                FakeCall::Spawn(config_path(&runtime, "wlan0")),
-                FakeCall::Terminate(2000),
-            ],
-            "ownership refusal must not spawn a replacement"
+            vec![FakeCall::Spawn(config_path(&runtime, "wlan0"))],
+            "ownership refusal must not signal an already-dead PID or spawn a replacement"
         );
         assert_eq!(
             supervisor
@@ -1691,7 +1646,7 @@ mod tests {
     async fn ensure_alive_leaves_a_healthy_supplicant_alone() {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
 
         supervisor
@@ -1707,8 +1662,8 @@ mod tests {
     async fn ensure_alive_tolerates_a_supplicant_that_is_still_associating() {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
-        let process = FakeProcess::new();
-        process.spawning_in_state("4WAY_HANDSHAKE");
+        let process = fake_process();
+        process.set_spawn_profile("4WAY_HANDSHAKE");
         let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
 
         supervisor
@@ -1727,8 +1682,8 @@ mod tests {
     async fn ensure_alive_restarts_a_supplicant_wedged_past_the_grace_period() {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
-        let process = FakeProcess::new();
-        process.spawning_in_state("4WAY_HANDSHAKE");
+        let process = fake_process();
+        process.set_spawn_profile("4WAY_HANDSHAKE");
         let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
 
         supervisor
@@ -1751,10 +1706,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ensure_alive_does_not_restart_a_normally_disconnected_supplicant() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = temp.path().join("run");
+        let process = fake_process();
+        process.set_spawn_profile("DISCONNECTED");
+        let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
+
+        supervisor
+            .configure(spec("wlan0", "upstream"))
+            .await
+            .expect("configure");
+        {
+            let mut tasks = supervisor.inner.tasks.lock().await;
+            tasks.get_mut("wlan0").expect("task").associated_or_started_at =
+                Instant::now() - ASSOCIATION_GRACE - Duration::from_secs(1);
+        }
+
+        assert!(!supervisor.ensure_alive().await.expect("ensure_alive"));
+        assert_eq!(process.spawn_count(), 1);
+    }
+
+    #[tokio::test]
     async fn reaching_completed_resets_the_association_clock() {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
 
         supervisor
@@ -1780,7 +1757,7 @@ mod tests {
     async fn a_failed_respawn_backs_off_before_trying_again() {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
 
         supervisor
@@ -1801,7 +1778,7 @@ mod tests {
     async fn disable_stops_the_supplicant_and_clears_its_record() {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
 
         supervisor
@@ -1830,7 +1807,7 @@ mod tests {
     async fn disabling_an_unconfigured_interface_is_not_an_error() {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
-        let supervisor = supervisor(temp.path(), &runtime, FakeProcess::new()).await;
+        let supervisor = supervisor(temp.path(), &runtime, fake_process()).await;
         assert!(supervisor
             .disable("wlan9")
             .await
@@ -1842,7 +1819,7 @@ mod tests {
     async fn status_reports_the_live_association() {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
-        let supervisor = supervisor(temp.path(), &runtime, FakeProcess::new()).await;
+        let supervisor = supervisor(temp.path(), &runtime, fake_process()).await;
 
         supervisor
             .configure(spec("wlan0", "upstream"))
@@ -1860,7 +1837,7 @@ mod tests {
     async fn status_of_a_managed_but_unreachable_supplicant_says_so() {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
 
         supervisor
@@ -1877,7 +1854,7 @@ mod tests {
     async fn reconnect_requires_a_configured_interface() {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
-        let supervisor = supervisor(temp.path(), &runtime, FakeProcess::new()).await;
+        let supervisor = supervisor(temp.path(), &runtime, fake_process()).await;
 
         let error = supervisor
             .reconnect("wlan9")
@@ -1899,7 +1876,7 @@ mod tests {
     async fn shutdown_with_preserve_interfaces_leaves_the_supplicant_running() {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
 
         supervisor
@@ -1927,7 +1904,7 @@ mod tests {
     async fn shutdown_with_restore_interfaces_stops_it_and_clears_the_record() {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
 
         supervisor
@@ -1953,7 +1930,7 @@ mod tests {
     async fn scan_on_unconfigured_interface_performs_ephemeral_scan_and_cleans_up() {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
 
         let results = supervisor.scan("wlan0").await.expect("scan succeeds");
@@ -1975,7 +1952,7 @@ mod tests {
     async fn scan_on_configured_interface_reuses_running_supplicant() {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
-        let process = FakeProcess::new();
+        let process = fake_process();
         let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
 
         supervisor

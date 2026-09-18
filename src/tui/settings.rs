@@ -432,19 +432,11 @@ async fn save_session_preferences(app: &mut TuiApp, client: &ApiClient) {
 }
 
 fn previous_settings_field(field: SettingsField) -> SettingsField {
-    let index = SETTINGS_FIELDS
-        .iter()
-        .position(|candidate| *candidate == field)
-        .unwrap_or(0);
-    SETTINGS_FIELDS[index.saturating_sub(1)]
+    super::input::move_clamped(&SETTINGS_FIELDS, field, false)
 }
 
 fn next_settings_field(field: SettingsField) -> SettingsField {
-    let index = SETTINGS_FIELDS
-        .iter()
-        .position(|candidate| *candidate == field)
-        .unwrap_or(0);
-    SETTINGS_FIELDS[(index + 1).min(SETTINGS_FIELDS.len() - 1)]
+    super::input::move_clamped(&SETTINGS_FIELDS, field, true)
 }
 
 pub(crate) async fn load_settings_data(app: &mut TuiApp, client: &ApiClient) {
@@ -709,19 +701,11 @@ impl PasswordChangeEditor {
 }
 
 fn next_password_field(current: PasswordField) -> PasswordField {
-    let index = PASSWORD_FIELDS
-        .iter()
-        .position(|field| *field == current)
-        .unwrap_or(0);
-    PASSWORD_FIELDS[(index + 1) % PASSWORD_FIELDS.len()]
+    super::input::move_wrapped(&PASSWORD_FIELDS, current, true)
 }
 
 fn previous_password_field(current: PasswordField) -> PasswordField {
-    let index = PASSWORD_FIELDS
-        .iter()
-        .position(|field| *field == current)
-        .unwrap_or(0);
-    PASSWORD_FIELDS[(index + PASSWORD_FIELDS.len() - 1) % PASSWORD_FIELDS.len()]
+    super::input::move_wrapped(&PASSWORD_FIELDS, current, false)
 }
 
 const PASSWORD_SUBMIT_LABEL: &str = "Submit";
