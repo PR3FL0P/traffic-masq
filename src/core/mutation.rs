@@ -48,12 +48,13 @@ impl NetworkMutationGate {
         self.admission.lock().await
     }
 
-    /// Background convergence/liveness, which never acquire admission.
+    /// Desired-state/background audits that are safe to run concurrently.
     pub async fn read(&self) -> RwLockReadGuard<'_, ()> {
         self.runtime.read().await
     }
 
-    /// A caller that already holds admission may exclude background writers.
+    /// Exclude concurrent runtime writers. Callers may already hold admission,
+    /// or may be autonomous background writers such as process liveness repair.
     pub async fn execute(&self) -> RwLockWriteGuard<'_, ()> {
         self.runtime.write().await
     }
@@ -91,6 +92,22 @@ mod tests {
         drop(wlan0);
         drop(eth0);
         drop(blocked.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn autonomous_runtime_writer_excludes_convergence() {
+        let gate = Arc::new(NetworkMutationGate::default());
+        let writer = gate.execute().await;
+        let convergence = tokio::spawn({
+            let gate = gate.clone();
+            async move {
+                let _guard = gate.read().await;
+            }
+        });
+        tokio::task::yield_now().await;
+        assert!(!convergence.is_finished());
+        drop(writer);
+        convergence.await.unwrap();
     }
 
     #[tokio::test]

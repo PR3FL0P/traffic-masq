@@ -43,8 +43,11 @@ an interface launch marker. Startup recovery compares those proofs with
 committed intent and only removes state whose ownership can still be verified.
 
 The global mutation gate serializes admitted network mutations with transaction
-execution, while background convergence uses the compatible read side. Accepted
-control operations keep running if the HTTP client disconnects. The executor
+execution. Desired-state convergence uses the compatible read side so an
+interface transaction can wait for its worker; autonomous background writers
+(such as supervised-process liveness repair) take exclusive runtime execution so
+they cannot replay stale state across a convergence pass. Accepted control
+operations keep running if the HTTP client disconnects. The executor
 limits queued work and waits for accepted operations during shutdown. If a
 request times out, the client must check the current state before retrying: the
 change may already have taken effect.

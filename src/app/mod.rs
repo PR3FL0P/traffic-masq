@@ -994,7 +994,11 @@ fn spawn_process_liveness_checks(
                     if shutdown_requested(&shutdown) {
                         break;
                     }
-                    let _network_mutation = network_mutations.read().await;
+                    // Liveness checks can restart or reconfigure supervised
+                    // runtimes. Keep them exclusive with desired-state convergence:
+                    // otherwise a DHCP/Wi-Fi readiness pass can replay state it
+                    // observed just before a transaction converged.
+                    let _network_mutation = network_mutations.execute().await;
                     let router_busy = match &router {
                         Some(router) => router.status().await
                             != crate::core::router_transaction::CoordinatorStatus::Idle,
