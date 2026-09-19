@@ -395,10 +395,6 @@ impl DhcpSupervisor {
         Ok(services)
     }
 
-    fn spawn_runtime() -> Result<RuntimeTask> {
-        Self::spawn_runtime_with_services(SharedDhcpServices::new())
-    }
-
     fn spawn_runtime_with_services(services: SharedDhcpServices) -> Result<RuntimeTask> {
         let runtime = SharedDhcpRuntime::bind(runtime_config(), services.clone())?;
         let task = tokio::spawn(async move {

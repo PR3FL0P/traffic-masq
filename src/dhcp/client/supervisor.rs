@@ -334,17 +334,26 @@ impl DhcpClientSupervisor {
         }
     }
 
-    /// Stop the candidate actor before restoring durable lease ownership.
-    /// Only unexpired leases can be restored; otherwise readiness must be
-    /// established by a fresh exchange instead of replaying stale addresses.
-    pub async fn restore(&self, spec: DhcpClientSpec, lease: Option<DhcpClientLease>) -> Result<()> {
-        let _operation = self.inner.operation_lock.lock().await;
-        let name = spec.interface.clone();
-        self.stop_task(&name).await;
-        self.inner.applier.cleanup(&name).await?;
-        self.inner.tasks.lock().await.insert(name.clone(), ClientTask::new(spec, true));
-        let lease = lease.filter(|lease| lease.expires_at_unix > current_unix_time());
-        self.restore_runtime_after_interrupted_stop(&name, lease).await
+    /// Restore DHCP configuration without replaying a captured lease.
+    ///
+    /// The `lease` argument is retained for source compatibility with older
+    /// callers. Dynamic DHCP state may have advanced since it was captured, so
+    /// it is intentionally ignored and the client reacquires current state.
+    pub async fn restore(
+        &self,
+        spec: DhcpClientSpec,
+        _lease: Option<DhcpClientLease>,
+    ) -> Result<()> {
+        let interface = spec.interface.clone();
+        self.configure(spec).await;
+        let status = self
+            .status(&interface)
+            .await
+            .context("DHCP client disappeared while restoring configuration")?;
+        if let DhcpClientRunState::Degraded { reason } = status.state {
+            bail!("DHCP client failed to restart on {interface}: {reason}");
+        }
+        Ok(())
     }
 
     pub async fn disable(&self, interface: &str) -> Result<Option<DhcpClientSpec>> {
@@ -894,9 +903,9 @@ struct OwnershipSink {
 impl DhcpClientActionSink for OwnershipSink {
     async fn lease_acquired(&mut self, lease: Lease) -> Result<()> {
         // Lease callbacks are participants in the configured DHCP runtime,
-        // not independent control requests. The supervisor stops/joins actors
-        // before changing their intent; each actor serializes its own
-        // ownership writes. Taking control admission here would deadlock lease readiness.
+        // not independent control requests. DHCP ownership and interface
+        // address writers serialize through the shared per-interface mutation
+        // lock. Taking control admission here would deadlock lease readiness.
         let persisted = self.persisted_lease(&lease);
         match self.applier.apply(persisted).await {
             Ok(applied) => {
@@ -927,9 +936,9 @@ impl DhcpClientActionSink for OwnershipSink {
 
     async fn cleanup_needed(&mut self, _lease: Lease) -> Result<()> {
         // Lease callbacks are participants in the configured DHCP runtime,
-        // not independent control requests. The supervisor stops/joins actors
-        // before changing their intent; each actor serializes its own
-        // ownership writes. Taking control admission here would deadlock lease readiness.
+        // not independent control requests. DHCP ownership and interface
+        // address writers serialize through the shared per-interface mutation
+        // lock. Taking control admission here would deadlock lease readiness.
         let result = self.applier.cleanup(&self.spec.interface).await;
         let mut shared = self.shared.lock().await;
         shared.lease = None;

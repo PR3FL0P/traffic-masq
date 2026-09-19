@@ -5,6 +5,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{InterfaceConfig, InterfaceRole, NetworkConfig};
+use crate::core::mutation::InterfaceMutationLocks;
 use crate::core::ownership::AddressOwnershipJournal;
 use crate::netlink::{AddressOwner, AddressOwnership, Ipv4AddressInfo, NetworkProvider};
 
@@ -87,6 +88,7 @@ pub fn owns_dynamic_ipv4(config: &InterfaceConfig) -> bool {
 pub struct InterfaceManager {
     provider: Arc<dyn NetworkProvider>,
     journal: AddressOwnershipJournal,
+    mutation_locks: InterfaceMutationLocks,
 }
 
 impl InterfaceManager {
@@ -95,7 +97,19 @@ impl InterfaceManager {
     /// that asks "is this mine" will look, or the answer depends on which
     /// object you happened to ask.
     pub fn new(provider: Arc<dyn NetworkProvider>, journal: AddressOwnershipJournal) -> Self {
-        Self { provider, journal }
+        Self::new_with_mutation_locks(provider, journal, InterfaceMutationLocks::global())
+    }
+
+    pub fn new_with_mutation_locks(
+        provider: Arc<dyn NetworkProvider>,
+        journal: AddressOwnershipJournal,
+        mutation_locks: InterfaceMutationLocks,
+    ) -> Self {
+        Self {
+            provider,
+            journal,
+            mutation_locks,
+        }
     }
 
     /// Whether traffic-masq installed this address.
@@ -143,7 +157,17 @@ impl InterfaceManager {
         else {
             return Ok(None);
         };
-        let ipv4_addresses = self.provider.list_ipv4_addresses(name).await?;
+        let ipv4_addresses = self
+            .provider
+            .list_ipv4_addresses(name)
+            .await?
+            .into_iter()
+            // DHCP leases are live protocol state, not configuration state.
+            // Replaying them from a transaction snapshot can overwrite a
+            // newer renewal/rebind during rollback, so DHCP owns their
+            // lifecycle exclusively.
+            .filter(|address| address.owner() != AddressOwner::TrafficMasqDhcp)
+            .collect();
 
         Ok(Some(InterfaceSnapshot {
             name: name.to_string(),
@@ -537,6 +561,7 @@ impl InterfaceManager {
     }
 
     pub async fn apply_plan(&self, plan: &InterfaceChangePlan) -> Result<()> {
+        let _mutation = self.mutation_locks.lock(&plan.interface).await;
         if plan.delete_ipv4.is_empty() && plan.retag_ipv4.is_none() && plan.add_ipv4.is_none() {
             tracing::info!(
                 interface = %plan.interface,
@@ -664,6 +689,7 @@ impl InterfaceManager {
     }
 
     pub async fn rollback(&self, snapshot: &InterfaceSnapshot) -> Result<()> {
+        let _mutation = self.mutation_locks.lock(&snapshot.name).await;
         let current = self.provider.list_ipv4_addresses(&snapshot.name).await?;
         let can_tag = self.provider.supports_ipv4_address_protocol();
         let same_address = |left: &Ipv4AddressInfo, right: &Ipv4AddressInfo| {
@@ -698,6 +724,12 @@ impl InterfaceManager {
         }
 
         for address in &snapshot.ipv4_addresses {
+            // Older durable transaction journals may still contain DHCP-owned
+            // addresses. Never replay those: DHCP lease state advances
+            // independently of the transaction and may already be newer.
+            if address.owner() == AddressOwner::TrafficMasqDhcp {
+                continue;
+            }
             // Ownership is restored as it was, except that a foreign tag is
             // never replayed: see `AddressOwner::restore_as`.
             let ownership = address.owner().restore_as();
@@ -1613,6 +1645,61 @@ mod tests {
             .expect("plan");
         assert_eq!(plan.delete_ipv4.len(), 0);
         assert!(plan.add_ipv4.is_some());
+    }
+
+    #[tokio::test]
+    async fn snapshot_excludes_dhcp_owned_addresses() {
+        let provider = Arc::new(FakeNetworkProvider::default());
+        let static_address = Ipv4AddressInfo {
+            interface_index: 1,
+            address: Ipv4Addr::new(192, 0, 2, 10),
+            prefix_len: 24,
+            protocol: Some(TRAFFIC_MASQ_ADDRESS_PROTOCOL),
+        };
+        let dhcp_address = Ipv4AddressInfo {
+            interface_index: 1,
+            address: Ipv4Addr::new(198, 51, 100, 20),
+            prefix_len: 24,
+            protocol: Some(TRAFFIC_MASQ_DHCP_ADDRESS_PROTOCOL),
+        };
+        provider
+            .add_interface("wan0", true, vec![static_address.clone(), dhcp_address])
+            .await;
+        let manager = InterfaceManager::new(provider, AddressOwnershipJournal::in_memory());
+
+        let snapshot = manager.snapshot("wan0").await.expect("snapshot");
+        assert_eq!(snapshot.ipv4_addresses, vec![static_address]);
+    }
+
+    #[tokio::test]
+    async fn rollback_never_replays_dhcp_addresses_from_legacy_snapshots() {
+        let provider = Arc::new(FakeNetworkProvider::default());
+        let newer_lease = Ipv4AddressInfo {
+            interface_index: 1,
+            address: Ipv4Addr::new(198, 51, 100, 30),
+            prefix_len: 24,
+            protocol: Some(TRAFFIC_MASQ_DHCP_ADDRESS_PROTOCOL),
+        };
+        provider
+            .add_interface("wan0", true, vec![newer_lease.clone()])
+            .await;
+        let manager = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
+        let legacy_snapshot = InterfaceSnapshot {
+            name: "wan0".into(),
+            was_up: true,
+            ipv4_addresses: vec![Ipv4AddressInfo {
+                interface_index: 1,
+                address: Ipv4Addr::new(198, 51, 100, 20),
+                prefix_len: 24,
+                protocol: Some(TRAFFIC_MASQ_DHCP_ADDRESS_PROTOCOL),
+            }],
+        };
+
+        manager.rollback(&legacy_snapshot).await.expect("rollback");
+        assert_eq!(
+            provider.list_ipv4_addresses("wan0").await.expect("addresses"),
+            vec![newer_lease]
+        );
     }
 
     #[tokio::test]

@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::config::{InterfaceConfig, InterfaceRole};
-use crate::core::desired::DesiredNetworkState;
+use crate::core::desired::{ConvergerState, DesiredNetworkState};
 use crate::core::mutation::NetworkMutationGate;
 use crate::wifi::{secret::WifiPassphrase, store::PassphraseStore};
 use crate::core::interface::{
@@ -511,8 +511,13 @@ impl NetworkTransactionManager {
         desired: &DesiredNetworkState,
         interface: &str,
     ) -> Result<()> {
-        if !desired.has_converger() {
-            return Ok(());
+        match desired.converger_state() {
+            ConvergerState::Detached => return Ok(()),
+            ConvergerState::Running => {}
+            ConvergerState::Failed(error) => {
+                bail!("network converger unavailable: {error}")
+            }
+            ConvergerState::Stopped => bail!("network converger unavailable: stopped"),
         }
 
         let version = desired.version();
@@ -535,7 +540,10 @@ impl NetworkTransactionManager {
     }
 
     pub async fn commit(&self, token: &str) -> Result<PendingNetworkChange> {
-        self.commit_with(token, |_, _, _| async { Ok(()) }).await
+        let desired = self.desired();
+        self.commit_with(token, |interface, config, allow| async move {
+            desired.commit_interface(token, interface, config, allow).await
+        }).await
     }
 
     pub async fn commit_with<F, Fut>(&self, token: &str, persist: F) -> Result<PendingNetworkChange>
@@ -544,6 +552,14 @@ impl NetworkTransactionManager {
         Fut: Future<Output = Result<()>>,
     {
         let _operation = self.inner.operation_lock.lock().await;
+        // Publish the committed layer and remove the proposal as one runtime
+        // operation. Otherwise a pass can read the old overrides followed by
+        // the newly empty tentative layer and briefly undo a confirmed change.
+        let gate = self.runtime_gate();
+        let _execution = match &gate {
+            Some(gate) => Some(gate.execute().await),
+            None => None,
+        };
         let (interface, target, allow_management_change) = {
             let pending = self.inner.pending.lock().await;
             let pending = pending
@@ -944,6 +960,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_converger_is_rejected_without_waiting_for_the_deadline() {
+        let directory = tempdir().unwrap();
+        let desired = desired_state(directory.path()).await;
+        desired.attach_converger();
+        desired.fail_converger("rtnetlink notification stream closed");
+        let manager = NetworkTransactionManager::new(
+            InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory()),
+            Duration::from_secs(60),
+            desired.clone(),
+        );
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.await_convergence(&desired, "test0"),
+        )
+        .await
+        .expect("failed converger should be rejected immediately")
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("network converger unavailable: rtnetlink notification stream closed")
+        );
+    }
+
+    #[tokio::test]
     async fn restart_removes_unconfirmed_address_on_previously_unmanaged_interface() {
         let directory = tempdir().unwrap();
         let provider = fake_network();
@@ -1009,6 +1051,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(addresses(&provider).await, before);
+    }
+
+    #[tokio::test]
+    async fn direct_commit_persists_the_configuration_and_recovery_token() {
+        let directory = tempdir().unwrap();
+        let desired = desired_state(directory.path()).await;
+        let manager = NetworkTransactionManager::new(
+            InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory()),
+            Duration::from_secs(60),
+            desired.clone(),
+        );
+        let pending = manager
+            .apply("test0", &interface_config(PROPOSED), None, false)
+            .await
+            .unwrap();
+        manager.commit(&pending.token).await.unwrap();
+        assert!(!desired.has_pending().await);
+        let reloaded = desired_state(directory.path()).await;
+        assert_eq!(
+            reloaded.committed_interface("test0").await.unwrap(),
+            Some(interface_config(PROPOSED))
+        );
+        let overrides = RuntimeOverrideManager::load(directory.path(), &AppConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            overrides
+                .snapshot()
+                .await
+                .committed_interface_transactions
+                .get("test0"),
+            Some(&pending.token)
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmation_waits_for_an_active_convergence_pass() {
+        let directory = tempdir().unwrap();
+        let desired = desired_state(directory.path()).await;
+        let manager = NetworkTransactionManager::new(
+            InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory()),
+            Duration::from_secs(60),
+            desired.clone(),
+        );
+        let gate = Arc::new(NetworkMutationGate::default());
+        manager.set_runtime_gate(gate.clone());
+        let pending = manager
+            .apply("test0", &interface_config(PROPOSED), None, false)
+            .await
+            .unwrap();
+        let pass = gate.read().await;
+        let (persisted_tx, mut persisted_rx) = tokio::sync::oneshot::channel();
+        let commit = tokio::spawn(async move {
+            manager
+                .commit_with(&pending.token, |_, _, _| async move {
+                    persisted_tx.send(()).unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut persisted_rx)
+                .await
+                .is_err()
+        );
+        assert!(desired.is_tentative("test0").await);
+        drop(pass);
+        tokio::time::timeout(Duration::from_secs(1), commit)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        persisted_rx.await.unwrap();
+        assert!(!desired.has_pending().await);
     }
 
     #[tokio::test]

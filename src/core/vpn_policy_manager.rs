@@ -206,6 +206,19 @@ impl<D: VpnDriver, E: NftExecutor> VpnPolicyManager<D, E> {
     }
 
     pub async fn deactivate(&self, desired: &VpnPolicyDesired) -> Result<()> {
+        let snapshot = self.snapshot(desired).await?;
+        if let Err(error) = self.deactivate_inner(desired).await {
+            return match self.rollback(desired, &snapshot).await {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(error.context(format!(
+                    "VPN policy deactivation failed and rollback was incomplete: {rollback:#}"
+                ))),
+            };
+        }
+        Ok(())
+    }
+
+    async fn deactivate_inner(&self, desired: &VpnPolicyDesired) -> Result<()> {
         let mut errors = Vec::new();
 
         // Remove policy routing first. If that cannot be completed, keep the
@@ -577,6 +590,7 @@ mod tests {
         rules: StdMutex<Vec<Ipv4RuleInfo>>,
         routes: StdMutex<Vec<Ipv4RouteInfo>>,
         fail_next_add_route: StdMutex<bool>,
+        fail_next_delete_rule: StdMutex<bool>,
     }
 
     impl FakeNetwork {
@@ -650,6 +664,9 @@ mod tests {
         }
 
         async fn delete_ipv4_rule(&self, rule: &Ipv4RuleInfo) -> Result<()> {
+            if std::mem::take(&mut *self.fail_next_delete_rule.lock().unwrap()) {
+                bail!("injected delete-rule failure");
+            }
             self.rules.lock().unwrap().retain(|current| current != rule);
             Ok(())
         }
@@ -885,6 +902,7 @@ mod tests {
             Ok(nft_ruleset(None)),
             Ok(Vec::new()),
             Ok(nft_ruleset(Some(&firewall_desired))),
+            Ok(nft_ruleset(Some(&firewall_desired))),
             Ok(Vec::new()),
         ]);
         let (manager, _provider, _dir) = manager_with(network.clone(), executor);
@@ -897,10 +915,41 @@ mod tests {
         assert!(network.list_ipv4_routes().await.unwrap().is_empty());
         let calls = manager.firewall.executor.calls.lock().unwrap();
 
-        assert_eq!(calls.len(), 5);
-        assert_eq!(calls[4].0, ["-f", "-"]);
-        let removal_batch = String::from_utf8(calls[4].1.clone()).unwrap();
+        assert_eq!(calls.len(), 6);
+        assert_eq!(calls[5].0, ["-f", "-"]);
+        let removal_batch = String::from_utf8(calls[5].1.clone()).unwrap();
         assert_eq!(removal_batch, "delete table inet traffic_masq_vpn\n");
+    }
+
+    #[tokio::test]
+    async fn failed_deactivation_restores_routes_and_rules() {
+        for firewall_failure in [false, true] {
+            let network = FakeNetwork::with_interface(OWNED_INTERFACE_NAME, 42);
+            let firewall_desired = desired().firewall();
+            let mut responses = vec![
+                Ok(nft_ruleset(None)),
+                Ok(nft_ruleset(None)),
+                Ok(Vec::new()),
+                Ok(nft_ruleset(Some(&firewall_desired))),
+            ];
+            if firewall_failure {
+                responses.push(Ok(nft_ruleset(Some(&firewall_desired))));
+                responses.push(Err(anyhow::anyhow!("injected firewall removal failure")));
+            }
+            responses.push(Ok(nft_ruleset(Some(&firewall_desired))));
+            let executor = FakeNftExecutor::with_responses(responses);
+            let (manager, _provider, _dir) = manager_with(network.clone(), executor);
+            activate_tunnel(&manager).await;
+            manager.activate(&desired()).await.unwrap();
+            let routes = network.list_ipv4_routes().await.unwrap();
+            let rules = network.list_ipv4_rules().await.unwrap();
+            *network.fail_next_delete_rule.lock().unwrap() = !firewall_failure;
+
+            assert!(manager.deactivate(&desired()).await.is_err());
+
+            assert_eq!(network.list_ipv4_routes().await.unwrap(), routes);
+            assert_eq!(network.list_ipv4_rules().await.unwrap(), rules);
+        }
     }
 
     #[tokio::test]
@@ -925,7 +974,7 @@ mod tests {
             protocol: TRAFFIC_MASQ_ROUTE_PROTOCOL,
             scope: 253,
         });
-        let executor = FakeNftExecutor::with_responses(vec![Ok(nft_ruleset(None)), Ok(Vec::new())]);
+        let executor = FakeNftExecutor::with_responses(vec![Ok(nft_ruleset(None)), Ok(nft_ruleset(None))]);
         let (manager, _provider, _dir) = manager_with(network.clone(), executor);
 
         manager

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
+    core::mutation::InterfaceMutationLocks,
     dhcp::client::{
         lease::{
             DhcpClientLease, DhcpClientLeaseState, DhcpClientOwnedRoute, LeaseValidationError,
@@ -54,11 +55,24 @@ pub enum OwnershipError {
 pub struct DhcpClientOwnershipApplier {
     network: Arc<dyn NetworkProvider>,
     store: DhcpClientLeaseStore,
+    mutation_locks: InterfaceMutationLocks,
 }
 
 impl DhcpClientOwnershipApplier {
     pub fn new(network: Arc<dyn NetworkProvider>, store: DhcpClientLeaseStore) -> Self {
-        Self { network, store }
+        Self::new_with_mutation_locks(network, store, InterfaceMutationLocks::global())
+    }
+
+    pub fn new_with_mutation_locks(
+        network: Arc<dyn NetworkProvider>,
+        store: DhcpClientLeaseStore,
+        mutation_locks: InterfaceMutationLocks,
+    ) -> Self {
+        Self {
+            network,
+            store,
+            mutation_locks,
+        }
     }
 
     pub async fn apply(
@@ -66,6 +80,7 @@ impl DhcpClientOwnershipApplier {
         mut lease: DhcpClientLease,
     ) -> Result<DhcpClientLease, OwnershipError> {
         lease.validate()?;
+        let _mutation = self.mutation_locks.lock(&lease.interface).await;
         self.verify_identity(&lease).await?;
         let prior = self.store.load(&lease.interface)?;
         let addresses = self
@@ -175,12 +190,13 @@ impl DhcpClientOwnershipApplier {
         interface: &str,
         now_unix: u64,
     ) -> Result<Option<DhcpClientLease>, OwnershipError> {
+        let _mutation = self.mutation_locks.lock(interface).await;
         let Some(lease) = self.store.load(interface)? else {
             return Ok(None);
         };
         self.verify_identity(&lease).await?;
         if lease.expires_at_unix <= now_unix {
-            self.cleanup(interface).await?;
+            self.cleanup_locked(interface).await?;
             return Err(OwnershipConflict::Expired.into());
         }
         match lease.state {
@@ -198,6 +214,7 @@ impl DhcpClientOwnershipApplier {
         interface: &str,
         now_unix: u64,
     ) -> Result<Option<DhcpClientLease>, OwnershipError> {
+        let _mutation = self.mutation_locks.lock(interface).await;
         let Some(mut lease) = self.store.load(interface)? else {
             return Ok(None);
         };
@@ -210,7 +227,7 @@ impl DhcpClientOwnershipApplier {
             Err(error) => return Err(error),
         }
         if lease.expires_at_unix <= now_unix {
-            self.cleanup(interface).await?;
+            self.cleanup_locked(interface).await?;
             return Ok(None);
         }
 
@@ -224,6 +241,11 @@ impl DhcpClientOwnershipApplier {
     }
 
     pub async fn cleanup(&self, interface: &str) -> Result<(), OwnershipError> {
+        let _mutation = self.mutation_locks.lock(interface).await;
+        self.cleanup_locked(interface).await
+    }
+
+    async fn cleanup_locked(&self, interface: &str) -> Result<(), OwnershipError> {
         let Some(mut lease) = self.store.load(interface)? else {
             return Ok(());
         };

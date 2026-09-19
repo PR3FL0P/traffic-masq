@@ -70,6 +70,10 @@ fn choose_profile<'a>(
 }
 
 impl ControlService {
+    async fn has_pending_interface_transaction(&self) -> bool {
+        !self.transactions.pending().await.is_empty()
+    }
+
     pub(crate) async fn autoconnect_wifi_once(&self) -> anyhow::Result<()> {
         let Some(wifi) = &self.wifi_client else {
             return Ok(());
@@ -95,13 +99,7 @@ impl ControlService {
                     continue;
                 }
             }
-            if self
-                .transactions
-                .pending()
-                .await
-                .iter()
-                .any(|change| &change.interface == name)
-            {
+            if self.has_pending_interface_transaction().await {
                 continue;
             }
             if let Some(router) = &self.router {
@@ -146,13 +144,7 @@ impl ControlService {
                     {
                         continue;
                     }
-                    if self
-                        .transactions
-                        .pending()
-                        .await
-                        .iter()
-                        .any(|change| &change.interface == name)
-                    {
+                    if self.has_pending_interface_transaction().await {
                         continue;
                     }
                     if let Some(router) = &self.router {
@@ -223,13 +215,7 @@ impl ControlService {
             {
                 continue;
             }
-            if self
-                .transactions
-                .pending()
-                .await
-                .iter()
-                .any(|change| &change.interface == name)
-            {
+            if self.has_pending_interface_transaction().await {
                 continue;
             }
             if let Some(router) = &self.router {

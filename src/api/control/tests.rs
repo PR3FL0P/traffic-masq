@@ -3099,6 +3099,81 @@ async fn wifi_client_deactivate_preserves_managed_and_allows_subsequent_reactiva
 }
 
 #[tokio::test]
+async fn autoconnect_is_blocked_by_pending_transaction_on_another_interface() {
+    let fixture = wifi_client_enabled_fixture().await;
+    let created = fixture
+        .service
+        .dispatch(Request::CreateWifiClientProfile {
+            profile: WifiClientProfileWriteRequest {
+                id: "saved".to_string(),
+                ssid: "upstream".to_string(),
+                country_code: Some("PL".to_string()),
+                security: WifiClientSecurity::Wpa2,
+                priority: 10,
+                autoconnect: true,
+                passphrase: Some("password123".to_string()),
+                clear_passphrase: false,
+            },
+        })
+        .await;
+    assert!(matches!(created, Response::WifiClientProfile { .. }));
+
+    let target = InterfaceConfig {
+        role: InterfaceRole::Input,
+        managed: true,
+        ipv4: None,
+        dhcp: None,
+        dhcp_client: None,
+        wifi: None,
+        wifi_client: None,
+        nat: false,
+    };
+    let pending = fixture
+        .service
+        .transactions
+        .apply_transition("wlan2", &target, None, None, true)
+        .await
+        .expect("create pending transaction on wlan2");
+
+    fixture.process.set_wpa_state("DISCONNECTED");
+    fixture
+        .service
+        .autoconnect_wifi_once()
+        .await
+        .expect("autoconnect pass");
+
+    let state = fixture.service.wifi_autoconnect.lock().await;
+    assert!(
+        state.attempts.get("wlan1").is_none(),
+        "pending transaction on wlan2 must block autoconnect mutation on wlan1"
+    );
+    assert!(
+        !state.connecting_since.contains_key("wlan1"),
+        "blocked autoconnect must not enter the association grace period"
+    );
+    drop(state);
+
+    let effective = fixture.service.effective_config().await.unwrap();
+    assert_eq!(
+        effective
+            .network
+            .interfaces
+            .get("wlan1")
+            .and_then(|interface| interface.wifi_client.as_ref())
+            .map(|wifi| wifi.security),
+        Some(WifiClientSecurity::Open),
+        "blocked autoconnect must not replace the active Wi-Fi client configuration"
+    );
+
+    fixture
+        .service
+        .transactions
+        .rollback(&pending.token)
+        .await
+        .expect("clean up pending wlan2 transaction");
+}
+
+#[tokio::test]
 async fn autoconnect_timeout_clears_stalled_profile_without_deadlock() {
     let fixture = wifi_client_enabled_fixture().await;
     let created = fixture

@@ -87,15 +87,42 @@ impl RouterDhcpClientRuntime for DhcpClientSupervisor {
         Ok(())
     }
 
-    async fn restore(&self, snapshot: &DhcpClientSnapshot) -> Result<()> {
-        match &snapshot.spec {
-            Some(spec) => self.restore(spec.clone(), snapshot.lease.clone()).await,
-            None => self.disable(&snapshot.interface).await.map(|_| ()),
-        }
-    }
-
     async fn disable(&self, interface: &str) -> Result<()> {
         self.disable(interface).await.map(|_| ())
+    }
+
+    async fn restore(&self, snapshot: &DhcpClientSnapshot) -> Result<()> {
+        let Some(spec) = &snapshot.spec else {
+            return self.disable(&snapshot.interface).await.map(|_| ());
+        };
+
+        // Router rollback restores DHCP intent, never a snapshotted lease.
+        // Wait for a fresh lease before declaring rollback complete so the
+        // coordinator does not report success while connectivity is still
+        // unresolved.
+        DhcpClientSupervisor::configure(self, spec.clone()).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let status = self
+                .status(&snapshot.interface)
+                .await
+                .ok_or_else(|| anyhow::anyhow!("DHCP client disappeared during rollback"))?;
+            if let Some(lease) = status.lease.as_ref() {
+                return DhcpClientSupervisor::verify_bound_lease(self, lease).await;
+            }
+            if let DhcpClientRunState::Degraded { reason } = status.state {
+                bail!(
+                    "DHCP client failed to reacquire a lease on {}: {reason}",
+                    snapshot.interface
+                );
+            }
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "DHCP client did not reacquire a lease on {} during rollback",
+                snapshot.interface
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     async fn verify_bound_lease(&self, status: &DhcpClientStatus) -> Result<()> {
@@ -1068,8 +1095,8 @@ where
                 let status = runtime.status(name).await;
                 dhcp_clients.push(DhcpClientSnapshot {
                     interface: name.clone(),
-                    spec: status.as_ref().map(|status| status.spec.clone()),
-                    lease: status.and_then(|status| status.lease),
+                    spec: status.map(|status| status.spec),
+                    lease: None,
                 });
             }
         }
@@ -1169,7 +1196,7 @@ where
         self.dataplane.apply(plan).await.map(|_| ())
     }
 
-    async fn apply_uplink_dhcp(&self, desired: Option<&DhcpClientSpec>) -> Result<()> {
+    async fn quiesce_uplink_dhcp(&self, desired: Option<&DhcpClientSpec>) -> Result<()> {
         let Some(runtime) = &self.dhcp_client else {
             if desired.is_some() {
                 bail!("embedded DHCP client runtime is unavailable");
@@ -1177,11 +1204,71 @@ where
             return Ok(());
         };
         for name in &self.owned_interfaces().await {
-            if desired.is_none_or(|spec| &spec.interface != name) {
+            let current = runtime.status(name).await;
+            let keep_running = match (current.as_ref(), desired) {
+                (Some(status), Some(spec)) if &spec.interface == name => {
+                    &status.spec == spec && matches!(&status.state, DhcpClientRunState::Running)
+                }
+                _ => false,
+            };
+            if current.is_some() && !keep_running {
                 runtime.disable(name).await?;
             }
         }
-        if let Some(spec) = desired { runtime.configure(spec.clone()).await?; }
+        Ok(())
+    }
+
+    async fn apply_uplink_dhcp(&self, desired: Option<&DhcpClientSpec>) -> Result<()> {
+        self.apply_uplink_dhcp_candidate(desired).await.map(|_| ())
+    }
+
+    async fn apply_uplink_dhcp_candidate(
+        &self,
+        desired: Option<&DhcpClientSpec>,
+    ) -> Result<bool> {
+        let Some(runtime) = &self.dhcp_client else {
+            if desired.is_some() {
+                bail!("embedded DHCP client runtime is unavailable");
+            }
+            return Ok(false);
+        };
+        let mut changed = false;
+        for name in &self.owned_interfaces().await {
+            if desired.is_none_or(|spec| &spec.interface != name)
+                && runtime.status(name).await.is_some()
+            {
+                runtime.disable(name).await?;
+                changed = true;
+            }
+        }
+        if let Some(spec) = desired {
+            let current = runtime.status(&spec.interface).await;
+            let needs_configure = current.as_ref().is_none_or(|status| {
+                &status.spec != spec || !matches!(&status.state, DhcpClientRunState::Running)
+            });
+            runtime.configure(spec.clone()).await?;
+            changed |= needs_configure;
+        }
+        Ok(changed)
+    }
+
+    async fn rollback_candidate_uplink_dhcp(&self) -> Result<()> {
+        let Some(runtime) = &self.dhcp_client else {
+            return Ok(());
+        };
+        let mut errors = Vec::new();
+        for name in &self.owned_interfaces().await {
+            if runtime.status(name).await.is_some() {
+                if let Err(error) = runtime.disable(name).await {
+                    errors.push(format!("{name}: {error:#}"));
+                }
+            }
+        }
+        anyhow::ensure!(
+            errors.is_empty(),
+            "candidate DHCP client cleanup failed: {}",
+            errors.join("; ")
+        );
         Ok(())
     }
 
@@ -1209,7 +1296,17 @@ where
         let mut errors = Vec::new();
         for entry in snapshot {
             let result = match &entry.spec {
-                Some(spec) => runtime.configure(spec.clone()).await,
+                Some(spec) => {
+                    async {
+                        if let Some(ap) = &self.access_points {
+                            if ap.status(&entry.interface).await.is_some() {
+                                ap.disable(&entry.interface).await?;
+                            }
+                        }
+                        runtime.configure(spec.clone()).await
+                    }
+                    .await
+                }
                 None => runtime.disable(&entry.interface).await,
             };
             if let Err(error) = result {
@@ -1236,7 +1333,17 @@ where
         let mut errors = Vec::new();
         for entry in snapshot {
             let result = match &entry.spec {
-                Some(spec) => runtime.configure(spec.clone()).await,
+                Some(spec) => {
+                    async {
+                        if let Some(station) = &self.stations {
+                            if station.status(&entry.interface).await.is_some() {
+                                station.disable(&entry.interface).await?;
+                            }
+                        }
+                        runtime.configure(spec.clone()).await
+                    }
+                    .await
+                }
                 None => runtime.disable(&entry.interface).await,
             };
             if let Err(error) = result {
@@ -1830,9 +1937,88 @@ mod tests {
         (subsystems, provider)
     }
 
-    /// A daemon that started without a router intent owns no interfaces. Taking
-    /// ownership has to happen when the intent arrives, otherwise the router
-    /// could never be provisioned at runtime with anything to roll back to.
+    #[tokio::test]
+    async fn wifi_rollback_releases_the_conflicting_radio_role() {
+        #[derive(Default)]
+        struct Radio {
+            ap: Mutex<Option<WifiApSpec>>,
+            station: Mutex<Option<WifiClientSpec>>,
+        }
+        #[async_trait]
+        impl RouterApRuntime for Radio {
+            async fn status(&self, _: &str) -> Option<(WifiApSpec, bool)> {
+                self.ap.lock().await.clone().map(|spec| (spec, true))
+            }
+            async fn configure(&self, spec: WifiApSpec) -> Result<()> {
+                anyhow::ensure!(self.station.lock().await.is_none(), "station owns radio");
+                *self.ap.lock().await = Some(spec);
+                Ok(())
+            }
+            async fn disable(&self, _: &str) -> Result<()> {
+                *self.ap.lock().await = None;
+                Ok(())
+            }
+        }
+        #[async_trait]
+        impl RouterStaRuntime for Radio {
+            async fn status(&self, _: &str) -> Option<(WifiClientSpec, bool)> {
+                self.station.lock().await.clone().map(|spec| (spec, true))
+            }
+            async fn configure(&self, spec: WifiClientSpec) -> Result<()> {
+                anyhow::ensure!(self.ap.lock().await.is_none(), "AP owns radio");
+                *self.station.lock().await = Some(spec);
+                Ok(())
+            }
+            async fn disable(&self, _: &str) -> Result<()> {
+                *self.station.lock().await = None;
+                Ok(())
+            }
+        }
+        let radio = Arc::new(Radio::default());
+        let (subsystems, _) = subsystems_for(&enabled_config()).await;
+        let subsystems = subsystems.with_wifi_runtimes(radio.clone(), radio.clone());
+        let ap = WifiApSpec {
+            interface: "wan0".into(),
+            ssid: "old-ap".into(),
+            country_code: None,
+            band: crate::config::WifiBand::Ghz2,
+            channel: 1,
+            channel_width: crate::config::WifiChannelWidth::Ht20,
+            security: crate::config::WifiSecurity::Open,
+            hidden: false,
+            client_isolation: false,
+            max_stations: 32,
+            passphrase_file: None,
+        };
+        let station = WifiClientSpec {
+            interface: "wan0".into(),
+            ssid: "upstream".into(),
+            country_code: None,
+            security: crate::config::WifiClientSecurity::Open,
+            passphrase_file: None,
+        };
+        *radio.station.lock().await = Some(station.clone());
+        subsystems
+            .rollback_output_wifi(&[WifiSnapshot {
+                interface: "wan0".into(),
+                spec: Some(ap.clone()),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(*radio.ap.lock().await, Some(ap));
+        assert!(radio.station.lock().await.is_none());
+
+        subsystems
+            .rollback_uplink_wifi(&[WifiSnapshot {
+                interface: "wan0".into(),
+                spec: Some(station.clone()),
+            }])
+            .await
+            .unwrap();
+        assert_eq!(*radio.station.lock().await, Some(station));
+        assert!(radio.ap.lock().await.is_none());
+    }
+
     #[tokio::test]
     async fn a_router_provisioned_at_runtime_takes_ownership_of_its_interfaces() {
         let mut config = enabled_config();

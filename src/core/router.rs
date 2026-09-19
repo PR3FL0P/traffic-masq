@@ -410,7 +410,13 @@ impl VpnChainSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DhcpClientSnapshot {
     pub interface: String,
+    /// DHCP configuration intent. This is the only DHCP state owned by router
+    /// transaction rollback.
     pub spec: Option<DhcpClientSpec>,
+    /// Compatibility-only field for callers compiled against the older public
+    /// snapshot shape. Dynamic leases are deliberately excluded from durable
+    /// journals/fingerprints and are never replayed during rollback.
+    #[serde(skip)]
     pub lease: Option<crate::dhcp::client::lease::DhcpClientLease>,
 }
 
@@ -526,8 +532,25 @@ pub trait RouterSubsystems: Send + Sync {
     async fn apply_routes(&self, plan: &RoutePlan) -> Result<()>;
     async fn apply_dhcp(&self, plan: &[DhcpPlan]) -> Result<()>;
     async fn apply_dataplane(&self, plan: &RouterDataplanePlan) -> Result<()>;
+    /// Stop DHCP clients whose ownership must disappear before interface
+    /// configuration is mutated.
+    async fn quiesce_uplink_dhcp(&self, _desired: Option<&DhcpClientSpec>) -> Result<()> {
+        // Conservative compatibility path for existing implementations: stop
+        // DHCP before interface mutation even if that causes a fresh acquire.
+        self.apply_uplink_dhcp(None).await
+    }
     async fn apply_uplink_dhcp(&self, _desired: Option<&DhcpClientSpec>) -> Result<()> {
         Ok(())
+    }
+    /// Apply candidate DHCP intent and report whether rollback should quiesce
+    /// candidate runtime before restoring interfaces. Kept separate so older
+    /// `RouterSubsystems` implementations retain the original public method.
+    async fn apply_uplink_dhcp_candidate(
+        &self,
+        desired: Option<&DhcpClientSpec>,
+    ) -> Result<bool> {
+        self.apply_uplink_dhcp(desired).await?;
+        Ok(true)
     }
     /// Activate hops 0..N in order. On any hop's failure, must roll back
     /// N..0 internally before returning `Err` — the outer `RouterManager`
@@ -563,6 +586,11 @@ pub trait RouterSubsystems: Send + Sync {
         self.rollback_dhcp(snapshot).await
     }
     async fn rollback_dataplane(&self, snapshot: &RouterDataplaneSnapshot) -> Result<()>;
+    /// Stop DHCP runtime installed by the candidate before interface rollback.
+    /// Previous DHCP intent is restored by `rollback_dhcp_clients` afterwards.
+    async fn rollback_candidate_uplink_dhcp(&self) -> Result<()> {
+        self.apply_uplink_dhcp(None).await
+    }
     async fn rollback_uplink_dhcp(&self, _snapshot: Option<&DhcpClientSpec>) -> Result<()> {
         Ok(())
     }
@@ -781,27 +809,72 @@ impl RouterManager {
             }};
         }
 
+        // DHCP rollback has two phases. The restore marker is placed before
+        // interfaces so old DHCP intent is restarted only after interface
+        // rollback. Candidate DHCP is recorded after interfaces so it is
+        // stopped before interface rollback. This also handles DHCP(A) ->
+        // DHCP(B) without either actor racing restored address state.
+        started.push(Stage::UplinkDhcpRestore);
+        if let Err(error) = self
+            .subsystems
+            .quiesce_uplink_dhcp(plan.desired.uplink_dhcp.as_ref())
+            .await
+        {
+            return Err(self.rollback_error(error, &snapshot, &started).await.into());
+        }
+
         apply_stage!(
             Stage::Interfaces,
             self.subsystems.apply_interfaces(&plan.interfaces)
         );
+        // A radio cannot run the old AP while its new station is starting.
+        // Record this stage before stopping anything so an uplink failure
+        // restores the AP too.
+        let output_stops: Vec<_> = plan
+            .output_wifi
+            .iter()
+            .filter(|item| matches!(item, WifiPlan::Stop { .. }))
+            .cloned()
+            .collect();
+        if !output_stops.is_empty() {
+            apply_stage!(
+                Stage::OutputWifi,
+                self.subsystems.apply_output_wifi(&output_stops)
+            );
+        }
         apply_stage!(
             Stage::UplinkWifi,
             self.subsystems.apply_uplink_wifi(&plan.uplink_wifi)
         );
-        apply_stage!(
-            Stage::UplinkDhcp,
-            self.subsystems
-                .apply_uplink_dhcp(plan.desired.uplink_dhcp.as_ref())
-        );
+        match self
+            .subsystems
+            .apply_uplink_dhcp_candidate(plan.desired.uplink_dhcp.as_ref())
+            .await
+        {
+            Ok(true) => started.push(Stage::UplinkDhcpCandidate),
+            Ok(false) => {}
+            Err(error) => {
+                // A failed apply may already have changed runtime state.
+                started.push(Stage::UplinkDhcpCandidate);
+                return Err(self.rollback_error(error, &snapshot, &started).await.into());
+            }
+        }
         apply_stage!(
             Stage::VpnChain,
             self.subsystems.apply_vpn_chain(&plan.vpn_chain)
         );
-        apply_stage!(
-            Stage::OutputWifi,
-            self.subsystems.apply_output_wifi(&plan.output_wifi)
-        );
+        if output_stops.is_empty() {
+            started.push(Stage::OutputWifi);
+        }
+        let output_changes: Vec<_> = plan
+            .output_wifi
+            .iter()
+            .filter(|item| !matches!(item, WifiPlan::Stop { .. }))
+            .cloned()
+            .collect();
+        if let Err(error) = self.subsystems.apply_output_wifi(&output_changes).await {
+            return Err(self.rollback_error(error, &snapshot, &started).await.into());
+        }
         apply_stage!(Stage::Dhcp, self.subsystems.apply_dhcp(&plan.dhcp));
         apply_stage!(Stage::Routes, self.subsystems.apply_routes(&plan.routes));
         apply_stage!(
@@ -865,9 +938,10 @@ impl RouterManager {
         self.rollback_stages(
             snapshot,
             &[
+                Stage::UplinkDhcpRestore,
                 Stage::Interfaces,
                 Stage::UplinkWifi,
-                Stage::UplinkDhcp,
+                Stage::UplinkDhcpCandidate,
                 Stage::VpnChain,
                 Stage::OutputWifi,
                 Stage::Dhcp,
@@ -892,7 +966,10 @@ impl RouterManager {
                         .rollback_uplink_wifi(&snapshot.uplink_wifi)
                         .await
                 }
-                Stage::UplinkDhcp => {
+                Stage::UplinkDhcpCandidate => {
+                    self.subsystems.rollback_candidate_uplink_dhcp().await
+                }
+                Stage::UplinkDhcpRestore => {
                     self.subsystems
                         .rollback_dhcp_clients(&snapshot.dhcp_clients, snapshot.uplink_dhcp.as_ref())
                         .await
@@ -929,9 +1006,10 @@ impl RouterManager {
 
 #[derive(Clone, Copy)]
 enum Stage {
+    UplinkDhcpRestore,
     Interfaces,
     UplinkWifi,
-    UplinkDhcp,
+    UplinkDhcpCandidate,
     VpnChain,
     OutputWifi,
     Dhcp,
@@ -942,9 +1020,10 @@ enum Stage {
 impl Stage {
     fn name(self) -> &'static str {
         match self {
+            Self::UplinkDhcpRestore => "uplink_dhcp_restore",
             Self::Interfaces => "interfaces",
             Self::UplinkWifi => "uplink_wifi",
-            Self::UplinkDhcp => "uplink_dhcp",
+            Self::UplinkDhcpCandidate => "uplink_dhcp_candidate",
             Self::VpnChain => "vpn_chain",
             Self::OutputWifi => "output_wifi",
             Self::Dhcp => "dhcp",
@@ -1151,11 +1230,34 @@ mod tests {
         assert_eq!(desired.dataplane, RouterDataplaneTarget::Disabled);
     }
 
+    #[test]
+    fn dhcp_snapshot_serialization_excludes_dynamic_lease_state() {
+        let snapshot = DhcpClientSnapshot {
+            interface: "wan0".into(),
+            spec: None,
+            lease: None,
+        };
+        let encoded = serde_json::to_value(snapshot).expect("serialize snapshot");
+        assert!(encoded.get("lease").is_none());
+    }
+
+    #[test]
+    fn legacy_dhcp_snapshot_lease_field_is_ignored() {
+        let snapshot: DhcpClientSnapshot = serde_json::from_str(
+            r#"{"interface":"wan0","spec":null,"lease":{"legacy":"ignored"}}"#,
+        )
+        .expect("legacy snapshot");
+        assert_eq!(snapshot.interface, "wan0");
+        assert!(snapshot.spec.is_none());
+        assert!(snapshot.lease.is_none());
+    }
+
     struct FakeSubsystems {
         events: Mutex<Vec<String>>,
         fail: Mutex<Option<String>>,
         rollback_fail: Mutex<Option<String>>,
         default_route: bool,
+        quiesce_dhcp: bool,
     }
 
     impl FakeSubsystems {
@@ -1165,6 +1267,7 @@ mod tests {
                 fail: Mutex::new(fail.map(str::to_string)),
                 rollback_fail: Mutex::new(None),
                 default_route: false,
+                quiesce_dhcp: false,
             })
         }
 
@@ -1174,6 +1277,17 @@ mod tests {
                 fail: Mutex::new(None),
                 rollback_fail: Mutex::new(None),
                 default_route: true,
+                quiesce_dhcp: false,
+            })
+        }
+
+        fn with_quiesced_dhcp(fail: Option<&str>) -> Arc<Self> {
+            Arc::new(Self {
+                events: Mutex::new(Vec::new()),
+                fail: Mutex::new(fail.map(str::to_string)),
+                rollback_fail: Mutex::new(None),
+                default_route: false,
+                quiesce_dhcp: true,
             })
         }
 
@@ -1302,11 +1416,23 @@ mod tests {
             self.event("snapshot_dataplane")?;
             Ok(dataplane_snapshot())
         }
+        async fn quiesce_uplink_dhcp(&self, _: Option<&DhcpClientSpec>) -> Result<()> {
+            if self.quiesce_dhcp {
+                self.event("quiesce_uplink_dhcp")?;
+            }
+            Ok(())
+        }
         async fn apply_interfaces(&self, _: &[InterfaceChangePlan]) -> Result<()> {
             self.event("apply_interfaces")
         }
         async fn apply_uplink_wifi(&self, _: &[WifiPlan<WifiClientSpec>]) -> Result<()> {
             self.event("apply_uplink_wifi")
+        }
+        async fn apply_uplink_dhcp_candidate(
+            &self,
+            _: Option<&DhcpClientSpec>,
+        ) -> Result<bool> {
+            Ok(self.quiesce_dhcp)
         }
         async fn apply_output_wifi(&self, _: &[WifiPlan<WifiApSpec>]) -> Result<()> {
             self.event("apply_output_wifi")
@@ -1320,8 +1446,26 @@ mod tests {
         async fn apply_dataplane(&self, _: &RouterDataplanePlan) -> Result<()> {
             self.event("apply_dataplane")
         }
+        async fn rollback_candidate_uplink_dhcp(&self) -> Result<()> {
+            if self.quiesce_dhcp {
+                self.event("rollback_candidate_uplink_dhcp")
+            } else {
+                Ok(())
+            }
+        }
         async fn rollback_interfaces(&self, _: &[InterfaceSnapshot]) -> Result<()> {
             self.event("rollback_interfaces")
+        }
+        async fn rollback_dhcp_clients(
+            &self,
+            _: &[DhcpClientSnapshot],
+            _: Option<&DhcpClientSpec>,
+        ) -> Result<()> {
+            if self.quiesce_dhcp {
+                self.event("rollback_uplink_dhcp")
+            } else {
+                Ok(())
+            }
         }
         async fn rollback_uplink_wifi(&self, _: &[WifiSnapshot<WifiClientSpec>]) -> Result<()> {
             self.event("rollback_uplink_wifi")
@@ -1359,6 +1503,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn access_point_stop_precedes_station_apply_and_is_compensated_on_failure() {
+        let fake = FakeSubsystems::new(Some("apply_uplink_wifi"));
+        let mut plan = plan();
+        plan.output_wifi.push(WifiPlan::Stop {
+            current: WifiApSpec {
+                interface: "wlan0".into(),
+                ssid: "old-ap".into(),
+                country_code: None,
+                band: crate::config::WifiBand::Ghz2,
+                channel: 1,
+                channel_width: crate::config::WifiChannelWidth::Ht20,
+                security: crate::config::WifiSecurity::Open,
+                hidden: false,
+                client_isolation: false,
+                max_stations: 32,
+                passphrase_file: None,
+            },
+        });
+        RouterManager::new(fake.clone())
+            .apply(&plan)
+            .await
+            .unwrap_err();
+        let events = fake.events();
+        let position = |name: &str| events.iter().position(|event| event == name).unwrap();
+        assert!(position("apply_output_wifi") < position("apply_uplink_wifi"));
+        assert!(position("rollback_uplink_wifi") < position("rollback_output_wifi"));
+    }
+
+    #[tokio::test]
     async fn snapshots_before_first_mutation_and_exact_success_order() {
         let fake = FakeSubsystems::new(None);
         RouterManager::new(fake.clone())
@@ -1388,6 +1561,62 @@ mod tests {
                 "health_dataplane",
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn dhcp_is_quiesced_before_interface_mutation_and_restored_after_interface_rollback() {
+        let fake = FakeSubsystems::with_quiesced_dhcp(Some("apply_interfaces"));
+        RouterManager::new(fake.clone())
+            .apply(&plan())
+            .await
+            .unwrap_err();
+
+        let events = fake.events();
+        let quiesce = events
+            .iter()
+            .position(|event| event == "quiesce_uplink_dhcp")
+            .expect("DHCP quiesce");
+        let apply = events
+            .iter()
+            .position(|event| event == "apply_interfaces")
+            .expect("interface apply");
+        let rollback_interface = events
+            .iter()
+            .position(|event| event == "rollback_interfaces")
+            .expect("interface rollback");
+        let rollback_dhcp = events
+            .iter()
+            .position(|event| event == "rollback_uplink_dhcp")
+            .expect("DHCP rollback");
+
+        assert!(quiesce < apply);
+        assert!(rollback_interface < rollback_dhcp);
+    }
+
+    #[tokio::test]
+    async fn candidate_dhcp_is_stopped_before_interfaces_and_previous_dhcp_restored_afterwards() {
+        let fake = FakeSubsystems::with_quiesced_dhcp(Some("apply_output_wifi"));
+        RouterManager::new(fake.clone())
+            .apply(&plan())
+            .await
+            .unwrap_err();
+
+        let events = fake.events();
+        let candidate = events
+            .iter()
+            .position(|event| event == "rollback_candidate_uplink_dhcp")
+            .expect("candidate DHCP rollback");
+        let interface = events
+            .iter()
+            .position(|event| event == "rollback_interfaces")
+            .expect("interface rollback");
+        let previous = events
+            .iter()
+            .position(|event| event == "rollback_uplink_dhcp")
+            .expect("previous DHCP restoration");
+
+        assert!(candidate < interface);
+        assert!(interface < previous);
     }
 
     #[tokio::test]

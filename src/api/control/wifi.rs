@@ -423,39 +423,3 @@ pub(super) fn wifi_edit_request_to_config(settings: WifiEditRequest) -> WifiApCo
         passphrase_file: None,
     }
 }
-
-pub(super) async fn restore_wifi_secret(
-    wifi: &HostapdSupervisor,
-    interface: &str,
-    previous: Option<&WifiPassphrase>,
-) -> Result<()> {
-    match previous {
-        Some(secret) => wifi.set_passphrase(interface, secret).await?,
-        None => wifi.clear_passphrase(interface).await?,
-    }
-    Ok(())
-}
-
-pub(super) async fn compensate_ap(
-    wifi: &HostapdSupervisor,
-    interface: &str,
-    previous_ap: Option<WifiApSpec>,
-    previous_secret: Option<WifiPassphrase>,
-) -> Result<()> {
-    let mut failures = Vec::new();
-    if let Err(error) = restore_wifi_secret(wifi, interface, previous_secret.as_ref()).await {
-        failures.push(format!("secret restoration failed: {error:#}"));
-    }
-    let runtime = match previous_ap {
-        Some(spec) => wifi.configure(spec).await,
-        None => wifi.disable(interface).await.map(|_| ()),
-    };
-    if let Err(error) = runtime {
-        failures.push(format!("hostapd restoration failed: {error:#}"));
-    }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        anyhow::bail!(failures.join("; "))
-    }
-}

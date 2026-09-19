@@ -9,7 +9,7 @@
 //! configuration: removing an entry alone cannot undo their runtime state.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -50,6 +50,20 @@ pub struct ConvergencePass {
     pub error: Option<String>,
 }
 
+/// Lifecycle of the daemon task that drives convergence.
+///
+/// `Detached` is intentional for one-shot tooling and unit tests that use the
+/// desired-state model without a runtime reconciler. `Failed` and `Stopped`
+/// are terminal for a daemon-attached state: callers must not mistake either
+/// for the detached/tooling case and silently skip convergence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConvergerState {
+    Detached,
+    Running,
+    Failed(String),
+    Stopped,
+}
+
 /// Committed configuration with any unconfirmed changes layered on top.
 #[derive(Clone)]
 pub struct DesiredNetworkState {
@@ -61,13 +75,12 @@ pub struct DesiredNetworkState {
     /// convergence pass had already seen its change when it ran.
     version: Arc<AtomicU64>,
     passes: watch::Sender<ConvergencePass>,
-    /// Whether a convergence loop is running against this state.
+    /// Lifecycle of the convergence loop driving this state.
     ///
-    /// Waiting for a pass only means something if something is passing. In the
-    /// daemon the converger attaches before its first pass; a state nobody
-    /// converges — unit tests, one-shot tooling — answers questions about the
-    /// desired configuration and nothing more, so callers must not block on it.
-    converger: Arc<AtomicBool>,
+    /// Waiting for a pass only means something while the converger is alive.
+    /// Keeping terminal states distinct from `Detached` prevents an unexpected
+    /// reconciler exit from being mistaken for one-shot/tooling mode.
+    converger: watch::Sender<ConvergerState>,
 }
 
 impl DesiredNetworkState {
@@ -79,7 +92,7 @@ impl DesiredNetworkState {
             tentative_changed: Arc::new(Notify::new()),
             version: Arc::new(AtomicU64::new(0)),
             passes: watch::Sender::new(ConvergencePass::default()),
-            converger: Arc::new(AtomicBool::new(false)),
+            converger: watch::Sender::new(ConvergerState::Detached),
         }
     }
 
@@ -90,12 +103,34 @@ impl DesiredNetworkState {
 
     /// Announce that a convergence loop is driving this state.
     pub fn attach_converger(&self) {
-        self.converger.store(true, Ordering::SeqCst);
+        self.converger.send_replace(ConvergerState::Running);
     }
 
     /// Whether anyone is converging the machine towards this state.
     pub fn has_converger(&self) -> bool {
-        self.converger.load(Ordering::SeqCst)
+        matches!(&*self.converger.borrow(), ConvergerState::Running)
+    }
+
+    pub(crate) fn converger_state(&self) -> ConvergerState {
+        self.converger.borrow().clone()
+    }
+
+    /// Mark the attached converger unusable and wake anyone waiting for it.
+    pub(crate) fn fail_converger(&self, error: impl Into<String>) {
+        if !matches!(&*self.converger.borrow(), ConvergerState::Failed(_)) {
+            self.converger
+                .send_replace(ConvergerState::Failed(error.into()));
+        }
+    }
+
+    /// Mark a normally terminating converger as stopped.
+    ///
+    /// A prior failure is sticky: shutdown after a failure must not erase the
+    /// reason transactions were unable to converge.
+    pub(crate) fn stop_converger(&self) {
+        if matches!(&*self.converger.borrow(), ConvergerState::Running) {
+            self.converger.send_replace(ConvergerState::Stopped);
+        }
     }
 
     /// Record the outcome of a convergence pass.
@@ -125,19 +160,50 @@ impl DesiredNetworkState {
     /// it, so those are skipped rather than mistaken for success.
     pub async fn pass_covering(&self, version: u64) -> ConvergencePass {
         let mut passes = self.passes.subscribe();
+        let mut converger = self.converger.subscribe();
         loop {
+            match &*converger.borrow_and_update() {
+                ConvergerState::Failed(error) => {
+                    return ConvergencePass {
+                        version,
+                        failures: BTreeMap::new(),
+                        error: Some(format!("network converger failed: {error}")),
+                    };
+                }
+                ConvergerState::Stopped => {
+                    return ConvergencePass {
+                        version,
+                        failures: BTreeMap::new(),
+                        error: Some("network converger stopped".into()),
+                    };
+                }
+                ConvergerState::Detached | ConvergerState::Running => {}
+            }
             {
                 let pass = passes.borrow_and_update();
                 if pass.version >= version {
                     return pass.clone();
                 }
             }
-            if passes.changed().await.is_err() {
-                return ConvergencePass {
-                    version,
-                    failures: BTreeMap::new(),
-                    error: Some("convergence stopped".into()),
-                };
+            tokio::select! {
+                changed = passes.changed() => {
+                    if changed.is_err() {
+                        return ConvergencePass {
+                            version,
+                            failures: BTreeMap::new(),
+                            error: Some("convergence result channel stopped".into()),
+                        };
+                    }
+                }
+                changed = converger.changed() => {
+                    if changed.is_err() {
+                        return ConvergencePass {
+                            version,
+                            failures: BTreeMap::new(),
+                            error: Some("network converger state channel stopped".into()),
+                        };
+                    }
+                }
             }
         }
     }
@@ -234,6 +300,18 @@ impl DesiredNetworkState {
     pub async fn committed_interface(&self, interface: &str) -> Result<Option<InterfaceConfig>> {
         Ok(self.overrides.snapshot().await.effective_config(&self.base)?
             .network.interfaces.get(interface).cloned())
+    }
+
+    pub(crate) async fn commit_interface(
+        &self,
+        token: &str,
+        interface: String,
+        config: InterfaceConfig,
+        allow_management_change: bool,
+    ) -> Result<()> {
+        self.overrides
+            .commit_interface(interface, config, allow_management_change, token)
+            .await
     }
 
     pub async fn restorations(&self) -> BTreeMap<String, InterfaceSnapshot> {
@@ -393,6 +471,40 @@ mod tests {
             .await
             .unwrap();
         assert!(pass.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn converger_failure_wakes_a_waiter_without_a_new_pass() {
+        let (state, _dir) = desired_state().await;
+        state.attach_converger();
+
+        let waiter = {
+            let state = state.clone();
+            tokio::spawn(async move { state.pass_covering(1).await })
+        };
+        tokio::task::yield_now().await;
+        state.fail_converger("rtnetlink notification stream closed");
+
+        let pass = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("failed converger should wake the waiter")
+            .expect("waiter task");
+        assert_eq!(
+            pass.error.as_deref(),
+            Some("network converger failed: rtnetlink notification stream closed")
+        );
+    }
+
+    #[tokio::test]
+    async fn converger_failure_is_sticky_across_stop() {
+        let (state, _dir) = desired_state().await;
+        state.attach_converger();
+        state.fail_converger("notifications closed");
+        state.stop_converger();
+        assert_eq!(
+            state.converger_state(),
+            ConvergerState::Failed("notifications closed".into())
+        );
     }
 
     #[tokio::test]

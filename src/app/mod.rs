@@ -103,7 +103,6 @@ impl DhcpRuntimeReconciler for DhcpSupervisor {
 
 #[async_trait]
 trait DhcpClientRuntimeReconciler: Send + Sync {
-    async fn spec(&self, interface: &str) -> Option<DhcpClientSpec>;
     async fn specs(&self) -> Vec<DhcpClientSpec>;
     async fn disable(&self, interface: &str) -> Result<Option<DhcpClientSpec>>;
     async fn reconcile(&self, spec: DhcpClientSpec, link_ready: bool) -> Result<()>;
@@ -113,10 +112,6 @@ trait DhcpClientRuntimeReconciler: Send + Sync {
 
 #[async_trait]
 impl DhcpClientRuntimeReconciler for DhcpClientSupervisor {
-    async fn spec(&self, interface: &str) -> Option<DhcpClientSpec> {
-        self.spec(interface).await
-    }
-
     async fn specs(&self) -> Vec<DhcpClientSpec> {
         self.statuses().await.into_iter().map(|status| status.spec).collect()
     }
@@ -662,6 +657,13 @@ async fn reconcile_network_runtime_once<
                 bail!("interface {name} is absent; convergence is deferred");
             };
 
+            // Release AP ownership before starting a station on the same radio.
+            // Starting an AP still waits until after station teardown and IPv4.
+            if config.wifi.is_none() {
+                if let Some(access_point) = wifi {
+                    access_point.reconcile_interface(name, config).await?;
+                }
+            }
             if let Some(client) = wifi_client {
                 client.reconcile_interface(name, config).await?;
             } else {
@@ -714,10 +716,9 @@ async fn reconcile_network_runtime_once<
                 interface_manager.verify_configured_ipv4(name, config).await?;
                 (true, dhcp.binding_stale(name).await?)
             } else { (false, false) };
-            if let Some(access_point) = wifi {
+            if config.wifi.is_some() {
+                let access_point = wifi.context("Wi-Fi access point runtime is unavailable")?;
                 access_point.reconcile_interface(name, config).await?;
-            } else {
-                anyhow::ensure!(config.wifi.is_none(), "Wi-Fi access point runtime is unavailable");
             }
             apply_dhcp_reconcile_action(dhcp, name,
                 plan_dhcp_reconcile(desired_dhcp, current_dhcp, true, ipv4_ready, binding_stale)).await?;
@@ -789,11 +790,12 @@ fn spawn_runtime_network_reconcile(
     router: Option<RouterTransactionCoordinator>,
     mut kernel_events: mpsc::UnboundedReceiver<KernelEvent>,
     mut shutdown: watch::Receiver<bool>,
-) -> JoinHandle<()> {
+) -> JoinHandle<Result<()>> {
+    // Attach synchronously, before the task is scheduled. Once the API is
+    // serving, a transaction must never observe daemon state as `Detached`
+    // merely because Tokio has not polled the reconciler yet.
+    desired.attach_converger();
     tokio::spawn(async move {
-        // Announced before the first pass: until something is converging, a
-        // transaction that proposed a change would have nothing to wait for.
-        desired.attach_converger();
         loop {
             if shutdown_requested(&shutdown) {
                 break;
@@ -861,10 +863,11 @@ fn spawn_runtime_network_reconcile(
                         while kernel_events.try_recv().is_ok() {}
                     }
                     None => {
-                        tracing::error!(
-                            "kernel change notifications stopped; nothing can be converged any more"
-                        );
-                        break;
+                        let message =
+                            "kernel change notifications stopped; nothing can be converged any more";
+                        desired.fail_converger(message);
+                        tracing::error!("{message}");
+                        bail!(message);
                     }
                 },
                 () = desired.changed() => {}
@@ -875,6 +878,8 @@ fn spawn_runtime_network_reconcile(
                 }
             }
         }
+        desired.stop_converger();
+        Ok(())
     })
 }
 
@@ -1300,9 +1305,10 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         }
     });
 
-    // Created before router recovery so autonomous DHCP lease callbacks cannot
-    // race startup reconciliation. The same gate is later installed in the
-    // ControlService and background reconcilers.
+    // Serializes request/background control-plane mutations. Autonomous DHCP
+    // lease ownership writes deliberately do not acquire this gate (router
+    // apply may wait for DHCP readiness); they serialize with interface
+    // address writers through InterfaceMutationLocks instead.
     let network_mutations = Arc::new(NetworkMutationGate::default());
 
     if shutdown_requested(&shutdown) {
@@ -1505,7 +1511,7 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         };
     let (reconcile_stop, reconcile_shutdown) = watch::channel(false);
     let reconcile_task = spawn_runtime_network_reconcile(
-        desired_state,
+        desired_state.clone(),
         ownership_journal.clone(),
         reconcile_network_provider,
         dhcp.clone(),
@@ -1524,6 +1530,7 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     // mark the handoff at the point it actually happens.
     drop(stack);
 
+    let (liveness_stop, liveness_shutdown) = watch::channel(false);
     let liveness_task = spawn_process_liveness_checks(
         dhcp.clone(),
         wifi_supervisor.clone(),
@@ -1531,12 +1538,53 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         dhcp_client.clone(),
         network_mutations.clone(),
         router_coordinator.clone(),
-        shutdown.clone(),
+        liveness_shutdown,
     );
 
     let (autoconnect_stop, autoconnect_shutdown) = tokio::sync::watch::channel(false);
     let autoconnect_task = spawn_wifi_autoconnect(autoconnect_control, autoconnect_shutdown);
-    let api_result = server.run(shutdown.clone()).await;
+    // The API normally follows the process shutdown signal. A failed network
+    // reconciler also stops it: keeping the control plane writable after the
+    // only convergence worker has died would turn network transactions into
+    // misleading timeouts or partial recovery attempts.
+    let (server_stop, server_shutdown) = watch::channel(shutdown_requested(&shutdown));
+    let mut process_shutdown = shutdown.clone();
+    let signal_server_stop = server_stop.clone();
+    let server_shutdown_relay = tokio::spawn(async move {
+        loop {
+            if shutdown_requested(&process_shutdown) {
+                let _ = signal_server_stop.send(true);
+                break;
+            }
+            if process_shutdown.changed().await.is_err() {
+                let _ = signal_server_stop.send(true);
+                break;
+            }
+        }
+    });
+
+    let mut reconcile_task = reconcile_task;
+    let mut reconcile_finished = false;
+    let mut reconcile_error = None;
+    let mut server_run = Box::pin(server.run(server_shutdown));
+    let api_result = tokio::select! {
+        result = &mut server_run => result,
+        result = &mut reconcile_task => {
+            reconcile_finished = true;
+            let message = match result {
+                Ok(Ok(())) => "network reconciler stopped unexpectedly".to_string(),
+                Ok(Err(error)) => format!("network reconciler failed: {error:#}"),
+                Err(error) => format!("network reconciler task failed: {error}"),
+            };
+            desired_state.fail_converger(message.clone());
+            reconcile_error = Some(message);
+            let _ = server_stop.send(true);
+            (&mut server_run).await
+        }
+    };
+    let _ = server_stop.send(true);
+    server_shutdown_relay.abort();
+    let _ = server_shutdown_relay.await;
     let _ = autoconnect_stop.send(true);
     // Finish any in-flight scan/activation before rolling back and stopping runtimes.
     let _ = autoconnect_task.await;
@@ -1544,7 +1592,9 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     // No new process restarts should be introduced while shutdown is trying
     // to prove rollback. The desired-state converger stays alive a little
     // longer because interface transaction rollback is expressed through it.
-    liveness_task.abort();
+    // Let a restart already in progress finish its bookkeeping before rollback.
+    // Aborting here can cancel a supervisor between a runtime write and its record.
+    let _ = liveness_stop.send(true);
     let _ = liveness_task.await;
 
     // Before the converger is stopped, not after: an unconfirmed change is
@@ -1565,7 +1615,21 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     }
 
     let _ = reconcile_stop.send(true);
-    let _ = reconcile_task.await;
+    if !reconcile_finished {
+        match reconcile_task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                reconcile_error.get_or_insert_with(|| {
+                    format!("network reconciler failed during shutdown: {error:#}")
+                });
+            }
+            Err(error) => {
+                reconcile_error.get_or_insert_with(|| {
+                    format!("network reconciler task failed during shutdown: {error}")
+                });
+            }
+        }
+    }
     session_reaper.abort();
     let _ = session_reaper.await;
     let graceful_signal = shutdown_requested(&shutdown);
@@ -1621,6 +1685,9 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
 
     if let Err(error) = api_result {
         cleanup_errors.push(format!("HTTP API failed: {error:#}"));
+    }
+    if let Some(error) = reconcile_error {
+        cleanup_errors.push(error);
     }
     if cleanup_errors.is_empty() {
         Ok(())
@@ -1689,6 +1756,8 @@ mod tests {
     };
     use crate::firewall::vpn::test_support::{nft_ruleset, FakeNftExecutor};
     use crate::firewall::{OwnedFirewallIntegrity, RouterDataplaneDesired};
+    #[cfg(target_os = "linux")]
+    use crate::dhcp::client::supervisor::LinuxDhcpClientLauncher;
     use crate::netlink::{
         Ipv4AddressInfo, Ipv4RouteInfo, Ipv4RuleInfo,
     };
@@ -1700,6 +1769,57 @@ mod tests {
 
     use super::*;
     use crate::test_support::{FakeNetworkProvider, StaticKeyVpnProvider};
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn closed_kernel_event_stream_fails_the_runtime_converger() {
+        let directory = tempdir().expect("tempdir");
+        let mut config = AppConfig::default();
+        config.runtime.state_dir = directory.path().join("state");
+        config.dhcp.leases_dir = directory.path().join("leases");
+        let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+            .await
+            .expect("overrides");
+        let desired = DesiredNetworkState::new(config.clone(), overrides);
+        let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetworkProvider::default());
+        let dhcp = DhcpSupervisor::start(&config).await.expect("DHCP supervisor");
+        let dhcp_client = DhcpClientSupervisor::start_with_launcher(
+            &config,
+            network.clone(),
+            Arc::new(LinuxDhcpClientLauncher),
+        )
+        .await
+        .expect("DHCP client supervisor");
+        let (kernel_events_tx, kernel_events) = mpsc::unbounded_channel();
+        drop(kernel_events_tx);
+        let (_shutdown_tx, shutdown) = watch::channel(false);
+
+        let task = spawn_runtime_network_reconcile(
+            desired.clone(),
+            AddressOwnershipJournal::in_memory(),
+            network,
+            dhcp,
+            None,
+            None,
+            dhcp_client,
+            Arc::new(NetworkMutationGate::default()),
+            None,
+            kernel_events,
+            shutdown,
+        );
+
+        let error = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("closed event stream should stop the reconciler")
+            .expect("reconciler task")
+            .unwrap_err();
+        assert!(error.to_string().contains("kernel change notifications stopped"));
+        assert!(matches!(
+            desired.converger_state(),
+            crate::core::desired::ConvergerState::Failed(reason)
+                if reason.contains("kernel change notifications stopped")
+        ));
+    }
 
     #[tokio::test]
     async fn startup_rollback_unwind_runs_pushed_steps_in_lifo_order() {
@@ -1795,10 +1915,6 @@ mod tests {
 
     #[async_trait]
     impl DhcpClientRuntimeReconciler for FakeDhcpClientReconciler {
-        async fn spec(&self, interface: &str) -> Option<DhcpClientSpec> {
-            self.specs.lock().await.get(interface).cloned()
-        }
-
         async fn specs(&self) -> Vec<DhcpClientSpec> {
             self.specs.lock().await.values().cloned().collect()
         }
@@ -2612,6 +2728,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn convergence_releases_access_point_before_starting_station() {
+        struct RadioRuntime {
+            ap: bool,
+            ap_running: Arc<Mutex<bool>>,
+        }
+        #[async_trait]
+        impl WifiRuntimeReconciler for RadioRuntime {
+            async fn ensure_alive(&self) -> Result<bool> {
+                Ok(false)
+            }
+            async fn reconcile_interface(&self, _: &str, config: &InterfaceConfig) -> Result<()> {
+                let mut running = self.ap_running.lock().await;
+                if self.ap {
+                    *running = config.wifi.is_some();
+                } else if config.wifi_client.is_some() {
+                    anyhow::ensure!(!*running, "radio is still owned by hostapd");
+                }
+                Ok(())
+            }
+            async fn association_ready(&self, _: &str) -> Option<bool> {
+                Some(true)
+            }
+        }
+        let mut config = dhcp_client_reconcile_config();
+        config.network.interfaces.remove("lan0");
+        config
+            .network
+            .interfaces
+            .get_mut("wan0")
+            .unwrap()
+            .wifi_client = Some(crate::config::WifiClientConfig {
+            ssid: "upstream".into(),
+            country_code: None,
+            security: crate::config::WifiClientSecurity::Open,
+            passphrase_file: None,
+        });
+        let directory = tempdir().unwrap();
+        let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+            .await
+            .unwrap();
+        let desired = DesiredNetworkState::new(config.clone(), overrides);
+        desired
+            .propose(
+                "switch",
+                "wan0",
+                config.network.interfaces["wan0"].clone(),
+                true,
+            )
+            .await;
+        let network = Arc::new(FakeNetworkProvider::default());
+        network.add_interface("wan0", 9).await;
+        let running = Arc::new(Mutex::new(true));
+        let ap = RadioRuntime {
+            ap: true,
+            ap_running: running.clone(),
+        };
+        let station = RadioRuntime {
+            ap: false,
+            ap_running: running.clone(),
+        };
+        let failures = reconcile_network_runtime_once(
+            &desired,
+            &AddressOwnershipJournal::in_memory(),
+            network,
+            &FakeDhcpReconciler::default(),
+            Some(&ap),
+            Some(&station),
+            Some(&FakeDhcpClientReconciler::default()),
+        )
+        .await
+        .unwrap();
+        assert!(failures.is_empty(), "{failures:?}");
+        assert!(!*running.lock().await);
+    }
+
+    #[tokio::test]
     async fn managed_wifi_dhcp_tracks_completed_while_wired_stays_ready() {
         let mut config = dhcp_client_reconcile_config();
         let wifi = config.network.interfaces.get_mut("wan0").expect("wan0");
@@ -3049,6 +3241,7 @@ mod tests {
         };
 
         let firewall_executor = FakeNftExecutor::with_responses(vec![
+            Ok(nft_ruleset(Some(&leftover_firewall))),
             Ok(nft_ruleset(Some(&leftover_firewall))),
             Ok(Vec::new()),
         ]);
