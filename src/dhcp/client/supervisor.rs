@@ -1,13 +1,13 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::Ipv4Addr;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{watch, Mutex, RwLock};
+use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -236,7 +236,6 @@ struct Inner {
     launcher: Arc<dyn DhcpClientLauncher>,
     tasks: Mutex<HashMap<String, ClientTask>>,
     operation_lock: Mutex<()>,
-    network_mutations: StdMutex<Option<Arc<RwLock<()>>>>,
 }
 
 impl Inner {
@@ -251,17 +250,6 @@ impl Inner {
 }
 
 impl DhcpClientSupervisor {
-    /// Share the process-wide network mutation gate with autonomous DHCP lease
-    /// callbacks. The actor only takes the read side while it changes owned
-    /// addresses/routes; API/router transactions take the write side.
-    pub fn set_network_mutation_gate(&self, gate: Arc<RwLock<()>>) {
-        *self
-            .inner
-            .network_mutations
-            .lock()
-            .expect("DHCP client mutation-gate mutex poisoned") = Some(gate);
-    }
-
     #[cfg(target_os = "linux")]
     pub async fn start(config: &AppConfig, network: Arc<dyn NetworkProvider>) -> Result<Self> {
         Self::start_with_launcher(config, network, Arc::new(LinuxDhcpClientLauncher)).await
@@ -281,7 +269,6 @@ impl DhcpClientSupervisor {
                 launcher,
                 tasks: Mutex::new(HashMap::new()),
                 operation_lock: Mutex::new(()),
-                network_mutations: StdMutex::new(None),
             }),
         };
 
@@ -345,6 +332,19 @@ impl DhcpClientSupervisor {
                 tracing::info!(%interface, "DHCP client paused while Wi-Fi is not associated");
             }
         }
+    }
+
+    /// Stop the candidate actor before restoring durable lease ownership.
+    /// Only unexpired leases can be restored; otherwise readiness must be
+    /// established by a fresh exchange instead of replaying stale addresses.
+    pub async fn restore(&self, spec: DhcpClientSpec, lease: Option<DhcpClientLease>) -> Result<()> {
+        let _operation = self.inner.operation_lock.lock().await;
+        let name = spec.interface.clone();
+        self.stop_task(&name).await;
+        self.inner.applier.cleanup(&name).await?;
+        self.inner.tasks.lock().await.insert(name.clone(), ClientTask::new(spec, true));
+        let lease = lease.filter(|lease| lease.expires_at_unix > current_unix_time());
+        self.restore_runtime_after_interrupted_stop(&name, lease).await
     }
 
     pub async fn disable(&self, interface: &str) -> Result<Option<DhcpClientSpec>> {
@@ -890,26 +890,13 @@ struct OwnershipSink {
     inner: std::sync::Weak<Inner>,
 }
 
-impl OwnershipSink {
-    fn network_mutation_gate(&self) -> Option<Arc<RwLock<()>>> {
-        self.inner.upgrade().and_then(|inner| {
-            inner
-                .network_mutations
-                .lock()
-                .expect("DHCP client mutation-gate mutex poisoned")
-                .clone()
-        })
-    }
-}
-
 #[async_trait]
 impl DhcpClientActionSink for OwnershipSink {
     async fn lease_acquired(&mut self, lease: Lease) -> Result<()> {
-        let gate = self.network_mutation_gate();
-        let _network_mutation = match gate {
-            Some(gate) => Some(gate.read_owned().await),
-            None => None,
-        };
+        // Lease callbacks are participants in the configured DHCP runtime,
+        // not independent control requests. The supervisor stops/joins actors
+        // before changing their intent; each actor serializes its own
+        // ownership writes. Taking control admission here would deadlock lease readiness.
         let persisted = self.persisted_lease(&lease);
         match self.applier.apply(persisted).await {
             Ok(applied) => {
@@ -939,11 +926,10 @@ impl DhcpClientActionSink for OwnershipSink {
     }
 
     async fn cleanup_needed(&mut self, _lease: Lease) -> Result<()> {
-        let gate = self.network_mutation_gate();
-        let _network_mutation = match gate {
-            Some(gate) => Some(gate.read_owned().await),
-            None => None,
-        };
+        // Lease callbacks are participants in the configured DHCP runtime,
+        // not independent control requests. The supervisor stops/joins actors
+        // before changing their intent; each actor serializes its own
+        // ownership writes. Taking control admission here would deadlock lease readiness.
         let result = self.applier.cleanup(&self.spec.interface).await;
         let mut shared = self.shared.lock().await;
         shared.lease = None;

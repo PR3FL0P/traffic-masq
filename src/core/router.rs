@@ -408,10 +408,19 @@ impl VpnChainSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DhcpClientSnapshot {
+    pub interface: String,
+    pub spec: Option<DhcpClientSpec>,
+    pub lease: Option<crate::dhcp::client::lease::DhcpClientLease>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouterSnapshot {
     pub interfaces: Vec<InterfaceSnapshot>,
     pub uplink_wifi: Vec<WifiSnapshot<WifiClientSpec>>,
     pub uplink_dhcp: Option<DhcpClientSpec>,
+    #[serde(default)]
+    pub dhcp_clients: Vec<DhcpClientSnapshot>,
     pub output_wifi: Vec<WifiSnapshot<WifiApSpec>>,
     pub dhcp: Vec<DhcpServiceSpec>,
 
@@ -491,6 +500,7 @@ pub trait RouterSubsystems: Send + Sync {
             interfaces: self.snapshot_interfaces().await?,
             uplink_wifi: self.snapshot_uplink_wifi().await?,
             uplink_dhcp: self.snapshot_uplink_dhcp().await?,
+            dhcp_clients: Vec::new(),
             output_wifi: self.snapshot_output_wifi().await?,
             routes: self.snapshot_routes().await?,
             dhcp: self.snapshot_dhcp().await?,
@@ -555,6 +565,12 @@ pub trait RouterSubsystems: Send + Sync {
     async fn rollback_dataplane(&self, snapshot: &RouterDataplaneSnapshot) -> Result<()>;
     async fn rollback_uplink_dhcp(&self, _snapshot: Option<&DhcpClientSpec>) -> Result<()> {
         Ok(())
+    }
+    async fn rollback_dhcp_clients(
+        &self, snapshots: &[DhcpClientSnapshot], legacy: Option<&DhcpClientSpec>,
+    ) -> Result<()> {
+        anyhow::ensure!(snapshots.is_empty(), "scoped DHCP client restoration is unavailable");
+        self.rollback_uplink_dhcp(legacy).await
     }
     async fn rollback_vpn_chain(&self, snapshot: &VpnChainSnapshot) -> Result<()> {
         if !snapshot.hops.is_empty() {
@@ -698,11 +714,39 @@ impl RouterManager {
         }
     }
 
+    /// Kernel route notifications also cover drift in policy routing. Check
+    /// health first so our own notifications do not trigger a write loop.
+    pub async fn dataplane_needs_reconcile(&self, desired: &RouterDesired) -> bool {
+        self.subsystems.health_routes(desired).await.is_err()
+            || self.subsystems.health_vpn_chain(desired).await.is_err()
+            || self.subsystems.health_dataplane(desired).await.is_err()
+    }
+
+    pub async fn reconcile_dataplane(&self, desired: &RouterDesired) -> Result<()> {
+        if self.subsystems.health_vpn_chain(desired).await.is_err() {
+            let plan = self.subsystems.plan_vpn_chain(desired).await?;
+            self.subsystems.apply_vpn_chain(&plan).await?;
+            self.subsystems.health_vpn_chain(desired).await?;
+        }
+        if self.subsystems.health_routes(desired).await.is_err() {
+            let plan = self.subsystems.plan_routes(desired).await?;
+            self.subsystems.apply_routes(&plan).await?;
+            self.subsystems.health_routes(desired).await?;
+        }
+        if self.subsystems.health_dataplane(desired).await.is_err() {
+            let plan = self.subsystems.plan_dataplane(desired).await?;
+            self.subsystems.apply_dataplane(&plan).await?;
+            self.subsystems.health_dataplane(desired).await?;
+        }
+        Ok(())
+    }
+
     pub async fn snapshot(&self) -> Result<RouterSnapshot> {
         Ok(RouterSnapshot {
             interfaces: self.subsystems.snapshot_interfaces().await?,
             uplink_wifi: self.subsystems.snapshot_uplink_wifi().await?,
             uplink_dhcp: self.subsystems.snapshot_uplink_dhcp().await?,
+            dhcp_clients: Vec::new(),
             output_wifi: self.subsystems.snapshot_output_wifi().await?,
             routes: self.subsystems.snapshot_routes().await?,
             dhcp: self.subsystems.snapshot_dhcp().await?,
@@ -784,20 +828,10 @@ impl RouterManager {
         if plan.desired.uplink_dhcp.is_some() {
             let deadline = tokio::time::Instant::now() + self.dhcp_readiness_timeout;
             loop {
-                if self
-                    .subsystems
-                    .health_uplink_dhcp(&plan.desired)
-                    .await
-                    .is_none()
-                {
+                let Some(reason) = self.subsystems.health_uplink_dhcp(&plan.desired).await else {
                     break;
-                }
+                };
                 if tokio::time::Instant::now() >= deadline {
-                    let reason = self
-                        .subsystems
-                        .health_uplink_dhcp(&plan.desired)
-                        .await
-                        .expect("DHCP uplink remained unready");
                     let error = anyhow::anyhow!("uplink DHCP readiness timed out: {reason:?}");
                     return Err(self.rollback_error(error, &snapshot, &started).await.into());
                 }
@@ -860,7 +894,7 @@ impl RouterManager {
                 }
                 Stage::UplinkDhcp => {
                     self.subsystems
-                        .rollback_uplink_dhcp(snapshot.uplink_dhcp.as_ref())
+                        .rollback_dhcp_clients(&snapshot.dhcp_clients, snapshot.uplink_dhcp.as_ref())
                         .await
                 }
                 Stage::VpnChain => {

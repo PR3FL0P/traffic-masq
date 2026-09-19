@@ -7,6 +7,7 @@
 
 pub mod desired;
 pub mod interface;
+pub mod mutation;
 pub mod override_manager;
 pub mod ownership;
 pub mod provisioning_secret_transaction;

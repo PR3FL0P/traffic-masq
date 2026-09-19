@@ -1,3 +1,4 @@
+use crate::core::mutation::NetworkMutationGate;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -5,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::sync::{Mutex, MutexGuard, RwLock};
+use tokio::sync::{Mutex, MutexGuard};
 
 use crate::core::override_manager::RuntimeOverrideManager;
 use crate::core::router::{RouterDesired, RouterManager, RouterPlan, RouterSnapshot};
@@ -114,7 +115,7 @@ struct Inner {
     state: Mutex<CoordinatorState>,
     journal: std::path::PathBuf,
     token_counter: AtomicU64,
-    timeout_mutation_gate: StdRwLock<Option<Arc<RwLock<()>>>>,
+    timeout_mutation_gate: StdRwLock<Option<Arc<NetworkMutationGate>>>,
 }
 
 #[derive(Clone)]
@@ -144,7 +145,7 @@ impl RouterTransactionCoordinator {
     /// Gate used by the automatic timeout rollback. API-driven router
     /// operations are already serialized by ControlService; the timer is the
     /// one mutation path that otherwise has no request-level guard.
-    pub fn set_timeout_mutation_gate(&self, gate: Arc<RwLock<()>>) {
+    pub fn set_timeout_mutation_gate(&self, gate: Arc<NetworkMutationGate>) {
         *self
             .inner
             .timeout_mutation_gate
@@ -239,20 +240,57 @@ impl RouterTransactionCoordinator {
     }
 
     pub async fn repair(&self, desired: RouterDesired) -> Result<()> {
-        let state = self.inner.state.lock().await;
+        self.repair_inner(desired, false).await
+    }
+
+    pub async fn reconcile_dataplane(&self, desired: RouterDesired) -> Result<()> {
+        self.repair_inner(desired, true).await
+    }
+
+    async fn repair_inner(&self, desired: RouterDesired, dataplane_only: bool) -> Result<()> {
+        let mut state = self.inner.state.lock().await;
         match &*state {
             CoordinatorState::Idle => {}
-            CoordinatorState::Pending(_) => {
-                return Err(CoordinatorConflict::TransactionPending.into())
-            }
-            CoordinatorState::RollbackFailed(_) => {
-                return Err(CoordinatorConflict::RollbackRecoveryRequired.into())
-            }
+            CoordinatorState::Pending(_) => return Err(CoordinatorConflict::TransactionPending.into()),
+            CoordinatorState::RollbackFailed(_) => return Err(CoordinatorConflict::RollbackRecoveryRequired.into()),
         }
-
+        if dataplane_only && !self.inner.manager.dataplane_needs_reconcile(&desired).await {
+            return Ok(());
+        }
         self.inner.manager.prepare_recovery(&desired).await?;
-        let plan = self.inner.manager.plan(desired).await?;
-        self.inner.manager.apply(&plan).await
+        let candidate = self.inner.overrides.build_candidate(
+            &crate::core::router_candidate::RouterIntentProposal::new()).await?;
+        let snapshot = self.inner.manager.snapshot_for(&desired).await?;
+        let token = self.next_token();
+        self.write_journal(candidate.base_revision(), &token, &snapshot, &desired).await?;
+        let result = if dataplane_only {
+            self.inner.manager.reconcile_dataplane(&desired).await
+        } else {
+            match self.inner.manager.plan(desired).await {
+                Ok(plan) => self.inner.manager.apply(&plan).await,
+                Err(error) => Err(error),
+            }
+        };
+        if let Err(error) = result {
+            let mut failures = self.inner.manager.rollback_to(&snapshot).await;
+            if failures.is_empty() {
+                if let Err(cleanup) = self.clear_journal().await { failures.push(cleanup.to_string()); }
+            }
+            if !failures.is_empty() {
+                *state = CoordinatorState::RollbackFailed(RollbackFailure {
+                    token, candidate, snapshot, failures,
+                });
+            }
+            return Err(error);
+        }
+        if let Err(error) = self.clear_journal().await {
+            // Keep recovery ownership until the durable journal is resolved.
+            *state = CoordinatorState::RollbackFailed(RollbackFailure {
+                token, candidate, snapshot, failures: vec![error.to_string()],
+            });
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub async fn commit(&self, token: &str) -> Result<u64> {
@@ -407,8 +445,8 @@ impl RouterTransactionCoordinator {
             .read()
             .expect("router timeout mutation-gate lock poisoned")
             .clone();
-        let _network_mutation = match gate {
-            Some(gate) => Some(gate.write_owned().await),
+        let _network_mutation = match &gate {
+            Some(gate) => Some(gate.write().await),
             None => None,
         };
         let mut state = self.inner.state.lock().await;

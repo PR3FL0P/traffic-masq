@@ -6,7 +6,7 @@
 pub mod client;
 pub mod ctrl;
 mod ctrl_transport;
-mod lifecycle;
+pub(crate) mod lifecycle;
 pub mod process;
 pub mod record;
 pub mod render;

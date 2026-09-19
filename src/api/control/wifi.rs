@@ -1,6 +1,6 @@
 use super::*;
 use super::dhcp::{
-    configure_dhcp_persisted, default_dhcp_settings, dhcp_edit_request_to_config,
+    default_dhcp_settings, dhcp_edit_request_to_config,
 };
 use super::runtime::compensation_message;
 
@@ -151,13 +151,6 @@ impl ControlService {
         let Some(previous_interface) = effective.network.interfaces.get(&interface).cloned() else {
             return wifi_error(WifiErrorDetail::InterfaceNotFound);
         };
-        let previous_override = self
-            .overrides
-            .snapshot()
-            .await
-            .interfaces
-            .get(&interface)
-            .cloned();
         let Some(cidr) = previous_interface.ipv4 else {
             return wifi_error(WifiErrorDetail::InvalidSpec {
                 message: "AP provisioning requires a configured IPv4 CIDR".to_string(),
@@ -168,132 +161,46 @@ impl ControlService {
                 message: "AP provisioning requires a managed output interface".to_string(),
             });
         }
-
-        let mut desired_interface = previous_interface.clone();
-        desired_interface.wifi = Some(wifi_edit_request_to_config(settings));
-        if let (Some(next), Some(previous)) = (
-            desired_interface.wifi.as_mut(),
-            previous_interface.wifi.as_ref(),
-        ) {
+        if let Err(error) = wifi.preflight_binary().await { return classify_wifi_error(error); }
+        let mut target = previous_interface.clone();
+        target.wifi = Some(wifi_edit_request_to_config(settings));
+        if let (Some(next), Some(previous)) = (target.wifi.as_mut(), previous_interface.wifi.as_ref()) {
             next.passphrase_file = previous.passphrase_file.clone();
         }
-        let spec = match WifiApSpec::from_interface_config(&interface, &desired_interface) {
-            Ok(Some(spec)) => spec,
-            Ok(None) => unreachable!("managed output checked above"),
-            Err(error) => {
-                return wifi_error(WifiErrorDetail::InvalidSpec {
-                    message: error.to_string(),
-                })
-            }
-        };
-        let dhcp_settings = if configure_dhcp {
-            match default_dhcp_settings(cidr) {
-                Ok(settings) => Some(settings),
+        if configure_dhcp {
+            let settings = match default_dhcp_settings(cidr) {
+                Ok(settings) => settings,
                 Err(message) => return wifi_error(WifiErrorDetail::InvalidSpec { message }),
-            }
-        } else {
-            None
-        };
-
-        let _wifi_mutation = self.wifi_mutations.lock().await;
-        let _dhcp_mutation = self.dhcp_mutations.lock().await;
-        let previous_ap = wifi.status(&interface).await.map(|status| status.spec);
-        let previous_secret = match wifi.stored_passphrase(&interface).await {
-            Ok(secret) => secret,
-            Err(error) => return classify_wifi_error(error),
-        };
-        let previous_dhcp = self.dhcp.spec(&interface).await;
-
-        if let Some(secret) = staged_passphrase.as_ref() {
-            if let Err(error) = wifi.set_passphrase(&interface, secret).await {
-                return classify_wifi_error(error);
-            }
-        }
-        if let Err(error) = wifi.configure(spec.clone()).await {
-            return match compensate_ap(wifi, &interface, previous_ap, previous_secret).await {
-                Ok(()) => classify_wifi_error(error),
-                Err(rollback) => wifi_error(WifiErrorDetail::Other {
-                    message: format!(
-                        "failed to configure access point: {error}; rollback also failed: {rollback:#}; recovery required"
-                    ),
-                }),
             };
+            target.dhcp = Some(dhcp_edit_request_to_config(settings));
         }
-        if let Err(error) = self
-            .overrides
-            .set_interface(interface.clone(), desired_interface.clone(), false)
-            .await
-        {
-            let restoration = compensate_ap(wifi, &interface, previous_ap, previous_secret).await;
-            return wifi_error(WifiErrorDetail::Other {
-                message: compensation_message(
-                    "AP provisioning failed to persist Wi-Fi settings",
-                    &error,
-                    restoration,
-                ),
-            });
-        }
-
-        let configured_dhcp = if let Some(settings) = dhcp_settings {
-            let mut dhcp_interface = desired_interface;
-            dhcp_interface.dhcp = Some(dhcp_edit_request_to_config(settings));
-            let result = match DhcpServiceSpec::from_interface_config(
-                &interface,
-                &dhcp_interface,
-                self.base_config.dhcp.default_lease_seconds,
-            ) {
-                Ok(Some(spec)) => {
-                    configure_dhcp_persisted(&self.dhcp, &self.overrides, spec.clone())
-                        .await
-                        .map(|()| spec)
-                }
-                Ok(None) => unreachable!("managed output was checked before provisioning"),
-                Err(error) => Err(error),
-            };
-            match result {
-                Ok(spec) => Some(spec),
-                Err(error) => {
-                    let mut rollback_failures = Vec::new();
-                    if let Err(rollback) = self
-                        .overrides
-                        .restore_interface_override(&interface, previous_override)
-                        .await
-                    {
-                        rollback_failures.push(format!("interface override: {rollback:#}"));
-                    }
-                    let dhcp_restore = match previous_dhcp {
-                        Some(spec) => self.dhcp.configure(spec).await,
-                        None => self.dhcp.disable(&interface).await.map(|_| ()),
-                    };
-                    if let Err(rollback) = dhcp_restore {
-                        rollback_failures.push(format!("DHCP: {rollback:#}"));
-                    }
-                    if let Err(rollback) =
-                        compensate_ap(wifi, &interface, previous_ap, previous_secret).await
-                    {
-                        rollback_failures.push(format!("access point: {rollback:#}"));
-                    }
-                    let message = if rollback_failures.is_empty() {
-                        format!(
-                            "AP provisioning failed while configuring DHCP; prior state was restored: {error:#}"
-                        )
-                    } else {
-                        format!(
-                            "AP provisioning failed while configuring DHCP: {error:#}; rollback was incomplete: {}; recovery required",
-                            rollback_failures.join("; ")
-                        )
-                    };
-                    return wifi_error(WifiErrorDetail::Other { message });
-                }
-            }
-        } else {
-            None
+        let spec = match WifiApSpec::from_interface_config(&interface, &target) {
+            Ok(Some(spec)) => spec,
+            Ok(None) => return wifi_error(WifiErrorDetail::InvalidSpec { message: "AP is disabled".into() }),
+            Err(error) => return wifi_error(WifiErrorDetail::InvalidSpec { message: error.to_string() }),
         };
-
-        Response::WifiAccessPointProvisioned {
-            spec,
-            dhcp: configured_dhcp,
+        let dhcp = match DhcpServiceSpec::from_interface_config(&interface, &target, self.base_config.dhcp.default_lease_seconds) {
+            Ok(spec) => spec,
+            Err(error) => return super::runtime::error_response(error),
+        };
+        // The legacy endpoint is an immediate commit, but its runtime and
+        // secret changes use the same durable interface transaction protocol.
+        let pending = match self.transactions.apply_with_passphrase(
+            &interface, &target, Some(&previous_interface), Some(previous_interface.role), false, staged_passphrase,
+        ).await {
+            Ok(pending) => pending,
+            Err(error) => return super::runtime::error_response(error),
+        };
+        let result = self.transactions.commit_with(&pending.token, |name, config, allow| {
+            self.overrides.commit_interface(name, config, allow, &pending.token)
+        }).await;
+        if let Err(error) = result {
+            let restored = self.transactions.rollback(&pending.token).await.map(|_| ());
+            return wifi_error(WifiErrorDetail::Other { message: compensation_message(
+                "failed to commit AP provisioning", &error, restored,
+            ) });
         }
+        Response::WifiAccessPointProvisioned { spec, dhcp: if configure_dhcp { dhcp } else { None } }
     }
 
     pub(super) async fn disable_wifi(&self, interface: String) -> Response {

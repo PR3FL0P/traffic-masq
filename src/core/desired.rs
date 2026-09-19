@@ -4,12 +4,9 @@
 //! overrides. The tentative one is a change that has been applied but not yet
 //! confirmed by whoever asked for it.
 //!
-//! The point of expressing an unconfirmed change as a *layer of desired state*
-//! rather than as a direct write to the kernel is that there is then only one
-//! writer. Convergence reaches a tentative change exactly the way it reaches a
-//! committed one, and abandoning it is dropping the layer — no separate undo
-//! path, nothing to snapshot, and nothing that can disagree with the converger
-//! about what the machine is supposed to look like.
+//! Both proposals and restoration snapshots remain in the desired layer until
+//! a convergence pass verifies them. This includes interfaces with no committed
+//! configuration: removing an entry alone cannot undo their runtime state.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -19,6 +16,7 @@ use anyhow::Result;
 use tokio::sync::{watch, Mutex, Notify};
 
 use crate::config::{AppConfig, InterfaceConfig};
+use crate::core::interface::InterfaceSnapshot;
 use crate::core::override_manager::RuntimeOverrideManager;
 
 /// An applied-but-unconfirmed interface configuration.
@@ -32,6 +30,7 @@ struct TentativeInterface {
     /// one it would refuse. The committed layer keeps the same permission in
     /// the override; this is where it lives until the change is committed.
     allow_management_change: bool,
+    restore: Option<InterfaceSnapshot>,
 }
 
 /// What one convergence pass achieved.
@@ -199,7 +198,7 @@ impl DesiredNetworkState {
 
     /// Whether this interface currently carries an unconfirmed change.
     pub async fn is_tentative(&self, interface: &str) -> bool {
-        self.tentative.lock().await.contains_key(interface)
+        self.tentative.lock().await.get(interface).is_some_and(|entry| entry.restore.is_none())
     }
 
     /// Propose a change: convergence will start moving the machine towards it.
@@ -219,6 +218,7 @@ impl DesiredNetworkState {
                 token: token.to_string(),
                 config,
                 allow_management_change,
+                restore: None,
             },
         );
         // Bumped after the layer is in place, never before: a converger that
@@ -227,12 +227,41 @@ impl DesiredNetworkState {
         self.tentative_changed.notify_one();
     }
 
+    pub async fn has_pending(&self) -> bool {
+        !self.tentative.lock().await.is_empty()
+    }
+
+    pub async fn committed_interface(&self, interface: &str) -> Result<Option<InterfaceConfig>> {
+        Ok(self.overrides.snapshot().await.effective_config(&self.base)?
+            .network.interfaces.get(interface).cloned())
+    }
+
+    pub async fn restorations(&self) -> BTreeMap<String, InterfaceSnapshot> {
+        self.tentative.lock().await.iter().filter_map(|(name, entry)| {
+            entry.restore.clone().map(|snapshot| (name.clone(), snapshot))
+        }).collect()
+    }
+
+    /// Replace a proposal with a restoration, including an explicit service
+    /// tombstone when the interface was not configured before the transaction.
+    pub async fn restore(
+        &self, token: &str, snapshot: InterfaceSnapshot, config: Option<InterfaceConfig>,
+    ) {
+        let interface = snapshot.name.clone();
+        let config = config.unwrap_or(InterfaceConfig {
+            role: crate::config::InterfaceRole::Output, managed: false, ipv4: None,
+            dhcp: None, dhcp_client: None, wifi: None, wifi_client: None, nat: false,
+        });
+        self.tentative.lock().await.insert(interface, TentativeInterface {
+            token: token.to_owned(), config, allow_management_change: true,
+            restore: Some(snapshot),
+        });
+        self.request_convergence();
+    }
+
     /// Drop everything a transaction proposed.
     ///
-    /// Used both when a change is confirmed — at which point the committed
-    /// layer already carries it — and when it is abandoned, where dropping the
-    /// layer is the whole of the rollback: convergence takes the machine back
-    /// to the committed state on its own.
+    /// Called after persistence succeeds or restoration has been verified.
     ///
     /// Returns the interfaces that were released.
     pub async fn withdraw(&self, token: &str) -> Vec<String> {

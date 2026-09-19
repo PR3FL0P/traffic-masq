@@ -273,3 +273,20 @@ pub(crate) fn unix_now() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
+
+/// Recover interrupted interface transactions before starting any supervisor.
+/// A durable PID plus its exact config argument is the ownership proof; stale
+/// records are cleared without signalling a process that no longer matches.
+pub(crate) async fn stop_recorded_interface(state_dir: &Path, interface: &str) -> anyhow::Result<()> {
+    let process = crate::wifi::process::TokioSupervisedProcess::new();
+    for kind in [crate::wifi::record::WifiProcessKind::AccessPoint, crate::wifi::record::WifiProcessKind::Client] {
+        let store = WifiRecordStore::new(kind, state_dir.join("wifi"), interface);
+        if let Some(record) = store.load().await? {
+            if process.cmdline_contains(record.pid, &record.config_path).await? {
+                graceful_stop(&process, record.pid, "Wi-Fi recovery").await?;
+            }
+            store.clear().await?;
+        }
+    }
+    Ok(())
+}

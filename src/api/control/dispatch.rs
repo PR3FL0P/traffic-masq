@@ -8,19 +8,16 @@ use super::runtime::error_response;
 
 impl ControlService {
     pub(super) async fn dispatch_inner(&self, request: Request) -> Response {
-        // The lock closes the race between "router is idle" and the first
-        // mutation performed by either the direct API path or router.apply().
-        // Once router.apply() returns Pending, the status guard below protects
-        // the whole commit-confirm window without holding a mutex for minutes.
-        let (_network_read, _network_write) = if is_network_mutation(&request) {
-            if is_converged_network_transaction_request(&request) {
-                (Some(self.network_mutations.read().await), None)
-            } else {
-                (None, Some(self.network_mutations.write().await))
-            }
-        } else {
-            (None, None)
-        };
+        // Admission stays held across convergence waits. Execution is held only
+        // by direct writers: the worker must remain able to realize proposals.
+        let _admission = if is_network_mutation(&request) {
+            Some(self.network_mutations.admit().await)
+        } else { None };
+        let _execution = if is_network_mutation(&request)
+            && !is_converged_network_transaction_request(&request)
+        {
+            Some(self.network_mutations.execute().await)
+        } else { None };
         if is_network_mutation(&request) && !is_provisioning_secret_recovery_request(&request) {
             if let Some(router) = &self.router {
                 // The provisioning-secret journal is an extra crash-recovery
@@ -574,7 +571,8 @@ fn is_network_mutation(request: &Request) -> bool {
 fn is_converged_network_transaction_request(request: &Request) -> bool {
     matches!(
         request,
-        Request::ApplyInterface { .. }
+        Request::ProvisionWifiAccessPoint { .. }
+            | Request::ApplyInterface { .. }
             | Request::ApplyInterfaceEdit { .. }
             | Request::CommitNetworkChange { .. }
             | Request::RollbackNetworkChange { .. }

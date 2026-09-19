@@ -1,5 +1,7 @@
 //! Installation, startup, and process lifecycle management.
 
+use crate::core::mutation::NetworkMutationGate;
+
 pub mod init;
 pub mod installer;
 mod process;
@@ -16,7 +18,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use tokio::signal;
-use tokio::sync::{mpsc, watch, RwLock};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior};
 
@@ -104,7 +106,8 @@ trait DhcpClientRuntimeReconciler: Send + Sync {
     async fn spec(&self, interface: &str) -> Option<DhcpClientSpec>;
     async fn specs(&self) -> Vec<DhcpClientSpec>;
     async fn disable(&self, interface: &str) -> Result<Option<DhcpClientSpec>>;
-    async fn reconcile(&self, spec: DhcpClientSpec, link_ready: bool);
+    async fn reconcile(&self, spec: DhcpClientSpec, link_ready: bool) -> Result<()>;
+    async fn verify_ready(&self, _interface: &str) -> Result<()> { Ok(()) }
     async fn ensure_alive(&self) -> Result<bool>;
 }
 
@@ -122,8 +125,29 @@ impl DhcpClientRuntimeReconciler for DhcpClientSupervisor {
         self.disable(interface).await
     }
 
-    async fn reconcile(&self, spec: DhcpClientSpec, link_ready: bool) {
-        self.reconcile_with_link_ready(spec, link_ready).await
+    async fn reconcile(&self, spec: DhcpClientSpec, link_ready: bool) -> Result<()> {
+        let name = spec.interface.clone();
+        self.reconcile_with_link_ready(spec, link_ready).await;
+        let status = self.status(&name).await.context("DHCP client disappeared")?;
+        if let crate::dhcp::client::DhcpClientRunState::Degraded { reason } = status.state {
+            bail!("DHCP client on {name} is degraded: {reason}");
+        }
+        Ok(())
+    }
+
+    async fn verify_ready(&self, interface: &str) -> Result<()> {
+        let deadline = time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = self.status(interface).await.context("DHCP client disappeared")?;
+            if let Some(lease) = status.lease {
+                return self.verify_bound_lease(&lease).await;
+            }
+            if let crate::dhcp::client::DhcpClientRunState::Degraded { reason } = status.state {
+                bail!("DHCP client on {interface} is degraded: {reason}");
+            }
+            anyhow::ensure!(time::Instant::now() < deadline, "DHCP lease is not ready on {interface}");
+            time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     async fn ensure_alive(&self) -> Result<bool> {
@@ -578,51 +602,24 @@ fn plan_dhcp_reconcile(
 }
 
 async fn apply_dhcp_reconcile_action<D: DhcpRuntimeReconciler>(
-    dhcp: &D,
-    interface: &str,
-    action: DhcpReconcileAction,
-) {
+    dhcp: &D, interface: &str, action: DhcpReconcileAction,
+) -> Result<()> {
     match action {
         DhcpReconcileAction::Keep => {}
-        DhcpReconcileAction::Configure(spec) => {
-            if let Err(error) = dhcp.reconcile(spec).await {
-                tracing::warn!(interface, %error, "failed to reconcile DHCP service");
-            }
-        }
-        DhcpReconcileAction::Disable => {
-            if let Err(error) = dhcp.disable(interface).await {
-                tracing::warn!(interface, %error, "failed to disable stale DHCP service");
-            }
-        }
+        DhcpReconcileAction::Configure(spec) => dhcp.reconcile(spec).await?,
+        DhcpReconcileAction::Disable => { dhcp.disable(interface).await?; }
     }
+    Ok(())
 }
 
 async fn reconcile_dhcp_client<L: DhcpClientRuntimeReconciler>(
-    client: &L,
-    interface: &str,
-    config: &InterfaceConfig,
-    link_ready: bool,
-) {
-    let desired = match DhcpClientSpec::from_interface_config(interface, config) {
-        Ok(spec) => spec,
-        Err(error) => {
-            tracing::warn!(interface, %error, "failed to derive effective DHCP client during reconcile");
-            return;
-        }
-    };
-    let current = client.spec(interface).await;
-    match (desired, current) {
-        (Some(spec), current) if current.as_ref() != Some(&spec) => {
-            client.reconcile(spec, link_ready).await;
-        }
-        (None, Some(_)) => {
-            if let Err(error) = client.disable(interface).await {
-                tracing::warn!(interface, %error, "failed to disable stale DHCP client");
-            }
-        }
-        (Some(spec), Some(_)) => client.reconcile(spec, link_ready).await,
-        _ => {}
+    client: &L, interface: &str, config: &InterfaceConfig, link_ready: bool,
+) -> Result<()> {
+    match DhcpClientSpec::from_interface_config(interface, config)? {
+        Some(spec) => client.reconcile(spec, link_ready).await?,
+        None => { client.disable(interface).await?; }
     }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -651,115 +648,88 @@ async fn reconcile_network_runtime_once<
         .map(|interface| (interface.name.clone(), interface))
         .collect();
 
+    let restorations = desired.restorations().await;
     for (name, config) in &effective.network.interfaces {
-        if let Some(client) = wifi_client {
-            if let Err(error) = client.reconcile_interface(name, config).await {
-                tracing::warn!(interface = %name, %error, "failed to reconcile Wi-Fi client");
-                failures.insert(name.clone(), error.to_string());
-            }
-        }
-
-        if let Some(dhcp_client) = dhcp_client {
-            let link_ready = if config.wifi_client.is_some() {
-                match wifi_client {
-                    Some(client) => client.association_ready(name).await.unwrap_or(false),
-                    None => false,
-                }
-            } else {
-                true
+        let result: Result<()> = async {
+            let strict = desired.is_tentative(name).await || restorations.contains_key(name);
+            let desired_dhcp = DhcpServiceSpec::from_interface_config(
+                name, config, effective.dhcp.default_lease_seconds,
+            )?;
+            let current_dhcp = dhcp.spec(name).await;
+            let Some(observed_interface) = observed_interfaces.get(name) else {
+                apply_dhcp_reconcile_action(dhcp, name,
+                    plan_dhcp_reconcile(desired_dhcp, current_dhcp, false, false, false)).await?;
+                bail!("interface {name} is absent; convergence is deferred");
             };
-            reconcile_dhcp_client(dhcp_client, name, config, link_ready).await;
-        }
-        let desired_dhcp = match DhcpServiceSpec::from_interface_config(
-            name,
-            config,
-            effective.dhcp.default_lease_seconds,
-        ) {
-            Ok(spec) => spec,
-            Err(error) => {
-                tracing::warn!(interface = %name, %error, "failed to derive effective DHCP service during reconcile");
-                continue;
-            }
-        };
-        let current_dhcp = dhcp.spec(name).await;
-        let Some(observed_interface) = observed_interfaces.get(name) else {
-            apply_dhcp_reconcile_action(
-                dhcp,
-                name,
-                plan_dhcp_reconcile(desired_dhcp, current_dhcp, false, false, false),
-            )
-            .await;
-            continue;
-        };
 
-        let current_addresses = match network.list_ipv4_addresses(name).await {
-            Ok(addresses) => addresses,
-            Err(error) => {
-                tracing::warn!(interface = %name, %error, "failed to list IPv4 addresses during runtime reconcile");
-                continue;
+            if let Some(client) = wifi_client {
+                client.reconcile_interface(name, config).await?;
+            } else {
+                anyhow::ensure!(config.wifi_client.is_none(), "Wi-Fi client runtime is unavailable");
             }
-        };
-        let needs_apply = if config.managed {
-            interface_needs_reapply(
-                observed_interface,
-                &current_addresses,
-                config,
-                network.supports_ipv4_address_protocol(),
-            )
-        } else {
-            // An interface we are not asked to manage has no business carrying
-            // an address of ours, however it got there — a change that was
-            // rolled back, an override that was removed, a previous run.
-            // Convergence is what cleans it up, because convergence is the only
-            // thing that writes.
-            interface_manager
-                .owns_any_address(name, &current_addresses)
-                .await
-        };
-        if needs_apply {
-            let allow_management_change = management_allowlist.contains(name);
-
-            if let Err(error) = interface_manager
-                .apply_interface(name, config, Some(config.role), allow_management_change)
-                .await
-            {
-                tracing::warn!(interface = %name, %error, "failed to converge interface");
-                failures.insert(name.clone(), error.to_string());
-                continue;
-            }
-        }
-
-        let (ipv4_ready, binding_stale) = if desired_dhcp.is_some() {
-            match interface_manager.verify_configured_ipv4(name, config).await {
-                Ok(()) => match dhcp.binding_stale(name).await {
-                    Ok(binding_stale) => (true, binding_stale),
-                    Err(error) => {
-                        tracing::warn!(interface = %name, %error, "failed to check DHCP binding freshness during runtime reconcile");
-                        (false, false)
-                    }
-                },
-                Err(error) => {
-                    tracing::warn!(interface = %name, %error, "managed interface is not yet ready for DHCP during runtime reconcile");
-                    (false, false)
+            let mut link_ready = true;
+            if config.wifi_client.is_some() {
+                let deadline = time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    link_ready = match wifi_client {
+                        Some(client) => client.association_ready(name).await.unwrap_or(false),
+                        None => false,
+                    };
+                    if link_ready || !strict { break; }
+                    anyhow::ensure!(time::Instant::now() < deadline, "Wi-Fi association is not ready on {name}");
+                    time::sleep(Duration::from_millis(20)).await;
                 }
             }
-        } else {
-            (false, false)
-        };
-
-        if let Some(access_point) = wifi {
-            if let Err(error) = access_point.reconcile_interface(name, config).await {
-                tracing::warn!(interface = %name, %error, "failed to reconcile Wi-Fi access point");
-                failures.insert(name.clone(), error.to_string());
+            if let Some(client) = dhcp_client {
+                reconcile_dhcp_client(client, name, config, link_ready).await?;
+            } else {
+                anyhow::ensure!(DhcpClientSpec::from_interface_config(name, config)?.is_none(),
+                    "DHCP client runtime is unavailable");
             }
-        }
 
-        apply_dhcp_reconcile_action(
-            dhcp,
-            name,
-            plan_dhcp_reconcile(desired_dhcp, current_dhcp, true, ipv4_ready, binding_stale),
-        )
-        .await;
+            if let Some(snapshot) = restorations.get(name) {
+                interface_manager.rollback(snapshot).await?;
+            } else {
+                let current_addresses = network.list_ipv4_addresses(name).await?;
+                let needs_apply = if config.managed {
+                    // Foreign addresses are intentionally preserved; their presence
+                    // must not cause an endless cycle of our own netlink events.
+                    let mut relevant = Vec::new();
+                    for address in &current_addresses {
+                        if config.ipv4.is_some_and(|ip| ip.addr() == address.address && ip.prefix_len() == address.prefix_len)
+                            || interface_manager.owns_address(name, address).await {
+                            relevant.push(address.clone());
+                        }
+                    }
+                    interface_needs_reapply(observed_interface, &relevant, config, false)
+                } else {
+                    interface_manager.owns_any_address(name, &current_addresses).await
+                };
+                if needs_apply {
+                    interface_manager.apply_interface(name, config, Some(config.role),
+                        management_allowlist.contains(name)).await?;
+                }
+            }
+            let (ipv4_ready, binding_stale) = if desired_dhcp.is_some() {
+                interface_manager.verify_configured_ipv4(name, config).await?;
+                (true, dhcp.binding_stale(name).await?)
+            } else { (false, false) };
+            if let Some(access_point) = wifi {
+                access_point.reconcile_interface(name, config).await?;
+            } else {
+                anyhow::ensure!(config.wifi.is_none(), "Wi-Fi access point runtime is unavailable");
+            }
+            apply_dhcp_reconcile_action(dhcp, name,
+                plan_dhcp_reconcile(desired_dhcp, current_dhcp, true, ipv4_ready, binding_stale)).await?;
+            if strict && DhcpClientSpec::from_interface_config(name, config)?.is_some() {
+                if let Some(client) = dhcp_client { client.verify_ready(name).await?; }
+            }
+            Ok(())
+        }.await;
+        if let Err(error) = result {
+            tracing::warn!(interface = %name, %error, "interface convergence incomplete");
+            failures.insert(name.clone(), format!("{error:#}"));
+        }
     }
 
     Ok(failures)
@@ -815,7 +785,7 @@ fn spawn_runtime_network_reconcile(
     wifi: Option<HostapdSupervisor>,
     wifi_client: Option<WifiClientSupervisor>,
     dhcp_client: DhcpClientSupervisor,
-    network_mutations: Arc<RwLock<()>>,
+    network_mutations: Arc<NetworkMutationGate>,
     router: Option<RouterTransactionCoordinator>,
     mut kernel_events: mpsc::UnboundedReceiver<KernelEvent>,
     mut shutdown: watch::Receiver<bool>,
@@ -852,18 +822,24 @@ fn spawn_runtime_network_reconcile(
                 if router_busy {
                     None
                 } else {
-                    Some(
-                        reconcile_network_runtime_once(
-                            &desired,
-                            &journal,
-                            network.clone(),
-                            &dhcp,
-                            wifi.as_ref(),
-                            wifi_client.as_ref(),
-                            Some(&dhcp_client),
-                        )
-                        .await,
-                    )
+                    let result = reconcile_network_runtime_once(
+                        &desired, &journal, network.clone(), &dhcp,
+                        wifi.as_ref(), wifi_client.as_ref(), Some(&dhcp_client),
+                    ).await;
+                    // Tentative interface state is owned by its transaction.
+                    // Router drift repair runs only against settled intent.
+                    if !desired.has_pending().await {
+                        if let Some(router) = &router {
+                            let repair = async {
+                                let effective = desired.effective().await?;
+                                router.reconcile_dataplane(RouterDesired::from_effective_config(&effective)?).await
+                            }.await;
+                            if let Err(error) = repair {
+                                tracing::warn!(%error, "router dataplane convergence failed");
+                            }
+                        }
+                    }
+                    Some(result)
                 }
             };
             if let Some(result) = result {
@@ -932,7 +908,9 @@ async fn check_process_liveness<D, W, C, L>(
     if let (Some(wifi_client), Some(dhcp_client)) = (wifi_client, dhcp_client) {
         for spec in dhcp_client.specs().await {
             if let Some(link_ready) = wifi_client.association_ready(&spec.interface).await {
-                dhcp_client.reconcile(spec, link_ready).await;
+                if let Err(error) = dhcp_client.reconcile(spec, link_ready).await {
+                    tracing::warn!(%error, "DHCP client liveness reconcile failed");
+                }
             }
         }
     }
@@ -980,7 +958,7 @@ fn spawn_process_liveness_checks(
     wifi: Option<HostapdSupervisor>,
     wifi_client: Option<WifiClientSupervisor>,
     dhcp_client: DhcpClientSupervisor,
-    network_mutations: Arc<RwLock<()>>,
+    network_mutations: Arc<NetworkMutationGate>,
     router: Option<RouterTransactionCoordinator>,
     mut shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
@@ -1325,8 +1303,7 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     // Created before router recovery so autonomous DHCP lease callbacks cannot
     // race startup reconciliation. The same gate is later installed in the
     // ControlService and background reconcilers.
-    let network_mutations = Arc::new(RwLock::new(()));
-    dhcp_client.set_network_mutation_gate(network_mutations.clone());
+    let network_mutations = Arc::new(NetworkMutationGate::default());
 
     if shutdown_requested(&shutdown) {
         stack.unwind().await;
@@ -1526,6 +1503,7 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
                 );
             }
         };
+    let (reconcile_stop, reconcile_shutdown) = watch::channel(false);
     let reconcile_task = spawn_runtime_network_reconcile(
         desired_state,
         ownership_journal.clone(),
@@ -1537,7 +1515,7 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         network_mutations.clone(),
         router_coordinator.clone(),
         kernel_events,
-        shutdown.clone(),
+        reconcile_shutdown,
     );
     // Nothing fallible or shutdown-checked remains between here and the main
     // serve loop: startup has fully succeeded, so teardown responsibility
@@ -1586,7 +1564,7 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         }
     }
 
-    reconcile_task.abort();
+    let _ = reconcile_stop.send(true);
     let _ = reconcile_task.await;
     session_reaper.abort();
     let _ = session_reaper.await;
@@ -1830,7 +1808,7 @@ mod tests {
             Ok(self.specs.lock().await.remove(interface))
         }
 
-        async fn reconcile(&self, spec: DhcpClientSpec, link_ready: bool) {
+        async fn reconcile(&self, spec: DhcpClientSpec, link_ready: bool) -> Result<()> {
             self.readiness
                 .lock()
                 .await
@@ -1840,6 +1818,7 @@ mod tests {
                 self.reconcile_calls.lock().await.push(spec.clone());
                 self.specs.lock().await.insert(spec.interface.clone(), spec);
             }
+            Ok(())
         }
 
         async fn ensure_alive(&self) -> Result<bool> {

@@ -1,3 +1,4 @@
+use crate::core::router::DhcpClientSnapshot;
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -59,6 +60,12 @@ pub trait RouterDhcpClientRuntime: Send + Sync {
     async fn configure(&self, spec: DhcpClientSpec) -> Result<()>;
     async fn disable(&self, interface: &str) -> Result<()>;
     async fn verify_bound_lease(&self, status: &DhcpClientStatus) -> Result<()>;
+    async fn restore(&self, snapshot: &DhcpClientSnapshot) -> Result<()> {
+        match &snapshot.spec {
+            Some(spec) => self.configure(spec.clone()).await,
+            None => self.disable(&snapshot.interface).await,
+        }
+    }
 }
 
 #[async_trait]
@@ -78,6 +85,13 @@ impl RouterDhcpClientRuntime for DhcpClientSupervisor {
             bail!("DHCP client failed to start on {interface}: {reason}");
         }
         Ok(())
+    }
+
+    async fn restore(&self, snapshot: &DhcpClientSnapshot) -> Result<()> {
+        match &snapshot.spec {
+            Some(spec) => self.restore(spec.clone(), snapshot.lease.clone()).await,
+            None => self.disable(&snapshot.interface).await.map(|_| ()),
+        }
     }
 
     async fn disable(&self, interface: &str) -> Result<()> {
@@ -1048,22 +1062,20 @@ where
             });
         }
 
-        let uplink_dhcp = match (&self.dhcp_client, desired.uplink_dhcp.as_ref()) {
-            (Some(runtime), Some(target)) => {
-                runtime.status(&target.interface).await.map(|s| s.spec)
+        let mut dhcp_clients = Vec::new();
+        if let Some(runtime) = &self.dhcp_client {
+            for name in &names {
+                let status = runtime.status(name).await;
+                dhcp_clients.push(DhcpClientSnapshot {
+                    interface: name.clone(),
+                    spec: status.as_ref().map(|status| status.spec.clone()),
+                    lease: status.and_then(|status| status.lease),
+                });
             }
-            (Some(runtime), None) => {
-                let mut current = None;
-                for name in &names {
-                    if let Some(status) = runtime.status(name).await {
-                        current = Some(status.spec);
-                        break;
-                    }
-                }
-                current
-            }
-            (None, _) => None,
-        };
+        }
+        // Retained for deserializing version-1/2 journals; new snapshots use
+        // the complete scoped collection, including absent clients.
+        let uplink_dhcp = None;
 
         let mut dhcp = Vec::new();
         let mut dhcp_absent_interfaces = Vec::new();
@@ -1079,6 +1091,7 @@ where
             interfaces,
             uplink_wifi,
             uplink_dhcp,
+            dhcp_clients,
             output_wifi,
             routes: self.routes.snapshot().await?,
             dhcp,
@@ -1163,16 +1176,12 @@ where
             }
             return Ok(());
         };
-        match desired {
-            Some(spec) => runtime.configure(spec.clone()).await?,
-            None => {
-                for name in &self.owned_interfaces().await {
-                    if runtime.status(name).await.is_some() {
-                        runtime.disable(name).await?;
-                    }
-                }
+        for name in &self.owned_interfaces().await {
+            if desired.is_none_or(|spec| &spec.interface != name) {
+                runtime.disable(name).await?;
             }
         }
+        if let Some(spec) = desired { runtime.configure(spec.clone()).await?; }
         Ok(())
     }
 
@@ -1307,6 +1316,21 @@ where
 
     async fn rollback_uplink_dhcp(&self, snapshot: Option<&DhcpClientSpec>) -> Result<()> {
         self.apply_uplink_dhcp(snapshot).await
+    }
+
+    async fn rollback_dhcp_clients(
+        &self, snapshots: &[DhcpClientSnapshot], legacy: Option<&DhcpClientSpec>,
+    ) -> Result<()> {
+        if snapshots.is_empty() { return self.rollback_uplink_dhcp(legacy).await; }
+        let runtime = self.dhcp_client.as_ref().context("DHCP client runtime is unavailable")?;
+        let mut errors = Vec::new();
+        for snapshot in snapshots {
+            if let Err(error) = runtime.restore(snapshot).await {
+                errors.push(format!("{}: {error:#}", snapshot.interface));
+            }
+        }
+        anyhow::ensure!(errors.is_empty(), "DHCP client restoration failed: {}", errors.join("; "));
+        Ok(())
     }
 
     async fn health_interfaces(&self, desired: &RouterDesired) -> Result<()> {

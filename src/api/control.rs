@@ -1,3 +1,4 @@
+use crate::core::mutation::NetworkMutationGate;
 mod dhcp;
 mod dhcp_client;
 mod dispatch;
@@ -16,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex};
 
 use crate::api::model::{
     ApiHttpsSettings, DhcpClientConfigRequest, DhcpClientErrorDetail, DhcpClientOperationalState,
@@ -93,7 +94,7 @@ pub struct ControlService {
     transactions: NetworkTransactionManager,
     /// Serializes entry into network-mutating API calls. Long-lived pending
     /// transactions are protected by coordinator status checks in dispatch.
-    network_mutations: Arc<RwLock<()>>,
+    network_mutations: Arc<NetworkMutationGate>,
     dhcp: DhcpSupervisor,
     overrides: RuntimeOverrideManager,
     dhcp_mutations: Arc<Mutex<()>>,
@@ -144,6 +145,7 @@ impl ControlService {
         baselines: Vec<InterfaceSnapshot>,
         journal: AddressOwnershipJournal,
     ) -> Self {
+        let network_mutations = Arc::new(NetworkMutationGate::default());
         let transactions = NetworkTransactionManager::new_with_services(
             InterfaceManager::new(network.clone(), journal),
             Duration::from_secs(config.security.rollback_timeout_seconds),
@@ -156,6 +158,7 @@ impl ControlService {
             DesiredNetworkState::new(config.clone(), overrides.clone()),
         );
 
+        transactions.set_runtime_gate(network_mutations.clone());
         let wifi_client_profiles =
             WifiClientProfileStore::new(config.runtime.state_dir.join("wifi/client-profiles"));
 
@@ -165,7 +168,7 @@ impl ControlService {
             config,
             network,
             transactions,
-            network_mutations: Arc::new(RwLock::new(())),
+            network_mutations,
             dhcp,
             overrides,
             dhcp_mutations: Arc::new(Mutex::new(())),
@@ -204,11 +207,9 @@ impl ControlService {
         self
     }
 
-    pub(crate) fn with_network_mutation_gate(mut self, gate: Arc<RwLock<()>>) -> Self {
+    pub(crate) fn with_network_mutation_gate(mut self, gate: Arc<NetworkMutationGate>) -> Self {
+        self.transactions.set_runtime_gate(gate.clone());
         self.network_mutations = gate;
-        if let Some(dhcp_client) = &self.dhcp_client {
-            dhcp_client.set_network_mutation_gate(self.network_mutations.clone());
-        }
         self
     }
 
@@ -241,7 +242,6 @@ impl ControlService {
     }
 
     pub fn with_dhcp_client_supervisor(mut self, dhcp_client: DhcpClientSupervisor) -> Self {
-        dhcp_client.set_network_mutation_gate(self.network_mutations.clone());
         self.dhcp_client = Some(dhcp_client);
         self
     }
