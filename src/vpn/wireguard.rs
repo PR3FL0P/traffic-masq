@@ -499,16 +499,29 @@ impl VpnDriver for WireGuardVpnDriver {
         Ok(self.provider.public_key(interface).await?)
     }
 
+    async fn delete_if_launch_marker(
+        &self,
+        interface: &str,
+        launch_marker: &str,
+    ) -> Result<bool, VpnDriverError> {
+        Ok(self
+            .provider
+            .delete_link_if_launch_marker(interface, launch_marker)
+            .await?)
+    }
+
     async fn activate(
         &self,
         interface: &str,
         profile: &Self::Profile,
+        launch_marker: &str,
     ) -> Result<Self::OwnershipProof, VpnDriverError> {
         self.provider
             .create_link(
                 interface,
                 &profile.interface.private_key,
                 profile.interface.listen_port,
+                launch_marker,
             )
             .await?;
 
@@ -534,8 +547,18 @@ impl VpnDriver for WireGuardVpnDriver {
 
         match activation {
             Ok(proof) => Ok(proof),
-            Err(error) => match self.provider.delete_link(interface).await {
-                Ok(()) => Err(error),
+            Err(error) => match self
+                .provider
+                .delete_link_if_launch_marker(interface, launch_marker)
+                .await
+            {
+                Ok(true) => Err(error),
+                Ok(false) => Err(VpnDriverError::ActivationCleanupFailed {
+                    interface: interface.to_string(),
+                    activation: error.to_string(),
+                    cleanup: "launch marker no longer matches; refusing to delete the interface"
+                        .to_string(),
+                }),
                 Err(cleanup) => Err(VpnDriverError::ActivationCleanupFailed {
                     interface: interface.to_string(),
                     activation: error.to_string(),

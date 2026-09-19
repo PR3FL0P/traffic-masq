@@ -412,16 +412,25 @@ The daemon can manage:
 - WireGuard interfaces
 - policy routes and VPN kill switch rules
 
-### Confirming a change
+### Transactional and immediate changes
 
-Applying a change does not make it permanent. The daemon brings the machine to
-the requested state and starts a timer, 60 seconds by default. Committing
-within that window keeps the change; letting the timer expire returns the
-machine to the configuration that was there before.
+Interface and router changes use **Apply → Commit** transactions. Apply brings
+the machine to the requested state and starts a timer, 60 seconds by default.
+Committing within that window keeps the change; letting the timer expire
+returns the interface/router state to the previous committed configuration.
 
-If the change cuts off your connection, the daemon rolls it back locally when
-the timer expires. The daemon must still be running for the timer to work;
-after a crash, recovery runs on restart. See [recovery](../SECURITY.md#rollback-and-recovery).
+Standalone DHCP, Wi-Fi and VPN operations are different: they take effect
+immediately and do not have an interface/router confirmation timer. Those
+subsystems write durable ownership or launch records before persistent runtime
+state is created, then reconcile those records against committed configuration
+on startup. This lets recovery remove only traffic-masq-owned crash residue
+without treating foreign processes, leases or interfaces as its own.
+
+If an interface/router change cuts off your connection, the daemon rolls it
+back locally when the timer expires. The daemon must still be running for the
+timer to fire; after a crash, recovery runs on restart. Immediate DHCP/Wi-Fi/VPN
+operations also run their ownership recovery during startup. See
+[recovery](../SECURITY.md#rollback-and-recovery).
 
 ### What the daemon considers its own
 

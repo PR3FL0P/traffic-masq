@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,13 +10,14 @@ use crate::config::{AppConfig, ShutdownPolicy};
 use crate::dhcp::supervisor::resolve_interface_index;
 use crate::wifi::ctrl::{CtrlError, HostapdCtrlClient, HostapdState, MacAddr, Station};
 use crate::wifi::lifecycle::{
-    classify_ownership, graceful_stop, preflight_binary as preflight_daemon_binary, retry_health,
-    save_spawned_record,
-    wait_until_ready, write_private_config, OwnershipOutcome, RetryState, STARTUP_READY_TIMEOUT,
+    classify_ownership, cleanup_unconfigured_records, graceful_stop,
+    preflight_binary as preflight_daemon_binary, retry_health, save_launch_intent,
+    save_spawned_record, wait_until_ready, write_private_config, OwnershipOutcome, RetryState,
+    STARTUP_READY_TIMEOUT,
 };
 pub use crate::wifi::lifecycle::WifiHealth;
 use crate::wifi::process::{ProcessError, SupervisedProcess, TokioSupervisedProcess};
-use crate::wifi::record::{PersistedWifiRecord, WifiRecordError, WifiRecordStore};
+use crate::wifi::record::{PersistedWifiRecord, WifiProcessKind, WifiRecordError, WifiRecordStore};
 use crate::wifi::render::{
     self, render_hostapd_config, ApRenderInput, RenderError, RenderedApConfig, WifiDigest,
 };
@@ -133,7 +134,46 @@ impl HostapdSupervisor {
             }),
         };
 
-        for spec in Self::effective_specs(config)? {
+        let specs = Self::effective_specs(config)?;
+        let configured_interfaces: HashSet<String> =
+            specs.iter().map(|spec| spec.interface.clone()).collect();
+        let configured_clients: HashSet<String> = config
+            .network
+            .interfaces
+            .iter()
+            .filter_map(|(name, interface)| interface.wifi_client.as_ref().map(|_| name.clone()))
+            .collect();
+        let no_interfaces = HashSet::new();
+        // AP startup precedes the client supervisor. Recover every Wi-Fi
+        // process type that could otherwise occupy an AP control socket first,
+        // including an uncommitted client/scan left by a crashed immediate
+        // mutation. Committed clients are explicitly preserved.
+        cleanup_unconfigured_records(
+            &supervisor.inner.records_dir,
+            WifiProcessKind::Scan,
+            &no_interfaces,
+            supervisor.inner.process.as_ref(),
+        )
+        .await
+        .map_err(SupervisorError::Configuration)?;
+        cleanup_unconfigured_records(
+            &supervisor.inner.records_dir,
+            WifiProcessKind::Client,
+            &configured_clients,
+            supervisor.inner.process.as_ref(),
+        )
+        .await
+        .map_err(SupervisorError::Configuration)?;
+        cleanup_unconfigured_records(
+            &supervisor.inner.records_dir,
+            WifiProcessKind::AccessPoint,
+            &configured_interfaces,
+            supervisor.inner.process.as_ref(),
+        )
+        .await
+        .map_err(SupervisorError::Configuration)?;
+
+        for spec in specs {
             if resolve_interface_index(&spec.interface).is_err() {
                 tracing::warn!(
                     interface = %spec.interface,
@@ -275,13 +315,24 @@ impl HostapdSupervisor {
     }
 
     async fn task_process_matches(&self, task: &ApTask) -> Result<bool, SupervisorError> {
+        if self
+            .record_store(&task.spec.interface)
+            .transition_pending()
+            .await?
+        {
+            return Ok(false);
+        }
         if task.record.pid == 0 || !self.inner.process.is_alive(task.record.pid).await? {
             return Ok(false);
         }
         if !self
             .inner
             .process
-            .cmdline_contains(task.record.pid, &task.record.config_path)
+            .cmdline_matches_kind(
+                task.record.pid,
+                WifiProcessKind::AccessPoint,
+                &task.record.config_path,
+            )
             .await?
         {
             return Ok(false);
@@ -306,6 +357,13 @@ impl HostapdSupervisor {
         rendered: &RenderedApConfig,
         ctrl_path: &Path,
     ) -> Result<(), SupervisorError> {
+        let store = self.record_store(&spec.interface);
+        // Persist the fact that runtime may diverge from the durable record
+        // before changing either the config file or the live daemon. Startup
+        // recovery treats this marker as rollback-required and restarts from
+        // committed desired state.
+        store.mark_transition().await?;
+
         write_config_file(rendered).await?;
         let client = HostapdCtrlClient::connect(ctrl_path, self.inner.ctrl_timeout).await?;
         client.reload().await?;
@@ -316,7 +374,8 @@ impl HostapdSupervisor {
             ssid: spec.ssid.clone(),
             ..task.record.clone()
         };
-        self.record_store(&spec.interface).save(&record).await?;
+        store.save(&record).await?;
+        store.clear_transition().await?;
 
         task.spec = spec.clone();
         task.record = record;
@@ -383,6 +442,7 @@ impl HostapdSupervisor {
         };
         classify_ownership(
             &store,
+            WifiProcessKind::AccessPoint,
             self.inner.process.as_ref(),
             status.is_some(),
             |record| {
@@ -405,17 +465,37 @@ impl HostapdSupervisor {
         ctrl_path: &Path,
     ) -> Result<PersistedWifiRecord, SupervisorError> {
         write_config_file(rendered).await?;
-        let pid = self
+        let store = self.record_store(&spec.interface);
+        save_launch_intent(
+            &store,
+            ctrl_path,
+            &rendered.path,
+            rendered.config_digest,
+            rendered.key_digest,
+            &spec.ssid,
+        )
+        .await?;
+
+        let pid = match self
             .inner
             .process
             .spawn(&self.inner.hostapd_binary, &rendered.path)
-            .await?;
+            .await
+        {
+            Ok(pid) => pid,
+            Err(error) => {
+                if let Err(cleanup) = store.clear().await {
+                    return Err(SupervisorError::Configuration(anyhow::anyhow!(
+                        "hostapd spawn failed: {error}; launch-intent cleanup also failed: {cleanup}; recovery required"
+                    )));
+                }
+                return Err(error.into());
+            }
+        };
 
         let result = async {
-            wait_for_ready(ctrl_path, self.inner.ctrl_timeout, &spec.interface).await?;
-
-            Ok(save_spawned_record(
-                &self.record_store(&spec.interface),
+            let record = save_spawned_record(
+                &store,
                 pid,
                 ctrl_path,
                 &rendered.path,
@@ -423,14 +503,17 @@ impl HostapdSupervisor {
                 rendered.key_digest,
                 &spec.ssid,
             )
-            .await?)
+            .await?;
+            wait_for_ready(ctrl_path, self.inner.ctrl_timeout, &spec.interface).await?;
+            store.clear_transition().await?;
+            Ok(record)
         }
         .await;
 
         match result {
             Ok(record) => Ok(record),
             Err(error) => match self.graceful_stop(pid).await {
-                Ok(()) => match self.record_store(&spec.interface).clear().await {
+                Ok(()) => match store.clear().await {
                     Ok(()) => Err(error),
                     Err(cleanup) => Err(SupervisorError::Configuration(anyhow::anyhow!(
                         "hostapd startup failed: {error}; process stopped but ownership-record cleanup failed: {cleanup}; recovery required"
@@ -622,13 +705,15 @@ impl HostapdSupervisor {
         }
 
         let ctrl_path = self.ctrl_path(interface);
+        let transition_pending = self.record_store(interface).transition_pending().await?;
         let process_alive = self
             .inner
             .process
             .is_alive(task.record.pid)
             .await
             .unwrap_or(false);
-        let ctrl_alive = process_alive
+        let ctrl_alive = !transition_pending
+            && process_alive
             && match HostapdCtrlClient::connect(&ctrl_path, self.inner.ctrl_timeout).await {
                 Ok(client) => client.ping().await.is_ok(),
                 Err(_) => false,
@@ -1330,6 +1415,123 @@ mod tests {
         );
         let status = supervisor.status("wlan0").await.expect("status");
         assert_eq!(status.pid, 4242);
+    }
+
+    #[tokio::test]
+    async fn recovers_a_process_spawned_after_a_durable_launch_intent() {
+        let temp = tempdir().expect("tempdir");
+        let runtime_dir = temp.path().join("hostapd");
+        let process = fake_process();
+        let supervisor = test_supervisor(temp.path(), &runtime_dir, process.clone()).await;
+
+        let target = spec("wlan0", "net-a");
+        let rendered = supervisor.render_for(&target).await.expect("render");
+        seed_process(&process, 4242, rendered.path.clone(), "net-a");
+        supervisor
+            .record_store("wlan0")
+            .save(&PersistedWifiRecord {
+                pid: 0,
+                started_at_unix: 1,
+                ctrl_path: supervisor.ctrl_path("wlan0"),
+                config_path: rendered.path.clone(),
+                config_digest: rendered.config_digest,
+                key_digest: rendered.key_digest,
+                ssid: "net-a".to_string(),
+            })
+            .await
+            .expect("seed launch intent");
+
+        supervisor.configure(target).await.expect("recover and adopt");
+
+        assert_eq!(process.spawn_count(), 0, "recovery must not spawn a duplicate");
+        assert_eq!(supervisor.status("wlan0").await.expect("status").pid, 4242);
+        assert_eq!(
+            supervisor
+                .record_store("wlan0")
+                .load()
+                .await
+                .expect("load")
+                .expect("record")
+                .pid,
+            4242,
+            "the launch intent must be upgraded to the recovered PID"
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_reload_is_restarted_from_committed_state() {
+        let temp = tempdir().expect("tempdir");
+        let runtime_dir = temp.path().join("hostapd");
+        let process = fake_process();
+        let supervisor = test_supervisor(temp.path(), &runtime_dir, process.clone()).await;
+
+        let committed = spec("wlan0", "net-a");
+        let rendered = supervisor.render_for(&committed).await.expect("render");
+        // Model a crash after hostapd accepted a new SSID but before the
+        // mutation completed and before desired state was persisted.
+        seed_process(&process, 4243, rendered.path.clone(), "uncommitted-net");
+        let store = supervisor.record_store("wlan0");
+        store
+            .save(&PersistedWifiRecord {
+                pid: 4243,
+                started_at_unix: 1,
+                ctrl_path: supervisor.ctrl_path("wlan0"),
+                config_path: rendered.path.clone(),
+                config_digest: rendered.config_digest,
+                key_digest: rendered.key_digest,
+                ssid: "net-a".to_string(),
+            })
+            .await
+            .expect("seed record");
+        store.mark_transition().await.expect("mark interrupted reload");
+
+        supervisor
+            .configure(committed)
+            .await
+            .expect("restart committed state");
+
+        assert!(process
+            .calls()
+            .iter()
+            .any(|call| matches!(call, FakeCall::Terminate(4243))));
+        assert_eq!(process.spawn_count(), 1);
+        assert!(!store.transition_pending().await.expect("transition state"));
+    }
+
+    #[tokio::test]
+    async fn startup_stops_owned_ap_absent_from_committed_configuration() {
+        let temp = tempdir().expect("tempdir");
+        let runtime_dir = temp.path().join("hostapd");
+        tokio::fs::create_dir_all(&runtime_dir)
+            .await
+            .expect("create runtime dir");
+        let process = fake_process();
+        let config = app_config(temp.path(), &runtime_dir);
+        let config_path = render::config_path(&runtime_dir, "wlan0");
+        seed_process(&process, 4244, config_path.clone(), "uncommitted-net");
+        let store = WifiRecordStore::for_access_point(temp.path().join("wifi"), "wlan0");
+        store
+            .save(&PersistedWifiRecord {
+                pid: 0,
+                started_at_unix: 1,
+                ctrl_path: runtime_dir.join("wlan0"),
+                config_path,
+                config_digest: WifiDigest::from_bytes([1; 32]),
+                key_digest: WifiDigest::from_bytes([2; 32]),
+                ssid: "uncommitted-net".to_string(),
+            })
+            .await
+            .expect("seed record");
+
+        HostapdSupervisor::start_with_process(&config, process.clone())
+            .await
+            .expect("startup recovery");
+
+        assert!(process
+            .calls()
+            .iter()
+            .any(|call| matches!(call, FakeCall::Terminate(4244))));
+        assert!(store.load().await.expect("load").is_none());
     }
 
     #[tokio::test]

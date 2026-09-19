@@ -442,17 +442,17 @@ where
         failures
     }
 
-    async fn install_relay_route(
+    async fn relay_route_specs(
         &self,
         hop: &VpnHopDesired,
         own_route: &VpnHopRoutingDesired,
-    ) -> Result<()> {
+    ) -> Result<(Ipv4RuleSpec, Ipv4RouteSpec)> {
         let deps = self.require_vpn_chain_deps()?;
         let upstream_index = deps
             .network
             .list_interfaces()
             .await
-            .context("failed to list interfaces while installing relay hop route")?
+            .context("failed to list interfaces while resolving relay hop route")?
             .into_iter()
             .find(|interface| interface.name == own_route.upstream_interface)
             .map(|interface| interface.index)
@@ -464,25 +464,102 @@ where
                 )
             })?;
 
-        let rule = Ipv4RuleSpec {
-            source: None,
-            destination: None,
-            table: hop.reserved.route_table.get(),
-            priority: Some(hop.reserved.rule_priority_start.get()),
-            fw_mark: Some(hop.reserved.fw_mark.get()),
-            fw_mask: Some(hop.reserved.fw_mask.get()),
-            input_interface: None,
-            output_interface: None,
+        Ok((
+            Ipv4RuleSpec {
+                source: None,
+                destination: None,
+                table: hop.reserved.route_table.get(),
+                priority: Some(hop.reserved.rule_priority_start.get()),
+                fw_mark: Some(hop.reserved.fw_mark.get()),
+                fw_mask: Some(hop.reserved.fw_mask.get()),
+                input_interface: None,
+                output_interface: None,
+            },
+            Ipv4RouteSpec {
+                destination: Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0)
+                    .expect("0.0.0.0/0 is always a valid network"),
+                gateway: None,
+                output_interface_index: Some(upstream_index),
+                table: hop.reserved.route_table.get(),
+                metric: Some(50),
+                protocol: TRAFFIC_MASQ_ROUTE_PROTOCOL,
+            },
+        ))
+    }
+
+    async fn health_relay_route(
+        &self,
+        hop: &VpnHopDesired,
+        own_route: &VpnHopRoutingDesired,
+    ) -> Result<()> {
+        let deps = self.require_vpn_chain_deps()?;
+        let (rule, route) = self.relay_route_specs(hop, own_route).await?;
+        let rule_info = crate::netlink::Ipv4RuleInfo {
+            source: rule.source,
+            destination: rule.destination,
+            table: rule.table,
+            priority: rule.priority,
+            fw_mark: rule.fw_mark,
+            fw_mask: rule.fw_mask,
+            input_interface: rule.input_interface.clone(),
+            output_interface: rule.output_interface.clone(),
         };
-        let route = Ipv4RouteSpec {
-            destination: Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0)
-                .expect("0.0.0.0/0 is always a valid network"),
-            gateway: None,
-            output_interface_index: Some(upstream_index),
-            table: hop.reserved.route_table.get(),
-            metric: Some(50),
-            protocol: TRAFFIC_MASQ_ROUTE_PROTOCOL,
-        };
+        let rules = deps
+            .network
+            .list_ipv4_rules()
+            .await
+            .context("failed to inspect relay hop IPv4 rules")?;
+        if !rules.iter().any(|current| current == &rule_info) {
+            bail!("relay hop {} IPv4 rule is missing", hop.hop_index);
+        }
+        if rules
+            .iter()
+            .any(|current| current.priority == rule.priority && current != &rule_info)
+        {
+            bail!(
+                "relay hop {} reserved IPv4 rule priority {:?} is occupied by different state",
+                hop.hop_index,
+                rule.priority
+            );
+        }
+
+        let routes = deps
+            .network
+            .list_ipv4_routes()
+            .await
+            .context("failed to inspect relay hop IPv4 routes")?;
+        let table_routes: Vec<_> = routes
+            .iter()
+            .filter(|current| current.table == route.table)
+            .collect();
+        if table_routes.len() != 1 {
+            bail!(
+                "relay hop {} route table {} drifted: expected one route, found {}",
+                hop.hop_index,
+                route.table,
+                table_routes.len()
+            );
+        }
+        let current = table_routes[0];
+        if current.destination != route.destination
+            || current.gateway != route.gateway
+            || current.output_interface_index != route.output_interface_index
+            || current.table != route.table
+            || current.metric != route.metric
+            || current.protocol != route.protocol
+        {
+            bail!("relay hop {} route state drifted", hop.hop_index);
+        }
+        Ok(())
+    }
+
+    async fn install_relay_route(
+        &self,
+        hop: &VpnHopDesired,
+        own_route: &VpnHopRoutingDesired,
+    ) -> Result<()> {
+        let deps = self.require_vpn_chain_deps()?;
+        let (rule, route) = self.relay_route_specs(hop, own_route).await?;
 
         let rule_info = crate::netlink::Ipv4RuleInfo {
             source: rule.source,
@@ -803,7 +880,6 @@ where
 {
     async fn prepare_recovery(&self, current: &RouterDesired) -> Result<()> {
         if current.vpn_chain.is_empty() {
-            *self.vpn_active_chain.write().await = Vec::new();
             return Ok(());
         }
         self.require_vpn_chain_deps()?;
@@ -835,8 +911,20 @@ where
                 ),
             }
         }
-        *self.vpn_active_chain.write().await = recovered;
+        // Recovery also runs before live repairs. Preserve known resources
+        // until apply/rollback has actually removed them, including hops no
+        // longer present in the desired chain or whose links disappeared.
+        let mut active = self.vpn_active_chain.write().await;
+        for hop in recovered {
+            if !active.contains(&hop) {
+                active.push(hop);
+            }
+        }
         Ok(())
+    }
+
+    async fn adopt_router_interfaces(&self, desired: &RouterDesired) {
+        self.adopt(desired).await;
     }
 
     async fn retain_router_interfaces(&self, interfaces: &[String]) {
@@ -865,14 +953,7 @@ where
             }
             return Ok(Vec::new());
         };
-        let mut names = self.owned_interfaces().await;
-        if let Some(spec) = &desired.uplink_wifi {
-            if !names.contains(&spec.interface) {
-                names.push(spec.interface.clone());
-            }
-        }
-        names.sort();
-        names.dedup();
+        let names = self.scoped_names(desired).await;
         let mut plans = Vec::new();
         for name in names {
             let current = runtime.status(&name).await.map(|(spec, _)| spec);
@@ -908,10 +989,7 @@ where
             .iter()
             .map(|spec| (spec.interface.as_str(), spec))
             .collect();
-        let mut names = self.owned_interfaces().await;
-        names.extend(targets.keys().map(|name| (*name).to_owned()));
-        names.sort();
-        names.dedup();
+        let names = self.scoped_names(desired).await;
         let mut plans = Vec::new();
         for name in names {
             let current = runtime.status(&name).await.map(|(spec, _)| spec);
@@ -943,19 +1021,12 @@ where
             .iter()
             .map(|spec| (spec.interface.as_str(), spec))
             .collect();
-        let mut interfaces: Vec<&str> = desired_by_interface.keys().copied().collect();
-        let owned = self.owned_interfaces().await;
-        for name in &owned {
-            if !interfaces.contains(&name.as_str()) {
-                interfaces.push(name.as_str());
-            }
-        }
-        interfaces.sort_unstable();
+        let interfaces = self.scoped_names(desired).await;
 
         let mut plans = Vec::new();
         for name in interfaces {
-            let current = self.dhcp.spec(name).await;
-            let target = desired_by_interface.get(name).map(|spec| (*spec).clone());
+            let current = self.dhcp.spec(&name).await;
+            let target = desired_by_interface.get(name.as_str()).map(|spec| (*spec).clone());
             let plan = match (current, target) {
                 (None, None) => continue,
                 (None, Some(desired)) => DhcpPlan::Start { desired },
@@ -1053,7 +1124,6 @@ where
         &self,
         desired: &RouterDesired,
     ) -> Result<crate::core::router::RouterSnapshot> {
-        self.adopt(desired).await;
         let names = self.scoped_names(desired).await;
         let mut interfaces = Vec::with_capacity(names.len());
         for name in &names {
@@ -1288,7 +1358,7 @@ where
 
     async fn rollback_uplink_wifi(&self, snapshot: &[WifiSnapshot<WifiClientSpec>]) -> Result<()> {
         let Some(runtime) = &self.stations else {
-            if !snapshot.is_empty() {
+            if snapshot.iter().any(|entry| entry.spec.is_some()) {
                 bail!("uplink Wi-Fi runtime is unavailable");
             }
             return Ok(());
@@ -1325,7 +1395,7 @@ where
 
     async fn rollback_output_wifi(&self, snapshot: &[WifiSnapshot<WifiApSpec>]) -> Result<()> {
         let Some(runtime) = &self.access_points else {
-            if !snapshot.is_empty() {
+            if snapshot.iter().any(|entry| entry.spec.is_some()) {
                 bail!("output Wi-Fi runtime is unavailable");
             }
             return Ok(());
@@ -1745,9 +1815,6 @@ where
     }
 
     async fn health_vpn_chain(&self, desired: &RouterDesired) -> Result<()> {
-        if desired.vpn_chain.is_empty() {
-            return Ok(());
-        }
         let active = self.vpn_active_chain.read().await.clone();
         if active.len() != desired.vpn_chain.len() {
             bail!(
@@ -1772,6 +1839,16 @@ where
                     "VPN hop {} status check failed: {error}",
                     expected.hop_index
                 ),
+            }
+            match &expected.kind {
+                VpnHopKind::Relay { own_route } => {
+                    self.health_relay_route(expected, own_route).await?;
+                }
+                VpnHopKind::Exit { policy } => {
+                    self.vpn_policy_manager_for_hop(expected.reserved, tunnel)?
+                        .health(policy)
+                        .await?;
+                }
             }
         }
         Ok(())
@@ -1938,6 +2015,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wired_router_snapshot_rolls_back_without_wifi_runtimes() {
+        let mut config = enabled_config();
+        config.network.interfaces.insert(
+            "lan0".to_string(),
+            dhcp_less_output_interface("192.168.10.1/24"),
+        );
+        let (subsystems, _) = subsystems_for(&config).await;
+        let desired = RouterDesired::from_effective_config(&config).unwrap();
+        let manager = crate::core::router::RouterManager::new(Arc::new(subsystems));
+        let snapshot = manager.snapshot_for(&desired).await.unwrap();
+        assert!(!snapshot.uplink_wifi.is_empty());
+        assert!(!snapshot.output_wifi.is_empty());
+        let failures = manager.rollback_to(&snapshot).await;
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[tokio::test]
     async fn wifi_rollback_releases_the_conflicting_radio_role() {
         #[derive(Default)]
         struct Radio {
@@ -2020,7 +2114,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_router_provisioned_at_runtime_takes_ownership_of_its_interfaces() {
+    async fn planning_a_runtime_router_is_observational_and_apply_adopts_interfaces() {
         let mut config = enabled_config();
         config.network.interfaces.insert(
             "lan0".to_string(),
@@ -2039,11 +2133,17 @@ mod tests {
             !snapshot.interfaces.is_empty(),
             "a runtime-provisioned router must capture the interfaces it is about to touch"
         );
+        assert!(
+            subsystems.owned_interfaces().await.is_empty(),
+            "snapshotting for a plan preview must not mutate router ownership"
+        );
+
+        subsystems.adopt_router_interfaces(&desired).await;
         let owned = subsystems.owned_interfaces().await;
         for entry in &desired.interfaces {
             assert!(
                 owned.contains(&entry.name),
-                "interface {} should be owned after the intent was snapshotted",
+                "interface {} should be owned once execution begins",
                 entry.name
             );
         }
@@ -2332,6 +2432,7 @@ mod tests {
     #[derive(Default)]
     struct FakeChainVpnProvider {
         links: StdMutex<HashMap<String, bool>>,
+        launch_markers: StdMutex<HashMap<String, String>>,
         fail_create: StdMutex<Option<String>>,
         fail_set_peers: StdMutex<Option<String>>,
         fail_delete: StdMutex<Option<String>>,
@@ -2362,6 +2463,7 @@ mod tests {
             name: &str,
             _private_key: &WireGuardKey,
             _listen_port: Option<u16>,
+            launch_marker: &str,
         ) -> Result<(), ProviderError> {
             if self.fail_create.lock().unwrap().as_deref() == Some(name) {
                 return Err(ProviderError::CommandFailed {
@@ -2371,7 +2473,29 @@ mod tests {
                 });
             }
             self.links.lock().unwrap().insert(name.to_string(), false);
+            self.launch_markers
+                .lock()
+                .unwrap()
+                .insert(name.to_string(), launch_marker.to_string());
             Ok(())
+        }
+
+        async fn delete_link_if_launch_marker(
+            &self,
+            name: &str,
+            launch_marker: &str,
+        ) -> Result<bool, ProviderError> {
+            let matches = self
+                .launch_markers
+                .lock()
+                .unwrap()
+                .get(name)
+                .is_some_and(|marker| marker == launch_marker);
+            if !matches {
+                return Ok(false);
+            }
+            self.delete_link(name).await?;
+            Ok(true)
         }
 
         async fn set_addresses(
@@ -2423,10 +2547,9 @@ mod tests {
                     stderr: format!("injected delete_link failure for {name}"),
                 });
             }
-            self.links
-                .lock()
-                .unwrap()
-                .remove(name)
+            let removed = self.links.lock().unwrap().remove(name);
+            self.launch_markers.lock().unwrap().remove(name);
+            removed
                 .map(|_| ())
                 .ok_or_else(|| ProviderError::NotFound(name.to_string()))
         }
@@ -2729,6 +2852,61 @@ mod tests {
                 .is_err(),
             "foreign/unproven surviving link must keep rollback in failed state"
         );
+    }
+
+    #[tokio::test]
+    async fn vpn_chain_health_detects_and_repair_reinstalls_relay_rule() {
+        let (subsystems, _vpn_provider, net, _dir) = chain_subsystems().await;
+        net.add_interface("tm-wg-0", 2).await;
+        let hop = relay_hop(0, "tm-wg-0", "wan0");
+        let plan = VpnChainPlan {
+            hops: vec![hop.clone()],
+        };
+        subsystems.apply_vpn_chain(&plan).await.expect("initial apply");
+        let mut desired = RouterDesired::from_effective_config(&AppConfig::default()).unwrap();
+        desired.vpn_chain = vec![hop];
+        net.rules.lock().await.clear();
+
+        assert!(subsystems.health_vpn_chain(&desired).await.is_err());
+        subsystems.apply_vpn_chain(&plan).await.expect("repair apply");
+        subsystems.health_vpn_chain(&desired).await.expect("healthy after repair");
+    }
+
+    #[tokio::test]
+    async fn vpn_repair_keeps_obsolete_hops_until_teardown() {
+        let (subsystems, vpn_provider, net, _dir) = chain_subsystems().await;
+        net.add_interface("tm-wg-0", 2).await;
+        let hop = relay_hop(0, "tm-wg-0", "wan0");
+        subsystems
+            .apply_vpn_chain(&VpnChainPlan { hops: vec![hop.clone()] })
+            .await
+            .unwrap();
+        let desired = RouterDesired::from_effective_config(&AppConfig::default()).unwrap();
+        assert!(subsystems.health_vpn_chain(&desired).await.is_err());
+        subsystems.prepare_recovery(&desired).await.unwrap();
+        assert_eq!(
+            subsystems.snapshot_vpn_chain().await.unwrap().previous_hops,
+            vec![hop]
+        );
+        subsystems.apply_vpn_chain(&VpnChainPlan { hops: vec![] }).await.unwrap();
+        assert!(!vpn_provider.link_exists("tm-wg-0").await.unwrap());
+        assert!(net.rules.lock().await.is_empty());
+        assert!(net.routes.lock().await.is_empty());
+        subsystems.health_vpn_chain(&desired).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn vpn_repair_keeps_hops_outside_the_recovered_desired_chain() {
+        let (subsystems, _vpn_provider, net, _dir) = chain_subsystems().await;
+        net.add_interface("tm-wg-0", 2).await;
+        let first = relay_hop(0, "tm-wg-0", "wan0");
+        let second = relay_hop(1, "tm-wg-1", "tm-wg-0");
+        let hops = vec![first.clone(), second];
+        subsystems.apply_vpn_chain(&VpnChainPlan { hops: hops.clone() }).await.unwrap();
+        let mut desired = RouterDesired::from_effective_config(&AppConfig::default()).unwrap();
+        desired.vpn_chain = vec![first];
+        subsystems.prepare_recovery(&desired).await.unwrap();
+        assert_eq!(subsystems.snapshot_vpn_chain().await.unwrap().previous_hops, hops);
     }
 
     #[tokio::test]

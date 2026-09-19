@@ -141,13 +141,15 @@ Interface and router changes use **Apply → Commit**. Apply changes the running
 network and starts a timer, normally 60 seconds. Commit keeps the change. If
 you lose access and cannot confirm, the daemon rolls it back when time runs out.
 
-The timer needs a running daemon. After a crash, recovery runs when the daemon
-starts again. Standalone Wi-Fi AP changes apply immediately and do not use
-this timer.
+Standalone DHCP, Wi-Fi and VPN operations apply immediately and do not use the
+interface/router confirmation timer. They instead persist ownership information
+before creating durable runtime state and reconcile it on restart. The timer
+itself needs a running daemon; crash recovery for both transaction journals and
+immediate-operation ownership records runs when the daemon starts again.
 
-traffic-masq records the addresses, routes and firewall objects it creates.
-Enabling management on an interface does not give it ownership of settings
-created by another network manager.
+traffic-masq records the addresses, routes, firewall objects, Wi-Fi processes,
+DHCP leases and VPN interfaces it owns. Enabling management on an interface
+does not give it ownership of settings created by another network manager.
 
 ### Configuration and files
 

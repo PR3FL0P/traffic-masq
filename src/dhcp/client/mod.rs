@@ -7,7 +7,8 @@ pub mod store;
 pub mod supervisor;
 
 pub use lease::{
-    DhcpClientLease, DhcpClientLeaseState, DhcpClientOwnedRoute, LeaseValidationError,
+    DhcpClientLease, DhcpClientLeasePolicy, DhcpClientLeaseState, DhcpClientOwnedRoute,
+    LeaseValidationError,
     DHCP_CLIENT_LEASE_SCHEMA_VERSION,
 };
 pub use ownership::{DhcpClientOwnershipApplier, OwnershipConflict, OwnershipError};

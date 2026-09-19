@@ -28,6 +28,13 @@ pub struct DhcpClientOwnedRoute {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DhcpClientLeasePolicy {
+    pub route_metric: u32,
+    pub install_default_route: bool,
+    pub request_dns: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DhcpClientLease {
     pub schema_version: u32,
     pub state: DhcpClientLeaseState,
@@ -35,6 +42,8 @@ pub struct DhcpClientLease {
     pub interface_index: u32,
     pub hardware_address: Vec<u8>,
     pub client_identifier: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<DhcpClientLeasePolicy>,
     pub server_identifier: Ipv4Addr,
     pub address: Ipv4Addr,
     pub prefix_len: u8,

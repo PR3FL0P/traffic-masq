@@ -12,7 +12,10 @@ pub mod wireguard;
 
 use std::fmt;
 
-pub use active_profile::{ActiveProfileError, ActiveProfileStore, PersistedActiveProfile};
+pub use active_profile::{
+    ActiveProfileError, ActiveProfileStore, ActivationIntentStore, PersistedActivationIntent,
+    PersistedActiveProfile,
+};
 pub use manager::{
     ManagerError, OwnedInterfaceRecord, ReconcileOutcome, VpnActiveStatus, VpnInterfaceSnapshot,
     VpnManager,
@@ -91,10 +94,17 @@ pub trait VpnDriver: Send + Sync {
         interface: &str,
     ) -> Result<Option<Self::OwnershipProof>, VpnDriverError>;
 
+    async fn delete_if_launch_marker(
+        &self,
+        interface: &str,
+        launch_marker: &str,
+    ) -> Result<bool, VpnDriverError>;
+
     async fn activate(
         &self,
         interface: &str,
         profile: &Self::Profile,
+        launch_marker: &str,
     ) -> Result<Self::OwnershipProof, VpnDriverError>;
 
     async fn deactivate(&self, interface: &str) -> Result<(), VpnDriverError>;

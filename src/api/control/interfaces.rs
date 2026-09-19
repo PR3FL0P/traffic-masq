@@ -4,10 +4,13 @@ impl ControlService {
     pub(super) async fn validate_default_route_management(
         &self,
         interface: &str,
+        current: Option<&InterfaceConfig>,
         config: &InterfaceConfig,
         allow_management_change: bool,
     ) -> Result<()> {
-        if config.role != InterfaceRole::Output || !config.managed || allow_management_change {
+        if allow_management_change
+            || (!config.managed && !current.is_some_and(|current| current.managed))
+        {
             return Ok(());
         }
 
@@ -21,11 +24,12 @@ impl ControlService {
         else {
             return Ok(());
         };
-        let carries_default_route = self
+        let routes = self
             .network
             .list_ipv4_routes()
             .await
-            .unwrap_or_default()
+            .with_context(|| format!("failed to inspect IPv4 routes before changing {interface}"))?;
+        let carries_default_route = routes
             .iter()
             .any(|route| {
                 route.destination.prefix_len() == 0 && route.output_interface_index == Some(index)
@@ -178,7 +182,13 @@ pub(super) async fn interface_statuses(
     transactions: &NetworkTransactionManager,
 ) -> Result<Vec<InterfaceStatus>> {
     let mut result = Vec::new();
-    let routes = network.list_ipv4_routes().await.unwrap_or_default();
+    let routes = match network.list_ipv4_routes().await {
+        Ok(routes) => routes,
+        Err(error) => {
+            tracing::warn!(%error, "failed to inspect IPv4 routes while listing interfaces");
+            Vec::new()
+        }
+    };
     for interface in network.list_interfaces().await? {
         let ipv4_addresses = network.list_ipv4_addresses(&interface.name).await?;
         let has_default_route = routes.iter().any(|route| {

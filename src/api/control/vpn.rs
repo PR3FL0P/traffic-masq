@@ -189,8 +189,8 @@ impl ControlService {
         };
         // Coexistence-window guard (Landing 1): `vpn_policy_set_mode` bypasses
         // `RouterTransactionCoordinator` entirely, so it must not race a
-        // pending chain-length-1 transaction over the same hop-0
-        // interface/reserved-ID band. Refuse outright while a transaction is
+        // pending chain transaction over the same hop-0 reserved-ID band.
+        // Refuse outright while a transaction is
         // pending or stuck in a failed rollback rather than letting the two
         // non-coordinated mutation paths touch the same resources at once.
         if let Some(router) = &self.router {
@@ -210,6 +210,13 @@ impl ControlService {
             Ok(effective) => effective,
             Err(error) => return vpn_policy_error(VpnPolicyErrorDetail::Other { message: error }),
         };
+        if !effective.router.vpn_chain.is_empty() {
+            return vpn_policy_error(VpnPolicyErrorDetail::Other {
+                message: "a router VPN chain is configured; legacy VPN policy mode cannot \
+                          mutate its reserved routing namespace"
+                    .to_string(),
+            });
+        }
         let rollback_desired = match vpn_policy_desired_for_mode(&effective, mode) {
             Ok(desired) => desired,
             Err(detail) => return vpn_policy_error(detail),
@@ -242,6 +249,13 @@ impl ControlService {
             Ok(effective) => effective,
             Err(error) => return vpn_policy_error(VpnPolicyErrorDetail::Other { message: error }),
         };
+        if !effective.router.vpn_chain.is_empty() {
+            return vpn_policy_error(VpnPolicyErrorDetail::Other {
+                message: "a router VPN chain is configured; legacy VPN policy mode cannot \
+                          mutate its reserved routing namespace"
+                    .to_string(),
+            });
+        }
         let target = effective.vpn.policy.default_mode;
         let rollback_desired = match vpn_policy_desired_for_mode(&effective, target) {
             Ok(desired) => desired,

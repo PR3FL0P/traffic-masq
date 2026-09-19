@@ -221,28 +221,40 @@ impl InterfaceManager {
 
             let allow_management_change = allow_all_management_changes
                 || management_allowlist.is_some_and(|allowed| allowed.contains(name));
-            let snapshot = self.snapshot(name).await?;
-
-            if let Err(error) = self
-                .apply_interface(
+            let applied = async {
+                let snapshot = self.snapshot(name).await?;
+                self.apply_interface(
                     name,
                     interface,
                     Some(interface.role),
                     allow_management_change,
                 )
-                .await
-            {
-                for snapshot in snapshots.iter().rev() {
-                    if let Err(rollback_error) = self.rollback(snapshot).await {
-                        tracing::error!(
-                            interface = %snapshot.name,
-                            %rollback_error,
-                            "failed to rollback interface after apply error"
-                        );
+                .await?;
+                Ok::<_, anyhow::Error>(snapshot)
+            }.await;
+            let snapshot = match applied {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    let mut rollback_failures = Vec::new();
+                    for snapshot in snapshots.iter().rev() {
+                        if let Err(rollback_error) = self.rollback(snapshot).await {
+                            tracing::error!(
+                                interface = %snapshot.name,
+                                %rollback_error,
+                                "failed to rollback interface after apply error"
+                            );
+                            rollback_failures.push(format!("{}: {rollback_error:#}", snapshot.name));
+                        }
                     }
+                    if !rollback_failures.is_empty() {
+                        return Err(error).context(format!(
+                            "failed to apply interface {name}; rollback incomplete: {}",
+                            rollback_failures.join("; ")
+                        ));
+                    }
+                    return Err(error).with_context(|| format!("failed to apply interface {name}"));
                 }
-                return Err(error).with_context(|| format!("failed to apply interface {name}"));
-            }
+            };
             snapshots.push(snapshot);
         }
 
@@ -815,6 +827,7 @@ mod tests {
     struct FakeNetworkProvider {
         interfaces: Mutex<HashMap<String, NetworkInterface>>,
         addresses: Mutex<HashMap<String, Vec<Ipv4AddressInfo>>>,
+        fail_address_read: Mutex<Option<String>>,
     }
 
     impl FakeNetworkProvider {
@@ -848,6 +861,10 @@ mod tests {
         }
 
         async fn list_ipv4_addresses(&self, interface: &str) -> Result<Vec<Ipv4AddressInfo>> {
+            anyhow::ensure!(
+                self.fail_address_read.lock().await.as_deref() != Some(interface),
+                "injected address observation failure"
+            );
             Ok(self
                 .addresses
                 .lock()
@@ -1782,6 +1799,26 @@ mod tests {
             .expect("addresses");
         assert_eq!(applied.len(), 1);
         assert_eq!(applied[0].address, Ipv4Addr::new(192, 168, 50, 1));
+    }
+
+    #[tokio::test]
+    async fn apply_network_rolls_back_when_a_later_snapshot_fails() {
+        let provider = Arc::new(FakeNetworkProvider::default());
+        provider.add_interface("eth0", false, Vec::new()).await;
+        provider.add_interface("eth1", false, Vec::new()).await;
+        *provider.fail_address_read.lock().await = Some("eth1".to_string());
+        let manager = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
+        let mut network = NetworkConfig::default();
+        network.interfaces.insert(
+            "eth0".into(), config(InterfaceRole::Output, "192.168.50.1/24"),
+        );
+        network.interfaces.insert(
+            "eth1".into(), config(InterfaceRole::Output, "192.168.60.1/24"),
+        );
+        let error = manager.apply_network(&network, false).await.unwrap_err();
+        assert!(format!("{error:#}").contains("injected address observation failure"));
+        assert!(provider.list_ipv4_addresses("eth0").await.unwrap().is_empty());
+        assert!(!provider.interfaces.lock().await["eth0"].is_up);
     }
 
     #[tokio::test]

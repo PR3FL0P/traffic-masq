@@ -248,6 +248,46 @@ async fn kernel_address_changes_are_delivered_as_events() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+#[ignore = "requires root and iproute2; run explicitly on a disposable Linux test host"]
+async fn kernel_policy_rule_changes_are_delivered_as_events() -> Result<()> {
+    require_root_or_skip()?;
+    require_ip_command_or_skip()?;
+    let mut events = traffic_masq::netlink::events::subscribe_to_kernel_changes()?;
+    let priority = 20_000 + (std::process::id() % 10_000);
+    let priority = priority.to_string();
+
+    run_ip([
+        "rule",
+        "add",
+        "priority",
+        priority.as_str(),
+        "from",
+        "198.51.100.0/24",
+        "table",
+        "main",
+    ])?;
+
+    let observed = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()).await;
+    let cleanup = run_ip([
+        "rule",
+        "del",
+        "priority",
+        priority.as_str(),
+        "from",
+        "198.51.100.0/24",
+        "table",
+        "main",
+    ]);
+    cleanup?;
+
+    let event = observed
+        .context("no policy-rule event arrived within 5s; the subscription is not delivering")?
+        .context("the event stream closed")?;
+    assert_eq!(event, traffic_masq::netlink::events::KernelEvent::Changed);
+    Ok(())
+}
+
 /// The whole of the transaction path, on a real kernel.
 ///
 /// An apply is now a proposal: the manager writes a layer of desired state and

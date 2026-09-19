@@ -63,8 +63,11 @@ type ProductionDataplaneProvider = LinuxRouterDataplaneProvider<
     NftCommandExecutor,
     RtnetlinkNetworkProvider,
 >;
+type ProductionVpnPolicyManager =
+    VpnPolicyManager<WireGuardVpnDriver, Arc<dyn NftExecutor>>;
 
 const PROCESS_LIVENESS_INTERVAL: Duration = Duration::from_secs(1);
+const ROUTER_DATAPLANE_INTEGRITY_INTERVAL: Duration = Duration::from_secs(15);
 
 const SESSION_REAP_INTERVAL: Duration = Duration::from_secs(900);
 
@@ -456,6 +459,16 @@ async fn apply_vpn_policy_startup<E: NftExecutor>(
     firewall_executor: E,
     vpn_manager: &Option<Arc<ProductionVpnManager>>,
 ) {
+    // The router VPN chain owns the same hop-0 reserved routing namespace
+    // as the legacy single-hop policy (the kernel interfaces themselves are
+    // deliberately distinct). Router recovery/repair runs
+    // before this startup hook, so touching legacy policy here would mutate a
+    // just-recovered chain outside the router transaction coordinator. The
+    // periodic integrity path has the same coexistence guard.
+    if !effective_config.router.vpn_chain.is_empty() {
+        return;
+    }
+
     let Some(tunnel) = vpn_manager else {
         return;
     };
@@ -767,16 +780,15 @@ fn spawn_session_reaper(auth: AuthService, mut shutdown: watch::Receiver<bool>) 
 
 /// Converge the machine towards the desired state, driven by events.
 ///
-/// There is no periodic pass. The three things that can make the machine and
-/// the desired state disagree all announce themselves:
+/// There is no periodic interface pass. The things that can make interface
+/// state disagree all announce themselves:
 ///
 /// - the desired state moved (an override was written),
-/// - the kernel state moved (anyone touched a link, address or route),
+/// - rtnetlink state moved (link, address, route or policy rule),
 /// - notifications were dropped, so an unknown amount of the above happened.
 ///
-/// Polling for these would add up to a second of latency to every change the
-/// daemon makes itself, and would spend the rest of its time asking a question
-/// whose answer is almost always "nothing".
+/// nftables has no rtnetlink notification, so router dataplane integrity is
+/// audited separately at a low cadence without polling all interface state.
 #[allow(clippy::too_many_arguments)]
 fn spawn_runtime_network_reconcile(
     desired: DesiredNetworkState,
@@ -809,7 +821,7 @@ fn spawn_runtime_network_reconcile(
             // caller cannot mistake an older pass for an answer about its own
             // change.
             let version = desired.version();
-            let result = {
+            let (result, router_busy) = {
                 // Interface transactions are themselves driven by this
                 // converger, so both use a shared/read gate. Direct API and
                 // router mutations take the exclusive/write side. This keeps
@@ -822,7 +834,7 @@ fn spawn_runtime_network_reconcile(
                     None => false,
                 };
                 if router_busy {
-                    None
+                    (None, true)
                 } else {
                     let result = reconcile_network_runtime_once(
                         &desired, &journal, network.clone(), &dhcp,
@@ -841,7 +853,7 @@ fn spawn_runtime_network_reconcile(
                             }
                         }
                     }
-                    Some(result)
+                    (Some(result), false)
                 }
             };
             if let Some(result) = result {
@@ -871,6 +883,11 @@ fn spawn_runtime_network_reconcile(
                     }
                 },
                 () = desired.changed() => {}
+                () = async {
+                    if let Some(router) = &router {
+                        router.wait_until_idle().await;
+                    }
+                }, if router_busy => {}
                 changed = shutdown.changed() => match changed {
                     Ok(()) if shutdown_requested(&shutdown) => break,
                     Ok(()) => {}
@@ -994,6 +1011,87 @@ fn spawn_process_liveness_checks(
                         Some(&dhcp_client),
                     )
                     .await;
+                }
+                changed = shutdown.changed() => match changed {
+                    Ok(()) if shutdown_requested(&shutdown) => break,
+                    Ok(()) => {}
+                    Err(_) => break,
+                }
+            }
+        }
+    })
+}
+
+fn spawn_router_dataplane_integrity_checks(
+    desired: DesiredNetworkState,
+    overrides: RuntimeOverrideManager,
+    network_mutations: Arc<NetworkMutationGate>,
+    router: Option<RouterTransactionCoordinator>,
+    vpn_policy: Option<Arc<ProductionVpnPolicyManager>>,
+    mut shutdown: watch::Receiver<bool>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        if router.is_none() && vpn_policy.is_none() {
+            return;
+        }
+        let mut interval = time::interval(ROUTER_DATAPLANE_INTEGRITY_INTERVAL);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // Startup already performs an explicit repair; wait a full interval
+        // before the first integrity audit rather than duplicating it.
+        interval.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    if shutdown_requested(&shutdown) { break; }
+                    let _network_mutation = network_mutations.read().await;
+                    let router_busy = match &router {
+                        Some(router) => router.status().await
+                            != crate::core::router_transaction::CoordinatorStatus::Idle,
+                        None => false,
+                    };
+                    if desired.has_pending().await || router_busy {
+                        continue;
+                    }
+                    let result = async {
+                        let effective = desired.effective().await?;
+                        let router_desired = RouterDesired::from_effective_config(&effective)?;
+                        if let Some(router) = &router {
+                            router.reconcile_dataplane(router_desired.clone()).await?;
+                        }
+
+                        // The legacy single-hop VPN policy owns the same hop-0
+                        // reserved namespace as the router VPN chain. Audit it
+                        // only when no chain is configured, so the two
+                        // coexistence paths never repair over one another.
+                        if router_desired.vpn_chain.is_empty() {
+                            if let Some(policy) = &vpn_policy {
+                                match overrides.effective_vpn_mode().await {
+                                    VpnPolicyMode::Vpn => {
+                                        let wanted = vpn_policy_desired(&effective).ok_or_else(|| {
+                                            anyhow::anyhow!(
+                                                "VPN policy mode is vpn but effective config has no protected subnets"
+                                            )
+                                        })?;
+                                        if policy.health(&wanted).await.is_err() {
+                                            policy.activate(&wanted).await?;
+                                        }
+                                    }
+                                    VpnPolicyMode::Direct => {
+                                        if policy.health_inactive().await.is_err() {
+                                            let target = vpn_policy_desired(&effective)
+                                                .unwrap_or_else(vpn_policy_teardown_target);
+                                            policy.deactivate(&target).await?;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok::<_, anyhow::Error>(())
+                    }.await;
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "network integrity audit failed");
+                    }
                 }
                 changed = shutdown.changed() => match changed {
                     Ok(()) if shutdown_requested(&shutdown) => break,
@@ -1454,14 +1552,19 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         control = control.with_wifi_client_supervisor(wifi_client.clone());
     }
     control = control.with_dhcp_client_supervisor(dhcp_client.clone());
-    if let Some(vpn) = &vpn_manager {
-        control = control.with_vpn_manager(vpn.clone());
+    let vpn_policy_manager = vpn_manager.as_ref().map(|vpn| {
         let firewall_executor: Arc<dyn NftExecutor> = Arc::new(NftCommandExecutor);
-        control = control.with_vpn_policy_manager(Arc::new(build_vpn_policy_manager(
-            network_provider,
+        Arc::new(build_vpn_policy_manager(
+            network_provider.clone(),
             firewall_executor,
             vpn.clone(),
-        )));
+        ))
+    });
+    if let Some(vpn) = &vpn_manager {
+        control = control.with_vpn_manager(vpn.clone());
+    }
+    if let Some(policy) = &vpn_policy_manager {
+        control = control.with_vpn_policy_manager(policy.clone());
     }
     // One desired state for both halves. The transaction manager proposes into
     // it and the converger drives it; two instances would mean proposals nobody
@@ -1541,6 +1644,16 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         liveness_shutdown,
     );
 
+    let (integrity_stop, integrity_shutdown) = watch::channel(false);
+    let integrity_task = spawn_router_dataplane_integrity_checks(
+        desired_state.clone(),
+        overrides.clone(),
+        network_mutations.clone(),
+        router_coordinator.clone(),
+        vpn_policy_manager,
+        integrity_shutdown,
+    );
+
     let (autoconnect_stop, autoconnect_shutdown) = tokio::sync::watch::channel(false);
     let autoconnect_task = spawn_wifi_autoconnect(autoconnect_control, autoconnect_shutdown);
     // The API normally follows the process shutdown signal. A failed network
@@ -1588,6 +1701,10 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     let _ = autoconnect_stop.send(true);
     // Finish any in-flight scan/activation before rolling back and stopping runtimes.
     let _ = autoconnect_task.await;
+
+    // Stop background dataplane repair before explicit transaction rollback.
+    let _ = integrity_stop.send(true);
+    let _ = integrity_task.await;
 
     // No new process restarts should be introduced while shutdown is trying
     // to prove rollback. The desired-state converger stays alive a little
@@ -3130,6 +3247,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_vpn_policy_startup_does_not_touch_legacy_policy_when_router_chain_exists() {
+        let mut config = vpn_policy_startup_config();
+        config.router.vpn_chain = vec![crate::config::VpnHopConfig {
+            profile_name: "chain.conf".to_string(),
+        }];
+        let state_dir = tempdir().expect("state dir");
+        let overrides = RuntimeOverrideManager::load(state_dir.path(), &config)
+            .await
+            .expect("overrides");
+        overrides
+            .set_vpn_mode(crate::config::VpnPolicyMode::Vpn)
+            .await
+            .expect("persist vpn mode");
+
+        let network = Arc::new(FakeNetworkProvider::default());
+        network.add_interface(OWNED_INTERFACE_NAME, 42).await;
+        let firewall_executor = FakeNftExecutor::with_responses(vec![
+            Ok(nft_ruleset(None)),
+            Ok(nft_ruleset(None)),
+            Ok(Vec::new()),
+        ]);
+        let (tunnel, _dir) = fake_vpn_manager();
+        tunnel
+            .import_profile("home.conf", valid_vpn_profile().as_bytes())
+            .expect("import");
+        tunnel.activate("home.conf").await.expect("tunnel activate");
+        let vpn_manager = Some(tunnel);
+
+        apply_vpn_policy_startup(
+            &config,
+            &overrides,
+            network.clone(),
+            firewall_executor,
+            &vpn_manager,
+        )
+        .await;
+
+        assert!(network.rules.lock().await.is_empty());
+        assert!(network.routes.lock().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn apply_vpn_policy_startup_activates_policy_in_vpn_mode_when_tunnel_is_healthy() {
         let config = vpn_policy_startup_config();
         let state_dir = tempdir().expect("state dir");
@@ -3291,7 +3450,9 @@ mod tests {
     /// flag only decides whether a missing binary is reported at startup.
     #[tokio::test]
     async fn wifi_supervisor_is_built_even_when_wifi_is_disabled_at_startup() {
+        let directory = tempdir().expect("tempdir");
         let mut config = AppConfig::default();
+        config.runtime.state_dir = directory.path().join("state");
         config.wifi.enabled = false;
         config.wifi.hostapd_binary = std::path::PathBuf::from("/definitely/not/a/real/hostapd");
 
@@ -3320,7 +3481,9 @@ mod tests {
 
     #[tokio::test]
     async fn wifi_client_supervisor_is_built_even_when_disabled_at_startup() {
+        let directory = tempdir().expect("tempdir");
         let mut config = AppConfig::default();
+        config.runtime.state_dir = directory.path().join("state");
         config.wifi_client.enabled = false;
         config.wifi_client.wpa_supplicant_binary =
             std::path::PathBuf::from("/definitely/not/a/real/wpa_supplicant");

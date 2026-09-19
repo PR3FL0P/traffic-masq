@@ -621,21 +621,33 @@ impl NetworkTransactionManager {
         let desired = self.desired();
         let gate = self.runtime_gate();
         let execution = match &gate { Some(gate) => Some(gate.execute().await), None => None };
-        if let Some(secret) = &pending.secret {
-            secret.restore(&PassphraseStore::new(desired.state_dir().join("wifi/psk")), &pending.info.interface)?;
-        }
-        desired.restore(token, pending.snapshot.clone(), pending.previous_config.clone()).await;
+        let secret_restored = match &pending.secret {
+            Some(secret) => secret.restore(
+                &PassphraseStore::new(desired.state_dir().join("wifi/psk")),
+                &pending.info.interface,
+            ),
+            None => Ok(()),
+        };
+        // Publishing rollback intent must not depend on secret-store I/O. If
+        // restoring the passphrase fails, keep the transaction rollback-only
+        // and journaled, but still stop converging toward the failed candidate.
+        desired
+            .restore(token, pending.snapshot.clone(), pending.previous_config.clone())
+            .await;
         drop(execution);
-        if let Err(error) = self
-            .await_convergence(&desired, &pending.info.interface)
-            .await
-        {
+        let restoration = match secret_restored {
+            Ok(()) => self
+                .await_convergence(&desired, &pending.info.interface)
+                .await,
+            Err(error) => Err(anyhow::Error::from(error)),
+        };
+        if let Err(error) = restoration {
             // Keep both the pending record and recovery journal. The desired
             // state already points back at the committed configuration, so a
             // later retry only needs to verify convergence; reporting success
             // here would falsely claim the runtime had been restored.
             bail!(
-                "failed to confirm rollback convergence for interface {}: {error}",
+                "failed to complete rollback for interface {}: {error}",
                 pending.info.interface
             );
         }
@@ -747,6 +759,14 @@ impl NetworkTransactionManager {
         let manager = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(manager.inner.rollback_timeout).await;
+            // Match request lock ordering: admission precedes operation_lock.
+            // Keep admission through convergence, but let rollback acquire and
+            // release execution itself so the converger can restore the state.
+            let gate = manager.runtime_gate();
+            let _admission = match &gate {
+                Some(gate) => Some(gate.admit().await),
+                None => None,
+            };
             if let Err(error) = manager.rollback(&token).await {
                 if !error.to_string().contains("not found") {
                     tracing::error!(%token, %error, "automatic network rollback failed");
@@ -1179,6 +1199,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timeout_waits_for_admitted_confirmation() {
+        let directory = tempdir().unwrap();
+        let desired = desired_state(directory.path()).await;
+        let manager = NetworkTransactionManager::new(
+            InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory()),
+            Duration::from_millis(20),
+            desired.clone(),
+        );
+        let gate = Arc::new(NetworkMutationGate::default());
+        manager.set_runtime_gate(gate.clone());
+        let pending = manager
+            .apply("test0", &interface_config(PROPOSED), None, false)
+            .await
+            .unwrap();
+
+        // A confirmation already admitted must not be overtaken by the timer
+        // while it performs validation before acquiring the operation lock.
+        let admission = gate.admit().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(manager.pending().await, vec![pending.clone()]);
+        assert!(desired.is_tentative("test0").await);
+        manager.commit(&pending.token).await.unwrap();
+        drop(admission);
+        assert_eq!(
+            desired.committed_interface("test0").await.unwrap(),
+            Some(interface_config(PROPOSED))
+        );
+    }
+
+    #[tokio::test]
     async fn uncommitted_change_is_automatically_rolled_back() {
         let directory = tempdir().expect("tempdir");
         let provider = fake_network();
@@ -1317,6 +1367,62 @@ mod tests {
             .expect("rollback task")
             .expect("retry rollback");
         assert!(manager.pending().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rollback_publishes_restore_intent_even_when_secret_restore_fails() {
+        let directory = tempdir().expect("tempdir");
+        let desired = desired_state(directory.path()).await;
+        let manager = NetworkTransactionManager::new(
+            InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory()),
+            Duration::from_secs(60),
+            desired.clone(),
+        );
+        let proposed = interface_config(PROPOSED);
+        let pending = manager
+            .apply_with_passphrase(
+                "test0",
+                &proposed,
+                None,
+                Some(InterfaceRole::Output),
+                false,
+                Some(WifiPassphrase::new("new-password").expect("passphrase")),
+            )
+            .await
+            .expect("apply");
+        assert!(desired.is_tentative("test0").await);
+
+        let psk_dir = directory.path().join("wifi/psk");
+        std::fs::remove_dir_all(&psk_dir).expect("remove passphrase directory");
+        std::os::unix::fs::symlink(directory.path(), &psk_dir)
+            .expect("replace passphrase directory with a rejected symlink");
+
+        let error = manager
+            .rollback(&pending.token)
+            .await
+            .expect_err("secret restoration must fail");
+        assert!(error.to_string().contains("failed to complete rollback"));
+        assert!(
+            !desired.is_tentative("test0").await,
+            "the failed candidate must stop being desired even when secret compensation fails"
+        );
+        assert!(desired.restorations().await.contains_key("test0"));
+        assert_eq!(
+            desired
+                .effective()
+                .await
+                .expect("effective config")
+                .network
+                .interfaces["test0"]
+                .ipv4,
+            Some(COMMITTED.parse().expect("network"))
+        );
+        assert_eq!(manager.pending().await, vec![pending.clone()]);
+        let commit_error = manager
+            .commit(&pending.token)
+            .await
+            .expect_err("failed rollback must remain rollback-only");
+        assert!(commit_error.to_string().contains("rollback-only"));
     }
 
     /// A change the planner refuses never becomes a proposal: the converger

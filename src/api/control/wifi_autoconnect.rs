@@ -93,6 +93,25 @@ impl ControlService {
             .filter(|interface| interface.is_wireless)
         {
             let name = &interface.name;
+            // Scanning can launch a temporary supplicant, so it belongs to the
+            // same mutation boundary as activation and timeout cleanup. Read
+            // eligibility only after admission: a queued pass must not act on
+            // an association timeout superseded by a newer control operation.
+            let _network_mutation = self.network_mutations.write().await;
+            let secrets = crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore::in_state_dir(
+                &self.config.runtime.state_dir,
+            );
+            let committed_token = self
+                .overrides
+                .snapshot()
+                .await
+                .committed_router_transaction;
+            if secrets
+                .unresolved_after_committed_cleanup(committed_token.as_deref())
+                .await?
+            {
+                continue;
+            }
             {
                 let state = self.wifi_autoconnect.lock().await;
                 if state.suspended.contains(name) {
@@ -129,31 +148,6 @@ impl ControlService {
                     state.connecting_since.remove(name);
                     drop(state);
                     tracing::warn!(interface = %name, "Wi-Fi autoconnect association timed out; clearing stalled profile");
-                    let _network_mutation = self.network_mutations.write().await;
-                    let secrets = crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore::in_state_dir(
-                        &self.config.runtime.state_dir,
-                    );
-                    let committed_token = self
-                        .overrides
-                        .snapshot()
-                        .await
-                        .committed_router_transaction;
-                    if secrets
-                        .unresolved_after_committed_cleanup(committed_token.as_deref())
-                        .await?
-                    {
-                        continue;
-                    }
-                    if self.has_pending_interface_transaction().await {
-                        continue;
-                    }
-                    if let Some(router) = &self.router {
-                        if router.status().await
-                            != crate::core::router_transaction::CoordinatorStatus::Idle
-                        {
-                            continue;
-                        }
-                    }
                     let _mutation = self.wifi_client_mutations.lock().await;
                     let response = self.disable_wifi_client_locked(name.clone()).await;
                     if !matches!(response, Response::WifiClientDisabled { .. }) {
@@ -197,34 +191,6 @@ impl ControlService {
                 profile.id.clone()
             };
 
-            // Serialize the actual mutation with router/interface transaction starts.
-            // The earlier checks can go stale while scanning, so repeat them
-            // after acquiring the global network mutation gate.
-            let _network_mutation = self.network_mutations.write().await;
-            let secrets = crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore::in_state_dir(
-                &self.config.runtime.state_dir,
-            );
-            let committed_token = self
-                .overrides
-                .snapshot()
-                .await
-                .committed_router_transaction;
-            if secrets
-                .unresolved_after_committed_cleanup(committed_token.as_deref())
-                .await?
-            {
-                continue;
-            }
-            if self.has_pending_interface_transaction().await {
-                continue;
-            }
-            if let Some(router) = &self.router {
-                if router.status().await
-                    != crate::core::router_transaction::CoordinatorStatus::Idle
-                {
-                    continue;
-                }
-            }
             let _mutation = self.wifi_client_mutations.lock().await;
             {
                 let mut state = self.wifi_autoconnect.lock().await;

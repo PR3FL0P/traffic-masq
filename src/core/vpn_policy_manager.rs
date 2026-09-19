@@ -8,7 +8,9 @@ use crate::config::{AppConfig, InterfaceRole};
 use crate::core::vpn_policy::{
     VpnPolicyDesiredState, VpnPolicyReservedIds, VpnPolicyResourceConflictDetector,
 };
-use crate::firewall::vpn::{VpnPolicyFirewallBackend, VpnPolicyFirewallDesired};
+use crate::firewall::vpn::{
+    VpnFirewallIntegrity, VpnPolicyFirewallBackend, VpnPolicyFirewallDesired,
+};
 use crate::firewall::NftExecutor;
 use crate::netlink::{
     Ipv4RouteInfo, Ipv4RouteSpec, Ipv4RuleInfo, Ipv4RuleSpec, NetworkProvider,
@@ -119,7 +121,8 @@ impl<D: VpnDriver, E: NftExecutor> VpnPolicyManager<D, E> {
         reserved: VpnPolicyReservedIds,
     ) -> Self {
         Self {
-            conflicts: VpnPolicyResourceConflictDetector::new(network.clone()),
+            conflicts: VpnPolicyResourceConflictDetector::new(network.clone())
+                .with_reserved_ids(reserved),
             network,
             firewall: Arc::new(firewall),
             tunnel,
@@ -150,6 +153,62 @@ impl<D: VpnDriver, E: NftExecutor> VpnPolicyManager<D, E> {
             routes,
             firewall: firewall.desired,
         })
+    }
+
+    pub async fn health(&self, desired: &VpnPolicyDesired) -> Result<()> {
+        let firewall_desired = desired.firewall();
+        firewall_desired.validate()?;
+        self.ensure_tunnel_healthy(&desired.vpn_interface).await?;
+
+        let expected = self.desired_state_strict(desired).await?;
+        let observation = self.conflicts.observe(&expected).await?;
+        if !observation.is_conflict_free() {
+            bail!(
+                "VPN policy reserved namespace contains foreign state: {:?}",
+                observation.conflicts
+            );
+        }
+        if !observation.is_fully_present() {
+            bail!(
+                "VPN policy routing state drifted: missing rules {:?}, missing routes {:?}, unexpected owned routes {:?}",
+                observation.missing_rules,
+                observation.missing_routes,
+                observation.unexpected_owned_routes
+            );
+        }
+
+        let firewall = self
+            .firewall
+            .observe_async()
+            .await
+            .context("failed to observe VPN policy firewall health")?;
+        if firewall.integrity != VpnFirewallIntegrity::Intact
+            || firewall.desired.as_ref() != Some(&firewall_desired)
+        {
+            bail!("VPN policy firewall state drifted");
+        }
+        Ok(())
+    }
+
+    pub async fn health_inactive(&self) -> Result<()> {
+        let expected = VpnPolicyDesiredState {
+            rules: Vec::new(),
+            routes: Vec::new(),
+        };
+        let observation = self.conflicts.observe(&expected).await?;
+        if !observation.is_conflict_free() || !observation.unexpected_owned_routes.is_empty() {
+            bail!("VPN policy routing state is still present");
+        }
+
+        let firewall = self
+            .firewall
+            .observe_async()
+            .await
+            .context("failed to observe inactive VPN policy firewall health")?;
+        if firewall.integrity != VpnFirewallIntegrity::Intact || firewall.desired.is_some() {
+            bail!("VPN policy firewall state is still present or drifted");
+        }
+        Ok(())
     }
 
     pub async fn activate(&self, desired: &VpnPolicyDesired) -> Result<VpnPolicySnapshot> {
@@ -769,6 +828,97 @@ mod tests {
         let calls = manager.firewall.executor.calls.lock().unwrap();
         assert_eq!(calls.len(), 3);
         assert_eq!(calls[2].0, ["-f", "-"]);
+    }
+
+    #[tokio::test]
+    async fn health_inactive_accepts_empty_policy_state() {
+        let network = FakeNetwork::with_interface(OWNED_INTERFACE_NAME, 42);
+        let executor = FakeNftExecutor::with_responses(vec![Ok(nft_ruleset(None))]);
+        let (manager, _provider, _dir) = manager_with(network, executor);
+
+        manager.health_inactive().await.expect("inactive policy");
+    }
+
+    #[tokio::test]
+    async fn health_accepts_fully_applied_policy() {
+        let network = FakeNetwork::with_interface(OWNED_INTERFACE_NAME, 42);
+        let firewall_desired = desired().firewall();
+        let executor = FakeNftExecutor::with_responses(vec![
+            Ok(nft_ruleset(None)),
+            Ok(nft_ruleset(None)),
+            Ok(Vec::new()),
+            Ok(nft_ruleset(Some(&firewall_desired))),
+        ]);
+        let (manager, _provider, _dir) = manager_with(network, executor);
+        activate_tunnel(&manager).await;
+        manager.activate(&desired()).await.expect("activate");
+
+        manager.health(&desired()).await.expect("healthy policy");
+    }
+
+    #[tokio::test]
+    async fn health_rejects_missing_routing_state() {
+        let network = FakeNetwork::with_interface(OWNED_INTERFACE_NAME, 42);
+        let executor = FakeNftExecutor::with_responses(vec![
+            Ok(nft_ruleset(None)),
+            Ok(nft_ruleset(None)),
+            Ok(Vec::new()),
+        ]);
+        let (manager, _provider, _dir) = manager_with(network.clone(), executor);
+        activate_tunnel(&manager).await;
+        manager.activate(&desired()).await.expect("activate");
+        network.rules.lock().unwrap().clear();
+
+        assert!(manager.health(&desired()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn health_rejects_missing_firewall_state() {
+        let network = FakeNetwork::with_interface(OWNED_INTERFACE_NAME, 42);
+        let executor = FakeNftExecutor::with_responses(vec![
+            Ok(nft_ruleset(None)),
+            Ok(nft_ruleset(None)),
+            Ok(Vec::new()),
+            Ok(nft_ruleset(None)),
+        ]);
+        let (manager, _provider, _dir) = manager_with(network, executor);
+        activate_tunnel(&manager).await;
+        manager.activate(&desired()).await.expect("activate");
+
+        assert!(manager.health(&desired()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn activate_with_explicit_reserved_ids_uses_the_same_conflict_namespace() {
+        let network = FakeNetwork::with_interface(OWNED_INTERFACE_NAME, 42);
+        let executor = FakeNftExecutor::with_responses(vec![
+            Ok(nft_ruleset(None)),
+            Ok(nft_ruleset(None)),
+            Ok(Vec::new()),
+        ]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = WireGuardProfileStore::new(dir.path().join("wireguard"));
+        let active_profile_store = ActiveProfileStore::new(dir.path().join("active-profile.json"));
+        let provider = Arc::new(StaticKeyVpnProvider::default());
+        let erased: Arc<dyn VpnProvider> = provider;
+        let tunnel = Arc::new(VpnManager::new(
+            WireGuardVpnDriver::new(erased, store),
+            active_profile_store,
+        ));
+        let reserved = VpnPolicyReservedIds::for_hop(1).expect("hop ids");
+        let manager = VpnPolicyManager::new_with_reserved(
+            network.clone(),
+            VpnPolicyFirewallBackend::new(executor),
+            tunnel,
+            reserved,
+        );
+        activate_tunnel(&manager).await;
+
+        manager.activate(&desired()).await.expect("activate hop policy");
+
+        let rules = network.list_ipv4_rules().await.expect("rules");
+        assert_eq!(rules[0].table, reserved.route_table.get());
+        assert_eq!(rules[0].priority, Some(reserved.rule_priority_start.get()));
     }
 
     #[tokio::test]

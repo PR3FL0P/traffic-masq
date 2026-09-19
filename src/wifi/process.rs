@@ -8,6 +8,8 @@ use thiserror::Error;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
+use crate::wifi::record::WifiProcessKind;
+
 #[derive(Debug, Error)]
 pub enum ProcessError {
     #[error("failed to spawn {binary}: {source}")]
@@ -20,6 +22,12 @@ pub enum ProcessError {
     #[error("failed to inspect process {pid}: {source}")]
     Inspect {
         pid: u32,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to scan processes for Wi-Fi ownership: {source}")]
+    Scan {
         #[source]
         source: std::io::Error,
     },
@@ -49,6 +57,26 @@ pub trait SupervisedProcess: Send + Sync {
 
     async fn cmdline_contains(&self, pid: u32, config_path: &Path) -> Result<bool, ProcessError>;
 
+    async fn cmdline_matches_kind(
+        &self,
+        pid: u32,
+        kind: WifiProcessKind,
+        config_path: &Path,
+    ) -> Result<bool, ProcessError> {
+        let _ = kind;
+        self.cmdline_contains(pid, config_path).await
+    }
+
+    /// Return all running processes whose argv matches the expected Wi-Fi
+    /// process kind and contains `config_path` in the exact position used by
+    /// this supervisor. This recovers a write-ahead launch intent persisted
+    /// before the child PID existed.
+    async fn pids_with_config_path(
+        &self,
+        kind: WifiProcessKind,
+        config_path: &Path,
+    ) -> Result<Vec<u32>, ProcessError>;
+
     async fn terminate(&self, pid: u32) -> Result<(), ProcessError>;
 
     async fn kill(&self, pid: u32) -> Result<(), ProcessError>;
@@ -77,6 +105,23 @@ impl SupervisedProcess for std::sync::Arc<dyn SupervisedProcess> {
 
     async fn cmdline_contains(&self, pid: u32, config_path: &Path) -> Result<bool, ProcessError> {
         (**self).cmdline_contains(pid, config_path).await
+    }
+
+    async fn cmdline_matches_kind(
+        &self,
+        pid: u32,
+        kind: WifiProcessKind,
+        config_path: &Path,
+    ) -> Result<bool, ProcessError> {
+        (**self).cmdline_matches_kind(pid, kind, config_path).await
+    }
+
+    async fn pids_with_config_path(
+        &self,
+        kind: WifiProcessKind,
+        config_path: &Path,
+    ) -> Result<Vec<u32>, ProcessError> {
+        (**self).pids_with_config_path(kind, config_path).await
     }
 
     async fn terminate(&self, pid: u32) -> Result<(), ProcessError> {
@@ -165,10 +210,57 @@ impl SupervisedProcess for TokioSupervisedProcess {
             Err(source) => return Err(ProcessError::Inspect { pid, source }),
         };
 
-        let config_path = config_path.as_os_str();
-        Ok(raw
-            .split(|byte| *byte == 0)
-            .any(|argument| argument == config_path.as_encoded_bytes()))
+        Ok(cmdline_has_exact_argument(&raw, config_path))
+    }
+
+    async fn cmdline_matches_kind(
+        &self,
+        pid: u32,
+        kind: WifiProcessKind,
+        config_path: &Path,
+    ) -> Result<bool, ProcessError> {
+        let path = format!("/proc/{pid}/cmdline");
+        let raw = match tokio::fs::read(&path).await {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(source) => return Err(ProcessError::Inspect { pid, source }),
+        };
+        Ok(cmdline_matches_kind(&raw, kind, config_path))
+    }
+
+    async fn pids_with_config_path(
+        &self,
+        kind: WifiProcessKind,
+        config_path: &Path,
+    ) -> Result<Vec<u32>, ProcessError> {
+        let mut matches = Vec::new();
+        let mut entries = tokio::fs::read_dir("/proc")
+            .await
+            .map_err(|source| ProcessError::Scan { source })?;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|source| ProcessError::Scan { source })?
+        {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let cmdline = entry.path().join("cmdline");
+            let raw = match tokio::fs::read(cmdline).await {
+                Ok(raw) => raw,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(source) => return Err(ProcessError::Scan { source }),
+            };
+            if cmdline_matches_kind(&raw, kind, config_path) {
+                matches.push(pid);
+            }
+        }
+        matches.sort_unstable();
+        Ok(matches)
     }
 
     async fn terminate(&self, pid: u32) -> Result<(), ProcessError> {
@@ -178,6 +270,28 @@ impl SupervisedProcess for TokioSupervisedProcess {
     async fn kill(&self, pid: u32) -> Result<(), ProcessError> {
         send_signal(pid, Signal::SIGKILL)
     }
+}
+
+fn cmdline_matches_kind(raw: &[u8], kind: WifiProcessKind, config_path: &Path) -> bool {
+    let args: Vec<&[u8]> = raw
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .collect();
+    let config = config_path.as_os_str().as_encoded_bytes();
+    match kind {
+        WifiProcessKind::AccessPoint => args.iter().enumerate().any(|(index, argument)| {
+            *argument == config && (index == 0 || args[index - 1] != &b"-c"[..])
+        }),
+        WifiProcessKind::Client | WifiProcessKind::Scan => args
+            .windows(2)
+            .any(|pair| pair[0] == &b"-c"[..] && pair[1] == config),
+    }
+}
+
+fn cmdline_has_exact_argument(raw: &[u8], config_path: &Path) -> bool {
+    let config_path = config_path.as_os_str();
+    raw.split(|byte| *byte == 0)
+        .any(|argument| argument == config_path.as_encoded_bytes())
 }
 
 fn send_signal(pid: u32, signal: Signal) -> Result<(), ProcessError> {
@@ -495,6 +609,23 @@ mod tests {
     use tempfile::NamedTempFile;
 
     use super::*;
+
+    #[test]
+    fn wifi_process_kind_matching_distinguishes_hostapd_from_supplicant() {
+        let config = Path::new("/run/traffic-masq/wlan0.conf");
+        let hostapd = b"/usr/sbin/hostapd\0/run/traffic-masq/wlan0.conf\0";
+        let supplicant = b"/usr/sbin/wpa_supplicant\0-i\0wlan0\0-c\0/run/traffic-masq/wlan0.conf\0";
+
+        assert!(cmdline_matches_kind(hostapd, WifiProcessKind::AccessPoint, config));
+        assert!(!cmdline_matches_kind(hostapd, WifiProcessKind::Client, config));
+        assert!(cmdline_matches_kind(supplicant, WifiProcessKind::Client, config));
+        assert!(cmdline_matches_kind(supplicant, WifiProcessKind::Scan, config));
+        assert!(!cmdline_matches_kind(
+            supplicant,
+            WifiProcessKind::AccessPoint,
+            config
+        ));
+    }
 
     #[tokio::test]
     async fn a_freshly_spawned_process_is_alive_and_visible_in_proc() {

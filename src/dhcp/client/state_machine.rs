@@ -318,15 +318,30 @@ impl DhcpClientStateMachine {
 
     fn bind(&mut self, ack: Ack, now: MonotonicTime) -> Vec<Action> {
         let lease = Lease::from_ack(ack, now);
+        // Renewal can change the subnet or gateways without changing the
+        // client address. Release the old ownership record before applying
+        // those resources: overwriting it would orphan removed routes, while
+        // a changed gateway/prefix would collide with our own previous state.
+        let previous = self
+            .active_lease()
+            .filter(|previous| {
+                previous.address != lease.address
+                    || previous.prefix_len != lease.prefix_len
+                    || previous.routers != lease.routers
+            })
+            .cloned();
         self.state = DhcpClientState::Bound {
             lease: lease.clone(),
         };
         self.retry = 0;
         self.deadline = Some(lease.renewal_at);
-        vec![
-            Action::LeaseAcquired(lease.clone()),
-            Action::WakeAt(lease.renewal_at),
-        ]
+        let mut actions = Vec::new();
+        if let Some(previous) = previous {
+            actions.push(Action::CleanupNeeded(previous));
+        }
+        actions.push(Action::LeaseAcquired(lease.clone()));
+        actions.push(Action::WakeAt(lease.renewal_at));
+        actions
     }
 
     fn nak(&mut self, now: MonotonicTime, jitter_ms: i32) -> Vec<Action> {
@@ -571,6 +586,48 @@ mod tests {
         );
         assert!(matches!(actions[0], Action::LeaseAcquired(_)));
         assert!(matches!(sm.state(), DhcpClientState::Bound { .. }));
+    }
+
+    #[test]
+    fn changed_renewal_network_releases_old_ownership_before_acquiring_new_lease() {
+        for change_prefix in [false, true] {
+            let mut sm = DhcpClientStateMachine::new(MAC);
+            let mut previous = acquire(&mut sm, Duration::ZERO, 80);
+            previous.routers = vec![SERVER];
+            sm.state = DhcpClientState::Renewing {
+                lease: previous.clone(),
+            };
+            let ack = Ack {
+                address: ADDRESS,
+                subnet_mask: if change_prefix {
+                    Ipv4Addr::new(255, 255, 255, 128)
+                } else {
+                    previous.subnet_mask
+                },
+                prefix_len: if change_prefix {
+                    25
+                } else {
+                    previous.prefix_len
+                },
+                // Removing a gateway must clean the old default route before
+                // its durable ownership record is replaced by a route-less ACK.
+                routers: if change_prefix {
+                    previous.routers.clone()
+                } else {
+                    Vec::new()
+                },
+                dns_servers: Vec::new(),
+                lease_seconds: 100,
+                server_identifier: SERVER,
+                renewal_seconds: 50,
+                rebinding_seconds: 87,
+            };
+            let actions = sm.bind(ack, Duration::from_secs(41));
+            assert_eq!(actions[0], Action::CleanupNeeded(previous));
+            assert!(matches!(&actions[1], Action::LeaseAcquired(lease)
+                    if lease.prefix_len == if change_prefix { 25 } else { 24 }));
+            assert!(matches!(actions[2], Action::WakeAt(_)));
+        }
     }
 
     #[test]

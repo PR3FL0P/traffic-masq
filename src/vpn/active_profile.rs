@@ -8,6 +8,7 @@ use tokio::fs;
 use crate::atomic_file::{self, PRIVATE_FILE_MODE};
 
 pub const CURRENT_ACTIVE_PROFILE_SCHEMA: u32 = 1;
+pub const CURRENT_ACTIVATION_INTENT_SCHEMA: u32 = 1;
 
 #[derive(Debug, Error)]
 pub enum ActiveProfileError {
@@ -21,6 +22,11 @@ pub enum ActiveProfileError {
         "persisted active profile {0} uses unsupported schema version {1} (current is {CURRENT_ACTIVE_PROFILE_SCHEMA})"
     )]
     UnsupportedSchema(PathBuf, u32),
+
+    #[error(
+        "persisted VPN activation intent {0} uses unsupported schema version {1} (current is {CURRENT_ACTIVATION_INTENT_SCHEMA})"
+    )]
+    UnsupportedActivationIntentSchema(PathBuf, u32),
 
     #[error("failed to write persisted active profile {0}: {1}")]
     Write(PathBuf, std::io::Error),
@@ -39,6 +45,89 @@ pub struct PersistedActiveProfile {
     pub profile_name: String,
     pub interface: String,
     pub ownership_proof_base64: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedActivationIntentDocument {
+    schema_version: u32,
+    profile_name: String,
+    interface: String,
+    launch_marker: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedActivationIntent {
+    pub profile_name: String,
+    pub interface: String,
+    pub launch_marker: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActivationIntentStore {
+    path: PathBuf,
+}
+
+impl ActivationIntentStore {
+    pub fn for_active_profile(active: &ActiveProfileStore) -> Self {
+        Self {
+            path: active.path.with_extension("intent.json"),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub async fn load(&self) -> Result<Option<PersistedActivationIntent>, ActiveProfileError> {
+        let content = match fs::read(&self.path).await {
+            Ok(content) => content,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(ActiveProfileError::Read(self.path.clone(), error)),
+        };
+
+        let document: PersistedActivationIntentDocument = serde_json::from_slice(&content)
+            .map_err(|error| ActiveProfileError::Parse(self.path.clone(), error))?;
+        if document.schema_version != CURRENT_ACTIVATION_INTENT_SCHEMA {
+            return Err(ActiveProfileError::UnsupportedActivationIntentSchema(
+                self.path.clone(),
+                document.schema_version,
+            ));
+        }
+
+        Ok(Some(PersistedActivationIntent {
+            profile_name: document.profile_name,
+            interface: document.interface,
+            launch_marker: document.launch_marker,
+        }))
+    }
+
+    pub async fn save(&self, intent: &PersistedActivationIntent) -> Result<(), ActiveProfileError> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)
+                .await
+                .map_err(|error| ActiveProfileError::Write(self.path.clone(), error))?;
+        }
+
+        let document = PersistedActivationIntentDocument {
+            schema_version: CURRENT_ACTIVATION_INTENT_SCHEMA,
+            profile_name: intent.profile_name.clone(),
+            interface: intent.interface.clone(),
+            launch_marker: intent.launch_marker.clone(),
+        };
+        let mut content = serde_json::to_vec_pretty(&document)
+            .expect("PersistedActivationIntentDocument serialization is infallible");
+        content.push(b'\n');
+        atomic_file::replace_preserving_on_error_async(&self.path, &content, PRIVATE_FILE_MODE)
+            .await
+            .map_err(|error| ActiveProfileError::Write(self.path.clone(), error))
+    }
+
+    pub async fn clear(&self) -> Result<(), ActiveProfileError> {
+        atomic_file::remove_preserving_on_error_async(&self.path, PRIVATE_FILE_MODE)
+            .await
+            .map(|_| ())
+            .map_err(|error| ActiveProfileError::Write(self.path.clone(), error))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -224,5 +313,28 @@ mod tests {
             error,
             ActiveProfileError::UnsupportedSchema(_, 99)
         ));
+    }
+
+    #[tokio::test]
+    async fn activation_intent_round_trips_and_uses_separate_file() {
+        let directory = tempdir().expect("tempdir");
+        let active = ActiveProfileStore::new(directory.path().join("active-profile.json"));
+        let store = ActivationIntentStore::for_active_profile(&active);
+        let intent = PersistedActivationIntent {
+            profile_name: "home.conf".to_string(),
+            interface: "tm-wg0".to_string(),
+            launch_marker: "traffic-masq:vpn:test".to_string(),
+        };
+
+        assert_eq!(
+            store.path(),
+            directory.path().join("active-profile.intent.json")
+        );
+        store.save(&intent).await.expect("save intent");
+        assert_eq!(store.load().await.expect("load intent"), Some(intent));
+        assert_eq!(active.load().await.expect("load active"), None);
+
+        store.clear().await.expect("clear intent");
+        assert_eq!(store.load().await.expect("load cleared intent"), None);
     }
 }

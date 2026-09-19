@@ -493,6 +493,12 @@ pub trait RouterSubsystems: Send + Sync {
         Ok(VpnChainSnapshot::empty())
     }
 
+    /// Widen volatile ownership to cover an intent that is about to mutate the
+    /// machine. Planning and snapshotting must stay observational; adoption is
+    /// deliberately a separate apply-time step so a plan preview cannot change
+    /// later reconciliation behaviour.
+    async fn adopt_router_interfaces(&self, _desired: &RouterDesired) {}
+
     /// Narrow ownership to exactly these interfaces.
     ///
     /// Called once a transaction settles, so the owned set tracks the intent
@@ -742,8 +748,10 @@ impl RouterManager {
         }
     }
 
-    /// Kernel route notifications also cover drift in policy routing. Check
-    /// health first so our own notifications do not trigger a write loop.
+    /// rtnetlink route and policy-rule notifications cover the kernel routing
+    /// side. nftables integrity is audited separately because it has no
+    /// rtnetlink event. Check health first so our own notifications do not
+    /// trigger a write loop.
     pub async fn dataplane_needs_reconcile(&self, desired: &RouterDesired) -> bool {
         self.subsystems.health_routes(desired).await.is_err()
             || self.subsystems.health_vpn_chain(desired).await.is_err()
@@ -797,6 +805,11 @@ impl RouterManager {
     }
 
     pub async fn apply(&self, plan: &RouterPlan) -> Result<()> {
+        // Ownership changes only when execution begins. A dry-run plan calls
+        // snapshot_for too, and must not acquire resources merely by observing
+        // them. Adopt before the apply snapshot so DHCP/Wi-Fi teardown covers
+        // interfaces newly introduced by this intent.
+        self.subsystems.adopt_router_interfaces(&plan.desired).await;
         let snapshot = self.snapshot_for(&plan.desired).await?;
         let mut started = Vec::new();
 

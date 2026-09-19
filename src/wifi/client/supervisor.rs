@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,13 +17,13 @@ use crate::wifi::client::render::{
     ClientRenderError, ClientRenderInput, RenderedClientConfig,
 };
 use crate::wifi::lifecycle::{
-    classify_ownership, graceful_stop, preflight_binary as preflight_daemon_binary, retry_health,
-    save_spawned_record,
-    unix_now, wait_until_ready, write_private_config, OwnershipOutcome, RetryState, WifiHealth,
-    STARTUP_READY_TIMEOUT,
+    classify_ownership, cleanup_unconfigured_records, graceful_stop,
+    preflight_binary as preflight_daemon_binary, retry_health, save_launch_intent,
+    save_spawned_record, unix_now, wait_until_ready, write_private_config, OwnershipOutcome,
+    RetryState, WifiHealth, STARTUP_READY_TIMEOUT,
 };
 use crate::wifi::process::{ProcessError, SupervisedProcess, TokioSupervisedProcess};
-use crate::wifi::record::{PersistedWifiRecord, WifiRecordError, WifiRecordStore};
+use crate::wifi::record::{PersistedWifiRecord, WifiProcessKind, WifiRecordError, WifiRecordStore};
 use crate::wifi::render::WifiDigest;
 use crate::wifi::secret::WifiPassphrase;
 use crate::wifi::store::{resolve_passphrase_parts, PassphraseStore, ResolvePassphraseError};
@@ -156,7 +156,28 @@ impl WifiClientSupervisor {
             }),
         };
 
-        for spec in Self::effective_specs(config)? {
+        let specs = Self::effective_specs(config)?;
+        let configured_interfaces: HashSet<String> =
+            specs.iter().map(|spec| spec.interface.clone()).collect();
+        let no_interfaces = HashSet::new();
+        cleanup_unconfigured_records(
+            &supervisor.inner.records_dir,
+            WifiProcessKind::Scan,
+            &no_interfaces,
+            supervisor.inner.process.as_ref(),
+        )
+        .await
+        .map_err(ClientSupervisorError::Configuration)?;
+        cleanup_unconfigured_records(
+            &supervisor.inner.records_dir,
+            WifiProcessKind::Client,
+            &configured_interfaces,
+            supervisor.inner.process.as_ref(),
+        )
+        .await
+        .map_err(ClientSupervisorError::Configuration)?;
+
+        for spec in specs {
             if resolve_interface_index(&spec.interface).is_err() {
                 tracing::warn!(
                     interface = %spec.interface,
@@ -303,7 +324,11 @@ impl WifiClientSupervisor {
         if !self
             .inner
             .process
-            .cmdline_contains(task.record.pid, &task.record.config_path)
+            .cmdline_matches_kind(
+                task.record.pid,
+                WifiProcessKind::Client,
+                &task.record.config_path,
+            )
             .await?
         {
             return Ok(false);
@@ -382,6 +407,7 @@ impl WifiClientSupervisor {
             };
         classify_ownership(
             &store,
+            WifiProcessKind::Client,
             self.inner.process.as_ref(),
             status.is_some(),
             |record| {
@@ -404,7 +430,18 @@ impl WifiClientSupervisor {
         ctrl_path: &Path,
     ) -> Result<PersistedWifiRecord, ClientSupervisorError> {
         write_config_file(rendered).await?;
-        let pid = self
+        let store = self.record_store(&spec.interface);
+        save_launch_intent(
+            &store,
+            ctrl_path,
+            &rendered.path,
+            rendered.config_digest,
+            rendered.key_digest,
+            &spec.ssid,
+        )
+        .await?;
+
+        let pid = match self
             .inner
             .process
             .spawn_wifi_client(
@@ -412,13 +449,22 @@ impl WifiClientSupervisor {
                 &spec.interface,
                 &rendered.path,
             )
-            .await?;
+            .await
+        {
+            Ok(pid) => pid,
+            Err(error) => {
+                if let Err(cleanup) = store.clear().await {
+                    return Err(ClientSupervisorError::Configuration(anyhow::anyhow!(
+                        "wpa_supplicant spawn failed: {error}; launch-intent cleanup also failed: {cleanup}; recovery required"
+                    )));
+                }
+                return Err(error.into());
+            }
+        };
 
         let result = async {
-            wait_for_ready(ctrl_path, self.inner.ctrl_timeout, &spec.interface).await?;
-
-            Ok(save_spawned_record(
-                &self.record_store(&spec.interface),
+            let record = save_spawned_record(
+                &store,
                 pid,
                 ctrl_path,
                 &rendered.path,
@@ -426,14 +472,17 @@ impl WifiClientSupervisor {
                 rendered.key_digest,
                 &spec.ssid,
             )
-            .await?)
+            .await?;
+            wait_for_ready(ctrl_path, self.inner.ctrl_timeout, &spec.interface).await?;
+            store.clear_transition().await?;
+            Ok(record)
         }
         .await;
 
         match result {
             Ok(record) => Ok(record),
             Err(error) => match self.graceful_stop(pid).await {
-                Ok(()) => match self.record_store(&spec.interface).clear().await {
+                Ok(()) => match store.clear().await {
                     Ok(()) => Err(error),
                     Err(cleanup) => Err(ClientSupervisorError::Configuration(anyhow::anyhow!(
                         "wpa_supplicant startup failed: {error}; process stopped but ownership-record cleanup failed: {cleanup}; recovery required"
@@ -578,6 +627,19 @@ impl WifiClientSupervisor {
         // Clean up stale socket if present
         let _ = tokio::fs::remove_file(&ctrl_path).await;
 
+        let store = WifiRecordStore::for_scan(&self.inner.records_dir, interface);
+        let config_digest = WifiDigest::of(&[scan_config.as_bytes()]);
+        let key_digest = WifiDigest::of(&[]);
+        save_launch_intent(
+            &store,
+            &ctrl_path,
+            &scan_config_path,
+            config_digest,
+            key_digest,
+            "",
+        )
+        .await?;
+
         let pid = match self
             .inner
             .process
@@ -590,10 +652,45 @@ impl WifiClientSupervisor {
         {
             Ok(pid) => pid,
             Err(err) => {
+                let cleanup = store.clear().await;
                 let _ = tokio::fs::remove_file(&scan_config_path).await;
+                if let Err(cleanup) = cleanup {
+                    return Err(ClientSupervisorError::Configuration(anyhow::anyhow!(
+                        "Wi-Fi scan spawn failed: {err}; launch-intent cleanup also failed: {cleanup}; recovery required"
+                    )));
+                }
                 return Err(ClientSupervisorError::from(err));
             }
         };
+
+        if let Err(error) = save_spawned_record(
+            &store,
+            pid,
+            &ctrl_path,
+            &scan_config_path,
+            config_digest,
+            key_digest,
+            "",
+        )
+        .await
+        {
+            return match self.graceful_stop(pid).await {
+                Ok(()) => {
+                    let cleanup = store.clear().await;
+                    let _ = tokio::fs::remove_file(&scan_config_path).await;
+                    let _ = tokio::fs::remove_file(&ctrl_path).await;
+                    match cleanup {
+                        Ok(()) => Err(error.into()),
+                        Err(cleanup) => Err(ClientSupervisorError::Configuration(anyhow::anyhow!(
+                            "failed to persist Wi-Fi scan ownership: {error}; process stopped but ownership cleanup failed: {cleanup}; recovery required"
+                        ))),
+                    }
+                }
+                Err(stop) => Err(ClientSupervisorError::Configuration(anyhow::anyhow!(
+                    "failed to persist Wi-Fi scan ownership: {error}; stopping ephemeral supplicant also failed: {stop}; recovery required"
+                ))),
+            };
+        }
 
         let ready = wait_for_ready(&ctrl_path, self.inner.ctrl_timeout, interface).await;
         let scan_result = match ready {
@@ -601,17 +698,32 @@ impl WifiClientSupervisor {
             Err(err) => Err(err),
         };
 
-        let stop_result = self.graceful_stop(pid).await;
-        let _ = tokio::fs::remove_file(&scan_config_path).await;
-        let _ = tokio::fs::remove_file(&ctrl_path).await;
-
-        match (scan_result, stop_result) {
-            (Ok(results), Ok(())) => Ok(results),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(_), Err(stop)) => Err(stop),
-            (Err(error), Err(stop)) => Err(ClientSupervisorError::Configuration(anyhow::anyhow!(
-                "Wi-Fi scan failed: {error}; stopping ephemeral supplicant also failed: {stop}; recovery required"
-            ))),
+        match self.graceful_stop(pid).await {
+            Ok(()) => {
+                let clear_result = store.clear().await;
+                let _ = tokio::fs::remove_file(&scan_config_path).await;
+                let _ = tokio::fs::remove_file(&ctrl_path).await;
+                match (scan_result, clear_result) {
+                    (Ok(results), Ok(())) => Ok(results),
+                    (Err(error), Ok(())) => Err(error),
+                    (Ok(_), Err(cleanup)) => Err(ClientSupervisorError::Configuration(
+                        anyhow::anyhow!(
+                            "Wi-Fi scan completed but ownership cleanup failed: {cleanup}; recovery required"
+                        ),
+                    )),
+                    (Err(error), Err(cleanup)) => Err(ClientSupervisorError::Configuration(
+                        anyhow::anyhow!(
+                            "Wi-Fi scan failed: {error}; ownership cleanup also failed: {cleanup}; recovery required"
+                        ),
+                    )),
+                }
+            }
+            Err(stop) => match scan_result {
+                Ok(_) => Err(stop),
+                Err(error) => Err(ClientSupervisorError::Configuration(anyhow::anyhow!(
+                    "Wi-Fi scan failed: {error}; stopping ephemeral supplicant also failed: {stop}; recovery required"
+                ))),
+            },
         }
     }
 
@@ -1437,6 +1549,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovers_supplicant_spawned_after_a_durable_launch_intent() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = temp.path().join("run");
+        let records = temp.path().join("wifi");
+        let process = fake_process();
+        let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
+
+        let target = spec("wlan0", "upstream");
+        let rendered = supervisor.render_for(&target).await.expect("render");
+        write_config_file(&rendered).await.expect("write config");
+        seed_process(&process, 4242, rendered.path.clone(), "COMPLETED");
+        WifiRecordStore::for_client(&records, "wlan0")
+            .save(&PersistedWifiRecord {
+                pid: 0,
+                started_at_unix: 1,
+                ctrl_path: runtime.join("wlan0"),
+                config_path: rendered.path.clone(),
+                config_digest: rendered.config_digest,
+                key_digest: rendered.key_digest,
+                ssid: "upstream".to_string(),
+            })
+            .await
+            .expect("seed launch intent");
+
+        supervisor.configure(target).await.expect("recover and adopt");
+
+        assert_eq!(process.spawn_count(), 0, "recovery must not spawn a duplicate");
+        assert_eq!(supervisor.status("wlan0").await.expect("status").pid, 4242);
+    }
+
+    #[tokio::test]
+    async fn startup_stops_pending_client_absent_from_committed_configuration() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = temp.path().join("run");
+        tokio::fs::create_dir_all(&runtime)
+            .await
+            .expect("create runtime dir");
+        let process = fake_process();
+        let config = app_config(temp.path(), &runtime);
+        let process_config = config_path(&runtime, "wlan0");
+        seed_process(&process, 4248, process_config.clone(), "COMPLETED");
+        let store = WifiRecordStore::for_client(temp.path().join("wifi"), "wlan0");
+        store
+            .save(&PersistedWifiRecord {
+                pid: 0,
+                started_at_unix: 1,
+                ctrl_path: runtime.join("wlan0"),
+                config_path: process_config,
+                config_digest: WifiDigest::from_bytes([1; 32]),
+                key_digest: WifiDigest::from_bytes([2; 32]),
+                ssid: "uncommitted-network".to_string(),
+            })
+            .await
+            .expect("seed launch intent");
+
+        WifiClientSupervisor::start_with_process(&config, process.clone())
+            .await
+            .expect("startup recovery");
+
+        assert!(process
+            .calls()
+            .iter()
+            .any(|call| matches!(call, FakeCall::Terminate(4248))));
+        assert!(store.load().await.expect("load").is_none());
+    }
+
+    #[tokio::test]
     async fn a_still_associating_supplicant_is_adopted_not_refused() {
         let temp = tempdir().expect("tempdir");
         let runtime = temp.path().join("run");
@@ -1943,9 +2122,52 @@ mod tests {
         let calls = process.calls();
         assert!(calls.iter().any(|c| matches!(c, FakeCall::Terminate(_))));
 
-        // Ephemeral config and socket were removed:
+        // Ephemeral config, socket, and durable ownership were removed:
         assert!(!runtime.join("wlan0-scan.conf").exists());
         assert!(!runtime.join("wlan0").exists());
+        assert!(
+            WifiRecordStore::for_scan(temp.path().join("wifi"), "wlan0")
+                .load()
+                .await
+                .expect("load scan record")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_recovers_an_interrupted_ephemeral_scan() {
+        let temp = tempdir().expect("tempdir");
+        let runtime = temp.path().join("run");
+        tokio::fs::create_dir_all(&runtime)
+            .await
+            .expect("create runtime dir");
+        let process = fake_process();
+        let config = app_config(temp.path(), &runtime);
+        let scan_path = scan_config_path(&runtime, "wlan0");
+        seed_process(&process, 4249, scan_path.clone(), "SCANNING");
+        let store = WifiRecordStore::for_scan(temp.path().join("wifi"), "wlan0");
+        store
+            .save(&PersistedWifiRecord {
+                pid: 0,
+                started_at_unix: 1,
+                ctrl_path: runtime.join("wlan0"),
+                config_path: scan_path,
+                config_digest: WifiDigest::from_bytes([3; 32]),
+                key_digest: WifiDigest::from_bytes([4; 32]),
+                ssid: String::new(),
+            })
+            .await
+            .expect("seed scan launch intent");
+
+        WifiClientSupervisor::start_with_process(&config, process.clone())
+            .await
+            .expect("startup recovery");
+
+        assert!(process
+            .calls()
+            .iter()
+            .any(|call| matches!(call, FakeCall::Terminate(4249))));
+        assert!(store.load().await.expect("load").is_none());
     }
 
     #[tokio::test]

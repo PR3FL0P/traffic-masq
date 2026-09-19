@@ -95,6 +95,10 @@ impl NetworkProvider for FakeNetwork {
     ) -> Result<()> {
         Ok(())
     }
+
+    async fn list_ipv4_routes(&self) -> Result<Vec<traffic_masq::netlink::Ipv4RouteInfo>> {
+        Ok(Vec::new())
+    }
 }
 
 #[tokio::test]
@@ -1100,6 +1104,7 @@ async fn router_status_is_ready_when_all_subsystems_are_healthy_over_http() -> R
 #[derive(Debug, Clone)]
 struct FakeVpnLink {
     private_key: traffic_masq::vpn::wireguard::WireGuardKey,
+    launch_marker: String,
     up: bool,
 }
 
@@ -1119,6 +1124,7 @@ impl traffic_masq::vpn::VpnProvider for FakeVpnProvider {
         name: &str,
         private_key: &traffic_masq::vpn::wireguard::WireGuardKey,
         _listen_port: Option<u16>,
+        launch_marker: &str,
     ) -> Result<(), traffic_masq::vpn::ProviderError> {
         let mut links = self.links.lock().unwrap();
         if links.contains_key(name) {
@@ -1132,10 +1138,29 @@ impl traffic_masq::vpn::VpnProvider for FakeVpnProvider {
             name.to_string(),
             FakeVpnLink {
                 private_key: private_key.clone(),
+                launch_marker: launch_marker.to_string(),
                 up: false,
             },
         );
         Ok(())
+    }
+
+    async fn delete_link_if_launch_marker(
+        &self,
+        name: &str,
+        launch_marker: &str,
+    ) -> Result<bool, traffic_masq::vpn::ProviderError> {
+        let matches = self
+            .links
+            .lock()
+            .unwrap()
+            .get(name)
+            .is_some_and(|link| link.launch_marker == launch_marker);
+        if !matches {
+            return Ok(false);
+        }
+        self.delete_link(name).await?;
+        Ok(true)
     }
 
     async fn set_addresses(

@@ -7,7 +7,7 @@ use genetlink::GenetlinkHandle;
 use ipnet::IpNet;
 use netlink_packet_core::{NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_DUMP, NLM_F_REQUEST};
 use netlink_packet_generic::GenlMessage;
-use netlink_packet_route::link::{LinkFlag, LinkMessage};
+use netlink_packet_route::link::{LinkAttribute, LinkFlag, LinkMessage};
 use netlink_packet_wireguard::{
     WireguardAddressFamily, WireguardAllowedIp, WireguardAllowedIpAttr, WireguardAttribute,
     WireguardCmd, WireguardDeviceFlags, WireguardMessage, WireguardPeer, WireguardPeerAttribute,
@@ -46,7 +46,14 @@ pub trait VpnProvider: Send + Sync {
         name: &str,
         private_key: &WireGuardKey,
         listen_port: Option<u16>,
+        launch_marker: &str,
     ) -> Result<(), ProviderError>;
+
+    async fn delete_link_if_launch_marker(
+        &self,
+        name: &str,
+        launch_marker: &str,
+    ) -> Result<bool, ProviderError>;
 
     async fn set_addresses(&self, name: &str, addresses: &[IpNet]) -> Result<(), ProviderError>;
 
@@ -78,8 +85,21 @@ impl VpnProvider for Arc<dyn VpnProvider> {
         name: &str,
         private_key: &WireGuardKey,
         listen_port: Option<u16>,
+        launch_marker: &str,
     ) -> Result<(), ProviderError> {
-        (**self).create_link(name, private_key, listen_port).await
+        (**self)
+            .create_link(name, private_key, listen_port, launch_marker)
+            .await
+    }
+
+    async fn delete_link_if_launch_marker(
+        &self,
+        name: &str,
+        launch_marker: &str,
+    ) -> Result<bool, ProviderError> {
+        (**self)
+            .delete_link_if_launch_marker(name, launch_marker)
+            .await
     }
 
     async fn set_addresses(&self, name: &str, addresses: &[IpNet]) -> Result<(), ProviderError> {
@@ -250,11 +270,17 @@ impl VpnProvider for NetlinkVpnProvider {
         name: &str,
         private_key: &WireGuardKey,
         listen_port: Option<u16>,
+        launch_marker: &str,
     ) -> Result<(), ProviderError> {
-        self.rt_handle
-            .link()
-            .add()
-            .wireguard(name.to_string())
+        // The alias is part of the same RTM_NEWLINK request as interface
+        // creation. A crash can therefore never leave a newly-created link
+        // without the durable launch marker needed to prove ownership.
+        let mut request = self.rt_handle.link().add().wireguard(name.to_string());
+        request
+            .message_mut()
+            .attributes
+            .push(LinkAttribute::IfAlias(launch_marker.to_string()));
+        request
             .execute()
             .await
             .map_err(|error| ProviderError::Netlink(error.to_string()))?;
@@ -267,6 +293,34 @@ impl VpnProvider for NetlinkVpnProvider {
             attributes.push(WireguardAttribute::ListenPort(port));
         }
         self.set_device(attributes).await
+    }
+
+    async fn delete_link_if_launch_marker(
+        &self,
+        name: &str,
+        launch_marker: &str,
+    ) -> Result<bool, ProviderError> {
+        let Some(link) = self.get_link(name).await else {
+            return Ok(false);
+        };
+        let marker_matches = link.attributes.iter().any(|attribute| {
+            matches!(attribute, LinkAttribute::IfAlias(value) if value == launch_marker)
+        });
+        if !marker_matches {
+            return Ok(false);
+        }
+
+        // Delete by the index from the same link snapshot used to verify the
+        // marker. This avoids re-resolving the interface by name during
+        // cleanup, so an ordinary delete-and-recreate race targets the old
+        // ifindex rather than the replacement interface.
+        self.rt_handle
+            .link()
+            .del(link.header.index)
+            .execute()
+            .await
+            .map_err(|error| ProviderError::Netlink(error.to_string()))?;
+        Ok(true)
     }
 
     async fn set_addresses(&self, name: &str, addresses: &[IpNet]) -> Result<(), ProviderError> {

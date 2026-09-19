@@ -21,15 +21,33 @@ and builds a plan. It changes only resources it owns. Runtime overrides are
 merged with the file configuration each time, so an earlier override does not
 become the base for the next one.
 
-Before applying a router transaction, the daemon saves a snapshot. It keeps that
-snapshot until the user commits the change or rollback succeeds. A commit saves
-the requested configuration; reconciliation then corrects differences between
-that configuration and the running system.
+Interface and router changes use commit-confirm transactions. Before applying
+one, the daemon persists the rollback state it needs; router transactions keep a
+full snapshot until the user commits the change or rollback succeeds. A commit
+saves the requested configuration, and reconciliation then corrects differences
+between committed intent and the running system.
 
-Accepted control operations keep running if the HTTP client disconnects. The
-executor limits queued work and waits for accepted operations during shutdown.
-If a request times out, the client must check the current state before retrying:
-the change may already have taken effect.
+Router provisioning rollback restores journaled Wi-Fi credentials before
+restoring runtime services, so reconnecting the previous uplink can obtain a
+fresh DHCP lease. The secret journal remains until runtime restoration succeeds;
+secret I/O or runtime failures keep the transaction in rollback recovery and
+prevent confirmation. This ordering also applies to timeout, shutdown and
+failed-apply compensation.
+
+Standalone DHCP, Wi-Fi and VPN operations are immediate rather than
+commit-confirm transactions. Because some of their effects survive a daemon
+crash, they establish durable ownership proof before persistent runtime state is
+created: DHCP lease records include the applied route policy, Wi-Fi launches use
+write-ahead process records, and WireGuard activation uses a durable intent plus
+an interface launch marker. Startup recovery compares those proofs with
+committed intent and only removes state whose ownership can still be verified.
+
+The global mutation gate serializes admitted network mutations with transaction
+execution, while background convergence uses the compatible read side. Accepted
+control operations keep running if the HTTP client disconnects. The executor
+limits queued work and waits for accepted operations during shutdown. If a
+request times out, the client must check the current state before retrying: the
+change may already have taken effect.
 
 ## Terminal client
 

@@ -86,6 +86,10 @@ impl DhcpClientLeaseStore {
         self.documents.remove(interface)?;
         Ok(())
     }
+
+    pub fn interfaces(&self) -> Result<Vec<String>, LeaseStoreError> {
+        self.documents.keys().map_err(Into::into)
+    }
 }
 
 #[cfg(test)]
@@ -109,6 +113,7 @@ mod tests {
             interface_index: 2,
             hardware_address: vec![2, 0, 0, 0, 0, 1],
             client_identifier: vec![1, 2, 0, 0, 0, 0, 1],
+            policy: None,
             server_identifier: Ipv4Addr::new(192, 0, 2, 1),
             address: Ipv4Addr::new(192, 0, 2, 20),
             prefix_len: 24,

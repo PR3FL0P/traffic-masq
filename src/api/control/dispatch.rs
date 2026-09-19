@@ -222,7 +222,12 @@ impl ControlService {
                 };
                 let current_role = current.as_ref().map(|config| config.role);
                 if let Err(error) = self
-                    .validate_default_route_management(&interface, &config, allow_management_change)
+                    .validate_default_route_management(
+                        &interface,
+                        current.as_ref(),
+                        &config,
+                        allow_management_change,
+                    )
                     .await
                 {
                     return Response::Error {
@@ -269,6 +274,7 @@ impl ControlService {
                         if let Err(error) = self
                             .validate_default_route_management(
                                 &interface,
+                                current.as_ref(),
                                 &config,
                                 allow_management_change,
                             )
@@ -321,7 +327,12 @@ impl ControlService {
                 };
                 let current_role = current.as_ref().map(|config| config.role);
                 if let Err(error) = self
-                    .validate_default_route_management(&interface, &config, allow_management_change)
+                    .validate_default_route_management(
+                        &interface,
+                        current.as_ref(),
+                        &config,
+                        allow_management_change,
+                    )
                     .await
                 {
                     return Response::Error {
@@ -368,6 +379,7 @@ impl ControlService {
                         if let Err(error) = self
                             .validate_default_route_management(
                                 &interface,
+                                current.as_ref(),
                                 &config,
                                 allow_management_change,
                             )

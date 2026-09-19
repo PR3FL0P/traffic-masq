@@ -39,6 +39,16 @@ Interface changes save snapshots too. Startup restores unconfirmed changes,
 including changes to previously unmanaged interfaces, before applying committed
 configuration.
 
+Standalone DHCP, Wi-Fi and VPN operations do not use the confirmation timer.
+Their persistent effects are protected by write-ahead ownership records: DHCP
+leases record the route policy under which they were applied, Wi-Fi daemon
+records are namespaced by process kind and written before launch, and WireGuard
+activation records a launch marker before link configuration. Startup recovery
+compares those proofs with committed intent and refuses to delete state whose
+ownership cannot be verified. Legacy Wi-Fi AP/client ownership files are
+validated by their recorded config path before migration into separate `wifi/ap`
+and `wifi/client` namespaces.
+
 Rollback cannot run while the daemon is stopped or killed; recovery resumes
 when it starts again. Test recovery on the kernel, init system and hardware you
 plan to use.

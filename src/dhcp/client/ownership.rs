@@ -75,6 +75,17 @@ impl DhcpClientOwnershipApplier {
         }
     }
 
+    pub(crate) fn persisted_interfaces(&self) -> Result<Vec<String>, OwnershipError> {
+        Ok(self.store.interfaces()?)
+    }
+
+    pub(crate) fn persisted_lease(
+        &self,
+        interface: &str,
+    ) -> Result<Option<DhcpClientLease>, OwnershipError> {
+        Ok(self.store.load(interface)?)
+    }
+
     pub async fn apply(
         &self,
         mut lease: DhcpClientLease,
@@ -175,7 +186,13 @@ impl DhcpClientOwnershipApplier {
                 .rollback_added(&lease, added_address, &added_routes)
                 .await;
             if cleaned.is_ok() {
-                self.store.remove(&lease.interface)?;
+                // Compensation removes only this attempt's additions. A
+                // renewal may have reused the prior address/routes, whose
+                // durable ownership proof must survive the failed update.
+                match &prior {
+                    Some(prior) => self.store.save(prior)?,
+                    None => { self.store.remove(&lease.interface)?; }
+                }
                 return Err(error);
             }
             return Err(OwnershipError::CleanupNeeded(error.to_string()));
@@ -618,6 +635,7 @@ mod tests {
             interface_index: 2,
             hardware_address: vec![2, 0, 0, 0, 0, 1],
             client_identifier: vec![1, 2, 0, 0, 0, 0, 1],
+            policy: None,
             server_identifier: Ipv4Addr::new(192, 0, 2, 1),
             address: Ipv4Addr::new(192, 0, 2, 20),
             prefix_len: 24,
@@ -822,6 +840,23 @@ mod tests {
         assert!(network.addresses.lock().unwrap().is_empty());
         assert!(network.routes.lock().unwrap().is_empty());
         assert!(store.load("eth0").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn failed_lease_update_preserves_prior_ownership_for_cleanup() {
+        let network = FakeNetwork::new();
+        let (_dir, store, applier) = fixture(network.clone());
+        let prior = applier.apply(lease()).await.unwrap();
+        *network.fail_route_add.lock().unwrap() = Some(2);
+        let mut updated = lease();
+        updated.owned_routes.push(route("203.0.113.0/24"));
+        assert!(applier.apply(updated).await.is_err());
+        assert_eq!(store.load("eth0").unwrap(), Some(prior));
+        assert_eq!(network.addresses.lock().unwrap().len(), 1);
+        assert_eq!(network.routes.lock().unwrap().len(), 1);
+        applier.cleanup("eth0").await.unwrap();
+        assert!(network.addresses.lock().unwrap().is_empty());
+        assert!(network.routes.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -1,13 +1,19 @@
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::sync::Mutex;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use rand::rngs::OsRng;
+use rand::RngCore;
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::config::ShutdownPolicy;
-use crate::vpn::active_profile::{ActiveProfileError, ActiveProfileStore, PersistedActiveProfile};
+use crate::vpn::active_profile::{
+    ActiveProfileError, ActiveProfileStore, ActivationIntentStore, PersistedActivationIntent,
+    PersistedActiveProfile,
+};
 use crate::vpn::store::WireGuardProfileSummary;
 use crate::vpn::{VpnDriver, VpnDriverError};
 
@@ -24,6 +30,17 @@ pub const OWNED_INTERFACE_NAME: &str = "tm-wg0";
 /// during the coexistence window.
 pub fn hop_interface_name(hop_index: u32) -> String {
     format!("tm-wg-{hop_index}")
+}
+
+fn new_launch_marker() -> String {
+    let mut token = [0u8; 16];
+    OsRng.fill_bytes(&mut token);
+    let mut marker = String::with_capacity(17 + token.len() * 2);
+    marker.push_str("traffic-masq:vpn:");
+    for byte in token {
+        write!(&mut marker, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    marker
 }
 
 #[derive(Debug, Error)]
@@ -100,16 +117,19 @@ pub struct VpnManager<D: VpnDriver> {
     /// is present", not "the map is non-empty".
     owned: Mutex<BTreeMap<String, OwnedInterfaceRecord<D::OwnershipProof>>>,
     active_profile_store: ActiveProfileStore,
+    activation_intent_store: ActivationIntentStore,
 
     activation_lock: AsyncMutex<()>,
 }
 
 impl<D: VpnDriver> VpnManager<D> {
     pub fn new(driver: D, active_profile_store: ActiveProfileStore) -> Self {
+        let activation_intent_store = ActivationIntentStore::for_active_profile(&active_profile_store);
         Self {
             driver,
             owned: Mutex::new(BTreeMap::new()),
             active_profile_store,
+            activation_intent_store,
             activation_lock: AsyncMutex::new(()),
         }
     }
@@ -249,9 +269,23 @@ impl<D: VpnDriver> VpnManager<D> {
 
         let profile = self.plan_activation_on(interface, name).await?;
         let snapshot = self.snapshot_on(interface).await?;
+        let intent = PersistedActivationIntent {
+            profile_name: name.to_string(),
+            interface: interface.to_string(),
+            launch_marker: new_launch_marker(),
+        };
 
-        if let Err(error) = self.activate_inner(interface, name, &profile).await {
-            return match self.rollback(&snapshot).await {
+        // Write-ahead ownership: this must be durable before RTM_NEWLINK. The
+        // driver places the same marker into IFLA_IFALIAS atomically with link
+        // creation, so recovery can prove ownership even if we die before the
+        // WireGuard private/public key exists.
+        self.activation_intent_store.save(&intent).await?;
+
+        if let Err(error) = self
+            .activate_inner(interface, name, &profile, &intent.launch_marker)
+            .await
+        {
+            return match self.rollback_activation_intent(&intent).await {
                 Ok(()) => Err(error),
                 Err(rollback) => Err(ManagerError::RollbackFailed {
                     operation: error.to_string(),
@@ -272,14 +306,21 @@ impl<D: VpnDriver> VpnManager<D> {
         if let Err(error) = self.active_profile_store.save(&persisted).await {
             let operation = ManagerError::ActiveProfile(error);
             return match self.rollback(&snapshot).await {
-                Ok(()) => Err(operation),
+                Ok(()) => match self.clear_activation_intent_for(interface).await {
+                    Ok(()) => Err(operation),
+                    Err(cleanup) => Err(ManagerError::RollbackFailed {
+                        operation: operation.to_string(),
+                        rollback: format!(
+                            "runtime rollback succeeded but activation-intent cleanup failed: {cleanup}"
+                        ),
+                    }),
+                },
                 Err(rollback) => {
-                    // If runtime rollback itself failed, retain/re-create the
-                    // durable proof that lets the next process verify the
-                    // surviving interface before touching it. A second store
-                    // failure is reported explicitly; there is no safe way to
-                    // manufacture crash-recovery evidence when the state disk
-                    // itself is unavailable.
+                    // Preserve the existing stronger recovery proof if runtime
+                    // rollback fails. The activation intent remains alongside
+                    // it, so startup can prefer the committed/public-key proof
+                    // when this write succeeds and otherwise still retry the
+                    // marker-verified rollback.
                     let recovery_marker = self.active_profile_store.save(&persisted).await.err();
                     Err(ManagerError::RollbackFailed {
                         operation: operation.to_string(),
@@ -294,6 +335,19 @@ impl<D: VpnDriver> VpnManager<D> {
             };
         }
 
+        // The active-profile record is the commit point. A stale intent is
+        // harmless after this point: startup verifies the stronger public-key
+        // proof first and then removes the intent. Do not turn a successful
+        // committed activation into a reported failure merely because journal
+        // cleanup hit a transient filesystem error.
+        if let Err(error) = self.clear_activation_intent_for(interface).await {
+            tracing::warn!(
+                interface,
+                error = %error,
+                "VPN activation committed but activation-intent cleanup failed; startup recovery will retry"
+            );
+        }
+
         Ok(())
     }
 
@@ -302,8 +356,12 @@ impl<D: VpnDriver> VpnManager<D> {
         interface: &str,
         name: &str,
         profile: &D::Profile,
+        launch_marker: &str,
     ) -> Result<(), ManagerError> {
-        let ownership_proof = self.driver.activate(interface, profile).await?;
+        let ownership_proof = self
+            .driver
+            .activate(interface, profile, launch_marker)
+            .await?;
 
         self.owned.lock().expect("owned mutex poisoned").insert(
             interface.to_string(),
@@ -314,6 +372,59 @@ impl<D: VpnDriver> VpnManager<D> {
             },
         );
 
+        Ok(())
+    }
+
+    async fn clear_activation_intent_for(&self, interface: &str) -> Result<(), ManagerError> {
+        if self
+            .activation_intent_store
+            .load()
+            .await?
+            .as_ref()
+            .is_some_and(|intent| intent.interface == interface)
+        {
+            self.activation_intent_store.clear().await?;
+        }
+        Ok(())
+    }
+
+    async fn rollback_activation_intent(
+        &self,
+        intent: &PersistedActivationIntent,
+    ) -> Result<(), ManagerError> {
+        if !self.driver.link_exists(&intent.interface).await? {
+            self.clear_activation_intent_for(&intent.interface).await?;
+            self.owned
+                .lock()
+                .expect("owned mutex poisoned")
+                .remove(&intent.interface);
+            return Ok(());
+        }
+
+        if !self
+            .driver
+            .delete_if_launch_marker(&intent.interface, &intent.launch_marker)
+            .await?
+        {
+            // The interface may have disappeared between the existence check
+            // and the marker-verified delete. That is safe: there is no
+            // runtime state left to own, so only the stale intent remains.
+            if !self.driver.link_exists(&intent.interface).await? {
+                self.clear_activation_intent_for(&intent.interface).await?;
+                self.owned
+                    .lock()
+                    .expect("owned mutex poisoned")
+                    .remove(&intent.interface);
+                return Ok(());
+            }
+            return Err(ManagerError::OwnershipProofFailed(intent.interface.clone()));
+        }
+
+        self.clear_activation_intent_for(&intent.interface).await?;
+        self.owned
+            .lock()
+            .expect("owned mutex poisoned")
+            .remove(&intent.interface);
         Ok(())
     }
 
@@ -332,16 +443,29 @@ impl<D: VpnDriver> VpnManager<D> {
             .cloned();
 
         let Some(record) = record else {
-            if !self.driver.link_exists(interface).await?
-                && self
+            if !self.driver.link_exists(interface).await? {
+                let persisted_matches = self
                     .active_profile_store
                     .load()
                     .await?
                     .as_ref()
-                    .is_some_and(|persisted| persisted.interface == interface)
-            {
-                self.active_profile_store.clear().await?;
-                return Ok(());
+                    .is_some_and(|persisted| persisted.interface == interface);
+                let intent_matches = self
+                    .activation_intent_store
+                    .load()
+                    .await?
+                    .as_ref()
+                    .is_some_and(|intent| intent.interface == interface);
+
+                if persisted_matches {
+                    self.active_profile_store.clear().await?;
+                }
+                if intent_matches {
+                    self.activation_intent_store.clear().await?;
+                }
+                if persisted_matches || intent_matches {
+                    return Ok(());
+                }
             }
             return Err(ManagerError::NotActive);
         };
@@ -355,6 +479,7 @@ impl<D: VpnDriver> VpnManager<D> {
         // If this clear fails, a retry sees the missing link and can finish the
         // persistence cleanup without reporting a false-success deactivation.
         self.active_profile_store.clear().await?;
+        self.clear_activation_intent_for(interface).await?;
         self.owned
             .lock()
             .expect("owned mutex poisoned")
@@ -373,6 +498,7 @@ impl<D: VpnDriver> VpnManager<D> {
         let currently_exists = self.driver.link_exists(&snapshot.interface).await?;
         if !currently_exists {
             self.active_profile_store.clear().await?;
+            self.clear_activation_intent_for(&snapshot.interface).await?;
             self.owned
                 .lock()
                 .expect("owned mutex poisoned")
@@ -399,6 +525,7 @@ impl<D: VpnDriver> VpnManager<D> {
 
         self.driver.deactivate(&record.interface).await?;
         self.active_profile_store.clear().await?;
+        self.clear_activation_intent_for(&snapshot.interface).await?;
         self.owned
             .lock()
             .expect("owned mutex poisoned")
@@ -414,15 +541,30 @@ impl<D: VpnDriver> VpnManager<D> {
         &self,
         interface: &str,
     ) -> Result<ReconcileOutcome<D::OwnershipProof>, ManagerError> {
+        // Reconciliation mutates the same runtime/ownership state as activation
+        // and deactivation. In particular, a persisted activation intent is a
+        // rollback journal only after an in-flight activation has stopped. If
+        // reconcile races the live activation between RTM_NEWLINK and the
+        // active-profile commit, it can otherwise delete the interface that
+        // activate() is still configuring. Serialize all three paths through
+        // the same lock so a launch intent cannot be mistaken for crash residue.
+        let _activation_guard = self.activation_lock.lock().await;
+
+        let persisted = self.active_profile_store.load().await?;
+        let intent = self.activation_intent_store.load().await?;
+
         if !self.driver.link_exists(interface).await? {
-            if self
-                .active_profile_store
-                .load()
-                .await?
+            if persisted
                 .as_ref()
                 .is_some_and(|persisted| persisted.interface == interface)
             {
                 self.active_profile_store.clear().await?;
+            }
+            if intent
+                .as_ref()
+                .is_some_and(|intent| intent.interface == interface)
+            {
+                self.activation_intent_store.clear().await?;
             }
             self.owned
                 .lock()
@@ -431,8 +573,11 @@ impl<D: VpnDriver> VpnManager<D> {
             return Ok(ReconcileOutcome::Absent);
         }
 
-        let persisted = self.active_profile_store.load().await?;
-        if let Some(persisted) = persisted {
+        // A durable active-profile record is the commit point. Prefer its
+        // public-key proof over any leftover activation intent. If it matches,
+        // the activation committed before the crash and the intent is merely a
+        // stale journal entry.
+        if let Some(persisted) = persisted.as_ref() {
             if persisted.interface == interface {
                 let decoded = BASE64
                     .decode(&persisted.ownership_proof_base64)
@@ -444,21 +589,52 @@ impl<D: VpnDriver> VpnManager<D> {
                         let record = OwnedInterfaceRecord {
                             interface: interface.to_string(),
                             ownership_proof: persisted_proof,
-                            profile_name: persisted.profile_name,
+                            profile_name: persisted.profile_name.clone(),
                         };
                         self.owned
                             .lock()
                             .expect("owned mutex poisoned")
                             .insert(interface.to_string(), record.clone());
+                        if intent
+                            .as_ref()
+                            .is_some_and(|intent| intent.interface == interface)
+                        {
+                            self.activation_intent_store.clear().await?;
+                        }
                         return Ok(ReconcileOutcome::Adopted(record));
                     }
                 } else {
                     tracing::warn!(
-                        interface = interface,
+                        interface,
                         "persisted active-profile ownership proof could not be decoded; \
                          treating the surviving interface as foreign rather than adopting it"
                     );
                 }
+
+                // Once the active record exists, a proof mismatch is treated as
+                // foreign/tampered state even if a stale launch marker happens
+                // to remain. Never let the weaker journal marker override the
+                // committed ownership proof.
+                return Ok(ReconcileOutcome::ForeignInterfacePresent);
+            }
+        }
+
+        // No committed record exists for this interface. A matching launch
+        // marker means the process died during activation, so roll back only
+        // the interface whose alias proves it was created by this intent.
+        if let Some(intent) = intent.as_ref() {
+            if intent.interface == interface
+                && self
+                    .driver
+                    .delete_if_launch_marker(interface, &intent.launch_marker)
+                    .await?
+            {
+                self.activation_intent_store.clear().await?;
+                self.owned
+                    .lock()
+                    .expect("owned mutex poisoned")
+                    .remove(interface);
+                return Ok(ReconcileOutcome::Absent);
             }
         }
 
@@ -563,6 +739,15 @@ mod tests {
             .expect("import");
 
         manager.activate("home.conf").await.expect("activate");
+        assert_eq!(
+            manager
+                .activation_intent_store
+                .load()
+                .await
+                .expect("load activation intent"),
+            None,
+            "successful activation must clean its write-ahead intent"
+        );
 
         let active = manager.active().expect("should be active");
         assert_eq!(active.interface, OWNED_INTERFACE_NAME);
@@ -702,6 +887,55 @@ mod tests {
         assert!(fake.link_exists(OWNED_INTERFACE_NAME).await.unwrap());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_waits_for_in_flight_activation_before_rolling_back_intent() {
+        use tokio::time::{timeout, Duration};
+
+        let (manager, fake, _dir) = manager_with_store();
+        let manager = std::sync::Arc::new(manager);
+        let marker = "traffic-masq:vpn:in-flight";
+
+        // Model the exact crash-journal state visible after create_link but
+        // before the active-profile commit, while an activation still owns the
+        // mutation lock. Reconcile must not treat this as abandoned state until
+        // that activation is no longer in flight.
+        let guard = manager.activation_lock.lock().await;
+        manager
+            .activation_intent_store
+            .save(&PersistedActivationIntent {
+                profile_name: "home.conf".to_string(),
+                interface: OWNED_INTERFACE_NAME.to_string(),
+                launch_marker: marker.to_string(),
+            })
+            .await
+            .expect("save intent");
+        fake.create_link(
+            OWNED_INTERFACE_NAME,
+            &WireGuardKey::parse(VALID_PRIVATE_KEY, "test").unwrap(),
+            None,
+            marker,
+        )
+        .await
+        .expect("create pending link");
+
+        let reconcile_manager = manager.clone();
+        let mut reconcile = tokio::spawn(async move { reconcile_manager.reconcile().await });
+
+        assert!(
+            timeout(Duration::from_millis(50), &mut reconcile).await.is_err(),
+            "reconcile must wait while activation owns the mutation lock"
+        );
+        assert!(
+            fake.link_exists(OWNED_INTERFACE_NAME).await.unwrap(),
+            "reconcile must not delete an interface belonging to an in-flight activation"
+        );
+
+        drop(guard);
+        let outcome = reconcile.await.expect("reconcile task").expect("reconcile");
+        assert_eq!(outcome, ReconcileOutcome::Absent);
+        assert!(!fake.link_exists(OWNED_INTERFACE_NAME).await.unwrap());
+    }
+
     #[tokio::test]
     async fn deactivate_refuses_to_touch_foreign_interface_that_replaced_owned_one() {
         let (manager, fake, _dir) = manager_with_store();
@@ -734,6 +968,7 @@ mod tests {
             OWNED_INTERFACE_NAME,
             &WireGuardKey::parse(VALID_PRIVATE_KEY, "test").unwrap(),
             None,
+            "test-launch-marker",
         )
         .await
         .unwrap();
@@ -783,6 +1018,132 @@ mod tests {
 
         assert_eq!(outcome, ReconcileOutcome::Absent);
         assert!(manager.active().is_none());
+    }
+
+    #[tokio::test]
+    async fn reconcile_clears_intent_when_crash_preceded_link_creation() {
+        let dir = tempdir().expect("tempdir");
+        let active_profile_store = ActiveProfileStore::new(dir.path().join("active-profile.json"));
+        let intent_store = ActivationIntentStore::for_active_profile(&active_profile_store);
+        intent_store
+            .save(&PersistedActivationIntent {
+                profile_name: "home.conf".to_string(),
+                interface: OWNED_INTERFACE_NAME.to_string(),
+                launch_marker: "traffic-masq:vpn:pre-create".to_string(),
+            })
+            .await
+            .expect("persist activation intent");
+
+        let store = WireGuardProfileStore::new(dir.path().join("wireguard"));
+        let (provider, fake) = fake_provider();
+        let driver = WireGuardVpnDriver::new(provider, store);
+        let manager = VpnManager::new(driver, active_profile_store);
+
+        let outcome = manager.reconcile().await.expect("reconcile");
+
+        assert_eq!(outcome, ReconcileOutcome::Absent);
+        assert!(!fake.link_exists(OWNED_INTERFACE_NAME).await.unwrap());
+        assert_eq!(intent_store.load().await.expect("load intent"), None);
+    }
+
+    #[tokio::test]
+    async fn reconcile_rolls_back_matching_uncommitted_activation_intent() {
+        let dir = tempdir().expect("tempdir");
+        let active_profile_store = ActiveProfileStore::new(dir.path().join("active-profile.json"));
+        let intent_store = ActivationIntentStore::for_active_profile(&active_profile_store);
+        let marker = "traffic-masq:vpn:pending-test";
+        intent_store
+            .save(&PersistedActivationIntent {
+                profile_name: "home.conf".to_string(),
+                interface: OWNED_INTERFACE_NAME.to_string(),
+                launch_marker: marker.to_string(),
+            })
+            .await
+            .expect("persist activation intent");
+
+        let store = WireGuardProfileStore::new(dir.path().join("wireguard"));
+        let (provider, fake) = fake_provider();
+        fake.create_link(
+            OWNED_INTERFACE_NAME,
+            &WireGuardKey::parse(VALID_PRIVATE_KEY, "test").unwrap(),
+            None,
+            marker,
+        )
+        .await
+        .expect("seed interrupted activation");
+        let driver = WireGuardVpnDriver::new(provider, store);
+        let manager = VpnManager::new(driver, active_profile_store);
+
+        let outcome = manager.reconcile().await.expect("reconcile");
+
+        assert_eq!(outcome, ReconcileOutcome::Absent);
+        assert!(!fake.link_exists(OWNED_INTERFACE_NAME).await.unwrap());
+        assert_eq!(intent_store.load().await.expect("load intent"), None);
+    }
+
+    #[tokio::test]
+    async fn reconcile_never_deletes_interface_when_activation_marker_mismatches() {
+        let dir = tempdir().expect("tempdir");
+        let active_profile_store = ActiveProfileStore::new(dir.path().join("active-profile.json"));
+        let intent_store = ActivationIntentStore::for_active_profile(&active_profile_store);
+        intent_store
+            .save(&PersistedActivationIntent {
+                profile_name: "home.conf".to_string(),
+                interface: OWNED_INTERFACE_NAME.to_string(),
+                launch_marker: "traffic-masq:vpn:ours".to_string(),
+            })
+            .await
+            .expect("persist activation intent");
+
+        let store = WireGuardProfileStore::new(dir.path().join("wireguard"));
+        let (provider, fake) = fake_provider();
+        fake.seed_foreign_link(OWNED_INTERFACE_NAME, OTHER_PRIVATE_KEY);
+        let driver = WireGuardVpnDriver::new(provider, store);
+        let manager = VpnManager::new(driver, active_profile_store);
+
+        let outcome = manager.reconcile().await.expect("reconcile");
+
+        assert_eq!(outcome, ReconcileOutcome::ForeignInterfacePresent);
+        assert!(fake.link_exists(OWNED_INTERFACE_NAME).await.unwrap());
+        assert!(intent_store.load().await.expect("load intent").is_some());
+    }
+
+    #[tokio::test]
+    async fn reconcile_prefers_committed_active_record_over_stale_activation_intent() {
+        let dir = tempdir().expect("tempdir");
+        let store = WireGuardProfileStore::new(dir.path().join("wireguard"));
+        let active_profile_store = ActiveProfileStore::new(dir.path().join("active-profile.json"));
+        let intent_store = ActivationIntentStore::for_active_profile(&active_profile_store);
+        let (provider, fake) = fake_provider();
+        let driver = WireGuardVpnDriver::new(provider, store);
+        let manager = VpnManager::new(driver, active_profile_store.clone());
+        manager
+            .import_profile("home.conf", valid_config(VALID_PRIVATE_KEY).as_bytes())
+            .expect("import");
+        manager.activate("home.conf").await.expect("activate");
+        let original = manager.active().expect("active");
+        let marker = fake
+            .launch_marker_for(OWNED_INTERFACE_NAME)
+            .expect("marker");
+        intent_store
+            .save(&PersistedActivationIntent {
+                profile_name: "home.conf".to_string(),
+                interface: OWNED_INTERFACE_NAME.to_string(),
+                launch_marker: marker,
+            })
+            .await
+            .expect("recreate stale intent");
+
+        let restarted_store = WireGuardProfileStore::new(dir.path().join("wireguard"));
+        let same_provider: std::sync::Arc<dyn VpnProvider> = fake.clone();
+        let restarted_driver = WireGuardVpnDriver::new(same_provider, restarted_store);
+        let restarted = VpnManager::new(restarted_driver, active_profile_store);
+
+        let outcome = restarted.reconcile().await.expect("reconcile");
+
+        assert_eq!(outcome, ReconcileOutcome::Adopted(original));
+        assert!(fake.link_exists(OWNED_INTERFACE_NAME).await.unwrap());
+        assert_eq!(intent_store.load().await.expect("load intent"), None);
     }
 
     #[tokio::test]

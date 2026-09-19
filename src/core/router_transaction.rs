@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::sync::{Mutex, MutexGuard};
+use tokio::sync::{watch, Mutex, MutexGuard};
 
 use crate::core::override_manager::RuntimeOverrideManager;
 use crate::core::router::{RouterDesired, RouterManager, RouterPlan, RouterSnapshot};
@@ -116,6 +116,7 @@ struct Inner {
     journal: std::path::PathBuf,
     token_counter: AtomicU64,
     timeout_mutation_gate: StdRwLock<Option<Arc<NetworkMutationGate>>>,
+    idle_epoch: watch::Sender<u64>,
 }
 
 #[derive(Clone)]
@@ -138,6 +139,7 @@ impl RouterTransactionCoordinator {
                 state: Mutex::new(CoordinatorState::Idle),
                 token_counter: AtomicU64::new(0),
                 timeout_mutation_gate: StdRwLock::new(None),
+                idle_epoch: watch::channel(0).0,
             }),
         }
     }
@@ -203,7 +205,14 @@ impl RouterTransactionCoordinator {
         if let Err(error) = self.inner.manager.apply(&plan.plan).await {
             // Retry the complete snapshot: a failed apply may also have failed
             // its compensation. Keep the journal until restoration succeeds.
-            let failures = self.inner.manager.rollback_to(&current_snapshot).await;
+            let mut failures = self.rollback_snapshot(&token, &current_snapshot).await;
+            if failures.is_empty() {
+                if let Err(ownership_error) = self.retain_committed_router_interfaces().await {
+                    failures.push(format!(
+                        "failed to restore committed router ownership: {ownership_error:#}"
+                    ));
+                }
+            }
             if failures.is_empty() {
                 if let Err(cleanup_error) = self.clear_journal().await {
                     *state = CoordinatorState::RollbackFailed(RollbackFailure {
@@ -219,12 +228,16 @@ impl RouterTransactionCoordinator {
                     )));
                 }
             } else {
+                let recovery = failures.join("; ");
                 *state = CoordinatorState::RollbackFailed(RollbackFailure {
                     token: token.clone(),
                     candidate: plan.candidate,
                     snapshot: current_snapshot,
                     failures,
                 });
+                return Err(error.context(format!(
+                    "router rollback recovery remains required: {recovery}"
+                )));
             }
             return Err(error);
         }
@@ -274,7 +287,16 @@ impl RouterTransactionCoordinator {
         if let Err(error) = result {
             let mut failures = self.inner.manager.rollback_to(&snapshot).await;
             if failures.is_empty() {
-                if let Err(cleanup) = self.clear_journal().await { failures.push(cleanup.to_string()); }
+                if let Err(ownership_error) = self.retain_committed_router_interfaces().await {
+                    failures.push(format!(
+                        "failed to restore committed router ownership: {ownership_error:#}"
+                    ));
+                }
+            }
+            if failures.is_empty() {
+                if let Err(cleanup) = self.clear_journal().await {
+                    failures.push(cleanup.to_string());
+                }
             }
             if !failures.is_empty() {
                 *state = CoordinatorState::RollbackFailed(RollbackFailure {
@@ -282,6 +304,17 @@ impl RouterTransactionCoordinator {
                 });
             }
             return Err(error);
+        }
+        if let Err(error) = self.retain_committed_router_interfaces().await {
+            *state = CoordinatorState::RollbackFailed(RollbackFailure {
+                token,
+                candidate,
+                snapshot,
+                failures: vec![format!(
+                    "failed to settle committed router ownership: {error:#}"
+                )],
+            });
+            return Err(error.context("router repair applied but ownership settlement failed"));
         }
         if let Err(error) = self.clear_journal().await {
             // Keep recovery ownership until the durable journal is resolved.
@@ -327,6 +360,7 @@ impl RouterTransactionCoordinator {
         self.inner.manager.retain_router_interfaces(&owned).await;
 
         *state = CoordinatorState::Idle;
+        self.notify_idle();
         // The persisted revision is authoritative if removal fails or the
         // process dies here. Recovery must never undo a committed revision.
         if let Err(error) = self.clear_journal().await {
@@ -372,6 +406,29 @@ impl RouterTransactionCoordinator {
         }
     }
 
+    /// Wait until a pending/recovery transaction has returned to idle.
+    ///
+    /// The epoch watch closes the race between checking `status()` and
+    /// registering the wakeup: an idle transition that happens in between is
+    /// retained as a changed watch value.
+    pub async fn wait_until_idle(&self) {
+        let mut idle = self.inner.idle_epoch.subscribe();
+        loop {
+            if self.status().await == CoordinatorStatus::Idle {
+                return;
+            }
+            if idle.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    fn notify_idle(&self) {
+        self.inner
+            .idle_epoch
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+    }
+
     pub async fn rollback_failure(&self) -> Option<RollbackFailure> {
         match &*self.inner.state.lock().await {
             CoordinatorState::RollbackFailed(failure) => Some(failure.clone()),
@@ -398,20 +455,20 @@ impl RouterTransactionCoordinator {
             CoordinatorState::Idle => return Err(NoPendingTransactionError.into()),
         };
 
-        let failures = self.inner.manager.rollback_to(&snapshot).await;
+        let mut failures = self.rollback_snapshot(&token, &snapshot).await;
         if failures.is_empty() {
-            // The snapshot names what was actually on the machine when the
-            // transaction started, so this at least drops hardware that has
-            // since vanished. It is not an exact revert of ownership: the
-            // aborted intent's interfaces stay owned until the next commit
-            // narrows them, which is the harmless direction to err in.
-            let owned: Vec<String> = snapshot
-                .interfaces
-                .iter()
-                .map(|entry| entry.name.clone())
-                .collect();
-            self.inner.manager.retain_router_interfaces(&owned).await;
-
+            // Applying a candidate widens the volatile ownership scope before
+            // its apply-time snapshot. The snapshot therefore contains both
+            // committed and candidate-only interfaces and cannot be used to
+            // decide what remains owned after an abort. Restore ownership from
+            // the durable committed intent instead.
+            if let Err(error) = self.retain_committed_router_interfaces().await {
+                failures.push(format!(
+                    "failed to restore committed router ownership: {error:#}"
+                ));
+            }
+        }
+        if failures.is_empty() {
             if let Err(error) = self.clear_journal().await {
                 **state = CoordinatorState::RollbackFailed(RollbackFailure {
                     token,
@@ -422,6 +479,7 @@ impl RouterTransactionCoordinator {
                 return Err(error.context("network restored but rollback journal cleanup failed"));
             }
             **state = CoordinatorState::Idle;
+            self.notify_idle();
             if trigger == RollbackTrigger::Timeout {
                 tracing::warn!("router transaction automatically rolled back after timeout");
             }
@@ -436,6 +494,49 @@ impl RouterTransactionCoordinator {
             });
             Err(anyhow::anyhow!("router rollback failed: {message}"))
         }
+    }
+
+    async fn rollback_snapshot(&self, token: &str, snapshot: &RouterSnapshot) -> Vec<String> {
+        let secrets = crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore::in_state_dir(
+            self.inner.overrides.path().parent().expect("override store has a parent"),
+        );
+        // Runtime restoration can need the old credentials to start a station
+        // or AP. Restore them before the snapshot, including apply compensation
+        // where the provisioning journal has not been bound to a token yet.
+        let restored = secrets
+            .restore_for_token_or_unbound_for_reconvergence(token)
+            .await;
+        let mut failures = self.inner.manager.rollback_to(snapshot).await;
+        match restored {
+            Err(error) => {
+                failures.push(format!("failed to restore provisioning secrets: {error:#}"))
+            }
+            Ok(true) if failures.is_empty() => {
+                if let Err(error) = secrets.complete_reconvergence().await {
+                    failures.push(format!(
+                        "failed to clear provisioning secret journal: {error:#}"
+                    ));
+                }
+            }
+            _ => {}
+        }
+        failures
+    }
+
+    async fn retain_committed_router_interfaces(&self) -> Result<()> {
+        let committed = self
+            .inner
+            .overrides
+            .build_candidate(&crate::core::router_candidate::RouterIntentProposal::new())
+            .await?;
+        let owned = committed
+            .desired()
+            .interfaces
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
+        self.inner.manager.retain_router_interfaces(&owned).await;
+        Ok(())
     }
 
     async fn rollback_timeout_fired(&self, token: &str) {
@@ -552,6 +653,12 @@ impl RouterTransactionCoordinator {
             );
             tracing::warn!("restored interrupted router transaction");
         }
+        // Rebuild volatile ownership from the durable committed intent for both
+        // aborted and already-committed journals. This keeps recovery correct
+        // even if the manager was constructed with a wider transient scope.
+        self.retain_committed_router_interfaces()
+            .await
+            .context("failed to restore committed router ownership during recovery")?;
         self.clear_journal().await?;
         Ok(!committed)
     }
@@ -649,6 +756,8 @@ mod tests {
         apply_fail: StdMutex<Option<&'static str>>,
         rollback_fail: StdMutex<Option<&'static str>>,
         drifted: StdMutex<bool>,
+        retained: StdMutex<Vec<Vec<String>>>,
+        rollback_secret: StdMutex<Option<std::path::PathBuf>>,
     }
 
     impl FakeSubsystems {
@@ -658,6 +767,8 @@ mod tests {
                 apply_fail: StdMutex::new(None),
                 rollback_fail: StdMutex::new(None),
                 drifted: StdMutex::new(false),
+                retained: StdMutex::new(Vec::new()),
+                rollback_secret: StdMutex::new(None),
             })
         }
 
@@ -675,6 +786,10 @@ mod tests {
 
         fn events(&self) -> Vec<String> {
             self.events.lock().unwrap().clone()
+        }
+
+        fn retained(&self) -> Vec<Vec<String>> {
+            self.retained.lock().unwrap().clone()
         }
 
         fn record(&self, event: &str) -> Result<()> {
@@ -735,6 +850,9 @@ mod tests {
             self.record("snapshot_interfaces")?;
             Ok(Vec::new())
         }
+        async fn retain_router_interfaces(&self, interfaces: &[String]) {
+            self.retained.lock().unwrap().push(interfaces.to_vec());
+        }
         async fn snapshot_routes(&self) -> Result<RouteSnapshot> {
             self.record("snapshot_routes")?;
             Ok(RouteSnapshot::empty())
@@ -760,6 +878,13 @@ mod tests {
             self.fail_if_matched("apply_dataplane", &self.apply_fail)
         }
         async fn rollback_interfaces(&self, _: &[InterfaceSnapshot]) -> Result<()> {
+            if let Some(root) = self.rollback_secret.lock().unwrap().as_ref() {
+                let store = crate::wifi::store::PassphraseStore::new(root.join("wifi/psk"));
+                anyhow::ensure!(
+                    store.get("wlan0")?.is_some_and(|secret| secret.expose() == "old-password"),
+                    "runtime rollback needs the original Wi-Fi credential"
+                );
+            }
             self.fail_if_matched("rollback_interfaces", &self.rollback_fail)
         }
         async fn rollback_routes(&self, _: &RouteSnapshot) -> Result<()> {
@@ -840,6 +965,15 @@ mod tests {
             .write_journal(candidate.base_revision(), "test-transaction", &snapshot, candidate.desired())
             .await
             .unwrap();
+        let expected = overrides
+            .build_candidate(&RouterIntentProposal::new())
+            .await
+            .expect("committed candidate")
+            .desired()
+            .interfaces
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
         let restored = RouterTransactionCoordinator::new(
             coordinator.manager(),
             overrides,
@@ -850,6 +984,7 @@ mod tests {
             .events()
             .iter()
             .any(|event| event == "rollback_interfaces"));
+        assert_eq!(fake.retained().last(), Some(&expected));
         assert!(!restored.inner.journal.exists());
     }
 
@@ -871,6 +1006,15 @@ mod tests {
             .commit_candidate_with_token(&candidate, Some("test-transaction"))
             .await
             .unwrap();
+        let expected = overrides
+            .build_candidate(&RouterIntentProposal::new())
+            .await
+            .expect("committed candidate")
+            .desired()
+            .interfaces
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
         let restored = RouterTransactionCoordinator::new(
             coordinator.manager(),
             overrides,
@@ -881,6 +1025,7 @@ mod tests {
             .events()
             .iter()
             .any(|event| event.starts_with("rollback_")));
+        assert_eq!(fake.retained().last(), Some(&expected));
         assert!(!restored.inner.journal.exists());
     }
 
@@ -965,6 +1110,7 @@ mod tests {
                 state: Mutex::new(CoordinatorState::Idle),
                 token_counter: AtomicU64::new(0),
                 timeout_mutation_gate: StdRwLock::new(None),
+                idle_epoch: watch::channel(0).0,
             }),
         };
 
@@ -1232,6 +1378,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wait_until_idle_wakes_after_rollback() {
+        let fake = FakeSubsystems::new();
+        let (coordinator, overrides, _directory) = coordinator_with(fake).await;
+        let candidate = build_candidate(&overrides).await;
+        let plan = coordinator.plan(candidate).await.expect("plan");
+        coordinator.apply(plan).await.expect("apply");
+
+        let waiter = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move { coordinator.wait_until_idle().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        coordinator.rollback().await.expect("rollback");
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("idle waiter wake")
+            .expect("waiter task");
+    }
+
+    async fn stage_test_secret(
+        directory: &std::path::Path,
+    ) -> crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore {
+        use crate::wifi::{secret::WifiPassphrase, store::PassphraseStore};
+        let secrets = crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore::in_state_dir(directory);
+        secrets
+            .stage(std::collections::BTreeMap::from([(
+                "wlan0".into(),
+                Some(WifiPassphrase::new("old-password").unwrap()),
+            )]))
+            .await
+            .unwrap();
+        PassphraseStore::new(directory.join("wifi/psk"))
+            .set("wlan0", &WifiPassphrase::new("new-password").unwrap())
+            .unwrap();
+        secrets
+    }
+
+    #[tokio::test]
+    async fn provisioning_timeout_restores_secrets_before_runtime_rollback() {
+        let fake = FakeSubsystems::new();
+        let (_, overrides, directory) = coordinator_with(fake.clone()).await;
+        let coordinator = RouterTransactionCoordinator::new(
+            RouterManager::new(fake.clone()),
+            overrides.clone(),
+            Duration::from_secs(60),
+        );
+        let secrets = stage_test_secret(directory.path()).await;
+        *fake.rollback_secret.lock().unwrap() = Some(directory.path().to_path_buf());
+        let plan = coordinator
+            .plan(build_candidate(&overrides).await)
+            .await
+            .unwrap();
+        let token = coordinator.apply(plan).await.unwrap();
+        secrets.bind_token(&token).await.unwrap();
+
+        coordinator.rollback_timeout_fired(&token).await;
+
+        assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
+        assert!(!secrets
+            .unresolved_after_committed_cleanup(None)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn provisioning_rollback_failure_retains_secret_journal_for_retry() {
+        let fake = FakeSubsystems::new();
+        let (_, overrides, directory) = coordinator_with(fake.clone()).await;
+        let coordinator = RouterTransactionCoordinator::new(
+            RouterManager::new(fake.clone()),
+            overrides.clone(),
+            Duration::from_secs(60),
+        );
+        let secrets = stage_test_secret(directory.path()).await;
+        *fake.rollback_secret.lock().unwrap() = Some(directory.path().to_path_buf());
+        let plan = coordinator
+            .plan(build_candidate(&overrides).await)
+            .await
+            .unwrap();
+        let token = coordinator.apply(plan).await.unwrap();
+        secrets.bind_token(&token).await.unwrap();
+        fake.fail_rollback("rollback_dhcp");
+
+        assert!(coordinator.rollback_with_token(&token).await.is_err());
+        assert_eq!(
+            coordinator.status().await,
+            CoordinatorStatus::RollbackFailed
+        );
+        assert!(secrets
+            .unresolved_after_committed_cleanup(None)
+            .await
+            .unwrap());
+        assert!(coordinator.commit(&token).await.is_err());
+
+        *fake.rollback_fail.lock().unwrap() = None;
+        coordinator.rollback_with_token(&token).await.unwrap();
+        assert!(!secrets
+            .unresolved_after_committed_cleanup(None)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn provisioning_secret_restore_failure_blocks_commit_and_can_be_retried() {
+        let fake = FakeSubsystems::new();
+        let (_, overrides, directory) = coordinator_with(fake.clone()).await;
+        let coordinator = RouterTransactionCoordinator::new(
+            RouterManager::new(fake),
+            overrides.clone(),
+            Duration::from_secs(60),
+        );
+        let secrets = stage_test_secret(directory.path()).await;
+        let plan = coordinator
+            .plan(build_candidate(&overrides).await)
+            .await
+            .unwrap();
+        let token = coordinator.apply(plan).await.unwrap();
+        secrets.bind_token(&token).await.unwrap();
+        let secret_path = directory.path().join("wifi/psk/wlan0");
+        std::fs::remove_file(&secret_path).unwrap();
+        std::fs::create_dir(&secret_path).unwrap();
+
+        assert!(coordinator.rollback_with_token(&token).await.is_err());
+        assert_eq!(
+            coordinator.status().await,
+            CoordinatorStatus::RollbackFailed
+        );
+        assert!(coordinator.commit(&token).await.is_err());
+        assert!(secrets
+            .unresolved_after_committed_cleanup(None)
+            .await
+            .unwrap());
+
+        std::fs::remove_dir(&secret_path).unwrap();
+        coordinator.rollback_with_token(&token).await.unwrap();
+        assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
+        assert!(!secrets
+            .unresolved_after_committed_cleanup(None)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn provisioning_apply_failure_restores_unbound_secret_before_compensation() {
+        let fake = FakeSubsystems::new();
+        let (coordinator, overrides, directory) = coordinator_with(fake.clone()).await;
+        let secrets = stage_test_secret(directory.path()).await;
+        *fake.rollback_secret.lock().unwrap() = Some(directory.path().to_path_buf());
+        fake.fail_apply("apply_routes");
+        let plan = coordinator
+            .plan(build_candidate(&overrides).await)
+            .await
+            .unwrap();
+
+        assert!(coordinator.apply(plan).await.is_err());
+        assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
+        assert!(!secrets
+            .unresolved_after_committed_cleanup(None)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
     async fn timeout_rolls_back_uncommitted_transaction() {
         let fake = FakeSubsystems::new();
         let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
@@ -1266,6 +1577,77 @@ mod tests {
             .events()
             .iter()
             .any(|event| event.starts_with("rollback_")));
+    }
+
+    #[tokio::test]
+    async fn rollback_restores_router_ownership_from_committed_intent() {
+        let fake = FakeSubsystems::new();
+        let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
+
+        let initial = build_candidate(&overrides).await;
+        let initial_plan = coordinator.plan(initial).await.expect("initial plan");
+        let initial_token = coordinator.apply(initial_plan).await.expect("initial apply");
+        coordinator.commit(&initial_token).await.expect("initial commit");
+
+        let expected = overrides
+            .build_candidate(&RouterIntentProposal::new())
+            .await
+            .expect("committed candidate")
+            .desired()
+            .interfaces
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
+
+        let candidate = overrides
+            .build_candidate(&RouterIntentProposal::new().set_interface(
+                "lan1",
+                output_interface("192.168.20.1/24", 100, 150),
+                false,
+            ))
+            .await
+            .expect("candidate with extra interface");
+        let plan = coordinator.plan(candidate).await.expect("plan");
+        coordinator.apply(plan).await.expect("apply");
+        coordinator.rollback().await.expect("rollback");
+
+        assert_eq!(fake.retained().last(), Some(&expected));
+    }
+
+    #[tokio::test]
+    async fn apply_failure_restores_router_ownership_from_committed_intent() {
+        let fake = FakeSubsystems::new();
+        let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
+
+        let initial = build_candidate(&overrides).await;
+        let initial_plan = coordinator.plan(initial).await.expect("initial plan");
+        let initial_token = coordinator.apply(initial_plan).await.expect("initial apply");
+        coordinator.commit(&initial_token).await.expect("initial commit");
+
+        let expected = overrides
+            .build_candidate(&RouterIntentProposal::new())
+            .await
+            .expect("committed candidate")
+            .desired()
+            .interfaces
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
+
+        let candidate = overrides
+            .build_candidate(&RouterIntentProposal::new().set_interface(
+                "lan1",
+                output_interface("192.168.20.1/24", 100, 150),
+                false,
+            ))
+            .await
+            .expect("candidate with extra interface");
+        let plan = coordinator.plan(candidate).await.expect("plan");
+        fake.fail_apply("apply_dhcp");
+        coordinator.apply(plan).await.expect_err("apply must fail");
+
+        assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
+        assert_eq!(fake.retained().last(), Some(&expected));
     }
 
     #[tokio::test]

@@ -15,7 +15,8 @@ use crate::config::{
     AppConfig, DhcpClientInterfaceConfig, InterfaceConfig, InterfaceRole, ShutdownPolicy,
 };
 use crate::dhcp::client::lease::{
-    DhcpClientLease, DhcpClientLeaseState, DhcpClientOwnedRoute, DHCP_CLIENT_LEASE_SCHEMA_VERSION,
+    DhcpClientLease, DhcpClientLeasePolicy, DhcpClientLeaseState, DhcpClientOwnedRoute,
+    DHCP_CLIENT_LEASE_SCHEMA_VERSION,
 };
 use crate::dhcp::client::ownership::DhcpClientOwnershipApplier;
 use crate::dhcp::client::packet::ClientPacketBuilder;
@@ -272,7 +273,9 @@ impl DhcpClientSupervisor {
             }),
         };
 
-        for spec in Self::effective_specs(config)? {
+        let specs = Self::effective_specs(config)?;
+        supervisor.recover_persisted_leases(&specs).await?;
+        for spec in specs {
             let link_ready = config
                 .network
                 .interfaces
@@ -292,6 +295,34 @@ impl DhcpClientSupervisor {
             }
         }
         Ok(specs.into_values().collect())
+    }
+
+    async fn recover_persisted_leases(&self, specs: &[DhcpClientSpec]) -> Result<()> {
+        for interface in self.inner.applier.persisted_interfaces()? {
+            let committed = specs.iter().find(|spec| spec.interface == interface);
+            let reason = match committed {
+                None => Some("no committed DHCP client configuration"),
+                Some(spec) => match self.inner.applier.persisted_lease(&interface)? {
+                    Some(lease) if persisted_lease_matches_spec(&lease, spec) => None,
+                    Some(_) => Some("persisted lease does not match committed DHCP client policy"),
+                    None => continue,
+                },
+            };
+            let Some(reason) = reason else {
+                continue;
+            };
+            tracing::warn!(%interface, %reason, "cleaning up persisted DHCP ownership during startup recovery");
+            self.inner
+                .applier
+                .cleanup(&interface)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to clean up persisted DHCP ownership for {interface}: {reason}"
+                    )
+                })?;
+        }
+        Ok(())
     }
 
     pub async fn configure(&self, spec: DhcpClientSpec) {
@@ -726,20 +757,20 @@ impl DhcpClientSupervisor {
         if !link_ready {
             return;
         }
-        let remembered = match self.adopt_persisted_lease(interface).await {
-            Ok(remembered) => remembered,
-            Err(error) => {
-                tracing::error!(%interface, %error, "unresolved persisted DHCP ownership blocks client start");
-                self.record_failure(interface, error.to_string()).await;
-                return;
-            }
-        };
         let (spec, shared) = {
             let tasks = self.inner.tasks.lock().await;
             let Some(task) = tasks.get(interface) else {
                 return;
             };
             (task.spec.clone(), task.shared.clone())
+        };
+        let remembered = match self.adopt_persisted_lease(interface, &spec).await {
+            Ok(remembered) => remembered,
+            Err(error) => {
+                tracing::error!(%interface, %error, "unresolved persisted DHCP ownership blocks client start");
+                self.record_failure(interface, error.to_string()).await;
+                return;
+            }
         };
         {
             let mut state = shared.lock().await;
@@ -785,7 +816,25 @@ impl DhcpClientSupervisor {
         }
     }
 
-    async fn adopt_persisted_lease(&self, interface: &str) -> Result<Option<DhcpClientLease>> {
+    async fn adopt_persisted_lease(
+        &self,
+        interface: &str,
+        spec: &DhcpClientSpec,
+    ) -> Result<Option<DhcpClientLease>> {
+        if let Some(lease) = self.inner.applier.persisted_lease(interface)? {
+            if !persisted_lease_matches_spec(&lease, spec) {
+                tracing::warn!(
+                    %interface,
+                    "persisted DHCP lease does not match committed client policy; cleaning it up before reacquiring"
+                );
+                return match self.inner.applier.cleanup(interface).await {
+                    Ok(()) => Ok(None),
+                    Err(cleanup) => Err(anyhow::anyhow!(
+                        "persisted DHCP ownership does not match committed policy and cleanup failed ({cleanup}); recovery required"
+                    )),
+                };
+            }
+        }
         match self
             .inner
             .applier
@@ -969,6 +1018,11 @@ impl OwnershipSink {
             interface_index: self.identity.index,
             hardware_address: self.identity.hardware_address.to_vec(),
             client_identifier: client_identifier(self.identity.hardware_address),
+            policy: Some(DhcpClientLeasePolicy {
+                route_metric: self.spec.route_metric,
+                install_default_route: self.spec.install_default_route,
+                request_dns: self.spec.request_dns,
+            }),
             server_identifier: lease.server_identifier,
             address: lease.address,
             prefix_len: lease.prefix_len,
@@ -1014,6 +1068,48 @@ impl OwnershipSink {
         }
         routes
     }
+}
+
+fn persisted_lease_matches_spec(lease: &DhcpClientLease, spec: &DhcpClientSpec) -> bool {
+    lease.policy.as_ref()
+        == Some(&DhcpClientLeasePolicy {
+            route_metric: spec.route_metric,
+            install_default_route: spec.install_default_route,
+            request_dns: spec.request_dns,
+        })
+        && lease.owned_routes == expected_owned_routes(lease, spec)
+}
+
+fn expected_owned_routes(
+    lease: &DhcpClientLease,
+    spec: &DhcpClientSpec,
+) -> Vec<DhcpClientOwnedRoute> {
+    let mut routes = vec![DhcpClientOwnedRoute {
+        destination: Ipv4Net::new(lease.address, lease.prefix_len)
+            .expect("validated DHCP prefix")
+            .trunc(),
+        gateway: None,
+        output_interface_index: Some(lease.interface_index),
+        table: MAIN_ROUTE_TABLE,
+        metric: None,
+        protocol: TRAFFIC_MASQ_DHCP_ROUTE_PROTOCOL,
+        scope: LINK_ROUTE_SCOPE,
+    }];
+    if spec.install_default_route {
+        if let Some(gateway) = lease.routers.first().copied() {
+            routes.push(DhcpClientOwnedRoute {
+                destination: Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0)
+                    .expect("0.0.0.0/0 is valid"),
+                gateway: Some(gateway),
+                output_interface_index: Some(lease.interface_index),
+                table: MAIN_ROUTE_TABLE,
+                metric: Some(spec.route_metric),
+                protocol: TRAFFIC_MASQ_DHCP_ROUTE_PROTOCOL,
+                scope: GATEWAY_ROUTE_SCOPE,
+            });
+        }
+    }
+    routes
 }
 
 fn client_identifier(hardware_address: [u8; 6]) -> Vec<u8> {
@@ -1629,6 +1725,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_cleans_persisted_ownership_without_committed_client_intent() {
+        let state_dir = TempDir::new().expect("state dir");
+        let network = FakeNetwork::present(7).await;
+        let launcher = Arc::new(FakeLauncher::default());
+        let supervisor = supervisor_with(&state_dir, network.clone(), launcher.clone()).await;
+        let mut sink = launcher.take_sink();
+        sink.lease_acquired(lease(Ipv4Addr::new(192, 0, 2, 42)))
+            .await
+            .expect("lease applied");
+        supervisor.shutdown(ShutdownPolicy::PreserveInterfaces).await;
+
+        let restarted = DhcpClientSupervisor::start_with_launcher(
+            &config(&state_dir, None),
+            network.clone(),
+            launcher.clone(),
+        )
+        .await
+        .expect("restart without committed DHCP client");
+
+        assert!(restarted.status("wan0").await.is_none());
+        assert!(network.addresses.lock().await.is_empty());
+        assert!(network.routes.lock().await.is_empty());
+        let store = DhcpClientLeaseStore::new(state_dir.path()).expect("store");
+        assert!(store.load("wan0").expect("load").is_none());
+    }
+
+    #[tokio::test]
+    async fn restart_rejects_lease_from_uncommitted_route_policy() {
+        let state_dir = TempDir::new().expect("state dir");
+        let network = FakeNetwork::present(7).await;
+        let launcher = Arc::new(FakeLauncher::default());
+        let supervisor = DhcpClientSupervisor::start_with_launcher(
+            &config(&state_dir, None),
+            network.clone(),
+            launcher.clone(),
+        )
+        .await
+        .expect("supervisor");
+
+        let mut tentative = spec();
+        tentative.route_metric = 777;
+        supervisor.configure(tentative).await;
+        let mut sink = launcher.take_sink();
+        sink.lease_acquired(lease(Ipv4Addr::new(192, 0, 2, 42)))
+            .await
+            .expect("tentative lease applied");
+        supervisor.shutdown(ShutdownPolicy::PreserveInterfaces).await;
+        assert!(network
+            .routes
+            .lock()
+            .await
+            .iter()
+            .any(|route| route.metric == Some(777)));
+
+        let restarted = supervisor_with(&state_dir, network.clone(), launcher.clone()).await;
+        assert_eq!(
+            launcher.remembered.lock().unwrap().last(),
+            Some(&None),
+            "a lease acquired under an uncommitted route policy must not be adopted"
+        );
+        assert!(restarted.status("wan0").await.expect("status").lease.is_none());
+        assert!(network.addresses.lock().await.is_empty());
+        assert!(network.routes.lock().await.is_empty());
+    }
+
+    #[tokio::test]
     async fn a_still_valid_lease_is_adopted_on_restart_instead_of_reacquired() {
         let state_dir = TempDir::new().expect("state dir");
         let network = FakeNetwork::present(7).await;
@@ -2037,6 +2199,7 @@ mod tests {
             interface_index: 7,
             hardware_address: MAC.to_vec(),
             client_identifier: client_identifier(MAC),
+            policy: None,
             server_identifier: Ipv4Addr::new(192, 0, 2, 1),
             address: Ipv4Addr::new(192, 0, 2, 42),
             prefix_len: 24,

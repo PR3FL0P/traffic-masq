@@ -5,10 +5,10 @@
 //! every change the daemon makes itself, and it wakes up constantly to ask a
 //! question whose answer is almost always "nothing happened".
 //!
-//! rtnetlink already broadcasts every link, address and route change. Listening
-//! to it means the daemon reacts to *anyone* touching the network — dhcpcd, a
-//! hotplugged adapter, a person typing `ip addr` — as fast as the kernel can
-//! tell it.
+//! rtnetlink already broadcasts every link, address, route and policy-rule
+//! change. Listening to it means the daemon reacts to *anyone* touching the
+//! network — dhcpcd, a hotplugged adapter, a person typing `ip addr` or
+//! `ip rule` — as fast as the kernel can tell it.
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
@@ -24,6 +24,7 @@ use tokio::sync::mpsc;
 const RTNLGRP_LINK: u32 = 1;
 const RTNLGRP_IPV4_IFADDR: u32 = 5;
 const RTNLGRP_IPV4_ROUTE: u32 = 7;
+const RTNLGRP_IPV4_RULE: u32 = 8;
 
 /// What the kernel told us.
 ///
@@ -58,7 +59,7 @@ fn classify(message: &NetlinkMessage<RouteNetlinkMessage>) -> Option<KernelEvent
     }
 }
 
-/// Subscribe to link, IPv4 address and IPv4 route changes.
+/// Subscribe to link, IPv4 address, IPv4 route and IPv4 policy-rule changes.
 ///
 /// Returns a receiver that yields one event per relevant kernel notification.
 /// The connection and the forwarding task live until the receiver is dropped.
@@ -81,7 +82,12 @@ pub fn subscribe_to_kernel_changes() -> Result<mpsc::UnboundedReceiver<KernelEve
         .bind_auto()
         .context("failed to bind the rtnetlink notification socket")?;
 
-    for group in [RTNLGRP_LINK, RTNLGRP_IPV4_IFADDR, RTNLGRP_IPV4_ROUTE] {
+    for group in [
+        RTNLGRP_LINK,
+        RTNLGRP_IPV4_IFADDR,
+        RTNLGRP_IPV4_ROUTE,
+        RTNLGRP_IPV4_RULE,
+    ] {
         connection
             .socket_mut()
             .socket_mut()

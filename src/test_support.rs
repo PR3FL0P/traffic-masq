@@ -154,6 +154,22 @@ impl<R: Send + 'static> SupervisedProcess for FakeSupervisedProcess<R> {
             .is_some_and(|recorded| recorded == config_path))
     }
 
+    async fn pids_with_config_path(
+        &self,
+        _kind: crate::wifi::record::WifiProcessKind,
+        config_path: &Path,
+    ) -> Result<Vec<u32>, ProcessError> {
+        let mut pids: Vec<u32> = self
+            .configs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(pid, recorded)| (recorded == config_path).then_some(*pid))
+            .collect();
+        pids.sort_unstable();
+        Ok(pids)
+    }
+
     async fn terminate(&self, pid: u32) -> Result<(), ProcessError> {
         self.calls
             .lock()
@@ -377,6 +393,7 @@ impl NetworkProvider for FakeNetworkProvider {
 #[derive(Debug, Clone)]
 struct FakeVpnLink {
     private_key: WireGuardKey,
+    launch_marker: String,
     up: bool,
 }
 
@@ -393,9 +410,18 @@ impl FakeVpnProvider {
             name.to_string(),
             FakeVpnLink {
                 private_key: key,
+                launch_marker: "foreign".to_string(),
                 up: true,
             },
         );
+    }
+
+    pub(crate) fn launch_marker_for(&self, name: &str) -> Option<String> {
+        self.links
+            .lock()
+            .unwrap()
+            .get(name)
+            .map(|link| link.launch_marker.clone())
     }
 
     fn require_link(&self, name: &str) -> Result<(), ProviderError> {
@@ -425,6 +451,7 @@ impl VpnProvider for FakeVpnProvider {
         name: &str,
         private_key: &WireGuardKey,
         _listen_port: Option<u16>,
+        launch_marker: &str,
     ) -> Result<(), ProviderError> {
         let mut links = self.links.lock().unwrap();
         if links.contains_key(name) {
@@ -438,10 +465,29 @@ impl VpnProvider for FakeVpnProvider {
             name.to_string(),
             FakeVpnLink {
                 private_key: private_key.clone(),
+                launch_marker: launch_marker.to_string(),
                 up: false,
             },
         );
         Ok(())
+    }
+
+    async fn delete_link_if_launch_marker(
+        &self,
+        name: &str,
+        launch_marker: &str,
+    ) -> Result<bool, ProviderError> {
+        let matches = self
+            .links
+            .lock()
+            .unwrap()
+            .get(name)
+            .is_some_and(|link| link.launch_marker == launch_marker);
+        if !matches {
+            return Ok(false);
+        }
+        self.delete_link(name).await?;
+        Ok(true)
     }
 
     async fn set_addresses(
@@ -513,6 +559,7 @@ const STATIC_TEST_VPN_PUBLIC_KEY: &str =
 /// Minimal WireGuard provider for tests that only care about link lifecycle.
 pub(crate) struct StaticKeyVpnProvider {
     links: StdMutex<HashMap<String, bool>>,
+    launch_markers: StdMutex<HashMap<String, String>>,
     public_key: WireGuardKey,
 }
 
@@ -520,6 +567,7 @@ impl Default for StaticKeyVpnProvider {
     fn default() -> Self {
         Self {
             links: StdMutex::new(HashMap::new()),
+            launch_markers: StdMutex::new(HashMap::new()),
             public_key: WireGuardKey::parse(STATIC_TEST_VPN_PUBLIC_KEY, "test").unwrap(),
         }
     }
@@ -546,9 +594,32 @@ impl VpnProvider for StaticKeyVpnProvider {
         name: &str,
         _private_key: &WireGuardKey,
         _listen_port: Option<u16>,
+        launch_marker: &str,
     ) -> Result<(), ProviderError> {
         self.links.lock().unwrap().insert(name.to_string(), false);
+        self.launch_markers
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), launch_marker.to_string());
         Ok(())
+    }
+
+    async fn delete_link_if_launch_marker(
+        &self,
+        name: &str,
+        launch_marker: &str,
+    ) -> Result<bool, ProviderError> {
+        let matches = self
+            .launch_markers
+            .lock()
+            .unwrap()
+            .get(name)
+            .is_some_and(|marker| marker == launch_marker);
+        if !matches {
+            return Ok(false);
+        }
+        self.delete_link(name).await?;
+        Ok(true)
     }
 
     async fn set_addresses(
@@ -586,10 +657,9 @@ impl VpnProvider for StaticKeyVpnProvider {
     }
 
     async fn delete_link(&self, name: &str) -> Result<(), ProviderError> {
-        self.links
-            .lock()
-            .unwrap()
-            .remove(name)
+        let removed = self.links.lock().unwrap().remove(name);
+        self.launch_markers.lock().unwrap().remove(name);
+        removed
             .map(|_| ())
             .ok_or_else(|| ProviderError::NotFound(name.to_string()))
     }

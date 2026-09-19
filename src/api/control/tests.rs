@@ -1523,19 +1523,32 @@ fn router_and_vpn_base_config(wireguard_dir: std::path::PathBuf) -> AppConfig {
 struct VpnPolicyFixture {
     service: ControlService,
     overrides: RuntimeOverrideManager,
+    network: Arc<FakePolicyNetwork>,
     _directory: tempfile::TempDir,
 }
 
 async fn vpn_policy_fixture(activate_tunnel: bool) -> VpnPolicyFixture {
+    vpn_policy_fixture_with_router_chain(activate_tunnel, false).await
+}
+
+async fn vpn_policy_fixture_with_router_chain(
+    activate_tunnel: bool,
+    router_chain: bool,
+) -> VpnPolicyFixture {
     let directory = tempdir().expect("tempdir");
-    let config = router_and_vpn_base_config(directory.path().join("wireguard"));
+    let mut config = router_and_vpn_base_config(directory.path().join("wireguard"));
+    if router_chain {
+        config.router.vpn_chain = vec![crate::config::VpnHopConfig {
+            profile_name: "chain.conf".to_string(),
+        }];
+    }
     let overrides = RuntimeOverrideManager::load(directory.path(), &config)
         .await
         .expect("overrides");
     let dhcp = DhcpSupervisor::start(&config)
         .await
         .expect("dhcp supervisor");
-    let network: Arc<dyn NetworkProvider> = FakePolicyNetwork::with_owned_interface();
+    let network = FakePolicyNetwork::with_owned_interface();
 
     let vpn_store =
         crate::vpn::WireGuardProfileStore::new(config.vpn.wireguard_config_dir.clone());
@@ -1560,13 +1573,14 @@ async fn vpn_policy_fixture(activate_tunnel: bool) -> VpnPolicyFixture {
         tunnel.clone(),
     ));
 
-    let service = ControlService::new(config, network, dhcp, overrides.clone())
+    let service = ControlService::new(config, network.clone(), dhcp, overrides.clone())
         .with_vpn_manager(tunnel)
         .with_vpn_policy_manager(policy);
 
     VpnPolicyFixture {
         service,
         overrides,
+        network,
         _directory: directory,
     }
 }
@@ -1600,6 +1614,29 @@ async fn vpn_policy_requests_are_rejected_when_vpn_is_disabled() {
             other => panic!("unexpected response: {other:?}"),
         }
     }
+}
+
+#[tokio::test]
+async fn legacy_vpn_policy_mutations_are_blocked_when_router_chain_is_configured() {
+    let fixture = vpn_policy_fixture_with_router_chain(true, true).await;
+
+    for request in [
+        Request::VpnPolicySetMode {
+            mode: VpnPolicyMode::Vpn,
+        },
+        Request::VpnPolicyClearMode,
+    ] {
+        match fixture.service.dispatch(request).await {
+            Response::VpnPolicyError {
+                detail: VpnPolicyErrorDetail::Other { message },
+            } => assert!(message.contains("router VPN chain")),
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    assert!(fixture.network.rules.lock().unwrap().is_empty());
+    assert!(fixture.network.routes.lock().unwrap().is_empty());
+    assert!(fixture.overrides.snapshot().await.vpn_mode.is_none());
 }
 
 #[tokio::test]
@@ -1934,6 +1971,22 @@ impl SupervisedProcess for FakeWifiProcess {
             .unwrap()
             .get(&pid)
             .is_some_and(|recorded| recorded == config_path))
+    }
+
+    async fn pids_with_config_path(
+        &self,
+        _kind: crate::wifi::record::WifiProcessKind,
+        config_path: &std::path::Path,
+    ) -> Result<Vec<u32>, WifiProcessError> {
+        let mut pids: Vec<u32> = self
+            .configs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(pid, recorded)| (recorded == config_path).then_some(*pid))
+            .collect();
+        pids.sort_unstable();
+        Ok(pids)
     }
 
     async fn terminate(&self, pid: u32) -> Result<(), WifiProcessError> {
@@ -2749,6 +2802,22 @@ impl SupervisedProcess for FakeSupplicantProcess {
             .is_some_and(|recorded| recorded == config_path))
     }
 
+    async fn pids_with_config_path(
+        &self,
+        _kind: crate::wifi::record::WifiProcessKind,
+        config_path: &std::path::Path,
+    ) -> Result<Vec<u32>, WifiProcessError> {
+        let mut pids: Vec<u32> = self
+            .configs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|(pid, recorded)| (recorded == config_path).then_some(*pid))
+            .collect();
+        pids.sort_unstable();
+        Ok(pids)
+    }
+
     async fn terminate(&self, pid: u32) -> Result<(), WifiProcessError> {
         self.responders.lock().unwrap().remove(&pid);
         self.configs.lock().unwrap().remove(&pid);
@@ -3171,6 +3240,119 @@ async fn autoconnect_is_blocked_by_pending_transaction_on_another_interface() {
         .rollback(&pending.token)
         .await
         .expect("clean up pending wlan2 transaction");
+}
+
+#[tokio::test]
+async fn autoconnect_does_not_launch_a_scan_during_secret_recovery() {
+    let fixture = wifi_client_enabled_fixture().await;
+    let created = fixture
+        .service
+        .dispatch(Request::CreateWifiClientProfile {
+            profile: WifiClientProfileWriteRequest {
+                id: "saved".into(),
+                ssid: "saved-wifi".into(),
+                country_code: Some("US".into()),
+                security: WifiClientSecurity::Open,
+                priority: 0,
+                autoconnect: true,
+                passphrase: None,
+                clear_passphrase: false,
+            },
+        })
+        .await;
+    assert!(matches!(created, Response::WifiClientProfile { .. }));
+    // Leave committed intent eligible for autoconnect, but require a temporary
+    // supplicant for any scan. Recovery must prevent even this preliminary write.
+    fixture
+        .service
+        .wifi_client
+        .as_ref()
+        .unwrap()
+        .disable("wlan1")
+        .await
+        .unwrap();
+    let next_pid = fixture.process.next_pid.load(WifiOrdering::Relaxed);
+    let secrets = crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore::in_state_dir(
+        &fixture.service.config.runtime.state_dir,
+    );
+    secrets
+        .stage(std::collections::BTreeMap::from([("wlan1".into(), None)]))
+        .await
+        .unwrap();
+
+    fixture.service.autoconnect_wifi_once().await.unwrap();
+
+    assert_eq!(
+        fixture.process.next_pid.load(WifiOrdering::Relaxed),
+        next_pid,
+        "unresolved recovery must block temporary scan processes"
+    );
+}
+
+#[tokio::test]
+async fn queued_autoconnect_timeout_does_not_disable_a_new_association() {
+    let fixture = wifi_client_enabled_fixture().await;
+    let created = fixture
+        .service
+        .dispatch(Request::CreateWifiClientProfile {
+            profile: WifiClientProfileWriteRequest {
+                id: "saved".into(),
+                ssid: "saved-wifi".into(),
+                country_code: Some("US".into()),
+                security: WifiClientSecurity::Open,
+                priority: 0,
+                autoconnect: true,
+                passphrase: None,
+                clear_passphrase: false,
+            },
+        })
+        .await;
+    assert!(matches!(created, Response::WifiClientProfile { .. }));
+    fixture.process.set_wpa_state("ASSOCIATING");
+    fixture
+        .service
+        .wifi_autoconnect
+        .lock()
+        .await
+        .connecting_since
+        .insert(
+            "wlan1".into(),
+            std::time::Instant::now() - std::time::Duration::from_secs(45),
+        );
+
+    // Hold the same gate as an admitted configuration request. Poll the
+    // background pass until it is waiting for that request to finish.
+    let mutation = fixture.service.network_mutations.write().await;
+    let pass = fixture.service.autoconnect_wifi_once();
+    tokio::pin!(pass);
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut pass)
+        .await
+        .is_err());
+    // The admitted request starts a new association before releasing admission.
+    fixture
+        .service
+        .wifi_autoconnect
+        .lock()
+        .await
+        .resume("wlan1");
+    drop(mutation);
+    tokio::time::timeout(Duration::from_secs(5), pass)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let effective = fixture.service.effective_config().await.unwrap();
+    assert!(
+        effective.network.interfaces["wlan1"].wifi_client.is_some(),
+        "an expired timeout must not disable a newer association"
+    );
+    assert!(fixture
+        .service
+        .wifi_autoconnect
+        .lock()
+        .await
+        .connecting_since
+        .contains_key("wlan1"));
 }
 
 #[tokio::test]
@@ -4073,6 +4255,7 @@ async fn disabling_wifi_client_fails_and_restores_state_if_dhcp_disable_fails() 
         interface_index: 2,
         hardware_address: vec![2, 0, 0, 0, 0, 1],
         client_identifier: vec![1, 2, 0, 0, 0, 0, 1],
+        policy: None,
         server_identifier: std::net::Ipv4Addr::new(192, 0, 2, 1),
         address: std::net::Ipv4Addr::new(192, 0, 2, 20),
         prefix_len: 24,
@@ -5116,6 +5299,7 @@ fn provisioning_apply_request_debug_redacts_key_material() {
 struct RouteFakeNetwork {
     interfaces: Vec<NetworkInterface>,
     routes: Vec<crate::netlink::Ipv4RouteInfo>,
+    route_error: Option<&'static str>,
 }
 
 #[async_trait]
@@ -5129,6 +5313,9 @@ impl NetworkProvider for RouteFakeNetwork {
     }
 
     async fn list_ipv4_routes(&self) -> Result<Vec<crate::netlink::Ipv4RouteInfo>> {
+        if let Some(message) = self.route_error {
+            anyhow::bail!(message);
+        }
         Ok(self.routes.clone())
     }
 
@@ -5158,6 +5345,85 @@ impl NetworkProvider for RouteFakeNetwork {
     ) -> Result<()> {
         Ok(())
     }
+}
+
+async fn route_guard_service(
+    route_error: Option<&'static str>,
+) -> (ControlService, tempfile::TempDir) {
+    let directory = tempdir().expect("tempdir");
+    let mut config = router_base_config();
+    config.runtime.state_dir = directory.path().to_path_buf();
+    let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+        .await
+        .expect("overrides");
+    let dhcp = DhcpSupervisor::start(&config)
+        .await
+        .expect("dhcp supervisor");
+    let network: Arc<dyn NetworkProvider> = Arc::new(RouteFakeNetwork {
+        interfaces: vec![NetworkInterface {
+            index: 2,
+            name: "lan0".to_string(),
+            is_up: true,
+            rx_bytes: 0,
+            tx_bytes: 0,
+            is_wireless: false,
+        }],
+        routes: vec![crate::netlink::Ipv4RouteInfo {
+            destination: "0.0.0.0/0".parse().unwrap(),
+            gateway: Some(Ipv4Addr::new(192, 168, 1, 1)),
+            output_interface_index: Some(2),
+            table: 254,
+            metric: Some(100),
+            protocol: 3,
+            scope: 0,
+        }],
+        route_error,
+    });
+    (
+        ControlService::new(config, network, dhcp, overrides),
+        directory,
+    )
+}
+
+#[tokio::test]
+async fn default_route_guard_covers_managed_to_unmanaged_and_input_transitions() {
+    let (service, _directory) = route_guard_service(None).await;
+    let current = router_base_config().network.interfaces["lan0"].clone();
+
+    let mut unmanaged = current.clone();
+    unmanaged.managed = false;
+    let error = service
+        .validate_default_route_management("lan0", Some(&current), &unmanaged, false)
+        .await
+        .expect_err("unmanaging the default-route interface needs confirmation");
+    assert!(error.to_string().contains("default route"));
+
+    let mut input = current.clone();
+    input.role = InterfaceRole::Input;
+    let error = service
+        .validate_default_route_management("lan0", Some(&current), &input, false)
+        .await
+        .expect_err("re-roling the default-route interface needs confirmation");
+    assert!(error.to_string().contains("default route"));
+
+    service
+        .validate_default_route_management("lan0", Some(&current), &input, true)
+        .await
+        .expect("explicit confirmation permits the transition");
+}
+
+#[tokio::test]
+async fn default_route_guard_fails_closed_when_routes_cannot_be_observed() {
+    let (service, _directory) = route_guard_service(Some("injected route dump failure")).await;
+    let current = router_base_config().network.interfaces["lan0"].clone();
+
+    let error = service
+        .validate_default_route_management("lan0", Some(&current), &current, false)
+        .await
+        .expect_err("route observation failure must not bypass the safety guard");
+    let message = format!("{error:#}");
+    assert!(message.contains("failed to inspect IPv4 routes"), "{message}");
+    assert!(message.contains("injected route dump failure"), "{message}");
 }
 
 #[tokio::test]
@@ -5218,6 +5484,7 @@ async fn list_routes_and_get_router_config_dispatch() {
                 scope: 254,
             },
         ],
+        route_error: None,
     });
     let service = ControlService::new(config.clone(), network, dhcp, overrides);
 

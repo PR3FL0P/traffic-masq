@@ -98,8 +98,7 @@ impl InterfaceEditor {
             let _: ipnet::Ipv4Net = self.cidr.trim().parse()?;
         }
         if self.has_default_route
-            && self.role == InterfaceRole::Output
-            && self.managed
+            && (self.original_managed || self.managed)
             && !self.allow_management_change
         {
             anyhow::bail!(
@@ -904,6 +903,22 @@ mod tests {
     #[test]
     fn managed_output_on_default_route_is_allowed_after_confirmation() {
         assert!(default_route_editor(true).edit_request().is_ok());
+    }
+
+    #[test]
+    fn managed_default_route_cannot_disable_management_without_confirmation() {
+        let mut editor = default_route_editor(false);
+        editor.managed = false;
+        let error = editor.edit_request().unwrap_err();
+        assert!(error.to_string().contains("default route"));
+    }
+
+    #[test]
+    fn managed_input_default_route_requires_confirmation() {
+        let mut editor = default_route_editor(false);
+        editor.role = InterfaceRole::Input;
+        let error = editor.edit_request().unwrap_err();
+        assert!(error.to_string().contains("default route"));
     }
 
     #[test]

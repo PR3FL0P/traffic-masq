@@ -17,7 +17,7 @@ The TUI serves as the primary operational console for the `traffic-masq` network
    - Communicates with `traffic-masqd` over a local Unix domain socket (`/run/traffic-masq/traffic-masqd.sock`).
    - Fully interactive: supports all tabs (Interfaces, DHCP Server, DHCP Client (configurable in Settings), Router, VPN, Wi-Fi, Settings, Logs).
    - Authenticated via shared device password; supports secure session caching in `$XDG_STATE_HOME`.
-   - All state modifications are transactional, subject to dry-run previews and automatic rollback timers.
+   - Interface/router applies use commit-confirm rollback timers; standalone DHCP, Wi-Fi and VPN mutations apply immediately and rely on daemon-side ownership recovery.
 
 2. **Direct / Recovery Mode (`--direct`):**
    - Directly binds to Linux Netlink via `RtnetlinkNetworkProvider`.
@@ -81,10 +81,10 @@ In a terminal application, performing long-running network operations directly i
    - **Mutations/Applies (`cancellable = false`):** Network mutations are **never** cancelled or retried on timeout. A lost or delayed Unix socket response does not mean the daemon failed to apply the change. The UI permits pressing `q` to queue an exit after the response arrives, but blocks other inputs.
 4. **Notification and Footer Integrity:** The progress banner renders on row `height - 3`. It explicitly preserves the key-hints row (`height - 2`), the error/status message row (`height - 1`), and the borders to eliminate visible screen flickering.
 
-### 3.2. Two-Phase Commit & Rollback Protection
+### 3.2. Commit-Confirm & Immediate Mutation Flows
 
-Because misconfiguring an IP address or firewall rule can sever SSH access, all destructive changes follow a strict rollback pattern:
-1. **Dry-Run Preview:** Before modifying state, the daemon calculates a diff (`InterfaceChangePlan`, `RouterPlan`, `RouterProvisioningPreviewView`). The TUI presents this plan on a dedicated preview screen (`Screen::Preview`, `Screen::RouterPlan`).
+Because misconfiguring an IP address or firewall rule can sever SSH access, interface and router changes use a strict rollback pattern:
+1. **Dry-Run Preview:** Before modifying transactional interface/router state, the daemon calculates a diff (`InterfaceChangePlan`, `RouterPlan`, `RouterProvisioningPreviewView`). The TUI presents this plan on a dedicated preview screen (`Screen::Preview`, `Screen::RouterPlan`).
 2. **Pending State (`Screen::PendingChange`, `Screen::RouterPending`):**
    - When the user confirms the plan, the change is applied with a hardware rollback timer (e.g. 60 seconds).
    - The TUI transitions to a Pending screen displaying a live countdown timer:
@@ -93,6 +93,8 @@ Because misconfiguring an IP address or firewall rule can sever SSH access, all 
    - Pressing **Esc** immediately triggers a rollback.
    - If the connection drops or the operator does not respond, the daemon automatically rolls back to the previous state when the timer expires.
 3. **Disconnect Handling:** If the daemon becomes unreachable while on a pending screen, the TUI retains the pending change state and warns the operator that the outcome is unverified rather than falsely claiming success.
+
+Standalone DHCP, Wi-Fi and VPN actions do not enter these pending screens and do not expose a commit timer. Once accepted, they are non-cancellable immediate mutations; crash safety is provided by the daemon's durable ownership/recovery mechanisms rather than TUI rollback state.
 
 ### 3.3. Screen and Section State Machine
 

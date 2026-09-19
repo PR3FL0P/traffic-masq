@@ -1775,6 +1775,7 @@ fn test_bound_lease_for_t1() -> DhcpClientLease {
         interface_index: 2,
         hardware_address: vec![0, 1, 2, 3, 4, 5],
         client_identifier: vec![1, 0, 1, 2, 3, 4, 5],
+        policy: None,
         server_identifier: Ipv4Addr::new(192, 0, 2, 1),
         address: Ipv4Addr::new(192, 0, 2, 2),
         prefix_len: 24,
