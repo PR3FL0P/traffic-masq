@@ -7,9 +7,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::config::{
-    AppConfig, DhcpClientInterfaceConfig, DhcpInterfaceConfig, InterfaceConfig, InterfaceRole,
-    RouterConfig, UplinkConfig, UplinkMode, WifiApConfig, WifiBand, WifiChannelWidth,
-    WifiClientConfig, WifiClientSecurity, WifiSecurity,
+    AppConfig, DhcpClientInterfaceConfig, DhcpInterfaceConfig, ForwardingConfig, InterfaceConfig,
+    InterfaceRole, RouterConfig, UplinkConfig, UplinkMode, WifiApConfig, WifiBand,
+    WifiChannelWidth, WifiClientConfig, WifiClientSecurity, WifiSecurity,
 };
 use crate::core::router_candidate::RouterIntentProposal;
 
@@ -331,7 +331,12 @@ pub fn derive_router_provisioning(
         }),
         owned_routes: Vec::new(),
         allow_default_route_change: true,
-        forwarding: None,
+        forwarding: Some(vec![ForwardingConfig {
+            source_subnet: None,
+            from: desired.output.interface.clone(),
+            to: desired.uplink.interface.clone(),
+            masquerade: true,
+        }]),
         vpn_chain: Vec::new(),
     };
 
@@ -543,6 +548,15 @@ mod tests {
         assert_eq!(
             effective.router.uplink.as_ref().unwrap().mode,
             UplinkMode::Dhcp
+        );
+        assert_eq!(
+            effective.router.forwarding,
+            Some(vec![ForwardingConfig {
+                source_subnet: None,
+                from: "wlan-out".to_string(),
+                to: "wlan-up".to_string(),
+                masquerade: true,
+            }])
         );
         let _proposal = effective.into_router_intent_proposal();
     }

@@ -181,7 +181,11 @@ impl RouterCandidate {
         proposal: &RouterIntentProposal,
     ) -> Result<Self> {
         if let RouterOverrideChange::Set(router) = &proposal.router {
-            if router.enabled && router.uplink.is_none() && router.owned_routes.is_empty() {
+            if router.enabled
+                && router.uplink.is_none()
+                && router.owned_routes.is_empty()
+                && router.forwarding.is_none()
+            {
                 bail!(
                     "router.uplink is required before an enabled router candidate can be activated"
                 );
@@ -243,7 +247,8 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use crate::config::{
-        DhcpInterfaceConfig, InterfaceRole, OwnedIpv4RouteConfig, UplinkConfig, UplinkMode,
+        DhcpInterfaceConfig, ForwardingConfig, InterfaceRole, OwnedIpv4RouteConfig, UplinkConfig,
+        UplinkMode,
     };
     use crate::firewall::RouterDataplaneTarget;
 
@@ -425,6 +430,39 @@ mod tests {
         .expect_err("activation must require a complete router intent");
 
         assert!(error.to_string().contains("router.uplink is required"));
+    }
+
+    #[test]
+    fn explicit_forwarding_does_not_require_a_global_uplink() {
+        let mut router = enabled_router();
+        router.uplink = None;
+        router.forwarding = Some(vec![ForwardingConfig {
+            source_subnet: None,
+            from: "lan0".to_string(),
+            to: "wan0".to_string(),
+            masquerade: true,
+        }]);
+
+        RouterCandidate::build(
+            &base_config(),
+            &committed(),
+            &RouterIntentProposal::new().set_router(router),
+        )
+        .expect("explicit forwarding should not require a global uplink");
+    }
+
+    #[test]
+    fn explicit_empty_forwarding_does_not_restore_the_legacy_uplink_requirement() {
+        let mut router = enabled_router();
+        router.uplink = None;
+        router.forwarding = Some(Vec::new());
+
+        RouterCandidate::build(
+            &base_config(),
+            &committed(),
+            &RouterIntentProposal::new().set_router(router),
+        )
+        .expect("an explicit empty forwarding list should be a valid disabled dataplane");
     }
 
     #[test]

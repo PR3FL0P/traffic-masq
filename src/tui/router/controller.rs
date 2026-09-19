@@ -146,6 +146,18 @@ pub(crate) async fn refresh_router_data(app: &mut TuiApp, client: &ApiClient) {
     load_router_data(app, client).await;
 }
 
+pub(super) fn router_plan_needed(router: &RouterData) -> bool {
+    router.enabled
+        || router.proposed_router_config.enabled
+        || router.proposed_router_config.uplink.is_some()
+        || !router.proposed_router_config.owned_routes.is_empty()
+        || router
+            .proposed_router_config
+            .forwarding
+            .as_ref()
+            .is_some_and(|rules| !rules.is_empty())
+}
+
 pub(crate) async fn load_router_data(app: &mut TuiApp, client: &ApiClient) {
     app.router.error = None;
 
@@ -211,7 +223,7 @@ pub(crate) async fn load_router_data(app: &mut TuiApp, client: &ApiClient) {
     }
     app.router.topology.loaded = topology_loaded;
 
-    if !app.router.enabled && app.router.proposed_router_config.owned_routes.is_empty() {
+    if !router_plan_needed(&app.router) {
         app.router.plan = None;
         app.router.lease_counts = Vec::new();
         return;

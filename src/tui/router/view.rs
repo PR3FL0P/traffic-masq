@@ -405,7 +405,15 @@ pub(super) fn format_forwarding_status(dataplane: &crate::firewall::RouterDatapl
         "forwarding off"
     };
     let nat = match &dataplane.target {
-        RouterDataplaneTarget::Enabled(_) => "NAT desired",
+        RouterDataplaneTarget::Enabled(desired)
+            if desired
+                .forwarding
+                .as_ref()
+                .is_none_or(|rules| rules.iter().any(|rule| rule.masquerade)) =>
+        {
+            "NAT desired"
+        }
+        RouterDataplaneTarget::Enabled(_) => "NAT disabled",
         RouterDataplaneTarget::Disabled => "NAT disabled",
     };
     let apply = if dataplane.requires_apply {

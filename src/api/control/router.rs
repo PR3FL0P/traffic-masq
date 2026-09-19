@@ -595,7 +595,8 @@ impl ControlService {
         };
         let unconfigured = effective.router.enabled
             && effective.router.uplink.is_none()
-            && effective.router.owned_routes.is_empty();
+            && effective.router.owned_routes.is_empty()
+            && effective.router.forwarding.is_none();
         let desired = match RouterDesired::from_effective_config(&effective) {
             Ok(desired) => desired,
             Err(error) => {

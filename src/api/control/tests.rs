@@ -868,6 +868,30 @@ async fn enabled_router_without_uplink_reports_unconfigured_provisioning_state()
 }
 
 #[tokio::test]
+async fn explicit_forwarding_without_uplink_is_not_reported_as_unconfigured() {
+    let mut config = router_base_config_with_router_enabled();
+    config.router.uplink = None;
+    config.router.forwarding = Some(vec![crate::config::ForwardingConfig {
+        source_subnet: None,
+        from: "lan0".to_string(),
+        to: "wan0".to_string(),
+        masquerade: true,
+    }]);
+    let (service, _directory) =
+        router_service_with_config(Arc::new(FakeRouterSubsystems::default()), config).await;
+
+    match service.dispatch(Request::RouterProvisioningStatus).await {
+        Response::RouterProvisioningStatus { status } => {
+            assert_eq!(status.stage, ProvisioningStage::Ready);
+            assert!(status.enabled);
+            assert!(status.ready);
+            assert_eq!(status.coordinator, CoordinatorStatus::Idle);
+        }
+        other => panic!("expected ready provisioning status, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn enabled_router_without_uplink_with_routes_reports_ready_provisioning_state() {
     let mut config = router_base_config_with_router_enabled();
     config.router.uplink = None;

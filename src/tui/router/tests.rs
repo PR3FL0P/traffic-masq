@@ -1,4 +1,5 @@
 use super::*;
+use super::controller::router_plan_needed;
 use super::editor::{
     cycle_output_interface, delete_selected_route, manual_route_delete_command, save_route_editor,
 };
@@ -52,6 +53,21 @@ fn router_action_cycles_forward_and_backward() {
     assert_eq!(action.prev(), RouterAction::Topology);
     assert_eq!(action.prev().prev(), RouterAction::Refresh);
     assert_eq!(action.prev().prev().prev(), RouterAction::ShareViaRoute);
+}
+
+#[test]
+fn staged_explicit_forwarding_requires_a_plan_even_when_committed_router_is_disabled() {
+    let mut router = RouterData::default();
+    router.enabled = false;
+    router.proposed_router_config.enabled = true;
+    router.proposed_router_config.forwarding = Some(vec![crate::config::ForwardingConfig {
+        source_subnet: None,
+        from: "lan0".to_string(),
+        to: "wan0".to_string(),
+        masquerade: true,
+    }]);
+
+    assert!(router_plan_needed(&router));
 }
 
 #[test]
@@ -738,6 +754,33 @@ fn formats_forwarding_status_reflects_snapshot_target_and_drift() {
     assert_eq!(
         format_forwarding_status(&plan),
         "forwarding on, NAT desired, drift: requires apply"
+    );
+}
+
+#[test]
+fn forwarding_status_does_not_claim_nat_for_non_masqueraded_rules() {
+    let plan = RouterDataplanePlan {
+        snapshot: RouterDataplaneSnapshot {
+            ipv4_forwarding: true,
+            owned: None,
+            owned_firewall_integrity: crate::firewall::OwnedFirewallIntegrity::Intact,
+        },
+        target: RouterDataplaneTarget::Enabled(RouterDataplaneDesired {
+            forwarding: Some(vec![crate::config::ForwardingConfig {
+                source_subnet: None,
+                from: "lan0".to_string(),
+                to: "wg0".to_string(),
+                masquerade: false,
+            }]),
+            uplink: String::new(),
+            outputs: Vec::new(),
+        }),
+        requires_apply: false,
+    };
+
+    assert_eq!(
+        format_forwarding_status(&plan),
+        "forwarding on, NAT disabled, in sync"
     );
 }
 
