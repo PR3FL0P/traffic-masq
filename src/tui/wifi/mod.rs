@@ -211,7 +211,6 @@ impl WifiEditor {
         }
     }
 
-
     pub(crate) fn active_value(&self) -> Option<&str> {
         match self.field {
             WifiField::Ssid => Some(&self.ssid),
@@ -425,7 +424,6 @@ impl WifiProfileEditor {
             cursor,
         }
     }
-
 
     pub(crate) fn active_value(&self) -> Option<&str> {
         match self.field {
@@ -676,9 +674,7 @@ pub(crate) fn render_wifi(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
                 competing_managers,
                 advice,
                 ..
-            }) if !competing_managers.is_empty() => {
-                (Some(competing_managers), advice.as_deref())
-            }
+            }) if !competing_managers.is_empty() => (Some(competing_managers), advice.as_deref()),
             _ => (None, None),
         };
 
@@ -935,7 +931,6 @@ async fn request_simple(app: &mut TuiApp, client: &ApiClient, request: Request, 
     }
 }
 
-
 async fn start_scan(app: &mut TuiApp, client: &ApiClient, interface: String) {
     match client
         .request(&Request::WifiClientScan {
@@ -960,8 +955,6 @@ async fn start_scan(app: &mut TuiApp, client: &ApiClient, interface: String) {
         Err(error) => app.push_message(LogLevel::Error, error.to_string()),
     }
 }
-
-
 
 pub(crate) async fn load_wifi_data(app: &mut TuiApp, client: &ApiClient) {
     app.wifi.error = None;
@@ -1281,7 +1274,6 @@ fn report_unexpected(app: &mut TuiApp, response: Response) {
         format!("Unexpected response: {response:?}"),
     );
 }
-
 
 #[cfg(test)]
 mod tests;

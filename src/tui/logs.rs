@@ -42,6 +42,45 @@ pub(crate) struct LogEntry {
 
 pub(crate) const LOG_HISTORY_LEN: usize = 500;
 
+pub(crate) fn with_troubleshooting_hint(level: LogLevel, message: String) -> String {
+    if level == LogLevel::Info || message.contains("Hint:") {
+        return message;
+    }
+
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("enable configure with traffic-masq") {
+        return message;
+    }
+    let hint = if lower.contains("convergence is deferred") {
+        Some("verify that the configured interface still exists; if it was renamed or removed, update or remove its traffic-masq interface configuration")
+    } else if lower.contains("unmanaged") || lower.contains("managed mode") {
+        Some(
+            "open Interfaces and enable Configure with traffic-masq before changing the IP address",
+        )
+    } else if lower.contains("vpn disabled") {
+        Some("open VPN and enable the VPN subsystem before activating a profile")
+    } else if lower.contains("wpa_supplicant")
+        && (lower.contains("missing") || lower.contains("unavailable"))
+    {
+        Some("install/start wpa_supplicant and retry the Wi-Fi client operation")
+    } else if lower.contains("permission denied") {
+        Some("check traffic-masqd privileges and the API socket/file permissions")
+    } else if lower.contains("ownership conflict") {
+        Some("another network manager may own this interface; stop the conflicting manager or release the interface before retrying")
+    } else if lower.contains("dhcp client")
+        && (lower.contains("disabled") || lower.contains("runtime is unavailable"))
+    {
+        Some("enable/configure the DHCP client for the uplink interface and retry")
+    } else {
+        None
+    };
+
+    match hint {
+        Some(hint) => format!("{message} | Hint: {hint}"),
+        None => message,
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LogFocus {
     #[default]
@@ -124,7 +163,24 @@ pub(crate) fn render_log(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
         return;
     }
 
-    let total = app.logs.len();
+    // Scroll visual rows so long diagnostics and their hints remain readable.
+    let width = area.width.saturating_sub(2).max(1) as usize;
+    let lines: Vec<Line> = app
+        .logs
+        .iter()
+        .flat_map(|entry| {
+            let text = format!(
+                "[{}] {}  {}",
+                format_time_hms(entry.at_unix),
+                entry.level.label(),
+                entry.message
+            );
+            wrap_log_message(&text, width)
+                .into_iter()
+                .map(move |line| Line::styled(line, Style::default().fg(entry.level.color())))
+        })
+        .collect();
+    let total = lines.len();
     let visible = (area.height.saturating_sub(2) as usize).max(1).min(total);
     let max_offset = total.saturating_sub(visible);
 
@@ -145,25 +201,38 @@ pub(crate) fn render_log(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let lines: Vec<Line> = app
-        .logs
-        .iter()
-        .skip(offset)
-        .take(visible)
-        .map(|entry| {
-            Line::styled(
-                format!(
-                    "[{}] {}  {}",
-                    format_time_hms(entry.at_unix),
-                    entry.level.label(),
-                    entry.message
-                ),
-                Style::default().fg(entry.level.color()),
-            )
-        })
-        .collect();
+    frame.render_widget(
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(offset)
+                .take(visible)
+                .collect::<Vec<_>>(),
+        ),
+        inner,
+    );
+}
 
-    frame.render_widget(Paragraph::new(lines), inner);
+fn wrap_log_message(message: &str, width: usize) -> Vec<String> {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+
+    let mut rows = Vec::new();
+    for line in message.split('\n') {
+        let mut row = String::new();
+        let mut used = 0;
+        for grapheme in line.graphemes(true) {
+            let size = grapheme.width();
+            if used + size > width.max(1) && !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+                used = 0;
+            }
+            row.push_str(grapheme);
+            used += size;
+        }
+        rows.push(row);
+    }
+    rows
 }
 
 pub(crate) fn handle_log_key(app: &mut TuiApp, key: KeyCode) {
@@ -259,81 +328,4 @@ fn export_log(app: &mut TuiApp) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn scrolling_past_the_last_entry_moves_onto_the_action_rows() {
-        let mut app = TuiApp::default();
-        app.logs.push_back(LogEntry {
-            at_unix: 0,
-            level: LogLevel::Info,
-            message: "one".to_string(),
-        });
-
-        app.logs_max_scroll = 1;
-        handle_log_key(&mut app, KeyCode::Down);
-        assert_eq!(app.logs_focus, LogFocus::Scroll);
-        assert_eq!(app.logs_scroll, 1);
-
-        handle_log_key(&mut app, KeyCode::Down);
-        assert_eq!(app.logs_focus, LogFocus::Export);
-        handle_log_key(&mut app, KeyCode::Down);
-        assert_eq!(app.logs_focus, LogFocus::Clear);
-        handle_log_key(&mut app, KeyCode::Down);
-        assert_eq!(
-            app.logs_focus,
-            LogFocus::Clear,
-            "must clamp at the last row"
-        );
-
-        handle_log_key(&mut app, KeyCode::Up);
-        assert_eq!(app.logs_focus, LogFocus::Export);
-        handle_log_key(&mut app, KeyCode::Up);
-        assert_eq!(app.logs_focus, LogFocus::Scroll);
-    }
-
-
-    #[test]
-    fn moving_up_one_row_from_the_bottom_is_not_snapped_back() {
-        let mut app = TuiApp::default();
-        for i in 0..20 {
-            app.logs.push_back(LogEntry {
-                at_unix: i,
-                level: LogLevel::Info,
-                message: format!("entry-{i}"),
-            });
-        }
-        app.logs_scroll = 10;
-        app.logs_max_scroll = 10;
-        handle_log_key(&mut app, KeyCode::Up);
-        assert_eq!(app.logs_scroll, 9);
-    }
-
-    #[test]
-    fn enter_on_the_clear_row_empties_the_log() {
-        let mut app = TuiApp::default();
-        app.logs.push_back(LogEntry {
-            at_unix: 0,
-            level: LogLevel::Info,
-            message: "one".to_string(),
-        });
-        app.logs_focus = LogFocus::Clear;
-
-        handle_log_key(&mut app, KeyCode::Enter);
-
-        assert_eq!(app.logs.len(), 1);
-        assert_eq!(app.logs.back().expect("entry").message, "Log cleared");
-        assert_eq!(app.logs_scroll, 0);
-    }
-
-    #[test]
-    fn paging_returns_the_cursor_to_the_scroll_region() {
-        let mut app = TuiApp {
-            logs_focus: LogFocus::Clear,
-            ..Default::default()
-        };
-        handle_log_key(&mut app, KeyCode::PageUp);
-        assert_eq!(app.logs_focus, LogFocus::Scroll);
-    }
-}
+mod tests;

@@ -1,5 +1,5 @@
-use super::*;
 use super::plan::{current_router_proposal, lease_counts_for_plan};
+use super::*;
 
 pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
     if app.router.pane == RouterPane::Sharing {
@@ -15,12 +15,18 @@ pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
         3 => RouterAction::PlanApply,
         4 => RouterAction::ShareViaRoute,
         6 => RouterAction::Topology,
+        7 => RouterAction::ToggleEnabled,
         _ => RouterAction::Refresh,
     };
 }
 
+/// Dispatch router-screen input to editing, planning, apply, confirmation, and rollback actions.
 pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
     match key {
+        KeyCode::Char('e') => {
+            toggle_router_enabled(app, client).await;
+            return;
+        }
         KeyCode::Char('1') => {
             select_pane(app, RouterPane::Routes);
             return;
@@ -112,7 +118,7 @@ pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &A
                     app.router.warning_message = None;
                 }
                 KeyCode::Down => {
-                    if app.router.action != RouterAction::Topology {
+                    if app.router.action != RouterAction::ToggleEnabled {
                         app.router.action = app.router.action.next();
                     }
                     app.router.warning_message = None;
@@ -126,6 +132,7 @@ pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &A
                     app.router.warning_message = None;
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => match app.router.action {
+                    RouterAction::ToggleEnabled => toggle_router_enabled(app, client).await,
                     RouterAction::AddRoute => open_route_editor_for_add(app, client).await,
                     RouterAction::EditRoute => open_route_editor_for_selected(app, client).await,
                     RouterAction::DeleteRoute => delete_selected_route(app),
@@ -142,10 +149,27 @@ pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &A
     }
 }
 
+async fn toggle_router_enabled(app: &mut TuiApp, client: &ApiClient) {
+    if !app.router.topology.loaded {
+        load_router_data(app, client).await;
+        if !app.router.topology.loaded {
+            app.push_message(
+                LogLevel::Error,
+                "Load router configuration before changing routing",
+            );
+            return;
+        }
+    }
+    app.router.proposed_router_config.enabled = !app.router.proposed_router_config.enabled;
+    app.router.staged = true;
+    open_router_plan(app, client).await;
+}
+
 pub(crate) async fn refresh_router_data(app: &mut TuiApp, client: &ApiClient) {
     load_router_data(app, client).await;
 }
 
+/// Report whether current editor state requires a new router preview.
 pub(super) fn router_plan_needed(router: &RouterData) -> bool {
     router.enabled
         || router.proposed_router_config.enabled
@@ -158,6 +182,7 @@ pub(super) fn router_plan_needed(router: &RouterData) -> bool {
             .is_some_and(|rules| !rules.is_empty())
 }
 
+/// Refresh router configuration, status, and pending transaction state from the daemon.
 pub(crate) async fn load_router_data(app: &mut TuiApp, client: &ApiClient) {
     app.router.error = None;
 

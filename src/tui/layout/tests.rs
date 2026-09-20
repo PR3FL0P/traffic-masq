@@ -1,0 +1,82 @@
+use super::*;
+
+#[test]
+fn point_in_rect_matches_inclusive_top_left_exclusive_bottom_right() {
+    let rect = Rect::new(2, 3, 4, 5);
+    assert!(point_in_rect((2, 3), rect));
+    assert!(point_in_rect((5, 7), rect));
+    assert!(!point_in_rect((6, 3), rect));
+    assert!(!point_in_rect((2, 8), rect));
+    assert!(!point_in_rect((1, 3), rect));
+}
+
+#[test]
+fn section_at_finds_the_tab_containing_the_click_point() {
+    let tabs = [
+        (Rect::new(0, 0, 8, 1), Section::Dashboard),
+        (Rect::new(8, 0, 8, 1), Section::Interfaces),
+        (Rect::new(16, 0, 8, 1), Section::Dhcp),
+        (Rect::new(24, 0, 8, 1), Section::DhcpClient),
+        (Rect::new(32, 0, 8, 1), Section::Router),
+        (Rect::new(40, 0, 8, 1), Section::Vpn),
+        (Rect::new(48, 0, 8, 1), Section::Wifi),
+        (Rect::new(56, 0, 8, 1), Section::Settings),
+        (Rect::new(64, 0, 8, 1), Section::Log),
+    ];
+    assert_eq!(section_at(&tabs, (3, 0)), Some(Section::Dashboard));
+    assert_eq!(section_at(&tabs, (11, 0)), Some(Section::Interfaces));
+    assert_eq!(section_at(&tabs, (19, 0)), Some(Section::Dhcp));
+    assert_eq!(section_at(&tabs, (27, 0)), Some(Section::DhcpClient));
+    assert_eq!(section_at(&tabs, (35, 0)), Some(Section::Router));
+    assert_eq!(section_at(&tabs, (43, 0)), Some(Section::Vpn));
+    assert_eq!(section_at(&tabs, (51, 0)), Some(Section::Wifi));
+    assert_eq!(section_at(&tabs, (59, 0)), Some(Section::Settings));
+    assert_eq!(section_at(&tabs, (67, 0)), Some(Section::Log));
+    assert_eq!(section_at(&tabs, (73, 0)), None);
+}
+
+#[test]
+fn section_at_works_without_dhcp_client_tab() {
+    let tabs = [
+        (Rect::new(0, 0, 8, 1), Section::Dashboard),
+        (Rect::new(8, 0, 8, 1), Section::Interfaces),
+        (Rect::new(16, 0, 8, 1), Section::Dhcp),
+        (Rect::new(24, 0, 8, 1), Section::Router),
+        (Rect::new(32, 0, 8, 1), Section::Vpn),
+        (Rect::new(40, 0, 8, 1), Section::Wifi),
+        (Rect::new(48, 0, 8, 1), Section::Settings),
+        (Rect::new(56, 0, 8, 1), Section::Log),
+    ];
+    assert_eq!(section_at(&tabs, (19, 0)), Some(Section::Dhcp));
+    assert_eq!(section_at(&tabs, (27, 0)), Some(Section::Router));
+}
+#[test]
+fn clip_interactions_removes_hidden_buttons_and_clips_lists() {
+    let mut ui = UiLayout {
+        buttons: vec![(Rect::new(2, 4, 5, 1), 0), (Rect::new(2, 12, 5, 1), 1)],
+        list_area: Some(Rect::new(1, 5, 10, 10)),
+        list_row_height: 1,
+        list_count: 20,
+        list_scroll_offset: 3,
+        ..Default::default()
+    };
+    let bounds = Rect::new(0, 3, 20, 7);
+    ui.clip_interactions(bounds);
+
+    assert_eq!(ui.buttons, vec![(Rect::new(2, 4, 5, 1), 0)]);
+    assert_eq!(ui.list_area, Some(Rect::new(1, 5, 10, 5)));
+    assert_eq!(ui.list_scroll_offset, 3);
+    assert_eq!(ui.content_area, Some(bounds));
+}
+
+#[test]
+fn clip_interactions_drops_list_outside_content() {
+    let mut ui = UiLayout {
+        list_area: Some(Rect::new(0, 20, 10, 2)),
+        list_count: 2,
+        ..Default::default()
+    };
+    ui.clip_interactions(Rect::new(0, 3, 20, 10));
+    assert!(ui.list_area.is_none());
+    assert_eq!(ui.list_count, 0);
+}

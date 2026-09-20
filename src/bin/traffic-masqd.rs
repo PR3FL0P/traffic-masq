@@ -9,6 +9,7 @@ use clap::{Parser, Subcommand};
 use nix::unistd::Uid;
 use traffic_masq::app::init::{self, NativeRunner, ServiceStore};
 use traffic_masq::app::installer::{self, InstallArgs, UninstallArgs};
+use traffic_masq::app::reset::{self, ResetArgs};
 use traffic_masq::app::service::{self, ServiceStatus};
 use traffic_masq::app::{reset_device_password, run_daemon};
 use traffic_masq::config::{AppConfig, ResolvedConfig, DEFAULT_CONFIG_PATH};
@@ -31,6 +32,9 @@ enum Command {
 
     /// Stop the daemon and remove installed files, preserving configuration and state
     Uninstall(UninstallArgs),
+
+    /// Reset all traffic-masq settings and persistent state to safe defaults
+    Reset(ResetArgs),
 
     /// Run the daemon in the foreground
     ///
@@ -123,6 +127,9 @@ async fn main() -> Result<()> {
     if let Command::Uninstall(uninstall_args) = &command {
         return installer::uninstall(uninstall_args.clone(), args.config).await;
     }
+    if let Command::Reset(reset_args) = &command {
+        return reset::run(reset_args.clone(), args.config).await;
+    }
     if let Command::Config {
         command: ConfigCommand::Init { path, force },
     } = &command
@@ -138,8 +145,8 @@ async fn main() -> Result<()> {
     let resolved = ResolvedConfig::load(args.config)?;
     let config = &resolved.config;
     match command {
-        Command::Install(_) | Command::Uninstall(_) => {
-            unreachable!("install handled before configuration resolution")
+        Command::Install(_) | Command::Uninstall(_) | Command::Reset(_) => {
+            unreachable!("administration command handled before configuration resolution")
         }
         Command::Config { command } => match command {
             ConfigCommand::Path => {
@@ -310,51 +317,5 @@ async fn set_password(config: &AppConfig) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn uninstall_cli_accepts_custom_paths_and_preview() {
-        use clap::Parser;
-        let args = super::Args::try_parse_from([
-            "traffic-masqd",
-            "--config",
-            "/tmp/config.toml",
-            "uninstall",
-            "--prefix",
-            "/opt/traffic-masq",
-            "--dry-run",
-            "--yes",
-        ])
-        .unwrap();
-        let Some(super::Command::Uninstall(options)) = args.command else {
-            panic!("wrong command")
-        };
-        assert!(options.dry_run && options.yes);
-        assert_eq!(
-            options.prefix,
-            std::path::PathBuf::from("/opt/traffic-masq")
-        );
-    }
-
-    use std::os::unix::fs::PermissionsExt;
-
-    use tempfile::tempdir;
-
-    use super::*;
-
-    #[test]
-    fn init_creates_a_private_valid_safe_config_and_refuses_overwrite() {
-        let directory = tempdir().expect("tempdir");
-        let path = directory.path().join("config.toml");
-        init_config(&path, false).expect("initialize");
-
-        assert_eq!(
-            fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
-            0o640
-        );
-        let config = AppConfig::load(&path).expect("load initialized config");
-        config.validate().expect("valid initialized config");
-        assert!(config.network.interfaces.is_empty());
-        assert!(init_config(&path, false).is_err());
-        init_config(&path, true).expect("explicit overwrite");
-    }
-}
+#[path = "traffic-masqd/tests.rs"]
+mod tests;

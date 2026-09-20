@@ -35,6 +35,7 @@ pub struct RuntimeOverrideManager {
 }
 
 impl RuntimeOverrideManager {
+    /// Load persisted overrides and reject configurations that cannot form valid router intent.
     pub async fn load(state_dir: impl AsRef<Path>, base: &AppConfig) -> Result<Self> {
         let store = RuntimeOverrideStore::in_state_dir(state_dir);
         let state = store.load().await?;
@@ -52,10 +53,12 @@ impl RuntimeOverrideManager {
         })
     }
 
+    /// Clone the committed override document under its state lock.
     pub async fn snapshot(&self) -> RuntimeOverrides {
         self.state.lock().await.clone()
     }
 
+    /// Merge overrides with the base configuration and return the named interface.
     pub async fn effective_interface(&self, interface: &str) -> Result<Option<InterfaceConfig>> {
         Ok(self
             .state
@@ -68,14 +71,17 @@ impl RuntimeOverrideManager {
             .cloned())
     }
 
+    /// Return the revision used to reject stale router candidates.
     pub async fn committed_revision(&self) -> u64 {
         self.state.lock().await.revision
     }
 
+    /// Return API settings after applying committed overrides to the base configuration.
     pub async fn effective_api_config(&self) -> Result<ApiConfig> {
         Ok(self.state.lock().await.effective_config(&self.base)?.api)
     }
 
+    /// Return security settings after applying committed overrides.
     pub async fn effective_security_config(&self) -> Result<SecurityConfig> {
         Ok(self
             .state
@@ -85,6 +91,7 @@ impl RuntimeOverrideManager {
             .security)
     }
 
+    /// Return the persisted VPN policy mode, falling back to the configured default.
     pub async fn effective_vpn_mode(&self) -> VpnPolicyMode {
         self.state
             .lock()
@@ -93,6 +100,7 @@ impl RuntimeOverrideManager {
             .unwrap_or(self.base.vpn.policy.default_mode)
     }
 
+    /// Validate a router proposal against the current committed revision without saving it.
     pub async fn build_candidate(
         &self,
         proposal: &RouterIntentProposal,
@@ -101,10 +109,12 @@ impl RuntimeOverrideManager {
         RouterCandidate::build(&self.base, &state, proposal)
     }
 
+    /// Persist a validated candidate only if its base revision is still current.
     pub async fn commit_candidate(&self, candidate: &RouterCandidate) -> Result<u64> {
         self.commit_candidate_with_token(candidate, None).await
     }
 
+    /// Reject stale candidates and persist the new intent with an optional recovery token.
     pub async fn commit_candidate_with_token(
         &self,
         candidate: &RouterCandidate,
@@ -120,11 +130,14 @@ impl RuntimeOverrideManager {
         Ok(state.revision)
     }
 
+    /// Validate and durably save a replacement override document under the mutation lock.
     pub async fn save_committed(&self, candidate: RuntimeOverrides) -> Result<()> {
         let mut state = self.state.lock().await;
         self.save_locked(&mut state, candidate).await
     }
 
+    /// Normalize and validate a candidate, increment its revision, and save before publishing it.
+    /// Notify convergence only after persistence succeeds; errors leave in-memory state unchanged.
     async fn save_locked(
         &self,
         state: &mut RuntimeOverrides,
@@ -152,6 +165,7 @@ impl RuntimeOverrideManager {
         self.changed.notified().await;
     }
 
+    /// Persist replacement API settings and notify the desired-state consumer.
     pub async fn set_api_config(&self, api: ApiConfig) -> Result<()> {
         let mut state = self.state.lock().await;
         let mut candidate = state.clone();
@@ -159,6 +173,7 @@ impl RuntimeOverrideManager {
         self.save_locked(&mut state, candidate).await
     }
 
+    /// Remove the API override so the base configuration supplies API settings.
     pub async fn clear_api_config(&self) -> Result<()> {
         let mut state = self.state.lock().await;
         let mut candidate = state.clone();
@@ -166,6 +181,7 @@ impl RuntimeOverrideManager {
         self.save_locked(&mut state, candidate).await
     }
 
+    /// Validate and persist replacement security settings.
     pub async fn set_security_config(&self, security: SecurityConfig) -> Result<()> {
         let mut state = self.state.lock().await;
         let mut candidate = state.clone();
@@ -173,6 +189,7 @@ impl RuntimeOverrideManager {
         self.save_locked(&mut state, candidate).await
     }
 
+    /// Remove the security override so base settings take effect.
     pub async fn clear_security_config(&self) -> Result<()> {
         let mut state = self.state.lock().await;
         let mut candidate = state.clone();
@@ -180,6 +197,15 @@ impl RuntimeOverrideManager {
         self.save_locked(&mut state, candidate).await
     }
 
+    /// Persist the VPN enabled flag after validating the resulting router configuration.
+    pub async fn set_vpn_enabled(&self, enabled: bool) -> Result<()> {
+        let mut state = self.state.lock().await;
+        let mut candidate = state.clone();
+        candidate.vpn_enabled = Some(enabled);
+        self.save_locked(&mut state, candidate).await
+    }
+
+    /// Persist a VPN policy mode only if the effective configuration supports it.
     pub async fn set_vpn_mode(&self, mode: VpnPolicyMode) -> Result<()> {
         let mut state = self.state.lock().await;
         let mut candidate = state.clone();
@@ -187,6 +213,7 @@ impl RuntimeOverrideManager {
         self.save_locked(&mut state, candidate).await
     }
 
+    /// Remove the policy override to restore the configured default VPN mode.
     pub async fn clear_vpn_mode(&self) -> Result<()> {
         let mut state = self.state.lock().await;
         let mut candidate = state.clone();
@@ -194,6 +221,7 @@ impl RuntimeOverrideManager {
         self.save_locked(&mut state, candidate).await
     }
 
+    /// Restore a prior interface override, or remove it when no prior override existed.
     pub async fn restore_interface_override(
         &self,
         interface: &str,
@@ -212,6 +240,7 @@ impl RuntimeOverrideManager {
         self.save_locked(&mut state, candidate).await
     }
 
+    /// Validate and persist an interface override with its management-change permission.
     pub async fn set_interface(
         &self,
         interface: String,
@@ -231,6 +260,7 @@ impl RuntimeOverrideManager {
         self.save_locked(&mut state, candidate).await
     }
 
+    /// Persist an interface override and its confirmation token in the same document.
     pub async fn commit_interface(
         &self,
         interface: String,
@@ -253,6 +283,7 @@ impl RuntimeOverrideManager {
         self.save_locked(&mut state, candidate).await
     }
 
+    /// Validate a proposed interface override against full router intent without persisting it.
     pub async fn check_interface(
         &self,
         interface: &str,
@@ -278,6 +309,7 @@ impl RuntimeOverrideManager {
     }
 }
 
+/// Reject overrides whose effective router intent or VPN policy dependencies are invalid.
 fn validate_candidate(candidate: &RuntimeOverrides, base: &AppConfig) -> Result<()> {
     let effective = candidate.effective_config(base)?;
     RouterDesired::from_effective_config(&effective)?;
@@ -293,693 +325,4 @@ fn validate_candidate(candidate: &RuntimeOverrides, base: &AppConfig) -> Result<
 }
 
 #[cfg(test)]
-mod tests {
-    use std::net::Ipv4Addr;
-
-    use tempfile::tempdir;
-
-    use std::collections::BTreeMap;
-
-    use crate::config::{
-        DhcpClientInterfaceConfig, DhcpInterfaceConfig, InterfaceRole, RouterConfig, UplinkConfig,
-        UplinkMode,
-    };
-    use crate::state::overrides::CURRENT_RUNTIME_OVERRIDES_SCHEMA;
-
-    use super::*;
-
-    fn base_config() -> AppConfig {
-        AppConfig::default()
-    }
-
-    /// The converger has no timer any more, so a change that does not announce
-    /// itself is a change that never gets applied.
-
-    #[tokio::test]
-    async fn writing_an_override_wakes_whoever_is_waiting_for_a_change() {
-        let directory = tempdir().expect("tempdir");
-        let base = base_config();
-        let manager = RuntimeOverrideManager::load(directory.path(), &base)
-            .await
-            .expect("overrides");
-
-        let waiter = {
-            let manager = manager.clone();
-            tokio::spawn(async move { manager.changed().await })
-        };
-        // Let the waiter reach the wait before the change happens: `changed`
-        // also retains a notification if convergence is still running.
-        tokio::task::yield_now().await;
-
-        manager
-            .set_interface(
-                "lan0".to_string(),
-                interface_config("192.168.30.1/24"),
-                false,
-            )
-            .await
-            .expect("set interface");
-
-        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
-            .await
-            .expect("an override write must wake the converger")
-            .expect("waiter task");
-    }
-
-    fn interface_config(address: &str) -> InterfaceConfig {
-        InterfaceConfig {
-            nat: true,
-            role: InterfaceRole::Output,
-            managed: true,
-            ipv4: Some(address.parse().expect("network")),
-            dhcp: None,
-            dhcp_client: None,
-            wifi: None,
-            wifi_client: None,
-        }
-    }
-
-    fn dhcp_interface_config(address: &str) -> InterfaceConfig {
-        let mut config = interface_config(address);
-        config.dhcp = Some(DhcpInterfaceConfig {
-            pool_start: Ipv4Addr::new(192, 168, 10, 100),
-            pool_end: Ipv4Addr::new(192, 168, 10, 200),
-            router: Ipv4Addr::new(192, 168, 10, 1),
-            dns_servers: Vec::new(),
-            lease_seconds: Some(3600),
-        });
-        config
-    }
-
-    /// A successful, self-contained mutation, for tests that need the store to
-    /// change but do not care what changed. `set_dhcp` used to serve this role.
-    fn api_override(port: u16) -> ApiConfig {
-        ApiConfig {
-            tcp: Some(crate::config::TcpApiConfig {
-                enabled: true,
-                listen: format!("0.0.0.0:{port}").parse().expect("socket address"),
-                certificate_path: Some("/etc/traffic-masq/server.pem".into()),
-                private_key_path: Some("/etc/traffic-masq/server-key.pem".into()),
-            }),
-        }
-    }
-
-    #[tokio::test]
-    async fn loads_unversioned_legacy_document_as_revision_zero() {
-        let directory = tempdir().expect("tempdir");
-        let store = RuntimeOverrideStore::in_state_dir(directory.path());
-        tokio::fs::write(
-            store.path(),
-            serde_json::to_vec(&serde_json::json!({
-                "api": {"tcp": null},
-                "interfaces": {}
-            }))
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-
-        let manager = RuntimeOverrideManager::load(directory.path(), &base_config())
-            .await
-            .expect("legacy load");
-        let state = manager.snapshot().await;
-        assert_eq!(state.schema_version, CURRENT_RUNTIME_OVERRIDES_SCHEMA);
-        assert_eq!(state.revision, 0);
-        assert_eq!(state.api, Some(ApiConfig { tcp: None }));
-    }
-
-    #[tokio::test]
-    async fn legacy_interface_override_without_dhcp_client_loads_unchanged() {
-        let directory = tempdir().expect("tempdir");
-        let store = RuntimeOverrideStore::in_state_dir(directory.path());
-        tokio::fs::write(
-            store.path(),
-            br#"{
-                "schema_version": 2,
-                "interfaces": {
-                    "wan0": {
-                        "config": {
-                            "role": "input",
-                            "managed": false,
-                            "ipv4": null,
-                            "dhcp": null,
-                            "wifi": null,
-                            "wifi_client": null
-                        }
-                    }
-                }
-            }"#,
-        )
-        .await
-        .unwrap();
-
-        let restored = RuntimeOverrideManager::load(directory.path(), &base_config())
-            .await
-            .expect("legacy override")
-            .snapshot()
-            .await;
-        assert!(restored.interfaces["wan0"].config.dhcp_client.is_none());
-    }
-
-    #[tokio::test]
-    async fn dhcp_client_interface_override_normalizes_saves_and_round_trips() {
-        let directory = tempdir().expect("tempdir");
-        let base = base_config();
-        let manager = RuntimeOverrideManager::load(directory.path(), &base)
-            .await
-            .unwrap();
-        let mut interface = InterfaceConfig {
-            nat: true,
-            role: InterfaceRole::Input,
-            managed: true,
-            ipv4: None,
-            dhcp: None,
-            dhcp_client: Some(DhcpClientInterfaceConfig {
-                route_metric: 250,
-                install_default_route: false,
-                request_dns: false,
-                send_release_on_shutdown: true,
-                ..DhcpClientInterfaceConfig::default()
-            }),
-            wifi: None,
-            wifi_client: None,
-        };
-        manager
-            .set_interface("wan0".into(), interface.clone(), false)
-            .await
-            .unwrap();
-
-        let restored = RuntimeOverrideManager::load(directory.path(), &base)
-            .await
-            .unwrap()
-            .snapshot()
-            .await;
-        assert_eq!(restored.interfaces["wan0"].config, interface);
-
-        interface.dhcp_client.as_mut().unwrap().enabled = false;
-        let normalized = RuntimeOverrides {
-            interfaces: BTreeMap::from([(
-                "wan0".into(),
-                InterfaceOverride {
-                    config: interface.clone(),
-                    allow_management_change: false,
-                },
-            )]),
-            ..RuntimeOverrides::default()
-        }
-        .normalized()
-        .unwrap();
-        assert_eq!(normalized.interfaces["wan0"].config, interface);
-    }
-
-    #[tokio::test]
-    async fn api_override_saves_and_reloads() {
-        let directory = tempdir().expect("tempdir");
-        let base = base_config();
-        let manager = RuntimeOverrideManager::load(directory.path(), &base)
-            .await
-            .unwrap();
-        manager
-            .set_api_config(ApiConfig {
-                tcp: Some(crate::config::TcpApiConfig {
-                    enabled: true,
-                    listen: "0.0.0.0:9443".parse().expect("socket address"),
-                    certificate_path: Some("/etc/traffic-masq/server.pem".into()),
-                    private_key_path: Some("/etc/traffic-masq/server-key.pem".into()),
-                }),
-            })
-            .await
-            .unwrap();
-
-        let restored = RuntimeOverrideManager::load(directory.path(), &base)
-            .await
-            .unwrap()
-            .snapshot()
-            .await;
-        assert_eq!(restored.revision, 1);
-        assert_eq!(
-            restored.api,
-            Some(ApiConfig {
-                tcp: Some(crate::config::TcpApiConfig {
-                    enabled: true,
-                    listen: "0.0.0.0:9443".parse().expect("socket address"),
-                    certificate_path: Some("/etc/traffic-masq/server.pem".into()),
-                    private_key_path: Some("/etc/traffic-masq/server-key.pem".into()),
-                }),
-            })
-        );
-    }
-
-    #[tokio::test]
-    async fn security_override_saves_reloads_and_can_be_cleared() {
-        let directory = tempdir().expect("tempdir");
-        let base = base_config();
-        let manager = RuntimeOverrideManager::load(directory.path(), &base)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            manager.effective_security_config().await.unwrap(),
-            base.security
-        );
-
-        manager
-            .set_security_config(crate::config::SecurityConfig {
-                rollback_timeout_seconds: 120,
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            manager
-                .effective_security_config()
-                .await
-                .unwrap()
-                .rollback_timeout_seconds,
-            120
-        );
-
-        let restored = RuntimeOverrideManager::load(directory.path(), &base)
-            .await
-            .unwrap();
-        assert_eq!(
-            restored
-                .effective_security_config()
-                .await
-                .unwrap()
-                .rollback_timeout_seconds,
-            120
-        );
-
-        restored.clear_security_config().await.unwrap();
-        assert_eq!(
-            restored.effective_security_config().await.unwrap(),
-            base.security
-        );
-    }
-
-    #[tokio::test]
-    async fn security_override_rejects_zero_rollback_timeout() {
-        let directory = tempdir().expect("tempdir");
-        let base = base_config();
-        let manager = RuntimeOverrideManager::load(directory.path(), &base)
-            .await
-            .unwrap();
-
-        let error = manager
-            .set_security_config(crate::config::SecurityConfig {
-                rollback_timeout_seconds: 0,
-            })
-            .await
-            .expect_err("zero rollback timeout must be rejected");
-        assert!(error.to_string().contains("rollback_timeout_seconds"));
-        assert_eq!(
-            manager.effective_security_config().await.unwrap(),
-            base.security
-        );
-    }
-
-    #[tokio::test]
-    async fn vpn_mode_defaults_to_base_config_and_can_be_overridden_and_cleared() {
-        let directory = tempdir().expect("tempdir");
-        let mut base = base_config();
-        base.network.interfaces.insert(
-            "wan0".into(),
-            InterfaceConfig {
-                nat: true,
-                role: InterfaceRole::Input,
-                managed: false,
-                ipv4: None,
-                dhcp: None,
-                dhcp_client: None,
-                wifi: None,
-                wifi_client: None,
-            },
-        );
-        base.network
-            .interfaces
-            .insert("lan0".into(), interface_config("192.168.10.1/24"));
-        base.vpn.enabled = true;
-        base.router = RouterConfig {
-            enabled: true,
-            uplink: Some(UplinkConfig {
-                interface: "wan0".into(),
-                mode: UplinkMode::External,
-            }),
-            ..RouterConfig::default()
-        };
-        base.validate().expect("base config");
-        let manager = RuntimeOverrideManager::load(directory.path(), &base)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            manager.effective_vpn_mode().await,
-            crate::config::VpnPolicyMode::Direct
-        );
-
-        manager
-            .set_vpn_mode(crate::config::VpnPolicyMode::Vpn)
-            .await
-            .unwrap();
-        assert_eq!(
-            manager.effective_vpn_mode().await,
-            crate::config::VpnPolicyMode::Vpn
-        );
-
-        let restored = RuntimeOverrideManager::load(directory.path(), &base)
-            .await
-            .unwrap();
-        assert_eq!(
-            restored.effective_vpn_mode().await,
-            crate::config::VpnPolicyMode::Vpn
-        );
-
-        manager.clear_vpn_mode().await.unwrap();
-        assert_eq!(
-            manager.effective_vpn_mode().await,
-            crate::config::VpnPolicyMode::Direct
-        );
-    }
-
-    #[tokio::test]
-    async fn set_vpn_mode_vpn_is_rejected_without_vpn_enabled_or_router_enabled() {
-        let directory = tempdir().expect("tempdir");
-        let base = base_config();
-        let manager = RuntimeOverrideManager::load(directory.path(), &base)
-            .await
-            .unwrap();
-
-        let error = manager
-            .set_vpn_mode(crate::config::VpnPolicyMode::Vpn)
-            .await
-            .expect_err("vpn disabled and router disabled");
-        assert!(error.to_string().contains("vpn.enabled = true"));
-        assert_eq!(
-            manager.effective_vpn_mode().await,
-            crate::config::VpnPolicyMode::Direct
-        );
-    }
-
-    #[tokio::test]
-    async fn version_two_records_upgrade_without_losing_revision() {
-        let directory = tempdir().unwrap();
-        let store = RuntimeOverrideStore::in_state_dir(directory.path());
-        tokio::fs::write(store.path(), br#"{"schema_version":2,"revision":7}"#)
-            .await
-            .unwrap();
-        let manager = RuntimeOverrideManager::load(directory.path(), &base_config())
-            .await
-            .unwrap();
-        let snapshot = manager.snapshot().await;
-        assert_eq!(snapshot.schema_version, 3);
-        assert_eq!(snapshot.revision, 7);
-        assert!(snapshot.committed_router_transaction.is_none());
-    }
-
-    #[tokio::test]
-    async fn rejects_future_schema_version() {
-        let directory = tempdir().expect("tempdir");
-        let store = RuntimeOverrideStore::in_state_dir(directory.path());
-        tokio::fs::write(store.path(), br#"{"schema_version":4,"revision":0}"#)
-            .await
-            .unwrap();
-
-        let error = RuntimeOverrideManager::load(directory.path(), &base_config())
-            .await
-            .expect_err("future schema");
-        assert!(error.to_string().contains("future schema version 4"));
-    }
-
-    #[tokio::test]
-    async fn router_and_interface_conflict_is_rejected_without_state_change() {
-        let directory = tempdir().expect("tempdir");
-        let mut base = base_config();
-        base.network.interfaces.insert(
-            "wan0".into(),
-            InterfaceConfig {
-                nat: true,
-                role: InterfaceRole::Input,
-                managed: false,
-                ipv4: None,
-                dhcp: None,
-                dhcp_client: None,
-                wifi: None,
-                wifi_client: None,
-            },
-        );
-        base.network
-            .interfaces
-            .insert("lan0".into(), interface_config("192.168.10.1/24"));
-        let manager = RuntimeOverrideManager::load(directory.path(), &base)
-            .await
-            .unwrap();
-        let mut candidate = manager.snapshot().await;
-        candidate.router = Some(RouterConfig {
-            enabled: true,
-            uplink: Some(UplinkConfig {
-                interface: "wan0".into(),
-                mode: UplinkMode::External,
-            }),
-            ..RouterConfig::default()
-        });
-        candidate.interfaces.insert(
-            "wan0".into(),
-            InterfaceOverride {
-                config: InterfaceConfig {
-                    nat: true,
-                    role: InterfaceRole::None,
-                    managed: false,
-                    ipv4: None,
-                    dhcp: None,
-                    dhcp_client: None,
-                    wifi: None,
-                    wifi_client: None,
-                },
-                allow_management_change: true,
-            },
-        );
-
-        manager
-            .save_committed(candidate)
-            .await
-            .expect_err("router conflict");
-        assert_eq!(manager.snapshot().await.revision, 0);
-        assert!(!manager.path().exists());
-    }
-
-    #[tokio::test]
-    async fn invalid_candidate_leaves_file_state_and_revision_unchanged() {
-        let directory = tempdir().expect("tempdir");
-        let mut base = base_config();
-        base.network
-            .interfaces
-            .insert("wlan0".into(), interface_config("192.168.10.1/24"));
-        let manager = RuntimeOverrideManager::load(directory.path(), &base)
-            .await
-            .unwrap();
-        manager.set_api_config(api_override(9443)).await.unwrap();
-        let before_state = manager.snapshot().await;
-        let before_file = tokio::fs::read(manager.path()).await.unwrap();
-
-        let error = manager
-            .set_interface("usb0".into(), interface_config("192.168.10.2/25"), false)
-            .await
-            .expect_err("overlap");
-        assert!(error.to_string().contains("overlap"));
-        assert_eq!(manager.snapshot().await, before_state);
-        assert_eq!(tokio::fs::read(manager.path()).await.unwrap(), before_file);
-    }
-
-    #[tokio::test]
-    async fn restoring_an_absent_interface_override_removes_it_exactly() {
-        let directory = tempdir().expect("tempdir");
-        let base = base_config();
-        let manager = RuntimeOverrideManager::load(directory.path(), &base)
-            .await
-            .expect("manager");
-
-        manager
-            .set_interface(
-                "wlan0".into(),
-                interface_config("192.168.30.1/24"),
-                false,
-            )
-            .await
-            .expect("set interface override");
-        assert!(manager.snapshot().await.interfaces.contains_key("wlan0"));
-
-        manager
-            .restore_interface_override("wlan0", None)
-            .await
-            .expect("restore absent override");
-
-        let state = manager.snapshot().await;
-        assert!(!state.interfaces.contains_key("wlan0"));
-        let persisted = RuntimeOverrideStore::in_state_dir(directory.path())
-            .load()
-            .await
-            .expect("load persisted overrides");
-        assert!(!persisted.interfaces.contains_key("wlan0"));
-    }
-
-    #[tokio::test]
-    async fn failed_file_save_does_not_publish_state_or_revision() {
-        let directory = tempdir().expect("tempdir");
-        let base = base_config();
-        let manager = RuntimeOverrideManager::load(directory.path(), &base)
-            .await
-            .expect("manager");
-        tokio::fs::create_dir(manager.path())
-            .await
-            .expect("conflicting target directory");
-        let before = manager.snapshot().await;
-
-        manager
-            .set_api_config(api_override(9443))
-            .await
-            .expect_err("rename over directory must fail");
-
-        assert_eq!(manager.snapshot().await, before);
-        assert_eq!(manager.snapshot().await.revision, 0);
-        assert!(manager.path().is_dir());
-    }
-
-    #[tokio::test]
-    async fn revision_increments_only_for_successful_saves() {
-        let directory = tempdir().expect("tempdir");
-        let mut base = base_config();
-        base.network
-            .interfaces
-            .insert("wlan0".into(), interface_config("192.168.10.1/24"));
-        let manager = RuntimeOverrideManager::load(directory.path(), &base)
-            .await
-            .unwrap();
-
-        manager.set_api_config(api_override(9443)).await.unwrap();
-        assert_eq!(manager.snapshot().await.revision, 1);
-        manager
-            .set_interface("usb0".into(), interface_config("192.168.10.2/25"), false)
-            .await
-            .expect_err("invalid save");
-        assert_eq!(manager.snapshot().await.revision, 1);
-        manager.set_api_config(api_override(9444)).await.unwrap();
-        assert_eq!(manager.snapshot().await.revision, 2);
-    }
-
-    #[tokio::test]
-    async fn candidate_commit_advances_revision_and_rejects_a_stale_candidate() {
-        let directory = tempdir().expect("tempdir");
-        let mut base = base_config();
-        base.network.interfaces.insert(
-            "wan0".into(),
-            InterfaceConfig {
-                nat: true,
-                role: InterfaceRole::Input,
-                managed: false,
-                ipv4: None,
-                dhcp: None,
-                dhcp_client: None,
-                wifi: None,
-                wifi_client: None,
-            },
-        );
-        base.network
-            .interfaces
-            .insert("lan0".into(), dhcp_interface_config("192.168.10.1/24"));
-        let manager = RuntimeOverrideManager::load(directory.path(), &base)
-            .await
-            .unwrap();
-
-        let router = RouterConfig {
-            enabled: true,
-            uplink: Some(UplinkConfig {
-                interface: "wan0".into(),
-                mode: UplinkMode::External,
-            }),
-            ..RouterConfig::default()
-        };
-        let candidate = manager
-            .build_candidate(&RouterIntentProposal::new().set_router(router.clone()))
-            .await
-            .expect("candidate");
-        assert_eq!(candidate.base_revision(), 0);
-
-        assert_eq!(manager.commit_candidate(&candidate).await.unwrap(), 1);
-        assert_eq!(manager.committed_revision().await, 1);
-        assert!(manager.snapshot().await.router.is_some());
-
-        let committed_state = manager.snapshot().await;
-        let committed_file = tokio::fs::read(manager.path()).await.unwrap();
-        let error = manager
-            .commit_candidate(&candidate)
-            .await
-            .expect_err("stale candidate must not be saved");
-        assert!(format!("{error:#}").contains("stale"));
-        assert_eq!(manager.snapshot().await, committed_state);
-        assert_eq!(
-            tokio::fs::read(manager.path()).await.unwrap(),
-            committed_file
-        );
-    }
-
-    #[tokio::test]
-    async fn candidate_rebuilt_on_current_state_commits_again() {
-        let directory = tempdir().expect("tempdir");
-        let base = base_config();
-        let manager = RuntimeOverrideManager::load(directory.path(), &base)
-            .await
-            .unwrap();
-
-        for expected_revision in 1..=2 {
-            let candidate = manager
-                .build_candidate(&RouterIntentProposal::new().set_interface(
-                    format!("lan{expected_revision}"),
-                    interface_config(&format!("192.168.{expected_revision}.1/24")),
-                    false,
-                ))
-                .await
-                .expect("candidate");
-            assert_eq!(candidate.base_revision(), expected_revision - 1);
-            assert_eq!(
-                manager.commit_candidate(&candidate).await.unwrap(),
-                expected_revision
-            );
-        }
-        assert_eq!(manager.snapshot().await.interfaces.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn concurrent_updates_do_not_lose_overrides() {
-        let directory = tempdir().expect("tempdir");
-        let manager = RuntimeOverrideManager::load(directory.path(), &base_config())
-            .await
-            .unwrap();
-        let first = manager.clone();
-        let second = manager.clone();
-        let (first_result, second_result) = tokio::join!(
-            first.set_interface("wlan0".into(), interface_config("192.168.10.1/24"), false),
-            second.set_interface("usb0".into(), interface_config("192.168.20.1/24"), false)
-        );
-        first_result.unwrap();
-        second_result.unwrap();
-        let state = manager.snapshot().await;
-        assert_eq!(state.revision, 2);
-        assert_eq!(state.interfaces.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn malformed_override_file_reports_its_path() {
-        let directory = tempdir().expect("tempdir");
-        let store = RuntimeOverrideStore::in_state_dir(directory.path());
-        tokio::fs::write(store.path(), b"not valid json")
-            .await
-            .expect("write malformed state");
-
-        let error = RuntimeOverrideManager::load(directory.path(), &base_config())
-            .await
-            .expect_err("malformed state must fail");
-        let message = format!("{error:#}");
-        assert!(message.contains("failed to parse runtime overrides"));
-        assert!(message.contains("runtime-overrides.json"));
-    }
-}
+mod tests;

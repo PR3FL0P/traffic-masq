@@ -1,8 +1,60 @@
-use super::*;
 use super::runtime::compensation_message;
+use super::*;
 
 impl ControlService {
+    pub(super) async fn vpn_config(&self) -> Response {
+        match self.effective_config().await {
+            Ok(config) => Response::VpnConfig {
+                enabled: config.vpn.enabled,
+            },
+            Err(message) => Response::Error { message },
+        }
+    }
+
+    pub(super) async fn set_vpn_enabled(&self, enabled: bool) -> Response {
+        let Some(vpn) = &self.vpn else {
+            return Response::Error {
+                message: "VPN runtime unavailable".into(),
+            };
+        };
+        if !enabled {
+            let effective = match self.effective_config().await {
+                Ok(config) => config,
+                Err(message) => return Response::Error { message },
+            };
+            if !effective.router.vpn_chain.is_empty()
+                || self.overrides.effective_vpn_mode().await == VpnPolicyMode::Vpn
+            {
+                return Response::Error { message: "Remove the router VPN chain and select Direct traffic policy before disabling VPN".into() };
+            }
+            match vpn.status().await {
+                Ok(Some(_)) => {
+                    return Response::Error {
+                        message: "Disconnect the active VPN profile before disabling VPN".into(),
+                    }
+                }
+                Err(error) => return classify_vpn_error(error),
+                Ok(None) => {}
+            }
+        }
+        match self.overrides.set_vpn_enabled(enabled).await {
+            Ok(()) => self.vpn_config().await,
+            Err(error) => Response::Error {
+                message: error.to_string(),
+            },
+        }
+    }
+
+    async fn vpn_is_enabled(&self) -> bool {
+        self.effective_config()
+            .await
+            .is_ok_and(|config| config.vpn.enabled)
+    }
+
     pub(super) async fn vpn_list_profiles(&self) -> Response {
+        if !self.vpn_is_enabled().await {
+            return vpn_disabled();
+        }
         let Some(vpn) = &self.vpn else {
             return vpn_disabled();
         };
@@ -15,6 +67,9 @@ impl ControlService {
     }
 
     pub(super) async fn vpn_import_profile(&self, name: String, contents: String) -> Response {
+        if !self.vpn_is_enabled().await {
+            return vpn_disabled();
+        }
         let Some(vpn) = &self.vpn else {
             return vpn_disabled();
         };
@@ -30,6 +85,9 @@ impl ControlService {
     }
 
     pub(super) async fn vpn_delete_profile(&self, name: String) -> Response {
+        if !self.vpn_is_enabled().await {
+            return vpn_disabled();
+        }
         let Some(vpn) = &self.vpn else {
             return vpn_disabled();
         };
@@ -53,13 +111,13 @@ impl ControlService {
         let desired = self.current_router_desired().await.map_err(|error| {
             format!("cannot verify whether VPN profile '{name}' is used by the router: {error:?}")
         })?;
-        Ok(desired
-            .vpn_chain
-            .iter()
-            .any(|hop| hop.profile_name == name))
+        Ok(desired.vpn_chain.iter().any(|hop| hop.profile_name == name))
     }
 
     pub(super) async fn vpn_status(&self) -> Response {
+        if !self.vpn_is_enabled().await {
+            return vpn_disabled();
+        }
         let Some(vpn) = &self.vpn else {
             return vpn_disabled();
         };
@@ -72,6 +130,9 @@ impl ControlService {
     }
 
     pub(super) async fn vpn_activate(&self, name: String) -> Response {
+        if !self.vpn_is_enabled().await {
+            return vpn_disabled();
+        }
         let Some(vpn) = &self.vpn else {
             return vpn_disabled();
         };
@@ -103,6 +164,9 @@ impl ControlService {
     }
 
     pub(super) async fn vpn_policy_status(&self) -> Response {
+        if !self.vpn_is_enabled().await {
+            return vpn_policy_disabled();
+        }
         let (Some(policy), Some(vpn)) = (&self.vpn_policy, &self.vpn) else {
             return vpn_policy_disabled();
         };
@@ -184,6 +248,9 @@ impl ControlService {
     }
 
     pub(super) async fn vpn_policy_set_mode(&self, mode: VpnPolicyMode) -> Response {
+        if !self.vpn_is_enabled().await {
+            return vpn_policy_disabled();
+        }
         let (Some(policy), Some(_vpn)) = (&self.vpn_policy, &self.vpn) else {
             return vpn_policy_disabled();
         };
@@ -242,6 +309,9 @@ impl ControlService {
     }
 
     pub(super) async fn vpn_policy_clear_mode(&self) -> Response {
+        if !self.vpn_is_enabled().await {
+            return vpn_policy_disabled();
+        }
         let (Some(policy), Some(_vpn)) = (&self.vpn_policy, &self.vpn) else {
             return vpn_policy_disabled();
         };
@@ -287,11 +357,12 @@ fn vpn_policy_desired_for_mode(
     target: VpnPolicyMode,
 ) -> Result<crate::core::vpn_policy_manager::VpnPolicyDesired, VpnPolicyErrorDetail> {
     match target {
-        VpnPolicyMode::Vpn => vpn_policy_desired(effective)
-            .ok_or(VpnPolicyErrorDetail::NoProtectedSubnets),
-        VpnPolicyMode::Direct => Ok(
-            vpn_policy_desired(effective).unwrap_or_else(vpn_policy_teardown_target),
-        ),
+        VpnPolicyMode::Vpn => {
+            vpn_policy_desired(effective).ok_or(VpnPolicyErrorDetail::NoProtectedSubnets)
+        }
+        VpnPolicyMode::Direct => {
+            Ok(vpn_policy_desired(effective).unwrap_or_else(vpn_policy_teardown_target))
+        }
     }
 }
 

@@ -24,16 +24,12 @@ impl ControlService {
         else {
             return Ok(());
         };
-        let routes = self
-            .network
-            .list_ipv4_routes()
-            .await
-            .with_context(|| format!("failed to inspect IPv4 routes before changing {interface}"))?;
-        let carries_default_route = routes
-            .iter()
-            .any(|route| {
-                route.destination.prefix_len() == 0 && route.output_interface_index == Some(index)
-            });
+        let routes = self.network.list_ipv4_routes().await.with_context(|| {
+            format!("failed to inspect IPv4 routes before changing {interface}")
+        })?;
+        let carries_default_route = routes.iter().any(|route| {
+            route.destination.prefix_len() == 0 && route.output_interface_index == Some(index)
+        });
         if carries_default_route {
             anyhow::bail!(
                 "interface {interface} carries the default route; set allow_management_change=true to confirm the connectivity risk"

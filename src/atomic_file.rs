@@ -6,8 +6,8 @@
 //! client lease state, Wi-Fi passphrases and AP/STA process records, WireGuard
 //! profiles and the active-profile marker, and the journal of addresses the
 //! daemon installed. The rules are the same for all of them — the directory is
-//! `0700`, the file is `0600`, a write is atomic, and a symlink anywhere on the
-//! path is refused rather than followed.
+//! `0700`, the file is `0600`, a write is atomic, and a symlink at the target
+//! path is refused rather than followed. Callers must trust parent directories.
 //!
 //! Those rules used to exist in seven copies, one per store, and had already
 //! drifted: some fsynced the parent directory and some did not, some set the
@@ -20,22 +20,15 @@
 //! Deliberately a leaf: nothing here imports from the rest of the crate, so it
 //! can be used from any layer without creating a dependency edge.
 
-//! Atomic file replacement with symlink checks and Unix permission handling.
-//!
-//! These functions are used for secrets and journals: data is first written
-//! to a temporary file with the requested mode, which then replaces the target.
-
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Mode for a file only root may read.
 /// Default mode for files containing private daemon state or secrets.
 pub const PRIVATE_FILE_MODE: u32 = 0o600;
 
-/// Mode for a directory only root may traverse.
 /// Default mode for directories containing private daemon state.
 pub const PRIVATE_DIR_MODE: u32 = 0o700;
 
@@ -82,7 +75,6 @@ impl std::error::Error for PrivateDirError {}
 /// Refuse a path that is a symlink.
 ///
 /// A missing path is fine — it is the *existing* symlink that is the problem.
-/// Reject a symlink at `path` without following it.
 pub fn reject_symlink(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
@@ -100,7 +92,6 @@ pub fn reject_symlink(path: &Path) -> io::Result<()> {
 /// An existing symlink or non-directory is refused rather than replaced: this
 /// runs as root, and silently writing through whatever is already there is the
 /// whole class of bug the check exists to prevent.
-/// Create a directory if needed and ensure it has the requested private mode.
 pub fn ensure_private_dir(path: &Path, mode: u32) -> Result<(), PrivateDirError> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -130,13 +121,15 @@ pub fn ensure_private_dir(path: &Path, mode: u32) -> Result<(), PrivateDirError>
 ///
 /// The parent directory must already exist; use [`ensure_private_dir`] first if
 /// that is not guaranteed.
-/// Atomically replace a regular file while preserving the requested mode.
 pub fn replace(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = parent_directory(path);
     reject_symlink(path)?;
 
     let (temporary, mut file) = create_temporary(path, parent, mode)?;
     let result = (|| -> io::Result<()> {
+        // Set the exact mode on the open temporary before publishing it.
+        // Creation permissions alone are filtered by the process umask.
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
         file.write_all(contents)?;
         file.sync_all()?;
         drop(file);
@@ -145,7 +138,6 @@ pub fn replace(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
         // planted.
         reject_symlink(path)?;
         fs::rename(&temporary, path)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
         File::open(parent)?.sync_all()
     })();
 
@@ -155,12 +147,8 @@ pub fn replace(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
     result
 }
 
-/// [`replace`], off the async runtime.
-///
-/// The work is genuinely blocking — three fsyncs — so it goes to the blocking
-/// pool rather than being reimplemented against `tokio::fs`. One implementation
-/// of the delicate part is the point of this module.
-/// Asynchronously perform [`replace`] without blocking the Tokio executor.
+/// Run [`replace`] on the blocking pool so file and directory fsyncs do not
+/// block the Tokio executor. Propagate both filesystem and worker errors.
 pub async fn replace_async(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
     let path = path.to_path_buf();
     let contents = contents.to_vec();
@@ -169,11 +157,10 @@ pub async fn replace_async(path: &Path, contents: &[u8], mode: u32) -> io::Resul
         .map_err(io::Error::other)?
 }
 
-/// Replace a non-secret file with strong failure semantics: if the operation
-/// returns `Err`, the exact previous bytes are restored (or a newly-created
-/// target is removed). This is for stores whose callers compensate runtime on
-/// persistence failure and therefore require `Err` to mean "committed bytes
-/// did not change".
+/// Replace a file, attempting to restore its previous bytes if replacement fails.
+/// If the file did not exist, remove the newly created target on failure.
+/// Return the original error after successful compensation; include both errors
+/// when restoration also fails and the final on-disk state may be uncertain.
 pub fn replace_preserving_on_error(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
     let previous = match OpenOptions::new()
         .read(true)
@@ -225,7 +212,7 @@ pub fn remove_durable(path: &Path) -> io::Result<bool> {
     reject_symlink(path)?;
     match fs::remove_file(path) {
         Ok(()) => {
-            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            let parent = parent_directory(path);
             File::open(parent)?.sync_all()?;
             Ok(true)
         }
@@ -280,6 +267,13 @@ pub async fn remove_durable_async(path: &Path) -> io::Result<bool> {
         .map_err(io::Error::other)?
 }
 
+/// Return the containing directory, treating a bare filename as relative to `.`.
+fn parent_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
 /// Open a uniquely named temporary next to `path`.
 ///
 /// Retries on a name collision instead of failing: two writers to the same
@@ -317,140 +311,4 @@ fn create_temporary(path: &Path, parent: &Path, mode: u32) -> io::Result<(PathBu
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use tempfile::tempdir;
-
-    #[test]
-    fn replace_writes_private_contents() {
-        let directory = tempdir().expect("tempdir");
-        let path = directory.path().join("document.json");
-
-        replace(&path, b"first", PRIVATE_FILE_MODE).expect("write");
-
-        assert_eq!(fs::read(&path).expect("read"), b"first");
-        let mode = fs::metadata(&path).expect("metadata").permissions().mode();
-        assert_eq!(mode & 0o777, PRIVATE_FILE_MODE);
-    }
-
-    #[test]
-    fn replace_overwrites_without_widening_permissions() {
-        let directory = tempdir().expect("tempdir");
-        let path = directory.path().join("document.json");
-
-        replace(&path, b"first", PRIVATE_FILE_MODE).expect("first write");
-        replace(&path, b"second", PRIVATE_FILE_MODE).expect("second write");
-
-        assert_eq!(fs::read(&path).expect("read"), b"second");
-        let mode = fs::metadata(&path).expect("metadata").permissions().mode();
-        assert_eq!(mode & 0o777, PRIVATE_FILE_MODE);
-    }
-
-    #[test]
-    fn replace_leaves_no_temporary_behind() {
-        let directory = tempdir().expect("tempdir");
-        let path = directory.path().join("document.json");
-
-        replace(&path, b"contents", PRIVATE_FILE_MODE).expect("write");
-
-        let leftovers: Vec<_> = fs::read_dir(directory.path())
-            .expect("read_dir")
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.ends_with(".tmp") || name.contains(".tmp-"))
-            .collect();
-        assert!(
-            leftovers.is_empty(),
-            "left temporaries behind: {leftovers:?}"
-        );
-    }
-
-    #[test]
-    fn replace_refuses_to_follow_a_symlinked_target() {
-        let directory = tempdir().expect("tempdir");
-        let outside = directory.path().join("outside");
-        fs::write(&outside, b"original").expect("seed");
-        let link = directory.path().join("document.json");
-        std::os::unix::fs::symlink(&outside, &link).expect("symlink");
-
-        let error = replace(&link, b"attacker", PRIVATE_FILE_MODE).expect_err("must refuse");
-
-        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert_eq!(
-            fs::read(&outside).expect("read"),
-            b"original",
-            "the symlink target must not have been written through"
-        );
-    }
-
-    #[tokio::test]
-    async fn replace_async_matches_the_blocking_version() {
-        let directory = tempdir().expect("tempdir");
-        let path = directory.path().join("document.json");
-
-        replace_async(&path, b"async", PRIVATE_FILE_MODE)
-            .await
-            .expect("write");
-
-        assert_eq!(fs::read(&path).expect("read"), b"async");
-        let mode = fs::metadata(&path).expect("metadata").permissions().mode();
-        assert_eq!(mode & 0o777, PRIVATE_FILE_MODE);
-    }
-
-    #[test]
-    fn ensure_private_dir_creates_and_tightens() {
-        let directory = tempdir().expect("tempdir");
-        let target = directory.path().join("store");
-
-        ensure_private_dir(&target, PRIVATE_DIR_MODE).expect("create");
-
-        let mode = fs::metadata(&target)
-            .expect("metadata")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, PRIVATE_DIR_MODE);
-    }
-
-    #[test]
-    fn ensure_private_dir_tightens_a_loose_existing_directory() {
-        let directory = tempdir().expect("tempdir");
-        let target = directory.path().join("store");
-        fs::create_dir(&target).expect("mkdir");
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).expect("loosen");
-
-        ensure_private_dir(&target, PRIVATE_DIR_MODE).expect("tighten");
-
-        let mode = fs::metadata(&target)
-            .expect("metadata")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, PRIVATE_DIR_MODE);
-    }
-
-    #[test]
-    fn ensure_private_dir_refuses_a_symlink() {
-        let directory = tempdir().expect("tempdir");
-        let elsewhere = directory.path().join("elsewhere");
-        fs::create_dir(&elsewhere).expect("mkdir");
-        let link = directory.path().join("store");
-        std::os::unix::fs::symlink(&elsewhere, &link).expect("symlink");
-
-        let error = ensure_private_dir(&link, PRIVATE_DIR_MODE).expect_err("must refuse");
-
-        assert!(matches!(error, PrivateDirError::Symlink(_)), "{error:?}");
-    }
-
-    #[test]
-    fn ensure_private_dir_refuses_a_file() {
-        let directory = tempdir().expect("tempdir");
-        let target = directory.path().join("store");
-        fs::write(&target, b"not a directory").expect("seed");
-
-        let error = ensure_private_dir(&target, PRIVATE_DIR_MODE).expect_err("must refuse");
-
-        assert!(
-            matches!(error, PrivateDirError::NotADirectory(_)),
-            "{error:?}"
-        );
-    }
-}
+mod tests;

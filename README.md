@@ -23,6 +23,17 @@ The project has two programs:
 The project is under development. Use a spare machine for testing. Networking
 is IPv4-only, apart from addresses inside WireGuard profiles.
 
+## Reset to defaults
+
+To clear traffic-masq configuration and persistent application state without uninstalling it, preview and run:
+
+```sh
+sudo traffic-masqd reset --dry-run
+sudo traffic-masqd reset
+```
+
+For a normal reset the daemon must be running and healthy: it restores traffic-masq-owned network state and acknowledges successful cleanup before recovery journals are removed. Logs and service registration are preserved; the daemon remains stopped until `sudo traffic-masqd start`. After a reboot, an intentional offline reset can be performed with `--force-offline`.
+
 ## Quick start
 
 ### 1. Build
@@ -122,10 +133,24 @@ address and a DHCP pool to a wireless interface alone does not create an AP.
 | **Interfaces** | Interface roles, managed IPv4 addresses and address removal |
 | **DHCP Server** | Address pools for local devices and leases |
 | **DHCP Client** | Obtaining an address from an upstream DHCP server |
-| **Router** | Static routes, Internet sharing and a topology view |
+| **Router** | Enable/disable routing, static routes, Internet sharing and topology |
 | **Wi-Fi** | Access points, client connections and saved profiles |
-| **VPN** | WireGuard profiles and VPN traffic policy |
+| **VPN** | Enable/disable VPN, WireGuard profiles and VPN traffic policy |
 | **Settings** | Application and session preferences |
+
+The Dashboard shows interfaces and traffic statistics side by side at 120 columns
+or wider. On smaller terminals, **1 / 2 / Tab** switches between the panels;
+Up/Down selects the interface whose RX/TX rates, totals and graphs are shown.
+
+In **VPN**, press **e** or choose **Enable VPN** even if `vpn.enabled` is false
+in the base configuration. This saves a runtime override and takes effect without
+a daemon restart. Import a profile and choose **Connect selected profile** to
+bring up its tunnel; **Traffic policy** controls routing through it. Disconnect
+and select Direct policy before disabling VPN. A configured router VPN chain
+must also be removed before disabling VPN.
+
+In **Router**, **e** or **Enable/Disable routing** opens a plan for review. Apply
+and commit it to save the routing change, using the normal rollback timer.
 
 In the Router tab, **1 / 2 / 3** selects Routes, Internet sharing or Topology.
 Use arrows to select items and Tab/Shift+Tab to move focus forward/backward

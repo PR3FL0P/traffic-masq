@@ -14,7 +14,10 @@ impl ControlService {
         })
     }
 
-    pub(super) async fn configure_api_https_settings(&self, settings: ApiHttpsSettings) -> Result<Response> {
+    pub(super) async fn configure_api_https_settings(
+        &self,
+        settings: ApiHttpsSettings,
+    ) -> Result<Response> {
         let api = api_https_settings_to_config(settings)?;
         self.overrides.set_api_config(api).await?;
         self.api_https_config_response().await
@@ -38,7 +41,10 @@ impl ControlService {
         })
     }
 
-    pub(super) async fn configure_security_settings(&self, settings: SecuritySettings) -> Result<Response> {
+    pub(super) async fn configure_security_settings(
+        &self,
+        settings: SecuritySettings,
+    ) -> Result<Response> {
         let security = SecurityConfig {
             rollback_timeout_seconds: settings.rollback_timeout_seconds,
         };

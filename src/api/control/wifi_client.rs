@@ -1,8 +1,11 @@
-use super::*;
 use super::dhcp_client::dhcp_client_request_to_config;
 use super::runtime::compensation_message;
+use super::*;
 
-pub(super) fn validate_wifi_client_interface(interface: &str, config: &InterfaceConfig) -> Result<(), String> {
+pub(super) fn validate_wifi_client_interface(
+    interface: &str,
+    config: &InterfaceConfig,
+) -> Result<(), String> {
     if !config.managed {
         return Err(format!(
             "interface '{interface}' is unmanaged; traffic-masq does not modify unmanaged interfaces. Enable 'managed' first."
@@ -208,8 +211,13 @@ impl ControlService {
             if let Err(error) = wifi_client.disable(&interface).await {
                 let mut rollback_failures = Vec::new();
                 if let Some(dhcp_client) = &self.dhcp_client {
-                    if let Err(rollback) =
-                        restore_dhcp_client(dhcp_client, &interface, previous_dhcp, previous_link_ready).await
+                    if let Err(rollback) = restore_dhcp_client(
+                        dhcp_client,
+                        &interface,
+                        previous_dhcp,
+                        previous_link_ready,
+                    )
+                    .await
                     {
                         rollback_failures.push(format!("DHCP client: {rollback:#}"));
                     }
@@ -294,8 +302,13 @@ impl ControlService {
         if let Err(error) = wifi_client.disable(&interface).await {
             let mut rollback_failures = Vec::new();
             if let Some(dhcp_client) = &self.dhcp_client {
-                if let Err(rollback) =
-                    restore_dhcp_client(dhcp_client, &interface, previous_dhcp.clone(), previous_link_ready).await
+                if let Err(rollback) = restore_dhcp_client(
+                    dhcp_client,
+                    &interface,
+                    previous_dhcp.clone(),
+                    previous_link_ready,
+                )
+                .await
                 {
                     rollback_failures.push(format!("DHCP client: {rollback:#}"));
                 }
@@ -333,7 +346,8 @@ impl ControlService {
             }
             if let Some(dhcp_client) = &self.dhcp_client {
                 if let Err(rollback) =
-                    restore_dhcp_client(dhcp_client, &interface, previous_dhcp, previous_link_ready).await
+                    restore_dhcp_client(dhcp_client, &interface, previous_dhcp, previous_link_ready)
+                        .await
                 {
                     rollback_failures.push(format!("DHCP client: {rollback:#}"));
                 }
@@ -636,12 +650,8 @@ impl ControlService {
             None => wifi_client.clear_passphrase(&interface).await,
         };
         if let Err(error) = secret_result {
-            let restoration = restore_wifi_client_secret(
-                wifi_client,
-                &interface,
-                previous_secret.as_ref(),
-            )
-            .await;
+            let restoration =
+                restore_wifi_client_secret(wifi_client, &interface, previous_secret.as_ref()).await;
             return wifi_client_profile_error(WifiClientProfileErrorDetail::ActivationFailed {
                 message: match restoration {
                     Ok(()) => error.to_string(),
@@ -675,7 +685,10 @@ impl ControlService {
                 .dhcp_client
                 .as_ref()
                 .expect("DHCP client availability checked above");
-            let dhcp_spec = match DhcpClientSpec::from_interface_config(&interface, &interface_config) {
+            let dhcp_spec = match DhcpClientSpec::from_interface_config(
+                &interface,
+                &interface_config,
+            ) {
                 Ok(Some(spec)) => spec,
                 Ok(None) => {
                     let rollback = compensate_wifi_client(
@@ -701,31 +714,23 @@ impl ControlService {
                         previous_secret,
                     )
                     .await;
-                    return wifi_client_profile_error(WifiClientProfileErrorDetail::ActivationFailed {
-                        message: compensation_message(
-                            "profile activation produced an invalid DHCP client specification",
-                            &error,
-                            rollback,
-                        ),
-                    });
+                    return wifi_client_profile_error(
+                        WifiClientProfileErrorDetail::ActivationFailed {
+                            message: compensation_message(
+                                "profile activation produced an invalid DHCP client specification",
+                                &error,
+                                rollback,
+                            ),
+                        },
+                    );
                 }
             };
             previous_dhcp = dhcp_client.spec(&interface).await;
-            if let Err(error) = configure_dhcp_client_checked(
-                dhcp_client,
-                dhcp_spec,
-                false,
-            )
-            .await
-            {
+            if let Err(error) = configure_dhcp_client_checked(dhcp_client, dhcp_spec, false).await {
                 let mut rollback_failures = Vec::new();
-                if let Err(rollback) = compensate_wifi_client(
-                    wifi_client,
-                    &interface,
-                    previous_spec,
-                    previous_secret,
-                )
-                .await
+                if let Err(rollback) =
+                    compensate_wifi_client(wifi_client, &interface, previous_spec, previous_secret)
+                        .await
                 {
                     rollback_failures.push(format!("Wi-Fi client: {rollback:#}"));
                 }
@@ -747,7 +752,9 @@ impl ControlService {
                         rollback_failures.join("; ")
                     )
                 };
-                return wifi_client_profile_error(WifiClientProfileErrorDetail::ActivationFailed { message });
+                return wifi_client_profile_error(WifiClientProfileErrorDetail::ActivationFailed {
+                    message,
+                });
             }
         }
 
@@ -757,13 +764,9 @@ impl ControlService {
             .await
         {
             let mut rollback_failures = Vec::new();
-            if let Err(rollback) = compensate_wifi_client(
-                wifi_client,
-                &interface,
-                previous_spec,
-                previous_secret,
-            )
-            .await
+            if let Err(rollback) =
+                compensate_wifi_client(wifi_client, &interface, previous_spec, previous_secret)
+                    .await
             {
                 rollback_failures.push(format!("Wi-Fi client: {rollback:#}"));
             }
@@ -865,7 +868,9 @@ pub(super) fn wifi_client_disabled() -> Response {
     }
 }
 
-pub(super) fn wifi_client_profile_input(request: WifiClientProfileWriteRequest) -> WifiClientProfileInput {
+pub(super) fn wifi_client_profile_input(
+    request: WifiClientProfileWriteRequest,
+) -> WifiClientProfileInput {
     WifiClientProfileInput {
         id: request.id,
         ssid: request.ssid,
@@ -882,9 +887,7 @@ async fn configure_dhcp_client_checked(
     link_ready: bool,
 ) -> Result<()> {
     let interface = spec.interface.clone();
-    supervisor
-        .configure_with_link_ready(spec, link_ready)
-        .await;
+    supervisor.configure_with_link_ready(spec, link_ready).await;
     let status = supervisor
         .status(&interface)
         .await
@@ -1034,7 +1037,9 @@ pub(super) fn classify_wifi_client_error(error: ClientSupervisorError) -> Respon
     Response::WifiClientError { detail }
 }
 
-pub(super) fn wifi_client_edit_request_to_config(settings: WifiClientEditRequest) -> WifiClientConfig {
+pub(super) fn wifi_client_edit_request_to_config(
+    settings: WifiClientEditRequest,
+) -> WifiClientConfig {
     WifiClientConfig {
         ssid: settings.ssid,
         country_code: settings.country_code,

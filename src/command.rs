@@ -7,6 +7,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 pub(crate) const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
+/// Drain one output stream, rejecting data larger than the per-stream limit.
 async fn read_output(reader: impl AsyncRead + Unpin) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     reader
@@ -20,6 +21,9 @@ async fn read_output(reader: impl AsyncRead + Unpin) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Run a command with piped input and a deadline, returning stdout on success.
+/// Drain stdout and stderr concurrently; kill and reap the child on timeout or I/O failure.
+/// A nonzero exit status is an error containing stderr.
 pub(crate) async fn run(
     program: &Path,
     arguments: &[&str],
@@ -36,6 +40,7 @@ pub(crate) async fn probe(program: &Path) -> Result<()> {
         .map(|_| ())
 }
 
+/// Execute a bounded command; optionally accept nonzero exit codes for version probes.
 async fn run_inner(
     program: &Path,
     arguments: &[&str],
@@ -100,86 +105,4 @@ async fn run_inner(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn timeout_terminates_and_reaps_the_child() {
-        let directory = tempfile::tempdir().unwrap();
-        let pid_path = directory.path().join("pid");
-        // A shell builtin loop keeps the test to exactly one child process.
-        let error = run(
-            Path::new("/bin/sh"),
-            &[
-                "-c",
-                "echo $$ > \"$1\"; while :; do :; done",
-                "test",
-                pid_path.to_str().unwrap(),
-            ],
-            &[],
-            Duration::from_secs(1),
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("timed out"), "{error:#}");
-        let pid: u32 = std::fs::read_to_string(pid_path)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        assert!(!Path::new(&format!("/proc/{pid}")).exists());
-    }
-
-    #[tokio::test]
-    async fn large_input_and_output_are_processed_concurrently() {
-        let input = vec![b'x'; 256 * 1024];
-        let output = run(Path::new("/bin/cat"), &[], &input, Duration::from_secs(5))
-            .await
-            .unwrap();
-        assert_eq!(output, input);
-    }
-
-    #[tokio::test]
-    async fn excessive_output_is_rejected() {
-        let size = (MAX_OUTPUT_BYTES + 1).to_string();
-        let error = run(
-            Path::new("/usr/bin/head"),
-            &["-c", &size, "/dev/zero"],
-            &[],
-            Duration::from_secs(5),
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            error.to_string().contains("output exceeds limit"),
-            "{error:#}"
-        );
-    }
-
-    #[tokio::test]
-    async fn version_probe_allows_hostapd_style_exit_status() {
-        let output = run_inner(
-            Path::new("/bin/sh"),
-            &["-c", "echo version; exit 1"],
-            &[],
-            Duration::from_secs(5),
-            false,
-        )
-        .await
-        .unwrap();
-        assert_eq!(output, b"version\n");
-    }
-
-    #[tokio::test]
-    async fn nonzero_exit_is_not_a_successful_preflight() {
-        let error = run(
-            Path::new("/bin/sh"),
-            &["-c", "echo broken >&2; exit 3"],
-            &[],
-            Duration::from_secs(5),
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("broken"));
-    }
-}
+mod tests;

@@ -3,9 +3,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-use tokio::sync::{
-    Mutex, MutexGuard, OwnedMutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
-};
+use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[derive(Clone, Default)]
 pub struct InterfaceMutationLocks {
@@ -25,6 +23,8 @@ impl InterfaceMutationLocks {
         GLOBAL.get_or_init(Self::default).clone()
     }
 
+    /// Serialize mutations of one interface until the returned guard is dropped.
+    /// Other interfaces can acquire their own locks independently.
     pub async fn lock(&self, interface: &str) -> OwnedMutexGuard<()> {
         let lock = {
             let mut locks = self.locks.lock().await;
@@ -44,6 +44,7 @@ pub struct NetworkMutationGate {
 }
 
 impl NetworkMutationGate {
+    /// Reserve admission for one control operation without preventing background convergence.
     pub async fn admit(&self) -> MutexGuard<'_, ()> {
         self.admission.lock().await
     }
@@ -59,6 +60,8 @@ impl NetworkMutationGate {
         self.runtime.write().await
     }
 
+    /// Acquire admission before exclusive runtime access, returning both guards.
+    /// This order lets convergence progress while another mutation waits for admission.
     pub async fn write(&self) -> (MutexGuard<'_, ()>, RwLockWriteGuard<'_, ()>) {
         let admission = self.admit().await;
         let runtime = self.execute().await;
@@ -67,63 +70,4 @@ impl NetworkMutationGate {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-
-    #[tokio::test]
-    async fn interface_mutations_serialize_per_interface_only() {
-        let locks = InterfaceMutationLocks::default();
-        let eth0 = locks.lock("eth0").await;
-
-        let blocked = tokio::spawn({
-            let locks = locks.clone();
-            async move { locks.lock("eth0").await }
-        });
-        tokio::task::yield_now().await;
-        assert!(!blocked.is_finished());
-
-        let wlan0 = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            locks.lock("wlan0"),
-        )
-        .await
-        .expect("different interfaces must not block each other");
-        drop(wlan0);
-        drop(eth0);
-        drop(blocked.await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn autonomous_runtime_writer_excludes_convergence() {
-        let gate = Arc::new(NetworkMutationGate::default());
-        let writer = gate.execute().await;
-        let convergence = tokio::spawn({
-            let gate = gate.clone();
-            async move {
-                let _guard = gate.read().await;
-            }
-        });
-        tokio::task::yield_now().await;
-        assert!(!convergence.is_finished());
-        drop(writer);
-        convergence.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn queued_mutation_does_not_block_transaction_convergence() {
-        let gate = Arc::new(NetworkMutationGate::default());
-        let transaction = gate.admit().await;
-        let writer = tokio::spawn({
-            let gate = gate.clone();
-            async move { let _guard = gate.write().await; }
-        });
-        tokio::task::yield_now().await;
-        let worker = tokio::time::timeout(std::time::Duration::from_secs(1), gate.read())
-            .await.expect("convergence must progress while another request waits");
-        assert!(!writer.is_finished());
-        drop(worker);
-        drop(transaction);
-        writer.await.unwrap();
-    }
-}
+mod tests;

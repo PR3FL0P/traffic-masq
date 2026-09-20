@@ -29,18 +29,18 @@ mod plan;
 mod view;
 
 // Keep router's external surface stable while implementation is split by responsibility.
-pub(crate) use controller::{focus_action, handle_router_key, load_router_data, refresh_router_data};
+pub(crate) use controller::{
+    focus_action, handle_router_key, load_router_data, refresh_router_data,
+};
+pub(crate) use editor::{focus_route_editor_action, handle_route_editor_key, render_route_editor};
 pub(crate) use pending::{
     handle_router_pending_key, refresh_router_pending_screen, render_router_pending,
 };
 pub(crate) use plan::{handle_router_plan_key, open_router_plan, render_router_plan};
-pub(crate) use editor::{focus_route_editor_action, handle_route_editor_key, render_route_editor};
 pub(crate) use view::render_router;
 
 // Internal cross-module helpers are re-exported only within the router module tree.
-use editor::{
-    delete_selected_route, open_route_editor_for_add, open_route_editor_for_selected,
-};
+use editor::{delete_selected_route, open_route_editor_for_add, open_route_editor_for_selected};
 use view::{describe_router_error, format_forwarding_status, summarize_uplink};
 
 #[derive(Debug, Default, Clone)]
@@ -108,6 +108,7 @@ pub(crate) enum RouterAction {
     ShareViaRoute,
     Refresh,
     Topology,
+    ToggleEnabled,
 }
 
 impl RouterAction {
@@ -119,19 +120,21 @@ impl RouterAction {
             Self::PlanApply => Self::ShareViaRoute,
             Self::ShareViaRoute => Self::Refresh,
             Self::Refresh => Self::Topology,
-            Self::Topology => Self::AddRoute,
+            Self::Topology => Self::ToggleEnabled,
+            Self::ToggleEnabled => Self::AddRoute,
         }
     }
 
     pub(crate) fn prev(self) -> Self {
         match self {
-            Self::AddRoute => Self::Topology,
+            Self::AddRoute => Self::ToggleEnabled,
             Self::EditRoute => Self::AddRoute,
             Self::DeleteRoute => Self::EditRoute,
             Self::PlanApply => Self::DeleteRoute,
             Self::ShareViaRoute => Self::PlanApply,
             Self::Refresh => Self::ShareViaRoute,
             Self::Topology => Self::Refresh,
+            Self::ToggleEnabled => Self::Topology,
         }
     }
 }

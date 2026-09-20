@@ -145,6 +145,8 @@ struct AuthServiceInner {
 }
 
 impl AuthService {
+    /// Validate authentication settings and open the private SQLite session store.
+    /// Initialize the schema, password-hashing parameters, and bounded login workers.
     pub async fn open(config: &AuthConfig) -> Result<Self, AuthError> {
         let session_idle_seconds =
             duration_to_i64("session_idle_seconds", config.session_idle_seconds)?;
@@ -217,6 +219,7 @@ impl AuthService {
         })
     }
 
+    /// Report whether an enabled device account exists.
     pub async fn is_initialized(&self) -> Result<bool, AuthError> {
         let exists: i64 = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM users WHERE username = ? AND enabled = 1)",
@@ -227,6 +230,8 @@ impl AuthService {
         Ok(exists != 0)
     }
 
+    /// Create the device administrator once, rejecting an already initialized account.
+    /// Disable other users and remove existing sessions in the same database transaction.
     pub async fn initialize_device_password(&self, password: &str) -> Result<Principal, AuthError> {
         validate_password(password)?;
         let password_hash =
@@ -273,6 +278,8 @@ impl AuthService {
         })
     }
 
+    /// Replace or create the device administrator password and revoke every session atomically.
+    /// This recovery entry point does not verify the previous password.
     pub async fn reset_device_password(&self, password: &str) -> Result<Principal, AuthError> {
         validate_password(password)?;
         let password_hash =
@@ -310,6 +317,7 @@ impl AuthService {
         })
     }
 
+    /// Verify the device password with rate and concurrency limits, then issue a session token.
     pub async fn login_device(
         &self,
         password: &str,
@@ -319,6 +327,8 @@ impl AuthService {
         self.login(password, client_name, peer).await
     }
 
+    /// Verify the current password, replace it, and revoke existing sessions.
+    /// If replacement fails, remove the temporary verification session.
     pub async fn change_device_password(
         &self,
         current_password: &str,
@@ -335,6 +345,8 @@ impl AuthService {
         result
     }
 
+    /// Apply the login budget, verify the password off the runtime, and store a token hash.
+    /// Return the bearer token with idle and absolute expiration times.
     async fn login(
         &self,
         password: &str,
@@ -410,6 +422,7 @@ impl AuthService {
         })
     }
 
+    /// Validate a bearer token and enabled user, reject expired sessions, and refresh idle expiry.
     pub async fn authenticate(&self, token: &str) -> Result<Principal, AuthError> {
         let token_hash = decode_and_hash_token(token).ok_or(AuthError::InvalidSession)?;
         let now = unix_timestamp()?;
@@ -464,6 +477,7 @@ impl AuthService {
         })
     }
 
+    /// Delete the session associated with the supplied token.
     pub async fn logout(&self, token: &str) -> Result<(), AuthError> {
         if let Some(token_hash) = decode_and_hash_token(token) {
             sqlx::query("DELETE FROM sessions WHERE token_hash = ?")
@@ -474,6 +488,7 @@ impl AuthService {
         Ok(())
     }
 
+    /// Delete all sessions for one user and return the number removed.
     pub async fn revoke_user_sessions(&self, user_id: i64) -> Result<u64, AuthError> {
         let result = sqlx::query("DELETE FROM sessions WHERE user_id = ?")
             .bind(user_id)
@@ -482,6 +497,7 @@ impl AuthService {
         Ok(result.rows_affected())
     }
 
+    /// Delete sessions past either expiration deadline and return the number removed.
     pub async fn purge_expired_sessions(&self) -> Result<u64, AuthError> {
         let now = unix_timestamp()?;
         let result = sqlx::query(
@@ -566,6 +582,7 @@ fn validate_password(password: &str) -> Result<(), AuthError> {
     }
 }
 
+/// Run password work on the blocking pool while holding a concurrency permit.
 async fn password_worker<T: Send + 'static>(
     semaphore: Arc<Semaphore>,
     work: impl FnOnce() -> T + Send + 'static,
@@ -579,6 +596,7 @@ async fn password_worker<T: Send + 'static>(
     .map_err(|_| AuthError::Worker)
 }
 
+/// Generate a salted Argon2 password hash on a blocking worker.
 async fn hash_password(params: Params, password: String) -> Result<String, AuthError> {
     tokio::task::spawn_blocking(move || {
         let salt = SaltString::generate(&mut OsRng);
@@ -591,6 +609,7 @@ async fn hash_password(params: Params, password: String) -> Result<String, AuthE
     .map_err(|_| AuthError::Worker)?
 }
 
+/// Check a password against its encoded hash; malformed hashes fail verification.
 fn verify_password(encoded_hash: &str, password: &str) -> bool {
     let Ok(parsed_hash) = PasswordHash::new(encoded_hash) else {
         return false;
@@ -612,6 +631,7 @@ fn generate_token() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// Decode a session token and return its hash, rejecting malformed token encoding.
 fn decode_and_hash_token(token: &str) -> Option<[u8; 32]> {
     let decoded = URL_SAFE_NO_PAD.decode(token).ok()?;
     if decoded.len() != TOKEN_BYTES {
@@ -645,280 +665,4 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    #[tokio::test]
-    async fn cancelled_password_waiter_keeps_worker_permit() {
-        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let worker = {
-            let semaphore = semaphore.clone();
-            tokio::spawn(async move {
-                super::password_worker(semaphore, move || {
-                    started_tx.send(()).unwrap();
-                    release_rx.recv().unwrap();
-                })
-                .await
-            })
-        };
-        started_rx.await.unwrap();
-        worker.abort();
-        let _ = worker.await;
-        let busy = super::password_worker(semaphore.clone(), || ()).await;
-        release_tx.send(()).unwrap();
-        assert!(matches!(busy, Err(super::AuthError::Busy)));
-        let permit = tokio::time::timeout(std::time::Duration::from_secs(5), semaphore.acquire())
-            .await
-            .unwrap()
-            .unwrap();
-        drop(permit);
-        super::password_worker(semaphore, || ()).await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn login_budget_replenishes_without_an_unbounded_queue() {
-        let mut budget = super::LoginBudget::new();
-        for _ in 0..20 {
-            budget.take().unwrap();
-        }
-        assert!(matches!(budget.take(), Err(super::AuthError::Busy)));
-        tokio::time::advance(std::time::Duration::from_secs(1)).await;
-        budget.take().unwrap();
-        assert!(matches!(budget.take(), Err(super::AuthError::Busy)));
-    }
-
-    use sqlx::Row;
-    use tempfile::TempDir;
-
-    use super::*;
-
-    fn test_config(temp_dir: &TempDir) -> AuthConfig {
-        AuthConfig {
-            database_path: temp_dir.path().join("nested/auth.sqlite3"),
-            session_idle_seconds: 300,
-            session_absolute_seconds: 600,
-            argon2_memory_kib: 8,
-            argon2_iterations: 1,
-            argon2_parallelism: 1,
-            max_concurrent_logins: 2,
-        }
-    }
-
-    async fn service() -> (TempDir, AuthService) {
-        let temp_dir = tempfile::tempdir().expect("create temporary directory");
-        let service = AuthService::open(&test_config(&temp_dir))
-            .await
-            .expect("open auth service");
-        (temp_dir, service)
-    }
-
-    #[tokio::test]
-    async fn initializes_device_then_logs_in_authenticates_and_logs_out() {
-        let (_temp_dir, service) = service().await;
-        assert!(!service
-            .is_initialized()
-            .await
-            .expect("query initialization"));
-
-        let created = service
-            .initialize_device_password("a secure password")
-            .await
-            .expect("initialize device password");
-        assert!(service
-            .is_initialized()
-            .await
-            .expect("query initialization"));
-
-        let login = service
-            .login_device("a secure password", Some("test"), Some("local"))
-            .await
-            .expect("log in");
-        assert_eq!(login.principal, created);
-        assert_eq!(
-            service
-                .authenticate(&login.token)
-                .await
-                .expect("authenticate"),
-            created
-        );
-
-        service.logout(&login.token).await.expect("log out");
-        assert!(matches!(
-            service.authenticate(&login.token).await,
-            Err(AuthError::InvalidSession)
-        ));
-    }
-
-    #[tokio::test]
-    async fn changing_device_password_revokes_existing_sessions() {
-        let (_temp_dir, service) = service().await;
-        service
-            .initialize_device_password("a secure password")
-            .await
-            .expect("initialize");
-        let session = service
-            .login_device("a secure password", None, None)
-            .await
-            .expect("login");
-
-        service
-            .change_device_password("a secure password", "a newer secure password")
-            .await
-            .expect("change password");
-        assert!(matches!(
-            service.authenticate(&session.token).await,
-            Err(AuthError::InvalidSession)
-        ));
-        assert!(service
-            .login_device("a secure password", None, None)
-            .await
-            .is_err());
-        service
-            .login_device("a newer secure password", None, None)
-            .await
-            .expect("login with new password");
-    }
-
-    #[tokio::test]
-    async fn rejects_wrong_password_and_uninitialized_login_identically() {
-        let (_temp_dir, service) = service().await;
-        assert!(matches!(
-            service.login_device("wrong password", None, None).await,
-            Err(AuthError::InvalidCredentials)
-        ));
-        service
-            .initialize_device_password("a secure password")
-            .await
-            .expect("initialize");
-        assert!(matches!(
-            service.login_device("wrong password", None, None).await,
-            Err(AuthError::InvalidCredentials)
-        ));
-    }
-
-    #[tokio::test]
-    async fn stores_only_the_token_hash() {
-        let (_temp_dir, service) = service().await;
-        service
-            .initialize_device_password("a secure password")
-            .await
-            .expect("initialize");
-        let login = service
-            .login_device("a secure password", None, None)
-            .await
-            .expect("log in");
-
-        let row =
-            sqlx::query("SELECT token_hash, typeof(token_hash) AS storage_type FROM sessions")
-                .fetch_one(&service.inner.pool)
-                .await
-                .expect("read stored token hash");
-        let stored_hash: Vec<u8> = row.get("token_hash");
-        assert_eq!(row.get::<String, _>("storage_type"), "blob");
-        assert_eq!(stored_hash, hash_token(&login.token));
-        assert_ne!(stored_hash, login.token.as_bytes());
-    }
-
-    #[tokio::test]
-    async fn expires_idle_sessions() {
-        let temp_dir = tempfile::tempdir().expect("create temporary directory");
-        let mut config = test_config(&temp_dir);
-        config.session_idle_seconds = 1;
-        config.session_absolute_seconds = 10;
-        let service = AuthService::open(&config).await.expect("open auth service");
-        service
-            .initialize_device_password("a secure password")
-            .await
-            .expect("initialize");
-        let login = service
-            .login_device("a secure password", None, None)
-            .await
-            .expect("log in");
-
-        tokio::time::sleep(Duration::from_millis(1_100)).await;
-        assert!(matches!(
-            service.authenticate(&login.token).await,
-            Err(AuthError::InvalidSession)
-        ));
-    }
-
-    #[tokio::test]
-    async fn device_password_can_only_be_initialized_once() {
-        let (_temp_dir, service) = service().await;
-        service
-            .initialize_device_password("a secure password")
-            .await
-            .expect("initialize");
-        assert!(matches!(
-            service
-                .initialize_device_password("another secure password")
-                .await,
-            Err(AuthError::AlreadyInitialized)
-        ));
-    }
-
-    #[tokio::test]
-    async fn rejects_a_password_shorter_than_the_documented_minimum() {
-        let (_temp_dir, service) = service().await;
-        let short: String = "a".repeat(MINIMUM_PASSWORD_CHARACTERS - 1);
-
-        assert!(matches!(
-            service.initialize_device_password(&short).await,
-            Err(AuthError::WeakPassword)
-        ));
-        assert!(service
-            .initialize_device_password(&"a".repeat(MINIMUM_PASSWORD_CHARACTERS))
-            .await
-            .is_ok());
-    }
-
-    #[tokio::test]
-    async fn weak_password_message_matches_the_enforced_minimum() {
-        assert_eq!(
-            AuthError::WeakPassword.to_string(),
-            format!("password must contain at least {MINIMUM_PASSWORD_CHARACTERS} characters")
-        );
-    }
-
-    #[tokio::test]
-    async fn purge_removes_expired_sessions_that_were_never_presented_again() {
-        let temp_dir = tempfile::tempdir().expect("create temporary directory");
-        let mut config = test_config(&temp_dir);
-        config.session_idle_seconds = 1;
-        config.session_absolute_seconds = 1;
-        let service = AuthService::open(&config).await.expect("open auth service");
-        service
-            .initialize_device_password("a secure password")
-            .await
-            .expect("initialize");
-        service
-            .login_device("a secure password", None, None)
-            .await
-            .expect("log in");
-
-        assert_eq!(service.purge_expired_sessions().await.expect("purge"), 0);
-        tokio::time::sleep(Duration::from_millis(1_100)).await;
-        assert_eq!(service.purge_expired_sessions().await.expect("purge"), 1);
-
-        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
-            .fetch_one(&service.inner.pool)
-            .await
-            .expect("count sessions");
-        assert_eq!(remaining, 0);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn new_database_is_private() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let (temp_dir, _service) = service().await;
-        let path = test_config(&temp_dir).database_path;
-        let mode = std::fs::metadata(path)
-            .expect("database metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600);
-    }
-}
+mod tests;

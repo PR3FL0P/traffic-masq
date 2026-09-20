@@ -1,4 +1,5 @@
 use std::collections::{HashSet, VecDeque};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -9,107 +10,79 @@ use ratatui::widgets::{Paragraph, Sparkline};
 use crossterm::event::KeyCode;
 
 use crate::api::client::ApiClient;
-use crate::api::model::InterfaceStatus;
+use crate::api::model::{DhcpClientOperationalState, DhcpClientStatusView, InterfaceStatus};
 use crate::core::transaction::PendingNetworkChange;
 
 use super::layout::panel;
-use super::logs::LogLevel;
 use super::theme;
 use super::{format_addresses, Screen, TuiApp};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DashboardFocus {
+pub(crate) enum DashboardPane {
     #[default]
-    List,
-    Interfaces,
-    PendingChanges,
-}
-
-pub(crate) const DASHBOARD_ACTIONS: [DashboardFocus; 2] =
-    [DashboardFocus::Interfaces, DashboardFocus::PendingChanges];
-
-pub(crate) const DASHBOARD_ACTION_LABELS: [&str; 2] = ["Interfaces", "Pending network changes"];
-
-fn next_dashboard_action(focus: DashboardFocus) -> DashboardFocus {
-    super::input::move_clamped(&DASHBOARD_ACTIONS, focus, true)
-}
-
-fn previous_dashboard_action(focus: DashboardFocus) -> DashboardFocus {
-    super::input::move_clamped(&DASHBOARD_ACTIONS, focus, false)
-}
-
-pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
-    if let Some(focus) = DASHBOARD_ACTIONS.get(slot) {
-        app.dashboard_focus = *focus;
-    }
+    Traffic,
+    Statistics,
 }
 
 pub(crate) async fn handle_dashboard_key(
     app: &mut TuiApp,
     key: KeyCode,
     _client: &ApiClient,
-    direct: bool,
+    _direct: bool,
 ) {
-    let key = match key {
-        KeyCode::Left if app.dashboard_focus != DashboardFocus::List => KeyCode::Up,
-        KeyCode::Right if app.dashboard_focus != DashboardFocus::List => KeyCode::Down,
-        _ => key,
-    };
     match key {
-        KeyCode::Tab | KeyCode::BackTab => {
-            let fields = [
-                DashboardFocus::List,
-                DashboardFocus::Interfaces,
-                DashboardFocus::PendingChanges,
-            ];
-            app.dashboard_focus =
-                super::input::move_wrapped(&fields, app.dashboard_focus, key == KeyCode::Tab);
+        KeyCode::Char('1') => app.dashboard_pane = DashboardPane::Traffic,
+        KeyCode::Char('2') => {
+            app.dashboard_pane = DashboardPane::Statistics;
+            app.dashboard_statistics_index = 0;
         }
-        KeyCode::Esc if app.dashboard_focus != DashboardFocus::List => {
-            app.dashboard_focus = DashboardFocus::List;
+        KeyCode::Tab | KeyCode::BackTab => {
+            app.dashboard_pane = match app.dashboard_pane {
+                DashboardPane::Traffic => {
+                    app.dashboard_statistics_index = 0;
+                    DashboardPane::Statistics
+                }
+                DashboardPane::Statistics => DashboardPane::Traffic,
+            };
         }
         KeyCode::Esc => app.should_quit = true,
-        KeyCode::Up => match app.dashboard_focus {
-            DashboardFocus::List => {
-                app.selected_interface = app.selected_interface.saturating_sub(1);
+        KeyCode::Up => match app.dashboard_pane {
+            DashboardPane::Traffic => {
+                app.selected_interface = app.selected_interface.saturating_sub(1)
             }
-            DashboardFocus::Interfaces => {
-                app.dashboard_focus = DashboardFocus::List;
-                app.selected_interface = app.dashboard.interfaces.len().saturating_sub(1);
+            DashboardPane::Statistics => {
+                app.dashboard_statistics_index = app.dashboard_statistics_index.saturating_sub(1)
             }
-            focus => app.dashboard_focus = previous_dashboard_action(focus),
         },
-        KeyCode::Down => match app.dashboard_focus {
-            DashboardFocus::List if app.selected_interface + 1 < app.dashboard.interfaces.len() => {
-                app.selected_interface += 1;
+        KeyCode::Down => match app.dashboard_pane {
+            DashboardPane::Traffic => {
+                app.selected_interface = (app.selected_interface + 1)
+                    .min(app.dashboard.interfaces.len().saturating_sub(1));
             }
-            DashboardFocus::List => app.dashboard_focus = DashboardFocus::Interfaces,
-            focus => app.dashboard_focus = next_dashboard_action(focus),
+            DashboardPane::Statistics => {
+                app.dashboard_statistics_index =
+                    (app.dashboard_statistics_index + 1).min(app.dashboard.interfaces.len());
+            }
         },
-        KeyCode::Home => app.selected_interface = 0,
-        KeyCode::End => {
-            app.selected_interface = app.dashboard.interfaces.len().saturating_sub(1);
+        KeyCode::Home => match app.dashboard_pane {
+            DashboardPane::Traffic => app.selected_interface = 0,
+            DashboardPane::Statistics => app.dashboard_statistics_index = 0,
+        },
+        KeyCode::End => match app.dashboard_pane {
+            DashboardPane::Traffic => {
+                app.selected_interface = app.dashboard.interfaces.len().saturating_sub(1)
+            }
+            DashboardPane::Statistics => {
+                app.dashboard_statistics_index = app.dashboard.interfaces.len()
+            }
+        },
+        KeyCode::Enter => {
+            if app.dashboard_pane == DashboardPane::Statistics && app.dashboard_statistics_index > 0
+            {
+                app.selected_interface = app.dashboard_statistics_index - 1;
+            }
+            app.screen = Screen::InterfaceList;
         }
-        KeyCode::Enter => match app.dashboard_focus {
-            DashboardFocus::List | DashboardFocus::Interfaces => {
-                app.screen = Screen::InterfaceList;
-            }
-            DashboardFocus::PendingChanges => {
-                if direct {
-                    app.push_message(
-                        LogLevel::Warn,
-                        "Network transactions require the daemon API; unavailable in direct/offline mode",
-                    );
-                } else if let Some(change) = app.dashboard.pending_network_changes.first().cloned()
-                {
-                    app.pending = Some(change);
-                    app.pending_return_screen = Screen::Dashboard;
-                    app.screen = Screen::PendingChange;
-                } else {
-                    app.push_message(LogLevel::Warn, "No pending network changes");
-                }
-            }
-        },
         _ => {}
     }
 }
@@ -121,13 +94,47 @@ pub(crate) struct TrafficSample {
     at: Instant,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct InterfaceKernelCounters {
+    rx_packets: u64,
+    tx_packets: u64,
+    rx_errors: u64,
+    tx_errors: u64,
+    rx_dropped: u64,
+    tx_dropped: u64,
+}
+
+impl InterfaceKernelCounters {
+    fn saturating_sub(self, baseline: Self) -> Self {
+        Self {
+            rx_packets: self.rx_packets.saturating_sub(baseline.rx_packets),
+            tx_packets: self.tx_packets.saturating_sub(baseline.tx_packets),
+            rx_errors: self.rx_errors.saturating_sub(baseline.rx_errors),
+            tx_errors: self.tx_errors.saturating_sub(baseline.tx_errors),
+            rx_dropped: self.rx_dropped.saturating_sub(baseline.rx_dropped),
+            tx_dropped: self.tx_dropped.saturating_sub(baseline.tx_dropped),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ConnectionStats {
+    active: Option<u64>,
+    limit: Option<u64>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TrafficHistory {
+    first: Option<TrafficSample>,
     last: Option<TrafficSample>,
     rx_rate_history: VecDeque<u64>,
     tx_rate_history: VecDeque<u64>,
     pub(crate) current_rx_rate: u64,
     pub(crate) current_tx_rate: u64,
+    peak_rx_rate: u64,
+    peak_tx_rate: u64,
+    first_kernel: Option<InterfaceKernelCounters>,
+    current_kernel: Option<InterfaceKernelCounters>,
 }
 
 pub(crate) const TRAFFIC_HISTORY_LEN: usize = 96;
@@ -150,16 +157,38 @@ impl TrafficHistory {
         self.tx_rate_history.as_slices().0
     }
 
-    pub(crate) fn record(&mut self, rx_bytes: u64, tx_bytes: u64, now: Instant) {
-        let Some(last) = self.last.clone() else {
-            self.last = Some(TrafficSample {
+    #[cfg(test)]
+    fn record(&mut self, rx_bytes: u64, tx_bytes: u64, now: Instant) {
+        self.record_with_counters(rx_bytes, tx_bytes, None, now);
+    }
+
+    fn record_with_counters(
+        &mut self,
+        rx_bytes: u64,
+        tx_bytes: u64,
+        counters: Option<InterfaceKernelCounters>,
+        now: Instant,
+    ) {
+        if self.first.is_none() {
+            let sample = TrafficSample {
                 rx_bytes,
                 tx_bytes,
                 at: now,
-            });
+            };
+            self.first = Some(sample.clone());
+            self.last = Some(sample);
+            self.first_kernel = counters;
+            self.current_kernel = counters;
+            return;
+        }
+
+        if self.first_kernel.is_none() && counters.is_some() {
+            self.first_kernel = counters;
+        }
+        self.current_kernel = counters;
+        let Some(last) = self.last.clone() else {
             return;
         };
-
         let elapsed = now.saturating_duration_since(last.at);
         if elapsed < TRAFFIC_MIN_SAMPLE_INTERVAL {
             return;
@@ -168,6 +197,8 @@ impl TrafficHistory {
         let seconds = elapsed.as_secs_f64();
         self.current_rx_rate = (rx_bytes.saturating_sub(last.rx_bytes) as f64 / seconds) as u64;
         self.current_tx_rate = (tx_bytes.saturating_sub(last.tx_bytes) as f64 / seconds) as u64;
+        self.peak_rx_rate = self.peak_rx_rate.max(self.current_rx_rate);
+        self.peak_tx_rate = self.peak_tx_rate.max(self.current_tx_rate);
         push_capped(&mut self.rx_rate_history, self.current_rx_rate);
         push_capped(&mut self.tx_rate_history, self.current_tx_rate);
         self.last = Some(TrafficSample {
@@ -175,6 +206,38 @@ impl TrafficHistory {
             tx_bytes,
             at: now,
         });
+    }
+
+    fn observed_for(&self, now: Instant) -> Duration {
+        self.first
+            .as_ref()
+            .map(|sample| now.saturating_duration_since(sample.at))
+            .unwrap_or_default()
+    }
+
+    fn bytes_since_start(&self, current_rx: u64, current_tx: u64) -> (u64, u64) {
+        self.first
+            .as_ref()
+            .map(|first| {
+                (
+                    current_rx.saturating_sub(first.rx_bytes),
+                    current_tx.saturating_sub(first.tx_bytes),
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    fn average_rates(&self, current_rx: u64, current_tx: u64, now: Instant) -> (u64, u64) {
+        let elapsed = self.observed_for(now).as_secs_f64();
+        if elapsed <= 0.0 {
+            return (0, 0);
+        }
+        let (rx, tx) = self.bytes_since_start(current_rx, current_tx);
+        ((rx as f64 / elapsed) as u64, (tx as f64 / elapsed) as u64)
+    }
+
+    fn kernel_since_start(&self) -> Option<InterfaceKernelCounters> {
+        Some(self.current_kernel?.saturating_sub(self.first_kernel?))
     }
 }
 
@@ -206,8 +269,13 @@ pub(crate) struct DashboardData {
     pub(crate) interfaces: Vec<InterfaceStatus>,
     pub(crate) managed: std::collections::HashMap<String, bool>,
     pub(crate) dhcp_interfaces: Vec<String>,
+    pub(crate) dhcp_clients: Vec<DhcpClientStatusView>,
+    pub(crate) dhcp_client_error: Option<String>,
+    pub(crate) vpn_enabled: Option<bool>,
     pub(crate) pending_network_changes: Vec<PendingNetworkChange>,
     pub(crate) error: Option<String>,
+    pub(crate) pane_tabs: Vec<(Rect, DashboardPane)>,
+    pub(crate) connections: ConnectionStats,
 }
 
 pub(crate) fn record_traffic_samples(app: &mut TuiApp) {
@@ -221,11 +289,18 @@ pub(crate) fn record_traffic_samples(app: &mut TuiApp) {
     app.traffic.retain(|index, _| present.contains(index));
 
     for status in &app.dashboard.interfaces {
+        let counters = read_interface_counters(&status.interface.name);
         app.traffic
             .entry(status.interface.index)
             .or_default()
-            .record(status.interface.rx_bytes, status.interface.tx_bytes, now);
+            .record_with_counters(
+                status.interface.rx_bytes,
+                status.interface.tx_bytes,
+                counters,
+                now,
+            );
     }
+    app.dashboard.connections = read_connection_stats();
 }
 
 pub(crate) fn render_dashboard(
@@ -234,54 +309,443 @@ pub(crate) fn render_dashboard(
     app: &mut TuiApp,
     direct: bool,
 ) {
-    let sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(5),
-            Constraint::Min(6),
-            Constraint::Length(4),
-        ])
-        .split(area);
+    let sections = Layout::vertical([
+        Constraint::Length(5),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .split(area);
     render_dashboard_summary(frame, sections[0], app, direct);
-    render_dashboard_traffic(frame, sections[1], app);
-    render_dashboard_actions(frame, sections[2], app);
-}
-
-fn render_dashboard_actions(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
-    let block = panel("Actions");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let mut lines = Vec::with_capacity(DASHBOARD_ACTIONS.len());
-    for (slot, (focus, label)) in DASHBOARD_ACTIONS
-        .iter()
-        .zip(DASHBOARD_ACTION_LABELS.iter())
-        .enumerate()
-    {
-        let selected = app.dashboard_focus == *focus;
-        let style = if selected {
-            Style::default()
-                .fg(theme::SELECTED_FG)
-                .bg(theme::SELECTED_BG)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme::ACCENT)
-        };
-        let marker = if selected { "▶ " } else { "  " };
-        let text = format!("{marker}{label}");
-        app.ui.buttons.push((
-            Rect {
-                x: inner.x,
-                y: inner.y + lines.len() as u16,
-                width: text.len() as u16,
-                height: 1,
-            },
-            slot,
-        ));
-        lines.push(Line::styled(text, style));
+    app.dashboard.pane_tabs.clear();
+    let mut x = sections[1].x;
+    for (label, pane) in [
+        ("[1 Interfaces stat]", DashboardPane::Traffic),
+        ("[2 Statistics]", DashboardPane::Statistics),
+    ] {
+        let rect = Rect::new(x, sections[1].y, label.len() as u16, 1);
+        app.dashboard.pane_tabs.push((rect, pane));
+        frame.render_widget(
+            Paragraph::new(label).style(if app.dashboard_pane == pane {
+                Style::default()
+                    .fg(theme::SELECTED_FG)
+                    .bg(theme::SELECTED_BG)
+            } else {
+                Style::default().fg(theme::MUTED)
+            }),
+            rect,
+        );
+        x += rect.width + 1;
     }
 
+    let body = Layout::horizontal([Constraint::Percentage(78), Constraint::Percentage(22)])
+        .split(sections[2]);
+    match app.dashboard_pane {
+        DashboardPane::Traffic => render_dashboard_traffic(frame, body[0], app),
+        DashboardPane::Statistics => render_numeric_statistics(frame, body[0], app),
+    }
+    render_dhcp_clients(frame, body[1], app, direct);
+}
+
+fn render_numeric_statistics(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
+    app.ui.list_area = None;
+    app.ui.list_count = 0;
+    app.ui.list_scroll_offset = 0;
+    if app.dashboard_statistics_index == 0 {
+        render_global_statistics(frame, area, app);
+        return;
+    }
+
+    let interface_index = app.dashboard_statistics_index.saturating_sub(1);
+    let Some(status) = app.dashboard.interfaces.get(interface_index) else {
+        frame.render_widget(
+            Paragraph::new("No interfaces detected").block(panel("Statistics")),
+            area,
+        );
+        return;
+    };
+
+    let name = &status.interface.name;
+    let history = app.traffic.get(&status.interface.index);
+    let now = Instant::now();
+    let (session_rx, session_tx) = history
+        .map(|history| {
+            history.bytes_since_start(status.interface.rx_bytes, status.interface.tx_bytes)
+        })
+        .unwrap_or_default();
+    let (avg_rx, avg_tx) = history
+        .map(|history| {
+            history.average_rates(status.interface.rx_bytes, status.interface.tx_bytes, now)
+        })
+        .unwrap_or_default();
+    let (current_rx, current_tx, peak_rx, peak_tx, observed) = history
+        .map(|history| {
+            (
+                history.current_rx_rate,
+                history.current_tx_rate,
+                history.peak_rx_rate,
+                history.peak_tx_rate,
+                history.observed_for(now),
+            )
+        })
+        .unwrap_or_default();
+
+    let managed = app
+        .dashboard
+        .managed
+        .get(name)
+        .map(|managed| if *managed { "yes" } else { "no" })
+        .unwrap_or("n/a");
+    let link = if status.interface.is_up { "up" } else { "down" };
+    let default_route = if status.has_default_route {
+        "yes"
+    } else {
+        "no"
+    };
+    let addresses = if status.ipv4_addresses.is_empty() {
+        "none".to_string()
+    } else {
+        status
+            .ipv4_addresses
+            .iter()
+            .map(|address| format!("{}/{}", address.address, address.prefix_len))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    let mut lines = vec![
+        stat_line(
+            "Observed",
+            format_duration(observed),
+            format!("link {link}  managed {managed}  default route {default_route}"),
+        ),
+        stat_line("IPv4", addresses, String::new()),
+        stat_line(
+            "Traffic since start",
+            format!(
+                "RX {}  TX {}",
+                format_bytes(session_rx),
+                format_bytes(session_tx)
+            ),
+            format!(
+                "total {}",
+                format_bytes(session_rx.saturating_add(session_tx))
+            ),
+        ),
+        stat_line(
+            "Current rate",
+            format!(
+                "RX {}  TX {}",
+                format_rate(current_rx),
+                format_rate(current_tx)
+            ),
+            String::new(),
+        ),
+        stat_line(
+            "Average rate",
+            format!("RX {}  TX {}", format_rate(avg_rx), format_rate(avg_tx)),
+            String::new(),
+        ),
+        stat_line(
+            "Peak rate",
+            format!("RX {}  TX {}", format_rate(peak_rx), format_rate(peak_tx)),
+            String::new(),
+        ),
+    ];
+
+    if let Some(counters) = history.and_then(TrafficHistory::kernel_since_start) {
+        lines.extend([
+            stat_line(
+                "Packets since start",
+                format!(
+                    "RX {}  TX {}",
+                    format_count(counters.rx_packets),
+                    format_count(counters.tx_packets)
+                ),
+                String::new(),
+            ),
+            stat_line(
+                "Errors since start",
+                format!(
+                    "RX {}  TX {}",
+                    format_count(counters.rx_errors),
+                    format_count(counters.tx_errors)
+                ),
+                format!(
+                    "total {}",
+                    format_count(counters.rx_errors.saturating_add(counters.tx_errors))
+                ),
+            ),
+            stat_line(
+                "Drops since start",
+                format!(
+                    "RX {}  TX {}",
+                    format_count(counters.rx_dropped),
+                    format_count(counters.tx_dropped)
+                ),
+                String::new(),
+            ),
+        ]);
+    } else {
+        lines.extend([
+            stat_line("Packets since start", "n/a".to_string(), String::new()),
+            stat_line("Errors since start", "n/a".to_string(), String::new()),
+            stat_line("Drops since start", "n/a".to_string(), String::new()),
+        ]);
+    }
+
+    lines.push(stat_line(
+        "Connections",
+        format_connection_stats(app.dashboard.connections),
+        "conntrack, system-wide".to_string(),
+    ));
+    lines.push(stat_line(
+        "Kernel traffic total",
+        format!(
+            "RX {}  TX {}",
+            format_bytes(status.interface.rx_bytes),
+            format_bytes(status.interface.tx_bytes)
+        ),
+        "since interface creation/reset".to_string(),
+    ));
+
+    let block = panel(&format!("Statistics: {name} | ↑/↓ all/interfaces"));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn render_global_statistics(frame: &mut ratatui::Frame<'_>, area: Rect, app: &TuiApp) {
+    let now = Instant::now();
+    let mut observed = Duration::ZERO;
+    let mut session_rx = 0u64;
+    let mut session_tx = 0u64;
+    let mut current_rx = 0u64;
+    let mut current_tx = 0u64;
+    let mut average_rx = 0u64;
+    let mut average_tx = 0u64;
+    let mut kernel = InterfaceKernelCounters::default();
+    let mut have_kernel = false;
+
+    let mut up = 0usize;
+    let mut managed = 0usize;
+    let mut kernel_rx = 0u64;
+    let mut kernel_tx = 0u64;
+    for status in &app.dashboard.interfaces {
+        if status.interface.is_up {
+            up += 1;
+        }
+        if app
+            .dashboard
+            .managed
+            .get(&status.interface.name)
+            .copied()
+            .unwrap_or(false)
+        {
+            managed += 1;
+        }
+        kernel_rx = kernel_rx.saturating_add(status.interface.rx_bytes);
+        kernel_tx = kernel_tx.saturating_add(status.interface.tx_bytes);
+
+        let Some(history) = app.traffic.get(&status.interface.index) else {
+            continue;
+        };
+        observed = observed.max(history.observed_for(now));
+        let (rx, tx) =
+            history.bytes_since_start(status.interface.rx_bytes, status.interface.tx_bytes);
+        session_rx = session_rx.saturating_add(rx);
+        session_tx = session_tx.saturating_add(tx);
+        current_rx = current_rx.saturating_add(history.current_rx_rate);
+        current_tx = current_tx.saturating_add(history.current_tx_rate);
+        let (rx, tx) =
+            history.average_rates(status.interface.rx_bytes, status.interface.tx_bytes, now);
+        average_rx = average_rx.saturating_add(rx);
+        average_tx = average_tx.saturating_add(tx);
+        if let Some(counters) = history.kernel_since_start() {
+            have_kernel = true;
+            kernel.rx_packets = kernel.rx_packets.saturating_add(counters.rx_packets);
+            kernel.tx_packets = kernel.tx_packets.saturating_add(counters.tx_packets);
+            kernel.rx_errors = kernel.rx_errors.saturating_add(counters.rx_errors);
+            kernel.tx_errors = kernel.tx_errors.saturating_add(counters.tx_errors);
+            kernel.rx_dropped = kernel.rx_dropped.saturating_add(counters.rx_dropped);
+            kernel.tx_dropped = kernel.tx_dropped.saturating_add(counters.tx_dropped);
+        }
+    }
+
+    let total = app.dashboard.interfaces.len();
+    let mut lines = vec![
+        stat_line(
+            "Observed",
+            format_duration(observed),
+            format!("{up}/{total} links up  {managed}/{total} managed"),
+        ),
+        stat_line(
+            "Traffic since start",
+            format!(
+                "RX {}  TX {}",
+                format_bytes(session_rx),
+                format_bytes(session_tx)
+            ),
+            format!(
+                "total {}",
+                format_bytes(session_rx.saturating_add(session_tx))
+            ),
+        ),
+        stat_line(
+            "Current rate",
+            format!(
+                "RX {}  TX {}",
+                format_rate(current_rx),
+                format_rate(current_tx)
+            ),
+            "all interfaces".to_string(),
+        ),
+        stat_line(
+            "Average rate",
+            format!(
+                "RX {}  TX {}",
+                format_rate(average_rx),
+                format_rate(average_tx)
+            ),
+            "all interfaces".to_string(),
+        ),
+    ];
+
+    if have_kernel {
+        lines.extend([
+            stat_line(
+                "Packets since start",
+                format!(
+                    "RX {}  TX {}",
+                    format_count(kernel.rx_packets),
+                    format_count(kernel.tx_packets)
+                ),
+                "all interfaces".to_string(),
+            ),
+            stat_line(
+                "Errors since start",
+                format!(
+                    "RX {}  TX {}",
+                    format_count(kernel.rx_errors),
+                    format_count(kernel.tx_errors)
+                ),
+                format!(
+                    "total {}",
+                    format_count(kernel.rx_errors.saturating_add(kernel.tx_errors))
+                ),
+            ),
+            stat_line(
+                "Drops since start",
+                format!(
+                    "RX {}  TX {}",
+                    format_count(kernel.rx_dropped),
+                    format_count(kernel.tx_dropped)
+                ),
+                "all interfaces".to_string(),
+            ),
+        ]);
+    }
+
+    lines.push(stat_line(
+        "Connections",
+        format_connection_stats(app.dashboard.connections),
+        "conntrack, system-wide".to_string(),
+    ));
+    lines.push(stat_line(
+        "Kernel traffic total",
+        format!(
+            "RX {}  TX {}",
+            format_bytes(kernel_rx),
+            format_bytes(kernel_tx)
+        ),
+        "all interfaces".to_string(),
+    ));
+
+    let block = panel("Statistics: all interfaces | ↓ per-interface");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn stat_line(label: &'static str, value: String, note: String) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(format!("{label:<21}"), Style::default().fg(theme::MUTED)),
+        Span::styled(value, Style::default().fg(theme::TEXT)),
+    ];
+    if !note.is_empty() {
+        spans.push(Span::styled(
+            format!("   {note}"),
+            Style::default().fg(theme::MUTED),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn format_connection_stats(stats: ConnectionStats) -> String {
+    match (stats.active, stats.limit) {
+        (Some(active), Some(limit)) => {
+            format!(
+                "{} active / {} limit",
+                format_count(active),
+                format_count(limit)
+            )
+        }
+        (Some(active), None) => format!("{} active", format_count(active)),
+        _ => "n/a".to_string(),
+    }
+}
+
+fn format_duration(duration: Duration) -> String {
+    let total = duration.as_secs();
+    let days = total / 86_400;
+    let hours = (total % 86_400) / 3_600;
+    let minutes = (total % 3_600) / 60;
+    let seconds = total % 60;
+    if days > 0 {
+        format!("{days}d {hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    }
+}
+
+fn format_count(value: u64) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(ch);
+    }
+    grouped
+}
+
+fn read_connection_stats() -> ConnectionStats {
+    ConnectionStats {
+        active: read_u64("/proc/sys/net/netfilter/nf_conntrack_count"),
+        limit: read_u64("/proc/sys/net/netfilter/nf_conntrack_max"),
+    }
+}
+
+fn read_interface_counters(interface: &str) -> Option<InterfaceKernelCounters> {
+    let root = Path::new("/sys/class/net")
+        .join(interface)
+        .join("statistics");
+    Some(InterfaceKernelCounters {
+        rx_packets: read_u64(root.join("rx_packets"))?,
+        tx_packets: read_u64(root.join("tx_packets"))?,
+        rx_errors: read_u64(root.join("rx_errors"))?,
+        tx_errors: read_u64(root.join("tx_errors"))?,
+        rx_dropped: read_u64(root.join("rx_dropped"))?,
+        tx_dropped: read_u64(root.join("tx_dropped"))?,
+    })
+}
+
+fn read_u64(path: impl AsRef<Path>) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn format_bytes(bytes: u64) -> String {
+    format_rate(bytes).trim_end_matches("/s").to_owned()
 }
 
 pub(crate) fn render_dashboard_summary(
@@ -298,6 +762,12 @@ pub(crate) fn render_dashboard_summary(
     let dhcp_count = app.dashboard.dhcp_interfaces.len();
     let pending_count = app.dashboard.pending_network_changes.len();
     let iface_count = app.dashboard.interfaces.len();
+    let (vpn_text, vpn_color) = match app.dashboard.vpn_enabled {
+        Some(true) => ("ON".to_string(), theme::GOOD),
+        Some(false) => ("OFF".to_string(), theme::MUTED),
+        None if direct => ("n/a".to_string(), theme::MUTED),
+        None => ("?".to_string(), theme::WARN),
+    };
 
     let card = |value: String, label: &'static str, color: Color| {
         Paragraph::new(vec![
@@ -316,39 +786,9 @@ pub(crate) fn render_dashboard_summary(
         theme::TEXT
     };
 
-    if inner.width < 70 {
-        let rows = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Ratio(1, 2); 2])
-            .split(inner);
-        let top = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Ratio(1, 2); 2])
-            .split(rows[0]);
-        let bottom = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Ratio(1, 2); 2])
-            .split(rows[1]);
-
-        frame.render_widget(card(mode_text.to_string(), "mode", theme::ACCENT), top[0]);
-        frame.render_widget(
-            card(iface_count.to_string(), "interfaces", theme::TEXT),
-            top[1],
-        );
-        frame.render_widget(
-            card(dhcp_count.to_string(), "dhcp active", theme::GOOD),
-            bottom[0],
-        );
-        frame.render_widget(
-            card(pending_count.to_string(), "pending changes", pending_color),
-            bottom[1],
-        );
-        return;
-    }
-
     let cards = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Ratio(1, 4); 4])
+        .constraints([Constraint::Ratio(1, 5); 5])
         .split(inner);
 
     frame.render_widget(card(mode_text.to_string(), "mode", theme::ACCENT), cards[0]);
@@ -357,13 +797,14 @@ pub(crate) fn render_dashboard_summary(
         cards[1],
     );
     frame.render_widget(
-        card(dhcp_count.to_string(), "dhcp active", theme::GOOD),
+        card(dhcp_count.to_string(), "dhcp server", theme::GOOD),
         cards[2],
     );
     frame.render_widget(
-        card(pending_count.to_string(), "pending changes", pending_color),
+        card(pending_count.to_string(), "pending", pending_color),
         cards[3],
     );
+    frame.render_widget(card(vpn_text, "vpn", vpn_color), cards[4]);
 }
 
 pub(crate) fn render_dashboard_traffic(
@@ -372,7 +813,7 @@ pub(crate) fn render_dashboard_traffic(
     app: &mut TuiApp,
 ) {
     if app.dashboard.interfaces.is_empty() {
-        let block = panel("Interface traffic");
+        let block = panel("Interfaces stat");
         let inner = block.inner(area);
         frame.render_widget(block, area);
         frame.render_widget(
@@ -385,13 +826,10 @@ pub(crate) fn render_dashboard_traffic(
         return;
     }
 
-    // On a short terminal, prioritize interfaces over history graphs.
     let row_height = if area.height < 14 { 1 } else { 3 };
     let total = app.dashboard.interfaces.len();
-
     let max_visible = ((area.height.saturating_sub(2)) / row_height).max(1) as usize;
     let visible = total.min(max_visible);
-
     let max_offset = total.saturating_sub(visible);
     let offset = app
         .selected_interface
@@ -400,12 +838,12 @@ pub(crate) fn render_dashboard_traffic(
 
     let title = if visible < total {
         format!(
-            "Interface traffic ({}-{} of {total}, ↑/↓ to scroll)",
+            "Interfaces stat ({}-{} of {total}, ↑/↓ to scroll)",
             offset + 1,
             offset + visible
         )
     } else {
-        "Interface traffic | [ext] external, [?] ownership unknown".to_string()
+        "Interfaces stat | [ext] external, [?] ownership unknown".to_string()
     };
     let block = panel(&title);
     let inner = block.inner(area);
@@ -437,11 +875,13 @@ pub(crate) fn render_dashboard_traffic(
         .enumerate()
     {
         let history = app.traffic.get(&status.interface.index);
+        let managed = app.dashboard.managed.get(&status.interface.name).copied();
         render_traffic_row(
             frame,
             rows[row],
             status,
             history,
+            managed,
             index == selected_interface,
         );
     }
@@ -452,6 +892,7 @@ fn render_traffic_row(
     area: Rect,
     status: &InterfaceStatus,
     history: Option<&TrafficHistory>,
+    managed: Option<bool>,
     selected: bool,
 ) {
     let marker = if selected { "▶" } else { " " };
@@ -479,6 +920,19 @@ fn render_traffic_row(
         up_span,
         Span::raw("   "),
         Span::styled(
+            match managed {
+                Some(true) => "traffic-masq:on",
+                Some(false) => "traffic-masq:off",
+                None => "traffic-masq:?",
+            },
+            Style::default().fg(if managed == Some(true) {
+                theme::GOOD
+            } else {
+                theme::WARN
+            }),
+        ),
+        Span::raw("   "),
+        Span::styled(
             format!("↓ {:>10}", format_rate(rx_rate)),
             Style::default().fg(theme::ACCENT),
         ),
@@ -498,9 +952,8 @@ fn render_traffic_row(
         return;
     }
 
-    let rx_slice = history.map(|history| history.rx_rates()).unwrap_or(&[]);
-    let tx_slice = history.map(|history| history.tx_rates()).unwrap_or(&[]);
-
+    let rx_slice = history.map(TrafficHistory::rx_rates).unwrap_or(&[]);
+    let tx_slice = history.map(TrafficHistory::tx_rates).unwrap_or(&[]);
     frame.render_widget(
         Sparkline::default()
             .data(rx_slice)
@@ -515,134 +968,78 @@ fn render_traffic_row(
     );
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+fn render_dhcp_clients(frame: &mut ratatui::Frame<'_>, area: Rect, app: &TuiApp, direct: bool) {
+    let title = format!("DHCP Clients ({})", app.dashboard.dhcp_clients.len());
+    let block = panel(&title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    #[test]
-    fn minimum_terminal_fills_traffic_view_and_keeps_selection_visible() {
-        use ratatui::{backend::TestBackend, Terminal};
-        let mut app = TuiApp::default();
-        app.dashboard.interfaces = (0..12)
-            .map(|index| InterfaceStatus {
-                interface: crate::netlink::NetworkInterface {
-                    index,
-                    name: format!("eth{index}"),
-                    is_up: true,
-                    rx_bytes: 0,
-                    tx_bytes: 0,
-                    is_wireless: false,
-                },
-                owned_ipv4_addresses: None,
-                ipv4_addresses: vec![],
-                has_default_route: false,
-            })
-            .collect();
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        for selected in [0, 5, 11] {
-            app.selected_interface = selected;
-            terminal
-                .draw(|frame| super::super::render(frame, &mut app, false))
-                .unwrap();
-            let area = app.ui.list_area.unwrap();
-            assert_eq!(app.ui.list_row_height, 1);
-            assert!(area.height >= 6);
-            let buffer = terminal.backend().buffer();
-            for y in area.y..area.bottom() {
-                let text: String = (area.x..area.right())
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect();
-                assert!(text.contains("eth"), "empty interface row: {text:?}");
+    if direct {
+        frame.render_widget(
+            Paragraph::new("DHCP client status is available in daemon mode")
+                .style(Style::default().fg(theme::MUTED)),
+            inner,
+        );
+        return;
+    }
+    if let Some(error) = &app.dashboard.dhcp_client_error {
+        frame.render_widget(
+            Paragraph::new(format!("Unavailable: {error}")).style(Style::default().fg(theme::WARN)),
+            inner,
+        );
+        return;
+    }
+    if app.dashboard.dhcp_clients.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No configured DHCP clients").style(Style::default().fg(theme::MUTED)),
+            inner,
+        );
+        return;
+    }
+
+    let visible = inner.height as usize;
+    let lines = app
+        .dashboard
+        .dhcp_clients
+        .iter()
+        .take(visible)
+        .map(|status| {
+            let state = match status.state {
+                DhcpClientOperationalState::Waiting => "waiting",
+                DhcpClientOperationalState::Running => "running",
+                DhcpClientOperationalState::Degraded => "degraded",
+            };
+            let address = match (status.address, status.prefix_length) {
+                (Some(address), Some(prefix)) => format!("{address}/{prefix}"),
+                _ => "no address".to_string(),
+            };
+            let color = match status.state {
+                DhcpClientOperationalState::Running => theme::GOOD,
+                DhcpClientOperationalState::Waiting => theme::WARN,
+                DhcpClientOperationalState::Degraded => theme::BAD,
+            };
+            if inner.width < 30 {
+                Line::from(vec![
+                    Span::styled(
+                        format!("{} ", status.interface),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(state, Style::default().fg(color)),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled(
+                        format!("{:<12}", status.interface),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(format!("{state:<9}"), Style::default().fg(color)),
+                    Span::raw(address),
+                ])
             }
-            let selected_y = area.y + (selected - app.ui.list_scroll_offset) as u16;
-            assert!(selected_y < area.bottom());
-            assert_eq!(buffer[(area.x, selected_y)].symbol(), "▶");
-        }
-    }
-
-    #[test]
-    fn dashboard_focus_reaches_every_action_and_clamps_at_both_ends() {
-        assert_eq!(
-            next_dashboard_action(DashboardFocus::Interfaces),
-            DashboardFocus::PendingChanges
-        );
-        assert_eq!(
-            next_dashboard_action(DashboardFocus::PendingChanges),
-            DashboardFocus::PendingChanges
-        );
-        assert_eq!(
-            previous_dashboard_action(DashboardFocus::PendingChanges),
-            DashboardFocus::Interfaces
-        );
-        assert_eq!(
-            previous_dashboard_action(DashboardFocus::Interfaces),
-            DashboardFocus::Interfaces
-        );
-    }
-
-    #[test]
-    fn every_dashboard_action_has_a_label() {
-        assert_eq!(DASHBOARD_ACTIONS.len(), DASHBOARD_ACTION_LABELS.len());
-
-        assert!(DASHBOARD_ACTION_LABELS
-            .iter()
-            .all(|label| !label.is_empty()));
-    }
-
-    #[test]
-    fn clicking_an_action_row_focuses_exactly_that_row() {
-        let mut app = TuiApp::default();
-        focus_action(&mut app, 1);
-        assert_eq!(app.dashboard_focus, DashboardFocus::PendingChanges);
-
-        focus_action(&mut app, 99);
-        assert_eq!(app.dashboard_focus, DashboardFocus::PendingChanges);
-    }
-
-    #[test]
-    fn format_rate_scales_units_correctly() {
-        assert_eq!(format_rate(0), "0 B/s");
-        assert_eq!(format_rate(512), "512 B/s");
-        assert_eq!(format_rate(1024), "1.0 KB/s");
-        assert_eq!(format_rate(1024 * 1024), "1.0 MB/s");
-        assert_eq!(format_rate(3 * 1024 * 1024), "3.0 MB/s");
-    }
-
-    #[test]
-    fn traffic_history_ignores_samples_taken_too_close_together() {
-        let mut history = TrafficHistory::default();
-        let start = Instant::now();
-        history.record(1_000, 500, start);
-
-        history.record(2_000, 1_000, start);
-        assert_eq!(history.current_rx_rate, 0);
-        assert_eq!(history.current_tx_rate, 0);
-        assert!(history.rx_rate_history.is_empty());
-    }
-
-    #[test]
-    fn traffic_history_computes_rate_from_byte_delta_over_elapsed_time() {
-        let mut history = TrafficHistory::default();
-        let start = Instant::now();
-        history.record(0, 0, start);
-        let later = start + Duration::from_secs(1);
-        history.record(1_000, 2_000, later);
-        assert_eq!(history.current_rx_rate, 1_000);
-        assert_eq!(history.current_tx_rate, 2_000);
-        assert_eq!(history.rx_rate_history.len(), 1);
-        assert_eq!(history.tx_rate_history.len(), 1);
-    }
-
-    #[test]
-    fn traffic_history_caps_backlog_length() {
-        let mut history = TrafficHistory::default();
-        let start = Instant::now();
-        history.record(0, 0, start);
-        for tick in 1..=(TRAFFIC_HISTORY_LEN as u64 + 10) {
-            let at = start + Duration::from_secs(tick);
-            history.record(tick * 1_000, tick * 1_000, at);
-        }
-        assert_eq!(history.rx_rate_history.len(), TRAFFIC_HISTORY_LEN);
-        assert_eq!(history.tx_rate_history.len(), TRAFFIC_HISTORY_LEN);
-    }
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(Paragraph::new(lines), inner);
 }
+
+#[cfg(test)]
+mod tests;

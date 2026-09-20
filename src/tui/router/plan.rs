@@ -41,10 +41,20 @@ pub(crate) fn render_router_plan(frame: &mut ratatui::Frame<'_>, area: Rect, app
     let Some(plan) = &app.router.plan else {
         return;
     };
-    let mut lines = vec![Line::from(format!(
-        "Uplink: {}",
-        summarize_uplink(&plan.dataplane.target)
-    ))];
+    let mut lines = vec![
+        Line::from(format!(
+            "Routing: {}",
+            if plan.desired.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        )),
+        Line::from(format!(
+            "Uplink: {}",
+            summarize_uplink(&plan.dataplane.target)
+        )),
+    ];
     if let RouterDataplaneTarget::Enabled(desired) = &plan.dataplane.target {
         if let Some(connections) = &desired.forwarding {
             for connection in connections {
@@ -214,7 +224,10 @@ pub(super) fn summarize_output_interfaces(interfaces: &[RouterInterfaceDesired])
         .collect()
 }
 
-pub(super) fn summarize_dhcp(dhcp: &[DhcpServiceSpec], lease_counts: &[(String, usize)]) -> Vec<String> {
+pub(super) fn summarize_dhcp(
+    dhcp: &[DhcpServiceSpec],
+    lease_counts: &[(String, usize)],
+) -> Vec<String> {
     dhcp.iter()
         .map(|spec| {
             let leases = lease_counts

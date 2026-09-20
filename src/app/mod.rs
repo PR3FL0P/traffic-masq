@@ -5,8 +5,10 @@ use crate::core::mutation::NetworkMutationGate;
 pub mod init;
 pub mod installer;
 mod process;
+pub mod reset;
 pub(crate) mod runtime;
 pub mod service;
+mod shutdown_control;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
@@ -40,9 +42,10 @@ use crate::core::vpn_policy_manager::{
 use crate::dhcp::client::{DhcpClientSpec, DhcpClientSupervisor};
 use crate::dhcp::supervisor::{DhcpServiceSpec, DhcpSupervisor};
 use crate::firewall::{
-    vpn::VpnPolicyFirewallBackend, Ipv4ForwardingBackend, LinuxRouterDataplaneProvider,
-    NftCommandExecutor, NftExecutor, NftablesBackend, ProcSysIpv4ForwardingIo,
-    RouterDataplaneManager, RouterDataplaneProvider, RouterDataplaneSnapshot,
+    missing_router_dataplane_interface, vpn::VpnPolicyFirewallBackend, Ipv4ForwardingBackend,
+    LinuxRouterDataplaneProvider, NftCommandExecutor, NftExecutor, NftablesBackend,
+    ProcSysIpv4ForwardingIo, RouterDataplaneManager, RouterDataplaneProvider,
+    RouterDataplaneSnapshot,
 };
 use crate::logging::init_logging;
 use crate::netlink::events::KernelEvent;
@@ -63,8 +66,7 @@ type ProductionDataplaneProvider = LinuxRouterDataplaneProvider<
     NftCommandExecutor,
     RtnetlinkNetworkProvider,
 >;
-type ProductionVpnPolicyManager =
-    VpnPolicyManager<WireGuardVpnDriver, Arc<dyn NftExecutor>>;
+type ProductionVpnPolicyManager = VpnPolicyManager<WireGuardVpnDriver, Arc<dyn NftExecutor>>;
 
 const PROCESS_LIVENESS_INTERVAL: Duration = Duration::from_secs(1);
 const ROUTER_DATAPLANE_INTEGRITY_INTERVAL: Duration = Duration::from_secs(15);
@@ -109,14 +111,20 @@ trait DhcpClientRuntimeReconciler: Send + Sync {
     async fn specs(&self) -> Vec<DhcpClientSpec>;
     async fn disable(&self, interface: &str) -> Result<Option<DhcpClientSpec>>;
     async fn reconcile(&self, spec: DhcpClientSpec, link_ready: bool) -> Result<()>;
-    async fn verify_ready(&self, _interface: &str) -> Result<()> { Ok(()) }
+    async fn verify_ready(&self, _interface: &str) -> Result<()> {
+        Ok(())
+    }
     async fn ensure_alive(&self) -> Result<bool>;
 }
 
 #[async_trait]
 impl DhcpClientRuntimeReconciler for DhcpClientSupervisor {
     async fn specs(&self) -> Vec<DhcpClientSpec> {
-        self.statuses().await.into_iter().map(|status| status.spec).collect()
+        self.statuses()
+            .await
+            .into_iter()
+            .map(|status| status.spec)
+            .collect()
     }
 
     async fn disable(&self, interface: &str) -> Result<Option<DhcpClientSpec>> {
@@ -126,7 +134,10 @@ impl DhcpClientRuntimeReconciler for DhcpClientSupervisor {
     async fn reconcile(&self, spec: DhcpClientSpec, link_ready: bool) -> Result<()> {
         let name = spec.interface.clone();
         self.reconcile_with_link_ready(spec, link_ready).await;
-        let status = self.status(&name).await.context("DHCP client disappeared")?;
+        let status = self
+            .status(&name)
+            .await
+            .context("DHCP client disappeared")?;
         if let crate::dhcp::client::DhcpClientRunState::Degraded { reason } = status.state {
             bail!("DHCP client on {name} is degraded: {reason}");
         }
@@ -136,14 +147,20 @@ impl DhcpClientRuntimeReconciler for DhcpClientSupervisor {
     async fn verify_ready(&self, interface: &str) -> Result<()> {
         let deadline = time::Instant::now() + Duration::from_secs(5);
         loop {
-            let status = self.status(interface).await.context("DHCP client disappeared")?;
+            let status = self
+                .status(interface)
+                .await
+                .context("DHCP client disappeared")?;
             if let Some(lease) = status.lease {
                 return self.verify_bound_lease(&lease).await;
             }
             if let crate::dhcp::client::DhcpClientRunState::Degraded { reason } = status.state {
                 bail!("DHCP client on {interface} is degraded: {reason}");
             }
-            anyhow::ensure!(time::Instant::now() < deadline, "DHCP lease is not ready on {interface}");
+            anyhow::ensure!(
+                time::Instant::now() < deadline,
+                "DHCP lease is not ready on {interface}"
+            );
             time::sleep(Duration::from_millis(20)).await;
         }
     }
@@ -260,11 +277,29 @@ where
     let dataplane_snapshot = match dataplane.apply(&plan).await {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            if let Err(rollback_error) = routes.rollback(&route_snapshot).await {
+            let route_rollback = routes.rollback(&route_snapshot).await;
+            if let Err(rollback_error) = &route_rollback {
                 tracing::error!(
                     %rollback_error,
                     "failed to rollback router routes after dataplane apply failure"
                 );
+            }
+            if route_rollback.is_ok() {
+                if let Some(missing) = missing_router_dataplane_interface(&error) {
+                    tracing::warn!(
+                        interface = %missing.interface,
+                        role = %missing.role,
+                        error = %format!("{error:#}"),
+                        hint = "Check ip link; reconnect the adapter or update the interface name in router configuration. Retrying automatically when it appears.",
+                        "router dataplane startup convergence is deferred until the interface appears; daemon startup will continue"
+                    );
+                    return Ok(RouterRuntimeState {
+                        routes,
+                        route_snapshot,
+                        dataplane,
+                        dataplane_snapshot: plan.snapshot,
+                    });
+                }
             }
             return Err(error).context("failed to apply router dataplane");
         }
@@ -278,15 +313,44 @@ where
     })
 }
 
+async fn restore_router_dataplane<P>(state: &RouterRuntimeState<P>) -> Result<()>
+where
+    P: RouterDataplaneProvider + Send + Sync,
+{
+    let mut errors = Vec::new();
+    if let Err(error) = state.dataplane.rollback(&state.dataplane_snapshot).await {
+        errors.push(format!("router dataplane rollback failed: {error:#}"));
+    }
+    if let Err(error) = state.routes.rollback(&state.route_snapshot).await {
+        errors.push(format!("router route rollback failed: {error:#}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!(errors.join("; "))
+    }
+}
+
 async fn rollback_router_dataplane<P>(state: &RouterRuntimeState<P>)
 where
     P: RouterDataplaneProvider + Send + Sync,
 {
-    if let Err(error) = state.dataplane.rollback(&state.dataplane_snapshot).await {
+    if let Err(error) = restore_router_dataplane(state).await {
         tracing::error!(%error, "failed to rollback router dataplane during daemon shutdown");
     }
-    if let Err(error) = state.routes.rollback(&state.route_snapshot).await {
-        tracing::error!(%error, "failed to rollback router routes during daemon shutdown");
+}
+
+fn log_router_dataplane_convergence_error(error: &anyhow::Error) {
+    if let Some(missing) = missing_router_dataplane_interface(error) {
+        tracing::warn!(
+            interface = %missing.interface,
+            role = %missing.role,
+            error = %format!("{error:#}"),
+            hint = "Check ip link; reconnect the adapter or update the interface name in router configuration. Retrying automatically when it appears.",
+            "router dataplane convergence is deferred until the interface appears; daemon remains operational"
+        );
+    } else {
+        tracing::warn!(error = %format!("{error:#}"), "router dataplane convergence failed");
     }
 }
 
@@ -351,7 +415,6 @@ async fn reconcile_address_ownership(
 #[allow(clippy::too_many_arguments)]
 fn production_router_coordinator(
     desired: &RouterDesired,
-    vpn_enabled: bool,
     vpn_store_dir: &Path,
     state_dir: &Path,
     journal: AddressOwnershipJournal,
@@ -396,12 +459,13 @@ fn production_router_coordinator(
         subsystems = subsystems.with_access_point_runtime(Arc::new(wifi));
     }
 
-    if vpn_enabled {
-        let vpn_provider: Arc<dyn VpnProvider> = Arc::new(
-            NetlinkVpnProvider::connect().context(
+    // Keep VPN control-plane dependencies available for runtime enablement.
+    // RouterDesired still rejects a VPN chain while VPN is disabled.
+    {
+        let vpn_provider: Arc<dyn VpnProvider> =
+            Arc::new(NetlinkVpnProvider::connect().context(
                 "failed to open VPN netlink connection for router transaction coordinator",
-            )?,
-        );
+            )?);
         subsystems = subsystems.with_vpn_chain(VpnChainDeps {
             vpn_provider,
             wireguard_store: WireGuardProfileStore::new(vpn_store_dir.to_path_buf()),
@@ -420,10 +484,6 @@ fn production_router_coordinator(
 }
 
 async fn build_vpn_manager(config: &AppConfig) -> Result<Option<Arc<ProductionVpnManager>>> {
-    if !config.vpn.enabled {
-        return Ok(None);
-    }
-
     let store = WireGuardProfileStore::new(config.vpn.wireguard_config_dir.clone());
     let active_profile_store =
         ActiveProfileStore::new(config.runtime.state_dir.join("vpn-active-profile.json"));
@@ -431,15 +491,17 @@ async fn build_vpn_manager(config: &AppConfig) -> Result<Option<Arc<ProductionVp
     let driver = WireGuardVpnDriver::new(provider, store);
     let manager = Arc::new(VpnManager::new(driver, active_profile_store));
 
-    match manager.reconcile().await {
-        Ok(outcome) => {
-            tracing::info!(?outcome, "VPN startup reconcile complete");
-        }
-        Err(error) => {
-            return Err(error).context("VPN startup reconcile failed");
+    // Build the control plane even when disabled; only enabled VPNs reconcile.
+    if config.vpn.enabled {
+        match manager.reconcile().await {
+            Ok(outcome) => {
+                tracing::info!(?outcome, "VPN startup reconcile complete");
+            }
+            Err(error) => {
+                return Err(error).context("VPN startup reconcile failed");
+            }
         }
     }
-
     Ok(Some(manager))
 }
 
@@ -465,7 +527,7 @@ async fn apply_vpn_policy_startup<E: NftExecutor>(
     // before this startup hook, so touching legacy policy here would mutate a
     // just-recovered chain outside the router transaction coordinator. The
     // periodic integrity path has the same coexistence guard.
-    if !effective_config.router.vpn_chain.is_empty() {
+    if !effective_config.vpn.enabled || !effective_config.router.vpn_chain.is_empty() {
         return;
     }
 
@@ -610,27 +672,37 @@ fn plan_dhcp_reconcile(
 }
 
 async fn apply_dhcp_reconcile_action<D: DhcpRuntimeReconciler>(
-    dhcp: &D, interface: &str, action: DhcpReconcileAction,
+    dhcp: &D,
+    interface: &str,
+    action: DhcpReconcileAction,
 ) -> Result<()> {
     match action {
         DhcpReconcileAction::Keep => {}
         DhcpReconcileAction::Configure(spec) => dhcp.reconcile(spec).await?,
-        DhcpReconcileAction::Disable => { dhcp.disable(interface).await?; }
+        DhcpReconcileAction::Disable => {
+            dhcp.disable(interface).await?;
+        }
     }
     Ok(())
 }
 
 async fn reconcile_dhcp_client<L: DhcpClientRuntimeReconciler>(
-    client: &L, interface: &str, config: &InterfaceConfig, link_ready: bool,
+    client: &L,
+    interface: &str,
+    config: &InterfaceConfig,
+    link_ready: bool,
 ) -> Result<()> {
     match DhcpClientSpec::from_interface_config(interface, config)? {
         Some(spec) => client.reconcile(spec, link_ready).await?,
-        None => { client.disable(interface).await?; }
+        None => {
+            client.disable(interface).await?;
+        }
     }
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Perform one desired-state reconciliation pass across interface, DHCP, and Wi-Fi services.
 async fn reconcile_network_runtime_once<
     D: DhcpRuntimeReconciler,
     W: WifiRuntimeReconciler,
@@ -661,13 +733,36 @@ async fn reconcile_network_runtime_once<
         let result: Result<()> = async {
             let strict = desired.is_tentative(name).await || restorations.contains_key(name);
             let desired_dhcp = DhcpServiceSpec::from_interface_config(
-                name, config, effective.dhcp.default_lease_seconds,
+                name,
+                config,
+                effective.dhcp.default_lease_seconds,
             )?;
             let current_dhcp = dhcp.spec(name).await;
             let Some(observed_interface) = observed_interfaces.get(name) else {
-                apply_dhcp_reconcile_action(dhcp, name,
-                    plan_dhcp_reconcile(desired_dhcp, current_dhcp, false, false, false)).await?;
-                bail!("interface {name} is absent; convergence is deferred");
+                apply_dhcp_reconcile_action(
+                    dhcp,
+                    name,
+                    plan_dhcp_reconcile(desired_dhcp, current_dhcp, false, false, false),
+                )
+                .await?;
+                let desired_ipv4 = config
+                    .ipv4
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| "none".to_string());
+                bail!(
+                    "interface {name} is absent; convergence is deferred until it appears \
+                     (desired: managed={}, role={:?}, ipv4={desired_ipv4}, dhcp_server={}, \
+                     dhcp_client={}, wifi_ap={}, wifi_client={}). Check that the interface name \
+                     exists and the device/link is present; if it was renamed or removed, update \
+                     or remove its traffic-masq configuration",
+                    config.managed,
+                    config.role,
+                    config.dhcp.is_some(),
+                    config.dhcp_client.is_some(),
+                    config.wifi.is_some(),
+                    config.wifi_client.is_some(),
+                );
             };
 
             // Release AP ownership before starting a station on the same radio.
@@ -680,7 +775,10 @@ async fn reconcile_network_runtime_once<
             if let Some(client) = wifi_client {
                 client.reconcile_interface(name, config).await?;
             } else {
-                anyhow::ensure!(config.wifi_client.is_none(), "Wi-Fi client runtime is unavailable");
+                anyhow::ensure!(
+                    config.wifi_client.is_none(),
+                    "Wi-Fi client runtime is unavailable"
+                );
             }
             let mut link_ready = true;
             if config.wifi_client.is_some() {
@@ -690,16 +788,23 @@ async fn reconcile_network_runtime_once<
                         Some(client) => client.association_ready(name).await.unwrap_or(false),
                         None => false,
                     };
-                    if link_ready || !strict { break; }
-                    anyhow::ensure!(time::Instant::now() < deadline, "Wi-Fi association is not ready on {name}");
+                    if link_ready || !strict {
+                        break;
+                    }
+                    anyhow::ensure!(
+                        time::Instant::now() < deadline,
+                        "Wi-Fi association is not ready on {name}"
+                    );
                     time::sleep(Duration::from_millis(20)).await;
                 }
             }
             if let Some(client) = dhcp_client {
                 reconcile_dhcp_client(client, name, config, link_ready).await?;
             } else {
-                anyhow::ensure!(DhcpClientSpec::from_interface_config(name, config)?.is_none(),
-                    "DHCP client runtime is unavailable");
+                anyhow::ensure!(
+                    DhcpClientSpec::from_interface_config(name, config)?.is_none(),
+                    "DHCP client runtime is unavailable"
+                );
             }
 
             if let Some(snapshot) = restorations.get(name) {
@@ -711,37 +816,58 @@ async fn reconcile_network_runtime_once<
                     // must not cause an endless cycle of our own netlink events.
                     let mut relevant = Vec::new();
                     for address in &current_addresses {
-                        if config.ipv4.is_some_and(|ip| ip.addr() == address.address && ip.prefix_len() == address.prefix_len)
-                            || interface_manager.owns_address(name, address).await {
+                        if config.ipv4.is_some_and(|ip| {
+                            ip.addr() == address.address && ip.prefix_len() == address.prefix_len
+                        }) || interface_manager.owns_address(name, address).await
+                        {
                             relevant.push(address.clone());
                         }
                     }
                     interface_needs_reapply(observed_interface, &relevant, config, false)
                 } else {
-                    interface_manager.owns_any_address(name, &current_addresses).await
+                    interface_manager
+                        .owns_any_address(name, &current_addresses)
+                        .await
                 };
                 if needs_apply {
-                    interface_manager.apply_interface(name, config, Some(config.role),
-                        management_allowlist.contains(name)).await?;
+                    interface_manager
+                        .apply_interface(
+                            name,
+                            config,
+                            Some(config.role),
+                            management_allowlist.contains(name),
+                        )
+                        .await?;
                 }
             }
             let (ipv4_ready, binding_stale) = if desired_dhcp.is_some() {
-                interface_manager.verify_configured_ipv4(name, config).await?;
+                interface_manager
+                    .verify_configured_ipv4(name, config)
+                    .await?;
                 (true, dhcp.binding_stale(name).await?)
-            } else { (false, false) };
+            } else {
+                (false, false)
+            };
             if config.wifi.is_some() {
                 let access_point = wifi.context("Wi-Fi access point runtime is unavailable")?;
                 access_point.reconcile_interface(name, config).await?;
             }
-            apply_dhcp_reconcile_action(dhcp, name,
-                plan_dhcp_reconcile(desired_dhcp, current_dhcp, true, ipv4_ready, binding_stale)).await?;
+            apply_dhcp_reconcile_action(
+                dhcp,
+                name,
+                plan_dhcp_reconcile(desired_dhcp, current_dhcp, true, ipv4_ready, binding_stale),
+            )
+            .await?;
             if strict && DhcpClientSpec::from_interface_config(name, config)?.is_some() {
-                if let Some(client) = dhcp_client { client.verify_ready(name).await?; }
+                if let Some(client) = dhcp_client {
+                    client.verify_ready(name).await?;
+                }
             }
             Ok(())
-        }.await;
+        }
+        .await;
         if let Err(error) = result {
-            tracing::warn!(interface = %name, %error, "interface convergence incomplete");
+            tracing::warn!(interface = %name, error = %format!("{error:#}"), "interface convergence incomplete");
             failures.insert(name.clone(), format!("{error:#}"));
         }
     }
@@ -749,6 +875,7 @@ async fn reconcile_network_runtime_once<
     Ok(failures)
 }
 
+/// Run periodic expired-session cleanup until shutdown is requested.
 fn spawn_session_reaper(auth: AuthService, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval = time::interval(SESSION_REAP_INTERVAL);
@@ -829,27 +956,40 @@ fn spawn_runtime_network_reconcile(
                 // preventing it from racing a direct mutation.
                 let _network_mutation = network_mutations.read().await;
                 let router_busy = match &router {
-                    Some(router) => router.status().await
-                        != crate::core::router_transaction::CoordinatorStatus::Idle,
+                    Some(router) => {
+                        router.status().await
+                            != crate::core::router_transaction::CoordinatorStatus::Idle
+                    }
                     None => false,
                 };
                 if router_busy {
                     (None, true)
                 } else {
                     let result = reconcile_network_runtime_once(
-                        &desired, &journal, network.clone(), &dhcp,
-                        wifi.as_ref(), wifi_client.as_ref(), Some(&dhcp_client),
-                    ).await;
+                        &desired,
+                        &journal,
+                        network.clone(),
+                        &dhcp,
+                        wifi.as_ref(),
+                        wifi_client.as_ref(),
+                        Some(&dhcp_client),
+                    )
+                    .await;
                     // Tentative interface state is owned by its transaction.
                     // Router drift repair runs only against settled intent.
                     if !desired.has_pending().await {
                         if let Some(router) = &router {
                             let repair = async {
                                 let effective = desired.effective().await?;
-                                router.reconcile_dataplane(RouterDesired::from_effective_config(&effective)?).await
-                            }.await;
+                                router
+                                    .reconcile_dataplane(RouterDesired::from_effective_config(
+                                        &effective,
+                                    )?)
+                                    .await
+                            }
+                            .await;
                             if let Err(error) = repair {
-                                tracing::warn!(%error, "router dataplane convergence failed");
+                                log_router_dataplane_convergence_error(&error);
                             }
                         }
                     }
@@ -975,6 +1115,7 @@ fn spawn_wifi_autoconnect(
     })
 }
 
+/// Monitor supervised network processes and retry recoverable failures until shutdown.
 fn spawn_process_liveness_checks(
     dhcp: DhcpSupervisor,
     wifi: Option<HostapdSupervisor>,
@@ -1026,6 +1167,7 @@ fn spawn_process_liveness_checks(
     })
 }
 
+/// Monitor committed route and firewall state and repair drift under the mutation gate.
 fn spawn_router_dataplane_integrity_checks(
     desired: DesiredNetworkState,
     overrides: RuntimeOverrideManager,
@@ -1068,7 +1210,7 @@ fn spawn_router_dataplane_integrity_checks(
                         // reserved namespace as the router VPN chain. Audit it
                         // only when no chain is configured, so the two
                         // coexistence paths never repair over one another.
-                        if router_desired.vpn_chain.is_empty() {
+                        if effective.vpn.enabled && router_desired.vpn_chain.is_empty() {
                             if let Some(policy) = &vpn_policy {
                                 match overrides.effective_vpn_mode().await {
                                     VpnPolicyMode::Vpn => {
@@ -1094,7 +1236,11 @@ fn spawn_router_dataplane_integrity_checks(
                         Ok::<_, anyhow::Error>(())
                     }.await;
                     if let Err(error) = result {
-                        tracing::warn!(%error, "network integrity audit failed");
+                        if missing_router_dataplane_interface(&error).is_some() {
+                            log_router_dataplane_convergence_error(&error);
+                        } else {
+                            tracing::warn!(%error, "network integrity audit failed");
+                        }
                     }
                 }
                 changed = shutdown.changed() => match changed {
@@ -1156,6 +1302,7 @@ async fn build_wifi_client_supervisor(
     Ok(Some(supervisor))
 }
 
+/// Open the configured authentication store and reset the device administrator password.
 pub async fn reset_device_password(config: &AppConfig, password: &str) -> Result<Principal> {
     config.validate()?;
     let _process_guard = ProcessGuard::acquire(&config.runtime.pid_path)?;
@@ -1263,6 +1410,8 @@ async fn migrate_vpn_policy_mode_to_chain(config: &mut AppConfig) {
     }];
 }
 
+/// Initialize services, recover interrupted changes, and drive network convergence until shutdown.
+/// Drain accepted operations before applying configured shutdown and restoration policies.
 pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     migrate_vpn_policy_mode_to_chain(&mut config).await;
     config.validate()?;
@@ -1468,7 +1617,6 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     // wiring — it opens a netlink socket and touches no data plane.
     let router_coordinator = match production_router_coordinator(
         &desired,
-        effective_config.vpn.enabled,
         &effective_config.vpn.wireguard_config_dir,
         &effective_config.runtime.state_dir,
         ownership_journal.clone(),
@@ -1588,7 +1736,7 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         socket = %socket_path.display(),
         https = effective_config.api.tcp.as_ref().is_some_and(|tcp| tcp.enabled),
         router_enabled = desired.enabled,
-        vpn_enabled = vpn_manager.is_some(),
+        vpn_enabled = effective_config.vpn.enabled,
         wifi_enabled = wifi_supervisor.is_some(),
         wifi_client_enabled = wifi_client_supervisor.is_some(),
         "traffic-masqd ready"
@@ -1757,16 +1905,32 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     tracing::info!(graceful_signal, "traffic-masqd stopping");
 
     let mut cleanup_errors = Vec::new();
-    let restore_interfaces = !graceful_signal
+    let shutdown_request =
+        match shutdown_control::request_for_current_process(&effective_config.runtime.pid_path) {
+            Ok(request) => request,
+            Err(error) => {
+                tracing::warn!(%error, "ignoring invalid transient shutdown request");
+                None
+            }
+        };
+    let restore_requested = shutdown_request
+        .as_ref()
+        .is_some_and(|request| request.restores_interfaces());
+    let restore_interfaces = restore_requested
+        || !graceful_signal
         || effective_config.runtime.shutdown_policy == ShutdownPolicy::RestoreInterfaces;
+    let shutdown_policy = if restore_interfaces {
+        ShutdownPolicy::RestoreInterfaces
+    } else {
+        ShutdownPolicy::PreserveInterfaces
+    };
+    if restore_requested {
+        tracing::info!(
+            "administrative shutdown requested restoration of traffic-masq-owned network state"
+        );
+    }
 
-    dhcp_client
-        .shutdown(if restore_interfaces {
-            ShutdownPolicy::RestoreInterfaces
-        } else {
-            ShutdownPolicy::PreserveInterfaces
-        })
-        .await;
+    dhcp_client.shutdown(shutdown_policy).await;
 
     let network_cleanup = if restore_interfaces {
         transactions.restore_baselines().await
@@ -1780,12 +1944,15 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
 
     if restore_interfaces {
         if let Some(state) = &router_state {
-            rollback_router_dataplane(state).await;
+            if let Err(error) = restore_router_dataplane(state).await {
+                tracing::error!(%error, "router cleanup failed during daemon shutdown");
+                cleanup_errors.push(error.to_string());
+            }
         }
     }
 
     if let Some(vpn) = &vpn_manager {
-        if let Err(error) = vpn.shutdown(effective_config.runtime.shutdown_policy).await {
+        if let Err(error) = vpn.shutdown(shutdown_policy).await {
             tracing::error!(%error, "VPN shutdown cleanup failed");
             cleanup_errors.push(error.to_string());
         }
@@ -1794,14 +1961,11 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     dhcp.shutdown().await;
 
     if let Some(wifi) = &wifi_supervisor {
-        wifi.shutdown(effective_config.runtime.shutdown_policy)
-            .await;
+        wifi.shutdown(shutdown_policy).await;
     }
 
     if let Some(wifi_client) = &wifi_client_supervisor {
-        wifi_client
-            .shutdown(effective_config.runtime.shutdown_policy)
-            .await;
+        wifi_client.shutdown(shutdown_policy).await;
     }
 
     if let Err(error) = api_result {
@@ -1809,6 +1973,17 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     }
     if let Some(error) = reconcile_error {
         cleanup_errors.push(error);
+    }
+    if cleanup_errors.is_empty() {
+        if let Some(request) = &shutdown_request {
+            if let Err(error) =
+                shutdown_control::acknowledge(&effective_config.runtime.pid_path, request)
+            {
+                cleanup_errors.push(format!(
+                    "failed to acknowledge requested shutdown cleanup: {error:#}"
+                ));
+            }
+        }
     }
     if cleanup_errors.is_empty() {
         Ok(())
@@ -1862,1641 +2037,4 @@ async fn rollback_interfaces(manager: &InterfaceManager, snapshots: &[InterfaceS
 }
 
 #[cfg(test)]
-mod tests {
-    use crate::netlink::AddressOwnership;
-    use std::collections::HashMap;
-    use std::net::Ipv4Addr;
-
-    use async_trait::async_trait;
-    use tempfile::tempdir;
-    use tokio::sync::Mutex;
-
-    use crate::config::{
-        DhcpInterfaceConfig, InterfaceConfig, InterfaceRole, RouterConfig, UplinkConfig,
-        UplinkMode, VpnConfig,
-    };
-    use crate::firewall::vpn::test_support::{nft_ruleset, FakeNftExecutor};
-    use crate::firewall::{OwnedFirewallIntegrity, RouterDataplaneDesired};
-    #[cfg(target_os = "linux")]
-    use crate::dhcp::client::supervisor::LinuxDhcpClientLauncher;
-    use crate::netlink::{
-        Ipv4AddressInfo, Ipv4RouteInfo, Ipv4RuleInfo,
-    };
-    use crate::vpn::active_profile::ActiveProfileStore;
-    use crate::vpn::manager::OWNED_INTERFACE_NAME;
-    use crate::vpn::store::WireGuardProfileStore;
-    use crate::vpn::wireguard::WireGuardVpnDriver;
-    use crate::vpn::VpnProvider;
-
-    use super::*;
-    use crate::test_support::{FakeNetworkProvider, StaticKeyVpnProvider};
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn closed_kernel_event_stream_fails_the_runtime_converger() {
-        let directory = tempdir().expect("tempdir");
-        let mut config = AppConfig::default();
-        config.runtime.state_dir = directory.path().join("state");
-        config.dhcp.leases_dir = directory.path().join("leases");
-        let overrides = RuntimeOverrideManager::load(directory.path(), &config)
-            .await
-            .expect("overrides");
-        let desired = DesiredNetworkState::new(config.clone(), overrides);
-        let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetworkProvider::default());
-        let dhcp = DhcpSupervisor::start(&config).await.expect("DHCP supervisor");
-        let dhcp_client = DhcpClientSupervisor::start_with_launcher(
-            &config,
-            network.clone(),
-            Arc::new(LinuxDhcpClientLauncher),
-        )
-        .await
-        .expect("DHCP client supervisor");
-        let (kernel_events_tx, kernel_events) = mpsc::unbounded_channel();
-        drop(kernel_events_tx);
-        let (_shutdown_tx, shutdown) = watch::channel(false);
-
-        let task = spawn_runtime_network_reconcile(
-            desired.clone(),
-            AddressOwnershipJournal::in_memory(),
-            network,
-            dhcp,
-            None,
-            None,
-            dhcp_client,
-            Arc::new(NetworkMutationGate::default()),
-            None,
-            kernel_events,
-            shutdown,
-        );
-
-        let error = tokio::time::timeout(Duration::from_secs(1), task)
-            .await
-            .expect("closed event stream should stop the reconciler")
-            .expect("reconciler task")
-            .unwrap_err();
-        assert!(error.to_string().contains("kernel change notifications stopped"));
-        assert!(matches!(
-            desired.converger_state(),
-            crate::core::desired::ConvergerState::Failed(reason)
-                if reason.contains("kernel change notifications stopped")
-        ));
-    }
-
-    #[tokio::test]
-    async fn startup_rollback_unwind_runs_pushed_steps_in_lifo_order() {
-        let order = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let mut stack = StartupRollback::new();
-        for n in [1, 2, 3] {
-            let order = order.clone();
-            stack.push(async move { order.lock().await.push(n) });
-        }
-        stack.unwind().await;
-        assert_eq!(*order.lock().await, vec![3, 2, 1]);
-    }
-
-    #[tokio::test]
-    async fn startup_rollback_unwind_on_empty_stack_is_a_noop() {
-        StartupRollback::new().unwind().await;
-    }
-
-    #[tokio::test]
-    async fn startup_rollback_dropping_without_unwind_runs_nothing() {
-        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        {
-            let mut stack = StartupRollback::new();
-            let flag = ran.clone();
-            stack.push(async move { flag.store(true, std::sync::atomic::Ordering::SeqCst) });
-        }
-        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    async fn startup_rollback_unwind_only_runs_what_was_actually_pushed() {
-        let order = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let mut stack = StartupRollback::new();
-        let pushed = order.clone();
-        stack.push(async move { pushed.lock().await.push("interfaces") });
-        stack.unwind().await;
-        assert_eq!(*order.lock().await, vec!["interfaces"]);
-    }
-
-    #[derive(Debug, Default)]
-    struct FakeDhcpReconciler {
-        specs: Mutex<HashMap<String, DhcpServiceSpec>>,
-        stale_bindings: Mutex<HashMap<String, bool>>,
-        configure_calls: Mutex<Vec<DhcpServiceSpec>>,
-        disable_calls: Mutex<Vec<String>>,
-        runtime_liveness_checks: Mutex<usize>,
-    }
-
-    #[async_trait]
-    impl DhcpRuntimeReconciler for FakeDhcpReconciler {
-        async fn spec(&self, interface: &str) -> Option<DhcpServiceSpec> {
-            self.specs.lock().await.get(interface).cloned()
-        }
-
-        async fn disable(&self, interface: &str) -> Result<Option<DhcpServiceSpec>> {
-            self.disable_calls.lock().await.push(interface.to_string());
-            Ok(self.specs.lock().await.remove(interface))
-        }
-
-        async fn binding_stale(&self, interface: &str) -> Result<bool> {
-            Ok(*self
-                .stale_bindings
-                .lock()
-                .await
-                .get(interface)
-                .unwrap_or(&false))
-        }
-
-        async fn reconcile(&self, spec: DhcpServiceSpec) -> Result<()> {
-            self.configure_calls.lock().await.push(spec.clone());
-            self.stale_bindings
-                .lock()
-                .await
-                .insert(spec.interface.clone(), false);
-            self.specs.lock().await.insert(spec.interface.clone(), spec);
-            Ok(())
-        }
-
-        async fn ensure_runtime_alive(&self) -> Result<bool> {
-            *self.runtime_liveness_checks.lock().await += 1;
-            Ok(false)
-        }
-    }
-
-    #[derive(Debug, Default)]
-    struct FakeDhcpClientReconciler {
-        specs: Mutex<HashMap<String, DhcpClientSpec>>,
-        reconcile_calls: Mutex<Vec<DhcpClientSpec>>,
-        readiness: Mutex<Vec<(String, bool)>>,
-        disable_calls: Mutex<Vec<String>>,
-        liveness_checks: Mutex<usize>,
-    }
-
-    #[async_trait]
-    impl DhcpClientRuntimeReconciler for FakeDhcpClientReconciler {
-        async fn specs(&self) -> Vec<DhcpClientSpec> {
-            self.specs.lock().await.values().cloned().collect()
-        }
-
-        async fn disable(&self, interface: &str) -> Result<Option<DhcpClientSpec>> {
-            self.disable_calls.lock().await.push(interface.to_string());
-            Ok(self.specs.lock().await.remove(interface))
-        }
-
-        async fn reconcile(&self, spec: DhcpClientSpec, link_ready: bool) -> Result<()> {
-            self.readiness
-                .lock()
-                .await
-                .push((spec.interface.clone(), link_ready));
-            let changed = self.specs.lock().await.get(&spec.interface) != Some(&spec);
-            if changed {
-                self.reconcile_calls.lock().await.push(spec.clone());
-                self.specs.lock().await.insert(spec.interface.clone(), spec);
-            }
-            Ok(())
-        }
-
-        async fn ensure_alive(&self) -> Result<bool> {
-            *self.liveness_checks.lock().await += 1;
-            Ok(false)
-        }
-    }
-
-    #[derive(Debug, Default)]
-    struct FakeWifiReconciler {
-        liveness_checks: Mutex<usize>,
-        associations: Mutex<HashMap<String, bool>>,
-    }
-
-    #[async_trait]
-    impl WifiRuntimeReconciler for FakeWifiReconciler {
-        async fn ensure_alive(&self) -> Result<bool> {
-            *self.liveness_checks.lock().await += 1;
-            Ok(false)
-        }
-
-        async fn association_ready(&self, interface: &str) -> Option<bool> {
-            self.associations.lock().await.get(interface).copied()
-        }
-    }
-
-    struct FakeDataplaneProvider {
-        state: Mutex<RouterDataplaneSnapshot>,
-        fail_next_apply: Mutex<bool>,
-    }
-
-    impl Default for FakeDataplaneProvider {
-        fn default() -> Self {
-            Self {
-                state: Mutex::new(RouterDataplaneSnapshot {
-                    ipv4_forwarding: false,
-                    owned: None,
-                    owned_firewall_integrity: OwnedFirewallIntegrity::Intact,
-                }),
-                fail_next_apply: Mutex::new(false),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl RouterDataplaneProvider for FakeDataplaneProvider {
-        async fn observe(&self) -> Result<RouterDataplaneSnapshot> {
-            Ok(self.state.lock().await.clone())
-        }
-
-        async fn apply_owned(&self, desired: &RouterDataplaneDesired) -> Result<()> {
-            let mut fail = self.fail_next_apply.lock().await;
-            if *fail {
-                *fail = false;
-                anyhow::bail!("injected dataplane apply failure");
-            }
-            drop(fail);
-            let mut state = self.state.lock().await;
-            state.ipv4_forwarding = true;
-            state.owned = Some(desired.clone());
-            Ok(())
-        }
-
-        async fn disable_owned(&self) -> Result<()> {
-            self.state.lock().await.owned = None;
-            Ok(())
-        }
-
-        async fn restore_owned(&self, snapshot: &RouterDataplaneSnapshot) -> Result<()> {
-            *self.state.lock().await = snapshot.clone();
-            Ok(())
-        }
-    }
-
-    const VALID_VPN_PRIVATE_KEY: &str = "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=";
-    const VALID_VPN_PUBLIC_KEY: &str = "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=";
-
-    fn valid_vpn_profile() -> String {
-        format!(
-            "[Interface]\n\
-             PrivateKey = {VALID_VPN_PRIVATE_KEY}\n\
-             Address = 10.0.0.2/24\n\
-             \n\
-             [Peer]\n\
-             PublicKey = {VALID_VPN_PUBLIC_KEY}\n\
-             AllowedIPs = 0.0.0.0/0\n\
-             Endpoint = 203.0.113.1:51820\n"
-        )
-    }
-
-    fn fake_vpn_manager() -> (Arc<ProductionVpnManager>, tempfile::TempDir) {
-        let dir = tempdir().expect("tempdir");
-        let store = WireGuardProfileStore::new(dir.path().join("wireguard"));
-        let active_profile_store = ActiveProfileStore::new(dir.path().join("active-profile.json"));
-        let provider: Arc<dyn VpnProvider> = Arc::new(StaticKeyVpnProvider::default());
-        let driver = WireGuardVpnDriver::new(provider, store);
-        (Arc::new(VpnManager::new(driver, active_profile_store)), dir)
-    }
-
-    fn vpn_policy_startup_config() -> AppConfig {
-        let mut config = AppConfig::default();
-        config.network.interfaces.insert(
-            "wan0".to_string(),
-            InterfaceConfig {
-                nat: true,
-                role: InterfaceRole::Input,
-                managed: false,
-                ipv4: None,
-                dhcp: None,
-                dhcp_client: None,
-                wifi: None,
-                wifi_client: None,
-            },
-        );
-        config.network.interfaces.insert(
-            "lan0".to_string(),
-            InterfaceConfig {
-                nat: true,
-                role: InterfaceRole::Output,
-                managed: true,
-                ipv4: Some("192.168.10.1/24".parse().expect("network")),
-                dhcp: None,
-                dhcp_client: None,
-                wifi: None,
-                wifi_client: None,
-            },
-        );
-        config.router = RouterConfig {
-            enabled: true,
-            uplink: Some(UplinkConfig {
-                interface: "wan0".to_string(),
-                mode: UplinkMode::External,
-            }),
-            ..RouterConfig::default()
-        };
-        config.vpn = VpnConfig {
-            enabled: true,
-            wireguard_config_dir: std::path::PathBuf::from("/var/lib/traffic-masq/vpn/wireguard"),
-            policy: Default::default(),
-        };
-        config
-    }
-
-    /// `default_mode: Vpn` with an active legacy profile and an empty
-    /// `vpn_chain` must migrate into a length-1 chain carrying that
-    /// profile's name — the one true migration in Landing 1.
-    #[tokio::test]
-    async fn migrates_default_mode_vpn_with_an_active_profile_into_a_length_one_chain() {
-        let state_dir = tempdir().expect("tempdir");
-        let mut config = vpn_policy_startup_config();
-        config.runtime.state_dir = state_dir.path().to_path_buf();
-        config.vpn.policy.default_mode = VpnPolicyMode::Vpn;
-        assert!(config.router.vpn_chain.is_empty());
-
-        let legacy_store =
-            ActiveProfileStore::new(state_dir.path().join("vpn-active-profile.json"));
-        legacy_store
-            .save(&crate::vpn::active_profile::PersistedActiveProfile {
-                profile_name: "home.conf".to_string(),
-                interface: "tm-wg0".to_string(),
-                ownership_proof_base64: "irrelevant".to_string(),
-            })
-            .await
-            .expect("persist legacy active profile");
-
-        migrate_vpn_policy_mode_to_chain(&mut config).await;
-
-        assert_eq!(config.router.vpn_chain.len(), 1);
-        assert_eq!(config.router.vpn_chain[0].profile_name, "home.conf");
-    }
-
-    /// Without a legacy active profile to synthesize from, the migration
-    /// must leave `vpn_chain` empty rather than fabricate a hop with no real
-    /// profile behind it.
-    #[tokio::test]
-    async fn does_not_synthesize_a_chain_without_a_legacy_active_profile() {
-        let state_dir = tempdir().expect("tempdir");
-        let mut config = vpn_policy_startup_config();
-        config.runtime.state_dir = state_dir.path().to_path_buf();
-        config.vpn.policy.default_mode = VpnPolicyMode::Vpn;
-
-        migrate_vpn_policy_mode_to_chain(&mut config).await;
-
-        assert!(config.router.vpn_chain.is_empty());
-    }
-
-    /// `default_mode: Direct` never triggers the migration, regardless of
-    /// whether a legacy active profile happens to be lying around.
-    #[tokio::test]
-    async fn direct_mode_never_triggers_the_migration() {
-        let state_dir = tempdir().expect("tempdir");
-        let mut config = vpn_policy_startup_config();
-        config.runtime.state_dir = state_dir.path().to_path_buf();
-        config.vpn.policy.default_mode = VpnPolicyMode::Direct;
-
-        let legacy_store =
-            ActiveProfileStore::new(state_dir.path().join("vpn-active-profile.json"));
-        legacy_store
-            .save(&crate::vpn::active_profile::PersistedActiveProfile {
-                profile_name: "home.conf".to_string(),
-                interface: "tm-wg0".to_string(),
-                ownership_proof_base64: "irrelevant".to_string(),
-            })
-            .await
-            .expect("persist legacy active profile");
-
-        migrate_vpn_policy_mode_to_chain(&mut config).await;
-
-        assert!(config.router.vpn_chain.is_empty());
-    }
-
-    fn hotplug_reconcile_config() -> AppConfig {
-        let mut config = AppConfig::default();
-        config.network.interfaces.insert(
-            "lan0".to_string(),
-            InterfaceConfig {
-                nat: true,
-                role: InterfaceRole::Output,
-                managed: true,
-                ipv4: Some("192.168.77.1/24".parse().expect("network")),
-                dhcp: Some(DhcpInterfaceConfig {
-                    pool_start: Ipv4Addr::new(192, 168, 77, 100),
-                    pool_end: Ipv4Addr::new(192, 168, 77, 120),
-                    router: Ipv4Addr::new(192, 168, 77, 1),
-                    dns_servers: vec![Ipv4Addr::new(1, 1, 1, 1)],
-                    lease_seconds: Some(300),
-                }),
-                dhcp_client: None,
-                wifi: None,
-                wifi_client: None,
-            },
-        );
-        config
-    }
-
-    #[test]
-    fn interface_reapply_detects_link_or_address_drift() {
-        let config = hotplug_reconcile_config();
-        let desired = config.network.interfaces.get("lan0").expect("lan0 config");
-        let interface = crate::netlink::NetworkInterface {
-            is_wireless: false,
-            index: 7,
-            name: "lan0".to_string(),
-            is_up: true,
-            rx_bytes: 0,
-            tx_bytes: 0,
-        };
-
-        let configured = |protocol| {
-            [Ipv4AddressInfo {
-                interface_index: 7,
-                address: Ipv4Addr::new(192, 168, 77, 1),
-                prefix_len: 24,
-                protocol,
-            }]
-        };
-        let ours = AddressOwnership::Static.protocol();
-
-        assert!(!interface_needs_reapply(
-            &interface,
-            &configured(ours),
-            desired,
-            true,
-        ));
-
-        assert!(!interface_needs_reapply(
-            &interface,
-            &configured(None),
-            desired,
-            false,
-        ));
-
-        // The address is right but carries no ownership tag on a kernel that
-        // can hold one: claiming it is work, and it is the only thing that
-        // keeps "did we put this here" answerable later.
-        assert!(interface_needs_reapply(
-            &interface,
-            &configured(None),
-            desired,
-            true,
-        ));
-
-        assert!(interface_needs_reapply(
-            &crate::netlink::NetworkInterface {
-                is_up: false,
-                ..interface.clone()
-            },
-            &configured(ours),
-            desired,
-            true,
-        ));
-
-        assert!(interface_needs_reapply(
-            &interface,
-            &[Ipv4AddressInfo {
-                interface_index: 7,
-                address: Ipv4Addr::new(192, 168, 88, 1),
-                prefix_len: 24,
-                protocol: ours,
-            }],
-            desired,
-            true,
-        ));
-    }
-
-    #[test]
-    fn dhcp_reconcile_disables_missing_interface_and_reconfigures_stale_binding() {
-        let config = hotplug_reconcile_config();
-        let spec = DhcpServiceSpec::from_interface_config(
-            "lan0",
-            config.network.interfaces.get("lan0").expect("lan0 config"),
-            config.dhcp.default_lease_seconds,
-        )
-        .expect("spec")
-        .expect("dhcp enabled");
-
-        assert_eq!(
-            plan_dhcp_reconcile(Some(spec.clone()), Some(spec.clone()), false, false, false),
-            DhcpReconcileAction::Disable
-        );
-        assert_eq!(
-            plan_dhcp_reconcile(Some(spec.clone()), Some(spec.clone()), true, true, true),
-            DhcpReconcileAction::Configure(spec.clone())
-        );
-        assert_eq!(
-            plan_dhcp_reconcile(Some(spec.clone()), Some(spec.clone()), true, true, false),
-            DhcpReconcileAction::Keep
-        );
-    }
-
-    #[tokio::test]
-    async fn runtime_reconcile_reapplies_output_interface_and_restores_dhcp_after_replug() {
-        let config = hotplug_reconcile_config();
-        let state_dir = tempdir().expect("state dir");
-        let overrides = RuntimeOverrideManager::load(state_dir.path(), &config)
-            .await
-            .expect("overrides");
-        let network = Arc::new(FakeNetworkProvider::default());
-        network
-            .add_interface_with_state("lan0", 7, false, Vec::new())
-            .await;
-        let dhcp = FakeDhcpReconciler::default();
-        let wifi = FakeWifiReconciler::default();
-
-        reconcile_network_runtime_once(
-            &DesiredNetworkState::new(config.clone(), overrides.clone()),
-            &AddressOwnershipJournal::in_memory(),
-            network.clone(),
-            &dhcp,
-            Some(&wifi),
-            None::<&FakeWifiReconciler>,
-            None::<&FakeDhcpClientReconciler>,
-        )
-        .await
-        .expect("reconcile");
-
-        let interfaces = network.list_interfaces().await.expect("interfaces");
-        let lan0 = interfaces
-            .into_iter()
-            .find(|interface| interface.name == "lan0")
-            .expect("lan0 present");
-        assert!(lan0.is_up);
-        assert_eq!(
-            network
-                .list_ipv4_addresses("lan0")
-                .await
-                .expect("addresses"),
-            vec![Ipv4AddressInfo {
-                interface_index: 7,
-                address: Ipv4Addr::new(192, 168, 77, 1),
-                prefix_len: 24,
-                protocol: None,
-            }]
-        );
-        assert_eq!(dhcp.configure_calls.lock().await.len(), 1);
-        assert!(dhcp.disable_calls.lock().await.is_empty());
-        assert_eq!(
-            *dhcp.runtime_liveness_checks.lock().await,
-            0,
-            "convergence must not poll for process liveness; that is a separate concern"
-        );
-        assert_eq!(*wifi.liveness_checks.lock().await, 0);
-    }
-
-    /// The tentative layer is not something convergence works around — it is
-    /// what convergence works towards. An unconfirmed change reaches the
-    /// machine the same way a committed one does, and withdrawing it takes the
-    /// machine back without anything having to remember how to undo it.
-    #[tokio::test]
-    async fn an_unconfirmed_change_is_converged_to_and_then_back_again() {
-        let config = hotplug_reconcile_config();
-        let state_dir = tempdir().expect("state dir");
-        let overrides = RuntimeOverrideManager::load(state_dir.path(), &config)
-            .await
-            .expect("overrides");
-        let network = Arc::new(FakeNetworkProvider::default());
-        network
-            .add_interface_with_state("lan0", 7, true, Vec::new())
-            .await;
-        let dhcp = FakeDhcpReconciler::default();
-        let desired = DesiredNetworkState::new(config.clone(), overrides.clone());
-        let journal = AddressOwnershipJournal::in_memory();
-
-        let proposed = InterfaceConfig {
-            ipv4: Some("10.9.9.1/24".parse().expect("network")),
-            dhcp: None,
-            ..config.network.interfaces["lan0"].clone()
-        };
-        desired.propose("token-1", "lan0", proposed, false).await;
-
-        reconcile_network_runtime_once(
-            &desired,
-            &journal,
-            network.clone(),
-            &dhcp,
-            None::<&FakeWifiReconciler>,
-            None::<&FakeWifiReconciler>,
-            None::<&FakeDhcpClientReconciler>,
-        )
-        .await
-        .expect("reconcile");
-
-        assert_eq!(
-            network
-                .list_ipv4_addresses("lan0")
-                .await
-                .expect("addresses")
-                .first()
-                .map(|address| address.address),
-            Some(Ipv4Addr::new(10, 9, 9, 1)),
-            "an unconfirmed change must reach the machine through convergence"
-        );
-
-        desired.withdraw("token-1").await;
-
-        reconcile_network_runtime_once(
-            &desired,
-            &journal,
-            network.clone(),
-            &dhcp,
-            None::<&FakeWifiReconciler>,
-            None::<&FakeWifiReconciler>,
-            None::<&FakeDhcpClientReconciler>,
-        )
-        .await
-        .expect("reconcile");
-
-        assert_eq!(
-            network
-                .list_ipv4_addresses("lan0")
-                .await
-                .expect("addresses")
-                .first()
-                .map(|address| address.address),
-            Some(Ipv4Addr::new(192, 168, 77, 1)),
-            "dropping the tentative layer is the whole of the rollback"
-        );
-    }
-
-    /// A management-role change the operator confirmed has to survive the trip
-    /// through the desired state: the permission lives in the override only
-    /// after the change is committed, so until then the proposal carries it.
-    #[tokio::test]
-    async fn a_proposal_carries_its_own_permission_to_touch_a_management_interface() {
-        let mut config = AppConfig::default();
-        config.network.interfaces.insert(
-            "mgmt0".to_string(),
-            InterfaceConfig {
-                nat: true,
-                role: InterfaceRole::None,
-                managed: true,
-                ipv4: Some("192.168.1.10/24".parse().expect("network")),
-                dhcp: None,
-                dhcp_client: None,
-                wifi: None,
-                wifi_client: None,
-            },
-        );
-        let state_dir = tempdir().expect("state dir");
-        let overrides = RuntimeOverrideManager::load(state_dir.path(), &config)
-            .await
-            .expect("overrides");
-        let network = Arc::new(FakeNetworkProvider::default());
-        network
-            .add_interface_with_state("mgmt0", 3, true, Vec::new())
-            .await;
-        let dhcp = FakeDhcpReconciler::default();
-        let desired = DesiredNetworkState::new(config.clone(), overrides.clone());
-        let journal = AddressOwnershipJournal::in_memory();
-
-        let proposed = InterfaceConfig {
-            ipv4: Some("192.168.1.11/24".parse().expect("network")),
-            ..config.network.interfaces["mgmt0"].clone()
-        };
-        desired
-            .propose("token-1", "mgmt0", proposed.clone(), true)
-            .await;
-
-        let failures = reconcile_network_runtime_once(
-            &desired,
-            &journal,
-            network.clone(),
-            &dhcp,
-            None::<&FakeWifiReconciler>,
-            None::<&FakeWifiReconciler>,
-            None::<&FakeDhcpClientReconciler>,
-        )
-        .await
-        .expect("reconcile");
-
-        assert!(failures.is_empty(), "unexpected failures: {failures:?}");
-        assert_eq!(
-            network
-                .list_ipv4_addresses("mgmt0")
-                .await
-                .expect("addresses")
-                .first()
-                .map(|address| address.address),
-            Some(Ipv4Addr::new(192, 168, 1, 11))
-        );
-
-        // Without the permission the next change to the same interface is
-        // refused, which is what makes carrying it meaningful rather than
-        // decorative.
-        desired.withdraw("token-1").await;
-        let unconfirmed = InterfaceConfig {
-            ipv4: Some("192.168.1.12/24".parse().expect("network")),
-            ..proposed
-        };
-        desired
-            .propose("token-2", "mgmt0", unconfirmed, false)
-            .await;
-        let failures = reconcile_network_runtime_once(
-            &desired,
-            &journal,
-            network.clone(),
-            &dhcp,
-            None::<&FakeWifiReconciler>,
-            None::<&FakeWifiReconciler>,
-            None::<&FakeDhcpClientReconciler>,
-        )
-        .await
-        .expect("reconcile");
-        assert!(failures.contains_key("mgmt0"));
-    }
-
-    /// Cleanup is a state, not an edge: an address tagged as ours on an
-    /// interface we are not asked to manage is removed whenever convergence
-    /// notices it, not only on the apply that stopped managing it.
-    #[tokio::test]
-    async fn convergence_takes_our_addresses_off_an_unmanaged_interface() {
-        let mut config = AppConfig::default();
-        config.network.interfaces.insert(
-            "lan0".to_string(),
-            InterfaceConfig {
-                nat: true,
-                role: InterfaceRole::Output,
-                managed: false,
-                ipv4: None,
-                dhcp: None,
-                dhcp_client: None,
-                wifi: None,
-                wifi_client: None,
-            },
-        );
-        let state_dir = tempdir().expect("state dir");
-        let overrides = RuntimeOverrideManager::load(state_dir.path(), &config)
-            .await
-            .expect("overrides");
-        let network = Arc::new(FakeNetworkProvider::default());
-        network
-            .add_interface_with_state(
-                "lan0",
-                7,
-                true,
-                vec![
-                    Ipv4AddressInfo {
-                        interface_index: 7,
-                        address: Ipv4Addr::new(192, 168, 77, 1),
-                        prefix_len: 24,
-                        protocol: AddressOwnership::Static.protocol(),
-                    },
-                    Ipv4AddressInfo {
-                        interface_index: 7,
-                        address: Ipv4Addr::new(10, 0, 0, 5),
-                        prefix_len: 24,
-                        protocol: None,
-                    },
-                ],
-            )
-            .await;
-        let dhcp = FakeDhcpReconciler::default();
-
-        reconcile_network_runtime_once(
-            &DesiredNetworkState::new(config.clone(), overrides.clone()),
-            &AddressOwnershipJournal::in_memory(),
-            network.clone(),
-            &dhcp,
-            None::<&FakeWifiReconciler>,
-            None::<&FakeWifiReconciler>,
-            None::<&FakeDhcpClientReconciler>,
-        )
-        .await
-        .expect("reconcile");
-
-        let addresses = network
-            .list_ipv4_addresses("lan0")
-            .await
-            .expect("addresses");
-        assert_eq!(
-            addresses
-                .iter()
-                .map(|address| address.address)
-                .collect::<Vec<_>>(),
-            vec![Ipv4Addr::new(10, 0, 0, 5)],
-            "only addresses we tagged as ours may be removed"
-        );
-    }
-
-    #[tokio::test]
-    async fn reconcile_skips_wifi_liveness_when_wifi_is_disabled() {
-        let config = hotplug_reconcile_config();
-        let state_dir = tempdir().expect("state dir");
-        let overrides = RuntimeOverrideManager::load(state_dir.path(), &config)
-            .await
-            .expect("overrides");
-        let network = Arc::new(FakeNetworkProvider::default());
-        let dhcp = FakeDhcpReconciler::default();
-
-        reconcile_network_runtime_once(
-            &DesiredNetworkState::new(config.clone(), overrides.clone()),
-            &AddressOwnershipJournal::in_memory(),
-            network,
-            &dhcp,
-            None::<&FakeWifiReconciler>,
-            None::<&FakeWifiReconciler>,
-            None::<&FakeDhcpClientReconciler>,
-        )
-        .await
-        .expect("reconcile");
-    }
-
-    #[tokio::test]
-    async fn liveness_checks_the_wifi_client_independently_of_the_access_point() {
-        let dhcp = FakeDhcpReconciler::default();
-        let wifi_client = FakeWifiReconciler::default();
-
-        check_process_liveness(
-            &dhcp,
-            None::<&FakeWifiReconciler>,
-            Some(&wifi_client),
-            None::<&FakeDhcpClientReconciler>,
-        )
-        .await;
-
-        assert_eq!(*wifi_client.liveness_checks.lock().await, 1);
-        assert_eq!(*dhcp.runtime_liveness_checks.lock().await, 1);
-    }
-
-    #[tokio::test]
-    async fn liveness_covers_every_supervised_runtime() {
-        let dhcp = FakeDhcpReconciler::default();
-        let wifi = FakeWifiReconciler::default();
-        let wifi_client = FakeWifiReconciler::default();
-        let dhcp_client = FakeDhcpClientReconciler::default();
-
-        check_process_liveness(&dhcp, Some(&wifi), Some(&wifi_client), Some(&dhcp_client)).await;
-
-        assert_eq!(*dhcp.runtime_liveness_checks.lock().await, 1);
-        assert_eq!(*wifi.liveness_checks.lock().await, 1);
-        assert_eq!(*wifi_client.liveness_checks.lock().await, 1);
-        assert_eq!(
-            *dhcp_client.liveness_checks.lock().await,
-            1,
-            "every supervised runtime means every one: the DHCP client was the \
-             one left behind in the convergence pass"
-        );
-    }
-
-    #[tokio::test]
-    async fn liveness_resynchronizes_wifi_association_into_dhcp_link_ready() {
-        let dhcp = FakeDhcpReconciler::default();
-        let wifi_client = FakeWifiReconciler::default();
-        let dhcp_client = FakeDhcpClientReconciler::default();
-        let spec = DhcpClientSpec {
-            interface: "wlan0".into(),
-            route_metric: 100,
-            install_default_route: true,
-            request_dns: true,
-            send_release_on_shutdown: false,
-        };
-        dhcp_client
-            .specs
-            .lock()
-            .await
-            .insert(spec.interface.clone(), spec.clone());
-        wifi_client
-            .associations
-            .lock()
-            .await
-            .insert(spec.interface.clone(), true);
-
-        check_process_liveness(
-            &dhcp,
-            None::<&FakeWifiReconciler>,
-            Some(&wifi_client),
-            Some(&dhcp_client),
-        )
-        .await;
-
-        assert_eq!(
-            dhcp_client.readiness.lock().await.as_slice(),
-            &[("wlan0".to_string(), true)]
-        );
-    }
-
-    fn dhcp_client_reconcile_config() -> AppConfig {
-        let mut config = hotplug_reconcile_config();
-        config.network.interfaces.insert(
-            "wan0".to_string(),
-            InterfaceConfig {
-                nat: true,
-                role: InterfaceRole::Input,
-                managed: true,
-                ipv4: None,
-                dhcp: None,
-                dhcp_client: Some(crate::config::DhcpClientInterfaceConfig::default()),
-                wifi: None,
-                wifi_client: None,
-            },
-        );
-        config
-    }
-
-    #[tokio::test]
-    async fn runtime_reconcile_declares_a_dhcp_client_once_and_stays_stable() {
-        let config = dhcp_client_reconcile_config();
-        let state_dir = tempdir().expect("state dir");
-        let overrides = RuntimeOverrideManager::load(state_dir.path(), &config)
-            .await
-            .expect("overrides");
-        let network = Arc::new(FakeNetworkProvider::default());
-        let dynamic = Ipv4AddressInfo {
-            interface_index: 9,
-            address: Ipv4Addr::new(192, 0, 2, 42),
-            prefix_len: 24,
-            protocol: None,
-        };
-        network
-            .add_interface_with_state("wan0", 9, true, vec![dynamic.clone()])
-            .await;
-        let dhcp = FakeDhcpReconciler::default();
-        let dhcp_client = FakeDhcpClientReconciler::default();
-
-        for _ in 0..3 {
-            reconcile_network_runtime_once(
-                &DesiredNetworkState::new(config.clone(), overrides.clone()),
-                &AddressOwnershipJournal::in_memory(),
-                network.clone(),
-                &dhcp,
-                None::<&FakeWifiReconciler>,
-                None::<&FakeWifiReconciler>,
-                Some(&dhcp_client),
-            )
-            .await
-            .expect("reconcile");
-        }
-
-        assert_eq!(dhcp_client.reconcile_calls.lock().await.len(), 1);
-        assert!(dhcp_client.disable_calls.lock().await.is_empty());
-        assert_eq!(
-            *dhcp_client.liveness_checks.lock().await,
-            0,
-            "convergence must not poll for process liveness; that is a separate concern"
-        );
-
-        assert_eq!(
-            network
-                .list_ipv4_addresses("wan0")
-                .await
-                .expect("addresses"),
-            vec![dynamic]
-        );
-
-        assert!(dhcp
-            .configure_calls
-            .lock()
-            .await
-            .iter()
-            .all(|spec| spec.interface != "wan0"));
-    }
-
-    #[tokio::test]
-    async fn convergence_releases_access_point_before_starting_station() {
-        struct RadioRuntime {
-            ap: bool,
-            ap_running: Arc<Mutex<bool>>,
-        }
-        #[async_trait]
-        impl WifiRuntimeReconciler for RadioRuntime {
-            async fn ensure_alive(&self) -> Result<bool> {
-                Ok(false)
-            }
-            async fn reconcile_interface(&self, _: &str, config: &InterfaceConfig) -> Result<()> {
-                let mut running = self.ap_running.lock().await;
-                if self.ap {
-                    *running = config.wifi.is_some();
-                } else if config.wifi_client.is_some() {
-                    anyhow::ensure!(!*running, "radio is still owned by hostapd");
-                }
-                Ok(())
-            }
-            async fn association_ready(&self, _: &str) -> Option<bool> {
-                Some(true)
-            }
-        }
-        let mut config = dhcp_client_reconcile_config();
-        config.network.interfaces.remove("lan0");
-        config
-            .network
-            .interfaces
-            .get_mut("wan0")
-            .unwrap()
-            .wifi_client = Some(crate::config::WifiClientConfig {
-            ssid: "upstream".into(),
-            country_code: None,
-            security: crate::config::WifiClientSecurity::Open,
-            passphrase_file: None,
-        });
-        let directory = tempdir().unwrap();
-        let overrides = RuntimeOverrideManager::load(directory.path(), &config)
-            .await
-            .unwrap();
-        let desired = DesiredNetworkState::new(config.clone(), overrides);
-        desired
-            .propose(
-                "switch",
-                "wan0",
-                config.network.interfaces["wan0"].clone(),
-                true,
-            )
-            .await;
-        let network = Arc::new(FakeNetworkProvider::default());
-        network.add_interface("wan0", 9).await;
-        let running = Arc::new(Mutex::new(true));
-        let ap = RadioRuntime {
-            ap: true,
-            ap_running: running.clone(),
-        };
-        let station = RadioRuntime {
-            ap: false,
-            ap_running: running.clone(),
-        };
-        let failures = reconcile_network_runtime_once(
-            &desired,
-            &AddressOwnershipJournal::in_memory(),
-            network,
-            &FakeDhcpReconciler::default(),
-            Some(&ap),
-            Some(&station),
-            Some(&FakeDhcpClientReconciler::default()),
-        )
-        .await
-        .unwrap();
-        assert!(failures.is_empty(), "{failures:?}");
-        assert!(!*running.lock().await);
-    }
-
-    #[tokio::test]
-    async fn managed_wifi_dhcp_tracks_completed_while_wired_stays_ready() {
-        let mut config = dhcp_client_reconcile_config();
-        let wifi = config.network.interfaces.get_mut("wan0").expect("wan0");
-        wifi.wifi_client = Some(crate::config::WifiClientConfig {
-            ssid: "upstream".to_string(),
-            country_code: None,
-            security: crate::config::WifiClientSecurity::Open,
-            passphrase_file: None,
-        });
-        config.network.interfaces.insert(
-            "eth0".to_string(),
-            InterfaceConfig {
-                nat: true,
-                role: InterfaceRole::Input,
-                managed: true,
-                ipv4: None,
-                dhcp: None,
-                dhcp_client: Some(crate::config::DhcpClientInterfaceConfig::default()),
-                wifi: None,
-                wifi_client: None,
-            },
-        );
-        let state_dir = tempdir().expect("state dir");
-        let overrides = RuntimeOverrideManager::load(state_dir.path(), &config)
-            .await
-            .expect("overrides");
-        let network = Arc::new(FakeNetworkProvider::default());
-        network.add_interface("wan0", 9).await;
-        network.add_interface("eth0", 10).await;
-        let dhcp = FakeDhcpReconciler::default();
-        let wifi_client = FakeWifiReconciler::default();
-        wifi_client
-            .associations
-            .lock()
-            .await
-            .insert("wan0".to_string(), false);
-        let dhcp_client = FakeDhcpClientReconciler::default();
-
-        reconcile_network_runtime_once(
-            &DesiredNetworkState::new(config.clone(), overrides.clone()),
-            &AddressOwnershipJournal::in_memory(),
-            network.clone(),
-            &dhcp,
-            None::<&FakeWifiReconciler>,
-            Some(&wifi_client),
-            Some(&dhcp_client),
-        )
-        .await
-        .expect("disconnected reconcile");
-        assert!(dhcp_client
-            .readiness
-            .lock()
-            .await
-            .contains(&("wan0".to_string(), false)));
-        assert!(dhcp_client
-            .readiness
-            .lock()
-            .await
-            .contains(&("eth0".to_string(), true)));
-
-        wifi_client
-            .associations
-            .lock()
-            .await
-            .insert("wan0".to_string(), true);
-        reconcile_network_runtime_once(
-            &DesiredNetworkState::new(config.clone(), overrides.clone()),
-            &AddressOwnershipJournal::in_memory(),
-            network,
-            &dhcp,
-            None::<&FakeWifiReconciler>,
-            Some(&wifi_client),
-            Some(&dhcp_client),
-        )
-        .await
-        .expect("completed reconcile");
-        assert_eq!(
-            dhcp_client
-                .readiness
-                .lock()
-                .await
-                .iter()
-                .filter(|(interface, ready)| interface == "wan0" && *ready)
-                .count(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn runtime_reconcile_disables_a_dhcp_client_whose_intent_was_removed() {
-        let config = hotplug_reconcile_config();
-        let state_dir = tempdir().expect("state dir");
-        let overrides = RuntimeOverrideManager::load(state_dir.path(), &config)
-            .await
-            .expect("overrides");
-        let network = Arc::new(FakeNetworkProvider::default());
-        network.add_interface("wan0", 9).await;
-        let dhcp = FakeDhcpReconciler::default();
-        let dhcp_client = FakeDhcpClientReconciler::default();
-
-        let spec = DhcpClientSpec::from_interface_config(
-            "wan0",
-            dhcp_client_reconcile_config()
-                .network
-                .interfaces
-                .get("wan0")
-                .expect("wan0 config"),
-        )
-        .expect("spec")
-        .expect("dhcp client enabled");
-        dhcp_client
-            .specs
-            .lock()
-            .await
-            .insert("wan0".to_string(), spec);
-
-        let mut config = config;
-        config.network.interfaces.insert(
-            "wan0".to_string(),
-            InterfaceConfig {
-                nat: true,
-                role: InterfaceRole::Input,
-                managed: false,
-                ipv4: None,
-                dhcp: None,
-                dhcp_client: None,
-                wifi: None,
-                wifi_client: None,
-            },
-        );
-
-        reconcile_network_runtime_once(
-            &DesiredNetworkState::new(config.clone(), overrides.clone()),
-            &AddressOwnershipJournal::in_memory(),
-            network,
-            &dhcp,
-            None::<&FakeWifiReconciler>,
-            None::<&FakeWifiReconciler>,
-            Some(&dhcp_client),
-        )
-        .await
-        .expect("reconcile");
-
-        assert_eq!(
-            dhcp_client.disable_calls.lock().await.as_slice(),
-            &["wan0".to_string()]
-        );
-        assert!(dhcp_client.specs.lock().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn runtime_reconcile_disables_stale_dhcp_when_interface_disappears() {
-        let config = hotplug_reconcile_config();
-        let state_dir = tempdir().expect("state dir");
-        let overrides = RuntimeOverrideManager::load(state_dir.path(), &config)
-            .await
-            .expect("overrides");
-        let dhcp = FakeDhcpReconciler::default();
-        let spec = DhcpServiceSpec::from_interface_config(
-            "lan0",
-            config.network.interfaces.get("lan0").expect("lan0 config"),
-            config.dhcp.default_lease_seconds,
-        )
-        .expect("spec")
-        .expect("dhcp enabled");
-        dhcp.specs.lock().await.insert("lan0".to_string(), spec);
-        let network = Arc::new(FakeNetworkProvider::default());
-
-        reconcile_network_runtime_once(
-            &DesiredNetworkState::new(config.clone(), overrides.clone()),
-            &AddressOwnershipJournal::in_memory(),
-            network,
-            &dhcp,
-            None::<&HostapdSupervisor>,
-            None::<&WifiClientSupervisor>,
-            None::<&FakeDhcpClientReconciler>,
-        )
-        .await
-        .expect("reconcile");
-
-        assert_eq!(
-            dhcp.disable_calls.lock().await.as_slice(),
-            &["lan0".to_string()]
-        );
-        assert!(dhcp.specs.lock().await.is_empty());
-    }
-
-    fn desired_with_route_and_dataplane() -> RouterDesired {
-        let mut config = AppConfig::default();
-        config.network.interfaces.insert(
-            "wan0".to_string(),
-            crate::config::InterfaceConfig {
-                nat: true,
-                role: crate::config::InterfaceRole::Input,
-                managed: false,
-                ipv4: None,
-                dhcp: None,
-                dhcp_client: None,
-                wifi: None,
-                wifi_client: None,
-            },
-        );
-        config.network.interfaces.insert(
-            "lan0".to_string(),
-            crate::config::InterfaceConfig {
-                nat: true,
-                role: crate::config::InterfaceRole::Output,
-                managed: true,
-                ipv4: Some("192.168.10.1/24".parse().expect("network")),
-                dhcp: None,
-                dhcp_client: None,
-                wifi: None,
-                wifi_client: None,
-            },
-        );
-        config.router = RouterConfig {
-            forwarding: None,
-            vpn_chain: Vec::new(),
-            enabled: true,
-            uplink: Some(UplinkConfig {
-                interface: "wan0".to_string(),
-                mode: UplinkMode::External,
-            }),
-            owned_routes: vec![crate::config::OwnedIpv4RouteConfig {
-                destination: "203.0.113.0/24".parse().expect("route"),
-                gateway: None,
-                output_interface: Some("wan0".to_string()),
-                table: 254,
-                metric: Some(100),
-            }],
-            allow_default_route_change: false,
-        };
-        RouterDesired::from_effective_config(&config).expect("desired")
-    }
-
-    #[tokio::test]
-    async fn apply_router_dataplane_applies_routes_then_dataplane() {
-        let network = Arc::new(FakeNetworkProvider::default());
-        network.add_interface("wan0", 1).await;
-        network.add_interface("lan0", 2).await;
-        let desired = desired_with_route_and_dataplane();
-
-        let state =
-            apply_router_dataplane(&desired, network.clone(), FakeDataplaneProvider::default())
-                .await
-                .expect("apply");
-
-        assert_eq!(network.routes.lock().await.len(), 1);
-        assert!(state
-            .dataplane
-            .snapshot()
-            .await
-            .expect("snapshot")
-            .owned
-            .is_some());
-
-        assert!(state.dataplane_snapshot.owned.is_none());
-    }
-
-    #[tokio::test]
-    async fn dataplane_apply_failure_rolls_back_routes_without_leaving_partial_state() {
-        let network = Arc::new(FakeNetworkProvider::default());
-        network.add_interface("wan0", 1).await;
-        network.add_interface("lan0", 2).await;
-        let desired = desired_with_route_and_dataplane();
-        let dataplane_provider = FakeDataplaneProvider::default();
-        *dataplane_provider.fail_next_apply.lock().await = true;
-
-        let error = apply_router_dataplane(&desired, network.clone(), dataplane_provider)
-            .await
-            .map(|_| ())
-            .expect_err("dataplane apply must fail");
-        assert!(format!("{error:#}").contains("injected dataplane apply failure"));
-        assert!(network.routes.lock().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn rollback_router_dataplane_restores_pre_apply_baseline() {
-        let network = Arc::new(FakeNetworkProvider::default());
-        network.add_interface("wan0", 1).await;
-        network.add_interface("lan0", 2).await;
-        let desired = desired_with_route_and_dataplane();
-
-        let state =
-            apply_router_dataplane(&desired, network.clone(), FakeDataplaneProvider::default())
-                .await
-                .expect("apply");
-        assert_eq!(network.routes.lock().await.len(), 1);
-
-        rollback_router_dataplane(&state).await;
-
-        assert!(network.routes.lock().await.is_empty());
-        assert!(state
-            .dataplane
-            .snapshot()
-            .await
-            .expect("snapshot")
-            .owned
-            .is_none());
-    }
-
-    #[tokio::test]
-    async fn apply_vpn_policy_startup_is_noop_when_vpn_is_disabled() {
-        let config = vpn_policy_startup_config();
-        let state_dir = tempdir().expect("state dir");
-        let overrides = RuntimeOverrideManager::load(state_dir.path(), &config)
-            .await
-            .expect("overrides");
-        let network = Arc::new(FakeNetworkProvider::default());
-
-        let firewall_executor = FakeNftExecutor::with_responses(vec![]);
-
-        apply_vpn_policy_startup(
-            &config,
-            &overrides,
-            network.clone(),
-            firewall_executor,
-            &None,
-        )
-        .await;
-
-        assert!(network.rules.lock().await.is_empty());
-        assert!(network.routes.lock().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn apply_vpn_policy_startup_does_not_touch_legacy_policy_when_router_chain_exists() {
-        let mut config = vpn_policy_startup_config();
-        config.router.vpn_chain = vec![crate::config::VpnHopConfig {
-            profile_name: "chain.conf".to_string(),
-        }];
-        let state_dir = tempdir().expect("state dir");
-        let overrides = RuntimeOverrideManager::load(state_dir.path(), &config)
-            .await
-            .expect("overrides");
-        overrides
-            .set_vpn_mode(crate::config::VpnPolicyMode::Vpn)
-            .await
-            .expect("persist vpn mode");
-
-        let network = Arc::new(FakeNetworkProvider::default());
-        network.add_interface(OWNED_INTERFACE_NAME, 42).await;
-        let firewall_executor = FakeNftExecutor::with_responses(vec![
-            Ok(nft_ruleset(None)),
-            Ok(nft_ruleset(None)),
-            Ok(Vec::new()),
-        ]);
-        let (tunnel, _dir) = fake_vpn_manager();
-        tunnel
-            .import_profile("home.conf", valid_vpn_profile().as_bytes())
-            .expect("import");
-        tunnel.activate("home.conf").await.expect("tunnel activate");
-        let vpn_manager = Some(tunnel);
-
-        apply_vpn_policy_startup(
-            &config,
-            &overrides,
-            network.clone(),
-            firewall_executor,
-            &vpn_manager,
-        )
-        .await;
-
-        assert!(network.rules.lock().await.is_empty());
-        assert!(network.routes.lock().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn apply_vpn_policy_startup_activates_policy_in_vpn_mode_when_tunnel_is_healthy() {
-        let config = vpn_policy_startup_config();
-        let state_dir = tempdir().expect("state dir");
-        let overrides = RuntimeOverrideManager::load(state_dir.path(), &config)
-            .await
-            .expect("overrides");
-        overrides
-            .set_vpn_mode(crate::config::VpnPolicyMode::Vpn)
-            .await
-            .expect("persist vpn mode");
-
-        let network = Arc::new(FakeNetworkProvider::default());
-        network.add_interface(OWNED_INTERFACE_NAME, 42).await;
-
-        let firewall_executor = FakeNftExecutor::with_responses(vec![
-            Ok(nft_ruleset(None)),
-            Ok(nft_ruleset(None)),
-            Ok(Vec::new()),
-        ]);
-        let (tunnel, _dir) = fake_vpn_manager();
-        tunnel
-            .import_profile("home.conf", valid_vpn_profile().as_bytes())
-            .expect("import");
-        tunnel.activate("home.conf").await.expect("tunnel activate");
-        let vpn_manager = Some(tunnel);
-
-        apply_vpn_policy_startup(
-            &config,
-            &overrides,
-            network.clone(),
-            firewall_executor,
-            &vpn_manager,
-        )
-        .await;
-
-        let rules = network.rules.lock().await;
-        assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].fw_mark, Some(0x5400_0000));
-        let routes = network.routes.lock().await;
-        assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].output_interface_index, Some(42));
-    }
-
-    #[tokio::test]
-    async fn apply_vpn_policy_startup_fails_closed_when_tunnel_is_not_active() {
-        let config = vpn_policy_startup_config();
-        let state_dir = tempdir().expect("state dir");
-        let overrides = RuntimeOverrideManager::load(state_dir.path(), &config)
-            .await
-            .expect("overrides");
-        overrides
-            .set_vpn_mode(crate::config::VpnPolicyMode::Vpn)
-            .await
-            .expect("persist vpn mode");
-
-        let network = Arc::new(FakeNetworkProvider::default());
-        network.add_interface(OWNED_INTERFACE_NAME, 42).await;
-
-        let firewall_executor = FakeNftExecutor::with_responses(vec![]);
-        let (tunnel, _dir) = fake_vpn_manager();
-
-        let vpn_manager = Some(tunnel);
-
-        apply_vpn_policy_startup(
-            &config,
-            &overrides,
-            network.clone(),
-            firewall_executor,
-            &vpn_manager,
-        )
-        .await;
-
-        assert!(network.rules.lock().await.is_empty());
-        assert!(network.routes.lock().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn apply_vpn_policy_startup_deactivates_leftover_policy_in_direct_mode() {
-        let config = vpn_policy_startup_config();
-        let state_dir = tempdir().expect("state dir");
-        let overrides = RuntimeOverrideManager::load(state_dir.path(), &config)
-            .await
-            .expect("overrides");
-
-        let network = Arc::new(FakeNetworkProvider::default());
-        network.rules.lock().await.push(Ipv4RuleInfo {
-            source: None,
-            destination: None,
-            table: 30_100,
-            priority: Some(10_100),
-            fw_mark: Some(0x5400_0000),
-            fw_mask: Some(0xff00_0000),
-            input_interface: None,
-            output_interface: None,
-        });
-        network.routes.lock().await.push(Ipv4RouteInfo {
-            destination: "0.0.0.0/0".parse().unwrap(),
-            gateway: None,
-            output_interface_index: Some(999),
-            table: 30_100,
-            metric: Some(50),
-            protocol: crate::netlink::TRAFFIC_MASQ_ROUTE_PROTOCOL,
-            scope: 253,
-        });
-        let leftover_firewall = crate::firewall::vpn::VpnPolicyFirewallDesired {
-            protected_subnets: vec!["192.168.10.0/24".parse().unwrap()],
-            vpn_interface: OWNED_INTERFACE_NAME.to_string(),
-            physical_uplink: "wan0".to_string(),
-        };
-
-        let firewall_executor = FakeNftExecutor::with_responses(vec![
-            Ok(nft_ruleset(Some(&leftover_firewall))),
-            Ok(nft_ruleset(Some(&leftover_firewall))),
-            Ok(Vec::new()),
-        ]);
-        let (tunnel, _dir) = fake_vpn_manager();
-        let vpn_manager = Some(tunnel);
-
-        apply_vpn_policy_startup(
-            &config,
-            &overrides,
-            network.clone(),
-            firewall_executor,
-            &vpn_manager,
-        )
-        .await;
-
-        assert!(network.rules.lock().await.is_empty());
-        assert!(network.routes.lock().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn preflight_accepts_a_runnable_binary() {
-        let binary = if std::path::Path::new("/bin/true").exists() {
-            "/bin/true"
-        } else {
-            "/bin/sh"
-        };
-        preflight_hostapd_binary(Path::new(binary))
-            .await
-            .expect("a real, executable binary must pass preflight");
-    }
-
-    #[tokio::test]
-    async fn preflight_reports_a_missing_binary_clearly() {
-        let error = preflight_hostapd_binary(Path::new("/definitely/not/a/real/hostapd"))
-            .await
-            .expect_err("a nonexistent binary must fail preflight");
-        let message = format!("{error:#}");
-        assert!(message.contains("hostapd"), "{message}");
-        assert!(
-            message.contains("/definitely/not/a/real/hostapd"),
-            "{message}"
-        );
-    }
-
-    /// `wifi.enabled = false` must not decide, for the lifetime of the process,
-    /// that Wi-Fi can never be turned on. The supervisor is built anyway; the
-    /// flag only decides whether a missing binary is reported at startup.
-    #[tokio::test]
-    async fn wifi_supervisor_is_built_even_when_wifi_is_disabled_at_startup() {
-        let directory = tempdir().expect("tempdir");
-        let mut config = AppConfig::default();
-        config.runtime.state_dir = directory.path().join("state");
-        config.wifi.enabled = false;
-        config.wifi.hostapd_binary = std::path::PathBuf::from("/definitely/not/a/real/hostapd");
-
-        let supervisor = build_wifi_supervisor(&config)
-            .await
-            .expect("a missing binary must not fail startup while Wi-Fi is off")
-            .expect("the supervisor must exist so Wi-Fi can be enabled at runtime");
-
-        // The check the flag used to gate now happens where the intent is real.
-        assert!(
-            supervisor.preflight_binary().await.is_err(),
-            "a missing hostapd must still be diagnosed, just later"
-        );
-    }
-
-    /// The startup hint half of the same rule: a box that declares it uses
-    /// Wi-Fi still finds out about a missing binary immediately.
-    #[tokio::test]
-    async fn a_missing_hostapd_still_fails_startup_when_wifi_is_enabled() {
-        let mut config = AppConfig::default();
-        config.wifi.enabled = true;
-        config.wifi.hostapd_binary = std::path::PathBuf::from("/definitely/not/a/real/hostapd");
-
-        assert!(build_wifi_supervisor(&config).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn wifi_client_supervisor_is_built_even_when_disabled_at_startup() {
-        let directory = tempdir().expect("tempdir");
-        let mut config = AppConfig::default();
-        config.runtime.state_dir = directory.path().join("state");
-        config.wifi_client.enabled = false;
-        config.wifi_client.wpa_supplicant_binary =
-            std::path::PathBuf::from("/definitely/not/a/real/wpa_supplicant");
-
-        let supervisor = build_wifi_client_supervisor(&config)
-            .await
-            .expect("a missing binary must not fail startup while the client is off")
-            .expect("the supervisor must exist so the client can be enabled at runtime");
-
-        assert!(supervisor.preflight_binary().await.is_err());
-    }
-}
+mod tests;

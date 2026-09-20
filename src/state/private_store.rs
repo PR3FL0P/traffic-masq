@@ -41,8 +41,19 @@ pub struct PrivateJsonDirectory {
 }
 
 impl PrivateJsonDirectory {
-    /// Open `<state_root>/<name>`, creating it if needed.
+    /// Open `<state_root>/<name>`, creating it if needed with directory mode 0700.
+    /// Reject names containing traversal or multiple components and symlinked store paths.
     pub fn open(state_root: impl AsRef<Path>, name: &str) -> Result<Self, PrivateStoreError> {
+        let mut components = Path::new(name).components();
+        if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+            || components.next().is_some()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "store name must be a single normal path component",
+            )
+            .into());
+        }
         let root = state_root.as_ref();
         reject_symlink(root)?;
         fs::create_dir_all(root)?;
@@ -52,6 +63,7 @@ impl PrivateJsonDirectory {
         Ok(Self { directory })
     }
 
+    /// Return the directory containing this store without accessing the filesystem.
     pub fn directory(&self) -> &Path {
         &self.directory
     }
@@ -89,6 +101,8 @@ impl PrivateJsonDirectory {
         Ok(())
     }
 
+    /// Durably remove a validated document; a missing document is already removed.
+    /// Attempt restoration if deletion fails after modifying the directory.
     pub fn remove(&self, key: &str) -> Result<(), PrivateStoreError> {
         let path = self.path(key)?;
         reject_symlink(&path)?;
@@ -120,6 +134,7 @@ impl PrivateJsonDirectory {
         Ok(keys)
     }
 
+    /// Validate the interface key before constructing its JSON document path.
     fn path(&self, key: &str) -> Result<PathBuf, PrivateStoreError> {
         if !valid_document_key(key) {
             return Err(PrivateStoreError::InvalidKey);
@@ -143,86 +158,17 @@ pub fn valid_document_key(key: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
+/// Reject a symlink while preserving metadata errors other than a missing path.
 fn reject_symlink(path: &Path) -> Result<(), PrivateStoreError> {
-    if let Ok(metadata) = fs::symlink_metadata(path) {
-        if metadata.file_type().is_symlink() {
-            return Err(PrivateStoreError::Symlink(path.to_path_buf()));
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(PrivateStoreError::Symlink(path.to_path_buf()))
         }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
     }
-    Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use std::os::unix::fs::{symlink, MetadataExt};
-
-    use tempfile::tempdir;
-
-    use super::*;
-
-    #[test]
-    fn writes_are_private_atomic_and_leave_no_temporaries() {
-        let root = tempdir().expect("tempdir");
-        let store = PrivateJsonDirectory::open(root.path(), "records").expect("store");
-
-        assert_eq!(
-            fs::metadata(store.directory()).expect("metadata").mode() & 0o777,
-            0o700
-        );
-
-        store.write("eth0", b"{\"a\":1}").expect("write");
-        store.write("eth0", b"{\"a\":2}").expect("overwrite");
-
-        let path = store.directory().join("eth0.json");
-        assert_eq!(fs::metadata(&path).expect("metadata").mode() & 0o777, 0o600);
-        assert_eq!(
-            store.read("eth0").expect("read").as_deref(),
-            Some(&b"{\"a\":2}"[..])
-        );
-        assert!(fs::read_dir(store.directory())
-            .expect("read_dir")
-            .all(|entry| !entry
-                .expect("entry")
-                .file_name()
-                .to_string_lossy()
-                .ends_with(".tmp")));
-
-        assert_eq!(store.keys().expect("keys"), vec!["eth0".to_string()]);
-        store.remove("eth0").expect("remove");
-        assert_eq!(store.read("eth0").expect("read"), None);
-        assert!(store.keys().expect("keys").is_empty());
-    }
-
-    #[test]
-    fn refuses_traversal_and_symlinked_documents() {
-        let root = tempdir().expect("tempdir");
-        let store = PrivateJsonDirectory::open(root.path(), "records").expect("store");
-
-        assert!(matches!(
-            store.read("../eth0"),
-            Err(PrivateStoreError::InvalidKey)
-        ));
-
-        let target = root.path().join("target");
-        fs::write(&target, b"do not replace").expect("write target");
-        symlink(&target, store.directory().join("eth0.json")).expect("symlink");
-
-        assert!(matches!(
-            store.write("eth0", b"{}"),
-            Err(PrivateStoreError::Symlink(_))
-        ));
-        assert_eq!(fs::read(&target).expect("read target"), b"do not replace");
-    }
-
-    #[test]
-    fn refuses_a_symlinked_store_directory() {
-        let root = tempdir().expect("tempdir");
-        let elsewhere = tempdir().expect("tempdir");
-        symlink(elsewhere.path(), root.path().join("records")).expect("symlink");
-
-        assert!(matches!(
-            PrivateJsonDirectory::open(root.path(), "records"),
-            Err(PrivateStoreError::Symlink(_))
-        ));
-    }
-}
+mod tests;

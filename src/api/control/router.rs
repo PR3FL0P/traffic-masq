@@ -1,5 +1,5 @@
-use super::*;
 use super::provisioning::*;
+use super::*;
 use crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore;
 
 impl ControlService {
@@ -199,11 +199,8 @@ impl ControlService {
             }
             Err(error) => {
                 if error.downcast_ref::<NoPendingTransactionError>().is_some() {
-                    let committed_token = self
-                        .overrides
-                        .snapshot()
-                        .await
-                        .committed_router_transaction;
+                    let committed_token =
+                        self.overrides.snapshot().await.committed_router_transaction;
                     if committed_token.as_deref() != Some(token.as_str()) {
                         let secrets = ProvisioningSecretTransactionStore::in_state_dir(
                             &self.config.runtime.state_dir,
@@ -315,9 +312,7 @@ impl ControlService {
                 return provisioning_error(RouterProvisioningErrorDetail::TransactionPending);
             }
             CoordinatorStatus::RollbackFailed => {
-                return provisioning_error(
-                    RouterProvisioningErrorDetail::RollbackRecoveryRequired,
-                );
+                return provisioning_error(RouterProvisioningErrorDetail::RollbackRecoveryRequired);
             }
         }
         if !self.transactions.pending().await.is_empty() {
@@ -424,17 +419,21 @@ impl ControlService {
             }
         }
 
-        let secret_tx = ProvisioningSecretTransactionStore::in_state_dir(
-            &self.config.runtime.state_dir,
-        );
+        let secret_tx =
+            ProvisioningSecretTransactionStore::in_state_dir(&self.config.runtime.state_dir);
         if let Err(error) = secret_tx.stage(previous).await {
             return provisioning_error(RouterProvisioningErrorDetail::Other {
                 message: format!("failed to open provisioning secret transaction: {error:#}"),
             });
         }
 
-        if let (Some(supervisor), Some(passphrase)) = (output_supervisor, output_passphrase.as_ref()) {
-            if let Err(error) = supervisor.set_passphrase(&output_interface, passphrase).await {
+        if let (Some(supervisor), Some(passphrase)) =
+            (output_supervisor, output_passphrase.as_ref())
+        {
+            if let Err(error) = supervisor
+                .set_passphrase(&output_interface, passphrase)
+                .await
+            {
                 let restore = secret_tx.restore_staged().await;
                 return provisioning_error(RouterProvisioningErrorDetail::InvalidSecret {
                     message: match restore {
@@ -446,8 +445,13 @@ impl ControlService {
                 });
             }
         }
-        if let (Some(supervisor), Some(passphrase)) = (uplink_supervisor, uplink_passphrase.as_ref()) {
-            if let Err(error) = supervisor.set_passphrase(&uplink_interface, passphrase).await {
+        if let (Some(supervisor), Some(passphrase)) =
+            (uplink_supervisor, uplink_passphrase.as_ref())
+        {
+            if let Err(error) = supervisor
+                .set_passphrase(&uplink_interface, passphrase)
+                .await
+            {
                 let restore = secret_tx.restore_staged().await;
                 return provisioning_error(RouterProvisioningErrorDetail::InvalidSecret {
                     message: match restore {
@@ -866,11 +870,15 @@ impl ControlService {
                                 tracing::error!(%error, %token, "provisioning secrets restored after timeout but router re-convergence failed; recovery journal retained");
                             }
                         },
-                        Err(error) => tracing::error!(%error, %token, "could not derive committed router state after provisioning timeout; recovery journal retained"),
+                        Err(error) => {
+                            tracing::error!(%error, %token, "could not derive committed router state after provisioning timeout; recovery journal retained")
+                        }
                     }
                 }
                 Ok(false) => {}
-                Err(error) => tracing::error!(%error, %token, "failed to restore provisioning secrets after timeout"),
+                Err(error) => {
+                    tracing::error!(%error, %token, "failed to restore provisioning secrets after timeout")
+                }
             }
         });
     }

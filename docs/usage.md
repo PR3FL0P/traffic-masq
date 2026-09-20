@@ -159,6 +159,23 @@ The release workflow builds an archive containing both binaries and SHA-256
 checksums. See [release procedure](release.md). Target machines do not need Rust
 or a C compiler.
 
+## Reset all settings
+
+To return traffic-masq to a clean, safe configuration while keeping the installation itself:
+
+```sh
+sudo traffic-masqd reset --dry-run
+sudo traffic-masqd reset
+```
+
+The reset command requires a healthy running daemon for the normal path. It requests restoration of traffic-masq-owned network state, stops the daemon, and requires a matching shutdown acknowledgement before deleting recovery/ownership journals. It then clears traffic-masq persistent state (runtime overrides, credentials and sessions, DHCP lease state, Wi-Fi state/profiles, VPN profiles and ownership journals) and replaces the selected configuration with safe defaults. Installation/runtime paths and the socket access group are preserved so the installed service remains usable. Logs, binaries and init-service registration are preserved, and the daemon is left stopped. Start it explicitly when ready:
+
+```sh
+sudo traffic-masqd start
+```
+
+Use `--yes` for non-interactive reset. Destructive state directories are checked before deletion; shallow paths and symlinked paths are refused. A stopped or unhealthy daemon is refused by default because the command cannot prove that owned kernel state was restored. After a reboot (or when live traffic-masq-owned kernel state is otherwise known to be clean), `--force-offline` explicitly permits reset while the daemon is stopped.
+
 ## Configuration
 
 Create the default configuration file:
@@ -476,6 +493,23 @@ as the router preview: review the complete plan, then press **Enter** on
 The API retains `managed` and `allow_management_change` for compatibility.
 
 Test configuration changes on a separate Linux host before production use.
+
+### Dashboard and convergence diagnostics
+
+The dashboard's **Interfaces stat** panel shows link activity and
+`traffic-masq:on/off/?` (managed, unmanaged, or ownership unavailable).
+Press **2** for aggregate statistics, then **Down/Up** to browse individual
+interfaces; **Home** returns to the aggregate view. The separate **DHCP Clients**
+panel shows configured uplink DHCP clients. The overview reports whether the VPN
+subsystem is enabled; this switch alone does not prove a tunnel is connected.
+
+An absent router dataplane interface defers startup convergence after successful
+rollback instead of stopping the daemon. The daemon retries when the interface
+appears. Check `ip link`, reconnect the adapter, or correct its name in the router
+configuration. Logs identify the missing interface and its role, include the
+underlying error, and suggest these recovery steps. Other apply or rollback
+failures still fail startup. TUI session logs wrap long diagnostics and hints;
+use **Up/Down**, **PageUp/PageDown**, or **Home/End** to read them.
 
 ### DHCP editor defaults
 

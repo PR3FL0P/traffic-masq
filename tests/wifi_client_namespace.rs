@@ -17,10 +17,9 @@ use traffic_masq::wifi::WpaState;
 mod support;
 
 use support::wifi::{
-    command_path, ensure_child_running, list_interfaces, list_phys, output_ns, output_text, path_str,
-    pid_alive, rename_interface, run, run_ns, spawn_ns, stop_child, stop_child_blocking,
-    stop_pid_blocking,
-    unique_suffix,
+    command_path, ensure_child_running, list_interfaces, list_phys, output_ns, output_text,
+    path_str, pid_alive, rename_interface, run, run_ns, spawn_ns, stop_child, stop_child_blocking,
+    stop_pid_blocking, unique_suffix,
 };
 
 static NAMESPACE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

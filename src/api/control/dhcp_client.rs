@@ -1,5 +1,5 @@
-use super::*;
 use super::runtime::compensation_message;
+use super::*;
 
 impl ControlService {
     pub(super) async fn dhcp_client_status(&self) -> Response {
@@ -94,14 +94,11 @@ impl ControlService {
             },
             None => true,
         };
-        if let Err(error) = configure_dhcp_client_checked(
-            supervisor,
-            spec.clone(),
-            link_ready,
-        )
-        .await
+        if let Err(error) =
+            configure_dhcp_client_checked(supervisor, spec.clone(), link_ready).await
         {
-            let restoration = restore_dhcp_client(supervisor, &interface, previous, link_ready).await;
+            let restoration =
+                restore_dhcp_client(supervisor, &interface, previous, link_ready).await;
             return dhcp_client_error(DhcpClientErrorDetail::RuntimeFailure {
                 message: match restoration {
                     Ok(()) => format!(
@@ -184,11 +181,7 @@ impl ControlService {
             let restoration =
                 restore_dhcp_client(supervisor, &interface, previous.clone(), link_ready).await;
             return dhcp_client_error(DhcpClientErrorDetail::OwnershipConflict {
-                message: compensation_message(
-                    "failed to disable DHCP client",
-                    &error,
-                    restoration,
-                ),
+                message: compensation_message("failed to disable DHCP client", &error, restoration),
             });
         }
         if let Err(error) = self
@@ -196,7 +189,8 @@ impl ControlService {
             .set_interface(interface.clone(), config, false)
             .await
         {
-            let restoration = restore_dhcp_client(supervisor, &interface, previous, link_ready).await;
+            let restoration =
+                restore_dhcp_client(supervisor, &interface, previous, link_ready).await;
             return dhcp_client_error(DhcpClientErrorDetail::PersistenceFailure {
                 message: match restoration {
                     Ok(()) => format!(
@@ -262,9 +256,7 @@ async fn configure_dhcp_client_checked(
     link_ready: bool,
 ) -> Result<()> {
     let interface = spec.interface.clone();
-    supervisor
-        .configure_with_link_ready(spec, link_ready)
-        .await;
+    supervisor.configure_with_link_ready(spec, link_ready).await;
     let status = supervisor
         .status(&interface)
         .await

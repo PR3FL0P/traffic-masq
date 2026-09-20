@@ -88,9 +88,7 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
                     "•••••• (saved; leave blank to keep) ",
                     Style::default().fg(theme::MUTED),
                 ));
-                spans.extend(input::render_masked_with_cursor(
-                    0, 0, true, '•', style,
-                ));
+                spans.extend(input::render_masked_with_cursor(0, 0, true, '•', style));
             } else {
                 spans.extend(input::render_masked_with_cursor(
                     input::grapheme_count(&editor.passphrase),

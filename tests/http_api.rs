@@ -1299,6 +1299,30 @@ async fn vpn_profile_list_import_activate_status_deactivate_over_http() -> Resul
     let admin = ApiClient::new(&config.runtime.socket_path);
     admin.login("correct horse battery").await?;
 
+    assert!(matches!(
+        admin.request(&Request::GetVpnConfig).await?,
+        Response::VpnConfig { enabled: false }
+    ));
+    assert!(matches!(
+        admin.request(&Request::VpnListProfiles).await?,
+        Response::VpnError { .. }
+    ));
+    assert!(matches!(
+        admin
+            .request(&Request::SetVpnEnabled { enabled: true })
+            .await?,
+        Response::VpnConfig { enabled: true }
+    ));
+    let persisted = RuntimeOverrideManager::load(&config.runtime.state_dir, &config).await?;
+    assert!(
+        persisted
+            .snapshot()
+            .await
+            .effective_config(&config)?
+            .vpn
+            .enabled
+    );
+
     match admin.request(&Request::VpnListProfiles).await? {
         Response::VpnProfiles { profiles } => assert!(profiles.is_empty()),
         response => panic!("unexpected response: {response:?}"),
@@ -1354,6 +1378,17 @@ async fn vpn_profile_list_import_activate_status_deactivate_over_http() -> Resul
         response => panic!("unexpected response: {response:?}"),
     }
 
+    assert!(matches!(
+        admin
+            .request(&Request::SetVpnEnabled { enabled: false })
+            .await?,
+        Response::Error { .. }
+    ));
+    assert!(matches!(
+        admin.request(&Request::GetVpnConfig).await?,
+        Response::VpnConfig { enabled: true }
+    ));
+
     match admin.request(&Request::VpnDeactivate).await? {
         Response::VpnDeactivated => {}
         response => panic!("unexpected response: {response:?}"),
@@ -1373,6 +1408,26 @@ async fn vpn_profile_list_import_activate_status_deactivate_over_http() -> Resul
         Response::VpnProfileDeleted { name } => assert_eq!(name, "home.conf"),
         response => panic!("unexpected response: {response:?}"),
     }
+
+    assert!(matches!(
+        admin
+            .request(&Request::SetVpnEnabled { enabled: false })
+            .await?,
+        Response::VpnConfig { enabled: false }
+    ));
+    assert!(matches!(
+        admin.request(&Request::VpnListProfiles).await?,
+        Response::VpnError { .. }
+    ));
+    let persisted = RuntimeOverrideManager::load(&config.runtime.state_dir, &config).await?;
+    assert!(
+        !persisted
+            .snapshot()
+            .await
+            .effective_config(&config)?
+            .vpn
+            .enabled
+    );
 
     shutdown_tx.send(true)?;
     server_task.await??;

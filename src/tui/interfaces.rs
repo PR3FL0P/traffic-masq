@@ -708,6 +708,8 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
         return;
     };
 
+    let mut unmanaged_ip_attempt = false;
+
     match key {
         KeyCode::Esc => app.screen = Screen::InterfaceList,
         KeyCode::Up | KeyCode::Char('k') if editor.field != InterfaceEditorField::Cidr => {
@@ -731,6 +733,8 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
             InterfaceEditorField::RemoveIpv4 => {
                 if editor.managed {
                     editor.remove_ipv4();
+                } else {
+                    unmanaged_ip_attempt = true;
                 }
             }
             InterfaceEditorField::Role => editor.role = next_role(editor.role),
@@ -742,7 +746,23 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
             super::input::TextEditor::new(&mut editor.cidr, cursor)
                 .handle_key_filtered(other, |c| c.is_ascii_digit() || matches!(c, '.' | '/'));
         }
+        KeyCode::Char(c)
+            if editor.field == InterfaceEditorField::Cidr
+                && (c.is_ascii_digit() || matches!(c, '.' | '/')) =>
+        {
+            unmanaged_ip_attempt = true;
+        }
+        KeyCode::Backspace | KeyCode::Delete if editor.field == InterfaceEditorField::Cidr => {
+            unmanaged_ip_attempt = true;
+        }
         _ => {}
+    }
+
+    if unmanaged_ip_attempt {
+        app.push_message(
+            LogLevel::Warn,
+            "IP editing requires managed mode. Enable Configure with traffic-masq first.",
+        );
     }
 }
 
@@ -916,332 +936,7 @@ fn next_role(role: InterfaceRole) -> InterfaceRole {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn default_route_editor(allow_management_change: bool) -> InterfaceEditor {
-        InterfaceEditor {
-            interface: "wlan0".into(),
-            field: InterfaceEditorField::Save,
-            cidr: "192.168.1.10/24".into(),
-            role: InterfaceRole::Output,
-            managed: true,
-            allow_management_change,
-            has_default_route: true,
-            original_managed: true,
-            original_cidr: "192.168.1.10/24".into(),
-            current_addresses: vec!["192.168.1.10/24".into()],
-            observed_addresses: vec![],
-            current_wifi_summary: None,
-            current_dhcp_summary: None,
-            cursor: 0,
-        }
-    }
-
-    fn unmanaged_editor() -> InterfaceEditor {
-        let mut editor = default_route_editor(false);
-        editor.original_managed = false;
-        editor.managed = false;
-        editor
-    }
-
-    #[test]
-    fn managed_output_on_default_route_requires_explicit_confirmation() {
-        let error = default_route_editor(false).edit_request().unwrap_err();
-        assert!(error.to_string().contains("default route"));
-    }
-
-    #[test]
-    fn managed_output_on_default_route_is_allowed_after_confirmation() {
-        assert!(default_route_editor(true).edit_request().is_ok());
-    }
-
-    #[test]
-    fn managed_default_route_cannot_disable_management_without_confirmation() {
-        let mut editor = default_route_editor(false);
-        editor.managed = false;
-        let error = editor.edit_request().unwrap_err();
-        assert!(error.to_string().contains("default route"));
-    }
-
-    #[test]
-    fn managed_input_default_route_requires_confirmation() {
-        let mut editor = default_route_editor(false);
-        editor.role = InterfaceRole::Input;
-        let error = editor.edit_request().unwrap_err();
-        assert!(error.to_string().contains("default route"));
-    }
-
-    #[test]
-    fn unmanaged_interface_rejects_ip_edits_with_a_clear_error() {
-        let mut editor = unmanaged_editor();
-        editor.cidr = "192.168.1.11/24".into();
-        let error = editor.edit_request().unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "cannot change IP while the interface is unmanaged; enable Configure with traffic-masq first"
-        );
-    }
-
-    #[test]
-    fn external_interface_can_change_router_role() {
-        let mut editor = unmanaged_editor();
-        editor.role = InterfaceRole::Input;
-        let request = editor
-            .edit_request()
-            .expect("role is independent of address configuration");
-        assert_eq!(request.role, InterfaceRole::Input);
-        assert!(!request.managed);
-    }
-
-    #[test]
-    fn unmanaged_interface_names_every_field_it_refuses_to_change() {
-        let mut editor = unmanaged_editor();
-        editor.cidr = "192.168.1.11/24".into();
-        editor.role = InterfaceRole::Input;
-        let error = editor.edit_request().unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "cannot change IP while the interface is unmanaged; enable Configure with traffic-masq first"
-        );
-    }
-
-    #[test]
-    fn an_unmanaged_interface_can_still_be_saved_untouched() {
-        // This is how a leftover traffic-masq address gets cleaned up, so it
-        // must not be swallowed by the settings guard.
-        assert!(unmanaged_editor().edit_request().is_ok());
-    }
-
-    #[test]
-    fn turning_management_on_is_not_a_settings_edit() {
-        let mut editor = unmanaged_editor();
-        editor.managed = true;
-        editor.allow_management_change = true;
-        editor.cidr = "192.168.1.11/24".into();
-        assert!(editor.edit_request().is_ok());
-    }
-
-    /// Clearing the field is the removal request, and it has to survive the
-    /// trip to the daemon as an empty CIDR — that is what makes the planner
-    /// take the address off instead of leaving it alone.
-    #[test]
-    fn an_empty_cidr_on_a_managed_interface_asks_for_the_address_to_be_removed() {
-        let mut editor = default_route_editor(true);
-        editor.cidr.clear();
-        let request = editor.edit_request().expect("removal must be a valid edit");
-        assert!(request.cidr.is_empty());
-        assert!(request.managed, "removal keeps the interface managed");
-        assert_eq!(request.role, InterfaceRole::Output);
-    }
-
-    #[test]
-    fn removing_the_ip_of_an_unmanaged_interface_points_at_the_managed_switch() {
-        let mut editor = unmanaged_editor();
-        editor.cidr.clear();
-        let error = editor.edit_request().unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "cannot remove the IP while the interface is unmanaged; enable Configure with traffic-masq so traffic-masq may take the address off"
-        );
-    }
-
-    #[test]
-    fn the_remove_row_clears_the_cidr_field() {
-        let mut editor = default_route_editor(true);
-        editor.remove_ipv4();
-        assert!(editor.cidr.is_empty());
-        assert_eq!(
-            editor.current_addresses,
-            vec!["192.168.1.10/24".to_string()],
-            "the address that is about to go is still reported"
-        );
-    }
-
-    #[test]
-    fn interface_editor_field_reaches_save_and_clamps_at_both_ends() {
-        for pair in INTERFACE_EDITOR_FIELDS.windows(2) {
-            assert_eq!(next_editor_field(pair[0]), pair[1]);
-            assert_eq!(previous_editor_field(pair[1]), pair[0]);
-        }
-        assert_eq!(
-            previous_editor_field(InterfaceEditorField::Cidr),
-            InterfaceEditorField::Cidr
-        );
-        assert_eq!(
-            next_editor_field(InterfaceEditorField::Save),
-            InterfaceEditorField::Save
-        );
-    }
-
-    #[test]
-    fn next_role_cycles_through_all_three_variants_without_repeating() {
-        let start = InterfaceRole::None;
-        let mut role = start;
-        let mut seen = Vec::new();
-        for _ in 0..3 {
-            seen.push(role);
-            role = next_role(role);
-        }
-        assert_eq!(role, start, "cycle must return to the starting role");
-        seen.sort_by_key(|role| format!("{role:?}"));
-        seen.dedup();
-        assert_eq!(seen.len(), 3, "all three roles must be distinct");
-    }
-
-    #[tokio::test]
-    async fn interface_editor_cursor_navigation_and_editing() {
-        let mut app = TuiApp {
-            screen: Screen::InterfaceEditor,
-            ..Default::default()
-        };
-        let mut editor = default_route_editor(true);
-        editor.field = InterfaceEditorField::Cidr;
-        editor.cidr = "192.168.1.1/24".into();
-        editor.cursor = editor.cidr.len();
-        app.editor = Some(editor);
-        let client = ApiClient::new("/socket-that-must-not-be-opened");
-
-        handle_editor_key(&mut app, KeyCode::Left, &client).await;
-        assert_eq!(app.editor.as_ref().unwrap().cursor, 13);
-
-        handle_editor_key(&mut app, KeyCode::Char('0'), &client).await;
-        assert_eq!(app.editor.as_ref().unwrap().cidr, "192.168.1.1/204");
-        assert_eq!(app.editor.as_ref().unwrap().cursor, 14);
-
-        handle_editor_key(&mut app, KeyCode::Backspace, &client).await;
-        assert_eq!(app.editor.as_ref().unwrap().cidr, "192.168.1.1/24");
-        assert_eq!(app.editor.as_ref().unwrap().cursor, 13);
-
-        handle_editor_key(&mut app, KeyCode::Home, &client).await;
-        assert_eq!(app.editor.as_ref().unwrap().cursor, 0);
-
-        handle_editor_key(&mut app, KeyCode::Delete, &client).await;
-        assert_eq!(app.editor.as_ref().unwrap().cidr, "92.168.1.1/24");
-        assert_eq!(app.editor.as_ref().unwrap().cursor, 0);
-    }
-}
+mod tests;
 
 #[cfg(test)]
-mod rendering_tests {
-    use super::*;
-    use crate::api::model::InterfaceStatus;
-    use crate::netlink::{Ipv4AddressInfo, NetworkInterface};
-    use ratatui::{backend::TestBackend, Terminal};
-
-    fn status(index: u32) -> InterfaceStatus {
-        InterfaceStatus {
-            interface: NetworkInterface {
-                index,
-                name: format!("eth{index}"),
-                is_up: true,
-                rx_bytes: 0,
-                tx_bytes: 0,
-                is_wireless: false,
-            },
-            ipv4_addresses: vec![],
-            owned_ipv4_addresses: None,
-            has_default_route: false,
-        }
-    }
-
-    #[test]
-    fn mixed_addresses_have_individual_ownership_colors() {
-        let mut status = status(1);
-        let address = |last, protocol| Ipv4AddressInfo {
-            interface_index: 1,
-            address: std::net::Ipv4Addr::new(192, 0, 2, last),
-            prefix_len: 24,
-            protocol,
-        };
-        // Journal-owned address without a kernel tag, our DHCP, foreign and untagged.
-        status.ipv4_addresses = vec![
-            address(1, None),
-            address(2, Some(202)),
-            address(3, Some(16)),
-            address(4, None),
-        ];
-        status.owned_ipv4_addresses = Some(status.ipv4_addresses[..2].to_vec());
-        let spans = format_addresses(&status);
-        assert_eq!(spans[0].content, "192.0.2.1/24");
-        assert_eq!(spans[2].content, "192.0.2.2/24");
-        for index in [4, 6] {
-            assert!(spans[index].content.starts_with("[ext] "));
-            assert_eq!(spans[index].style.fg, Some(theme::WARN));
-        }
-        status.owned_ipv4_addresses = None;
-        let spans = format_addresses(&status);
-        assert!(spans[0].content.starts_with("[?] "));
-        assert_eq!(spans[0].style.fg, Some(theme::WARN));
-        assert!(!spans[2].content.starts_with('['));
-        assert!(spans[4].content.starts_with("[ext] "));
-    }
-
-    #[test]
-    fn interface_list_keeps_selected_row_visible_and_click_offset_correct() {
-        let mut app = TuiApp::default();
-        app.dashboard.interfaces = (0..20).map(status).collect();
-        app.selected_interface = 19;
-        let mut terminal = Terminal::new(TestBackend::new(80, 6)).unwrap();
-        terminal
-            .draw(|frame| render_interface_list(frame, frame.area(), &mut app))
-            .unwrap();
-        assert_eq!(app.ui.list_scroll_offset, 16);
-        let buffer = terminal.backend().buffer();
-        let last_row: String = (0..80).map(|x| buffer[(x, 4)].symbol()).collect();
-        assert!(last_row.contains("eth19"));
-    }
-
-    #[test]
-    fn preview_buttons_are_visible_and_cancel_has_a_click_target() {
-        let mut app = TuiApp {
-            preview: Some(crate::core::interface::InterfaceChangePlan {
-                interface: "eth0".into(),
-                delete_ipv4: vec![],
-                retag_ipv4: None,
-                add_ipv4: None,
-                set_link_up: false,
-                management_change: false,
-                dhcp_action: crate::core::interface::DhcpChangeAction::Unchanged,
-                releasing_management: false,
-            }),
-            preview_scroll: usize::MAX,
-            ..Default::default()
-        };
-        let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
-        terminal
-            .draw(|frame| render_preview(frame, frame.area(), &mut app))
-            .unwrap();
-        let (rect, _) = app
-            .ui
-            .buttons
-            .iter()
-            .find(|(_, slot)| *slot == 1)
-            .expect("Cancel click target");
-        assert!(rect.y < 7);
-        let buffer = terminal.backend().buffer();
-        let row: String = (0..80).map(|x| buffer[(x, rect.y)].symbol()).collect();
-        assert!(row.contains("Cancel"));
-    }
-
-    #[tokio::test]
-    async fn interface_plan_requires_reaching_the_end_before_apply() {
-        let mut app = TuiApp {
-            screen: Screen::Preview,
-            preview_max_scroll: 7,
-            ..Default::default()
-        };
-        let client = ApiClient::new("/socket-that-must-not-be-opened");
-
-        handle_preview_key(&mut app, KeyCode::Enter, &client).await;
-        assert!(app
-            .message
-            .as_deref()
-            .is_some_and(|message| message.contains("Review the complete interface plan")));
-
-        handle_preview_key(&mut app, KeyCode::PageDown, &client).await;
-        assert_eq!(app.preview_scroll, 7);
-        handle_preview_key(&mut app, KeyCode::Up, &client).await;
-        assert_eq!(app.preview_scroll, 6);
-    }
-}
+mod rendering_tests;

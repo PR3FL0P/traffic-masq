@@ -19,9 +19,9 @@ mod support;
 
 use support::wifi::{
     command_path, ensure_child_running, interface_phy, interfaces_on_phy, output_ns, output_text,
-    path_str, pid_alive, read_pid_file, redact_ssid, refuse_management_uplink, run, run_ns, spawn_ns,
-    stop_child, stop_child_blocking, stop_pid_blocking, unique_suffix, validate_interface,
-    validate_psk_file,
+    path_str, pid_alive, read_pid_file, redact_ssid, refuse_management_uplink, run, run_ns,
+    spawn_ns, stop_child, stop_child_blocking, stop_pid_blocking, unique_suffix,
+    validate_interface, validate_psk_file,
 };
 
 static PHYSICAL_WIFI_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

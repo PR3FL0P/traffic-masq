@@ -4,9 +4,9 @@ mod dhcp_client;
 mod dispatch;
 mod interfaces;
 mod provisioning;
+mod router;
 mod runtime;
 mod settings;
-mod router;
 mod vpn;
 mod wifi;
 mod wifi_autoconnect;
@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tokio::sync::{Mutex};
+use tokio::sync::Mutex;
 
 use crate::api::model::{
     ApiHttpsSettings, DhcpClientConfigRequest, DhcpClientErrorDetail, DhcpClientOperationalState,
@@ -250,11 +250,13 @@ impl ControlService {
         self.transactions.clone()
     }
 
-
+    /// Close operation admission and wait for accepted requests before runtime shutdown.
     pub async fn finish_operations(&self) {
         self.operations.close().await;
     }
 
+    /// Execute a control request through the tracked operation service so caller cancellation
+    /// does not interrupt an accepted network mutation.
     pub async fn dispatch(&self, request: Request) -> Response {
         let service = self.clone();
         match self

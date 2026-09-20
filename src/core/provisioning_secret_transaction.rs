@@ -46,10 +46,7 @@ impl ProvisioningSecretTransactionStore {
         }
     }
 
-    pub async fn stage(
-        &self,
-        previous: BTreeMap<String, Option<WifiPassphrase>>,
-    ) -> Result<()> {
+    pub async fn stage(&self, previous: BTreeMap<String, Option<WifiPassphrase>>) -> Result<()> {
         if previous.is_empty() {
             return Ok(());
         }
@@ -59,9 +56,7 @@ impl ProvisioningSecretTransactionStore {
 
         let previous = previous
             .into_iter()
-            .map(|(interface, secret)| {
-                (interface, secret.map(|secret| secret.expose().to_owned()))
-            })
+            .map(|(interface, secret)| (interface, secret.map(|secret| secret.expose().to_owned())))
             .collect();
         self.save(&ProvisioningSecretJournal {
             version: JOURNAL_VERSION,
@@ -84,9 +79,7 @@ impl ProvisioningSecretTransactionStore {
         let Some(journal) = self.load().await? else {
             return Ok(false);
         };
-        if journal.token.as_deref().is_some()
-            && journal.token.as_deref() == committed_token
-        {
+        if journal.token.as_deref().is_some() && journal.token.as_deref() == committed_token {
             self.clear().await?;
             return Ok(false);
         }
@@ -99,9 +92,9 @@ impl ProvisioningSecretTransactionStore {
         };
         match journal.token.as_deref() {
             Some(existing) if existing == token => return Ok(()),
-            Some(existing) => bail!(
-                "provisioning secret journal belongs to transaction {existing}, not {token}"
-            ),
+            Some(existing) => {
+                bail!("provisioning secret journal belongs to transaction {existing}, not {token}")
+            }
             None => {}
         }
         journal.token = Some(token.to_owned());
@@ -113,7 +106,9 @@ impl ProvisioningSecretTransactionStore {
             return Ok(false);
         };
         if journal.token.is_some() {
-            bail!("refusing to restore a token-bound provisioning secret journal without its token");
+            bail!(
+                "refusing to restore a token-bound provisioning secret journal without its token"
+            );
         }
         self.restore_and_clear(journal).await?;
         Ok(true)
@@ -128,7 +123,9 @@ impl ProvisioningSecretTransactionStore {
             return Ok(false);
         };
         if journal.token.is_some() {
-            bail!("refusing to restore a token-bound provisioning secret journal without its token");
+            bail!(
+                "refusing to restore a token-bound provisioning secret journal without its token"
+            );
         }
         self.restore_only(&journal).await?;
         Ok(true)
@@ -153,7 +150,11 @@ impl ProvisioningSecretTransactionStore {
         let Some(journal) = self.load().await? else {
             return Ok(false);
         };
-        if journal.token.as_deref().is_some_and(|existing| existing != token) {
+        if journal
+            .token
+            .as_deref()
+            .is_some_and(|existing| existing != token)
+        {
             bail!("provisioning secret journal does not belong to transaction {token}");
         }
         self.restore_and_clear(journal).await?;
@@ -170,7 +171,11 @@ impl ProvisioningSecretTransactionStore {
         let Some(journal) = self.load().await? else {
             return Ok(false);
         };
-        if journal.token.as_deref().is_some_and(|existing| existing != token) {
+        if journal
+            .token
+            .as_deref()
+            .is_some_and(|existing| existing != token)
+        {
             bail!("provisioning secret journal does not belong to transaction {token}");
         }
         self.restore_only(&journal).await?;
@@ -199,9 +204,7 @@ impl ProvisioningSecretTransactionStore {
         let Some(journal) = self.load().await? else {
             return Ok(false);
         };
-        if journal.token.as_deref().is_some()
-            && journal.token.as_deref() == committed_token
-        {
+        if journal.token.as_deref().is_some() && journal.token.as_deref() == committed_token {
             self.clear().await?;
             return Ok(false);
         }
@@ -221,7 +224,9 @@ impl ProvisioningSecretTransactionStore {
                 Some(raw) => match WifiPassphrase::new(raw.clone()) {
                     Ok(secret) => self.passphrases.set(interface, &secret),
                     Err(error) => {
-                        failures.push(format!("{interface}: invalid journaled passphrase: {error}"));
+                        failures.push(format!(
+                            "{interface}: invalid journaled passphrase: {error}"
+                        ));
                         continue;
                     }
                 },
@@ -266,7 +271,10 @@ impl ProvisioningSecretTransactionStore {
             .parent()
             .context("provisioning secret journal path has no parent")?;
         atomic_file::ensure_private_dir(parent, PRIVATE_DIR_MODE).with_context(|| {
-            format!("failed to secure provisioning state directory {}", parent.display())
+            format!(
+                "failed to secure provisioning state directory {}",
+                parent.display()
+            )
         })?;
         atomic_file::reject_symlink(&self.journal).with_context(|| {
             format!(
@@ -286,12 +294,13 @@ impl ProvisioningSecretTransactionStore {
                 })
             }
         });
-        let journal: ProvisioningSecretJournal = serde_json::from_slice(&bytes).with_context(|| {
-            format!(
-                "failed to parse provisioning secret journal {}",
-                self.journal.display()
-            )
-        })?;
+        let journal: ProvisioningSecretJournal =
+            serde_json::from_slice(&bytes).with_context(|| {
+                format!(
+                    "failed to parse provisioning secret journal {}",
+                    self.journal.display()
+                )
+            })?;
         if journal.version != JOURNAL_VERSION {
             bail!(
                 "unsupported provisioning secret journal version {} in {}",
@@ -308,7 +317,10 @@ impl ProvisioningSecretTransactionStore {
             .parent()
             .context("provisioning secret journal path has no parent")?;
         atomic_file::ensure_private_dir(parent, PRIVATE_DIR_MODE).with_context(|| {
-            format!("failed to secure provisioning state directory {}", parent.display())
+            format!(
+                "failed to secure provisioning state directory {}",
+                parent.display()
+            )
         })?;
         let mut bytes = Zeroizing::new(serde_json::to_vec_pretty(journal)?);
         bytes.push(b'\n');
@@ -328,7 +340,10 @@ impl ProvisioningSecretTransactionStore {
             .parent()
             .context("provisioning secret journal path has no parent")?;
         atomic_file::ensure_private_dir(parent, PRIVATE_DIR_MODE).with_context(|| {
-            format!("failed to secure provisioning state directory {}", parent.display())
+            format!(
+                "failed to secure provisioning state directory {}",
+                parent.display()
+            )
         })?;
         atomic_file::remove_preserving_on_error_async(&self.journal, PRIVATE_FILE_MODE)
             .await
@@ -343,98 +358,4 @@ impl ProvisioningSecretTransactionStore {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn uncommitted_journal_restores_prior_secret() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
-        let passphrases = PassphraseStore::new(temp.path().join("wifi/psk"));
-        let old = WifiPassphrase::new("old-password").expect("old");
-        let new = WifiPassphrase::new("new-password").expect("new");
-        passphrases.set("wlan0", &old).expect("old write");
-        store
-            .stage(BTreeMap::from([("wlan0".to_owned(), Some(old))]))
-            .await
-            .expect("stage");
-        passphrases.set("wlan0", &new).expect("new write");
-        store.bind_token("token").await.expect("bind");
-
-        assert!(store.recover(Some("different-token")).await.expect("recover"));
-        assert_eq!(
-            passphrases
-                .get("wlan0")
-                .expect("read")
-                .expect("secret")
-                .expose(),
-            "old-password"
-        );
-    }
-
-    #[tokio::test]
-    async fn committed_journal_keeps_new_secret() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
-        let passphrases = PassphraseStore::new(temp.path().join("wifi/psk"));
-        let old = WifiPassphrase::new("old-password").expect("old");
-        let new = WifiPassphrase::new("new-password").expect("new");
-        store
-            .stage(BTreeMap::from([("wlan0".to_owned(), Some(old))]))
-            .await
-            .expect("stage");
-        passphrases.set("wlan0", &new).expect("new write");
-        store.bind_token("token").await.expect("bind");
-
-        assert!(!store.recover(Some("token")).await.expect("recover"));
-        assert_eq!(
-            passphrases
-                .get("wlan0")
-                .expect("read")
-                .expect("secret")
-                .expose(),
-            "new-password"
-        );
-    }
-
-    #[tokio::test]
-    async fn reconvergence_restore_keeps_journal_until_explicit_completion() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
-        let passphrases = PassphraseStore::new(temp.path().join("wifi/psk"));
-        let old = WifiPassphrase::new("old-password").expect("old");
-        let new = WifiPassphrase::new("new-password").expect("new");
-        store
-            .stage(BTreeMap::from([("wlan0".to_owned(), Some(old))]))
-            .await
-            .expect("stage");
-        passphrases.set("wlan0", &new).expect("new write");
-
-        assert!(store
-            .restore_staged_for_reconvergence()
-            .await
-            .expect("restore"));
-        assert_eq!(
-            passphrases
-                .get("wlan0")
-                .expect("read")
-                .expect("secret")
-                .expose(),
-            "old-password"
-        );
-        assert!(store
-            .unresolved_after_committed_cleanup(None)
-            .await
-            .expect("journal must remain"));
-
-        store
-            .complete_reconvergence()
-            .await
-            .expect("complete recovery");
-        assert!(!store
-            .unresolved_after_committed_cleanup(None)
-            .await
-            .expect("journal cleared"));
-    }
-
-}
+mod tests;

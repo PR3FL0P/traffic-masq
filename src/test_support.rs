@@ -17,7 +17,6 @@ use crate::vpn::wireguard::{WireGuardKey, WireGuardPeerConfig};
 use crate::vpn::{ProviderError, VpnProvider};
 use crate::wifi::process::{ProcessError, SupervisedProcess};
 
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum FakeProcessCall {
     Spawn(PathBuf),
@@ -553,8 +552,7 @@ impl VpnProvider for FakeVpnProvider {
     }
 }
 
-const STATIC_TEST_VPN_PUBLIC_KEY: &str =
-    "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=";
+const STATIC_TEST_VPN_PUBLIC_KEY: &str = "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=";
 
 /// Minimal WireGuard provider for tests that only care about link lifecycle.
 pub(crate) struct StaticKeyVpnProvider {
@@ -674,6 +672,12 @@ impl VpnProvider for StaticKeyVpnProvider {
     }
 
     async fn is_up(&self, name: &str) -> Result<bool, ProviderError> {
-        Ok(self.links.lock().unwrap().get(name).copied().unwrap_or(false))
+        Ok(self
+            .links
+            .lock()
+            .unwrap()
+            .get(name)
+            .copied()
+            .unwrap_or(false))
     }
 }

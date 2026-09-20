@@ -6,9 +6,9 @@ use async_trait::async_trait;
 
 use crate::netlink::NetworkInterface;
 
-use super::*;
 use super::dhcp::*;
 use super::interfaces::*;
+use super::*;
 
 #[test]
 fn default_ap_dhcp_pool_uses_larger_side_of_router_in_24() {
@@ -792,19 +792,16 @@ async fn router_service_with_config(
         .await
         .expect("overrides");
     let manager = crate::core::router::RouterManager::new(fake);
-    let coordinator = RouterTransactionCoordinator::new(
-        manager,
-        overrides.clone(),
-        Duration::from_millis(200),
-    );
+    let coordinator =
+        RouterTransactionCoordinator::new(manager, overrides.clone(), Duration::from_millis(200));
     let dhcp = DhcpSupervisor::start(&config)
         .await
         .expect("dhcp supervisor");
     let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
         addresses: Vec::new(),
     });
-    let service = ControlService::new(config, network, dhcp, overrides)
-        .with_router_coordinator(coordinator);
+    let service =
+        ControlService::new(config, network, dhcp, overrides).with_router_coordinator(coordinator);
     (service, directory)
 }
 
@@ -1155,7 +1152,8 @@ async fn vpn_enabled_service_with_provider(
     provider: FakeVpnProvider,
 ) -> (ControlService, tempfile::TempDir) {
     let directory = tempdir().expect("tempdir");
-    let config = router_base_config();
+    let mut config = router_base_config();
+    config.vpn.enabled = true;
     let overrides = RuntimeOverrideManager::load(directory.path(), &config)
         .await
         .expect("overrides");
@@ -1574,8 +1572,7 @@ async fn vpn_policy_fixture_with_router_chain(
         .expect("dhcp supervisor");
     let network = FakePolicyNetwork::with_owned_interface();
 
-    let vpn_store =
-        crate::vpn::WireGuardProfileStore::new(config.vpn.wireguard_config_dir.clone());
+    let vpn_store = crate::vpn::WireGuardProfileStore::new(config.vpn.wireguard_config_dir.clone());
     let active_profile_store =
         crate::vpn::ActiveProfileStore::new(directory.path().join("active-profile.json"));
     let provider: Arc<dyn crate::vpn::VpnProvider> = Arc::new(FakeVpnProvider::default());
@@ -1906,7 +1903,9 @@ impl FakeWifiHostapd {
                 let reply = if command == "PING" {
                     "PONG\n".to_string()
                 } else if command == "STATUS" {
-                    format!("state=ENABLED\nssid[0]={ssid}\nbssid[0]=02:00:00:00:00:00\nnum_sta[0]=0\n")
+                    format!(
+                        "state=ENABLED\nssid[0]={ssid}\nbssid[0]=02:00:00:00:00:00\nnum_sta[0]=0\n"
+                    )
                 } else if command == "RELOAD" {
                     ssid = read_ssid(&config_path);
                     "OK\n".to_string()
@@ -2101,8 +2100,7 @@ async fn wifi_enabled_fixture() -> WifiFixture {
         .await
         .expect("wifi supervisor");
     configure_wlan0(&wifi, &config).await;
-    let service =
-        ControlService::new(config, network, dhcp, overrides).with_wifi_supervisor(wifi);
+    let service = ControlService::new(config, network, dhcp, overrides).with_wifi_supervisor(wifi);
     WifiFixture {
         service,
         process,
@@ -2248,8 +2246,7 @@ async fn get_wifi_config_reports_none_for_an_interface_without_a_wifi_block() {
     let wifi = WifiSupervisor::start_with_process(&config, process)
         .await
         .expect("wifi supervisor");
-    let service =
-        ControlService::new(config, network, dhcp, overrides).with_wifi_supervisor(wifi);
+    let service = ControlService::new(config, network, dhcp, overrides).with_wifi_supervisor(wifi);
     let _ = &mut fixture_directory;
 
     match service
@@ -2511,8 +2508,7 @@ async fn wifi_set_passphrase_applies_live_via_reload() {
         )
         .unwrap();
     configure_wlan0(&wifi, &config).await;
-    let service =
-        ControlService::new(config, network, dhcp, overrides).with_wifi_supervisor(wifi);
+    let service = ControlService::new(config, network, dhcp, overrides).with_wifi_supervisor(wifi);
 
     match service
         .dispatch(Request::WifiSetPassphrase {
@@ -2585,8 +2581,7 @@ async fn wifi_configured_response_never_serializes_the_passphrase_that_was_just_
         .await
         .expect("wifi supervisor");
     configure_wlan0(&wifi, &config).await;
-    let service =
-        ControlService::new(config, network, dhcp, overrides).with_wifi_supervisor(wifi);
+    let service = ControlService::new(config, network, dhcp, overrides).with_wifi_supervisor(wifi);
 
     let secret = "super secret passphrase, must never leak";
     let response = service
@@ -2698,8 +2693,7 @@ impl FakeSupplicant {
                         {
                             use std::os::linux::net::SocketAddrExt;
                             if let Some(name) = from.as_abstract_name() {
-                                attached
-                                    .retain(|address| address.as_abstract_name() != Some(name));
+                                attached.retain(|address| address.as_abstract_name() != Some(name));
                             }
                         }
                         "OK\n".to_string()
@@ -3546,10 +3540,9 @@ async fn configuring_a_client_on_an_output_interface_is_an_invalid_spec() {
     let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
         addresses: Vec::new(),
     });
-    let wifi_client =
-        ClientSupervisor::start_with_process(&config, FakeSupplicantProcess::new())
-            .await
-            .expect("wifi client supervisor");
+    let wifi_client = ClientSupervisor::start_with_process(&config, FakeSupplicantProcess::new())
+        .await
+        .expect("wifi client supervisor");
     let service = ControlService::new(config, network, dhcp, overrides)
         .with_wifi_client_supervisor(wifi_client);
 
@@ -3718,16 +3711,12 @@ async fn wifi_client_scan_rejects_non_wireless_interface() {
     let dhcp = DhcpSupervisor::start(&config)
         .await
         .expect("dhcp supervisor");
-    let network: Arc<dyn NetworkProvider> =
-        Arc::new(ProvisioningNetwork::with_wireless(&["wlan1"]).with_address(
-            "eth0",
-            [192, 168, 1, 1],
-            24,
-        ));
-    let wifi_client =
-        ClientSupervisor::start_with_process(&config, FakeSupplicantProcess::new())
-            .await
-            .expect("wifi client supervisor");
+    let network: Arc<dyn NetworkProvider> = Arc::new(
+        ProvisioningNetwork::with_wireless(&["wlan1"]).with_address("eth0", [192, 168, 1, 1], 24),
+    );
+    let wifi_client = ClientSupervisor::start_with_process(&config, FakeSupplicantProcess::new())
+        .await
+        .expect("wifi client supervisor");
     let service = ControlService::new(config, network, dhcp, overrides)
         .with_wifi_client_supervisor(wifi_client);
 
@@ -3759,10 +3748,9 @@ async fn wifi_client_scan_rejects_missing_interface_when_network_known() {
         .expect("dhcp supervisor");
     let network: Arc<dyn NetworkProvider> =
         Arc::new(ProvisioningNetwork::with_wireless(&["wlan1"]));
-    let wifi_client =
-        ClientSupervisor::start_with_process(&config, FakeSupplicantProcess::new())
-            .await
-            .expect("wifi client supervisor");
+    let wifi_client = ClientSupervisor::start_with_process(&config, FakeSupplicantProcess::new())
+        .await
+        .expect("wifi client supervisor");
     let service = ControlService::new(config, network, dhcp, overrides)
         .with_wifi_client_supervisor(wifi_client);
 
@@ -3959,9 +3947,7 @@ async fn dhcp_client_control_delete_cleans_runtime_and_persists_disabled_intent(
             interface: "wan0".into(),
         })
         .await;
-    assert!(
-        matches!(response, Response::DhcpClientDisabled { interface } if interface == "wan0")
-    );
+    assert!(matches!(response, Response::DhcpClientDisabled { interface } if interface == "wan0"));
     assert!(fixture.supervisor.spec("wan0").await.is_none());
     let persisted = fixture
         .overrides
@@ -4053,10 +4039,9 @@ async fn disabling_wifi_client_also_cleans_up_and_disables_active_dhcp_client() 
     let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
         addresses: Vec::new(),
     });
-    let wifi_client =
-        ClientSupervisor::start_with_process(&config, FakeSupplicantProcess::new())
-            .await
-            .expect("wifi client supervisor");
+    let wifi_client = ClientSupervisor::start_with_process(&config, FakeSupplicantProcess::new())
+        .await
+        .expect("wifi client supervisor");
     let wifi_spec = WifiClientSpec::from_interface_config("wlan1", &wlan1_cfg)
         .expect("valid")
         .expect("wifi_client declared on wlan1");
@@ -4172,10 +4157,9 @@ async fn disabling_wifi_client_restores_dhcp_and_wifi_if_persistence_fails() {
     let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
         addresses: Vec::new(),
     });
-    let wifi_client =
-        ClientSupervisor::start_with_process(&config, FakeSupplicantProcess::new())
-            .await
-            .expect("wifi client supervisor");
+    let wifi_client = ClientSupervisor::start_with_process(&config, FakeSupplicantProcess::new())
+        .await
+        .expect("wifi client supervisor");
     let wifi_spec = WifiClientSpec::from_interface_config("wlan1", &wlan1_cfg)
         .expect("valid")
         .expect("wifi_client declared on wlan1");
@@ -4248,10 +4232,9 @@ async fn disabling_wifi_client_fails_and_restores_state_if_dhcp_disable_fails() 
     let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
         addresses: Vec::new(),
     });
-    let wifi_client =
-        ClientSupervisor::start_with_process(&config, FakeSupplicantProcess::new())
-            .await
-            .expect("wifi client supervisor");
+    let wifi_client = ClientSupervisor::start_with_process(&config, FakeSupplicantProcess::new())
+        .await
+        .expect("wifi client supervisor");
     let wifi_spec = WifiClientSpec::from_interface_config("wlan1", &wlan1_cfg)
         .expect("valid")
         .expect("wifi_client declared on wlan1");
@@ -4269,9 +4252,8 @@ async fn disabling_wifi_client_fails_and_restores_state_if_dhcp_disable_fails() 
     dhcp_client.configure(dhcp_spec).await;
     assert!(dhcp_client.spec("wlan1").await.is_some());
 
-    let store =
-        crate::dhcp::client::store::DhcpClientLeaseStore::new(&config.runtime.state_dir)
-            .expect("store");
+    let store = crate::dhcp::client::store::DhcpClientLeaseStore::new(&config.runtime.state_dir)
+        .expect("store");
     let lease = crate::dhcp::client::lease::DhcpClientLease {
         schema_version: crate::dhcp::client::lease::DHCP_CLIENT_LEASE_SCHEMA_VERSION,
         state: crate::dhcp::client::lease::DhcpClientLeaseState::Bound,
@@ -4359,10 +4341,7 @@ impl RouterSubsystems for FakeProvisioningSubsystems {
             })
             .collect())
     }
-    async fn plan_output_wifi(
-        &self,
-        desired: &RouterDesired,
-    ) -> Result<Vec<WifiPlan<WifiApSpec>>> {
+    async fn plan_output_wifi(&self, desired: &RouterDesired) -> Result<Vec<WifiPlan<WifiApSpec>>> {
         Ok(desired
             .output_wifi
             .iter()
@@ -5446,7 +5425,10 @@ async fn default_route_guard_fails_closed_when_routes_cannot_be_observed() {
         .await
         .expect_err("route observation failure must not bypass the safety guard");
     let message = format!("{error:#}");
-    assert!(message.contains("failed to inspect IPv4 routes"), "{message}");
+    assert!(
+        message.contains("failed to inspect IPv4 routes"),
+        "{message}"
+    );
     assert!(message.contains("injected route dump failure"), "{message}");
 }
 

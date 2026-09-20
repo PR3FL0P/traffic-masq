@@ -20,6 +20,7 @@ pub(crate) struct VpnData {
     pub(crate) selected_profile: usize,
     pub(crate) error: Option<VpnErrorDetail>,
     pub(crate) focus: VpnFocus,
+    pub(crate) enabled: Option<bool>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -32,15 +33,17 @@ pub(crate) enum VpnFocus {
     Delete,
     Policy,
     Refresh,
+    ToggleEnabled,
 }
 
-const VPN_ACTION_FOCUS: [VpnFocus; 6] = [
+const VPN_ACTION_FOCUS: [VpnFocus; 7] = [
     VpnFocus::Connect,
     VpnFocus::Disconnect,
     VpnFocus::Import,
     VpnFocus::Delete,
     VpnFocus::Policy,
     VpnFocus::Refresh,
+    VpnFocus::ToggleEnabled,
 ];
 
 fn next_vpn_action_focus(focus: VpnFocus) -> VpnFocus {
@@ -97,10 +100,21 @@ impl VpnImportEditor {
 pub(crate) fn render_vpn(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Min(3)])
+        .constraints([Constraint::Length(5), Constraint::Min(3)])
         .split(area);
 
-    let mut status_lines = Vec::new();
+    let mut status_lines = vec![Line::styled(
+        match app.vpn.enabled {
+            Some(true) => "VPN: enabled",
+            Some(false) => "VPN: disabled — press e to enable",
+            None => "VPN: status unavailable",
+        },
+        Style::default().fg(if app.vpn.enabled == Some(true) {
+            theme::GOOD
+        } else {
+            theme::WARN
+        }),
+    )];
     match &app.vpn.active {
         Some(active) => status_lines.push(Line::styled(
             format!(
@@ -133,7 +147,7 @@ pub(crate) fn render_vpn(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
 
     let profile_and_actions = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(6)])
+        .constraints([Constraint::Min(1), Constraint::Length(7)])
         .split(inner);
     let list_area = profile_and_actions[0];
     let actions_area = profile_and_actions[1];
@@ -203,6 +217,14 @@ pub(crate) fn render_vpn(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
         (VPN_DELETE_LABEL, VpnFocus::Delete),
         (VPN_POLICY_LABEL, VpnFocus::Policy),
         (VPN_REFRESH_LABEL, VpnFocus::Refresh),
+        (
+            if app.vpn.enabled == Some(true) {
+                "Disable VPN: e"
+            } else {
+                "Enable VPN: e"
+            },
+            VpnFocus::ToggleEnabled,
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -307,6 +329,7 @@ pub(crate) async fn handle_vpn_key(app: &mut TuiApp, key: KeyCode, client: &ApiC
         _ => key,
     };
     match key {
+        KeyCode::Char('e') => toggle_vpn_enabled(app, client).await,
         KeyCode::Tab | KeyCode::BackTab => {
             let fields = [
                 VpnFocus::List,
@@ -316,9 +339,9 @@ pub(crate) async fn handle_vpn_key(app: &mut TuiApp, key: KeyCode, client: &ApiC
                 VpnFocus::Delete,
                 VpnFocus::Policy,
                 VpnFocus::Refresh,
+                VpnFocus::ToggleEnabled,
             ];
-            app.vpn.focus =
-                super::input::move_wrapped(&fields, app.vpn.focus, key == KeyCode::Tab);
+            app.vpn.focus = super::input::move_wrapped(&fields, app.vpn.focus, key == KeyCode::Tab);
         }
         KeyCode::Esc if app.vpn.focus != VpnFocus::List => {
             app.vpn.focus = VpnFocus::List;
@@ -354,8 +377,40 @@ pub(crate) async fn handle_vpn_key(app: &mut TuiApp, key: KeyCode, client: &ApiC
             VpnFocus::Delete => vpn_delete_selected(app, client).await,
             VpnFocus::Policy => open_vpn_policy(app, client).await,
             VpnFocus::Refresh => load_vpn_data(app, client).await,
+            VpnFocus::ToggleEnabled => toggle_vpn_enabled(app, client).await,
         },
         _ => {}
+    }
+}
+
+async fn toggle_vpn_enabled(app: &mut TuiApp, client: &ApiClient) {
+    let Some(enabled) = app.vpn.enabled else {
+        load_vpn_data(app, client).await;
+        app.push_message(LogLevel::Warn, "Refresh VPN status before changing it");
+        return;
+    };
+    match client
+        .request(&Request::SetVpnEnabled { enabled: !enabled })
+        .await
+    {
+        Ok(Response::VpnConfig { enabled }) => {
+            app.vpn.enabled = Some(enabled);
+            app.push_message(
+                LogLevel::Info,
+                if enabled {
+                    "VPN enabled and saved"
+                } else {
+                    "VPN disabled and saved"
+                },
+            );
+            load_vpn_data(app, client).await;
+        }
+        Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
+        Ok(response) => app.push_message(
+            LogLevel::Error,
+            format!("Unexpected response: {response:?}"),
+        ),
+        Err(error) => app.push_message(LogLevel::Error, error.to_string()),
     }
 }
 
@@ -405,6 +460,32 @@ fn toggle_vpn_import_field(field: VpnImportField) -> VpnImportField {
 
 pub(crate) async fn load_vpn_data(app: &mut TuiApp, client: &ApiClient) {
     app.vpn.error = None;
+    app.vpn.enabled = None;
+    match client.request(&Request::GetVpnConfig).await {
+        Ok(Response::VpnConfig { enabled }) => {
+            app.vpn.enabled = Some(enabled);
+            if !enabled {
+                app.vpn.profiles.clear();
+                app.vpn.active = None;
+                return;
+            }
+        }
+        Ok(Response::Error { message }) => {
+            app.push_message(LogLevel::Error, message);
+            return;
+        }
+        Ok(response) => {
+            app.push_message(
+                LogLevel::Error,
+                format!("Unexpected response: {response:?}"),
+            );
+            return;
+        }
+        Err(error) => {
+            app.push_message(LogLevel::Error, error.to_string());
+            return;
+        }
+    }
 
     match client.request(&Request::VpnListProfiles).await {
         Ok(Response::VpnProfiles { profiles }) => app.vpn.profiles = profiles,
@@ -567,7 +648,7 @@ pub(crate) async fn vpn_import_submit(app: &mut TuiApp, client: &ApiClient) {
 fn describe_vpn_error(detail: &VpnErrorDetail) -> String {
     match detail {
         VpnErrorDetail::VpnDisabled => {
-            "VPN is not enabled (vpn.enabled is false in the daemon config)".to_string()
+            "VPN is disabled; enable it in the VPN tab with e".to_string()
         }
         VpnErrorDetail::NotFound { name } => format!("Profile '{name}' not found"),
         VpnErrorDetail::InvalidProfile { message } => format!("Invalid profile: {message}"),
@@ -588,159 +669,4 @@ fn describe_vpn_error(detail: &VpnErrorDetail) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn vpn_action_focus_reaches_every_action_and_clamps_at_both_ends() {
-        assert_eq!(
-            next_vpn_action_focus(VpnFocus::Connect),
-            VpnFocus::Disconnect
-        );
-        assert_eq!(
-            next_vpn_action_focus(VpnFocus::Disconnect),
-            VpnFocus::Import
-        );
-        assert_eq!(next_vpn_action_focus(VpnFocus::Import), VpnFocus::Delete);
-        assert_eq!(next_vpn_action_focus(VpnFocus::Delete), VpnFocus::Policy);
-        assert_eq!(next_vpn_action_focus(VpnFocus::Policy), VpnFocus::Refresh);
-        assert_eq!(next_vpn_action_focus(VpnFocus::Refresh), VpnFocus::Refresh);
-        assert_eq!(
-            previous_vpn_action_focus(VpnFocus::Refresh),
-            VpnFocus::Policy
-        );
-        assert_eq!(
-            previous_vpn_action_focus(VpnFocus::Policy),
-            VpnFocus::Delete
-        );
-        assert_eq!(
-            previous_vpn_action_focus(VpnFocus::Delete),
-            VpnFocus::Import
-        );
-        assert_eq!(
-            previous_vpn_action_focus(VpnFocus::Import),
-            VpnFocus::Disconnect
-        );
-        assert_eq!(
-            previous_vpn_action_focus(VpnFocus::Disconnect),
-            VpnFocus::Connect
-        );
-    }
-
-    #[test]
-    fn vpn_focus_defaults_to_list() {
-        assert_eq!(VpnFocus::default(), VpnFocus::List);
-    }
-
-    #[test]
-    fn describes_each_vpn_error_detail_distinctly() {
-        let messages = [
-            describe_vpn_error(&VpnErrorDetail::VpnDisabled),
-            describe_vpn_error(&VpnErrorDetail::NotFound {
-                name: "home.conf".to_string(),
-            }),
-            describe_vpn_error(&VpnErrorDetail::InvalidProfile {
-                message: "missing [Interface] section".to_string(),
-            }),
-            describe_vpn_error(&VpnErrorDetail::AlreadyActive),
-            describe_vpn_error(&VpnErrorDetail::NotActive),
-            describe_vpn_error(&VpnErrorDetail::ProfileInUse {
-                name: "home.conf".to_string(),
-            }),
-            describe_vpn_error(&VpnErrorDetail::ForeignInterfaceConflict),
-            describe_vpn_error(&VpnErrorDetail::Other {
-                message: "boom".to_string(),
-            }),
-        ];
-
-        for (index, message) in messages.iter().enumerate() {
-            assert!(!message.is_empty());
-            for (other_index, other) in messages.iter().enumerate() {
-                if index != other_index {
-                    assert_ne!(message, other, "variants must not collapse into one string");
-                }
-            }
-        }
-        assert!(messages[1].contains("home.conf"));
-        assert!(messages[2].contains("missing [Interface] section"));
-        assert_eq!(messages[7], "boom");
-    }
-
-    #[test]
-    fn vpn_import_field_toggles_between_the_only_two_fields() {
-        assert_eq!(
-            toggle_vpn_import_field(VpnImportField::Name),
-            VpnImportField::Path
-        );
-        assert_eq!(
-            toggle_vpn_import_field(VpnImportField::Path),
-            VpnImportField::Name
-        );
-    }
-
-    #[test]
-    fn vpn_import_editor_active_value_targets_the_selected_field() {
-        let mut editor = VpnImportEditor {
-            field: VpnImportField::Name,
-            name: "home".to_string(),
-            path: "/etc/wireguard/home.conf".to_string(),
-            cursor: 0,
-        };
-        editor.active_value_mut().push_str(".conf");
-        assert_eq!(editor.name, "home.conf");
-        assert_eq!(editor.path, "/etc/wireguard/home.conf");
-
-        editor.field = VpnImportField::Path;
-        editor.active_value_mut().push('x');
-        assert_eq!(editor.path, "/etc/wireguard/home.confx");
-        assert_eq!(editor.name, "home.conf");
-    }
-
-    #[test]
-    fn vpn_import_editor_has_no_contents_field_to_retain_a_secret() {
-        let editor = VpnImportEditor {
-            field: VpnImportField::Name,
-            name: "home.conf".to_string(),
-            path: "/etc/wireguard/home.conf".to_string(),
-            cursor: 0,
-        };
-        let debug = format!("{editor:?}");
-        assert!(debug.contains("name"));
-        assert!(debug.contains("path"));
-        assert!(!debug.contains("contents"));
-        assert!(!debug.contains("PrivateKey"));
-    }
-
-    #[tokio::test]
-    async fn vpn_import_editor_cursor_navigation_and_editing() {
-        let mut app = TuiApp::default();
-        let mut editor = VpnImportEditor {
-            field: VpnImportField::Name,
-            name: "work".to_string(),
-            path: "/tmp/vpn.conf".to_string(),
-            cursor: 4,
-        };
-        editor.cursor = editor.name.len();
-        app.vpn_import = Some(editor);
-        app.screen = Screen::VpnImport;
-        let client = ApiClient::new("/nonexistent.sock");
-
-        handle_vpn_import_key(&mut app, KeyCode::Left, &client).await;
-        assert_eq!(app.vpn_import.as_ref().unwrap().cursor, 3);
-
-        handle_vpn_import_key(&mut app, KeyCode::Char('1'), &client).await;
-        assert_eq!(app.vpn_import.as_ref().unwrap().name, "wor1k");
-        assert_eq!(app.vpn_import.as_ref().unwrap().cursor, 4);
-
-        handle_vpn_import_key(&mut app, KeyCode::Backspace, &client).await;
-        assert_eq!(app.vpn_import.as_ref().unwrap().name, "work");
-        assert_eq!(app.vpn_import.as_ref().unwrap().cursor, 3);
-
-        handle_vpn_import_key(&mut app, KeyCode::Down, &client).await;
-        assert_eq!(app.vpn_import.as_ref().unwrap().field, VpnImportField::Path);
-        assert_eq!(
-            app.vpn_import.as_ref().unwrap().cursor,
-            "/tmp/vpn.conf".len()
-        );
-    }
-}
+mod tests;

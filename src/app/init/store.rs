@@ -42,7 +42,7 @@ impl ServiceStore {
             .mode(0o600)
             .open(path)?;
         file.try_lock_exclusive()
-            .context("another installation or uninstallation is in progress")?;
+            .context("another traffic-masq service administration operation is in progress")?;
         Ok(file)
     }
     pub fn ensure_unchanged(&self, expected: Option<&Registration>) -> Result<()> {

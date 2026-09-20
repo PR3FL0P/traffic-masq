@@ -1,23 +1,28 @@
-use super::*;
 use super::dhcp::{
     build_effective_dhcp_service, configure_dhcp_persisted, dhcp_edit_request_to_config,
     disable_dhcp_persisted,
 };
 use super::interfaces::{interface_edit_request_to_config, interface_statuses};
 use super::runtime::error_response;
+use super::*;
 
 impl ControlService {
+    /// Route a typed request to its handler while enforcing mutation and recovery gates.
     pub(super) async fn dispatch_inner(&self, request: Request) -> Response {
         // Admission stays held across convergence waits. Execution is held only
         // by direct writers: the worker must remain able to realize proposals.
         let _admission = if is_network_mutation(&request) {
             Some(self.network_mutations.admit().await)
-        } else { None };
+        } else {
+            None
+        };
         let _execution = if is_network_mutation(&request)
             && !is_converged_network_transaction_request(&request)
         {
             Some(self.network_mutations.execute().await)
-        } else { None };
+        } else {
+            None
+        };
         if is_network_mutation(&request) && !is_provisioning_secret_recovery_request(&request) {
             if let Some(router) = &self.router {
                 // The provisioning-secret journal is an extra crash-recovery
@@ -28,11 +33,8 @@ impl ControlService {
                     let secrets = crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore::in_state_dir(
                         &self.config.runtime.state_dir,
                     );
-                    let committed_token = self
-                        .overrides
-                        .snapshot()
-                        .await
-                        .committed_router_transaction;
+                    let committed_token =
+                        self.overrides.snapshot().await.committed_router_transaction;
                     match secrets
                         .unresolved_after_committed_cleanup(committed_token.as_deref())
                         .await
@@ -464,6 +466,8 @@ impl ControlService {
                 self.vpn_import_profile(name, contents).await
             }
             Request::VpnDeleteProfile { name } => self.vpn_delete_profile(name).await,
+            Request::GetVpnConfig => self.vpn_config().await,
+            Request::SetVpnEnabled { enabled } => self.set_vpn_enabled(enabled).await,
             Request::VpnStatus => self.vpn_status().await,
             Request::VpnActivate { name } => self.vpn_activate(name).await,
             Request::VpnDeactivate => self.vpn_deactivate().await,
@@ -535,7 +539,7 @@ impl ControlService {
     }
 }
 
-
+/// Classify requests that must be serialized with other network mutations.
 fn is_network_mutation(request: &Request) -> bool {
     matches!(
         request,
@@ -557,6 +561,7 @@ fn is_network_mutation(request: &Request) -> bool {
             | Request::RouterProvisioningRepair
             | Request::VpnImportProfile { .. }
             | Request::VpnDeleteProfile { .. }
+            | Request::SetVpnEnabled { .. }
             | Request::VpnActivate { .. }
             | Request::VpnDeactivate
             | Request::VpnPolicySetMode { .. }
@@ -580,6 +585,7 @@ fn is_network_mutation(request: &Request) -> bool {
     )
 }
 
+/// Identify transactions that require convergence to progress while admission remains reserved.
 fn is_converged_network_transaction_request(request: &Request) -> bool {
     matches!(
         request,
@@ -591,6 +597,7 @@ fn is_converged_network_transaction_request(request: &Request) -> bool {
     )
 }
 
+/// Identify mutations that require exclusive runtime execution.
 fn is_direct_network_mutation(request: &Request) -> bool {
     is_network_mutation(request)
         && !matches!(
@@ -603,7 +610,7 @@ fn is_direct_network_mutation(request: &Request) -> bool {
         )
 }
 
-
+/// Identify requests allowed to repair or inspect retained provisioning recovery state.
 fn is_provisioning_secret_recovery_request(request: &Request) -> bool {
     matches!(
         request,

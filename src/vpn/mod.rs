@@ -13,7 +13,7 @@ pub mod wireguard;
 use std::fmt;
 
 pub use active_profile::{
-    ActiveProfileError, ActiveProfileStore, ActivationIntentStore, PersistedActivationIntent,
+    ActivationIntentStore, ActiveProfileError, ActiveProfileStore, PersistedActivationIntent,
     PersistedActiveProfile,
 };
 pub use manager::{

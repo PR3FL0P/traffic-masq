@@ -34,6 +34,7 @@ impl TransactionPlan {
         &self.candidate
     }
 
+    /// Capture the observed router fingerprint and build a plan for a validated candidate.
     pub fn plan(&self) -> &RouterPlan {
         &self.plan
     }
@@ -155,6 +156,7 @@ impl RouterTransactionCoordinator {
             .expect("router timeout mutation-gate lock poisoned") = Some(gate);
     }
 
+    /// Capture the observed router fingerprint and build a plan for a validated candidate.
     pub async fn plan(&self, candidate: RouterCandidate) -> Result<TransactionPlan> {
         let snapshot = self.inner.manager.snapshot_for(candidate.desired()).await?;
         let fingerprint = ObservationFingerprint::of(&snapshot)?;
@@ -170,6 +172,8 @@ impl RouterTransactionCoordinator {
         self.inner.manager.clone()
     }
 
+    /// Reject stale or conflicting plans, journal recovery state, and apply the candidate.
+    /// Return a confirmation token; an unconfirmed change is rolled back after its deadline.
     pub async fn apply(&self, plan: TransactionPlan) -> Result<String> {
         let mut state = self.inner.state.lock().await;
         match &*state {
@@ -201,7 +205,7 @@ impl RouterTransactionCoordinator {
             &current_snapshot,
             plan.candidate.desired(),
         )
-            .await?;
+        .await?;
         if let Err(error) = self.inner.manager.apply(&plan.plan).await {
             // Retry the complete snapshot: a failed apply may also have failed
             // its compensation. Keep the journal until restoration succeeds.
@@ -252,10 +256,12 @@ impl RouterTransactionCoordinator {
         Ok(token)
     }
 
+    /// Reapply committed router intent without creating a new confirmation transaction.
     pub async fn repair(&self, desired: RouterDesired) -> Result<()> {
         self.repair_inner(desired, false).await
     }
 
+    /// Repair committed routing and firewall state without a full subsystem reconfiguration.
     pub async fn reconcile_dataplane(&self, desired: RouterDesired) -> Result<()> {
         self.repair_inner(desired, true).await
     }
@@ -264,18 +270,26 @@ impl RouterTransactionCoordinator {
         let mut state = self.inner.state.lock().await;
         match &*state {
             CoordinatorState::Idle => {}
-            CoordinatorState::Pending(_) => return Err(CoordinatorConflict::TransactionPending.into()),
-            CoordinatorState::RollbackFailed(_) => return Err(CoordinatorConflict::RollbackRecoveryRequired.into()),
+            CoordinatorState::Pending(_) => {
+                return Err(CoordinatorConflict::TransactionPending.into())
+            }
+            CoordinatorState::RollbackFailed(_) => {
+                return Err(CoordinatorConflict::RollbackRecoveryRequired.into())
+            }
         }
         if dataplane_only && !self.inner.manager.dataplane_needs_reconcile(&desired).await {
             return Ok(());
         }
         self.inner.manager.prepare_recovery(&desired).await?;
-        let candidate = self.inner.overrides.build_candidate(
-            &crate::core::router_candidate::RouterIntentProposal::new()).await?;
+        let candidate = self
+            .inner
+            .overrides
+            .build_candidate(&crate::core::router_candidate::RouterIntentProposal::new())
+            .await?;
         let snapshot = self.inner.manager.snapshot_for(&desired).await?;
         let token = self.next_token();
-        self.write_journal(candidate.base_revision(), &token, &snapshot, &desired).await?;
+        self.write_journal(candidate.base_revision(), &token, &snapshot, &desired)
+            .await?;
         let result = if dataplane_only {
             self.inner.manager.reconcile_dataplane(&desired).await
         } else {
@@ -300,7 +314,10 @@ impl RouterTransactionCoordinator {
             }
             if !failures.is_empty() {
                 *state = CoordinatorState::RollbackFailed(RollbackFailure {
-                    token, candidate, snapshot, failures,
+                    token,
+                    candidate,
+                    snapshot,
+                    failures,
                 });
             }
             return Err(error);
@@ -319,13 +336,18 @@ impl RouterTransactionCoordinator {
         if let Err(error) = self.clear_journal().await {
             // Keep recovery ownership until the durable journal is resolved.
             *state = CoordinatorState::RollbackFailed(RollbackFailure {
-                token, candidate, snapshot, failures: vec![error.to_string()],
+                token,
+                candidate,
+                snapshot,
+                failures: vec![error.to_string()],
             });
             return Err(error);
         }
         Ok(())
     }
 
+    /// Persist the matching pending candidate and return its new committed revision.
+    /// Persistence failure keeps the transaction pending; successful commit retires recovery state.
     pub async fn commit(&self, token: &str) -> Result<u64> {
         let mut state = self.inner.state.lock().await;
         let pending = match &*state {
@@ -369,12 +391,14 @@ impl RouterTransactionCoordinator {
         Ok(revision)
     }
 
+    /// Restore the pending router snapshot, retaining failure state when restoration is incomplete.
     pub async fn rollback(&self) -> Result<()> {
         let mut state = self.inner.state.lock().await;
         self.rollback_locked(&mut state, RollbackTrigger::Manual)
             .await
     }
 
+    /// Return the token for a pending transaction or failed rollback, or `None` when idle.
     pub async fn pending_token(&self) -> Option<String> {
         match &*self.inner.state.lock().await {
             CoordinatorState::Pending(pending) => Some(pending.token.clone()),
@@ -383,6 +407,7 @@ impl RouterTransactionCoordinator {
         }
     }
 
+    /// Restore the pending snapshot only when its token matches the supplied token.
     pub async fn rollback_with_token(&self, token: &str) -> Result<()> {
         let mut state = self.inner.state.lock().await;
         let expected = match &*state {
@@ -398,6 +423,7 @@ impl RouterTransactionCoordinator {
             .await
     }
 
+    /// Report whether the coordinator is idle, awaiting confirmation, or awaiting rollback recovery.
     pub async fn status(&self) -> CoordinatorStatus {
         match &*self.inner.state.lock().await {
             CoordinatorState::Idle => CoordinatorStatus::Idle,
@@ -429,6 +455,7 @@ impl RouterTransactionCoordinator {
             .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
     }
 
+    /// Return details retained after an incomplete rollback, if any.
     pub async fn rollback_failure(&self) -> Option<RollbackFailure> {
         match &*self.inner.state.lock().await {
             CoordinatorState::RollbackFailed(failure) => Some(failure.clone()),
@@ -604,8 +631,7 @@ impl RouterTransactionCoordinator {
     }
 
     async fn clear_journal(&self) -> Result<()> {
-        crate::atomic_file::remove_preserving_on_error_async(&self.inner.journal, 0o600)
-            .await?;
+        crate::atomic_file::remove_preserving_on_error_async(&self.inner.journal, 0o600).await?;
         Ok(())
     }
 
@@ -674,1032 +700,4 @@ impl RouterTransactionCoordinator {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::net::Ipv4Addr;
-    use std::sync::Mutex as StdMutex;
-
-    use async_trait::async_trait;
-    use tempfile::tempdir;
-
-    use crate::config::{
-        AppConfig, DhcpInterfaceConfig, InterfaceConfig, InterfaceRole, RouterConfig, UplinkConfig,
-        UplinkMode,
-    };
-    use crate::core::interface::{DhcpChangeAction, InterfaceChangePlan, InterfaceSnapshot};
-    use crate::core::route::{RoutePlan, RouteSnapshot};
-    use crate::core::router::{DhcpPlan, RouterSubsystems};
-    use crate::core::router_candidate::RouterIntentProposal;
-    use crate::dhcp::supervisor::DhcpServiceSpec;
-    use crate::firewall::{RouterDataplanePlan, RouterDataplaneSnapshot};
-
-    use super::*;
-
-    fn output_interface(address: &str, pool_start: u8, pool_end: u8) -> InterfaceConfig {
-        let ipv4: ipnet::Ipv4Net = address.parse().expect("IPv4 network");
-        let octet = ipv4.addr().octets()[2];
-        InterfaceConfig {
-            nat: true,
-            role: InterfaceRole::Output,
-            managed: true,
-            ipv4: Some(ipv4),
-            dhcp: Some(DhcpInterfaceConfig {
-                pool_start: Ipv4Addr::new(192, 168, octet, pool_start),
-                pool_end: Ipv4Addr::new(192, 168, octet, pool_end),
-                router: ipv4.addr(),
-                dns_servers: Vec::new(),
-                lease_seconds: None,
-            }),
-            dhcp_client: None,
-            wifi: None,
-            wifi_client: None,
-        }
-    }
-
-    fn base_config() -> AppConfig {
-        let mut config = AppConfig::default();
-        config.network.interfaces.insert(
-            "wan0".to_string(),
-            InterfaceConfig {
-                nat: true,
-                role: InterfaceRole::Input,
-                managed: false,
-                ipv4: None,
-                dhcp: None,
-                dhcp_client: None,
-                wifi: None,
-                wifi_client: None,
-            },
-        );
-        config.network.interfaces.insert(
-            "lan0".to_string(),
-            output_interface("192.168.10.1/24", 100, 150),
-        );
-        config
-    }
-
-    fn enabled_router() -> RouterConfig {
-        RouterConfig {
-            forwarding: None,
-            vpn_chain: Vec::new(),
-            enabled: true,
-            uplink: Some(UplinkConfig {
-                interface: "wan0".to_string(),
-                mode: UplinkMode::External,
-            }),
-            owned_routes: Vec::new(),
-            allow_default_route_change: false,
-        }
-    }
-
-    struct FakeSubsystems {
-        events: StdMutex<Vec<String>>,
-        apply_fail: StdMutex<Option<&'static str>>,
-        rollback_fail: StdMutex<Option<&'static str>>,
-        drifted: StdMutex<bool>,
-        retained: StdMutex<Vec<Vec<String>>>,
-        rollback_secret: StdMutex<Option<std::path::PathBuf>>,
-    }
-
-    impl FakeSubsystems {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                events: StdMutex::new(Vec::new()),
-                apply_fail: StdMutex::new(None),
-                rollback_fail: StdMutex::new(None),
-                drifted: StdMutex::new(false),
-                retained: StdMutex::new(Vec::new()),
-                rollback_secret: StdMutex::new(None),
-            })
-        }
-
-        fn fail_apply(&self, stage: &'static str) {
-            *self.apply_fail.lock().unwrap() = Some(stage);
-        }
-
-        fn fail_rollback(&self, stage: &'static str) {
-            *self.rollback_fail.lock().unwrap() = Some(stage);
-        }
-
-        fn drift(&self) {
-            *self.drifted.lock().unwrap() = true;
-        }
-
-        fn events(&self) -> Vec<String> {
-            self.events.lock().unwrap().clone()
-        }
-
-        fn retained(&self) -> Vec<Vec<String>> {
-            self.retained.lock().unwrap().clone()
-        }
-
-        fn record(&self, event: &str) -> Result<()> {
-            self.events.lock().unwrap().push(event.to_string());
-            Ok(())
-        }
-
-        fn dataplane_snapshot(&self) -> RouterDataplaneSnapshot {
-            RouterDataplaneSnapshot {
-                ipv4_forwarding: *self.drifted.lock().unwrap(),
-                owned: None,
-                owned_firewall_integrity: crate::firewall::OwnedFirewallIntegrity::Intact,
-            }
-        }
-    }
-
-    #[async_trait]
-    impl RouterSubsystems for FakeSubsystems {
-        async fn plan_interfaces(
-            &self,
-            _: &crate::core::router::RouterDesired,
-        ) -> Result<Vec<InterfaceChangePlan>> {
-            self.record("plan_interfaces")?;
-            Ok(vec![InterfaceChangePlan {
-                interface: "lan0".into(),
-                delete_ipv4: Vec::new(),
-                retag_ipv4: None,
-                add_ipv4: None,
-                set_link_up: false,
-                management_change: false,
-                dhcp_action: DhcpChangeAction::Unchanged,
-                releasing_management: false,
-            }])
-        }
-        async fn plan_routes(&self, _: &crate::core::router::RouterDesired) -> Result<RoutePlan> {
-            self.record("plan_routes")?;
-            Ok(RoutePlan {
-                add: Vec::new(),
-                delete: Vec::new(),
-            })
-        }
-        async fn plan_dhcp(&self, _: &crate::core::router::RouterDesired) -> Result<Vec<DhcpPlan>> {
-            self.record("plan_dhcp")?;
-            Ok(Vec::new())
-        }
-        async fn plan_dataplane(
-            &self,
-            desired: &crate::core::router::RouterDesired,
-        ) -> Result<RouterDataplanePlan> {
-            self.record("plan_dataplane")?;
-            Ok(RouterDataplanePlan {
-                snapshot: self.dataplane_snapshot(),
-                target: desired.dataplane.clone(),
-                requires_apply: true,
-            })
-        }
-        async fn snapshot_interfaces(&self) -> Result<Vec<InterfaceSnapshot>> {
-            self.record("snapshot_interfaces")?;
-            Ok(Vec::new())
-        }
-        async fn retain_router_interfaces(&self, interfaces: &[String]) {
-            self.retained.lock().unwrap().push(interfaces.to_vec());
-        }
-        async fn snapshot_routes(&self) -> Result<RouteSnapshot> {
-            self.record("snapshot_routes")?;
-            Ok(RouteSnapshot::empty())
-        }
-        async fn snapshot_dhcp(&self) -> Result<Vec<DhcpServiceSpec>> {
-            self.record("snapshot_dhcp")?;
-            Ok(Vec::new())
-        }
-        async fn snapshot_dataplane(&self) -> Result<RouterDataplaneSnapshot> {
-            self.record("snapshot_dataplane")?;
-            Ok(self.dataplane_snapshot())
-        }
-        async fn apply_interfaces(&self, _: &[InterfaceChangePlan]) -> Result<()> {
-            self.fail_if_matched("apply_interfaces", &self.apply_fail)
-        }
-        async fn apply_routes(&self, _: &RoutePlan) -> Result<()> {
-            self.fail_if_matched("apply_routes", &self.apply_fail)
-        }
-        async fn apply_dhcp(&self, _: &[DhcpPlan]) -> Result<()> {
-            self.fail_if_matched("apply_dhcp", &self.apply_fail)
-        }
-        async fn apply_dataplane(&self, _: &RouterDataplanePlan) -> Result<()> {
-            self.fail_if_matched("apply_dataplane", &self.apply_fail)
-        }
-        async fn rollback_interfaces(&self, _: &[InterfaceSnapshot]) -> Result<()> {
-            if let Some(root) = self.rollback_secret.lock().unwrap().as_ref() {
-                let store = crate::wifi::store::PassphraseStore::new(root.join("wifi/psk"));
-                anyhow::ensure!(
-                    store.get("wlan0")?.is_some_and(|secret| secret.expose() == "old-password"),
-                    "runtime rollback needs the original Wi-Fi credential"
-                );
-            }
-            self.fail_if_matched("rollback_interfaces", &self.rollback_fail)
-        }
-        async fn rollback_routes(&self, _: &RouteSnapshot) -> Result<()> {
-            self.fail_if_matched("rollback_routes", &self.rollback_fail)
-        }
-        async fn rollback_dhcp(&self, _: &[DhcpServiceSpec]) -> Result<()> {
-            self.fail_if_matched("rollback_dhcp", &self.rollback_fail)
-        }
-        async fn rollback_dataplane(&self, _: &RouterDataplaneSnapshot) -> Result<()> {
-            self.fail_if_matched("rollback_dataplane", &self.rollback_fail)
-        }
-        async fn health_interfaces(&self, _: &crate::core::router::RouterDesired) -> Result<()> {
-            self.record("health_interfaces")
-        }
-        async fn health_routes(&self, _: &crate::core::router::RouterDesired) -> Result<()> {
-            self.record("health_routes")
-        }
-        async fn health_dhcp(&self, _: &crate::core::router::RouterDesired) -> Result<()> {
-            self.record("health_dhcp")
-        }
-        async fn health_dataplane(&self, _: &crate::core::router::RouterDesired) -> Result<()> {
-            self.record("health_dataplane")
-        }
-    }
-
-    impl FakeSubsystems {
-        fn fail_if_matched(
-            &self,
-            event: &'static str,
-            switch: &StdMutex<Option<&'static str>>,
-        ) -> Result<()> {
-            self.record(event)?;
-            if *switch.lock().unwrap() == Some(event) {
-                anyhow::bail!("injected {event} failure");
-            }
-            Ok(())
-        }
-    }
-
-    async fn coordinator_with(
-        fake: Arc<FakeSubsystems>,
-    ) -> (
-        RouterTransactionCoordinator,
-        RuntimeOverrideManager,
-        tempfile::TempDir,
-    ) {
-        let directory = tempdir().expect("tempdir");
-        let overrides = RuntimeOverrideManager::load(directory.path(), &base_config())
-            .await
-            .expect("overrides manager");
-        let manager = RouterManager::new(fake);
-        let coordinator = RouterTransactionCoordinator::new(
-            manager,
-            overrides.clone(),
-            Duration::from_millis(30),
-        );
-        (coordinator, overrides, directory)
-    }
-
-    async fn build_candidate(overrides: &RuntimeOverrideManager) -> RouterCandidate {
-        overrides
-            .build_candidate(&RouterIntentProposal::new().set_router(enabled_router()))
-            .await
-            .expect("candidate")
-    }
-
-    #[tokio::test]
-    async fn recovery_restores_a_snapshot_left_before_apply() {
-        let fake = FakeSubsystems::new();
-        let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
-        let candidate = build_candidate(&overrides).await;
-        let snapshot = coordinator
-            .manager()
-            .snapshot_for(candidate.desired())
-            .await
-            .unwrap();
-        coordinator
-            .write_journal(candidate.base_revision(), "test-transaction", &snapshot, candidate.desired())
-            .await
-            .unwrap();
-        let expected = overrides
-            .build_candidate(&RouterIntentProposal::new())
-            .await
-            .expect("committed candidate")
-            .desired()
-            .interfaces
-            .iter()
-            .map(|entry| entry.name.clone())
-            .collect::<Vec<_>>();
-        let restored = RouterTransactionCoordinator::new(
-            coordinator.manager(),
-            overrides,
-            Duration::from_secs(60),
-        );
-        restored.recover().await.unwrap();
-        assert!(fake
-            .events()
-            .iter()
-            .any(|event| event == "rollback_interfaces"));
-        assert_eq!(fake.retained().last(), Some(&expected));
-        assert!(!restored.inner.journal.exists());
-    }
-
-    #[tokio::test]
-    async fn recovery_does_not_undo_a_persisted_commit() {
-        let fake = FakeSubsystems::new();
-        let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
-        let candidate = build_candidate(&overrides).await;
-        let snapshot = coordinator
-            .manager()
-            .snapshot_for(candidate.desired())
-            .await
-            .unwrap();
-        coordinator
-            .write_journal(candidate.base_revision(), "test-transaction", &snapshot, candidate.desired())
-            .await
-            .unwrap();
-        overrides
-            .commit_candidate_with_token(&candidate, Some("test-transaction"))
-            .await
-            .unwrap();
-        let expected = overrides
-            .build_candidate(&RouterIntentProposal::new())
-            .await
-            .expect("committed candidate")
-            .desired()
-            .interfaces
-            .iter()
-            .map(|entry| entry.name.clone())
-            .collect::<Vec<_>>();
-        let restored = RouterTransactionCoordinator::new(
-            coordinator.manager(),
-            overrides,
-            Duration::from_secs(60),
-        );
-        restored.recover().await.unwrap();
-        assert!(!fake
-            .events()
-            .iter()
-            .any(|event| event.starts_with("rollback_")));
-        assert_eq!(fake.retained().last(), Some(&expected));
-        assert!(!restored.inner.journal.exists());
-    }
-
-    #[tokio::test]
-    async fn failed_recovery_preserves_the_journal_for_retry() {
-        let fake = FakeSubsystems::new();
-        let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
-        let candidate = build_candidate(&overrides).await;
-        let snapshot = coordinator
-            .manager()
-            .snapshot_for(candidate.desired())
-            .await
-            .unwrap();
-        coordinator
-            .write_journal(candidate.base_revision(), "test-transaction", &snapshot, candidate.desired())
-            .await
-            .unwrap();
-        fake.fail_rollback("rollback_routes");
-        assert!(coordinator.recover().await.is_err());
-        assert!(coordinator.inner.journal.exists());
-        *fake.rollback_fail.lock().unwrap() = None;
-        coordinator.recover().await.unwrap();
-        assert!(!coordinator.inner.journal.exists());
-    }
-
-    #[tokio::test]
-    async fn unrelated_saved_settings_do_not_confirm_router_transaction() {
-        let fake = FakeSubsystems::new();
-        let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
-        let candidate = build_candidate(&overrides).await;
-        let snapshot = coordinator
-            .manager()
-            .snapshot_for(candidate.desired())
-            .await
-            .unwrap();
-        coordinator
-            .write_journal(candidate.base_revision(), "unconfirmed", &snapshot, candidate.desired())
-            .await
-            .unwrap();
-        overrides
-            .set_vpn_mode(crate::config::VpnPolicyMode::Direct)
-            .await
-            .unwrap();
-        assert!(coordinator.recover().await.unwrap());
-        assert!(fake
-            .events()
-            .iter()
-            .any(|event| event == "rollback_interfaces"));
-    }
-
-    #[tokio::test]
-    async fn invalid_recovery_record_is_not_discarded() {
-        let (coordinator, _, _directory) = coordinator_with(FakeSubsystems::new()).await;
-        tokio::fs::write(&coordinator.inner.journal, b"invalid")
-            .await
-            .unwrap();
-        assert!(coordinator.recover().await.is_err());
-        assert!(coordinator.inner.journal.exists());
-    }
-
-    #[tokio::test]
-    async fn write_journal_creates_missing_parent_directory() {
-        let fake = FakeSubsystems::new();
-        let (coordinator, overrides, directory) = coordinator_with(fake.clone()).await;
-        let nested_dir = directory.path().join("nested_missing_state_dir");
-        let non_existent_journal = nested_dir.join("router-transaction.json");
-        assert!(!nested_dir.exists());
-
-        let candidate = build_candidate(&overrides).await;
-        let snapshot = coordinator
-            .manager()
-            .snapshot_for(candidate.desired())
-            .await
-            .unwrap();
-
-        let isolated_coordinator = RouterTransactionCoordinator {
-            inner: Arc::new(Inner {
-                journal: non_existent_journal.clone(),
-                manager: coordinator.manager(),
-                overrides,
-                rollback_timeout: Duration::from_secs(60),
-                state: Mutex::new(CoordinatorState::Idle),
-                token_counter: AtomicU64::new(0),
-                timeout_mutation_gate: StdRwLock::new(None),
-                idle_epoch: watch::channel(0).0,
-            }),
-        };
-
-        isolated_coordinator
-            .write_journal(candidate.base_revision(), "token-1", &snapshot, candidate.desired())
-            .await
-            .unwrap();
-
-        assert!(non_existent_journal.exists());
-    }
-
-    #[tokio::test]
-    async fn full_lifecycle_applies_and_commits() {
-        let fake = FakeSubsystems::new();
-        let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
-        let candidate = build_candidate(&overrides).await;
-
-        let plan = coordinator.plan(candidate).await.expect("plan");
-        coordinator.apply(plan).await.expect("apply");
-        assert_eq!(coordinator.status().await, CoordinatorStatus::Pending);
-
-        let revision = coordinator
-            .commit(&coordinator.pending_token().await.unwrap_or_default())
-            .await
-            .expect("commit");
-        assert_eq!(revision, 1);
-        assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
-        assert_eq!(overrides.committed_revision().await, 1);
-        assert!(overrides.snapshot().await.router.is_some());
-
-        let events = fake.events();
-        assert!(events.contains(&"apply_interfaces".to_string()));
-        assert!(events.contains(&"health_dataplane".to_string()));
-        assert!(!events.iter().any(|event| event.starts_with("rollback_")));
-    }
-
-    #[tokio::test]
-    async fn second_concurrent_transaction_is_rejected() {
-        let fake = FakeSubsystems::new();
-        let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
-        let candidate = build_candidate(&overrides).await;
-        let plan = coordinator.plan(candidate).await.expect("plan");
-        coordinator.apply(plan).await.expect("first apply");
-
-        let second_candidate = overrides
-            .build_candidate(&RouterIntentProposal::new().set_interface(
-                "lan1",
-                output_interface("192.168.20.1/24", 100, 150),
-                false,
-            ))
-            .await
-            .expect("second candidate");
-        let second_plan = coordinator
-            .plan(second_candidate)
-            .await
-            .expect("second plan");
-        let error = coordinator
-            .apply(second_plan)
-            .await
-            .expect_err("second concurrent apply must be rejected");
-        assert!(error.to_string().contains("already pending"));
-        assert_eq!(coordinator.status().await, CoordinatorStatus::Pending);
-    }
-
-    #[tokio::test]
-    async fn repair_reapplies_committed_intent_without_creating_a_revision() {
-        let fake = FakeSubsystems::new();
-        let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
-        let candidate = build_candidate(&overrides).await;
-        overrides
-            .commit_candidate(&candidate)
-            .await
-            .expect("seed committed intent");
-        let desired = RouterDesired::from_effective_config(
-            &overrides
-                .snapshot()
-                .await
-                .effective_config(&base_config())
-                .expect("effective config"),
-        )
-        .expect("desired");
-
-        coordinator.repair(desired).await.expect("repair");
-
-        assert_eq!(overrides.committed_revision().await, 1);
-        assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
-        let events = fake.events();
-        assert!(events.contains(&"plan_interfaces".to_string()));
-        assert!(events.contains(&"apply_dataplane".to_string()));
-        assert!(!events.iter().any(|event| event.starts_with("rollback_")));
-    }
-
-    #[tokio::test]
-    async fn repair_respects_pending_transaction_ownership() {
-        let fake = FakeSubsystems::new();
-        let (coordinator, overrides, _directory) = coordinator_with(fake).await;
-        let candidate = build_candidate(&overrides).await;
-        let desired = candidate.desired().clone();
-        let plan = coordinator.plan(candidate).await.expect("plan");
-        coordinator.apply(plan).await.expect("apply");
-
-        let error = coordinator
-            .repair(desired)
-            .await
-            .expect_err("pending transaction must keep ownership");
-
-        assert!(error.to_string().contains("already pending"));
-        assert_eq!(coordinator.status().await, CoordinatorStatus::Pending);
-    }
-
-    #[tokio::test]
-    async fn stale_candidate_is_rejected_before_mutation() {
-        let fake = FakeSubsystems::new();
-        let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
-        let candidate = build_candidate(&overrides).await;
-        let plan = coordinator.plan(candidate).await.expect("plan");
-
-        let unrelated = overrides
-            .build_candidate(&RouterIntentProposal::new().set_interface(
-                "lan1",
-                output_interface("192.168.20.1/24", 100, 150),
-                false,
-            ))
-            .await
-            .expect("unrelated candidate");
-        overrides
-            .commit_candidate(&unrelated)
-            .await
-            .expect("unrelated commit");
-
-        let error = coordinator
-            .apply(plan)
-            .await
-            .expect_err("stale candidate must be rejected");
-        assert!(error.to_string().contains("stale"));
-        assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
-        assert!(!fake
-            .events()
-            .iter()
-            .any(|event| event.starts_with("apply_")));
-    }
-
-    #[tokio::test]
-    async fn stale_plan_fingerprint_is_rejected_before_mutation() {
-        let fake = FakeSubsystems::new();
-        let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
-        let candidate = build_candidate(&overrides).await;
-        let plan = coordinator.plan(candidate).await.expect("plan");
-
-        fake.drift();
-
-        let error = coordinator
-            .apply(plan)
-            .await
-            .expect_err("drifted observation must be rejected");
-        assert!(error.to_string().contains("stale"));
-        assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
-        assert!(!fake
-            .events()
-            .iter()
-            .any(|event| event.starts_with("apply_")));
-    }
-
-    #[tokio::test]
-    async fn commit_persistence_failure_leaves_transaction_pending() {
-        let fake = FakeSubsystems::new();
-        let (coordinator, overrides, directory) = coordinator_with(fake.clone()).await;
-        let candidate = build_candidate(&overrides).await;
-        let plan = coordinator.plan(candidate).await.expect("plan");
-        coordinator.apply(plan).await.expect("apply");
-
-        tokio::fs::create_dir(overrides.path())
-            .await
-            .expect("conflicting target directory");
-
-        let error = coordinator
-            .commit(&coordinator.pending_token().await.unwrap_or_default())
-            .await
-            .expect_err("commit persistence must fail");
-        assert!(!error.to_string().is_empty());
-        assert_eq!(coordinator.status().await, CoordinatorStatus::Pending);
-        assert_eq!(overrides.committed_revision().await, 0);
-
-        tokio::fs::remove_dir(overrides.path())
-            .await
-            .expect("cleanup");
-        let revision = coordinator
-            .commit(&coordinator.pending_token().await.unwrap_or_default())
-            .await
-            .expect("retry commit");
-        assert_eq!(revision, 1);
-        let _ = directory;
-    }
-
-    #[tokio::test]
-    async fn stale_confirmation_cannot_commit_or_rollback_a_new_transaction() {
-        let (coordinator, overrides, _directory) = coordinator_with(FakeSubsystems::new()).await;
-        let plan = coordinator
-            .plan(build_candidate(&overrides).await)
-            .await
-            .unwrap();
-        let old = coordinator.apply(plan).await.unwrap();
-        coordinator.rollback_with_token(&old).await.unwrap();
-        let plan = coordinator
-            .plan(build_candidate(&overrides).await)
-            .await
-            .unwrap();
-        let current = coordinator.apply(plan).await.unwrap();
-        assert_ne!(old, current);
-        assert!(coordinator.commit(&old).await.is_err());
-        assert!(coordinator.rollback_with_token(&old).await.is_err());
-        assert_eq!(coordinator.status().await, CoordinatorStatus::Pending);
-        assert_eq!(overrides.committed_revision().await, 0);
-        coordinator.commit(&current).await.unwrap();
-        assert_eq!(overrides.committed_revision().await, 1);
-    }
-
-    #[tokio::test]
-    async fn rollback_journal_cleanup_failure_cannot_be_committed() {
-        let (coordinator, overrides, _directory) = coordinator_with(FakeSubsystems::new()).await;
-        let plan = coordinator
-            .plan(build_candidate(&overrides).await)
-            .await
-            .unwrap();
-        coordinator.apply(plan).await.unwrap();
-        let journal = &coordinator.inner.journal;
-        tokio::fs::remove_file(journal).await.unwrap();
-        tokio::fs::create_dir(journal).await.unwrap();
-        assert!(coordinator.rollback().await.is_err());
-        assert_eq!(
-            coordinator.status().await,
-            CoordinatorStatus::RollbackFailed
-        );
-        assert!(coordinator
-            .commit(&coordinator.pending_token().await.unwrap_or_default())
-            .await
-            .is_err());
-        assert_eq!(overrides.committed_revision().await, 0);
-        tokio::fs::remove_dir(journal).await.unwrap();
-        coordinator.rollback().await.unwrap();
-        assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
-    }
-
-    #[tokio::test]
-    async fn manual_rollback_restores_idle_state() {
-        let fake = FakeSubsystems::new();
-        let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
-        let candidate = build_candidate(&overrides).await;
-        let plan = coordinator.plan(candidate).await.expect("plan");
-        coordinator.apply(plan).await.expect("apply");
-
-        coordinator.rollback().await.expect("manual rollback");
-        assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
-        assert_eq!(overrides.committed_revision().await, 0);
-        assert!(fake
-            .events()
-            .iter()
-            .any(|event| event == "rollback_dataplane"));
-
-        let error = coordinator
-            .rollback()
-            .await
-            .expect_err("nothing left to roll back");
-        assert!(error.to_string().contains("no router transaction"));
-    }
-
-    #[tokio::test]
-    async fn wait_until_idle_wakes_after_rollback() {
-        let fake = FakeSubsystems::new();
-        let (coordinator, overrides, _directory) = coordinator_with(fake).await;
-        let candidate = build_candidate(&overrides).await;
-        let plan = coordinator.plan(candidate).await.expect("plan");
-        coordinator.apply(plan).await.expect("apply");
-
-        let waiter = tokio::spawn({
-            let coordinator = coordinator.clone();
-            async move { coordinator.wait_until_idle().await }
-        });
-        tokio::task::yield_now().await;
-        assert!(!waiter.is_finished());
-
-        coordinator.rollback().await.expect("rollback");
-        tokio::time::timeout(Duration::from_secs(1), waiter)
-            .await
-            .expect("idle waiter wake")
-            .expect("waiter task");
-    }
-
-    async fn stage_test_secret(
-        directory: &std::path::Path,
-    ) -> crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore {
-        use crate::wifi::{secret::WifiPassphrase, store::PassphraseStore};
-        let secrets = crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore::in_state_dir(directory);
-        secrets
-            .stage(std::collections::BTreeMap::from([(
-                "wlan0".into(),
-                Some(WifiPassphrase::new("old-password").unwrap()),
-            )]))
-            .await
-            .unwrap();
-        PassphraseStore::new(directory.join("wifi/psk"))
-            .set("wlan0", &WifiPassphrase::new("new-password").unwrap())
-            .unwrap();
-        secrets
-    }
-
-    #[tokio::test]
-    async fn provisioning_timeout_restores_secrets_before_runtime_rollback() {
-        let fake = FakeSubsystems::new();
-        let (_, overrides, directory) = coordinator_with(fake.clone()).await;
-        let coordinator = RouterTransactionCoordinator::new(
-            RouterManager::new(fake.clone()),
-            overrides.clone(),
-            Duration::from_secs(60),
-        );
-        let secrets = stage_test_secret(directory.path()).await;
-        *fake.rollback_secret.lock().unwrap() = Some(directory.path().to_path_buf());
-        let plan = coordinator
-            .plan(build_candidate(&overrides).await)
-            .await
-            .unwrap();
-        let token = coordinator.apply(plan).await.unwrap();
-        secrets.bind_token(&token).await.unwrap();
-
-        coordinator.rollback_timeout_fired(&token).await;
-
-        assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
-        assert!(!secrets
-            .unresolved_after_committed_cleanup(None)
-            .await
-            .unwrap());
-    }
-
-    #[tokio::test]
-    async fn provisioning_rollback_failure_retains_secret_journal_for_retry() {
-        let fake = FakeSubsystems::new();
-        let (_, overrides, directory) = coordinator_with(fake.clone()).await;
-        let coordinator = RouterTransactionCoordinator::new(
-            RouterManager::new(fake.clone()),
-            overrides.clone(),
-            Duration::from_secs(60),
-        );
-        let secrets = stage_test_secret(directory.path()).await;
-        *fake.rollback_secret.lock().unwrap() = Some(directory.path().to_path_buf());
-        let plan = coordinator
-            .plan(build_candidate(&overrides).await)
-            .await
-            .unwrap();
-        let token = coordinator.apply(plan).await.unwrap();
-        secrets.bind_token(&token).await.unwrap();
-        fake.fail_rollback("rollback_dhcp");
-
-        assert!(coordinator.rollback_with_token(&token).await.is_err());
-        assert_eq!(
-            coordinator.status().await,
-            CoordinatorStatus::RollbackFailed
-        );
-        assert!(secrets
-            .unresolved_after_committed_cleanup(None)
-            .await
-            .unwrap());
-        assert!(coordinator.commit(&token).await.is_err());
-
-        *fake.rollback_fail.lock().unwrap() = None;
-        coordinator.rollback_with_token(&token).await.unwrap();
-        assert!(!secrets
-            .unresolved_after_committed_cleanup(None)
-            .await
-            .unwrap());
-    }
-
-    #[tokio::test]
-    async fn provisioning_secret_restore_failure_blocks_commit_and_can_be_retried() {
-        let fake = FakeSubsystems::new();
-        let (_, overrides, directory) = coordinator_with(fake.clone()).await;
-        let coordinator = RouterTransactionCoordinator::new(
-            RouterManager::new(fake),
-            overrides.clone(),
-            Duration::from_secs(60),
-        );
-        let secrets = stage_test_secret(directory.path()).await;
-        let plan = coordinator
-            .plan(build_candidate(&overrides).await)
-            .await
-            .unwrap();
-        let token = coordinator.apply(plan).await.unwrap();
-        secrets.bind_token(&token).await.unwrap();
-        let secret_path = directory.path().join("wifi/psk/wlan0");
-        std::fs::remove_file(&secret_path).unwrap();
-        std::fs::create_dir(&secret_path).unwrap();
-
-        assert!(coordinator.rollback_with_token(&token).await.is_err());
-        assert_eq!(
-            coordinator.status().await,
-            CoordinatorStatus::RollbackFailed
-        );
-        assert!(coordinator.commit(&token).await.is_err());
-        assert!(secrets
-            .unresolved_after_committed_cleanup(None)
-            .await
-            .unwrap());
-
-        std::fs::remove_dir(&secret_path).unwrap();
-        coordinator.rollback_with_token(&token).await.unwrap();
-        assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
-        assert!(!secrets
-            .unresolved_after_committed_cleanup(None)
-            .await
-            .unwrap());
-    }
-
-    #[tokio::test]
-    async fn provisioning_apply_failure_restores_unbound_secret_before_compensation() {
-        let fake = FakeSubsystems::new();
-        let (coordinator, overrides, directory) = coordinator_with(fake.clone()).await;
-        let secrets = stage_test_secret(directory.path()).await;
-        *fake.rollback_secret.lock().unwrap() = Some(directory.path().to_path_buf());
-        fake.fail_apply("apply_routes");
-        let plan = coordinator
-            .plan(build_candidate(&overrides).await)
-            .await
-            .unwrap();
-
-        assert!(coordinator.apply(plan).await.is_err());
-        assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
-        assert!(!secrets
-            .unresolved_after_committed_cleanup(None)
-            .await
-            .unwrap());
-    }
-
-    #[tokio::test]
-    async fn timeout_rolls_back_uncommitted_transaction() {
-        let fake = FakeSubsystems::new();
-        let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
-        let candidate = build_candidate(&overrides).await;
-        let plan = coordinator.plan(candidate).await.expect("plan");
-        coordinator.apply(plan).await.expect("apply");
-        assert_eq!(coordinator.status().await, CoordinatorStatus::Pending);
-
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
-        assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
-        assert_eq!(overrides.committed_revision().await, 0);
-    }
-
-    #[tokio::test]
-    async fn timeout_does_not_roll_back_an_already_committed_transaction() {
-        let fake = FakeSubsystems::new();
-        let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
-        let candidate = build_candidate(&overrides).await;
-        let plan = coordinator.plan(candidate).await.expect("plan");
-        coordinator.apply(plan).await.expect("apply");
-        coordinator
-            .commit(&coordinator.pending_token().await.unwrap_or_default())
-            .await
-            .expect("commit before timeout");
-
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
-        assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
-        assert_eq!(overrides.committed_revision().await, 1);
-        assert!(!fake
-            .events()
-            .iter()
-            .any(|event| event.starts_with("rollback_")));
-    }
-
-    #[tokio::test]
-    async fn rollback_restores_router_ownership_from_committed_intent() {
-        let fake = FakeSubsystems::new();
-        let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
-
-        let initial = build_candidate(&overrides).await;
-        let initial_plan = coordinator.plan(initial).await.expect("initial plan");
-        let initial_token = coordinator.apply(initial_plan).await.expect("initial apply");
-        coordinator.commit(&initial_token).await.expect("initial commit");
-
-        let expected = overrides
-            .build_candidate(&RouterIntentProposal::new())
-            .await
-            .expect("committed candidate")
-            .desired()
-            .interfaces
-            .iter()
-            .map(|entry| entry.name.clone())
-            .collect::<Vec<_>>();
-
-        let candidate = overrides
-            .build_candidate(&RouterIntentProposal::new().set_interface(
-                "lan1",
-                output_interface("192.168.20.1/24", 100, 150),
-                false,
-            ))
-            .await
-            .expect("candidate with extra interface");
-        let plan = coordinator.plan(candidate).await.expect("plan");
-        coordinator.apply(plan).await.expect("apply");
-        coordinator.rollback().await.expect("rollback");
-
-        assert_eq!(fake.retained().last(), Some(&expected));
-    }
-
-    #[tokio::test]
-    async fn apply_failure_restores_router_ownership_from_committed_intent() {
-        let fake = FakeSubsystems::new();
-        let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
-
-        let initial = build_candidate(&overrides).await;
-        let initial_plan = coordinator.plan(initial).await.expect("initial plan");
-        let initial_token = coordinator.apply(initial_plan).await.expect("initial apply");
-        coordinator.commit(&initial_token).await.expect("initial commit");
-
-        let expected = overrides
-            .build_candidate(&RouterIntentProposal::new())
-            .await
-            .expect("committed candidate")
-            .desired()
-            .interfaces
-            .iter()
-            .map(|entry| entry.name.clone())
-            .collect::<Vec<_>>();
-
-        let candidate = overrides
-            .build_candidate(&RouterIntentProposal::new().set_interface(
-                "lan1",
-                output_interface("192.168.20.1/24", 100, 150),
-                false,
-            ))
-            .await
-            .expect("candidate with extra interface");
-        let plan = coordinator.plan(candidate).await.expect("plan");
-        fake.fail_apply("apply_dhcp");
-        coordinator.apply(plan).await.expect_err("apply must fail");
-
-        assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
-        assert_eq!(fake.retained().last(), Some(&expected));
-    }
-
-    #[tokio::test]
-    async fn incomplete_rollback_enters_recovery_state_and_can_be_retried() {
-        let fake = FakeSubsystems::new();
-        let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
-        let candidate = build_candidate(&overrides).await;
-        let plan = coordinator.plan(candidate).await.expect("plan");
-        coordinator.apply(plan).await.expect("apply");
-
-        fake.fail_rollback("rollback_dhcp");
-        let error = coordinator
-            .rollback()
-            .await
-            .expect_err("partial rollback failure");
-        assert!(error.to_string().contains("rollback_dhcp"));
-        assert_eq!(
-            coordinator.status().await,
-            CoordinatorStatus::RollbackFailed
-        );
-        let failure = coordinator
-            .rollback_failure()
-            .await
-            .expect("recorded failure");
-        assert!(failure.failures.iter().any(|f| f.contains("rollback_dhcp")));
-
-        let blocked_candidate = build_candidate(&overrides).await;
-        let blocked_plan = coordinator
-            .plan(blocked_candidate)
-            .await
-            .expect("plan during recovery");
-        let apply_error = coordinator
-            .apply(blocked_plan)
-            .await
-            .expect_err("apply must be blocked during recovery");
-        assert!(apply_error.to_string().contains("recovery state"));
-
-        *fake.rollback_fail.lock().unwrap() = None;
-        coordinator.rollback().await.expect("retry rollback");
-        assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
-    }
-
-    #[tokio::test]
-    async fn apply_failure_leaves_coordinator_idle() {
-        let fake = FakeSubsystems::new();
-        let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
-        let candidate = build_candidate(&overrides).await;
-        let plan = coordinator.plan(candidate).await.expect("plan");
-
-        fake.fail_apply("apply_dhcp");
-        let error = coordinator.apply(plan).await.expect_err("apply must fail");
-        assert!(error.to_string().contains("injected apply_dhcp failure"));
-        assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
-    }
-}
+mod tests;

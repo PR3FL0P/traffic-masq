@@ -10,7 +10,9 @@ pub(super) struct ProvisioningSecretAvailability {
     pub(super) output_pending: bool,
 }
 
-pub(super) fn provisioning_desired(request: &RouterProvisioningRequest) -> RouterProvisioningDesired {
+pub(super) fn provisioning_desired(
+    request: &RouterProvisioningRequest,
+) -> RouterProvisioningDesired {
     RouterProvisioningDesired {
         uplink: ProvisioningUplink {
             interface: request.uplink.interface.clone(),
@@ -220,7 +222,9 @@ pub(super) fn classify_provisioning_derivation_error(
     }
 }
 
-pub(super) fn classify_provisioning_transaction_error(error: &anyhow::Error) -> RouterProvisioningErrorDetail {
+pub(super) fn classify_provisioning_transaction_error(
+    error: &anyhow::Error,
+) -> RouterProvisioningErrorDetail {
     if let Some(conflict) = error.downcast_ref::<CoordinatorConflict>() {
         return match conflict {
             CoordinatorConflict::TransactionPending => {

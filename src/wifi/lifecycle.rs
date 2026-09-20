@@ -53,9 +53,8 @@ impl RetryState {
 
     pub(crate) fn respawn_failed(&mut self, base_seconds: u64, error: &str) {
         self.last_failure = Some(error.to_string());
-        self.next_restart_earliest = Some(
-            Instant::now() + backoff_duration(base_seconds, self.consecutive_failures),
-        );
+        self.next_restart_earliest =
+            Some(Instant::now() + backoff_duration(base_seconds, self.consecutive_failures));
     }
 }
 
@@ -71,6 +70,7 @@ pub(crate) enum OwnershipOutcome {
     DigestMismatch(PersistedWifiRecord),
 }
 
+/// Retry a readiness probe until it succeeds or the timeout expires.
 pub(crate) async fn wait_until_ready<F, Fut>(timeout: Duration, mut probe: F) -> bool
 where
     F: FnMut() -> Fut,
@@ -108,7 +108,10 @@ where
     // exact private config-path argument. Never guess when more than one
     // process matches.
     if let Some(pending) = record.clone().filter(|record| record.pid == 0) {
-        match process.pids_with_config_path(kind, &pending.config_path).await {
+        match process
+            .pids_with_config_path(kind, &pending.config_path)
+            .await
+        {
             Ok(pids) if pids.is_empty() => {
                 store.clear().await?;
                 record = None;
@@ -142,7 +145,10 @@ where
         let Some(record) = record else {
             return Ok(OwnershipOutcome::Absent);
         };
-        return match process.cmdline_matches_kind(record.pid, kind, &record.config_path).await {
+        return match process
+            .cmdline_matches_kind(record.pid, kind, &record.config_path)
+            .await
+        {
             Ok(true) => Ok(OwnershipOutcome::UnreachableOwned(record)),
             Ok(false) => {
                 // The durable PID/config proof is stale. Only now is it safe to
@@ -269,6 +275,8 @@ pub(crate) async fn preflight_binary(
     })
 }
 
+/// Send SIGTERM and wait for exit, escalating to SIGKILL after the grace period.
+/// Treat an absent process as stopped; report failure if it survives the kill deadline.
 pub(crate) async fn graceful_stop(
     process: &dyn SupervisedProcess,
     pid: u32,
@@ -316,6 +324,7 @@ pub(crate) async fn graceful_stop(
     }
 }
 
+/// Compute a bounded exponential restart delay from the consecutive failure count.
 pub(crate) fn backoff_duration(base_seconds: u64, consecutive_failures: u32) -> Duration {
     let multiplier = 1u64.checked_shl(consecutive_failures.saturating_sub(1));
     let seconds = multiplier
@@ -324,6 +333,7 @@ pub(crate) fn backoff_duration(base_seconds: u64, consecutive_failures: u32) -> 
     Duration::from_secs(seconds).min(BACKOFF_CEILING)
 }
 
+/// Atomically write a runtime configuration with private file permissions off the async executor.
 pub(crate) async fn write_private_config(path: &Path, text: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -362,7 +372,9 @@ pub(crate) async fn cleanup_unconfigured_records(
         }
 
         let pid = if record.pid == 0 {
-            let pids = process.pids_with_config_path(kind, &record.config_path).await?;
+            let pids = process
+                .pids_with_config_path(kind, &record.config_path)
+                .await?;
             match pids.as_slice() {
                 [] => None,
                 [pid] => Some(*pid),
@@ -399,7 +411,10 @@ pub(crate) async fn cleanup_unconfigured_records(
 /// A durable PID, or a write-ahead launch intent that resolves to exactly one
 /// process, plus its exact kind/config argument is the ownership proof. Stale
 /// records are cleared without signalling a process that no longer matches.
-pub(crate) async fn stop_recorded_interface(state_dir: &Path, interface: &str) -> anyhow::Result<()> {
+pub(crate) async fn stop_recorded_interface(
+    state_dir: &Path,
+    interface: &str,
+) -> anyhow::Result<()> {
     let process = crate::wifi::process::TokioSupervisedProcess::new();
     for kind in [
         WifiProcessKind::AccessPoint,
@@ -409,7 +424,9 @@ pub(crate) async fn stop_recorded_interface(state_dir: &Path, interface: &str) -
         let store = WifiRecordStore::new(kind, state_dir.join("wifi"), interface);
         if let Some(record) = store.load().await? {
             let pid = if record.pid == 0 {
-                let pids = process.pids_with_config_path(kind, &record.config_path).await?;
+                let pids = process
+                    .pids_with_config_path(kind, &record.config_path)
+                    .await?;
                 match pids.as_slice() {
                     [] => None,
                     [pid] => Some(*pid),

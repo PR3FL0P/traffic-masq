@@ -53,6 +53,7 @@ impl std::fmt::Debug for ApiClient {
 }
 
 impl ApiClient {
+    /// Create an unauthenticated Unix-socket client; clones share authentication state.
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             socket_path: socket_path.into(),
@@ -60,6 +61,7 @@ impl ApiClient {
         }
     }
 
+    /// Clear local credentials without contacting the server.
     pub(crate) async fn forget_authentication(&self) {
         *self.session.write().await = None;
     }
@@ -68,6 +70,7 @@ impl ApiClient {
         self.session.read().await.clone()
     }
 
+    /// Install cached credentials locally; the next request still requires server validation.
     pub(crate) async fn restore_authentication(&self, session: ClientAuthentication) {
         *self.session.write().await = Some(session);
     }
@@ -76,6 +79,7 @@ impl ApiClient {
         &self.socket_path
     }
 
+    /// Query whether the daemon has an initialized device password.
     pub async fn auth_initialized(&self) -> Result<bool> {
         let response = self
             .send(Method::GET, &format!("{API_PREFIX}/auth/status"), None)
@@ -86,6 +90,7 @@ impl ApiClient {
         Ok(status.initialized)
     }
 
+    /// Initialize the device password and cache the returned authenticated session.
     pub async fn initialize(&self, password: &str) -> Result<LoginSession> {
         let body = serialize_json(&PasswordRequest { password })?;
         let response = self
@@ -102,6 +107,7 @@ impl ApiClient {
         Ok(session)
     }
 
+    /// Authenticate with the device password and share the returned session across client clones.
     pub async fn login(&self, password: &str) -> Result<LoginSession> {
         let body = serialize_json(&LoginRequest {
             password,
@@ -122,6 +128,7 @@ impl ApiClient {
         Ok(session)
     }
 
+    /// Change the device password and discard local credentials after server success.
     pub async fn change_password(&self, current_password: &str, new_password: &str) -> Result<()> {
         let body = serialize_json(&ChangePasswordRequest {
             current_password,
@@ -139,6 +146,7 @@ impl ApiClient {
         Ok(())
     }
 
+    /// Ask the daemon to revoke this session and clear local credentials even if the request fails.
     pub async fn logout(&self) -> Result<()> {
         let result = match self
             .send(Method::POST, &format!("{API_PREFIX}/auth/logout"), None)
@@ -152,10 +160,13 @@ impl ApiClient {
         result
     }
 
+    /// Report whether local credentials exist; this does not verify server-side session validity.
     pub async fn is_authenticated(&self) -> bool {
         self.session.read().await.is_some()
     }
 
+    /// Translate a control request to REST, send it, and decode the typed response.
+    /// Transport, HTTP status, and response decoding failures are returned to the caller.
     pub async fn request(
         &self,
         request: &crate::api::model::Request,
@@ -176,11 +187,14 @@ impl ApiClient {
         serde_json::from_slice(&body).context("failed to decode response from the API")
     }
 
+    /// Send an HTTP request with the default ten-second deadline.
     async fn send(&self, method: Method, path: &str, body: Option<Vec<u8>>) -> Result<RawResponse> {
         self.send_with_timeout(method, path, body, std::time::Duration::from_secs(10))
             .await
     }
 
+    /// Bound request duration and discard credentials on an unauthorized response.
+    /// A timeout does not prove the server-side operation was cancelled.
     async fn send_with_timeout(
         &self,
         method: Method,
@@ -657,6 +671,18 @@ fn map_request(request: &crate::api::model::Request) -> Result<RestRequest> {
             body: None,
             synthesize_pong: false,
         },
+        Request::GetVpnConfig => RestRequest {
+            method: Method::GET,
+            path: format!("{API_PREFIX}/vpn/config"),
+            body: None,
+            synthesize_pong: false,
+        },
+        Request::SetVpnEnabled { enabled } => RestRequest {
+            method: Method::PUT,
+            path: format!("{API_PREFIX}/vpn/config"),
+            body: Some(serialize_json(&serde_json::json!({ "enabled": enabled }))?),
+            synthesize_pong: false,
+        },
         Request::VpnStatus => RestRequest {
             method: Method::GET,
             path: format!("{API_PREFIX}/vpn/status"),
@@ -940,6 +966,7 @@ fn into_success_body(response: RawResponse) -> Result<Bytes> {
     )
 }
 
+/// Percent-encode a value as one URL path segment so reserved bytes cannot alter routing.
 fn encode_path_segment(segment: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
@@ -957,218 +984,4 @@ fn encode_path_segment(segment: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::api::model::Request;
-
-    #[tokio::test]
-    async fn silent_api_times_out_and_closes_connection() {
-        use tokio::io::AsyncReadExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("api.sock");
-        let listener = tokio::net::UnixListener::bind(&path).unwrap();
-        let client = ApiClient::new(path);
-        let request = tokio::spawn(async move {
-            client
-                .send_with_timeout(
-                    Method::GET,
-                    "/api/v1/status",
-                    None,
-                    std::time::Duration::from_millis(50),
-                )
-                .await
-        });
-        let (mut peer, _) = listener.accept().await.unwrap();
-        assert!(request
-            .await
-            .unwrap()
-            .err()
-            .expect("request timeout")
-            .to_string()
-            .contains("timed out"));
-        tokio::task::yield_now().await;
-        let mut bytes = Vec::new();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            peer.read_to_end(&mut bytes),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    }
-
-    #[test]
-    fn percent_encodes_path_segments() {
-        assert_eq!(encode_path_segment("eth0.100-guest_~"), "eth0.100-guest_~");
-        assert_eq!(encode_path_segment("vlan/guest %"), "vlan%2Fguest%20%25");
-        assert_eq!(encode_path_segment("é"), "%C3%A9");
-    }
-
-    #[test]
-    fn maps_ping_to_status_and_synthesizes_pong() {
-        let mapped = map_request(&Request::Ping).expect("ping should map");
-
-        assert_eq!(mapped.method, Method::GET);
-        assert_eq!(mapped.path, "/api/v1/status");
-        assert!(mapped.body.is_none());
-        assert!(mapped.synthesize_pong);
-    }
-
-    #[test]
-    fn maps_all_dhcp_client_paths_without_using_server_dhcp_routes() {
-        let cases = [
-            (
-                Request::GetDhcpClient {
-                    interface: "wan/0".into(),
-                },
-                Method::GET,
-                "/api/v1/dhcp-client/wan%2F0",
-            ),
-            (
-                Request::ConfigureDhcpClient {
-                    interface: "wan/0".into(),
-                    config: Default::default(),
-                },
-                Method::PUT,
-                "/api/v1/dhcp-client/wan%2F0",
-            ),
-            (
-                Request::DisableDhcpClient {
-                    interface: "wan/0".into(),
-                },
-                Method::DELETE,
-                "/api/v1/dhcp-client/wan%2F0",
-            ),
-            (
-                Request::RenewDhcpClient {
-                    interface: "wan/0".into(),
-                },
-                Method::POST,
-                "/api/v1/dhcp-client/wan%2F0/renew",
-            ),
-            (
-                Request::ReleaseDhcpClient {
-                    interface: "wan/0".into(),
-                },
-                Method::POST,
-                "/api/v1/dhcp-client/wan%2F0/release",
-            ),
-        ];
-        for (request, method, path) in cases {
-            let mapped = map_request(&request).expect("DHCP client request should map");
-            assert_eq!(mapped.method, method);
-            assert_eq!(mapped.path, path);
-            assert!(mapped.path.contains("dhcp-client"));
-            assert!(!mapped.path.starts_with("/api/v1/dhcp/"));
-        }
-    }
-
-    #[test]
-    fn maps_and_encodes_wifi_client_scan() {
-        let mapped = map_request(&Request::WifiClientScan {
-            interface: "wlan/guest".to_string(),
-        })
-        .expect("scan should map");
-
-        assert_eq!(mapped.method, Method::POST);
-        assert_eq!(mapped.path, "/api/v1/wifi-client/wlan%2Fguest/scan");
-        assert!(mapped.body.is_none());
-        assert!(!mapped.synthesize_pong);
-    }
-
-    #[test]
-    fn maps_provisioning_paths_under_the_existing_router_surface() {
-        use crate::api::model::{
-            ProvisioningOutputRequest, ProvisioningUplinkRequest, RouterProvisioningApplyRequest,
-            RouterProvisioningPreviewRequest, RouterProvisioningRequest,
-        };
-
-        let provisioning = RouterProvisioningRequest {
-            uplink: ProvisioningUplinkRequest {
-                interface: "wlan-up".to_string(),
-                ssid: "upstream".to_string(),
-                country_code: None,
-                security: Default::default(),
-            },
-            output: ProvisioningOutputRequest {
-                interface: "wlan-out".to_string(),
-                ssid: "traffic-masq".to_string(),
-                country_code: None,
-                band: Default::default(),
-                channel: 6,
-                channel_width: Default::default(),
-                security: Default::default(),
-                hidden: false,
-                client_isolation: false,
-                max_stations: 32,
-            },
-            downstream: Default::default(),
-            allow_management_change: false,
-        };
-
-        let preview = map_request(&Request::RouterProvisioningPreview {
-            request: RouterProvisioningPreviewRequest {
-                provisioning: provisioning.clone(),
-                uplink_secret_pending: true,
-                output_secret_pending: true,
-            },
-        })
-        .expect("preview should map");
-        assert_eq!(preview.method, Method::POST);
-        assert_eq!(preview.path, "/api/v1/router/provisioning/preview");
-        let encoded = String::from_utf8(preview.body.expect("preview body")).expect("utf-8 body");
-        assert!(!encoded.contains("passphrase"), "{encoded}");
-
-        let apply = map_request(&Request::RouterProvisioningApply {
-            request: RouterProvisioningApplyRequest {
-                provisioning,
-                uplink_passphrase: Some("upstream-secret".to_string()),
-                output_passphrase: None,
-            },
-        })
-        .expect("apply should map");
-        assert_eq!(apply.method, Method::POST);
-        assert_eq!(apply.path, "/api/v1/router/provisioning/apply");
-        assert!(apply.body.is_some());
-
-        let status = map_request(&Request::RouterProvisioningStatus).expect("status should map");
-        assert_eq!(status.method, Method::GET);
-        assert_eq!(status.path, "/api/v1/router/provisioning/status");
-        assert!(status.body.is_none());
-
-        let repair = map_request(&Request::RouterProvisioningRepair).expect("repair should map");
-        assert_eq!(repair.method, Method::POST);
-        assert_eq!(repair.path, "/api/v1/router/provisioning/repair");
-        assert!(repair.body.is_none());
-    }
-
-    #[test]
-    fn maps_and_encodes_mutation_tokens() {
-        let mapped = map_request(&Request::CommitNetworkChange {
-            token: "pending/change".to_string(),
-        })
-        .expect("commit should map");
-
-        assert_eq!(mapped.method, Method::POST);
-        assert_eq!(mapped.path, "/api/v1/network-transactions/commit");
-        assert!(mapped.body.is_some());
-        assert!(!mapped.synthesize_pong);
-    }
-
-    #[test]
-    fn maps_route_management_requests() {
-        let list_routes = map_request(&Request::ListRoutes {
-            include_local_table: true,
-        })
-        .expect("list_routes should map");
-        assert_eq!(list_routes.method, Method::GET);
-        assert_eq!(list_routes.path, "/api/v1/routes?include_local_table=true");
-        assert!(list_routes.body.is_none());
-
-        let get_router_cfg =
-            map_request(&Request::GetRouterConfig).expect("get_router_config should map");
-        assert_eq!(get_router_cfg.method, Method::GET);
-        assert_eq!(get_router_cfg.path, "/api/v1/router/config");
-        assert!(get_router_cfg.body.is_none());
-    }
-}
+mod tests;

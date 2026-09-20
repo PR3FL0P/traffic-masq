@@ -1,8 +1,6 @@
-use super::*;
-use super::dhcp::{
-    default_dhcp_settings, dhcp_edit_request_to_config,
-};
+use super::dhcp::{default_dhcp_settings, dhcp_edit_request_to_config};
 use super::runtime::compensation_message;
+use super::*;
 
 impl ControlService {
     pub(super) async fn wifi_status(&self) -> Response {
@@ -161,10 +159,14 @@ impl ControlService {
                 message: "AP provisioning requires a managed output interface".to_string(),
             });
         }
-        if let Err(error) = wifi.preflight_binary().await { return classify_wifi_error(error); }
+        if let Err(error) = wifi.preflight_binary().await {
+            return classify_wifi_error(error);
+        }
         let mut target = previous_interface.clone();
         target.wifi = Some(wifi_edit_request_to_config(settings));
-        if let (Some(next), Some(previous)) = (target.wifi.as_mut(), previous_interface.wifi.as_ref()) {
+        if let (Some(next), Some(previous)) =
+            (target.wifi.as_mut(), previous_interface.wifi.as_ref())
+        {
             next.passphrase_file = previous.passphrase_file.clone();
         }
         if configure_dhcp {
@@ -176,31 +178,59 @@ impl ControlService {
         }
         let spec = match WifiApSpec::from_interface_config(&interface, &target) {
             Ok(Some(spec)) => spec,
-            Ok(None) => return wifi_error(WifiErrorDetail::InvalidSpec { message: "AP is disabled".into() }),
-            Err(error) => return wifi_error(WifiErrorDetail::InvalidSpec { message: error.to_string() }),
+            Ok(None) => {
+                return wifi_error(WifiErrorDetail::InvalidSpec {
+                    message: "AP is disabled".into(),
+                })
+            }
+            Err(error) => {
+                return wifi_error(WifiErrorDetail::InvalidSpec {
+                    message: error.to_string(),
+                })
+            }
         };
-        let dhcp = match DhcpServiceSpec::from_interface_config(&interface, &target, self.base_config.dhcp.default_lease_seconds) {
+        let dhcp = match DhcpServiceSpec::from_interface_config(
+            &interface,
+            &target,
+            self.base_config.dhcp.default_lease_seconds,
+        ) {
             Ok(spec) => spec,
             Err(error) => return super::runtime::error_response(error),
         };
         // The legacy endpoint is an immediate commit, but its runtime and
         // secret changes use the same durable interface transaction protocol.
-        let pending = match self.transactions.apply_with_passphrase(
-            &interface, &target, Some(&previous_interface), Some(previous_interface.role), false, staged_passphrase,
-        ).await {
+        let pending = match self
+            .transactions
+            .apply_with_passphrase(
+                &interface,
+                &target,
+                Some(&previous_interface),
+                Some(previous_interface.role),
+                false,
+                staged_passphrase,
+            )
+            .await
+        {
             Ok(pending) => pending,
             Err(error) => return super::runtime::error_response(error),
         };
-        let result = self.transactions.commit_with(&pending.token, |name, config, allow| {
-            self.overrides.commit_interface(name, config, allow, &pending.token)
-        }).await;
+        let result = self
+            .transactions
+            .commit_with(&pending.token, |name, config, allow| {
+                self.overrides
+                    .commit_interface(name, config, allow, &pending.token)
+            })
+            .await;
         if let Err(error) = result {
             let restored = self.transactions.rollback(&pending.token).await.map(|_| ());
-            return wifi_error(WifiErrorDetail::Other { message: compensation_message(
-                "failed to commit AP provisioning", &error, restored,
-            ) });
+            return wifi_error(WifiErrorDetail::Other {
+                message: compensation_message("failed to commit AP provisioning", &error, restored),
+            });
         }
-        Response::WifiAccessPointProvisioned { spec, dhcp: if configure_dhcp { dhcp } else { None } }
+        Response::WifiAccessPointProvisioned {
+            spec,
+            dhcp: if configure_dhcp { dhcp } else { None },
+        }
     }
 
     pub(super) async fn disable_wifi(&self, interface: String) -> Response {

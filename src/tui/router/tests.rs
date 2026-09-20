@@ -1,4 +1,3 @@
-use super::*;
 use super::controller::router_plan_needed;
 use super::editor::{
     cycle_output_interface, delete_selected_route, manual_route_delete_command, save_route_editor,
@@ -9,6 +8,7 @@ use super::view::{
     describe_router_error, format_coordinator_status, format_forwarding_status, format_owner_badge,
     health_report_details, router_action_buttons, summarize_uplink,
 };
+use super::*;
 use crate::config::InterfaceConfig;
 use crate::firewall::{RouterDataplaneDesired, RouterDataplanePlan, RouterDataplaneSnapshot};
 use std::net::Ipv4Addr;
@@ -25,6 +25,30 @@ fn dhcp_spec(interface: &str) -> DhcpServiceSpec {
         dns_servers: vec![Ipv4Addr::new(8, 8, 8, 8)],
         lease_seconds: 3_600,
     }
+}
+
+#[tokio::test]
+async fn routing_toggle_stages_configuration_for_plan_review() {
+    let client = ApiClient::new("/socket-that-must-not-be-opened");
+    let mut app = TuiApp {
+        screen: Screen::Router,
+        ..Default::default()
+    };
+    app.router.topology.loaded = true;
+    handle_router_key(&mut app, KeyCode::Char('e'), &client).await;
+    assert!(app.router.staged);
+    assert!(app.router.proposed_router_config.enabled);
+    assert!(
+        !app.router.enabled,
+        "toggle must not skip plan/apply/commit"
+    );
+    assert_eq!(
+        app.screen,
+        Screen::Router,
+        "failed preview must not proceed to apply"
+    );
+    handle_router_key(&mut app, KeyCode::Char('e'), &client).await;
+    assert!(!app.router.proposed_router_config.enabled);
 }
 
 #[test]
@@ -47,12 +71,12 @@ fn router_action_cycles_forward_and_backward() {
     );
     assert_eq!(
         action.next().next().next().next().next().next().next(),
-        RouterAction::AddRoute
+        RouterAction::ToggleEnabled
     );
 
-    assert_eq!(action.prev(), RouterAction::Topology);
-    assert_eq!(action.prev().prev(), RouterAction::Refresh);
-    assert_eq!(action.prev().prev().prev(), RouterAction::ShareViaRoute);
+    assert_eq!(action.prev(), RouterAction::ToggleEnabled);
+    assert_eq!(action.prev().prev(), RouterAction::Topology);
+    assert_eq!(action.prev().prev().prev(), RouterAction::Refresh);
 }
 
 #[test]
@@ -602,7 +626,7 @@ async fn empty_router_actions_require_tab_and_clamp_at_the_last() {
         handle_router_key(&mut app, KeyCode::Down, &client).await;
         assert_eq!(app.router.focus, RouterFocus::Actions);
     }
-    assert_eq!(app.router.action, RouterAction::Topology);
+    assert_eq!(app.router.action, RouterAction::ToggleEnabled);
 
     handle_router_key(&mut app, KeyCode::Tab, &client).await;
     assert_eq!(app.router.focus, RouterFocus::RouteTable);
@@ -629,10 +653,10 @@ fn router_buttons_wrap_and_remain_visible_at_supported_sizes() {
                 .draw(|frame| super::super::render(frame, &mut app, false))
                 .unwrap();
             let action_buttons = if width >= 112 {
-                assert_eq!(app.ui.buttons.len(), 8, "{width}x{height}");
+                assert_eq!(app.ui.buttons.len(), 9, "{width}x{height}");
                 &app.ui.buttons[1..]
             } else {
-                assert_eq!(app.ui.buttons.len(), 7, "{width}x{height}");
+                assert_eq!(app.ui.buttons.len(), 8, "{width}x{height}");
                 &app.ui.buttons[..]
             };
             let buffer = terminal.backend().buffer();

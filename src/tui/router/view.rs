@@ -15,7 +15,7 @@ pub(super) fn format_owner_badge(owner: RouteOwner) -> Span<'static> {
     }
 }
 
-pub(super) fn router_action_buttons(router: &RouterData) -> [(RouterAction, &'static str); 7] {
+pub(super) fn router_action_buttons(router: &RouterData) -> [(RouterAction, &'static str); 8] {
     let manual_delete = router
         .routes
         .get(router.selected_route)
@@ -35,10 +35,21 @@ pub(super) fn router_action_buttons(router: &RouterData) -> [(RouterAction, &'st
         (RouterAction::ShareViaRoute, "[Share via: n]"),
         (RouterAction::Refresh, "[Refresh]"),
         (RouterAction::Topology, "[Topology: t]"),
+        (
+            RouterAction::ToggleEnabled,
+            if router.proposed_router_config.enabled {
+                "[Disable routing: e]"
+            } else {
+                "[Enable routing: e]"
+            },
+        ),
     ]
 }
 
-pub(super) fn router_button_positions(buttons: &[(RouterAction, &str)], width: u16) -> Vec<(u16, u16)> {
+pub(super) fn router_button_positions(
+    buttons: &[(RouterAction, &str)],
+    width: u16,
+) -> Vec<(u16, u16)> {
     let (mut x, mut y) = (0, 0);
     buttons
         .iter()
