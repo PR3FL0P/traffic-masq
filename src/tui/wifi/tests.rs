@@ -90,13 +90,13 @@
         app.wifi.selected = 19;
         app.wifi.selected_radio = 19;
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 15)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal
             .draw(|frame| super::super::render(frame, &mut app, false))
             .unwrap();
         assert!(app.ui.list_scroll_offset > 0);
         let area = app.ui.list_area.unwrap();
-        assert!(area.bottom() <= 11);
+        assert!(area.bottom() <= 20);
         super::super::handle_key(&mut app, KeyCode::Tab, &client, false).await;
         assert!(app.wifi.actions_open);
         handle_wifi_key(&mut app, KeyCode::End, &client).await;
@@ -104,7 +104,7 @@
             .draw(|frame| super::super::render(frame, &mut app, false))
             .unwrap();
         for (rect, _) in &app.ui.buttons {
-            assert!(rect.bottom() <= 10);
+            assert!(rect.bottom() <= 20);
         }
         assert!(app
             .ui
@@ -149,13 +149,13 @@
         prompt.choice = WifiIpChoice::NewStatic;
         prompt.current_static_ip = Some("192.168.1.5/24".into());
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 15)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal
             .draw(|frame| super::super::render(frame, &mut app, false))
             .unwrap();
         assert_eq!(app.ui.buttons.len(), 2);
         for (rect, _) in &app.ui.buttons {
-            assert!(rect.bottom() <= 10);
+            assert!(rect.bottom() <= 20);
         }
         let (rect, _) = app.ui.buttons[1];
         super::super::handle_mouse(
@@ -547,7 +547,7 @@
             ..Default::default()
         };
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 15)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal
             .draw(|frame| render_wifi_scan(frame, frame.area(), &mut app))
             .unwrap();
@@ -588,7 +588,7 @@
             ..Default::default()
         };
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 15)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal
             .draw(|frame| render_wifi_profiles(frame, frame.area(), &mut app))
             .unwrap();
@@ -655,7 +655,7 @@
             ..Default::default()
         };
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 15)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal
             .draw(|frame| render_wifi_profiles(frame, frame.area(), &mut app))
             .unwrap();

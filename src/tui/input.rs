@@ -1,6 +1,8 @@
 use crossterm::event::KeyCode;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Span;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use super::theme;
 
@@ -21,7 +23,41 @@ pub(crate) fn move_wrapped<T: Copy + PartialEq>(items: &[T], current: T, forward
     items[(index + step) % items.len()]
 }
 
+pub(crate) fn grapheme_count(text: &str) -> usize {
+    text.graphemes(true).count()
+}
+
+fn grapheme_byte_position(text: &str, index: usize) -> usize {
+    text.grapheme_indices(true)
+        .nth(index)
+        .map(|(byte, _)| byte)
+        .unwrap_or(text.len())
+}
+
+fn grapheme_byte_range(text: &str, index: usize) -> Option<std::ops::Range<usize>> {
+    let start = text.grapheme_indices(true).nth(index)?.0;
+    let end = text[start..]
+        .grapheme_indices(true)
+        .nth(1)
+        .map(|(relative, _)| start + relative)
+        .unwrap_or(text.len());
+    Some(start..end)
+}
+
+fn grapheme_cursor_after_byte(text: &str, byte: usize) -> usize {
+    if byte == 0 {
+        return 0;
+    }
+    for (index, (start, grapheme)) in text.grapheme_indices(true).enumerate() {
+        if byte <= start + grapheme.len() {
+            return index + 1;
+        }
+    }
+    grapheme_count(text)
+}
+
 /// Helper for editing text with a movable cursor, insertion, deletion, and navigation.
+/// Cursor indices are extended grapheme clusters, not UTF-8 bytes or Unicode scalars.
 pub(crate) struct TextEditor<'a> {
     pub value: &'a mut String,
     pub cursor: &'a mut usize,
@@ -29,56 +65,45 @@ pub(crate) struct TextEditor<'a> {
 
 impl<'a> TextEditor<'a> {
     pub fn new(value: &'a mut String, cursor: &'a mut usize) -> Self {
-        let char_count = value.chars().count();
-        if *cursor > char_count {
-            *cursor = char_count;
+        let count = grapheme_count(value);
+        if *cursor > count {
+            *cursor = count;
         }
         Self { value, cursor }
     }
 
     pub fn insert(&mut self, c: char) {
-        let char_count = self.value.chars().count();
-        let idx = (*self.cursor).min(char_count);
-        let byte_pos = self
-            .value
-            .char_indices()
-            .nth(idx)
-            .map(|(i, _)| i)
-            .unwrap_or(self.value.len());
+        let count = grapheme_count(self.value);
+        let index = (*self.cursor).min(count);
+        let byte_pos = grapheme_byte_position(self.value, index);
         self.value.insert(byte_pos, c);
-        *self.cursor += 1;
+        *self.cursor = grapheme_cursor_after_byte(self.value, byte_pos + c.len_utf8());
     }
 
     pub fn backspace(&mut self) -> bool {
-        if *self.cursor > 0 {
-            *self.cursor -= 1;
-            let byte_pos = self
-                .value
-                .char_indices()
-                .nth(*self.cursor)
-                .map(|(i, _)| i)
-                .unwrap_or(self.value.len());
-            self.value.remove(byte_pos);
-            true
-        } else {
-            false
+        if *self.cursor == 0 {
+            return false;
         }
+        let index = self.cursor.saturating_sub(1);
+        let Some(range) = grapheme_byte_range(self.value, index) else {
+            *self.cursor = grapheme_count(self.value);
+            return false;
+        };
+        self.value.replace_range(range, "");
+        *self.cursor = index;
+        true
     }
 
     pub fn delete(&mut self) -> bool {
-        let char_count = self.value.chars().count();
-        if *self.cursor < char_count {
-            let byte_pos = self
-                .value
-                .char_indices()
-                .nth(*self.cursor)
-                .map(|(i, _)| i)
-                .unwrap_or(self.value.len());
-            self.value.remove(byte_pos);
-            true
-        } else {
-            false
+        let count = grapheme_count(self.value);
+        if *self.cursor >= count {
+            return false;
         }
+        let Some(range) = grapheme_byte_range(self.value, *self.cursor) else {
+            return false;
+        };
+        self.value.replace_range(range, "");
+        true
     }
 
     pub fn move_left(&mut self) -> bool {
@@ -91,8 +116,8 @@ impl<'a> TextEditor<'a> {
     }
 
     pub fn move_right(&mut self) -> bool {
-        let char_count = self.value.chars().count();
-        if *self.cursor < char_count {
+        let count = grapheme_count(self.value);
+        if *self.cursor < count {
             *self.cursor += 1;
             true
         } else {
@@ -105,7 +130,7 @@ impl<'a> TextEditor<'a> {
     }
 
     pub fn move_end(&mut self) {
-        *self.cursor = self.value.chars().count();
+        *self.cursor = grapheme_count(self.value);
     }
 
     pub fn handle_key(&mut self, key: KeyCode) -> bool {
@@ -155,41 +180,70 @@ pub(crate) fn render_value_with_cursor(
         return vec![Span::styled(text.to_string(), base_style)];
     }
 
-    let char_count = text.chars().count();
-    let clamped_cursor = cursor.min(char_count);
+    const EDIT_WINDOW_CELLS: usize = 24;
+    let graphemes = text.graphemes(true).collect::<Vec<_>>();
+    let count = graphemes.len();
+    let cursor = cursor.min(count);
+    let cursor_width = if cursor < count {
+        UnicodeWidthStr::width(graphemes[cursor]).max(1)
+    } else {
+        1
+    };
+    let budget = EDIT_WINDOW_CELLS.saturating_sub(1).max(cursor_width);
+    let mut used = cursor_width;
+    let mut start = cursor;
+    while start > 0 {
+        let width = UnicodeWidthStr::width(graphemes[start - 1]);
+        if used.saturating_add(width) > budget {
+            break;
+        }
+        start -= 1;
+        used = used.saturating_add(width);
+    }
+    let mut end = if cursor < count { cursor + 1 } else { cursor };
+    while end < count {
+        let width = UnicodeWidthStr::width(graphemes[end]);
+        if used.saturating_add(width) > budget {
+            break;
+        }
+        used = used.saturating_add(width);
+        end += 1;
+    }
+    let local_cursor = cursor.saturating_sub(start);
+    let visible = &graphemes[start..end];
     let blink = is_cursor_blink_visible();
 
     let cursor_style = Style::default()
         .fg(theme::SELECTED_FG)
         .bg(theme::SELECTED_BG)
         .add_modifier(Modifier::BOLD);
-
     let mut spans = Vec::new();
-    let chars: Vec<char> = text.chars().collect();
+    if start > 0 {
+        spans.push(Span::styled("…", Style::default().fg(theme::MUTED)));
+    }
 
-    if clamped_cursor < char_count {
-        if clamped_cursor > 0 {
-            let before: String = chars[..clamped_cursor].iter().collect();
-            spans.push(Span::styled(before, base_style));
+    if cursor < count {
+        if local_cursor > 0 {
+            spans.push(Span::styled(visible[..local_cursor].concat(), base_style));
         }
-        let current: String = chars[clamped_cursor..=clamped_cursor].iter().collect();
         let style = if blink {
             cursor_style
         } else {
             base_style.add_modifier(Modifier::UNDERLINED)
         };
-        spans.push(Span::styled(current, style));
-        if clamped_cursor + 1 < char_count {
-            let after: String = chars[clamped_cursor + 1..].iter().collect();
-            spans.push(Span::styled(after, base_style));
+        spans.push(Span::styled(visible[local_cursor].to_string(), style));
+        if local_cursor + 1 < visible.len() {
+            spans.push(Span::styled(
+                visible[local_cursor + 1..].concat(),
+                base_style,
+            ));
         }
     } else {
-        if !text.is_empty() {
-            spans.push(Span::styled(text.to_string(), base_style));
+        if !visible.is_empty() {
+            spans.push(Span::styled(visible.concat(), base_style));
         }
-        let cursor_char = " ";
         let style = if blink { cursor_style } else { base_style };
-        spans.push(Span::styled(cursor_char.to_string(), style));
+        spans.push(Span::styled(" ".to_string(), style));
     }
 
     spans
@@ -197,7 +251,7 @@ pub(crate) fn render_value_with_cursor(
 
 /// Formats masked password text into Spans with cursor highlighting.
 pub(crate) fn render_masked_with_cursor(
-    char_count: usize,
+    grapheme_count: usize,
     cursor: usize,
     active: bool,
     mask_char: char,
@@ -205,25 +259,32 @@ pub(crate) fn render_masked_with_cursor(
 ) -> Vec<Span<'static>> {
     if !active {
         return vec![Span::styled(
-            mask_char.to_string().repeat(char_count),
+            mask_char.to_string().repeat(grapheme_count),
             base_style,
         )];
     }
 
-    let clamped_cursor = cursor.min(char_count);
+    const EDIT_WINDOW_CHARS: usize = 18;
+    let clamped_cursor = cursor.min(grapheme_count);
+    let start = clamped_cursor.saturating_sub(EDIT_WINDOW_CHARS.saturating_sub(1));
+    let end = (start + EDIT_WINDOW_CHARS).min(grapheme_count);
+    let local_cursor = clamped_cursor.saturating_sub(start);
+    let visible_count = end.saturating_sub(start);
     let blink = is_cursor_blink_visible();
 
     let cursor_style = Style::default()
         .fg(theme::SELECTED_FG)
         .bg(theme::SELECTED_BG)
         .add_modifier(Modifier::BOLD);
-
     let mut spans = Vec::new();
+    if start > 0 {
+        spans.push(Span::styled("…", Style::default().fg(theme::MUTED)));
+    }
 
-    if clamped_cursor < char_count {
-        if clamped_cursor > 0 {
+    if clamped_cursor < grapheme_count {
+        if local_cursor > 0 {
             spans.push(Span::styled(
-                mask_char.to_string().repeat(clamped_cursor),
+                mask_char.to_string().repeat(local_cursor),
                 base_style,
             ));
         }
@@ -233,24 +294,23 @@ pub(crate) fn render_masked_with_cursor(
             base_style.add_modifier(Modifier::UNDERLINED)
         };
         spans.push(Span::styled(mask_char.to_string(), style));
-        if clamped_cursor + 1 < char_count {
+        if local_cursor + 1 < visible_count {
             spans.push(Span::styled(
                 mask_char
                     .to_string()
-                    .repeat(char_count - clamped_cursor - 1),
+                    .repeat(visible_count - local_cursor - 1),
                 base_style,
             ));
         }
     } else {
-        if char_count > 0 {
+        if visible_count > 0 {
             spans.push(Span::styled(
-                mask_char.to_string().repeat(char_count),
+                mask_char.to_string().repeat(visible_count),
                 base_style,
             ));
         }
-        let cursor_char = " ";
         let style = if blink { cursor_style } else { base_style };
-        spans.push(Span::styled(cursor_char.to_string(), style));
+        spans.push(Span::styled(" ".to_string(), style));
     }
 
     spans
@@ -304,6 +364,42 @@ mod tests {
         ed.backspace();
         assert_eq!(ed.value, "café");
         assert_eq!(*ed.cursor, 3);
+    }
+
+    #[test]
+    fn text_editor_treats_combining_sequences_as_one_cursor_step() {
+        let mut val = String::from("e\u{301}x");
+        let mut cur = val.chars().count();
+        let mut ed = TextEditor::new(&mut val, &mut cur);
+
+        assert_eq!(*ed.cursor, 2);
+        ed.move_left();
+        assert_eq!(*ed.cursor, 1);
+        assert!(ed.backspace());
+        assert_eq!(ed.value, "x");
+        assert_eq!(*ed.cursor, 0);
+
+        ed.insert('e');
+        ed.insert('\u{301}');
+        assert_eq!(ed.value, "e\u{301}x");
+        assert_eq!(*ed.cursor, 1);
+    }
+
+    #[test]
+    fn active_long_values_keep_the_cursor_in_a_bounded_viewport() {
+        let spans = render_value_with_cursor(
+            "abcdefghijklmnopqrstuvwxyz0123456789",
+            36,
+            true,
+            Style::default(),
+        );
+        let rendered = spans.iter().fold(String::new(), |mut rendered, span| {
+            rendered.push_str(span.content.as_ref());
+            rendered
+        });
+        assert!(rendered.starts_with('…'));
+        assert!(rendered.ends_with(' '));
+        assert!(rendered.len() < 30);
     }
 
     #[test]

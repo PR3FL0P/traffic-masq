@@ -187,6 +187,7 @@ pub(super) async fn apply_wifi_static_ip(
                     // Retain the token and deadline so the user can inspect/roll back
                     // an ambiguous commit instead of losing the pending transaction.
                     app.pending = Some(change);
+                    app.pending_return_screen = Screen::Wifi;
                     app.screen = Screen::PendingChange;
                     app.push_message(LogLevel::Warn, format!("Static IP commit was not confirmed: {result:?}. Inspect pending state before retrying."));
                     false

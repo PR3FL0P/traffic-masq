@@ -173,7 +173,7 @@ pub(crate) fn render_vpn_policy(frame: &mut ratatui::Frame<'_>, area: Rect, app:
             .add_modifier(Modifier::BOLD),
     ));
     lines.push(Line::styled(
-        "Up/Down/j/k: move | Enter/Space: activate selected row | Esc: back",
+        "Up/Down: move | Enter: activate selected row | Esc: back",
         Style::default().fg(theme::MUTED),
     ));
     lines.push(Line::from(""));

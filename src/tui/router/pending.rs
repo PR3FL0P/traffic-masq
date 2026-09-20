@@ -1,7 +1,7 @@
 use super::*;
 
 pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
-    let Some(view) = &app.router_pending else {
+    let Some(view) = app.router_pending.as_mut() else {
         return;
     };
     let now = current_unix_time();
@@ -21,7 +21,7 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
         theme::BAD
     };
 
-    let mut lines = vec![
+    let mut detail_lines = vec![
         Line::styled(
             format!("Pending transaction: {}", view.token),
             Style::default()
@@ -29,40 +29,31 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
                 .add_modifier(Modifier::BOLD),
         ),
         Line::from(format!("Automatic rollback in: {remaining}s / {timeout}s")),
-        Line::from(""),
     ];
-
     if let Some(failures) = &view.rollback_failure {
-        lines.push(Line::styled(
+        detail_lines.push(Line::from(""));
+        detail_lines.push(Line::styled(
             "ROLLBACK FAILED — manual recovery required:",
             Style::default().fg(theme::BAD).add_modifier(Modifier::BOLD),
         ));
         for failure in failures {
-            lines.push(Line::styled(
+            detail_lines.push(Line::styled(
                 format!("  {failure}"),
                 Style::default().fg(theme::BAD),
             ));
         }
-        lines.push(Line::from(""));
     }
-
-    lines.push(Line::styled(
-        "Press Enter to COMMIT (persist changes).",
-        Style::default().fg(theme::GOOD),
-    ));
-    lines.push(Line::styled(
-        "Press Esc to ROLLBACK immediately.",
-        Style::default().fg(theme::WARN),
-    ));
-    lines.push(Line::from(""));
 
     let block = panel("Router change pending confirmation");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(8)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(4),
+        ])
         .split(inner);
 
     let gauge = Gauge::default()
@@ -72,39 +63,48 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
         .label(format!("{remaining}s"));
     frame.render_widget(gauge, chunks[0]);
 
-    for (slot, (label, is_commit)) in [
-        (ROUTER_PENDING_COMMIT_LABEL, true),
-        (ROUTER_PENDING_ROLLBACK_LABEL, false),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let button_text = format!("[{label}]");
-        let button_y = chunks[1].y + lines.len() as u16;
-        app.ui.buttons.push((
-            Rect {
-                x: chunks[1].x,
-                y: button_y,
-                width: button_text.len() as u16,
-                height: 1,
-            },
-            slot,
-        ));
-        let style = if is_commit {
+    let visible_rows = chunks[1].height.max(1) as usize;
+    view.max_scroll = detail_lines.len().saturating_sub(visible_rows);
+    view.scroll = view.scroll.min(view.max_scroll);
+    frame.render_widget(
+        Paragraph::new(detail_lines).scroll((view.scroll.min(u16::MAX as usize) as u16, 0)),
+        chunks[1],
+    );
+
+    let action_lines = vec![
+        Line::styled(
+            "[Commit]  persist changes (Enter)",
             Style::default()
                 .fg(theme::SELECTED_FG)
                 .bg(theme::GOOD)
-                .add_modifier(Modifier::BOLD)
-        } else {
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(
+            "[Rollback]  restore previous state (Esc)",
             Style::default()
                 .fg(theme::SELECTED_FG)
                 .bg(theme::WARN)
-                .add_modifier(Modifier::BOLD)
-        };
-        lines.push(Line::styled(button_text, style));
-    }
-
-    frame.render_widget(Paragraph::new(lines), chunks[1]);
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(
+            "Up/Down or PgUp/PgDn scrolls diagnostics",
+            Style::default().fg(theme::MUTED),
+        ),
+    ];
+    app.ui.buttons.push((
+        Rect::new(chunks[2].x, chunks[2].y, "[Commit]".len() as u16, 1),
+        0,
+    ));
+    app.ui.buttons.push((
+        Rect::new(
+            chunks[2].x,
+            chunks[2].y.saturating_add(1),
+            "[Rollback]".len() as u16,
+            1,
+        ),
+        1,
+    ));
+    frame.render_widget(Paragraph::new(action_lines), chunks[2]);
 }
 
 pub(super) fn router_pending_seconds_remaining(
@@ -118,6 +118,36 @@ pub(super) fn router_pending_seconds_remaining(
 
 pub(crate) async fn handle_router_pending_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
     match key {
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(view) = app.router_pending.as_mut() {
+                view.scroll = view.scroll.saturating_sub(1);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(view) = app.router_pending.as_mut() {
+                view.scroll = view.scroll.saturating_add(1).min(view.max_scroll);
+            }
+        }
+        KeyCode::PageUp => {
+            if let Some(view) = app.router_pending.as_mut() {
+                view.scroll = view.scroll.saturating_sub(10);
+            }
+        }
+        KeyCode::PageDown => {
+            if let Some(view) = app.router_pending.as_mut() {
+                view.scroll = view.scroll.saturating_add(10).min(view.max_scroll);
+            }
+        }
+        KeyCode::Home => {
+            if let Some(view) = app.router_pending.as_mut() {
+                view.scroll = 0;
+            }
+        }
+        KeyCode::End => {
+            if let Some(view) = app.router_pending.as_mut() {
+                view.scroll = view.max_scroll;
+            }
+        }
         KeyCode::Enter => finish_router_pending(app, client, true).await,
         KeyCode::Esc => finish_router_pending(app, client, false).await,
         _ => {}

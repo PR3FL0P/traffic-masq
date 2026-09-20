@@ -1,9 +1,9 @@
 use anyhow::Result;
 use crossterm::event::KeyCode;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Gauge, Paragraph};
 
 use crate::api::client::ApiClient;
 use crate::api::model::{InterfaceEditRequest, Request, Response};
@@ -58,7 +58,7 @@ pub(crate) struct InterfaceEditor {
 impl InterfaceEditor {
     pub(crate) fn reset_cursor(&mut self) {
         if self.field == InterfaceEditorField::Cidr {
-            self.cursor = self.cidr.chars().count();
+            self.cursor = super::input::grapheme_count(&self.cidr);
         } else {
             self.cursor = 0;
         }
@@ -325,7 +325,7 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
     }
     if editor.original_managed && !editor.managed {
         lines.push(Line::styled(
-            "Saving will remove traffic-masq-owned settings and stop managing this interface",
+            "Applying will remove traffic-masq-owned settings and stop managing this interface",
             Style::default().fg(theme::WARN),
         ));
     }
@@ -339,7 +339,7 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
     ));
     lines.push(Line::from(""));
 
-    const SAVE_LABEL: &str = "Review changes";
+    const SAVE_LABEL: &str = "[Plan / Apply]";
     let button_row_index = lines.len() as u16;
     lines.push(action_row(SAVE_LABEL, InterfaceEditorField::Save));
 
@@ -373,9 +373,9 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
     );
 }
 
-const PREVIEW_APPLY_LABEL: &str = "Apply";
-const PREVIEW_RELEASE_LABEL: &str = "Remove settings and stop managing";
-const PREVIEW_CANCEL_LABEL: &str = "Cancel";
+const PREVIEW_APPLY_LABEL: &str = "[Apply]  apply changes (Enter)";
+const PREVIEW_RELEASE_LABEL: &str = "[Apply]  remove settings and stop managing (Enter)";
+const PREVIEW_CANCEL_LABEL: &str = "[Cancel] return without applying (Esc)";
 
 pub(crate) fn render_preview(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
     let Some(plan) = &app.preview else {
@@ -445,7 +445,7 @@ pub(crate) fn render_preview(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
         }
     }
 
-    let block = panel("Dry-run preview");
+    let block = panel("Interface plan preview");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let apply_label = if plan.releasing_management {
@@ -453,37 +453,34 @@ pub(crate) fn render_preview(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
     } else {
         PREVIEW_APPLY_LABEL
     };
-    let apply_row = lines.len();
-    let choice = |label: &str, selected: bool| {
-        let marker = if selected { "▶ " } else { "  " };
-        let style = if selected {
-            Style::default()
-                .fg(theme::SELECTED_FG)
-                .bg(theme::SELECTED_BG)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        Line::styled(format!("{marker}{label}"), style)
-    };
-    lines.push(choice(apply_label, app.preview_apply_selected));
-    lines.push(choice(PREVIEW_CANCEL_LABEL, !app.preview_apply_selected));
+    let cancel_row = lines.len();
     lines.push(Line::styled(
-        "Up/Down: select | PgUp/PgDn: scroll | Enter: confirm | Esc: cancel",
-        Style::default().fg(theme::MUTED),
+        PREVIEW_CANCEL_LABEL,
+        Style::default().fg(theme::ACCENT),
     ));
-    let offset = app
-        .preview_scroll
-        .unwrap_or_else(|| super::layout::focused_lines_offset(&lines, inner.height))
-        .min(lines.len().saturating_sub(inner.height as usize));
-    for (slot, label) in [apply_label, PREVIEW_CANCEL_LABEL].iter().enumerate() {
-        let row = apply_row + slot;
-        if row >= offset && row < offset + inner.height as usize {
+    let apply_row = lines.len();
+    lines.push(Line::styled(
+        apply_label,
+        Style::default()
+            .fg(theme::SELECTED_FG)
+            .bg(theme::SELECTED_BG)
+            .add_modifier(Modifier::BOLD),
+    ));
+
+    let visible_rows = inner.height.max(1) as usize;
+    app.preview_max_scroll = lines.len().saturating_sub(visible_rows);
+    app.preview_scroll = app.preview_scroll.min(app.preview_max_scroll);
+    let offset = app.preview_scroll;
+    for (row, label, slot) in [
+        (cancel_row, PREVIEW_CANCEL_LABEL, 1),
+        (apply_row, apply_label, 0),
+    ] {
+        if row >= offset && row < offset.saturating_add(visible_rows) {
             app.ui.buttons.push((
                 Rect::new(
                     inner.x,
                     inner.y + (row - offset) as u16,
-                    (label.len() as u16 + 2).min(inner.width),
+                    (label.len() as u16).min(inner.width),
                     1,
                 ),
                 slot,
@@ -491,70 +488,106 @@ pub(crate) fn render_preview(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
         }
     }
     frame.render_widget(
-        Paragraph::new(lines.into_iter().skip(offset).collect::<Vec<_>>()),
+        Paragraph::new(lines).scroll((offset.min(u16::MAX as usize) as u16, 0)),
         inner,
     );
 }
 
-const PENDING_COMMIT_LABEL: &str = "Commit";
-const PENDING_ROLLBACK_LABEL: &str = "Rollback";
+const PENDING_COMMIT_LABEL: &str = "[Commit]";
+const PENDING_ROLLBACK_LABEL: &str = "[Rollback]";
 
 pub(crate) fn render_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
     let Some(change) = &app.pending else {
         return;
     };
     let seconds = change.expires_at_unix.saturating_sub(current_unix_time());
-    let mut lines = vec![
+    let timeout = change.rollback_timeout_seconds;
+    let ratio = if timeout > 0 {
+        (seconds as f64 / timeout as f64).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let gauge_color = if seconds > timeout / 2 {
+        theme::GOOD
+    } else if seconds > timeout / 4 {
+        theme::WARN
+    } else {
+        theme::BAD
+    };
+    let lines = vec![
+        Line::styled(
+            format!("Pending transaction: {}", change.token),
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ),
         Line::from(format!("Interface: {}", change.interface)),
-        Line::styled(
-            format!("Automatic rollback in: {seconds}s"),
-            Style::default().fg(if seconds <= 10 {
-                theme::BAD
-            } else {
-                theme::WARN
-            }),
-        ),
-        Line::styled(
-            "Commit only after verifying connectivity.",
-            Style::default().fg(theme::MUTED),
-        ),
-        Line::from(""),
+        Line::from(format!("Automatic rollback in: {seconds}s / {timeout}s")),
     ];
 
-    let block = panel("Pending change");
+    let block = panel("Interface change pending confirmation");
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(4),
+        ])
+        .split(inner);
+
+    frame.render_widget(
+        Gauge::default()
+            .block(panel("Rollback countdown"))
+            .gauge_style(Style::default().fg(gauge_color))
+            .ratio(ratio)
+            .label(format!("{seconds}s")),
+        chunks[0],
+    );
+    frame.render_widget(Paragraph::new(lines), chunks[1]);
+
     app.ui.buttons.push((
-        Rect {
-            x: inner.x,
-            y: inner.y + lines.len() as u16,
-            width: PENDING_COMMIT_LABEL.len() as u16,
-            height: 1,
-        },
+        Rect::new(
+            chunks[2].x,
+            chunks[2].y,
+            PENDING_COMMIT_LABEL.len() as u16,
+            1,
+        ),
         0,
     ));
-    lines.push(Line::styled(
-        PENDING_COMMIT_LABEL,
-        Style::default()
-            .fg(theme::ACCENT)
-            .add_modifier(Modifier::BOLD),
-    ));
     app.ui.buttons.push((
-        Rect {
-            x: inner.x,
-            y: inner.y + lines.len() as u16,
-            width: PENDING_ROLLBACK_LABEL.len() as u16,
-            height: 1,
-        },
+        Rect::new(
+            chunks[2].x,
+            chunks[2].y.saturating_add(1),
+            PENDING_ROLLBACK_LABEL.len() as u16,
+            1,
+        ),
         1,
     ));
-    lines.push(Line::styled(
-        PENDING_ROLLBACK_LABEL,
-        Style::default()
-            .fg(theme::ACCENT)
-            .add_modifier(Modifier::BOLD),
-    ));
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled(
+                "[Commit]  persist changes (Enter)",
+                Style::default()
+                    .fg(theme::SELECTED_FG)
+                    .bg(theme::GOOD)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(
+                "[Rollback]  restore previous state (Esc)",
+                Style::default()
+                    .fg(theme::SELECTED_FG)
+                    .bg(theme::WARN)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(
+                "Commit only after verifying connectivity",
+                Style::default().fg(theme::MUTED),
+            ),
+        ]),
+        chunks[2],
+    );
 }
 
 pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
@@ -637,7 +670,7 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
                 .as_ref()
                 .and_then(|interface| interface.dhcp.as_ref())
                 .map(|dhcp| format!("DHCP pool {}-{}", dhcp.pool_start, dhcp.pool_end));
-            let cursor = cidr.chars().count();
+            let cursor = super::input::grapheme_count(&cidr);
             app.editor = Some(InterfaceEditor {
                 interface: name,
                 field: InterfaceEditorField::Cidr,
@@ -741,8 +774,8 @@ pub(crate) async fn submit_dry_run(app: &mut TuiApp, client: &ApiClient) {
     {
         Ok(Response::InterfacePlan { plan }) => {
             app.preview = Some(plan);
-            app.preview_apply_selected = false;
-            app.preview_scroll = None;
+            app.preview_scroll = 0;
+            app.preview_max_scroll = 0;
             app.screen = Screen::Preview;
         }
         Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
@@ -755,23 +788,36 @@ pub(crate) async fn submit_dry_run(app: &mut TuiApp, client: &ApiClient) {
 }
 
 pub(crate) async fn handle_preview_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
+    const PAGE: usize = 10;
     match key {
         KeyCode::Esc => app.screen = Screen::InterfaceEditor,
-        KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
-            app.preview_apply_selected = !app.preview_apply_selected;
-            app.preview_scroll = None;
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.preview_scroll = app.preview_scroll.saturating_sub(1);
         }
-        KeyCode::PageUp | KeyCode::Home => app.preview_scroll = Some(0),
-        KeyCode::PageDown | KeyCode::End => app.preview_scroll = None,
-        KeyCode::Enter if app.preview_apply_selected => apply_preview(app, client).await,
-        KeyCode::Enter => app.screen = Screen::InterfaceEditor,
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.preview_scroll = app
+                .preview_scroll
+                .saturating_add(1)
+                .min(app.preview_max_scroll);
+        }
+        KeyCode::PageUp => app.preview_scroll = app.preview_scroll.saturating_sub(PAGE),
+        KeyCode::PageDown => {
+            app.preview_scroll = app
+                .preview_scroll
+                .saturating_add(PAGE)
+                .min(app.preview_max_scroll);
+        }
+        KeyCode::Home => app.preview_scroll = 0,
+        KeyCode::End => app.preview_scroll = app.preview_max_scroll,
+        KeyCode::Enter if app.preview_scroll >= app.preview_max_scroll => {
+            apply_preview(app, client).await;
+        }
+        KeyCode::Enter => app.push_message(
+            LogLevel::Warn,
+            "Review the complete interface plan before applying; scroll to the end first.",
+        ),
         _ => {}
     }
-}
-
-pub(crate) fn focus_preview_action(app: &mut TuiApp, slot: usize) {
-    app.preview_apply_selected = slot == 0;
-    app.preview_scroll = None;
 }
 
 async fn apply_preview(app: &mut TuiApp, client: &ApiClient) {
@@ -796,6 +842,7 @@ async fn apply_preview(app: &mut TuiApp, client: &ApiClient) {
     {
         Ok(Response::NetworkChangePending { change }) => {
             app.pending = Some(change);
+            app.pending_return_screen = Screen::InterfaceList;
             app.screen = Screen::PendingChange;
         }
         Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
@@ -817,7 +864,7 @@ pub(crate) async fn handle_pending_key(app: &mut TuiApp, key: KeyCode, client: &
 
 async fn finish_pending(app: &mut TuiApp, client: &ApiClient, commit: bool) {
     let Some(change) = &app.pending else {
-        app.screen = Screen::Dashboard;
+        app.screen = app.pending_return_screen;
         return;
     };
     let request = if commit {
@@ -834,12 +881,16 @@ async fn finish_pending(app: &mut TuiApp, client: &ApiClient, commit: bool) {
         Ok(Response::NetworkChangeCommitted { .. }) if commit => {
             app.push_message(LogLevel::Info, "Network change committed");
             app.pending = None;
-            app.screen = Screen::Dashboard;
+            app.preview = None;
+            app.editor = None;
+            app.screen = app.pending_return_screen;
         }
         Ok(Response::NetworkChangeRolledBack { .. }) if !commit => {
             app.push_message(LogLevel::Info, "Network change rolled back");
             app.pending = None;
-            app.screen = Screen::Dashboard;
+            app.preview = None;
+            app.editor = None;
+            app.screen = app.pending_return_screen;
         }
         Ok(Response::Error { message }) => {
             app.push_message(LogLevel::Error, message);
@@ -1154,7 +1205,7 @@ mod rendering_tests {
                 dhcp_action: crate::core::interface::DhcpChangeAction::Unchanged,
                 releasing_management: false,
             }),
-            preview_apply_selected: false,
+            preview_scroll: usize::MAX,
             ..Default::default()
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
@@ -1171,5 +1222,26 @@ mod rendering_tests {
         let buffer = terminal.backend().buffer();
         let row: String = (0..80).map(|x| buffer[(x, rect.y)].symbol()).collect();
         assert!(row.contains("Cancel"));
+    }
+
+    #[tokio::test]
+    async fn interface_plan_requires_reaching_the_end_before_apply() {
+        let mut app = TuiApp {
+            screen: Screen::Preview,
+            preview_max_scroll: 7,
+            ..Default::default()
+        };
+        let client = ApiClient::new("/socket-that-must-not-be-opened");
+
+        handle_preview_key(&mut app, KeyCode::Enter, &client).await;
+        assert!(app
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("Review the complete interface plan")));
+
+        handle_preview_key(&mut app, KeyCode::PageDown, &client).await;
+        assert_eq!(app.preview_scroll, 7);
+        handle_preview_key(&mut app, KeyCode::Up, &client).await;
+        assert_eq!(app.preview_scroll, 6);
     }
 }

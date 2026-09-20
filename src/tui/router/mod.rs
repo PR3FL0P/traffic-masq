@@ -54,6 +54,8 @@ pub(crate) struct RouterData {
     pub(crate) proposed_router_config: RouterConfig,
     pub(crate) staged: bool,
     pub(crate) plan: Option<RouterPlan>,
+    pub(crate) plan_scroll: usize,
+    pub(crate) plan_max_scroll: usize,
     pub(crate) editor: Option<RouteEditor>,
     pub(crate) focus: RouterFocus,
     pub(crate) action: RouterAction,
@@ -189,10 +191,10 @@ pub(crate) struct RouteEditor {
 impl RouteEditor {
     pub(crate) fn reset_cursor(&mut self) {
         self.cursor = match self.field {
-            RouteEditorField::Destination => self.destination.chars().count(),
-            RouteEditorField::Gateway => self.gateway.chars().count(),
-            RouteEditorField::Metric => self.metric.chars().count(),
-            RouteEditorField::Table => self.table.chars().count(),
+            RouteEditorField::Destination => super::input::grapheme_count(&self.destination),
+            RouteEditorField::Gateway => super::input::grapheme_count(&self.gateway),
+            RouteEditorField::Metric => super::input::grapheme_count(&self.metric),
+            RouteEditorField::Table => super::input::grapheme_count(&self.table),
             _ => 0,
         };
     }
@@ -222,12 +224,12 @@ pub(crate) struct RouterPendingView {
     pub(crate) plan: RouterPlan,
     pub(crate) applied_at_unix: u64,
     pub(crate) rollback_failure: Option<Vec<String>>,
+    pub(crate) scroll: usize,
+    pub(crate) max_scroll: usize,
 }
 
-const ROUTER_APPLY_LABEL: &str = "Apply";
-
-const ROUTER_PENDING_COMMIT_LABEL: &str = "Commit";
-const ROUTER_PENDING_ROLLBACK_LABEL: &str = "Rollback";
+const ROUTER_APPLY_LABEL: &str = "[Apply]  apply changes (Enter)";
+const ROUTER_CANCEL_LABEL: &str = "[Cancel] return without applying (Esc)";
 
 #[cfg(test)]
 mod tests;

@@ -93,7 +93,7 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
                 ));
             } else {
                 spans.extend(input::render_masked_with_cursor(
-                    editor.passphrase.chars().count(),
+                    input::grapheme_count(&editor.passphrase),
                     editor.cursor,
                     true,
                     '•',

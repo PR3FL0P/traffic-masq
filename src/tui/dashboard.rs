@@ -103,6 +103,7 @@ pub(crate) async fn handle_dashboard_key(
                 } else if let Some(change) = app.dashboard.pending_network_changes.first().cloned()
                 {
                     app.pending = Some(change);
+                    app.pending_return_screen = Screen::Dashboard;
                     app.screen = Screen::PendingChange;
                 } else {
                     app.push_message(LogLevel::Warn, "No pending network changes");

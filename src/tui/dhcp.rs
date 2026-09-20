@@ -87,7 +87,7 @@ impl DhcpEditor {
     }
 
     pub(crate) fn reset_cursor(&mut self) {
-        self.cursor = self.active_value().map_or(0, |v| v.chars().count());
+        self.cursor = self.active_value().map_or(0, super::input::grapheme_count);
     }
 
     pub(crate) fn active_editor(&mut self) -> Option<super::input::TextEditor<'_>> {
@@ -127,16 +127,24 @@ pub(crate) fn render_dhcp_interface_list(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let visible = inner.height.max(1) as usize;
+    let max_scroll = app.dashboard.interfaces.len().saturating_sub(visible);
+    let offset = app
+        .selected_interface
+        .saturating_sub(visible.saturating_sub(1))
+        .min(max_scroll);
     app.ui.list_area = Some(inner);
     app.ui.list_row_height = 1;
     app.ui.list_count = app.dashboard.interfaces.len();
-    app.ui.list_scroll_offset = 0;
+    app.ui.list_scroll_offset = offset;
 
     let lines = app
         .dashboard
         .interfaces
         .iter()
         .enumerate()
+        .skip(offset)
+        .take(visible)
         .map(|(index, status)| {
             let selected = index == app.selected_interface;
             let marker = if selected { "▶" } else { " " };
@@ -239,7 +247,7 @@ pub(crate) fn render_dhcp_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
             Style::default().fg(theme::MUTED),
         ),
         Line::styled(
-            "j/k or arrows: move | Enter/Space: activate | type digits, '.', ',' to edit",
+            "arrows: move | Enter: activate | type digits, '.', ',' to edit",
             Style::default().fg(theme::MUTED),
         ),
         Line::from(""),
@@ -424,7 +432,7 @@ pub(crate) async fn open_dhcp_editor(app: &mut TuiApp, client: &ApiClient) {
             spec: Some(spec), ..
         }) => {
             let pool_start = spec.pool_start.to_string();
-            let cursor = pool_start.chars().count();
+            let cursor = super::input::grapheme_count(&pool_start);
             app.dhcp_editor = Some(DhcpEditor {
                 interface,
                 field: DhcpField::PoolStart,
@@ -480,7 +488,7 @@ pub(crate) async fn open_dhcp_editor(app: &mut TuiApp, client: &ApiClient) {
                 .and_then(|cidr| suggest_pool(cidr.addr(), cidr.prefix_len()))
                 .map(|(start, end)| (start.to_string(), end.to_string()))
                 .unwrap_or_default();
-            let cursor = pool_start.chars().count();
+            let cursor = super::input::grapheme_count(&pool_start);
             app.dhcp_editor = Some(DhcpEditor {
                 interface,
                 field: DhcpField::PoolStart,

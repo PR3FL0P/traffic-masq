@@ -82,7 +82,7 @@ impl VpnImportEditor {
     }
 
     pub(crate) fn reset_cursor(&mut self) {
-        self.cursor = self.active_value().chars().count();
+        self.cursor = super::input::grapheme_count(self.active_value());
     }
 
     pub(crate) fn active_editor(&mut self) -> super::input::TextEditor<'_> {
@@ -131,13 +131,27 @@ pub(crate) fn render_vpn(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
     let inner = block.inner(chunks[1]);
     frame.render_widget(block, chunks[1]);
 
-    app.ui.list_area = Some(inner);
+    let profile_and_actions = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(6)])
+        .split(inner);
+    let list_area = profile_and_actions[0];
+    let actions_area = profile_and_actions[1];
+
+    let visible_profiles = list_area.height.max(1) as usize;
+    let max_scroll = app.vpn.profiles.len().saturating_sub(visible_profiles);
+    let scroll = app
+        .vpn
+        .selected_profile
+        .saturating_sub(visible_profiles.saturating_sub(1))
+        .min(max_scroll);
+    app.ui.list_area = Some(list_area);
     app.ui.list_row_height = 1;
     app.ui.list_count = app.vpn.profiles.len();
-    app.ui.list_scroll_offset = 0;
+    app.ui.list_scroll_offset = scroll;
 
     let list_focused = app.vpn.focus == VpnFocus::List;
-    let mut lines: Vec<Line> = if app.vpn.profiles.is_empty() {
+    let profile_lines: Vec<Line> = if app.vpn.profiles.is_empty() {
         vec![Line::styled(
             "(none imported)",
             Style::default().fg(theme::MUTED),
@@ -147,6 +161,8 @@ pub(crate) fn render_vpn(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
             .profiles
             .iter()
             .enumerate()
+            .skip(scroll)
+            .take(visible_profiles)
             .map(|(index, profile)| {
                 let selected = index == app.vpn.selected_profile;
                 let marker = if selected { "▶" } else { " " };
@@ -166,8 +182,8 @@ pub(crate) fn render_vpn(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
             })
             .collect()
     };
+    frame.render_widget(Paragraph::new(profile_lines), list_area);
 
-    lines.push(Line::from(""));
     let action = |label: &str, active: bool| {
         let marker = if active { "▶ " } else { "  " };
         let style = if active {
@@ -179,6 +195,7 @@ pub(crate) fn render_vpn(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
         };
         Line::styled(format!("{marker}{label}"), style)
     };
+    let mut action_lines = Vec::with_capacity(6);
     for (slot, (label, focus)) in [
         (VPN_CONNECT_LABEL, VpnFocus::Connect),
         (VPN_DISCONNECT_LABEL, VpnFocus::Disconnect),
@@ -192,17 +209,16 @@ pub(crate) fn render_vpn(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
     {
         app.ui.buttons.push((
             Rect {
-                x: inner.x,
-                y: inner.y + lines.len() as u16,
+                x: actions_area.x,
+                y: actions_area.y + slot as u16,
                 width: label.len() as u16,
                 height: 1,
             },
             slot,
         ));
-        lines.push(action(label, app.vpn.focus == focus));
+        action_lines.push(action(label, app.vpn.focus == focus));
     }
-
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(Paragraph::new(action_lines), actions_area);
 }
 
 const VPN_CONNECT_LABEL: &str = "Connect selected profile";

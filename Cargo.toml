@@ -64,6 +64,8 @@ tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
 toml = "0.8"
 tower = "0.5"
+unicode-segmentation = "1.13"
+unicode-width = "0.2"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

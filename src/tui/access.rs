@@ -35,7 +35,7 @@ pub(crate) struct AccessEditor {
 
 impl AccessEditor {
     pub(crate) fn reset_cursor(&mut self) {
-        self.cursor = self.active_value().map(|s| s.chars().count()).unwrap_or(0);
+        self.cursor = self.active_value().map(super::input::grapheme_count).unwrap_or(0);
     }
 
     pub(crate) fn active_value(&self) -> Option<&str> {
@@ -261,7 +261,7 @@ pub(crate) fn render_access(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
             Style::default().fg(theme::MUTED),
         ),
         Line::styled(
-            "j/k or arrows: move | Enter/Space: activate | type or arrows to edit",
+            "arrows: move | Enter: activate | type or arrows to edit",
             Style::default().fg(theme::MUTED),
         ),
         Line::from(""),

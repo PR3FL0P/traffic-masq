@@ -78,8 +78,8 @@ impl SecurityEditor {
 
     pub(crate) fn reset_cursor(&mut self) {
         self.cursor = match self.field {
-            SettingsField::RollbackTimeout => self.rollback_timeout_input.chars().count(),
-            SettingsField::RememberMinutes => self.remember_minutes_input.chars().count(),
+            SettingsField::RollbackTimeout => super::input::grapheme_count(&self.rollback_timeout_input),
+            SettingsField::RememberMinutes => super::input::grapheme_count(&self.remember_minutes_input),
             _ => 0,
         };
     }
@@ -461,7 +461,7 @@ pub(crate) async fn load_settings_data(app: &mut TuiApp, client: &ApiClient) {
             };
             app.show_dhcp_client = preferences.show_dhcp_client;
             let rollback_timeout_input = desired.rollback_timeout_seconds.to_string();
-            let cursor = rollback_timeout_input.chars().count();
+            let cursor = super::input::grapheme_count(&rollback_timeout_input);
             app.settings = Some(SecurityEditor {
                 remember_session: preferences.remember,
                 remember_minutes_input: preferences.minutes.to_string(),
@@ -542,7 +542,7 @@ pub(crate) async fn submit_security_settings(app: &mut TuiApp, client: &ApiClien
             };
             app.show_dhcp_client = preferences.show_dhcp_client;
             let rollback_timeout_input = desired.rollback_timeout_seconds.to_string();
-            let cursor = rollback_timeout_input.chars().count();
+            let cursor = super::input::grapheme_count(&rollback_timeout_input);
             app.settings = Some(SecurityEditor {
                 remember_session: preferences.remember,
                 remember_minutes_input: preferences.minutes.to_string(),
@@ -592,7 +592,7 @@ async fn reset_security_settings(app: &mut TuiApp, client: &ApiClient) {
             };
             app.show_dhcp_client = preferences.show_dhcp_client;
             let rollback_timeout_input = desired.rollback_timeout_seconds.to_string();
-            let cursor = rollback_timeout_input.chars().count();
+            let cursor = super::input::grapheme_count(&rollback_timeout_input);
             app.settings = Some(SecurityEditor {
                 remember_session: preferences.remember,
                 remember_minutes_input: preferences.minutes.to_string(),
@@ -659,7 +659,7 @@ impl PasswordChangeEditor {
     }
 
     fn reset_cursor(&mut self) {
-        self.cursor = self.active_value().chars().count();
+        self.cursor = super::input::grapheme_count(self.active_value());
     }
 
     fn active_value(&self) -> &str {
@@ -731,7 +731,7 @@ pub(crate) fn render_settings_password(
         };
         let mut spans = vec![Span::styled(format!("{marker}{label}: "), style)];
         spans.extend(super::input::render_masked_with_cursor(
-            value.chars().count(),
+            super::input::grapheme_count(value),
             editor.cursor,
             active,
             '•',

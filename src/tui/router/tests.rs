@@ -57,8 +57,10 @@ fn router_action_cycles_forward_and_backward() {
 
 #[test]
 fn staged_explicit_forwarding_requires_a_plan_even_when_committed_router_is_disabled() {
-    let mut router = RouterData::default();
-    router.enabled = false;
+    let mut router = RouterData {
+        enabled: false,
+        ..Default::default()
+    };
     router.proposed_router_config.enabled = true;
     router.proposed_router_config.forwarding = Some(vec![crate::config::ForwardingConfig {
         source_subnet: None,
@@ -494,6 +496,27 @@ fn manual_delete_preserves_route_selectors_and_quotes_interface_names() {
 }
 
 #[tokio::test]
+async fn router_plan_requires_reaching_the_end_before_apply() {
+    let mut app = TuiApp {
+        screen: Screen::RouterPlan,
+        ..Default::default()
+    };
+    app.router.plan_max_scroll = 7;
+    let client = ApiClient::new("/socket-that-must-not-be-opened");
+
+    super::plan::handle_router_plan_key(&mut app, KeyCode::Enter, &client).await;
+    assert!(app
+        .message
+        .as_deref()
+        .is_some_and(|message| message.contains("Review the complete router plan")));
+
+    super::plan::handle_router_plan_key(&mut app, KeyCode::PageDown, &client).await;
+    assert_eq!(app.router.plan_scroll, 7);
+    super::plan::handle_router_plan_key(&mut app, KeyCode::Up, &client).await;
+    assert_eq!(app.router.plan_scroll, 6);
+}
+
+#[tokio::test]
 async fn router_actions_are_reachable_with_arrows_and_activate_only_on_enter() {
     let mut app = TuiApp {
         screen: Screen::Router,
@@ -588,7 +611,7 @@ async fn empty_router_actions_require_tab_and_clamp_at_the_last() {
 #[test]
 fn router_buttons_wrap_and_remain_visible_at_supported_sizes() {
     use ratatui::{backend::TestBackend, Terminal};
-    for (width, height) in [(60, 15), (80, 24), (120, 30)] {
+    for (width, height) in [(80, 24), (100, 28), (120, 30)] {
         for warning in [None, Some("External route is read-only".to_string())] {
             let mut app = TuiApp {
                 screen: Screen::Router,

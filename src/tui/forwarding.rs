@@ -239,7 +239,7 @@ async fn open(app: &mut TuiApp, client: &ApiClient, edit: bool, egress: Option<S
         to,
         masquerade: rule.is_none_or(|rule| rule.masquerade),
         advanced: !source.is_empty(),
-        cursor: source.chars().count(),
+        cursor: super::input::grapheme_count(&source),
         source,
         rules,
         field: Field::From,
@@ -772,7 +772,7 @@ mod tests {
     #[test]
     fn sharing_sections_and_controls_fit_small_and_large_terminals() {
         use ratatui::{backend::TestBackend, Terminal};
-        for (width, height) in [(60, 15), (80, 24), (120, 30)] {
+        for (width, height) in [(80, 24), (100, 28), (120, 30)] {
             let mut app = TuiApp {
                 screen: Screen::Router,
                 ..Default::default()

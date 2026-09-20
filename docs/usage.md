@@ -470,8 +470,9 @@ offered in the role selector.
 
 In the interface editor, **Configure with traffic-masq** controls configuration
 ownership independently of the router role. Address editing is unavailable
-when it is off. Review changes opens a read-only preview; selecting Apply
-confirms the displayed connectivity risks and starts the rollback timer.
+when it is off. **Plan / Apply** opens a read-only preview using the same flow
+as the router preview: review the complete plan, then press **Enter** on
+**Apply** to start the rollback timer, or **Esc** to cancel.
 The API retains `managed` and `allow_management_change` for compatibility.
 
 Test configuration changes on a separate Linux host before production use.

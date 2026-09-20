@@ -639,7 +639,7 @@ impl NetworkTransactionManager {
             Ok(()) => self
                 .await_convergence(&desired, &pending.info.interface)
                 .await,
-            Err(error) => Err(anyhow::Error::from(error)),
+            Err(error) => Err(error),
         };
         if let Err(error) = restoration {
             // Keep both the pending record and recovery journal. The desired

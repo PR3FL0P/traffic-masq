@@ -3237,7 +3237,7 @@ async fn autoconnect_is_blocked_by_pending_transaction_on_another_interface() {
 
     let state = fixture.service.wifi_autoconnect.lock().await;
     assert!(
-        state.attempts.get("wlan1").is_none(),
+        !state.attempts.contains_key("wlan1"),
         "pending transaction on wlan2 must block autoconnect mutation on wlan1"
     );
     assert!(

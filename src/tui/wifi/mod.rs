@@ -195,7 +195,7 @@ impl WifiEditor {
                 )
             },
         );
-        let cursor = ssid.chars().count();
+        let cursor = super::input::grapheme_count(&ssid);
         Self {
             interface: row.interface.clone(),
             field: WifiField::Ssid,
@@ -222,7 +222,7 @@ impl WifiEditor {
     }
 
     pub(crate) fn reset_cursor(&mut self) {
-        self.cursor = self.active_value().map_or(0, |v| v.chars().count());
+        self.cursor = self.active_value().map_or(0, super::input::grapheme_count);
     }
 
     pub(crate) fn active_editor(&mut self) -> Option<super::input::TextEditor<'_>> {
@@ -391,7 +391,7 @@ impl WifiProfileEditor {
     ) -> Result<Self, &'static str> {
         let security = map_scan_security(network.security)?;
         let id = profile_id_for_ssid(&network.ssid);
-        let cursor = id.chars().count();
+        let cursor = super::input::grapheme_count(&id);
         Ok(Self {
             interface,
             original_id: None,
@@ -409,7 +409,7 @@ impl WifiProfileEditor {
     }
 
     fn from_profile(interface: String, profile: &WifiClientProfileSummary) -> Self {
-        let cursor = profile.id.chars().count();
+        let cursor = super::input::grapheme_count(&profile.id);
         Self {
             interface,
             original_id: Some(profile.id.clone()),
@@ -439,7 +439,7 @@ impl WifiProfileEditor {
     }
 
     pub(crate) fn reset_cursor(&mut self) {
-        self.cursor = self.active_value().map_or(0, |v| v.chars().count());
+        self.cursor = self.active_value().map_or(0, super::input::grapheme_count);
     }
 
     pub(crate) fn active_editor(&mut self) -> Option<super::input::TextEditor<'_>> {
@@ -1147,7 +1147,7 @@ fn masked(value: &str, existing: bool) -> String {
             "(not set)".into()
         }
     } else {
-        "•".repeat(value.chars().count())
+        "•".repeat(super::input::grapheme_count(value))
     }
 }
 fn cycle_ap_security(value: WifiSecurity) -> WifiSecurity {

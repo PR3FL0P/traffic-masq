@@ -352,7 +352,7 @@ pub(super) async fn open_route_editor_for_selected(app: &mut TuiApp, client: &Ap
     };
     let available_interfaces = fetch_available_interfaces(app, client).await;
     let dest_str = orig.destination.to_string();
-    let cursor = dest_str.chars().count();
+    let cursor = super::super::input::grapheme_count(&dest_str);
     app.router.editor = Some(RouteEditor {
         original_route: Some(orig.clone()),
         destination: dest_str,

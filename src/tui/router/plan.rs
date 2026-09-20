@@ -150,15 +150,13 @@ pub(crate) fn render_router_plan(frame: &mut ratatui::Frame<'_>, area: Rect, app
     let block = panel("Router plan preview");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    app.ui.buttons.push((
-        Rect {
-            x: inner.x,
-            y: inner.y + lines.len() as u16,
-            width: ROUTER_APPLY_LABEL.len() as u16,
-            height: 1,
-        },
-        0,
+
+    let cancel_row = lines.len();
+    lines.push(Line::styled(
+        ROUTER_CANCEL_LABEL,
+        Style::default().fg(theme::ACCENT),
     ));
+    let apply_row = lines.len();
     lines.push(Line::styled(
         ROUTER_APPLY_LABEL,
         Style::default()
@@ -166,7 +164,39 @@ pub(crate) fn render_router_plan(frame: &mut ratatui::Frame<'_>, area: Rect, app
             .bg(theme::SELECTED_BG)
             .add_modifier(Modifier::BOLD),
     ));
-    frame.render_widget(Paragraph::new(lines), inner);
+
+    let visible_rows = inner.height.max(1) as usize;
+    app.router.plan_max_scroll = lines.len().saturating_sub(visible_rows);
+    app.router.plan_scroll = app.router.plan_scroll.min(app.router.plan_max_scroll);
+    let offset = app.router.plan_scroll;
+
+    if cancel_row >= offset && cancel_row < offset.saturating_add(visible_rows) {
+        app.ui.buttons.push((
+            Rect {
+                x: inner.x,
+                y: inner.y + (cancel_row - offset) as u16,
+                width: (ROUTER_CANCEL_LABEL.len() as u16).min(inner.width),
+                height: 1,
+            },
+            1,
+        ));
+    }
+    if apply_row >= offset && apply_row < offset.saturating_add(visible_rows) {
+        app.ui.buttons.push((
+            Rect {
+                x: inner.x,
+                y: inner.y + (apply_row - offset) as u16,
+                width: (ROUTER_APPLY_LABEL.len() as u16).min(inner.width),
+                height: 1,
+            },
+            0,
+        ));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines).scroll((offset.min(u16::MAX as usize) as u16, 0)),
+        inner,
+    );
 }
 
 pub(super) fn summarize_output_interfaces(interfaces: &[RouterInterfaceDesired]) -> Vec<String> {
@@ -226,6 +256,8 @@ pub(crate) async fn open_router_plan(app: &mut TuiApp, client: &ApiClient) {
         Ok(Response::RouterPlan { plan }) => {
             app.router.lease_counts = lease_counts_for_plan(client, &plan).await;
             app.router.plan = Some(plan);
+            app.router.plan_scroll = 0;
+            app.router.plan_max_scroll = 0;
             app.screen = Screen::RouterPlan;
         }
         Ok(Response::RouterError { detail }) => {
@@ -245,9 +277,38 @@ pub(crate) async fn open_router_plan(app: &mut TuiApp, client: &ApiClient) {
 }
 
 pub(crate) async fn handle_router_plan_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
+    const PAGE: usize = 10;
     match key {
         KeyCode::Esc => app.screen = Screen::Router,
-        KeyCode::Enter => router_apply_current_plan(app, client).await,
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.router.plan_scroll = app.router.plan_scroll.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.router.plan_scroll = app
+                .router
+                .plan_scroll
+                .saturating_add(1)
+                .min(app.router.plan_max_scroll);
+        }
+        KeyCode::PageUp => {
+            app.router.plan_scroll = app.router.plan_scroll.saturating_sub(PAGE);
+        }
+        KeyCode::PageDown => {
+            app.router.plan_scroll = app
+                .router
+                .plan_scroll
+                .saturating_add(PAGE)
+                .min(app.router.plan_max_scroll);
+        }
+        KeyCode::Home => app.router.plan_scroll = 0,
+        KeyCode::End => app.router.plan_scroll = app.router.plan_max_scroll,
+        KeyCode::Enter if app.router.plan_scroll >= app.router.plan_max_scroll => {
+            router_apply_current_plan(app, client).await;
+        }
+        KeyCode::Enter => app.push_message(
+            LogLevel::Warn,
+            "Review the complete router plan before applying; scroll to the end first.",
+        ),
         _ => {}
     }
 }
@@ -261,6 +322,8 @@ async fn router_apply_current_plan(app: &mut TuiApp, client: &ApiClient) {
                 plan,
                 applied_at_unix: current_unix_time(),
                 rollback_failure: None,
+                scroll: 0,
+                max_scroll: 0,
             });
             app.screen = Screen::RouterPending;
         }

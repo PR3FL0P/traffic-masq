@@ -22,7 +22,7 @@ The TUI serves as the primary operational console for the `traffic-masq` network
 2. **Direct / Recovery Mode (`--direct`):**
    - Directly binds to Linux Netlink via `RtnetlinkNetworkProvider`.
    - Read-only emergency inspection mode when `traffic-masqd` is down or unresponsive.
-   - Restricts operations to the Dashboard and Interfaces tabs; daemon-dependent sections (DHCP, Wi-Fi, VPN, Router, Settings) are politely disabled with informational warnings.
+   - Restricts mutation-capable navigation to Dashboard, Interfaces, and Log; daemon-dependent tabs are rendered muted and keyboard section navigation skips them. Clicking a disabled tab still produces an informational warning.
 
 ---
 
@@ -37,9 +37,8 @@ The TUI serves as the primary operational console for the `traffic-masq` network
 | [`dashboard.rs`](file:///home/user/Documents/programming/traffic_masq/traffic_masq/src/tui/dashboard.rs) | System overview dashboard, interface summaries, live traffic sparklines (RX/TX rate histories with rate smoothing). | `DashboardData`, `DashboardFocus`, `TrafficHistory`, `TrafficSample` |
 | [`interfaces.rs`](file:///home/user/Documents/programming/traffic_masq/traffic_masq/src/tui/interfaces.rs) | Network interface list and editor; address ownership tags (`[ext]`, `[?]`), default route risk warnings, dry-run change plan previews. | `InterfaceEditor`, `InterfaceEditorField`, `render_interface_list`, `render_preview` |
 | [`dhcp.rs`](file:///home/user/Documents/programming/traffic_masq/traffic_masq/src/tui/dhcp.rs) | Downstream DHCP server configuration per interface, pool range validation, DNS settings, active lease viewer. | `DhcpEditor`, `DhcpField`, `DhcpLeasesView` |
-| [`dhcp_client.rs`](file:///home/user/Documents/programming/traffic_masq/traffic_masq/src/tui/dhcp_client.rs) | Uplink DHCP client supervision view: operational states (`Running`, `Waiting`, `Degraded`), lease renewal, release, and defaults configuration. | `render`, `refresh`, `handle_dhcp_client_key` |
+| [`dhcp_client.rs`](file:///home/user/Documents/programming/traffic_masq/traffic_masq/src/tui/dhcp_client.rs) | Uplink DHCP client supervision view with interface-name-based selection, scrolling, lease renewal/release, and defaults configuration. | `render`, `refresh`, `handle_key` |
 | [`router/mod.rs`](file:///home/user/Documents/programming/traffic_masq/traffic_masq/src/tui/router/mod.rs) | Router façade and shared state; route editing, controller/API orchestration, rendering, pending transaction views, and tests are split into `router/` submodules. | `RouterData`, `RouteEditorField`, `RouterPendingView`, `render_router` |
-| [`provisioning.rs`](file:///home/user/Documents/programming/traffic_masq/traffic_masq/src/tui/provisioning.rs) | Multi-step interactive router provisioning wizard: uplink selection (Wi-Fi/Ethernet), output AP config, dry-run review, commit & rollback. | `ProvisioningWizard`, `NetworkChoice`, `PendingProvisioning` |
 | [`wifi/mod.rs`](file:///home/user/Documents/programming/traffic_masq/traffic_masq/src/tui/wifi/mod.rs) | Wi-Fi façade and shared state/model mapping; owns radio list behavior and re-exports screen handlers. | `WifiData`, `WifiRole`, `WifiEditor`, `WifiScanPicker`, `WifiProfileEditor`, `WifiConnectPrompt` |
 | [`wifi/`](file:///home/user/Documents/programming/traffic_masq/traffic_masq/src/tui/wifi) | Wi-Fi screen implementations split by responsibility: AP editor, scan picker, saved profiles, profile editor, connect/IP prompt, and Wi-Fi-specific tests. | `ap_editor`, `scan`, `profiles`, `profile_editor`, `connect` |
 | [`vpn.rs`](file:///home/user/Documents/programming/traffic_masq/traffic_masq/src/tui/vpn.rs) | WireGuard VPN profile management, connection lifecycle, configuration import wizard, deletion confirmation. | `VpnData`, `VpnFocus`, `VpnImportEditor` |
@@ -79,12 +78,13 @@ In a terminal application, performing long-running network operations directly i
 3. **Cancellable vs. Non-Cancellable Operations:**
    - **Reads/Refreshes (`cancellable = true`):** If the user presses any key during a background refresh, the future is dropped immediately, returning the input event so the operator's action is processed without latency.
    - **Mutations/Applies (`cancellable = false`):** Network mutations are **never** cancelled or retried on timeout. A lost or delayed Unix socket response does not mean the daemon failed to apply the change. The UI permits pressing `q` to queue an exit after the response arrives, but blocks other inputs.
-4. **Notification and Footer Integrity:** The progress banner renders on row `height - 3`. It explicitly preserves the key-hints row (`height - 2`), the error/status message row (`height - 1`), and the borders to eliminate visible screen flickering.
+4. **Resize-Safe Progress Rendering:** At the same terminal size, the progress banner reuses the last rendered frame so footer/status context stays intact. After a resize, the stale snapshot is discarded and progress is rendered against the new geometry instead of replaying old coordinates.
 
 ### 3.2. Commit-Confirm & Immediate Mutation Flows
 
 Because misconfiguring an IP address or firewall rule can sever SSH access, interface and router changes use a strict rollback pattern:
-1. **Dry-Run Preview:** Before modifying transactional interface/router state, the daemon calculates a diff (`InterfaceChangePlan`, `RouterPlan`, `RouterProvisioningPreviewView`). The TUI presents this plan on a dedicated preview screen (`Screen::Preview`, `Screen::RouterPlan`).
+1. **Dry-Run Preview:** Before modifying transactional interface/router state, the daemon calculates a diff (`InterfaceChangePlan`, `RouterPlan`). The TUI presents this plan on a dedicated preview screen (`Screen::Preview`, `Screen::RouterPlan`).
+   - Both previews use the same controls: scroll through the complete plan, press **Enter** on `[Apply]` only after reaching the end, or press **Esc** / `[Cancel]` to return without applying.
 2. **Pending State (`Screen::PendingChange`, `Screen::RouterPending`):**
    - When the user confirms the plan, the change is applied with a hardware rollback timer (e.g. 60 seconds).
    - The TUI transitions to a Pending screen displaying a live countdown timer:
@@ -103,7 +103,7 @@ Navigation is structured around 9 top-level **Sections** represented by the top 
 
 - Every fine-grained `Screen` maps to its parent `Section` via `section_of(Screen)`.
 - Left/Right arrows cycle through sections **only** when not currently editing an input field or trapped in a modal sub-flow.
-- **Modal Isolation:** If an operator is inside an active editor (e.g. `InterfaceEditor`, `WifiEditor`, `ProvisioningWizard`), tab switching is prohibited until the user exits with `Esc` or completes the action with `Enter`.
+- **Modal Isolation:** If an operator is inside an active editor or transaction sub-flow (for example `InterfaceEditor`, `WifiEditor`, `RouterPlan`), tab switching is prohibited until the user exits or completes the action.
 
 ### 3.4. Hit-Testing & Mouse Coordinates (`UiLayout`)
 
@@ -119,19 +119,27 @@ Mouse support is dynamically synchronized during the rendering pass:
   - If inside a button rect in `buttons`, it activates the corresponding slot.
   - If inside `list_area`, it translates the terminal row to the model index:
     $$\text{index} = \text{list\_scroll\_offset} + \frac{\text{mouse.row} - \text{list\_area.y}}{\text{list\_row\_height}}$$
-- When terminal dimensions fall below the minimum threshold ($60 \times 15$), `app.ui.input_enabled` is set to `false`, and all hit regions are wiped clean to avoid ghost clicks.
+- The shell supports terminals at or above $80 \times 24$. Below that size `app.ui.input_enabled` is `false` and all hit regions are wiped clean.
+- After every screen renderer completes, `UiLayout::clip_interactions` intersects list/button hit targets with the central content viewport. Rendered overflow may be clipped visually, but it can never remain mouse-active in the header/footer.
 
-### 3.5. Text Input & Cursor Safety
+### 3.5. Scroll Ownership and Review Screens
+
+Mouse-wheel input on Dashboard, VPN, Router route/sharing lists, and Log returns focus to the list or viewport and clamps at its boundaries; it must not advance focus onto action buttons. Both interface and router plan reviews support wheel scrolling through the same handlers as Up/Down.
+
+Scrollable screens own their viewport state explicitly instead of relying on Paragraph clipping. Lists register the visible `list_area`, `list_row_height`, item count, and model-level scroll offset in `UiLayout`. Interface and router plan reviews both keep explicit scroll/max-scroll state; Apply is accepted only after the operator has reached the end of the plan. Their pending screens share the same countdown and Commit/Rollback action layout; router pending additionally supports scrolling rollback diagnostics. DHCP Client selection is keyed by interface name, not by a shared list index, because dashboard interfaces and configured DHCP clients are different collections.
+
+### 3.6. Text Input & Cursor Safety
 
 Never manipulate UTF-8 strings by raw byte indexing. The helper `input::TextEditor` wraps `(&mut String, &mut usize)`:
-- Uses `chars().count()` for visual cursor position and `char_indices()` for byte slicing.
-- Automatically clamps cursor boundaries on insertion, deletion, backspace, home, and end.
+- Indexes extended grapheme clusters with `unicode-segmentation`, so combining sequences move/delete as one visible character.
+- Converts grapheme positions to UTF-8 byte ranges only at the mutation boundary; raw byte indexing is never exposed to screens.
+- Active text fields bound the caret viewport by terminal-cell width with `unicode-width`, so long paths, wide glyphs, and identifiers do not push the caret off-screen.
+- Password fields use the same grapheme count while rendering only mask characters.
 - Provides `is_cursor_blink_visible()` based on 500ms intervals since Unix epoch.
-- Password fields use `render_masked_with_cursor` to obscure secrets while maintaining full cursor positioning fidelity.
 
-### 3.6. Security, Zeroization & Session Storage
+### 3.7. Security, Zeroization & Session Storage
 
-1. **Zeroization:** Structs storing sensitive passphrases (e.g. `ProvisioningWizard`, `PasswordChangeEditor`, authentication buffers) implement `Drop` to call `.zeroize()` on underlying strings.
+1. **Zeroization:** Structs storing sensitive passphrases (for example `PasswordChangeEditor`, Wi-Fi editors, and authentication buffers) implement `Drop` to call `.zeroize()` on underlying strings.
 2. **Session Persistence (`session.rs`):**
    - Stored under `$XDG_STATE_HOME/traffic-masq/client/<sha256-of-socket-path>.session.json`.
    - File and directory permissions must be strictly verified: owner UID match, directory mode `0700`, file mode `0600`.
@@ -266,7 +274,7 @@ async fn test_editor_navigation() {
 ```
 
 ### Pattern 4: Terminal Resize & Clipping Verification
-Verify that reducing terminal dimensions below $60 \times 15$ properly degrades into a warning banner and wipes hit targets:
+Verify that reducing terminal dimensions below $80 \times 24$ properly degrades into a warning banner and wipes hit targets:
 ```rust
 #[tokio::test]
 async fn resize_clears_hit_regions() {

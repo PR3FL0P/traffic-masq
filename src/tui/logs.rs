@@ -97,7 +97,7 @@ fn format_time_hms(unix_time: u64) -> String {
     let hours = seconds_of_day / 3_600;
     let minutes = (seconds_of_day % 3_600) / 60;
     let seconds = seconds_of_day % 60;
-    format!("{hours:02}:{minutes:02}:{seconds:02}")
+    format!("{hours:02}:{minutes:02}:{seconds:02}Z")
 }
 
 pub(crate) fn render_log(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
@@ -112,6 +112,8 @@ pub(crate) fn render_log(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
     render_log_actions(frame, sections[1], app);
 
     if app.logs.is_empty() {
+        app.logs_scroll = 0;
+        app.logs_max_scroll = 0;
         let block = panel("Session log");
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -126,10 +128,9 @@ pub(crate) fn render_log(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
     let visible = (area.height.saturating_sub(2) as usize).max(1).min(total);
     let max_offset = total.saturating_sub(visible);
 
-    if app.logs_scroll >= max_offset.saturating_sub(1) {
-        app.logs_scroll = max_offset;
-    }
-    let offset = app.logs_scroll.min(max_offset);
+    app.logs_max_scroll = max_offset;
+    app.logs_scroll = app.logs_scroll.min(max_offset);
+    let offset = app.logs_scroll;
 
     let title = if visible < total {
         format!(
@@ -166,8 +167,8 @@ pub(crate) fn render_log(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
 }
 
 pub(crate) fn handle_log_key(app: &mut TuiApp, key: KeyCode) {
-    let total = app.logs.len();
     const PAGE: usize = 10;
+    let max_scroll = app.logs_max_scroll;
 
     let key = match key {
         KeyCode::Left if app.logs_focus != LogFocus::Scroll => KeyCode::Up,
@@ -185,8 +186,8 @@ pub(crate) fn handle_log_key(app: &mut TuiApp, key: KeyCode) {
         }
         KeyCode::Esc => app.screen = Screen::Dashboard,
         KeyCode::Down => match app.logs_focus {
-            LogFocus::Scroll if app.logs_scroll < total => {
-                app.logs_scroll = app.logs_scroll.saturating_add(1).min(total);
+            LogFocus::Scroll if app.logs_scroll < max_scroll => {
+                app.logs_scroll = app.logs_scroll.saturating_add(1).min(max_scroll);
             }
             LogFocus::Scroll => app.logs_focus = LogFocus::Export,
             LogFocus::Export => app.logs_focus = LogFocus::Clear,
@@ -199,7 +200,7 @@ pub(crate) fn handle_log_key(app: &mut TuiApp, key: KeyCode) {
         },
         KeyCode::PageDown => {
             app.logs_focus = LogFocus::Scroll;
-            app.logs_scroll = app.logs_scroll.saturating_add(PAGE).min(total);
+            app.logs_scroll = app.logs_scroll.saturating_add(PAGE).min(max_scroll);
         }
         KeyCode::PageUp => {
             app.logs_focus = LogFocus::Scroll;
@@ -211,7 +212,7 @@ pub(crate) fn handle_log_key(app: &mut TuiApp, key: KeyCode) {
         }
         KeyCode::End => {
             app.logs_focus = LogFocus::Scroll;
-            app.logs_scroll = total;
+            app.logs_scroll = max_scroll;
         }
         KeyCode::Enter => match app.logs_focus {
             LogFocus::Scroll => {}
@@ -219,7 +220,9 @@ pub(crate) fn handle_log_key(app: &mut TuiApp, key: KeyCode) {
             LogFocus::Clear => {
                 app.logs.clear();
                 app.logs_scroll = 0;
+                app.logs_max_scroll = 0;
                 app.push_message(LogLevel::Info, "Log cleared");
+                app.logs_scroll = 0;
             }
         },
         _ => {}
@@ -268,6 +271,7 @@ mod tests {
             message: "one".to_string(),
         });
 
+        app.logs_max_scroll = 1;
         handle_log_key(&mut app, KeyCode::Down);
         assert_eq!(app.logs_focus, LogFocus::Scroll);
         assert_eq!(app.logs_scroll, 1);
@@ -287,6 +291,23 @@ mod tests {
         assert_eq!(app.logs_focus, LogFocus::Export);
         handle_log_key(&mut app, KeyCode::Up);
         assert_eq!(app.logs_focus, LogFocus::Scroll);
+    }
+
+
+    #[test]
+    fn moving_up_one_row_from_the_bottom_is_not_snapped_back() {
+        let mut app = TuiApp::default();
+        for i in 0..20 {
+            app.logs.push_back(LogEntry {
+                at_unix: i,
+                level: LogLevel::Info,
+                message: format!("entry-{i}"),
+            });
+        }
+        app.logs_scroll = 10;
+        app.logs_max_scroll = 10;
+        handle_log_key(&mut app, KeyCode::Up);
+        assert_eq!(app.logs_scroll, 9);
     }
 
     #[test]

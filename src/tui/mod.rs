@@ -183,19 +183,36 @@ fn section_of(screen: Screen) -> Section {
     }
 }
 
-fn adjacent_section(current: Section, forward: bool, show_dhcp_client: bool) -> Section {
+fn section_of_app(app: &TuiApp) -> Section {
+    if app.screen == Screen::PendingChange {
+        section_of(app.pending_return_screen)
+    } else {
+        section_of(app.screen)
+    }
+}
+
+fn section_available(section: Section, direct: bool) -> bool {
+    !direct || matches!(section, Section::Dashboard | Section::Interfaces | Section::Log)
+}
+
+fn adjacent_section(current: Section, forward: bool, show_dhcp_client: bool, direct: bool) -> Section {
     let sections = active_sections(show_dhcp_client);
     let index = sections
         .iter()
         .position(|section| *section == current)
         .unwrap_or(0);
     let len = sections.len();
-    let next_index = if forward {
-        (index + 1) % len
-    } else {
-        (index + len - 1) % len
-    };
-    sections[next_index]
+    for step in 1..=len {
+        let next_index = if forward {
+            (index + step) % len
+        } else {
+            (index + len - (step % len)) % len
+        };
+        if section_available(sections[next_index], direct) {
+            return sections[next_index];
+        }
+    }
+    current
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,10 +237,13 @@ struct TuiApp {
     dhcp_editor: Option<DhcpEditor>,
     dhcp_leases: Option<DhcpLeasesView>,
     dhcp_clients: Vec<DhcpClientStatusView>,
+    dhcp_client_selected: Option<String>,
+    dhcp_client_scroll: usize,
     preview: Option<InterfaceChangePlan>,
-    preview_apply_selected: bool,
-    preview_scroll: Option<usize>,
+    preview_scroll: usize,
+    preview_max_scroll: usize,
     pending: Option<PendingNetworkChange>,
+    pending_return_screen: Screen,
     router: RouterData,
     router_pending: Option<RouterPendingView>,
     forwarding: Option<forwarding::ForwardingEditor>,
@@ -248,6 +268,7 @@ struct TuiApp {
     should_quit: bool,
     logs: VecDeque<logs::LogEntry>,
     logs_scroll: usize,
+    logs_max_scroll: usize,
     logs_focus: logs::LogFocus,
 }
 
@@ -264,10 +285,13 @@ impl Default for TuiApp {
             dhcp_editor: None,
             dhcp_leases: None,
             dhcp_clients: Vec::new(),
+            dhcp_client_selected: None,
+            dhcp_client_scroll: 0,
             preview: None,
-            preview_apply_selected: true,
-            preview_scroll: None,
+            preview_scroll: 0,
+            preview_max_scroll: 0,
             pending: None,
+            pending_return_screen: Screen::Dashboard,
             router: RouterData::default(),
             router_pending: None,
             forwarding: None,
@@ -292,6 +316,7 @@ impl Default for TuiApp {
             should_quit: false,
             logs: VecDeque::new(),
             logs_scroll: 0,
+            logs_max_scroll: 0,
             logs_focus: logs::LogFocus::default(),
         }
     }
@@ -299,6 +324,7 @@ impl Default for TuiApp {
 
 impl TuiApp {
     pub(crate) fn push_message(&mut self, level: logs::LogLevel, text: impl Into<String>) {
+        let follow_log_tail = self.logs_scroll >= self.logs_max_scroll;
         let text = text.into();
         self.message = Some(text.clone());
         self.logs.push_back(logs::LogEntry {
@@ -308,6 +334,12 @@ impl TuiApp {
         });
         if self.logs.len() > logs::LOG_HISTORY_LEN {
             self.logs.pop_front();
+        }
+        if follow_log_tail {
+            // The exact maximum depends on the rendered viewport. A sentinel
+            // is clamped to that maximum on the next render, preserving
+            // follow-tail without snapping back after a deliberate Up.
+            self.logs_scroll = usize::MAX;
         }
     }
 }
@@ -531,6 +563,9 @@ async fn run_loop(
                 if !direct && app.screen == Screen::DhcpLeases {
                     dhcp::refresh_dhcp_leases(&mut app, client).await;
                 }
+                if !direct && app.screen == Screen::DhcpClient {
+                    dhcp_client::refresh(&mut app, client).await;
+                }
                 if !direct && app.screen == Screen::Vpn {
                     vpn::load_vpn_data(&mut app, client).await;
                 }
@@ -618,11 +653,9 @@ async fn drive_ui(
             _ = &mut operation => return Ok(exit_requested),
             _ = tokio::time::sleep(Duration::from_millis(50)) => {
                 let elapsed = started.elapsed();
-                let is_resized = terminal.size().ok().map(|s| ratatui::layout::Rect::new(0, 0, s.width, s.height)) != Some(snapshot.area);
-                let should_render = !is_resized
-                    && (!cancellable
-                        || elapsed >= Duration::from_millis(500)
-                        || deadline.is_some());
+                let should_render = !cancellable
+                    || elapsed >= Duration::from_millis(500)
+                    || deadline.is_some();
                 if should_render {
                     terminal.draw(|frame| {
                         render_operation_snapshot(
@@ -635,14 +668,15 @@ async fn drive_ui(
                     if matches!(input, Event::Key(k) if k.kind != event::KeyEventKind::Press) { continue; }
                     if matches!(input, Event::Mouse(m) if matches!(m.kind, MouseEventKind::Moved)) { continue; }
                     if cancellable { return Ok(Some(input)); }
-                    if matches!(input, Event::Key(k) if is_quit_key(k)) { exit_requested = Some(input); }
+                    if matches!(input, Event::Key(k) if is_operation_exit_key(k)) { exit_requested = Some(input); }
                 }
             }
         }
     }
 }
 
-/// Keep the notification and footer border intact while an API request runs.
+/// Reuse the current frame while an API request runs. If the terminal is
+/// resized, discard the stale snapshot and redraw progress in the new geometry.
 /// Routine refreshes should finish without flashing a progress indicator.
 fn render_operation_snapshot(
     frame: &mut ratatui::Frame<'_>,
@@ -652,14 +686,26 @@ fn render_operation_snapshot(
     cancellable: bool,
 ) {
     let area = frame.area();
-    if area != snapshot.area {
+    if area == snapshot.area {
+        *frame.buffer_mut() = snapshot.clone();
+    } else {
+        frame.render_widget(ratatui::widgets::Clear, area);
+    }
+    if cancellable && elapsed < Duration::from_millis(500) {
         return;
     }
-    *frame.buffer_mut() = snapshot.clone();
-    if (cancellable && elapsed < Duration::from_millis(500))
-        || area.width < MIN_TERMINAL_WIDTH
-        || area.height < MIN_TERMINAL_HEIGHT
-    {
+    if area.width < MIN_TERMINAL_WIDTH || area.height < MIN_TERMINAL_HEIGHT {
+        let message = if cancellable {
+            "Refreshing… resize to at least 80x24"
+        } else {
+            "Operation in progress… resize to at least 80x24. Q: exit after result"
+        };
+        frame.render_widget(
+            Paragraph::new(message)
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(theme::WARN)),
+            area,
+        );
         return;
     }
     let remaining = deadline
@@ -717,7 +763,7 @@ async fn reauthenticate(
                     Style::default(),
                 )];
                 spans.extend(input::render_masked_with_cursor(
-                    password.chars().count(),
+                    input::grapheme_count(password.as_str()),
                     cursor,
                     true,
                     '*',
@@ -821,6 +867,12 @@ async fn navigate_to_section(app: &mut TuiApp, section: Section, client: &ApiCli
                     "DHCP Client management requires the daemon API",
                 );
             } else {
+                app.dhcp_client_selected = app
+                    .dashboard
+                    .interfaces
+                    .get(app.selected_interface)
+                    .map(|status| status.interface.name.clone());
+                app.dhcp_client_scroll = 0;
                 app.screen = Screen::DhcpClient;
                 dhcp_client::refresh(app, client).await;
             }
@@ -894,12 +946,48 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
         return;
     }
     let point = (mouse.column, mouse.row);
-    match mouse.kind {
-        MouseEventKind::Down(MouseButton::Left) => {
-            if let Some(section) = layout::section_at(&app.ui.tabs, point) {
-                navigate_to_section(app, section, client, direct).await;
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+        if let Some(section) = layout::section_at(&app.ui.tabs, point) {
+            navigate_to_section(app, section, client, direct).await;
+            return;
+        }
+    }
+    if app
+        .ui
+        .content_area
+        .is_some_and(|area| !layout::point_in_rect(point, area))
+    {
+        return;
+    }
+
+    // Wheel input belongs to the list/viewport, even when a button had focus.
+    // In particular, scrolling must not select a destructive action for Enter.
+    if matches!(
+        mouse.kind,
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+    ) {
+        match app.screen {
+            Screen::Dashboard => app.dashboard_focus = dashboard::DashboardFocus::List,
+            Screen::Vpn => app.vpn.focus = vpn::VpnFocus::List,
+            Screen::Router if !app.router.topology.open => {
+                app.router.focus = RouterFocus::RouteTable;
+                app.router.sharing_actions_focused = false;
+            }
+            Screen::Log => {
+                app.logs_focus = logs::LogFocus::Scroll;
+                app.logs_scroll = if mouse.kind == MouseEventKind::ScrollUp {
+                    app.logs_scroll.saturating_sub(1)
+                } else {
+                    app.logs_scroll.saturating_add(1).min(app.logs_max_scroll)
+                };
                 return;
             }
+            _ => {}
+        }
+    }
+
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
             if app.screen == Screen::Router {
                 if let Some((_, pane)) = app
                     .router
@@ -919,9 +1007,13 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                 .find(|(rect, _)| layout::point_in_rect(point, *rect))
             {
                 focus_action_slot(app, slot);
-                let key = if (app.screen == Screen::PendingChange
-                    || app.screen == Screen::RouterPending)
-                    && slot == 1
+                let key = if matches!(
+                    app.screen,
+                    Screen::Preview
+                        | Screen::PendingChange
+                        | Screen::RouterPlan
+                        | Screen::RouterPending
+                ) && slot == 1
                 {
                     KeyCode::Esc
                 } else {
@@ -944,6 +1036,9 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                                 if app.screen == Screen::Dashboard {
                                     app.dashboard_focus = dashboard::DashboardFocus::List;
                                 }
+                            }
+                            Screen::DhcpClient => {
+                                dhcp_client::select_row(app, index);
                             }
                             Screen::Vpn => {
                                 app.vpn.selected_profile = index;
@@ -995,11 +1090,20 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
             }
         }
         MouseEventKind::ScrollUp => match app.screen {
+            Screen::Preview => interfaces::handle_preview_key(app, KeyCode::Up, client).await,
             Screen::Wifi => wifi::handle_wifi_key(app, KeyCode::Up, client).await,
             Screen::WifiScan => wifi::handle_wifi_scan_key(app, KeyCode::Up),
             Screen::WifiProfiles => wifi::handle_wifi_profiles_key(app, KeyCode::Up, client).await,
             Screen::Dashboard | Screen::InterfaceList | Screen::DhcpInterfaceList => {
                 app.selected_interface = app.selected_interface.saturating_sub(1);
+            }
+            Screen::DhcpClient => dhcp_client::move_selection(app, false),
+            Screen::Router => router::handle_router_key(app, KeyCode::Up, client).await,
+            Screen::RouterPlan => {
+                router::handle_router_plan_key(app, KeyCode::Up, client).await;
+            }
+            Screen::RouterPending => {
+                router::handle_router_pending_key(app, KeyCode::Up, client).await;
             }
             Screen::Vpn => {
                 app.vpn.focus = vpn::VpnFocus::List;
@@ -1013,6 +1117,7 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
             _ => {}
         },
         MouseEventKind::ScrollDown => match app.screen {
+            Screen::Preview => interfaces::handle_preview_key(app, KeyCode::Down, client).await,
             Screen::Wifi => wifi::handle_wifi_key(app, KeyCode::Down, client).await,
             Screen::WifiScan => wifi::handle_wifi_scan_key(app, KeyCode::Down),
             Screen::WifiProfiles => {
@@ -1022,6 +1127,14 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                 if app.selected_interface + 1 < app.dashboard.interfaces.len() =>
             {
                 app.selected_interface += 1;
+            }
+            Screen::DhcpClient => dhcp_client::move_selection(app, true),
+            Screen::Router => router::handle_router_key(app, KeyCode::Down, client).await,
+            Screen::RouterPlan => {
+                router::handle_router_plan_key(app, KeyCode::Down, client).await;
+            }
+            Screen::RouterPending => {
+                router::handle_router_pending_key(app, KeyCode::Down, client).await;
             }
             Screen::Vpn if app.vpn.selected_profile + 1 < app.vpn.profiles.len() => {
                 app.vpn.focus = vpn::VpnFocus::List;
@@ -1040,8 +1153,8 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
     }
 }
 
-const MIN_TERMINAL_WIDTH: u16 = 60;
-const MIN_TERMINAL_HEIGHT: u16 = 15;
+const MIN_TERMINAL_WIDTH: u16 = 80;
+const MIN_TERMINAL_HEIGHT: u16 = 24;
 
 pub(crate) fn format_message_lines(text: &str) -> Vec<Line<'_>> {
     const SHIFT_HINT: &str = "to copy, hold down shift";
@@ -1095,6 +1208,14 @@ fn is_quit_key(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
+fn is_operation_exit_key(key: KeyEvent) -> bool {
+    is_quit_key(key)
+        || (matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER))
+}
+
 async fn handle_key_event(app: &mut TuiApp, key: KeyEvent, client: &ApiClient, direct: bool) {
     if is_quit_key(key) {
         app.should_quit = true;
@@ -1121,7 +1242,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp, direct: bool) {
     app.ui = UiLayout::default();
     if area.width < MIN_TERMINAL_WIDTH || area.height < MIN_TERMINAL_HEIGHT {
         frame.render_widget(
-            Paragraph::new("Terminal too small — resize to at least 60x15. Q: exit. Pending changes keep their original rollback deadlines.")
+            Paragraph::new("Terminal too small — resize to at least 80x24. Q: exit. Pending changes keep their original rollback deadlines.")
                 .alignment(Alignment::Center)
                 .style(Style::default().fg(theme::WARN)),
             area,
@@ -1188,6 +1309,9 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp, direct: bool) {
         Screen::Log => logs::render_log(frame, chunks[1], app),
     }
 
+    // Mouse geometry is a derived view of what is actually visible. Never let
+    // a renderer leave an off-screen control active in the shell chrome.
+    app.ui.clip_interactions(chunks[1]);
     layout::render_footer(frame, chunks[2], app);
 }
 
@@ -1196,7 +1320,6 @@ fn focus_action_slot(app: &mut TuiApp, slot: usize) {
         Screen::Dashboard => dashboard::focus_action(app, slot),
         Screen::Access => access::focus_action(app, slot),
         Screen::InterfaceEditor => interfaces::focus_action(app, slot),
-        Screen::Preview => interfaces::focus_preview_action(app, slot),
         Screen::DhcpEditor => dhcp::focus_action(app, slot),
         Screen::Router => router::focus_action(app, slot),
         Screen::Forwarding => forwarding::focus_action(app, slot),
@@ -1221,7 +1344,7 @@ fn focus_action_slot(app: &mut TuiApp, slot: usize) {
 
 async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: bool) {
     if !app.ui.input_enabled {
-        if key == KeyCode::Char('q') {
+        if matches!(key, KeyCode::Char('q') | KeyCode::Char('Q')) {
             app.should_quit = true;
         }
         return;
@@ -1243,9 +1366,10 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
 
     if matches!(key, KeyCode::F(2) | KeyCode::F(3)) {
         let target = adjacent_section(
-            section_of(app.screen),
+            section_of_app(app),
             key == KeyCode::F(3),
             app.show_dhcp_client,
+            direct,
         );
         navigate_to_section(app, target, client, direct).await;
         return;
@@ -1296,9 +1420,10 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
         };
         if !horizontal_focus && matches!(key, KeyCode::Left | KeyCode::Right) {
             let target = adjacent_section(
-                section_of(app.screen),
+                section_of_app(app),
                 key == KeyCode::Right,
                 app.show_dhcp_client,
+                direct,
             );
             navigate_to_section(app, target, client, direct).await;
             return;
@@ -1343,7 +1468,7 @@ fn refresh_pending_screen(app: &mut TuiApp) {
         return;
     }
     let Some(change) = &app.pending else {
-        app.screen = Screen::Dashboard;
+        app.screen = app.pending_return_screen;
         return;
     };
     if app.dashboard.error.is_some() {
@@ -1361,7 +1486,9 @@ fn refresh_pending_screen(app: &mut TuiApp) {
             "Network transaction is no longer pending; outcome unknown. Inspect current interface state.",
         );
         app.pending = None;
-        app.screen = Screen::Dashboard;
+        app.preview = None;
+        app.editor = None;
+        app.screen = app.pending_return_screen;
     }
 }
 
@@ -1629,14 +1756,14 @@ mod tests {
             }),
             ..Default::default()
         };
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(60, 15)).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal
             .draw(|frame| render(frame, &mut app, false))
             .unwrap();
         let (rect, _) = *app.ui.buttons.iter().find(|(_, slot)| *slot == 1).unwrap();
         assert!(
-            rect.y < 10,
-            "rollback must fit inside the content panel at 60x15"
+            rect.y < 20,
+            "rollback must fit inside the content panel at 80x24"
         );
         handle_mouse(
             &mut app,
@@ -1810,7 +1937,7 @@ mod tests {
 
     #[test]
     fn footer_message_is_visible_at_supported_sizes() {
-        for (width, height) in [(80, 24), (60, 15)] {
+        for (width, height) in [(80, 24), (100, 30)] {
             let mut terminal =
                 Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
             let mut app = TuiApp::default();
@@ -1831,7 +1958,7 @@ mod tests {
 
     #[test]
     fn refreshing_preserves_footer_notification_and_does_not_flash_for_fast_reads() {
-        for (width, height) in [(80, 24), (60, 15)] {
+        for (width, height) in [(80, 24), (100, 30)] {
             let mut terminal =
                 Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
             let mut app = TuiApp::default();
@@ -1887,6 +2014,74 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn operation_snapshot_redraws_safely_after_terminal_resize() {
+        let mut old_terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        let mut app = TuiApp::default();
+        let snapshot = old_terminal
+            .draw(|frame| render(frame, &mut app, false))
+            .unwrap()
+            .buffer
+            .clone();
+
+        let mut resized = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        resized
+            .draw(|frame| {
+                render_operation_snapshot(
+                    frame,
+                    &snapshot,
+                    None,
+                    Duration::from_secs(2),
+                    false,
+                )
+            })
+            .unwrap();
+        let rendered = resized
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Operation in progress"));
+        assert!(!rendered.contains("traffic-masq"));
+    }
+
+    #[tokio::test]
+    async fn mouse_content_actions_are_ignored_outside_the_content_viewport() {
+        let client = ApiClient::new("/socket-that-must-not-be-opened");
+        let mut app = TuiApp {
+            screen: Screen::Log,
+            ..Default::default()
+        };
+        app.logs.push_back(logs::LogEntry {
+            at_unix: 0,
+            level: LogLevel::Info,
+            message: "keep".into(),
+        });
+        app.logs_focus = logs::LogFocus::Clear;
+        app.ui.input_enabled = true;
+        app.ui.content_area = Some(ratatui::layout::Rect::new(0, 3, 80, 17));
+        app.ui
+            .buttons
+            .push((ratatui::layout::Rect::new(1, 22, 10, 1), 1));
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: 22,
+                modifiers: KeyModifiers::NONE,
+            },
+            &client,
+            false,
+        )
+        .await;
+        assert_eq!(app.logs.len(), 1);
     }
 
     #[tokio::test]
@@ -1965,40 +2160,40 @@ mod tests {
     #[test]
     fn adjacent_section_cycles_forward_and_backward_through_all_nine() {
         assert_eq!(
-            adjacent_section(Section::Dashboard, true, true),
+            adjacent_section(Section::Dashboard, true, true, false),
             Section::Interfaces
         );
-        assert_eq!(adjacent_section(Section::Vpn, true, true), Section::Wifi);
+        assert_eq!(adjacent_section(Section::Vpn, true, true, false), Section::Wifi);
         assert_eq!(
-            adjacent_section(Section::Wifi, true, true),
+            adjacent_section(Section::Wifi, true, true, false),
             Section::Settings
         );
         assert_eq!(
-            adjacent_section(Section::Settings, true, true),
+            adjacent_section(Section::Settings, true, true, false),
             Section::Log
         );
         assert_eq!(
-            adjacent_section(Section::Log, true, true),
+            adjacent_section(Section::Log, true, true, false),
             Section::Dashboard
         );
         assert_eq!(
-            adjacent_section(Section::Dashboard, false, true),
+            adjacent_section(Section::Dashboard, false, true, false),
             Section::Log
         );
         assert_eq!(
-            adjacent_section(Section::Interfaces, false, true),
+            adjacent_section(Section::Interfaces, false, true, false),
             Section::Dashboard
         );
         assert_eq!(
-            adjacent_section(Section::Interfaces, true, true),
+            adjacent_section(Section::Interfaces, true, true, false),
             Section::Dhcp
         );
         assert_eq!(
-            adjacent_section(Section::Dhcp, true, true),
+            adjacent_section(Section::Dhcp, true, true, false),
             Section::DhcpClient
         );
         assert_eq!(
-            adjacent_section(Section::DhcpClient, true, true),
+            adjacent_section(Section::DhcpClient, true, true, false),
             Section::Router
         );
     }
@@ -2006,13 +2201,45 @@ mod tests {
     #[test]
     fn adjacent_section_cycles_without_dhcp_client_by_default() {
         assert_eq!(
-            adjacent_section(Section::Dhcp, true, false),
+            adjacent_section(Section::Dhcp, true, false, false),
             Section::Router
         );
         assert_eq!(
-            adjacent_section(Section::Router, false, false),
+            adjacent_section(Section::Router, false, false, false),
             Section::Dhcp
         );
+    }
+
+    #[test]
+    fn direct_mode_section_navigation_skips_daemon_only_tabs() {
+        assert_eq!(
+            adjacent_section(Section::Interfaces, true, true, true),
+            Section::Log
+        );
+        assert_eq!(
+            adjacent_section(Section::Log, true, true, true),
+            Section::Dashboard
+        );
+        assert_eq!(
+            adjacent_section(Section::Dashboard, false, true, true),
+            Section::Log
+        );
+    }
+
+    #[test]
+    fn operation_exit_accepts_plain_q_but_normal_quit_stays_ctrl_c() {
+        assert!(is_operation_exit_key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        )));
+        assert!(is_operation_exit_key(KeyEvent::new(
+            KeyCode::Char('Q'),
+            KeyModifiers::SHIFT,
+        )));
+        assert!(!is_quit_key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        )));
     }
 
     #[tokio::test]
@@ -2057,6 +2284,22 @@ mod tests {
         assert_eq!(section_of(Screen::SettingsPassword), Section::Settings);
         assert_eq!(section_of(Screen::Access), Section::Settings);
         assert_eq!(section_of(Screen::Log), Section::Log);
+    }
+
+    #[test]
+    fn pending_change_uses_its_origin_section() {
+        let mut app = TuiApp {
+            screen: Screen::PendingChange,
+            pending_return_screen: Screen::InterfaceList,
+            ..Default::default()
+        };
+        assert_eq!(section_of_app(&app), Section::Interfaces);
+
+        app.pending_return_screen = Screen::Wifi;
+        assert_eq!(section_of_app(&app), Section::Wifi);
+
+        app.pending_return_screen = Screen::Dashboard;
+        assert_eq!(section_of_app(&app), Section::Dashboard);
     }
 
     #[tokio::test]
@@ -2185,6 +2428,121 @@ mod tests {
         assert_eq!(hint_line.spans.len(), 1);
         assert_eq!(hint_line.spans[0].content, "To copy, hold down Shift");
         assert_eq!(hint_line.spans[0].style, Style::default().fg(theme::BAD));
+    }
+
+    #[tokio::test]
+    async fn wheel_scrolls_interface_preview_and_clamps_at_both_ends() {
+        let client = ApiClient::new("/socket-that-must-not-be-opened");
+        let mut app = TuiApp {
+            screen: Screen::Preview,
+            preview_max_scroll: 2,
+            ..Default::default()
+        };
+        app.ui.input_enabled = true;
+        for (kind, expected) in [
+            (MouseEventKind::ScrollDown, 1),
+            (MouseEventKind::ScrollDown, 2),
+            (MouseEventKind::ScrollDown, 2),
+            (MouseEventKind::ScrollUp, 1),
+            (MouseEventKind::ScrollUp, 0),
+            (MouseEventKind::ScrollUp, 0),
+        ] {
+            handle_mouse(
+                &mut app,
+                MouseEvent {
+                    kind,
+                    column: 10,
+                    row: 10,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &client,
+                false,
+            )
+            .await;
+            assert_eq!(app.preview_scroll, expected);
+            assert_eq!(app.screen, Screen::Preview);
+        }
+    }
+
+    #[tokio::test]
+    async fn wheel_cannot_focus_or_execute_log_actions() {
+        let client = ApiClient::new("/socket-that-must-not-be-opened");
+        let mut app = TuiApp {
+            screen: Screen::Log,
+            logs_focus: logs::LogFocus::Clear,
+            logs_max_scroll: 1,
+            ..Default::default()
+        };
+        app.ui.input_enabled = true;
+        app.push_message(LogLevel::Info, "keep this entry");
+        let count = app.logs.len();
+        for kind in [
+            MouseEventKind::ScrollDown,
+            MouseEventKind::ScrollDown,
+            MouseEventKind::ScrollDown,
+            MouseEventKind::ScrollUp,
+        ] {
+            handle_mouse(
+                &mut app,
+                MouseEvent {
+                    kind,
+                    column: 10,
+                    row: 10,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &client,
+                false,
+            )
+            .await;
+            assert_eq!(app.logs_focus, logs::LogFocus::Scroll);
+            handle_key(&mut app, KeyCode::Enter, &client, false).await;
+            assert_eq!(app.logs.len(), count);
+        }
+        assert_eq!(app.logs_scroll, 0);
+    }
+
+    #[tokio::test]
+    async fn wheel_returns_focus_to_lists_even_when_empty_or_at_the_boundary() {
+        let client = ApiClient::new("/socket-that-must-not-be-opened");
+        for screen in [Screen::Dashboard, Screen::Vpn, Screen::Router] {
+            for kind in [MouseEventKind::ScrollUp, MouseEventKind::ScrollDown] {
+                let mut app = TuiApp {
+                    screen,
+                    ..Default::default()
+                };
+                app.ui.input_enabled = true;
+                app.dashboard_focus = dashboard::DashboardFocus::Interfaces;
+                app.vpn.focus = vpn::VpnFocus::Delete;
+                app.router.focus = RouterFocus::Actions;
+                app.router.action = router::RouterAction::DeleteRoute;
+                app.router.sharing_actions_focused = true;
+                handle_mouse(
+                    &mut app,
+                    MouseEvent {
+                        kind,
+                        column: 10,
+                        row: 10,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                    &client,
+                    false,
+                )
+                .await;
+                match screen {
+                    Screen::Dashboard => {
+                        assert_eq!(app.dashboard_focus, dashboard::DashboardFocus::List)
+                    }
+                    Screen::Vpn => assert_eq!(app.vpn.focus, vpn::VpnFocus::List),
+                    Screen::Router => {
+                        assert_eq!(app.router.focus, RouterFocus::RouteTable);
+                        assert!(!app.router.sharing_actions_focused);
+                        assert_eq!(app.router.action, router::RouterAction::DeleteRoute);
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(app.screen, screen);
+            }
+        }
     }
 
     #[tokio::test]
