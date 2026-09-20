@@ -385,10 +385,11 @@ pub(crate) fn render_dashboard_traffic(
         return;
     }
 
-    const ROW_HEIGHT: u16 = 4;
+    // On a short terminal, prioritize interfaces over history graphs.
+    let row_height = if area.height < 14 { 1 } else { 3 };
     let total = app.dashboard.interfaces.len();
 
-    let max_visible = ((area.height.saturating_sub(2)) / ROW_HEIGHT).max(1) as usize;
+    let max_visible = ((area.height.saturating_sub(2)) / row_height).max(1) as usize;
     let visible = total.min(max_visible);
 
     let max_offset = total.saturating_sub(visible);
@@ -399,7 +400,7 @@ pub(crate) fn render_dashboard_traffic(
 
     let title = if visible < total {
         format!(
-            "Interface traffic ({}-{} of {total}, scroll with j/k)",
+            "Interface traffic ({}-{} of {total}, ↑/↓ to scroll)",
             offset + 1,
             offset + visible
         )
@@ -410,14 +411,19 @@ pub(crate) fn render_dashboard_traffic(
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    app.ui.list_area = Some(inner);
-    app.ui.list_row_height = ROW_HEIGHT;
+    app.ui.list_area = Some(Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        (visible as u16 * row_height).min(inner.height),
+    ));
+    app.ui.list_row_height = row_height;
     app.ui.list_count = total;
     app.ui.list_scroll_offset = offset;
 
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(vec![Constraint::Length(ROW_HEIGHT); visible])
+        .constraints(vec![Constraint::Length(row_height); visible])
         .split(inner);
 
     let selected_interface = app.selected_interface;
@@ -448,16 +454,6 @@ fn render_traffic_row(
     history: Option<&TrafficHistory>,
     selected: bool,
 ) {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .split(area);
-
     let marker = if selected { "▶" } else { " " };
     let name_style = if selected {
         Style::default()
@@ -494,7 +490,13 @@ fn render_traffic_row(
         Span::raw("   "),
     ]);
     header.spans.extend(format_addresses(status));
-    frame.render_widget(Paragraph::new(header), rows[0]);
+    frame.render_widget(
+        Paragraph::new(header),
+        Rect::new(area.x, area.y, area.width, area.height.min(1)),
+    );
+    if area.height < 3 {
+        return;
+    }
 
     let rx_slice = history.map(|history| history.rx_rates()).unwrap_or(&[]);
     let tx_slice = history.map(|history| history.tx_rates()).unwrap_or(&[]);
@@ -503,19 +505,60 @@ fn render_traffic_row(
         Sparkline::default()
             .data(rx_slice)
             .style(Style::default().fg(theme::ACCENT)),
-        rows[1],
+        Rect::new(area.x, area.y + 1, area.width, 1),
     );
     frame.render_widget(
         Sparkline::default()
             .data(tx_slice)
             .style(Style::default().fg(theme::ACCENT_ALT)),
-        rows[2],
+        Rect::new(area.x, area.y + 2, area.width, 1),
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn minimum_terminal_fills_traffic_view_and_keeps_selection_visible() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = TuiApp::default();
+        app.dashboard.interfaces = (0..12)
+            .map(|index| InterfaceStatus {
+                interface: crate::netlink::NetworkInterface {
+                    index,
+                    name: format!("eth{index}"),
+                    is_up: true,
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    is_wireless: false,
+                },
+                owned_ipv4_addresses: None,
+                ipv4_addresses: vec![],
+                has_default_route: false,
+            })
+            .collect();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        for selected in [0, 5, 11] {
+            app.selected_interface = selected;
+            terminal
+                .draw(|frame| super::super::render(frame, &mut app, false))
+                .unwrap();
+            let area = app.ui.list_area.unwrap();
+            assert_eq!(app.ui.list_row_height, 1);
+            assert!(area.height >= 6);
+            let buffer = terminal.backend().buffer();
+            for y in area.y..area.bottom() {
+                let text: String = (area.x..area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect();
+                assert!(text.contains("eth"), "empty interface row: {text:?}");
+            }
+            let selected_y = area.y + (selected - app.ui.list_scroll_offset) as u16;
+            assert!(selected_y < area.bottom());
+            assert_eq!(buffer[(area.x, selected_y)].symbol(), "▶");
+        }
+    }
 
     #[test]
     fn dashboard_focus_reaches_every_action_and_clamps_at_both_ends() {

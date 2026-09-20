@@ -4,8 +4,10 @@
 use crossterm::event::KeyCode;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::config::InterfaceRole;
 use crate::vpn::manager::hop_interface_name;
@@ -101,9 +103,18 @@ fn topology_lines(router: &RouterData, expanded: bool) -> Vec<Line<'static>> {
 
     if let Some(connections) = &router.proposed_router_config.forwarding {
         lines.push(note("IPv4 forwarding connections"));
-        for connection in connections {
+        for (index, connection) in connections.iter().enumerate() {
             lines.push(node(
-                format!("{} → {}", connection.from, connection.to),
+                format!(
+                    "{} {} → {}",
+                    if index + 1 == connections.len() {
+                        "└─"
+                    } else {
+                        "├─"
+                    },
+                    connection.from,
+                    connection.to
+                ),
                 None,
                 related(&connection.from) || related(&connection.to),
             ));
@@ -140,178 +151,177 @@ fn topology_lines(router: &RouterData, expanded: bool) -> Vec<Line<'static>> {
                 )));
             }
         }
-        return lines;
-    }
-
-    lines.push(note("Local networks / Wi-Fi"));
-    let mut has_lan = false;
-    for interface in interfaces
-        .iter()
-        .filter(|interface| interface.config.role == InterfaceRole::Output)
-    {
-        has_lan = true;
-        lines.push(node(
-            format!(
-                "{}{}",
-                interface.name,
-                if interface.config.managed {
-                    ""
-                } else {
-                    " [ext]"
-                }
-            ),
-            Some(interface.config.managed),
-            related(&interface.name),
-        ));
-        if let Some(address) = interface.config.ipv4 {
-            lines.push(note(format!(
-                "    {}{}",
-                address.trunc(),
-                if interface.config.nat {
-                    " NAT"
-                } else {
-                    " no NAT"
-                }
-            )));
-        }
-    }
-    if !has_lan {
-        lines.push(note(if desired.is_some() {
-            "  No configured LAN"
-        } else {
-            "  LAN data unavailable"
-        }));
-    }
-    lines.push(arrow());
-    lines.push(node(
-        format!(
-            "Router: {}",
-            if router.enabled {
-                "enabled"
-            } else {
-                "disabled"
-            }
-        ),
-        None,
-        false,
-    ));
-    lines.push(note(match &router.plan {
-        Some(plan) => format!(
-            "  Forwarding: {} (snapshot)",
-            if plan.dataplane.snapshot.ipv4_forwarding {
-                "on"
-            } else {
-                "off"
-            }
-        ),
-        None => "  Forwarding: unknown".into(),
-    }));
-
-    // Configuration orders hops from the physical uplink towards the LAN.
-    // Display the reverse order for outbound LAN traffic / tunnel transport.
-    let chain = &router.proposed_router_config.vpn_chain;
-    if chain.is_empty() {
-        lines.push(note("  VPN: none configured"));
     } else {
-        for (index, hop) in chain.iter().enumerate().rev() {
-            lines.push(arrow());
-            let interface = hop_interface_name(index as u32);
-            lines.push(node(
-                format!("VPN: {interface}"),
-                Some(true),
-                related(&interface),
-            ));
-            if expanded {
-                lines.push(note(format!("    Profile: {}", hop.profile_name)));
-            }
-        }
-    }
-    lines.push(arrow());
-    let uplink = router
-        .proposed_router_config
-        .uplink
-        .as_ref()
-        .map(|uplink| uplink.interface.as_str());
-    if let Some(uplink) = uplink {
-        let managed = interfaces
+        lines.push(note("Local networks / Wi-Fi"));
+        let mut has_lan = false;
+        for interface in interfaces
             .iter()
-            .find(|interface| interface.name == uplink)
-            .map(|interface| interface.config.managed);
-        lines.push(node(
-            format!(
-                "Uplink: {uplink}{}",
-                match managed {
-                    Some(true) => "",
-                    Some(false) => " [ext]",
-                    None => " [?]",
-                }
-            ),
-            Some(managed.unwrap_or(false)),
-            related(uplink),
-        ));
-        let gateways: Vec<_> = router
-            .routes
-            .iter()
-            .filter(|route| {
-                route.destination.prefix_len() == 0
-                    && route.output_interface.as_deref() == Some(uplink)
-            })
-            .collect();
-        lines.push(note(format!("  Default candidates: {}", gateways.len())));
-        for route in gateways {
-            lines.push(node(
-                route.gateway.map_or_else(
-                    || "Direct (no gateway)".into(),
-                    |gateway| format!("Gateway: {gateway}"),
-                ),
-                Some(route.owner.is_owned()),
-                selected == Some(route),
-            ));
-            lines.push(note(format!(
-                "    table {} / metric {}",
-                route.table,
-                route.metric.unwrap_or(0)
-            )));
-        }
-    } else {
-        lines.push(node("Uplink: not configured", Some(false), false));
-        lines.push(note("  Observed default routes:"));
-        let mut found = false;
-        for route in router
-            .routes
-            .iter()
-            .filter(|route| route.destination.prefix_len() == 0)
+            .filter(|interface| interface.config.role == InterfaceRole::Output)
         {
-            found = true;
+            has_lan = true;
             lines.push(node(
                 format!(
-                    "dev {}",
-                    route.output_interface.as_deref().unwrap_or("unknown")
+                    "{}{}",
+                    interface.name,
+                    if interface.config.managed {
+                        ""
+                    } else {
+                        " [ext]"
+                    }
                 ),
-                Some(route.owner.is_owned()),
-                selected == Some(route),
+                Some(interface.config.managed),
+                related(&interface.name),
             ));
+            if let Some(address) = interface.config.ipv4 {
+                lines.push(note(format!(
+                    "    {}{}",
+                    address.trunc(),
+                    if interface.config.nat {
+                        " NAT"
+                    } else {
+                        " no NAT"
+                    }
+                )));
+            }
+        }
+        if !has_lan {
+            lines.push(note(if desired.is_some() {
+                "  No configured LAN"
+            } else {
+                "  LAN data unavailable"
+            }));
+        }
+        lines.push(arrow());
+        lines.push(node(
+            format!(
+                "Router: {}",
+                if router.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            ),
+            None,
+            false,
+        ));
+        lines.push(note(match &router.plan {
+            Some(plan) => format!(
+                "  Forwarding: {} (snapshot)",
+                if plan.dataplane.snapshot.ipv4_forwarding {
+                    "on"
+                } else {
+                    "off"
+                }
+            ),
+            None => "  Forwarding: unknown".into(),
+        }));
+
+        // Configuration orders hops from the physical uplink towards the LAN.
+        // Display the reverse order for outbound LAN traffic / tunnel transport.
+        let chain = &router.proposed_router_config.vpn_chain;
+        if chain.is_empty() {
+            lines.push(note("  VPN: none configured"));
+        } else {
+            for (index, hop) in chain.iter().enumerate().rev() {
+                lines.push(arrow());
+                let interface = hop_interface_name(index as u32);
+                lines.push(node(
+                    format!("VPN: {interface}"),
+                    Some(true),
+                    related(&interface),
+                ));
+                if expanded {
+                    lines.push(note(format!("    Profile: {}", hop.profile_name)));
+                }
+            }
+        }
+        lines.push(arrow());
+        let uplink = router
+            .proposed_router_config
+            .uplink
+            .as_ref()
+            .map(|uplink| uplink.interface.as_str());
+        if let Some(uplink) = uplink {
+            let managed = interfaces
+                .iter()
+                .find(|interface| interface.name == uplink)
+                .map(|interface| interface.config.managed);
             lines.push(node(
-                route.gateway.map_or_else(
-                    || "Direct (no gateway)".into(),
-                    |gateway| format!("Gateway: {gateway}"),
+                format!(
+                    "Uplink: {uplink}{}",
+                    match managed {
+                        Some(true) => "",
+                        Some(false) => " [ext]",
+                        None => " [?]",
+                    }
                 ),
-                Some(route.owner.is_owned()),
-                selected == Some(route),
+                Some(managed.unwrap_or(false)),
+                related(uplink),
             ));
-            lines.push(note(format!(
-                "    table {} / metric {}",
-                route.table,
-                route.metric.unwrap_or(0)
-            )));
+            let gateways: Vec<_> = router
+                .routes
+                .iter()
+                .filter(|route| {
+                    route.destination.prefix_len() == 0
+                        && route.output_interface.as_deref() == Some(uplink)
+                })
+                .collect();
+            lines.push(note(format!("  Default candidates: {}", gateways.len())));
+            for route in gateways {
+                lines.push(node(
+                    route.gateway.map_or_else(
+                        || "Direct (no gateway)".into(),
+                        |gateway| format!("Gateway: {gateway}"),
+                    ),
+                    Some(route.owner.is_owned()),
+                    selected == Some(route),
+                ));
+                lines.push(note(format!(
+                    "    table {} / metric {}",
+                    route.table,
+                    route.metric.unwrap_or(0)
+                )));
+            }
+        } else {
+            lines.push(node("Uplink: not configured", Some(false), false));
+            lines.push(note("  Observed default routes:"));
+            let mut found = false;
+            for route in router
+                .routes
+                .iter()
+                .filter(|route| route.destination.prefix_len() == 0)
+            {
+                found = true;
+                lines.push(node(
+                    format!(
+                        "dev {}",
+                        route.output_interface.as_deref().unwrap_or("unknown")
+                    ),
+                    Some(route.owner.is_owned()),
+                    selected == Some(route),
+                ));
+                lines.push(node(
+                    route.gateway.map_or_else(
+                        || "Direct (no gateway)".into(),
+                        |gateway| format!("Gateway: {gateway}"),
+                    ),
+                    Some(route.owner.is_owned()),
+                    selected == Some(route),
+                ));
+                lines.push(note(format!(
+                    "    table {} / metric {}",
+                    route.table,
+                    route.metric.unwrap_or(0)
+                )));
+            }
+            if !found {
+                lines.push(note("    None in route list"));
+            }
         }
-        if !found {
-            lines.push(note("    None in route list"));
-        }
+        // A dotted edge explicitly leaves Internet reachability unresolved.
+        lines.push(note("      ⋮"));
+        lines.push(node("Internet: not tested", None, false));
     }
-    // A dotted edge explicitly leaves Internet reachability unresolved.
-    lines.push(note("      ⋮"));
-    lines.push(node("Internet: not tested", None, false));
     lines.push(Line::default());
     lines.push(note("Selected route (route list)"));
     if let Some(route) = selected {
@@ -344,6 +354,37 @@ fn topology_lines(router: &RouterData, expanded: bool) -> Vec<Line<'static>> {
     lines
 }
 
+/// Wrap styled labels before computing scroll bounds so every continuation is reachable.
+fn wrap_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
+    let width = usize::from(width.max(1));
+    let mut result = Vec::new();
+    for line in lines {
+        let mut current = Line::default().style(line.style);
+        let mut used = 0;
+        for span in line.spans {
+            let mut chunk = String::new();
+            for grapheme in span.content.graphemes(true) {
+                let size = grapheme.width();
+                if used > 0 && used + size > width {
+                    current
+                        .spans
+                        .push(Span::styled(std::mem::take(&mut chunk), span.style));
+                    result.push(current);
+                    current = Line::default().style(line.style);
+                    used = 0;
+                }
+                chunk.push_str(grapheme);
+                used += size;
+            }
+            if !chunk.is_empty() {
+                current.spans.push(Span::styled(chunk, span.style));
+            }
+        }
+        result.push(current);
+    }
+    result
+}
+
 pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp, expanded: bool) {
     let block = panel("Topology");
     let inner = block.inner(area);
@@ -359,7 +400,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
         inner.width,
         inner.height.saturating_sub(3),
     );
-    let lines = topology_lines(&app.router, expanded);
+    let lines = wrap_lines(topology_lines(&app.router, expanded), content.width);
     let max_width = lines
         .iter()
         .map(Line::width)
@@ -378,6 +419,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
     } else {
         0
     };
+    let line_count = lines.len();
     frame.render_widget(Paragraph::new(lines).scroll(view.scroll), content);
     if inner.height > 2 {
         let footer = Rect::new(inner.x, inner.bottom() - 1, inner.width, 1);
@@ -387,6 +429,12 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
         } else {
             let button_text = "[t: expand]";
             ("[t: expand] PgUp/PgDn: scroll", button_text.len() as u16)
+        };
+        let position = format!(" {}/{}", view.scroll.0 + 1, line_count);
+        let label = if footer.width as usize >= label.len() + position.len() {
+            format!("{label}{position}")
+        } else {
+            label.to_string()
         };
         frame.render_widget(
             Paragraph::new(label).style(Style::default().fg(theme::ACCENT)),
@@ -405,6 +453,52 @@ mod tests {
     use super::*;
     use crossterm::event::KeyCode;
     use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn wrapped_topology_preserves_text_styles_and_unicode_width() {
+        let style = Style::default()
+            .fg(theme::GOOD)
+            .add_modifier(Modifier::BOLD);
+        let original = "vpn-東京-long-interface → eth0";
+        let lines = wrap_lines(vec![Line::styled(original, style)], 12);
+        assert!(lines.len() > 1);
+        assert!(lines
+            .iter()
+            .all(|line| line.width() <= 12 && line.style == style));
+        let text: String = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(text, original);
+    }
+
+    #[test]
+    fn explicit_forwarding_keeps_selected_route_section() {
+        let mut router = RouterData::default();
+        router.proposed_router_config.forwarding = Some(vec![]);
+        let lines = topology_lines(&router, true);
+        assert!(lines
+            .iter()
+            .any(|line| line.to_string().contains("Selected route")));
+    }
+
+    #[test]
+    fn topology_resize_clamps_scroll_and_keeps_footer_visible() {
+        let mut app = TuiApp::default();
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        for (width, height) in [(30, 16), (80, 16), (120, 40)] {
+            app.ui.buttons.clear();
+            app.router.topology.scroll = (u16::MAX, u16::MAX);
+            terminal
+                .draw(|frame| render(frame, Rect::new(0, 0, width, height), &mut app, true))
+                .unwrap();
+            let view = &app.router.topology;
+            assert_eq!(view.scroll.0, view.max_scroll.0);
+            assert_eq!(view.scroll.1, 0);
+            assert_eq!(app.ui.buttons[0].0.y, height - 2);
+        }
+    }
 
     #[test]
     fn topology_view_key_navigation_and_clamping() {
