@@ -434,3 +434,34 @@ async fn rollback_treats_none_and_zero_metric_as_equivalent() {
     let routes = provider.routes.lock().await;
     assert_eq!(routes.len(), 1);
 }
+
+#[tokio::test]
+async fn foreign_conflict_is_typed_and_preserves_the_route() {
+    let provider = Arc::new(FakeNetwork::default());
+    let foreign = route("198.51.100.0/24", 4);
+    provider.routes.lock().await.push(foreign.clone());
+    let manager = RouteManager::new(provider.clone());
+    let error = manager
+        .plan(&[desired("198.51.100.0/24")], true)
+        .await
+        .unwrap_err();
+    assert!(error.downcast_ref::<ForeignRouteConflict>().is_some());
+    assert_eq!(provider.route_snapshot().await, vec![foreign]);
+}
+
+#[tokio::test]
+async fn repeated_route_rollback_does_not_duplicate_restored_objects() {
+    let provider = Arc::new(FakeNetwork::default());
+    let owned = route("198.51.100.0/24", TRAFFIC_MASQ_ROUTE_PROTOCOL);
+    provider.routes.lock().await.push(owned.clone());
+    let manager = RouteManager::new(provider.clone());
+    let snapshot = manager.snapshot().await.unwrap();
+    provider.routes.lock().await.clear();
+    manager.rollback(&snapshot).await.unwrap();
+    manager.rollback(&snapshot).await.unwrap();
+    assert_eq!(provider.route_snapshot().await.len(), 1);
+    assert!(route_info_matches(
+        &provider.route_snapshot().await[0],
+        &owned
+    ));
+}

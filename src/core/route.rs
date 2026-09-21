@@ -8,6 +8,15 @@ use serde::{Deserialize, Serialize};
 use crate::config::{OwnedIpv4RouteConfig, RouterConfig};
 use crate::netlink::{Ipv4RouteInfo, Ipv4RouteSpec, NetworkProvider, TRAFFIC_MASQ_ROUTE_PROTOCOL};
 
+#[derive(Debug, thiserror::Error)]
+#[error("blocked/degraded dataplane: destination prefix {destination} in table {table} collides with existing route owned by {owner} with identical metric {metric}; invariant=preserve_foreign_route; operation=plan_route; metadata_safe_to_remove=false")]
+pub struct ForeignRouteConflict {
+    pub destination: ipnet::Ipv4Net,
+    pub table: u32,
+    pub metric: u32,
+    pub owner: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManagedIpv4Route {
     pub destination: ipnet::Ipv4Net,
@@ -157,13 +166,13 @@ impl RouteManager {
                 desired_route.metric.unwrap_or(0),
             );
             if let Some(owner) = foreign_routes.get(&key) {
-                bail!(
-                    "destination prefix {} in table {} collides with existing route owned by {} with identical metric {}",
-                    desired_route.destination,
-                    desired_route.table,
-                    owner,
-                    desired_route.metric.unwrap_or(0)
-                );
+                return Err(ForeignRouteConflict {
+                    destination: desired_route.destination,
+                    table: desired_route.table,
+                    metric: desired_route.metric.unwrap_or(0),
+                    owner: owner.to_string(),
+                }
+                .into());
             }
         }
 
@@ -223,7 +232,14 @@ impl RouteManager {
                 .any(|s| route_info_matches(s, route))
         }) {
             if let Err(error) = self.provider.delete_ipv4_route(route).await {
-                errors.push(format!("failed to delete {}: {error}", route.destination));
+                // Another writer may have already completed this deletion.
+                let remaining = self.owned_routes().await?;
+                if remaining
+                    .iter()
+                    .any(|entry| route_info_matches(entry, route))
+                {
+                    errors.push(format!("operation=delete_route; object={}; invariant=restore_owned_routes: {error}", route.destination));
+                }
             }
         }
 
@@ -234,7 +250,13 @@ impl RouteManager {
             .filter(|route| !current.iter().any(|c| route_info_matches(c, route)))
         {
             if let Err(error) = self.provider.add_ipv4_route(&spec_from_info(route)).await {
-                errors.push(format!("failed to restore {}: {error}", route.destination));
+                let observed = self.owned_routes().await?;
+                if !observed
+                    .iter()
+                    .any(|entry| route_info_matches(entry, route))
+                {
+                    errors.push(format!("operation=restore_route; object={}; invariant=restore_owned_routes: {error}", route.destination));
+                }
             }
         }
 
