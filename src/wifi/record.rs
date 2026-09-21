@@ -330,8 +330,12 @@ impl WifiRecordStore {
         let mut records = Vec::new();
         for interface in candidates {
             let store = Self::new(kind, base, &interface);
-            if let Some(record) = store.load().await? {
-                records.push((interface, store, record));
+            match store.load().await {
+                Ok(Some(record)) => records.push((interface, store, record)),
+                Ok(None) => {}
+                Err(error) => tracing::error!(%interface, journal = %store.path().display(),
+                    operation = "discover_wifi_record", invariant = "proven_process_identity",
+                    metadata_safe_to_remove = false, %error, "Wi-Fi ownership record blocked; continuing discovery"),
             }
         }
         Ok(records)

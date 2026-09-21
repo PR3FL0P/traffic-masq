@@ -301,17 +301,23 @@ impl DhcpClientSupervisor {
 
     async fn recover_persisted_leases(&self, specs: &[DhcpClientSpec]) -> Result<()> {
         for interface in self.inner.applier.persisted_interfaces()? {
+            if crate::core::recovery::check_scope(self.inner.applier.state_dir(), Some(&interface))
+                .is_err()
+            {
+                continue;
+            }
+            let result: Result<()> = async {
             let committed = specs.iter().find(|spec| spec.interface == interface);
             let reason = match committed {
                 None => Some("no committed DHCP client configuration"),
                 Some(spec) => match self.inner.applier.persisted_lease(&interface)? {
                     Some(lease) if persisted_lease_matches_spec(&lease, spec) => None,
                     Some(_) => Some("persisted lease does not match committed DHCP client policy"),
-                    None => continue,
+                    None => return Ok(()),
                 },
             };
             let Some(reason) = reason else {
-                continue;
+                return Ok(());
             };
             tracing::warn!(%interface, %reason, "cleaning up persisted DHCP ownership during startup recovery");
             self.inner
@@ -321,6 +327,13 @@ impl DhcpClientSupervisor {
                 .with_context(|| {
                     format!("failed to clean up persisted DHCP ownership for {interface}: {reason}")
                 })?;
+                Ok(())
+            }.await;
+            if let Err(error) = result {
+                tracing::error!(%interface, operation = "recover_dhcp_ownership",
+                    invariant = "exact_lease_ownership", metadata_safe_to_remove = false,
+                    error = %format!("{error:#}"), "DHCP recovery blocked on this interface; continuing startup");
+            }
         }
         Ok(())
     }
@@ -332,6 +345,13 @@ impl DhcpClientSupervisor {
 
     /// Replace client settings and start acquisition only when the supplied link state permits it.
     pub async fn configure_with_link_ready(&self, spec: DhcpClientSpec, link_ready: bool) {
+        if let Err(error) = crate::core::recovery::check_scope(
+            self.inner.applier.state_dir(),
+            Some(&spec.interface),
+        ) {
+            tracing::error!(interface = %spec.interface, %error, "DHCP client blocked by interface recovery");
+            return;
+        }
         let _operation = self.inner.operation_lock.lock().await;
         let interface = spec.interface.clone();
         let (unchanged, readiness_changed) = {

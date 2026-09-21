@@ -167,9 +167,10 @@ impl DhcpSupervisor {
                 );
                 continue;
             }
+            let interface = spec.interface.clone();
             if let Err(error) = supervisor.configure(spec).await {
-                supervisor.shutdown().await;
-                return Err(error);
+                tracing::warn!(%interface, error = %format!("{error:#}"), operation = "dhcp_startup",
+                    "DHCP interface degraded; runtime convergence will retry");
             }
         }
 

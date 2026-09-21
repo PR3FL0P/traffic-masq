@@ -367,10 +367,15 @@ pub(crate) async fn cleanup_unconfigured_records(
     process: &dyn SupervisedProcess,
 ) -> anyhow::Result<()> {
     for (interface, store, record) in WifiRecordStore::discover(kind, records_dir).await? {
-        if configured_interfaces.contains(&interface) {
+        if configured_interfaces.contains(&interface)
+            || records_dir.parent().is_some_and(|root| {
+                crate::core::recovery::check_scope(root, Some(&interface)).is_err()
+            })
+        {
             continue;
         }
 
+        let result: anyhow::Result<()> = async {
         let pid = if record.pid == 0 {
             let pids = process
                 .pids_with_config_path(kind, &record.config_path)
@@ -403,6 +408,13 @@ pub(crate) async fn cleanup_unconfigured_records(
             graceful_stop(process, pid, "Wi-Fi startup recovery").await?;
         }
         store.clear().await?;
+            Ok(())
+        }.await;
+        if let Err(error) = result {
+            tracing::error!(%interface, journal = %store.path().display(), operation = "recover_wifi_process",
+                invariant = "proven_process_identity", metadata_safe_to_remove = false,
+                error = %format!("{error:#}"), "Wi-Fi recovery isolated to this interface");
+        }
     }
     Ok(())
 }

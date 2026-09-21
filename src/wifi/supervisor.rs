@@ -271,6 +271,10 @@ impl HostapdSupervisor {
     /// Serialize configuration changes and reconcile the requested interface with hostapd.
     /// Reuse matching state or restart the owned process as needed; propagate setup failures.
     pub async fn configure(&self, spec: WifiApSpec) -> Result<(), SupervisorError> {
+        crate::core::recovery::check_scope(
+            self.inner.records_dir.parent().expect("state directory"),
+            Some(&spec.interface),
+        )?;
         let _operation = self.inner.operation_lock.lock().await;
         let interface = spec.interface.clone();
         let ctrl_path = self.ctrl_path(&interface);

@@ -75,6 +75,13 @@ impl DhcpClientOwnershipApplier {
         }
     }
 
+    pub(crate) fn state_dir(&self) -> &std::path::Path {
+        self.store
+            .directory()
+            .parent()
+            .expect("DHCP store has a state directory")
+    }
+
     pub(crate) fn persisted_interfaces(&self) -> Result<Vec<String>, OwnershipError> {
         Ok(self.store.interfaces()?)
     }
