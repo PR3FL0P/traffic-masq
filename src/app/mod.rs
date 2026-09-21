@@ -313,6 +313,38 @@ where
     })
 }
 
+/// Full startup repair must not snapshot/plan absent physical interfaces.
+/// The runtime interface converger and dataplane reconciler finish this work
+/// when the kernel announces their return. Crash recovery is never skipped.
+async fn missing_router_repair_interfaces(
+    desired: &RouterDesired,
+    network: &dyn NetworkProvider,
+) -> Result<Vec<String>> {
+    let observed = network
+        .list_interfaces()
+        .await
+        .context("failed to observe interfaces before router startup repair")?;
+    let mut missing: Vec<String> = desired
+        .interfaces
+        .iter()
+        .filter(|entry| {
+            !desired
+                .vpn_chain
+                .iter()
+                .any(|hop| hop.interface == entry.name)
+        })
+        .filter(|entry| {
+            !observed
+                .iter()
+                .any(|interface| interface.name == entry.name)
+        })
+        .map(|entry| entry.name.clone())
+        .collect();
+    missing.sort();
+    missing.dedup();
+    Ok(missing)
+}
+
 async fn restore_router_dataplane<P>(state: &RouterRuntimeState<P>) -> Result<()>
 where
     P: RouterDataplaneProvider + Send + Sync,
@@ -721,6 +753,12 @@ async fn reconcile_network_runtime_once<
     let management_allowlist = desired.management_allowlist().await;
     let mut failures: BTreeMap<String, String> = BTreeMap::new();
     let interface_manager = InterfaceManager::new(network.clone(), journal.clone());
+    crate::core::transaction::retry_interface_recovery(
+        desired.state_dir(),
+        &interface_manager,
+        &desired.committed_overrides().await,
+    )
+    .await?;
     let observed_interfaces: HashMap<_, _> = network
         .list_interfaces()
         .await?
@@ -731,6 +769,7 @@ async fn reconcile_network_runtime_once<
     let restorations = desired.restorations().await;
     for (name, config) in &effective.network.interfaces {
         let result: Result<()> = async {
+            crate::core::recovery::check_scope(&effective.runtime.state_dir, Some(name))?;
             let strict = desired.is_tentative(name).await || restorations.contains_key(name);
             let desired_dhcp = DhcpServiceSpec::from_interface_config(
                 name,
@@ -934,6 +973,7 @@ fn spawn_runtime_network_reconcile(
     // serving, a transaction must never observe daemon state as `Detached`
     // merely because Tokio has not polled the reconciler yet.
     desired.attach_converger();
+    let mut recovery_events = crate::core::recovery::subscribe();
     tokio::spawn(async move {
         loop {
             if shutdown_requested(&shutdown) {
@@ -1023,6 +1063,11 @@ fn spawn_runtime_network_reconcile(
                     }
                 },
                 () = desired.changed() => {}
+                _ = recovery_events.changed() => {}
+                // I/O failures may clear without a kernel notification. Retry
+                // unresolved startup snapshots even while the network is quiet.
+                () = time::sleep(Duration::from_secs(30)),
+                    if !router_busy && !crate::core::recovery::blocked_interfaces(desired.state_dir()).is_empty() => {}
                 () = async {
                     if let Some(router) = &router {
                         router.wait_until_idle().await;
@@ -1430,7 +1475,7 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     )
     .recover(override_snapshot.committed_router_transaction.as_deref())
     .await
-    .context("failed to recover router provisioning secrets")?;
+    .context("invariant=restore_provisioning_secrets; object=router-provisioning-secrets.json; operation=startup_recovery; metadata_safe_to_remove=false; preserve journal for inspection")?;
     let effective_config = override_snapshot.effective_config(&config)?;
     let bindings = HttpApiBindings::bind(&effective_config)?;
     let auth = AuthService::open(&config.auth).await?;
@@ -1462,10 +1507,22 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         &override_snapshot,
     )
     .await
-    .context("failed to recover interrupted interface transactions")?;
-    let startup_baselines = interface_manager
-        .apply_network_with_management_allowlist(&effective_config.network, &management_allowlist)
-        .await?;
+    .context("invariant=enumerable_interface_journals; object=interface-transactions; operation=startup_recovery; metadata_safe_to_remove=false")?;
+    let mut startup_config = effective_config.clone();
+    startup_config.network.interfaces.retain(|name, _| {
+        crate::core::recovery::check_scope(&config.runtime.state_dir, Some(name)).is_ok()
+    });
+    // Defer legacy interface/dataplane bootstrap when a router snapshot exists;
+    // the coordinator owns restoration and subsequent committed-state repair.
+    let router_recovery_pending =
+        tokio::fs::try_exists(config.runtime.state_dir.join("router-transaction.json")).await?;
+    let startup_baselines = if router_recovery_pending {
+        Vec::new()
+    } else {
+        interface_manager
+            .apply_network_degraded(&startup_config.network, &management_allowlist)
+            .await?
+    };
     // Cloned, not borrowed: `startup_baselines` is moved into
     // ControlService::new_with_baselines later in this function, and a live
     // borrow held inside `stack` would make that move a compile error.
@@ -1481,11 +1538,12 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         return Ok(());
     }
 
-    let wifi_supervisor = match build_wifi_supervisor(&effective_config).await {
+    let wifi_supervisor = match build_wifi_supervisor(&startup_config).await {
         Ok(supervisor) => supervisor,
         Err(error) => {
-            stack.unwind().await;
-            return Err(error);
+            tracing::error!(subsystem = "wifi_ap", operation = "initialize_supervisor",
+                error = %format!("{error:#}"), "Wi-Fi subsystem unavailable; other subsystems will still start");
+            None
         }
     };
     if let Some(wifi) = &wifi_supervisor {
@@ -1499,11 +1557,12 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         return Ok(());
     }
 
-    let wifi_client_supervisor = match build_wifi_client_supervisor(&effective_config).await {
+    let wifi_client_supervisor = match build_wifi_client_supervisor(&startup_config).await {
         Ok(supervisor) => supervisor,
         Err(error) => {
-            stack.unwind().await;
-            return Err(error);
+            tracing::error!(subsystem = "wifi_client", operation = "initialize_supervisor",
+                error = %format!("{error:#}"), "Wi-Fi subsystem unavailable; other subsystems will still start");
+            None
         }
     };
     if let Some(wifi_client) = &wifi_client_supervisor {
@@ -1521,7 +1580,7 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         return Ok(());
     }
 
-    let dhcp = match DhcpSupervisor::start(&effective_config).await {
+    let dhcp = match DhcpSupervisor::start(&startup_config).await {
         Ok(supervisor) => supervisor,
         Err(error) => {
             stack.unwind().await;
@@ -1540,7 +1599,7 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     }
 
     let dhcp_client =
-        match DhcpClientSupervisor::start(&effective_config, network_provider.clone()).await {
+        match DhcpClientSupervisor::start(&startup_config, network_provider.clone()).await {
             Ok(supervisor) => supervisor,
             Err(error) => {
                 stack.unwind().await;
@@ -1580,7 +1639,10 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     // `router_state` itself, which the final shutdown path below also reads
     // — two ends pulling on the same value from opposite directions is
     // exactly what `Arc` sidesteps.
-    let router_state = if desired.enabled {
+    let router_state = if desired.enabled
+        && !router_recovery_pending
+        && crate::core::recovery::check_scope(&config.runtime.state_dir, None).is_ok()
+    {
         let dataplane_provider = match production_dataplane_provider() {
             Ok(provider) => provider,
             Err(error) => {
@@ -1590,6 +1652,15 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         };
         match apply_router_dataplane(&desired, network_provider.clone(), dataplane_provider).await {
             Ok(state) => Some(Arc::new(state)),
+            Err(error)
+                if error
+                    .downcast_ref::<crate::core::route::ForeignRouteConflict>()
+                    .is_some() =>
+            {
+                tracing::error!(error = %format!("{error:#}"), state = "blocked_degraded_dataplane",
+                    "foreign route preserved; control plane will remain available");
+                None
+            }
             Err(error) => {
                 stack.unwind().await;
                 return Err(error);
@@ -1637,13 +1708,43 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
                 // bootstrap covers interfaces/routes/dataplane separately;
                 // this pass also brings up Wi-Fi and the VPN hop chain and is
                 // idempotent for stages already converged.
-                coordinator.repair(desired.clone()).await?;
+                let missing = missing_router_repair_interfaces(
+                    &desired, network_provider.as_ref(),
+                ).await?;
+                if missing.is_empty() {
+                    if let Err(error) = coordinator.repair(desired.clone()).await {
+                        tracing::error!(operation = "repair_committed_router", error = %format!("{error:#}"),
+                            "router convergence degraded; control plane remains available");
+                    }
+                } else {
+                    tracing::warn!(
+                        interfaces = %missing.join(", "),
+                        hint = "Check ip link; reconnect the adapters or correct the interface names in router configuration. Runtime convergence will retry when they appear.",
+                        "router startup repair convergence is deferred: configured interfaces are absent; daemon startup will continue"
+                    );
+                }
                 Ok::<_, anyhow::Error>(())
             }
             .await;
             if let Err(error) = recovered {
-                stack.unwind().await;
-                return Err(error).context("failed to recover/reconcile router state");
+                if coordinator.status().await
+                    == crate::core::router_transaction::CoordinatorStatus::RollbackFailed
+                    || error
+                        .downcast_ref::<crate::core::route::ForeignRouteConflict>()
+                        .is_some()
+                    || crate::core::recovery::check_scope(&config.runtime.state_dir, None).is_err()
+                    || crate::core::recovery::cleanup_pending(
+                        &config.runtime.state_dir.join("router-transaction.json"),
+                    )
+                {
+                    tracing::error!(journal = %config.runtime.state_dir.join("router-transaction.json").display(),
+                        operation = "startup_recovery", invariant = "preserve_unresolved_snapshot",
+                        metadata_safe_to_remove = false, error = %format!("{error:#}"),
+                        "router dataplane blocked; control plane remains available");
+                } else {
+                    stack.unwind().await;
+                    return Err(error).context("invariant=provable_router_recovery; operation=startup_recovery; metadata_safe_to_remove=false; preserve recovery metadata");
+                }
             }
             Some(coordinator)
         }

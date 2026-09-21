@@ -516,6 +516,38 @@ impl InterfaceManager {
         }
     }
 
+    /// Best-effort daemon bootstrap. Transactions retain all-or-nothing apply.
+    pub async fn apply_network_degraded(
+        &self,
+        config: &NetworkConfig,
+        allowlist: &BTreeSet<String>,
+    ) -> Result<Vec<InterfaceSnapshot>> {
+        config.validate()?;
+        let observed = self.provider.list_interfaces().await?;
+        let mut snapshots = Vec::new();
+        for (name, interface) in &config.interfaces {
+            if !interface.managed || !observed.iter().any(|entry| &entry.name == name) {
+                continue;
+            }
+            let result: Result<()> = async {
+                snapshots.push(self.snapshot(name).await?);
+                self.apply_interface(
+                    name,
+                    interface,
+                    Some(interface.role),
+                    allowlist.contains(name),
+                )
+                .await
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::error!(interface = %name, operation = "startup_apply_interface",
+                    error = %format!("{error:#}"), "interface degraded; remaining interfaces will still start");
+            }
+        }
+        Ok(snapshots)
+    }
+
     /// Plan and apply one interface configuration, returning its original state for rollback.
     pub async fn apply_interface(
         &self,

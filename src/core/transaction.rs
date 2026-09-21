@@ -65,39 +65,75 @@ pub async fn recover_interface_transactions(
     committed: &crate::state::overrides::RuntimeOverrides,
 ) -> Result<()> {
     let root = state_dir.to_path_buf();
-    let (store, records) = tokio::task::spawn_blocking(move || -> Result<_> {
-        let store = crate::state::private_store::PrivateJsonDirectory::open(
-            root,
-            "interface-transactions",
-        )?;
-        let mut records = Vec::new();
-        for name in store.keys()? {
-            let bytes = store
-                .read(&name)?
-                .ok_or_else(|| anyhow::anyhow!("interface journal disappeared"))?;
+    let store = tokio::task::spawn_blocking(move || {
+        crate::state::private_store::PrivateJsonDirectory::open(root, "interface-transactions")
+    })
+    .await??;
+    let names = store.keys()?;
+    recover_interface_journals(state_dir, manager, committed, &store, names).await;
+    Ok(())
+}
+
+/// Retry only failed startup journals, never live unconfirmed transactions.
+pub(crate) async fn retry_interface_recovery(
+    state_dir: &std::path::Path,
+    manager: &InterfaceManager,
+    committed: &crate::state::overrides::RuntimeOverrides,
+) -> Result<()> {
+    let names = crate::core::recovery::blocked_interfaces(state_dir);
+    if names.is_empty() {
+        return Ok(());
+    }
+    let root = state_dir.to_path_buf();
+    let store = tokio::task::spawn_blocking(move || {
+        crate::state::private_store::PrivateJsonDirectory::open(root, "interface-transactions")
+    })
+    .await??;
+    recover_interface_journals(state_dir, manager, committed, &store, names).await;
+    Ok(())
+}
+
+async fn recover_interface_journals(
+    state_dir: &std::path::Path,
+    manager: &InterfaceManager,
+    committed: &crate::state::overrides::RuntimeOverrides,
+    store: &crate::state::private_store::PrivateJsonDirectory,
+    names: Vec<String>,
+) {
+    for name in names {
+        let path = store.directory().join(format!("{name}.json"));
+        let result: Result<()> = async {
+            let bytes = store.read(&name)?.ok_or_else(|| {
+                anyhow::anyhow!("recovery journal disappeared before restoration")
+            })?;
+            if crate::core::recovery::completed(&path, &bytes).await? {
+                return crate::core::recovery::retire(&path).await;
+            }
             let record: InterfaceJournal = serde_json::from_slice(&bytes)?;
             anyhow::ensure!(
                 matches!(record.version, 1 | 2) && record.snapshot.name == name,
-                "invalid interface transaction journal"
+                "invariant=valid_interface_snapshot: unsupported schema or interface mismatch"
             );
-            records.push((name, record));
-        }
-        Ok((store, records))
-    })
-    .await??;
-    for (name, record) in records {
-        if committed.committed_interface_transactions.get(&name) != Some(&record.token) {
-            if let Some(secret) = &record.secret {
-                secret.restore(&PassphraseStore::new(state_dir.join("wifi/psk")), &name)?;
+            if committed.committed_interface_transactions.get(&name) != Some(&record.token) {
+                if let Some(secret) = &record.secret {
+                    secret.restore(&PassphraseStore::new(state_dir.join("wifi/psk")), &name)?;
+                }
+                crate::wifi::lifecycle::stop_recorded_interface(state_dir, &name).await?;
+                manager.rollback(&record.snapshot).await?;
+                tracing::warn!(interface = %name, "restored interrupted interface transaction");
             }
-            crate::wifi::lifecycle::stop_recorded_interface(state_dir, &name).await?;
-            manager.rollback(&record.snapshot).await?;
-            tracing::warn!(interface = %name, "restored interrupted interface transaction");
+            crate::core::recovery::retire(&path).await
         }
-        let store = store.clone();
-        tokio::task::spawn_blocking(move || store.remove(&name)).await??;
+        .await;
+        match result {
+            Ok(()) => crate::core::recovery::unblock_interface(state_dir, &name),
+            Err(error) => crate::core::recovery::block_interface(
+                state_dir,
+                &name,
+                format!("journal={}; {error:#}", path.display()),
+            ),
+        }
     }
-    Ok(())
 }
 
 /// Applies interface changes by proposing them as desired state.
@@ -794,6 +830,12 @@ impl NetworkTransactionManager {
         secret: Option<SecretSnapshot>,
     ) -> Result<()> {
         let root = self.desired().state_dir().to_path_buf();
+        crate::core::recovery::before_write(
+            &root
+                .join("interface-transactions")
+                .join(format!("{}.json", snapshot.name)),
+        )
+        .await?;
         let record = InterfaceJournal {
             version: 2,
             token: token.to_owned(),
@@ -818,18 +860,12 @@ impl NetworkTransactionManager {
 
     /// Durably remove an interface recovery record on the blocking thread pool.
     async fn clear_journal(&self, interface: &str) -> Result<()> {
-        let root = self.desired().state_dir().to_path_buf();
-        let interface = interface.to_owned();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let store = crate::state::private_store::PrivateJsonDirectory::open(
-                root,
-                "interface-transactions",
-            )?;
-            store.remove(&interface)?;
-            Ok(())
-        })
-        .await??;
-        Ok(())
+        let path = self
+            .desired()
+            .state_dir()
+            .join("interface-transactions")
+            .join(format!("{interface}.json"));
+        crate::core::recovery::retire(&path).await
     }
 
     fn spawn_rollback_timer(&self, token: String) {

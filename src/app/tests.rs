@@ -1676,3 +1676,117 @@ async fn wifi_client_supervisor_is_built_even_when_disabled_at_startup() {
 
     assert!(supervisor.preflight_binary().await.is_err());
 }
+
+#[tokio::test]
+async fn router_startup_repair_waits_for_missing_lan_and_uplink() {
+    let network = FakeNetworkProvider::default();
+    let desired = desired_with_route_and_dataplane();
+    assert_eq!(
+        missing_router_repair_interfaces(&desired, &network)
+            .await
+            .unwrap(),
+        vec!["lan0", "wan0"]
+    );
+    network.add_interface("wan0", 1).await;
+    assert_eq!(
+        missing_router_repair_interfaces(&desired, &network)
+            .await
+            .unwrap(),
+        vec!["lan0"]
+    );
+    network.add_interface("lan0", 2).await;
+    assert!(missing_router_repair_interfaces(&desired, &network)
+        .await
+        .unwrap()
+        .is_empty());
+    // Presence, not link readiness: a down interface can be raised by repair.
+    assert!(network.routes.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn runtime_retries_startup_recovery_after_replug_without_replaying_live_journals() {
+    let directory = tempdir().unwrap();
+    let mut config = AppConfig::default();
+    config.runtime.state_dir = directory.path().to_path_buf();
+    config.network.interfaces.insert(
+        "eth0".into(),
+        InterfaceConfig {
+            role: InterfaceRole::None,
+            managed: false,
+            ipv4: None,
+            dhcp: None,
+            dhcp_client: None,
+            wifi: None,
+            wifi_client: None,
+            nat: false,
+        },
+    );
+    let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+        .await
+        .unwrap();
+    let desired = DesiredNetworkState::new(config, overrides.clone());
+    let network = Arc::new(FakeNetworkProvider::default());
+    let ownership = AddressOwnershipJournal::in_memory();
+    let manager = InterfaceManager::new(network.clone(), ownership.clone());
+    let store = crate::state::private_store::PrivateJsonDirectory::open(
+        directory.path(),
+        "interface-transactions",
+    )
+    .unwrap();
+    let snapshot = crate::core::interface::InterfaceSnapshot {
+        name: "eth0".into(),
+        was_up: true,
+        ipv4_addresses: Vec::new(),
+    };
+    store
+        .write(
+            "eth0",
+            &serde_json::to_vec(&serde_json::json!({
+                "version": 2, "token": "interrupted", "snapshot": snapshot,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    crate::core::transaction::recover_interface_transactions(
+        directory.path(),
+        &manager,
+        &overrides.snapshot().await,
+    )
+    .await
+    .unwrap();
+    assert!(crate::core::recovery::check_scope(directory.path(), Some("eth0")).is_err());
+    // This appeared after startup and belongs to a live transaction. A retry
+    // must neither parse it nor retire it, even while another interface recovers.
+    store.write("live0", b"live transaction journal").unwrap();
+    let dhcp = FakeDhcpReconciler::default();
+    for present in [false, true] {
+        if present {
+            network
+                .add_interface_with_state("eth0", 1, false, Vec::new())
+                .await;
+        }
+        let failures = reconcile_network_runtime_once(
+            &desired,
+            &ownership,
+            network.clone(),
+            &dhcp,
+            None::<&FakeWifiReconciler>,
+            None::<&FakeWifiReconciler>,
+            None::<&FakeDhcpClientReconciler>,
+        )
+        .await
+        .unwrap();
+        assert_eq!(failures.is_empty(), present, "{failures:?}");
+        assert_eq!(
+            crate::core::recovery::check_scope(directory.path(), Some("eth0")).is_ok(),
+            present
+        );
+        assert_eq!(store.read("eth0").unwrap().is_none(), present);
+        assert_eq!(
+            store.read("live0").unwrap().unwrap(),
+            b"live transaction journal"
+        );
+        assert!(crate::core::recovery::check_scope(directory.path(), Some("live0")).is_ok());
+    }
+    assert!(network.list_interfaces().await.unwrap()[0].is_up);
+}

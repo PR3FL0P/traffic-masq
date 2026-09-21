@@ -657,3 +657,41 @@ async fn a_refused_change_is_reported_to_the_caller_and_not_proposed() {
     assert!(!desired.is_tentative("test0").await);
     assert!(manager.pending().await.is_empty());
 }
+
+#[tokio::test]
+async fn corrupt_interface_journal_does_not_prevent_another_recovery() {
+    let directory = tempdir().unwrap();
+    let provider = fake_network();
+    let interfaces = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
+    let transactions = NetworkTransactionManager::new(
+        interfaces.clone(),
+        Duration::from_secs(60),
+        desired_state(directory.path()).await,
+    );
+    transactions
+        .write_journal("interrupted", interfaces.snapshot("test0").await.unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(
+        directory.path().join("interface-transactions/bad0.json"),
+        b"invalid",
+    )
+    .await
+    .unwrap();
+    recover_interface_transactions(directory.path(), &interfaces, &Default::default())
+        .await
+        .unwrap();
+    assert!(crate::core::recovery::check_scope(directory.path(), Some("bad0")).is_err());
+    assert!(crate::core::recovery::check_scope(directory.path(), Some("test0")).is_ok());
+    assert!(!directory
+        .path()
+        .join("interface-transactions/test0.json")
+        .exists());
+    assert!(directory
+        .path()
+        .join("interface-transactions/bad0.json")
+        .exists());
+    recover_interface_transactions(directory.path(), &interfaces, &Default::default())
+        .await
+        .unwrap();
+}

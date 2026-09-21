@@ -216,6 +216,10 @@ impl DesiredNetworkState {
             .expect("override store has a parent")
     }
 
+    pub(crate) async fn committed_overrides(&self) -> crate::state::overrides::RuntimeOverrides {
+        self.overrides.snapshot().await
+    }
+
     /// Merge base configuration, committed overrides, and tentative interface changes.
     /// Tentative entries take precedence; invalid committed configuration is an error.
     pub async fn effective(&self) -> Result<AppConfig> {

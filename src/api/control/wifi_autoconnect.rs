@@ -93,6 +93,11 @@ impl ControlService {
             .filter(|interface| interface.is_wireless)
         {
             let name = &interface.name;
+            if crate::core::recovery::check_scope(&self.config.runtime.state_dir, Some(name))
+                .is_err()
+            {
+                continue;
+            }
             // Scanning can launch a temporary supplicant, so it belongs to the
             // same mutation boundary as activation and timeout cleanup. Read
             // eligibility only after admission: a queued pass must not act on
