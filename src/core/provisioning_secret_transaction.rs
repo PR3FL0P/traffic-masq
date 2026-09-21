@@ -294,6 +294,10 @@ impl ProvisioningSecretTransactionStore {
                 })
             }
         });
+        if crate::core::recovery::completed(&self.journal, &bytes).await? {
+            crate::core::recovery::retire(&self.journal).await?;
+            return Ok(None);
+        }
         let journal: ProvisioningSecretJournal =
             serde_json::from_slice(&bytes).with_context(|| {
                 format!(
@@ -312,6 +316,7 @@ impl ProvisioningSecretTransactionStore {
     }
 
     async fn save(&self, journal: &ProvisioningSecretJournal) -> Result<()> {
+        crate::core::recovery::before_write(&self.journal).await?;
         let parent = self
             .journal
             .parent()
@@ -335,25 +340,7 @@ impl ProvisioningSecretTransactionStore {
     }
 
     async fn clear(&self) -> Result<()> {
-        let parent = self
-            .journal
-            .parent()
-            .context("provisioning secret journal path has no parent")?;
-        atomic_file::ensure_private_dir(parent, PRIVATE_DIR_MODE).with_context(|| {
-            format!(
-                "failed to secure provisioning state directory {}",
-                parent.display()
-            )
-        })?;
-        atomic_file::remove_preserving_on_error_async(&self.journal, PRIVATE_FILE_MODE)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to remove provisioning secret journal {}",
-                    self.journal.display()
-                )
-            })?;
-        Ok(())
+        crate::core::recovery::retire(&self.journal).await
     }
 }
 

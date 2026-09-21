@@ -67,6 +67,7 @@ pub enum CoordinatorStatus {
     Idle,
     Pending,
     RollbackFailed,
+    RecoveredButJournalCleanupPending,
 }
 
 #[derive(Debug, Clone)]
@@ -75,6 +76,8 @@ pub struct RollbackFailure {
     pub candidate: RouterCandidate,
     pub snapshot: RouterSnapshot,
     pub failures: Vec<String>,
+    /// Startup ownership reconstruction that must succeed before any rollback.
+    pub recovery_desired: Option<RouterDesired>,
 }
 
 #[derive(Debug, Clone)]
@@ -175,6 +178,14 @@ impl RouterTransactionCoordinator {
     /// Reject stale or conflicting plans, journal recovery state, and apply the candidate.
     /// Return a confirmation token; an unconfirmed change is rolled back after its deadline.
     pub async fn apply(&self, plan: TransactionPlan) -> Result<String> {
+        crate::core::recovery::check_scope(
+            self.inner
+                .overrides
+                .path()
+                .parent()
+                .expect("state directory"),
+            None,
+        )?;
         let mut state = self.inner.state.lock().await;
         match &*state {
             CoordinatorState::Idle => {}
@@ -220,6 +231,7 @@ impl RouterTransactionCoordinator {
             if failures.is_empty() {
                 if let Err(cleanup_error) = self.clear_journal().await {
                     *state = CoordinatorState::RollbackFailed(RollbackFailure {
+                        recovery_desired: None,
                         token: token.clone(),
                         candidate: plan.candidate,
                         snapshot: current_snapshot,
@@ -234,6 +246,7 @@ impl RouterTransactionCoordinator {
             } else {
                 let recovery = failures.join("; ");
                 *state = CoordinatorState::RollbackFailed(RollbackFailure {
+                    recovery_desired: None,
                     token: token.clone(),
                     candidate: plan.candidate,
                     snapshot: current_snapshot,
@@ -267,6 +280,14 @@ impl RouterTransactionCoordinator {
     }
 
     async fn repair_inner(&self, desired: RouterDesired, dataplane_only: bool) -> Result<()> {
+        crate::core::recovery::check_scope(
+            self.inner
+                .overrides
+                .path()
+                .parent()
+                .expect("state directory"),
+            None,
+        )?;
         let mut state = self.inner.state.lock().await;
         match &*state {
             CoordinatorState::Idle => {}
@@ -314,6 +335,7 @@ impl RouterTransactionCoordinator {
             }
             if !failures.is_empty() {
                 *state = CoordinatorState::RollbackFailed(RollbackFailure {
+                    recovery_desired: None,
                     token,
                     candidate,
                     snapshot,
@@ -324,6 +346,7 @@ impl RouterTransactionCoordinator {
         }
         if let Err(error) = self.retain_committed_router_interfaces().await {
             *state = CoordinatorState::RollbackFailed(RollbackFailure {
+                recovery_desired: None,
                 token,
                 candidate,
                 snapshot,
@@ -336,6 +359,7 @@ impl RouterTransactionCoordinator {
         if let Err(error) = self.clear_journal().await {
             // Keep recovery ownership until the durable journal is resolved.
             *state = CoordinatorState::RollbackFailed(RollbackFailure {
+                recovery_desired: None,
                 token,
                 candidate,
                 snapshot,
@@ -426,6 +450,11 @@ impl RouterTransactionCoordinator {
     /// Report whether the coordinator is idle, awaiting confirmation, or awaiting rollback recovery.
     pub async fn status(&self) -> CoordinatorStatus {
         match &*self.inner.state.lock().await {
+            CoordinatorState::Idle
+                if crate::core::recovery::cleanup_pending(&self.inner.journal) =>
+            {
+                CoordinatorStatus::RecoveredButJournalCleanupPending
+            }
             CoordinatorState::Idle => CoordinatorStatus::Idle,
             CoordinatorState::Pending(_) => CoordinatorStatus::Pending,
             CoordinatorState::RollbackFailed(_) => CoordinatorStatus::RollbackFailed,
@@ -439,12 +468,15 @@ impl RouterTransactionCoordinator {
     /// retained as a changed watch value.
     pub async fn wait_until_idle(&self) {
         let mut idle = self.inner.idle_epoch.subscribe();
+        let mut housekeeping = crate::core::recovery::subscribe();
         loop {
             if self.status().await == CoordinatorStatus::Idle {
                 return;
             }
-            if idle.changed().await.is_err() {
-                return;
+            tokio::select! {
+                changed = idle.changed() => if changed.is_err() { return; },
+                // Housekeeping can retire metadata without changing transaction state.
+                _ = housekeeping.changed() => {},
             }
         }
     }
@@ -468,6 +500,20 @@ impl RouterTransactionCoordinator {
         state: &mut MutexGuard<'_, CoordinatorState>,
         trigger: RollbackTrigger,
     ) -> Result<()> {
+        // A failed startup prepare may have discovered only part of a VPN
+        // chain. Never let a manual retry retire that journal using incomplete
+        // volatile ownership; reconstruct it first and retain the intent on error.
+        if let CoordinatorState::RollbackFailed(failure) = &mut **state {
+            if let Some(desired) = &failure.recovery_desired {
+                if let Err(error) = self.inner.manager.prepare_recovery(desired).await {
+                    failure.failures = vec![format!("failed to prepare recovery: {error:#}")];
+                    return Err(
+                        error.context("failed to reconstruct partially-applied router state")
+                    );
+                }
+                failure.recovery_desired = None;
+            }
+        }
         let (token, candidate, snapshot) = match &**state {
             CoordinatorState::Pending(pending) => (
                 pending.token.clone(),
@@ -498,6 +544,7 @@ impl RouterTransactionCoordinator {
         if failures.is_empty() {
             if let Err(error) = self.clear_journal().await {
                 **state = CoordinatorState::RollbackFailed(RollbackFailure {
+                    recovery_desired: None,
                     token,
                     candidate,
                     snapshot,
@@ -514,6 +561,7 @@ impl RouterTransactionCoordinator {
         } else {
             let message = failures.join("; ");
             **state = CoordinatorState::RollbackFailed(RollbackFailure {
+                recovery_desired: None,
                 token,
                 candidate,
                 snapshot,
@@ -607,6 +655,9 @@ impl RouterTransactionCoordinator {
         snapshot: &RouterSnapshot,
         current_desired: &RouterDesired,
     ) -> Result<()> {
+        crate::core::recovery::before_write(&self.inner.journal).await?;
+        anyhow::ensure!(!tokio::fs::try_exists(&self.inner.journal).await?,
+            "invariant=retain_recovery_proof; journal={}; operation=write_journal; metadata_safe_to_remove=false: unresolved journal", self.inner.journal.display());
         let journal = TransactionJournal {
             version: 2,
             base_revision,
@@ -631,29 +682,67 @@ impl RouterTransactionCoordinator {
     }
 
     async fn clear_journal(&self) -> Result<()> {
-        crate::atomic_file::remove_preserving_on_error_async(&self.inner.journal, 0o600).await?;
+        crate::core::recovery::retire(&self.inner.journal).await?;
         Ok(())
     }
 
     /// Restore an interrupted transaction before accepting control requests.
     pub async fn recover(&self) -> Result<bool> {
-        let _state = self.inner.state.lock().await;
+        let mut state = self.inner.state.lock().await;
         crate::atomic_file::reject_symlink(&self.inner.journal)?;
         let bytes = match tokio::fs::read(&self.inner.journal).await {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.into()),
         };
-        let journal: TransactionJournal =
-            serde_json::from_slice(&bytes).context("invalid router transaction journal")?;
+        if crate::core::recovery::completed(&self.inner.journal, &bytes).await? {
+            self.retain_committed_router_interfaces().await?;
+            self.clear_journal().await?;
+            *state = CoordinatorState::Idle;
+            self.notify_idle();
+            return Ok(false);
+        }
+        // Even an unsupported schema can be retired when its token is proven
+        // committed. A parse error alone is never proof of kernel ownership.
+        let committed_token = self
+            .inner
+            .overrides
+            .snapshot()
+            .await
+            .committed_router_transaction;
+        let header: serde_json::Value = serde_json::from_slice(&bytes).with_context(|| format!(
+            "invariant=decodable_recovery_snapshot; journal={}; object=router; operation=decode; metadata_safe_to_remove=false; preserve journal for operator inspection", self.inner.journal.display()))?;
+        if header
+            .get("token")
+            .and_then(|value| value.as_str())
+            .is_some_and(|token| Some(token) == committed_token.as_deref())
+        {
+            let suffix = match serde_json::from_slice::<TransactionJournal>(&bytes) {
+                Ok(record) if matches!(record.version, 1 | 2) => "stale",
+                _ => "corrupt",
+            };
+            if let Err(error) = crate::core::recovery::quarantine(&self.inner.journal, suffix).await
+            {
+                tracing::warn!(journal = %self.inner.journal.display(), operation = "quarantine_committed_journal",
+                    invariant = "committed_token_proof", metadata_safe_to_remove = true, %error,
+                    "quarantine unavailable; retiring committed metadata separately");
+                self.clear_journal().await?;
+            }
+            self.retain_committed_router_interfaces().await?;
+            *state = CoordinatorState::Idle;
+            self.notify_idle();
+            return Ok(false);
+        }
+        let journal: TransactionJournal = serde_json::from_value(header).with_context(|| format!(
+            "invariant=valid_recovery_snapshot; journal={}; object=router; operation=decode; metadata_safe_to_remove=false", self.inner.journal.display()))?;
         anyhow::ensure!(
             matches!(journal.version, 1 | 2),
-            "unsupported router transaction journal version"
+            "invariant=supported_schema; journal={}; object=router; operation=decode; metadata_safe_to_remove=false: unsupported router transaction journal version", self.inner.journal.display()
         );
         let revision = self.inner.overrides.committed_revision().await;
         anyhow::ensure!(
             revision >= journal.base_revision,
-            "transaction journal is newer than committed configuration"
+            "invariant=revision_order; journal={}; object=router; operation=validate; metadata_safe_to_remove=false: transaction journal is newer than committed configuration", self.inner.journal.display()
         );
         let committed = self
             .inner
@@ -664,19 +753,35 @@ impl RouterTransactionCoordinator {
             .as_deref()
             == Some(journal.token.as_str());
         if !committed {
+            let candidate = self
+                .inner
+                .overrides
+                .build_candidate(&crate::core::router_candidate::RouterIntentProposal::new())
+                .await?;
+            *state = CoordinatorState::RollbackFailed(RollbackFailure {
+                recovery_desired: journal.current_desired.clone(),
+                token: journal.token.clone(), candidate, snapshot: journal.snapshot.clone(),
+                failures: vec![format!("journal={}; operation=startup_rollback; invariant=restore_snapshot; metadata_safe_to_remove=false", self.inner.journal.display())],
+            });
             if let Some(current_desired) = journal.current_desired.as_ref() {
-                self.inner
-                    .manager
-                    .prepare_recovery(current_desired)
-                    .await
-                    .context("failed to reconstruct partially-applied router state")?;
+                if let Err(error) = self.inner.manager.prepare_recovery(current_desired).await {
+                    if let CoordinatorState::RollbackFailed(failure) = &mut *state {
+                        failure.failures.push(format!("operation=prepare_recovery; invariant=prove_partial_ownership: {error:#}"));
+                    }
+                    return Err(error).context("failed to reconstruct partially-applied router state; metadata_safe_to_remove=false");
+                }
+            }
+            if let CoordinatorState::RollbackFailed(failure) = &mut *state {
+                failure.recovery_desired = None;
             }
             let failures = self.inner.manager.rollback_to(&journal.snapshot).await;
-            anyhow::ensure!(
-                failures.is_empty(),
-                "interrupted router transaction recovery failed: {}",
-                failures.join("; ")
-            );
+            if !failures.is_empty() {
+                let message = failures.join("; ");
+                if let CoordinatorState::RollbackFailed(failure) = &mut *state {
+                    failure.failures = failures;
+                }
+                anyhow::bail!("invariant=restore_snapshot; journal={}; object=router; operation=rollback; metadata_safe_to_remove=false: {message}", self.inner.journal.display());
+            }
             tracing::warn!("restored interrupted router transaction");
         }
         // Rebuild volatile ownership from the durable committed intent for both
@@ -686,6 +791,8 @@ impl RouterTransactionCoordinator {
             .await
             .context("failed to restore committed router ownership during recovery")?;
         self.clear_journal().await?;
+        *state = CoordinatorState::Idle;
+        self.notify_idle();
         Ok(!committed)
     }
 

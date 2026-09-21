@@ -5539,3 +5539,87 @@ async fn list_routes_and_get_router_config_dispatch() {
         other => panic!("unexpected response: {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn unrelated_recovery_does_not_block_interface_commit_or_rollback() {
+    let directory = tempdir().unwrap();
+    let mut config = AppConfig::default();
+    config.runtime.state_dir = directory.path().to_path_buf();
+    config.dhcp.leases_dir = directory.path().join("leases");
+    let interface = InterfaceConfig {
+        role: InterfaceRole::Output,
+        managed: true,
+        ipv4: Some("192.168.77.1/24".parse().unwrap()),
+        dhcp: None,
+        dhcp_client: None,
+        wifi: None,
+        wifi_client: None,
+        nat: true,
+    };
+    config
+        .network
+        .interfaces
+        .insert("eth0".into(), interface.clone());
+    let network = Arc::new(crate::test_support::FakeNetworkProvider::default());
+    network.add_interface("eth0", 1).await;
+    let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+        .await
+        .unwrap();
+    let dhcp = DhcpSupervisor::start(&config).await.unwrap();
+    let service = ControlService::new(config, network, dhcp, overrides.clone());
+    crate::core::recovery::block_interface(directory.path(), "wlan0", "invalid snapshot".into());
+
+    for commit in [true, false] {
+        let token = match service
+            .dispatch(Request::ApplyInterface {
+                interface: "eth0".into(),
+                config: interface.clone(),
+                allow_management_change: false,
+            })
+            .await
+        {
+            Response::NetworkChangePending { change } => change.token,
+            other => panic!("apply rejected: {other:?}"),
+        };
+        // A block on this transaction's own interface must still be enforced.
+        crate::core::recovery::block_interface(
+            directory.path(),
+            "eth0",
+            "recovery required".into(),
+        );
+        let request = if commit {
+            Request::CommitNetworkChange {
+                token: token.clone(),
+            }
+        } else {
+            Request::RollbackNetworkChange {
+                token: token.clone(),
+            }
+        };
+        assert!(matches!(
+            service.dispatch(request).await,
+            Response::Error { .. }
+        ));
+        crate::core::recovery::unblock_interface(directory.path(), "eth0");
+        let response = service
+            .dispatch(if commit {
+                Request::CommitNetworkChange { token }
+            } else {
+                Request::RollbackNetworkChange { token }
+            })
+            .await;
+        if commit {
+            assert!(
+                matches!(response, Response::NetworkChangeCommitted { .. }),
+                "{response:?}"
+            );
+            assert!(overrides.snapshot().await.interfaces.contains_key("eth0"));
+        } else {
+            assert!(
+                matches!(response, Response::NetworkChangeRolledBack { .. }),
+                "{response:?}"
+            );
+        }
+        assert!(service.transactions.pending().await.is_empty());
+    }
+}

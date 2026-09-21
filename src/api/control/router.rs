@@ -311,7 +311,8 @@ impl ControlService {
             CoordinatorStatus::Pending => {
                 return provisioning_error(RouterProvisioningErrorDetail::TransactionPending);
             }
-            CoordinatorStatus::RollbackFailed => {
+            CoordinatorStatus::RollbackFailed
+            | CoordinatorStatus::RecoveredButJournalCleanupPending => {
                 return provisioning_error(RouterProvisioningErrorDetail::RollbackRecoveryRequired);
             }
         }
@@ -620,6 +621,7 @@ impl ControlService {
         let ready = desired.enabled && readiness.ready() && !unconfigured;
         let stage = match coordinator {
             CoordinatorStatus::RollbackFailed => ProvisioningStage::RollbackFailed,
+            CoordinatorStatus::RecoveredButJournalCleanupPending => ProvisioningStage::Degraded,
             CoordinatorStatus::Pending => ProvisioningStage::AwaitingConfirmation,
             CoordinatorStatus::Idle if unconfigured => ProvisioningStage::Unconfigured,
             CoordinatorStatus::Idle if !desired.enabled => ProvisioningStage::Inactive,

@@ -78,6 +78,8 @@ struct FakeSubsystems {
     events: StdMutex<Vec<String>>,
     apply_fail: StdMutex<Option<&'static str>>,
     rollback_fail: StdMutex<Option<&'static str>>,
+    prepare_fail: std::sync::atomic::AtomicBool,
+    prepare_attempts: std::sync::atomic::AtomicUsize,
     drifted: StdMutex<bool>,
     retained: StdMutex<Vec<Vec<String>>>,
     rollback_secret: StdMutex<Option<std::path::PathBuf>>,
@@ -89,6 +91,8 @@ impl FakeSubsystems {
             events: StdMutex::new(Vec::new()),
             apply_fail: StdMutex::new(None),
             rollback_fail: StdMutex::new(None),
+            prepare_fail: std::sync::atomic::AtomicBool::new(false),
+            prepare_attempts: std::sync::atomic::AtomicUsize::new(0),
             drifted: StdMutex::new(false),
             retained: StdMutex::new(Vec::new()),
             rollback_secret: StdMutex::new(None),
@@ -131,6 +135,15 @@ impl FakeSubsystems {
 
 #[async_trait]
 impl RouterSubsystems for FakeSubsystems {
+    async fn prepare_recovery(&self, _: &RouterDesired) -> Result<()> {
+        self.prepare_attempts.fetch_add(1, Ordering::SeqCst);
+        anyhow::ensure!(
+            !self.prepare_fail.load(Ordering::SeqCst),
+            "ownership unavailable"
+        );
+        Ok(())
+    }
+
     async fn plan_interfaces(
         &self,
         _: &crate::core::router::RouterDesired,
@@ -1059,5 +1072,144 @@ async fn apply_failure_leaves_coordinator_idle() {
     fake.fail_apply("apply_dhcp");
     let error = coordinator.apply(plan).await.expect_err("apply must fail");
     assert!(error.to_string().contains("injected apply_dhcp failure"));
+    assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
+}
+
+#[tokio::test]
+async fn completed_receipt_skips_destructive_recovery_after_restart() {
+    use sha2::Digest;
+    let fake = FakeSubsystems::new();
+    let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
+    let candidate = build_candidate(&overrides).await;
+    let snapshot = coordinator
+        .manager()
+        .snapshot_for(candidate.desired())
+        .await
+        .unwrap();
+    coordinator
+        .write_journal(
+            candidate.base_revision(),
+            "recovered",
+            &snapshot,
+            candidate.desired(),
+        )
+        .await
+        .unwrap();
+    let bytes = tokio::fs::read(&coordinator.inner.journal).await.unwrap();
+    tokio::fs::write(
+        coordinator.inner.journal.with_extension("json.recovered"),
+        sha2::Sha256::digest(&bytes).as_slice(),
+    )
+    .await
+    .unwrap();
+    assert!(!coordinator.recover().await.unwrap());
+    assert!(!fake
+        .events()
+        .iter()
+        .any(|event| event.starts_with("rollback_")));
+    assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
+}
+
+#[tokio::test]
+async fn unsupported_committed_journal_is_quarantined_without_rollback() {
+    let fake = FakeSubsystems::new();
+    let (coordinator, overrides, directory) = coordinator_with(fake.clone()).await;
+    let candidate = build_candidate(&overrides).await;
+    overrides
+        .commit_candidate_with_token(&candidate, Some("committed"))
+        .await
+        .unwrap();
+    tokio::fs::write(
+        &coordinator.inner.journal,
+        br#"{"version":999,"token":"committed"}"#,
+    )
+    .await
+    .unwrap();
+    assert!(!coordinator.recover().await.unwrap());
+    assert!(!coordinator.inner.journal.exists());
+    assert!(std::fs::read_dir(directory.path())
+        .unwrap()
+        .any(|entry| entry
+            .unwrap()
+            .path()
+            .to_string_lossy()
+            .ends_with(".corrupt")));
+    assert!(!fake
+        .events()
+        .iter()
+        .any(|event| event.starts_with("rollback_")));
+}
+
+#[tokio::test]
+async fn restored_router_reports_cleanup_pending_and_never_rolls_back_twice() {
+    let fake = FakeSubsystems::new();
+    let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
+    let candidate = build_candidate(&overrides).await;
+    let plan = coordinator.plan(candidate).await.unwrap();
+    coordinator.apply(plan).await.unwrap();
+    let receipt = coordinator.inner.journal.with_extension("json.recovered");
+    tokio::fs::create_dir(&receipt).await.unwrap();
+    coordinator.rollback().await.unwrap();
+    assert_eq!(
+        coordinator.status().await,
+        CoordinatorStatus::RecoveredButJournalCleanupPending
+    );
+    let after = fake.events();
+    tokio::fs::remove_dir(receipt).await.unwrap();
+    crate::core::recovery::before_write(&coordinator.inner.journal)
+        .await
+        .unwrap();
+    assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
+    assert_eq!(fake.events(), after);
+}
+
+#[tokio::test]
+async fn manual_rollback_retries_failed_startup_preparation_before_restoring() {
+    let fake = FakeSubsystems::new();
+    let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
+    let candidate = build_candidate(&overrides).await;
+    let snapshot = coordinator
+        .manager()
+        .snapshot_for(candidate.desired())
+        .await
+        .unwrap();
+    coordinator
+        .write_journal(
+            candidate.base_revision(),
+            "interrupted",
+            &snapshot,
+            candidate.desired(),
+        )
+        .await
+        .unwrap();
+    fake.prepare_fail.store(true, Ordering::SeqCst);
+
+    assert!(coordinator.recover().await.is_err());
+    assert!(coordinator
+        .rollback_with_token("interrupted")
+        .await
+        .is_err());
+    assert_eq!(fake.prepare_attempts.load(Ordering::SeqCst), 2);
+    assert!(!fake
+        .events()
+        .iter()
+        .any(|event| event.starts_with("rollback_")));
+    assert!(coordinator.inner.journal.exists());
+    assert_eq!(
+        coordinator.status().await,
+        CoordinatorStatus::RollbackFailed
+    );
+
+    fake.prepare_fail.store(false, Ordering::SeqCst);
+    coordinator
+        .rollback_with_token("interrupted")
+        .await
+        .unwrap();
+    assert_eq!(fake.prepare_attempts.load(Ordering::SeqCst), 3);
+    assert!(fake
+        .events()
+        .iter()
+        .any(|event| event.starts_with("rollback_")));
+    assert!(!coordinator.inner.journal.exists());
     assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
 }

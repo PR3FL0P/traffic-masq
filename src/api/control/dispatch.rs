@@ -23,6 +23,31 @@ impl ControlService {
         } else {
             None
         };
+        if is_network_mutation(&request) {
+            // Confirmation requests carry a token, not an interface name.
+            // Keep their recovery scope identical to the original apply.
+            let transaction_interface = match &request {
+                Request::CommitNetworkChange { token }
+                | Request::RollbackNetworkChange { token } => self
+                    .transactions
+                    .pending()
+                    .await
+                    .into_iter()
+                    .find(|change| &change.token == token)
+                    .map(|change| change.interface),
+                _ => None,
+            };
+            if let Err(error) = crate::core::recovery::check_scope(
+                &self.config.runtime.state_dir,
+                transaction_interface
+                    .as_deref()
+                    .or_else(|| recovery_interface(&request)),
+            ) {
+                return Response::Error {
+                    message: format!("{error:#}"),
+                };
+            }
+        }
         if is_network_mutation(&request) && !is_provisioning_secret_recovery_request(&request) {
             if let Some(router) = &self.router {
                 // The provisioning-secret journal is an extra crash-recovery
@@ -75,6 +100,11 @@ impl ControlService {
                     CoordinatorStatus::Pending => {
                         return Response::Error {
                             message: "a router transaction is pending; direct network mutations are blocked until it commits or rolls back".to_owned(),
+                        };
+                    }
+                    CoordinatorStatus::RecoveredButJournalCleanupPending => {
+                        return Response::Error {
+                            message: "kernel state recovered; journal housekeeping is pending and will retry automatically; overlapping mutations are temporarily blocked".to_owned(),
                         };
                     }
                     CoordinatorStatus::RollbackFailed => {
@@ -618,4 +648,41 @@ fn is_provisioning_secret_recovery_request(request: &Request) -> bool {
             | Request::RouterRollback { .. }
             | Request::RollbackNetworkChange { .. }
     )
+}
+
+fn recovery_interface(request: &Request) -> Option<&str> {
+    match request {
+        Request::GetInterfaceConfig { interface, .. }
+        | Request::GetDhcpClient { interface, .. }
+        | Request::ConfigureDhcpClient { interface, .. }
+        | Request::DisableDhcpClient { interface, .. }
+        | Request::RenewDhcpClient { interface, .. }
+        | Request::ReleaseDhcpClient { interface, .. }
+        | Request::ConfigureDhcpSettings { interface, .. }
+        | Request::GetDhcpConfig { interface, .. }
+        | Request::ConfigureDhcp { interface, .. }
+        | Request::DisableDhcp { interface, .. }
+        | Request::ListLeases { interface, .. }
+        | Request::DryRunInterface { interface, .. }
+        | Request::DryRunInterfaceEdit { interface, .. }
+        | Request::ApplyInterface { interface, .. }
+        | Request::ApplyInterfaceEdit { interface, .. }
+        | Request::GetWifiConfig { interface, .. }
+        | Request::ConfigureWifi { interface, .. }
+        | Request::ProvisionWifiAccessPoint { interface, .. }
+        | Request::DisableWifi { interface, .. }
+        | Request::WifiSetPassphrase { interface, .. }
+        | Request::ListWifiStations { interface, .. }
+        | Request::WifiDeauthStation { interface, .. }
+        | Request::WifiReload { interface, .. }
+        | Request::GetWifiClientConfig { interface, .. }
+        | Request::ConfigureWifiClient { interface, .. }
+        | Request::DisableWifiClient { interface, .. }
+        | Request::WifiClientSetPassphrase { interface, .. }
+        | Request::WifiClientReconnect { interface, .. }
+        | Request::WifiClientScan { interface, .. }
+        | Request::ActivateWifiClientProfile { interface, .. }
+        | Request::DeactivateWifiClientProfile { interface, .. } => Some(interface),
+        _ => None,
+    }
 }

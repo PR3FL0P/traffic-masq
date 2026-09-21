@@ -390,6 +390,9 @@ pub(super) fn health_report_details(health: &RouterHealthReport) -> Vec<(&'stati
 
 pub(super) fn format_coordinator_status(status: CoordinatorStatus) -> &'static str {
     match status {
+        CoordinatorStatus::RecoveredButJournalCleanupPending => {
+            "recovered (journal cleanup pending)"
+        }
         CoordinatorStatus::Idle => "idle",
         CoordinatorStatus::Pending => "pending",
         CoordinatorStatus::RollbackFailed => "rollback failed (recovery required)",
