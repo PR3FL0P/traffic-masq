@@ -11,6 +11,7 @@ pub mod mutation;
 pub mod override_manager;
 pub mod ownership;
 pub mod provisioning_secret_transaction;
+pub mod recovery;
 pub mod route;
 pub mod router;
 pub mod router_candidate;
