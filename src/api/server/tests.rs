@@ -254,7 +254,8 @@ fn every_control_request_has_the_expected_authorization_class() {
                 client_isolation: false,
                 max_stations: 32,
             },
-            passphrase: Some("write-only-secret".to_owned()),
+            passphrase: Some("write-only-secret".into()),
+            clear_passphrase: false,
             configure_dhcp: true,
         },
         Request::ConfigureWifiClient {

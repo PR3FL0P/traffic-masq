@@ -7,6 +7,7 @@ pub mod events;
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -409,6 +410,99 @@ pub trait NetworkProvider: Send + Sync {
 
     async fn delete_ipv4_rule(&self, _rule: &Ipv4RuleInfo) -> Result<()> {
         anyhow::bail!("IPv4 rule deletion is not supported by this network provider")
+    }
+}
+
+#[async_trait]
+impl<T> NetworkProvider for Arc<T>
+where
+    T: NetworkProvider + ?Sized,
+{
+    fn supports_ipv4_address_protocol(&self) -> bool {
+        (**self).supports_ipv4_address_protocol()
+    }
+
+    async fn list_interfaces(&self) -> Result<Vec<NetworkInterface>> {
+        (**self).list_interfaces().await
+    }
+
+    async fn hardware_address(&self, interface: &str) -> Result<Vec<u8>> {
+        (**self).hardware_address(interface).await
+    }
+
+    async fn list_ipv4_addresses(&self, interface: &str) -> Result<Vec<Ipv4AddressInfo>> {
+        (**self).list_ipv4_addresses(interface).await
+    }
+
+    async fn set_link_up(&self, name: &str) -> Result<()> {
+        (**self).set_link_up(name).await
+    }
+
+    async fn set_link_down(&self, name: &str) -> Result<()> {
+        (**self).set_link_down(name).await
+    }
+
+    async fn add_ipv4_address(
+        &self,
+        interface: &str,
+        address: Ipv4Addr,
+        prefix_len: u8,
+        ownership: AddressOwnership,
+    ) -> Result<()> {
+        (**self)
+            .add_ipv4_address(interface, address, prefix_len, ownership)
+            .await
+    }
+
+    async fn set_ipv4_address_ownership(
+        &self,
+        interface: &str,
+        address: Ipv4Addr,
+        prefix_len: u8,
+        ownership: AddressOwnership,
+    ) -> Result<()> {
+        (**self)
+            .set_ipv4_address_ownership(interface, address, prefix_len, ownership)
+            .await
+    }
+
+    async fn delete_ipv4_address(
+        &self,
+        interface: &str,
+        address: Ipv4Addr,
+        prefix_len: u8,
+    ) -> Result<()> {
+        (**self)
+            .delete_ipv4_address(interface, address, prefix_len)
+            .await
+    }
+
+    async fn list_ipv4_routes(&self) -> Result<Vec<Ipv4RouteInfo>> {
+        (**self).list_ipv4_routes().await
+    }
+
+    async fn list_ipv4_routes_in_table(&self, table: u32) -> Result<Vec<Ipv4RouteInfo>> {
+        (**self).list_ipv4_routes_in_table(table).await
+    }
+
+    async fn add_ipv4_route(&self, route: &Ipv4RouteSpec) -> Result<()> {
+        (**self).add_ipv4_route(route).await
+    }
+
+    async fn delete_ipv4_route(&self, route: &Ipv4RouteInfo) -> Result<()> {
+        (**self).delete_ipv4_route(route).await
+    }
+
+    async fn list_ipv4_rules(&self) -> Result<Vec<Ipv4RuleInfo>> {
+        (**self).list_ipv4_rules().await
+    }
+
+    async fn add_ipv4_rule(&self, rule: &Ipv4RuleSpec) -> Result<()> {
+        (**self).add_ipv4_rule(rule).await
+    }
+
+    async fn delete_ipv4_rule(&self, rule: &Ipv4RuleInfo) -> Result<()> {
+        (**self).delete_ipv4_rule(rule).await
     }
 }
 

@@ -184,6 +184,7 @@ impl PhysicalWifiFixture {
         self.config.vpn.enabled = false;
         self.config.wifi.enabled = true;
         self.config.wifi.hostapd_binary = command_path("hostapd")?;
+        self.config.wifi.iw_binary = command_path("iw")?;
         self.config.wifi.runtime_dir = self.temp.path().join("hostapd");
         self.config.wifi.restart_backoff_seconds = 1;
         self.config.wifi_client.enabled = true;
@@ -1031,20 +1032,33 @@ impl PhysicalWifiFixture {
             client_isolation: false,
             max_stations: 32,
         };
-        match client
+        let pending = match client
             .request(&Request::ProvisionWifiAccessPoint {
                 interface: self.output_interface.clone(),
                 settings,
 
                 passphrase: Some(self.ap_psk_secret.clone()),
+                clear_passphrase: false,
                 configure_dhcp: true,
             })
             .await
-            .context("supported one-step AP reconfiguration API request failed")?
+            .context("supported AP reconfiguration API request failed")?
         {
-            Response::WifiAccessPointProvisioned { spec, .. }
-                if spec.interface == self.output_interface && spec.channel == 1 => {}
+            Response::NetworkChangePending { change }
+                if change.interface == self.output_interface => change,
             response => bail!("AP reconfiguration returned unexpected response: {response:?}"),
+        };
+        match client
+            .request(&Request::CommitNetworkChange {
+                token: pending.token,
+            })
+            .await
+            .context("AP reconfiguration commit request failed")?
+        {
+            Response::NetworkChangeCommitted { .. } => {}
+            response => bail!(
+                "AP reconfiguration commit returned unexpected response: {response:?}"
+            ),
         }
 
         let (retained_address, retained_prefix, retained_gateway) = self
@@ -1084,7 +1098,7 @@ impl PhysicalWifiFixture {
         )
         .await?;
         println!(
-            "AP RESTART/REASSOCIATION: hostapd PID {initial_hostapd_pid} -> {restarted_hostapd_pid} through one-step AP channel change; wpa_supplicant PID {supplicant_pid}, upstream {address}/{prefix}, protocol-202 gateway {gateway}, exact bound lease, router readiness, phone station, and downstream DHCP retained/re-established"
+            "AP RESTART/REASSOCIATION: hostapd PID {initial_hostapd_pid} -> {restarted_hostapd_pid} through commit-confirm AP channel change; wpa_supplicant PID {supplicant_pid}, upstream {address}/{prefix}, protocol-202 gateway {gateway}, exact bound lease, router readiness, phone station, and downstream DHCP retained/re-established"
         );
         Ok(())
     }

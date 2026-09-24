@@ -112,23 +112,34 @@ impl PrivateJsonDirectory {
 
     /// The keys of every document in the directory.
     ///
-    /// Temporary files and anything that is not a plain `<key>.json` are
-    /// skipped: a leftover from an interrupted write is not a record.
+    /// Temporary files and unrelated names are skipped. A path that *looks* like a real
+    /// `<key>.json` document but is a symlink or another file type is an error instead of being
+    /// silently hidden from recovery enumeration.
     pub fn keys(&self) -> Result<Vec<String>, PrivateStoreError> {
         let mut keys = Vec::new();
         for entry in fs::read_dir(&self.directory)? {
             let entry = entry?;
-            if !entry.file_type()?.is_file() {
-                continue;
-            }
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             let Some(key) = name.strip_suffix(".json") else {
                 continue;
             };
-            if valid_document_key(key) {
-                keys.push(key.to_string());
+            if !valid_document_key(key) {
+                continue;
             }
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                return Err(PrivateStoreError::Symlink(path));
+            }
+            if !file_type.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("document path is not a regular file: {}", path.display()),
+                )
+                .into());
+            }
+            keys.push(key.to_string());
         }
         keys.sort();
         Ok(keys)

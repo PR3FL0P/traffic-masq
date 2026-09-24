@@ -513,6 +513,7 @@ async fn an_unchanged_supplicant_from_a_previous_daemon_is_adopted() {
         .save(&PersistedWifiRecord {
             pid: 4242,
             started_at_unix: 1,
+            binary_path: Some(std::path::PathBuf::from("/usr/sbin/wpa_supplicant")),
             ctrl_path: runtime.join("wlan0"),
             config_path: rendered.path.clone(),
             config_digest: rendered.config_digest,
@@ -552,6 +553,7 @@ async fn recovers_supplicant_spawned_after_a_durable_launch_intent() {
         .save(&PersistedWifiRecord {
             pid: 0,
             started_at_unix: 1,
+            binary_path: Some(std::path::PathBuf::from("/usr/sbin/wpa_supplicant")),
             ctrl_path: runtime.join("wlan0"),
             config_path: rendered.path.clone(),
             config_digest: rendered.config_digest,
@@ -590,6 +592,7 @@ async fn startup_stops_pending_client_absent_from_committed_configuration() {
         .save(&PersistedWifiRecord {
             pid: 0,
             started_at_unix: 1,
+            binary_path: Some(std::path::PathBuf::from("/usr/sbin/wpa_supplicant")),
             ctrl_path: runtime.join("wlan0"),
             config_path: process_config,
             config_digest: WifiDigest::from_bytes([1; 32]),
@@ -627,6 +630,7 @@ async fn a_still_associating_supplicant_is_adopted_not_refused() {
         .save(&PersistedWifiRecord {
             pid: 4243,
             started_at_unix: 1,
+            binary_path: Some(std::path::PathBuf::from("/usr/sbin/wpa_supplicant")),
             ctrl_path: runtime.join("wlan0"),
             config_path: rendered.path.clone(),
             config_digest: rendered.config_digest,
@@ -659,6 +663,7 @@ async fn a_supplicant_answering_for_a_different_network_is_refused() {
         .save(&PersistedWifiRecord {
             pid: 4244,
             started_at_unix: 1,
+            binary_path: Some(std::path::PathBuf::from("/usr/sbin/wpa_supplicant")),
             ctrl_path: runtime.join("wlan0"),
             config_path: rendered.path.clone(),
             config_digest: rendered.config_digest,
@@ -707,6 +712,7 @@ async fn a_stale_record_with_nothing_behind_it_is_a_fresh_start() {
         .save(&PersistedWifiRecord {
             pid: 9999,
             started_at_unix: 1,
+            binary_path: Some(std::path::PathBuf::from("/usr/sbin/wpa_supplicant")),
             ctrl_path: runtime.join("wlan0"),
             config_path: runtime.join("wlan0.conf"),
             config_digest: WifiDigest::from_bytes([7; 32]),
@@ -740,6 +746,7 @@ async fn a_config_changed_while_the_daemon_was_stopped_restarts_the_supplicant()
         .save(&PersistedWifiRecord {
             pid: 4246,
             started_at_unix: 1,
+            binary_path: Some(std::path::PathBuf::from("/usr/sbin/wpa_supplicant")),
             ctrl_path: runtime.join("wlan0"),
             config_path: rendered.path.clone(),
             config_digest: WifiDigest::from_bytes([1; 32]),
@@ -1143,6 +1150,7 @@ async fn startup_recovers_an_interrupted_ephemeral_scan() {
         .save(&PersistedWifiRecord {
             pid: 0,
             started_at_unix: 1,
+            binary_path: Some(std::path::PathBuf::from("/usr/sbin/wpa_supplicant")),
             ctrl_path: runtime.join("wlan0"),
             config_path: scan_path,
             config_digest: WifiDigest::from_bytes([3; 32]),

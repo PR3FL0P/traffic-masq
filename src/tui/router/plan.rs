@@ -335,6 +335,7 @@ async fn router_apply_current_plan(app: &mut TuiApp, client: &ApiClient) {
                 plan,
                 applied_at_unix: current_unix_time(),
                 rollback_failure: None,
+                recovery: None,
                 scroll: 0,
                 max_scroll: 0,
             });

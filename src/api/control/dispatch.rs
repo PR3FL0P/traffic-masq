@@ -514,10 +514,17 @@ impl ControlService {
                 interface,
                 settings,
                 passphrase,
+                clear_passphrase,
                 configure_dhcp,
             } => {
-                self.provision_wifi_access_point(interface, settings, passphrase, configure_dhcp)
-                    .await
+                self.provision_wifi_access_point(
+                    interface,
+                    settings,
+                    passphrase,
+                    clear_passphrase,
+                    configure_dhcp,
+                )
+                .await
             }
             Request::DisableWifi { interface } => self.disable_wifi(interface).await,
             Request::WifiSetPassphrase {

@@ -60,6 +60,123 @@ impl Default for RuntimeOverrides {
     }
 }
 
+/// Recovery-only view of a persisted override document.
+///
+/// Loading validates only the JSON envelope and schema. Individual proof fields
+/// are decoded independently so damage in one recovery scope cannot suppress an
+/// unrelated recovery pass.
+#[derive(Debug, Clone)]
+pub struct RecoveryCommitProof {
+    path: PathBuf,
+    object: serde_json::Map<String, serde_json::Value>,
+}
+
+impl RecoveryCommitProof {
+    pub fn committed_router_transaction(&self) -> Result<Option<String>> {
+        match self.object.get("committed_router_transaction") {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(value) => Ok(Some(
+                value
+                    .as_str()
+                    .with_context(|| {
+                        format!(
+                            "runtime override router commit token in {} is not a string",
+                            self.path.display()
+                        )
+                    })?
+                    .to_owned(),
+            )),
+        }
+    }
+
+    pub fn committed_interface_transactions(&self) -> Result<BTreeMap<String, String>> {
+        let mut committed = BTreeMap::new();
+        let Some(value) = self.object.get("committed_interface_transactions") else {
+            return Ok(committed);
+        };
+        if value.is_null() {
+            return Ok(committed);
+        }
+        let entries = value.as_object().with_context(|| {
+            format!(
+                "runtime override interface commit proof in {} is not an object",
+                self.path.display()
+            )
+        })?;
+        for (interface, token) in entries {
+            let token = token.as_str().with_context(|| {
+                format!(
+                    "runtime override interface commit token for {interface} in {} is not a string",
+                    self.path.display()
+                )
+            })?;
+            committed.insert(interface.clone(), token.to_owned());
+        }
+        Ok(committed)
+    }
+
+    /// Decode only state that can affect router rollback/ownership. API, auth,
+    /// security and legacy VPN-policy overrides are intentionally excluded.
+    pub fn router_recovery_overrides(&self) -> Result<RuntimeOverrides> {
+        self.router_recovery_overrides_with_commit_token(self.committed_router_transaction()?)
+    }
+
+    /// Decode router recovery state using a commit token that was parsed independently.
+    ///
+    /// This lets startup recover interface transactions first even when the router proof field is
+    /// malformed, and conversely lets router recovery proceed when only interface proof is bad.
+    pub fn router_recovery_overrides_with_commit_token(
+        &self,
+        committed_router_transaction: Option<String>,
+    ) -> Result<RuntimeOverrides> {
+        let revision = match self.object.get("revision") {
+            None => 0,
+            Some(value) => value.as_u64().with_context(|| {
+                format!(
+                    "runtime override recovery revision in {} is not an unsigned integer",
+                    self.path.display()
+                )
+            })?,
+        };
+        let router = match self.object.get("router") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(serde_json::from_value(value.clone()).with_context(|| {
+                format!(
+                    "invalid router override required for recovery in {}",
+                    self.path.display()
+                )
+            })?),
+        };
+        let vpn_enabled = match self.object.get("vpn_enabled") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(value.as_bool().with_context(|| {
+                format!(
+                    "runtime override vpn_enabled in {} is not a boolean",
+                    self.path.display()
+                )
+            })?),
+        };
+        let interfaces = match self.object.get("interfaces") {
+            None | Some(serde_json::Value::Null) => BTreeMap::new(),
+            Some(value) => serde_json::from_value(value.clone()).with_context(|| {
+                format!(
+                    "invalid interface overrides required for recovery in {}",
+                    self.path.display()
+                )
+            })?,
+        };
+
+        Ok(RuntimeOverrides {
+            revision,
+            committed_router_transaction,
+            router,
+            vpn_enabled,
+            interfaces,
+            ..RuntimeOverrides::default()
+        })
+    }
+}
+
 const fn current_schema_version() -> u32 {
     CURRENT_RUNTIME_OVERRIDES_SCHEMA
 }
@@ -88,6 +205,20 @@ impl RuntimeOverrides {
             effective.vpn.enabled = enabled;
         }
         effective.validate()?;
+        Ok(effective)
+    }
+
+    /// Merge only state required by router recovery and validate only that recovery surface.
+    pub fn effective_router_recovery_config(&self, base: &AppConfig) -> Result<AppConfig> {
+        let mut effective = base.clone();
+        effective.network = self.effective_network(&base.network)?;
+        if let Some(router) = &self.router {
+            effective.router = router.clone();
+        }
+        if let Some(enabled) = self.vpn_enabled {
+            effective.vpn.enabled = enabled;
+        }
+        effective.validate_router_recovery()?;
         Ok(effective)
     }
 
@@ -131,7 +262,82 @@ impl RuntimeOverrideStore {
         &self.path
     }
 
+    /// Read the recovery proof envelope without decoding unrelated overrides.
+    ///
+    /// A valid, supported schema is required before persisted transaction tokens
+    /// can be trusted. Non-proof fields are intentionally left uninterpreted.
+    pub async fn load_recovery_commit_proof(&self) -> Result<RecoveryCommitProof> {
+        atomic_file::reject_symlink(&self.path).with_context(|| {
+            format!(
+                "unsafe runtime override recovery proof path {}",
+                self.path.display()
+            )
+        })?;
+        let content = match fs::read(&self.path).await {
+            Ok(content) => content,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Ok(RecoveryCommitProof {
+                    path: self.path.clone(),
+                    object: serde_json::Map::new(),
+                });
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to read runtime override recovery proof {}",
+                        self.path.display()
+                    )
+                });
+            }
+        };
+
+        let value: serde_json::Value = serde_json::from_slice(&content).with_context(|| {
+            format!(
+                "failed to parse runtime override recovery proof {}",
+                self.path.display()
+            )
+        })?;
+        let object = value.as_object().cloned().with_context(|| {
+            format!(
+                "runtime override recovery proof {} is not an object",
+                self.path.display()
+            )
+        })?;
+        let persisted_schema = match object.get("schema_version") {
+            None => None,
+            Some(value) => Some(value.as_u64().with_context(|| {
+                format!(
+                    "runtime override schema version in {} is not an unsigned integer",
+                    self.path.display()
+                )
+            })?),
+        };
+        if let Some(version) = persisted_schema {
+            if version > u64::from(CURRENT_RUNTIME_OVERRIDES_SCHEMA) {
+                bail!(
+                    "runtime overrides {} use unsupported future schema version {version} (current is {})",
+                    self.path.display(),
+                    CURRENT_RUNTIME_OVERRIDES_SCHEMA
+                );
+            }
+            if version != 2 && version != u64::from(CURRENT_RUNTIME_OVERRIDES_SCHEMA) {
+                bail!(
+                    "runtime overrides {} use unsupported schema version {version}",
+                    self.path.display()
+                );
+            }
+        }
+
+        Ok(RecoveryCommitProof {
+            path: self.path.clone(),
+            object,
+        })
+    }
+
     pub async fn load(&self) -> Result<RuntimeOverrides> {
+        atomic_file::reject_symlink(&self.path).with_context(|| {
+            format!("unsafe runtime override path {}", self.path.display())
+        })?;
         let content = match fs::read(&self.path).await {
             Ok(content) => content,
             Err(error) if error.kind() == ErrorKind::NotFound => {

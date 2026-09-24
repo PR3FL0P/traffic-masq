@@ -335,18 +335,35 @@ impl ProvisioningSecretTransactionStore {
     }
 
     fn decode(&self, bytes: &[u8]) -> Result<ProvisioningSecretJournal> {
-        let journal: ProvisioningSecretJournal = serde_json::from_slice(bytes).with_context(|| {
-            format!(
-                "invariant=valid_provisioning_secret_snapshot; journal={}; object=router-provisioning-secrets; operation=decode; metadata_safe_to_remove=false; operator_action=inspect_or_restore_journal",
-                self.journal.display()
+        let diagnostic = || {
+            crate::core::recovery::RecoveryDiagnostic::fatal(
+                crate::core::recovery::StartupRecoveryCode::ValidProvisioningSecretSnapshot,
+                "decode",
+                crate::core::recovery::RecoveryAction::RestoreCoherentBackup,
             )
-        })?;
+            .journal(self.journal.clone())
+            .object("router-provisioning-secrets")
+            .detail("backup_scope", "complete_state_directory")
+            .detail("do_not_edit_journal", true)
+        };
+        let journal: ProvisioningSecretJournal =
+            serde_json::from_slice(bytes).with_context(diagnostic)?;
         if journal.version != JOURNAL_VERSION {
-            bail!(
-                "invariant=supported_provisioning_secret_schema; journal={}; object=router-provisioning-secrets; operation=decode; metadata_safe_to_remove=false; operator_action=inspect_or_restore_journal: unsupported provisioning secret journal version {}",
-                self.journal.display(),
+            let diagnostic = crate::core::recovery::RecoveryDiagnostic::fatal(
+                crate::core::recovery::StartupRecoveryCode::SupportedProvisioningSecretSchema,
+                "decode",
+                crate::core::recovery::RecoveryAction::UseCompatibleDaemon,
+            )
+            .journal(self.journal.clone())
+            .object("router-provisioning-secrets")
+            .detail("journal_schema", journal.version)
+            .detail("supported_schemas", JOURNAL_VERSION)
+            .detail("fallback_action", "restore_coherent_backup");
+            return Err(anyhow::anyhow!(
+                "unsupported provisioning secret journal version {}",
                 journal.version
-            );
+            )
+            .context(diagnostic));
         }
         Ok(journal)
     }

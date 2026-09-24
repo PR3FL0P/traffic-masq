@@ -27,8 +27,11 @@ before cleaning up pending changes.
 
 Router transactions save a private snapshot before making changes. After a
 restart, the daemon restores an uncommitted snapshot unless a matching commit
-token was saved atomically. A corrupt journal or failed restore stops startup
-and leaves the record available for diagnosis.
+token was saved atomically. Startup remains blocked when the daemon cannot
+safely read or prove the persisted recovery evidence. If the journal is
+understood but rollback itself fails, the daemon can keep the control plane
+available in `RollbackFailed` while retaining the record for diagnosis and an
+explicit retry.
 
 State schema version 3 can read version 2 records. Older binaries cannot read
 newly saved version 3 records, so back up state before upgrading. If recovery
@@ -64,10 +67,11 @@ store I/O are retried. A corrupt journal is never treated as proof by itself.
 Manual intervention is required when the daemon cannot prove whether an
 interrupted change committed, when journal revisions contradict committed state,
 when route ownership is ambiguous, or when the recovery store has a structural
-or permission error. In those cases preserve the state directory first. Check
-the log fields `invariant`, `journal`, `operation`, `metadata_safe_to_remove`, and
-`operator_action`; repair the reported filesystem/layout problem or restore a
-matching journal/state backup, then restart the daemon. Do not delete an
+or permission error. In those cases preserve the complete state directory first.
+Check the stable `recovery_code` first, then `invariant`, `journal` or `path`,
+`operation`, `metadata_safe_to_remove`, and `operator_action`; each fatal code
+links to one matching procedure in the
+[operator recovery runbook](docs/recovery.md). Do not delete or hand-edit an
 unresolved router or provisioning journal merely to make startup continue.
 
 A corrupt per-interface journal is scoped to that interface. Repair or restore

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -55,27 +56,30 @@ pub trait SupervisedProcess: Send + Sync {
 
     async fn is_alive(&self, pid: u32) -> Result<bool, ProcessError>;
 
-    async fn cmdline_contains(&self, pid: u32, config_path: &Path) -> Result<bool, ProcessError>;
-
-    async fn cmdline_matches_kind(
+    async fn identity_matches(
         &self,
         pid: u32,
         kind: WifiProcessKind,
+        binary_path: &Path,
         config_path: &Path,
-    ) -> Result<bool, ProcessError> {
-        let _ = kind;
-        self.cmdline_contains(pid, config_path).await
-    }
+        started_at_unix: u64,
+    ) -> Result<bool, ProcessError>;
 
-    /// Return all running processes whose argv matches the expected Wi-Fi
-    /// process kind and contains `config_path` in the exact position used by
-    /// this supervisor. This recovers a write-ahead launch intent persisted
-    /// before the child PID existed.
-    async fn pids_with_config_path(
+    /// Return all running processes whose executable and argv match the exact
+    /// Wi-Fi daemon identity expected by this supervisor. This recovers a
+    /// write-ahead launch intent persisted before the child PID existed.
+    async fn pids_matching_identity(
         &self,
         kind: WifiProcessKind,
+        binary_path: &Path,
         config_path: &Path,
+        started_at_unix: u64,
     ) -> Result<Vec<u32>, ProcessError>;
+
+    /// Prove that `socket_path` is the Unix-domain socket currently held open
+    /// by `pid`. This ties a control pathname to the supervised process rather
+    /// than trusting whichever process happens to answer at that pathname.
+    async fn owns_unix_socket(&self, pid: u32, socket_path: &Path) -> Result<bool, ProcessError>;
 
     async fn terminate(&self, pid: u32) -> Result<(), ProcessError>;
 
@@ -103,25 +107,33 @@ impl SupervisedProcess for std::sync::Arc<dyn SupervisedProcess> {
         (**self).is_alive(pid).await
     }
 
-    async fn cmdline_contains(&self, pid: u32, config_path: &Path) -> Result<bool, ProcessError> {
-        (**self).cmdline_contains(pid, config_path).await
-    }
-
-    async fn cmdline_matches_kind(
+    async fn identity_matches(
         &self,
         pid: u32,
         kind: WifiProcessKind,
+        binary_path: &Path,
         config_path: &Path,
+        started_at_unix: u64,
     ) -> Result<bool, ProcessError> {
-        (**self).cmdline_matches_kind(pid, kind, config_path).await
+        (**self)
+            .identity_matches(pid, kind, binary_path, config_path, started_at_unix)
+            .await
     }
 
-    async fn pids_with_config_path(
+    async fn pids_matching_identity(
         &self,
         kind: WifiProcessKind,
+        binary_path: &Path,
         config_path: &Path,
+        started_at_unix: u64,
     ) -> Result<Vec<u32>, ProcessError> {
-        (**self).pids_with_config_path(kind, config_path).await
+        (**self)
+            .pids_matching_identity(kind, binary_path, config_path, started_at_unix)
+            .await
+    }
+
+    async fn owns_unix_socket(&self, pid: u32, socket_path: &Path) -> Result<bool, ProcessError> {
+        (**self).owns_unix_socket(pid, socket_path).await
     }
 
     async fn terminate(&self, pid: u32) -> Result<(), ProcessError> {
@@ -202,22 +214,13 @@ impl SupervisedProcess for TokioSupervisedProcess {
         Ok(probe_pid_exists(pid))
     }
 
-    async fn cmdline_contains(&self, pid: u32, config_path: &Path) -> Result<bool, ProcessError> {
-        let path = format!("/proc/{pid}/cmdline");
-        let raw = match tokio::fs::read(&path).await {
-            Ok(raw) => raw,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(source) => return Err(ProcessError::Inspect { pid, source }),
-        };
-
-        Ok(cmdline_has_exact_argument(&raw, config_path))
-    }
-
-    async fn cmdline_matches_kind(
+    async fn identity_matches(
         &self,
         pid: u32,
         kind: WifiProcessKind,
+        binary_path: &Path,
         config_path: &Path,
+        started_at_unix: u64,
     ) -> Result<bool, ProcessError> {
         let path = format!("/proc/{pid}/cmdline");
         let raw = match tokio::fs::read(&path).await {
@@ -225,13 +228,19 @@ impl SupervisedProcess for TokioSupervisedProcess {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(source) => return Err(ProcessError::Inspect { pid, source }),
         };
-        Ok(cmdline_matches_kind(&raw, kind, config_path))
+        if !argv_matches_kind(&raw, kind, config_path) {
+            return Ok(false);
+        }
+        Ok(executable_matches(pid, binary_path).await?
+            && process_started_near(pid, started_at_unix).await?)
     }
 
-    async fn pids_with_config_path(
+    async fn pids_matching_identity(
         &self,
         kind: WifiProcessKind,
+        binary_path: &Path,
         config_path: &Path,
+        started_at_unix: u64,
     ) -> Result<Vec<u32>, ProcessError> {
         let mut matches = Vec::new();
         let mut entries = tokio::fs::read_dir("/proc")
@@ -255,12 +264,19 @@ impl SupervisedProcess for TokioSupervisedProcess {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(source) => return Err(ProcessError::Scan { source }),
             };
-            if cmdline_matches_kind(&raw, kind, config_path) {
+            if argv_matches_kind(&raw, kind, config_path)
+                && executable_matches(pid, binary_path).await?
+                && process_started_after_intent(pid, started_at_unix).await?
+            {
                 matches.push(pid);
             }
         }
         matches.sort_unstable();
         Ok(matches)
+    }
+
+    async fn owns_unix_socket(&self, pid: u32, socket_path: &Path) -> Result<bool, ProcessError> {
+        unix_socket_owned_by(pid, socket_path).await
     }
 
     async fn terminate(&self, pid: u32) -> Result<(), ProcessError> {
@@ -272,26 +288,121 @@ impl SupervisedProcess for TokioSupervisedProcess {
     }
 }
 
-fn cmdline_matches_kind(raw: &[u8], kind: WifiProcessKind, config_path: &Path) -> bool {
+fn argv_matches_kind(raw: &[u8], kind: WifiProcessKind, config_path: &Path) -> bool {
     let args: Vec<&[u8]> = raw
         .split(|byte| *byte == 0)
         .filter(|argument| !argument.is_empty())
         .collect();
     let config = config_path.as_os_str().as_encoded_bytes();
     match kind {
-        WifiProcessKind::AccessPoint => args.iter().enumerate().any(|(index, argument)| {
-            *argument == config && (index == 0 || args[index - 1] != &b"-c"[..])
-        }),
-        WifiProcessKind::Client | WifiProcessKind::Scan => args
-            .windows(2)
-            .any(|pair| pair[0] == &b"-c"[..] && pair[1] == config),
+        WifiProcessKind::AccessPoint => args.len() == 2 && args[1] == config,
+        WifiProcessKind::Client | WifiProcessKind::Scan => {
+            let Some(stem) = config_path.file_stem().and_then(|stem| stem.to_str()) else {
+                return false;
+            };
+            let interface = match kind {
+                WifiProcessKind::Client => stem,
+                WifiProcessKind::Scan => match stem.strip_suffix("-scan") {
+                    Some(interface) => interface,
+                    None => return false,
+                },
+                WifiProcessKind::AccessPoint => unreachable!(),
+            };
+            args.len() == 5
+                && args[1] == &b"-i"[..]
+                && args[2] == interface.as_bytes()
+                && args[3] == &b"-c"[..]
+                && args[4] == config
+        }
     }
 }
 
-fn cmdline_has_exact_argument(raw: &[u8], config_path: &Path) -> bool {
-    let config_path = config_path.as_os_str();
-    raw.split(|byte| *byte == 0)
-        .any(|argument| argument == config_path.as_encoded_bytes())
+async fn executable_matches(pid: u32, binary_path: &Path) -> Result<bool, ProcessError> {
+    let proc_exe = format!("/proc/{pid}/exe");
+    let actual = match tokio::fs::metadata(&proc_exe).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => return Err(ProcessError::Inspect { pid, source }),
+    };
+    let expected = tokio::fs::metadata(binary_path)
+        .await
+        .map_err(|source| ProcessError::Inspect { pid, source })?;
+    Ok(actual.dev() == expected.dev() && actual.ino() == expected.ino())
+}
+
+async fn process_started_at(pid: u32) -> Result<Option<u64>, ProcessError> {
+    let proc_dir = format!("/proc/{pid}");
+    let metadata = match tokio::fs::metadata(&proc_dir).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(ProcessError::Inspect { pid, source }),
+    };
+    Ok(u64::try_from(metadata.ctime()).ok())
+}
+
+async fn process_started_near(pid: u32, started_at_unix: u64) -> Result<bool, ProcessError> {
+    const MAX_RECORD_DELAY_SECONDS: u64 = 30;
+    Ok(process_started_at(pid).await?.is_some_and(|actual| {
+        actual <= started_at_unix.saturating_add(1)
+            && actual.saturating_add(MAX_RECORD_DELAY_SECONDS) >= started_at_unix
+    }))
+}
+
+async fn process_started_after_intent(
+    pid: u32,
+    intent_at_unix: u64,
+) -> Result<bool, ProcessError> {
+    const MAX_LAUNCH_DELAY_SECONDS: u64 = 30;
+    Ok(process_started_at(pid).await?.is_some_and(|actual| {
+        actual.saturating_add(1) >= intent_at_unix
+            && actual <= intent_at_unix.saturating_add(MAX_LAUNCH_DELAY_SECONDS)
+    }))
+}
+
+async fn unix_socket_owned_by(pid: u32, socket_path: &Path) -> Result<bool, ProcessError> {
+    let table = tokio::fs::read("/proc/net/unix")
+        .await
+        .map_err(|source| ProcessError::Inspect { pid, source })?;
+    let expected_path = socket_path.as_os_str().as_encoded_bytes();
+    let mut matching_inodes = table.split(|byte| *byte == b'\n').skip(1).filter_map(|line| {
+        let fields: Vec<&[u8]> = line
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty())
+            .collect();
+        (fields.len() >= 8 && fields[7] == expected_path).then_some(fields[6])
+    });
+    let Some(inode) = matching_inodes.next() else {
+        return Ok(false);
+    };
+    // Multiple live sockets claiming the same pathname means an unlink/rebind
+    // race is in progress. Refuse to guess which one a new ctrl client reaches.
+    if matching_inodes.next().is_some() {
+        return Ok(false);
+    }
+    let Ok(inode) = std::str::from_utf8(inode) else {
+        return Ok(false);
+    };
+
+    let expected_fd = format!("socket:[{inode}]");
+    let fd_dir = format!("/proc/{pid}/fd");
+    let mut entries = match tokio::fs::read_dir(&fd_dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => return Err(ProcessError::Inspect { pid, source }),
+    };
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|source| ProcessError::Inspect { pid, source })?
+    {
+        match tokio::fs::read_link(entry.path()).await {
+            Ok(target) if target.as_os_str() == std::ffi::OsStr::new(&expected_fd) => return Ok(true),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(ProcessError::Inspect { pid, source }),
+        }
+    }
+    Ok(false)
 }
 
 fn send_signal(pid: u32, signal: Signal) -> Result<(), ProcessError> {

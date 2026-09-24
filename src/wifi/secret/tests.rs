@@ -43,3 +43,13 @@ fn never_renders_its_value() {
     assert_eq!(format!("{passphrase:?}"), "[REDACTED]");
     assert_eq!(format!("{passphrase}"), "[REDACTED]");
 }
+
+#[test]
+fn passphrase_update_debug_never_exposes_secret() {
+    let update = super::WifiPassphraseUpdate::Set(
+        WifiPassphrase::new("correct horse battery").expect("valid"),
+    );
+    let debug = format!("{update:?}");
+    assert!(debug.contains("REDACTED"));
+    assert!(!debug.contains("correct horse battery"));
+}

@@ -6,7 +6,8 @@ use super::pending::router_pending_seconds_remaining;
 use super::plan::{summarize_dhcp, summarize_output_interfaces};
 use super::view::{
     describe_router_error, format_coordinator_status, format_forwarding_status, format_owner_badge,
-    health_report_details, router_action_buttons, summarize_uplink,
+    health_report_details, recovery_notice_summary, recovery_notice_text, router_action_buttons,
+    summarize_uplink,
 };
 use super::*;
 use crate::config::InterfaceConfig;
@@ -676,6 +677,102 @@ fn router_buttons_wrap_and_remain_visible_at_supported_sizes() {
     }
 }
 
+
+#[test]
+fn degraded_recovery_marks_router_mutations_as_blocked() {
+    let mut router = RouterData::default();
+    router.recovery = Some(RouterRecoveryNotice {
+        recovery_code: "TM-REC-207".into(),
+        invariant: "router_rollback_failed".into(),
+        summary: "rollback failed".into(),
+        blocked_operation: "new router transactions".into(),
+        operator_action: "retry_rollback".into(),
+        operator_guidance: "retry rollback".into(),
+        runbook: "docs/recovery.md#tm-rec-207".into(),
+        failures: Vec::new(),
+    });
+
+    let buttons = router_action_buttons(&router);
+    assert_eq!(buttons[3], (RouterAction::PlanApply, "[Apply blocked: recovery]"));
+    assert_eq!(
+        buttons[7],
+        (RouterAction::ToggleEnabled, "[Routing change blocked]")
+    );
+}
+
+#[tokio::test]
+async fn failed_status_refresh_preserves_last_known_recovery() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("api.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut bytes = [0; 1024];
+        while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+            let count = stream.read(&mut bytes).await.unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&bytes[..count]);
+        }
+        stream
+            .write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+    });
+
+    let mut app = TuiApp::default();
+    app.router.coordinator_status = Some(CoordinatorStatus::RollbackFailed);
+    app.router.recovery = Some(RouterRecoveryNotice {
+        recovery_code: "TM-REC-207".into(),
+        invariant: "router_rollback_failed".into(),
+        summary: "rollback failed".into(),
+        blocked_operation: "new router transactions".into(),
+        operator_action: "retry_rollback".into(),
+        operator_guidance: "retry rollback".into(),
+        runbook: "docs/recovery.md#tm-rec-207".into(),
+        failures: vec!["route restore failed".into()],
+    });
+
+    load_router_data(&mut app, &ApiClient::new(socket)).await;
+    server.await.unwrap();
+
+    assert_eq!(
+        app.router.coordinator_status,
+        Some(CoordinatorStatus::RollbackFailed)
+    );
+    assert_eq!(
+        app.router
+            .recovery
+            .as_ref()
+            .map(|notice| notice.recovery_code.as_str()),
+        Some("TM-REC-207")
+    );
+    assert!(app.router.recovery_blocks_mutations());
+}
+
+#[test]
+fn coordinator_status_blocks_mutations_without_structured_notice() {
+    for status in [
+        CoordinatorStatus::RollbackFailed,
+        CoordinatorStatus::RecoveredButJournalCleanupPending,
+    ] {
+        let mut router = RouterData::default();
+        router.coordinator_status = Some(status);
+
+        assert!(router.recovery_blocks_mutations());
+        let buttons = router_action_buttons(&router);
+        assert_eq!(buttons[3], (RouterAction::PlanApply, "[Apply blocked: recovery]"));
+        assert_eq!(
+            buttons[7],
+            (RouterAction::ToggleEnabled, "[Routing change blocked]")
+        );
+    }
+}
+
 #[test]
 fn router_pending_countdown_counts_down_and_floors_at_zero() {
     assert_eq!(router_pending_seconds_remaining(1_000, 60, 1_000), 60);
@@ -886,6 +983,57 @@ fn health_report_details_is_empty_when_every_subsystem_is_healthy() {
     };
 
     assert!(health_report_details(&health).is_empty());
+}
+
+
+#[test]
+fn main_router_recovery_summary_stays_compact() {
+    let notice = RouterRecoveryNotice {
+        recovery_code: "TM-REC-207".into(),
+        invariant: "router_rollback_failed".into(),
+        summary: "rollback failed".into(),
+        blocked_operation: "new router transactions".into(),
+        operator_action: "retry_rollback".into(),
+        operator_guidance: "retry rollback".into(),
+        runbook: "docs/recovery.md#tm-rec-207".into(),
+        failures: vec!["one".into(), "two".into(), "three".into()],
+    };
+
+    let lines = recovery_notice_summary(&notice);
+    assert!(lines.len() <= 5);
+    assert!(lines.iter().any(|line| line.contains("Failures: 3")));
+    assert!(!lines.iter().any(|line| line.contains("failure: one")));
+}
+
+#[test]
+fn formats_structured_router_recovery_notice() {
+    let notice = RouterRecoveryNotice {
+        recovery_code: "TM-REC-207".into(),
+        invariant: "router_rollback_failed".into(),
+        summary: "Previous router rollback did not fully restore runtime state.".into(),
+        blocked_operation: "new router transactions".into(),
+        operator_action: "retry_rollback".into(),
+        operator_guidance:
+            "repair the reported runtime failure and retry rollback without deleting the journal"
+                .into(),
+        runbook: "docs/recovery.md#tm-rec-207".into(),
+        failures: vec![
+            "dhcp restart failed".into(),
+            "route restore failed".into(),
+            "firewall restore failed".into(),
+        ],
+    };
+
+    let lines = recovery_notice_text(&notice, Some(2));
+    assert!(lines.iter().any(|line| line.contains("TM-REC-207")));
+    assert!(lines.iter().any(|line| line.contains("router_rollback_failed")));
+    assert!(lines.iter().any(|line| line.contains("new router transactions")));
+    assert!(lines.iter().any(|line| line.contains("retry_rollback")));
+    assert!(lines.iter().any(|line| line.contains("dhcp restart failed")));
+    assert!(lines.iter().any(|line| line.contains("route restore failed")));
+    assert!(!lines.iter().any(|line| line.contains("firewall restore failed")));
+    assert!(lines.iter().any(|line| line.contains("... 1 more failure(s)")));
+    assert!(lines.iter().any(|line| line.contains("docs/recovery.md#tm-rec-207")));
 }
 
 #[test]

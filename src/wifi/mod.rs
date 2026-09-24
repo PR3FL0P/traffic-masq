@@ -8,6 +8,7 @@ pub mod ctrl;
 mod ctrl_transport;
 pub(crate) mod lifecycle;
 pub mod process;
+pub(crate) mod radio;
 pub mod record;
 pub mod render;
 pub mod secret;
@@ -34,11 +35,12 @@ pub use ctrl::{
     MacAddr, MacAddrParseError, Station,
 };
 pub use process::{ProcessError, SupervisedProcess, TokioSupervisedProcess};
+pub use radio::RadioError;
 pub use record::{PersistedWifiRecord, WifiProcessKind, WifiRecordError, WifiRecordStore};
 pub use render::{
     config_path, render_hostapd_config, ApRenderInput, RenderError, RenderedApConfig, WifiDigest,
 };
-pub use secret::{PassphraseError, WifiPassphrase};
+pub use secret::{PassphraseError, WifiPassphrase, WifiPassphraseUpdate};
 pub use store::{
     resolve_passphrase, PassphraseStore, PassphraseStoreError, ResolvePassphraseError,
 };

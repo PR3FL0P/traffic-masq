@@ -130,22 +130,21 @@ struct Inner {
 }
 
 impl WifiClientSupervisor {
-    /// Start the wpa_supplicant supervisor from effective configuration using the production process adapter.
-    pub async fn start(config: &AppConfig) -> Result<Self, ClientSupervisorError> {
-        Self::start_with_process(config, Arc::new(TokioSupervisedProcess::new())).await
+    /// Construct supplicant supervision without cleanup or committed-state application.
+    pub fn open_for_recovery(config: &AppConfig) -> Self {
+        Self::open_with_process_for_recovery(config, Arc::new(TokioSupervisedProcess::new()))
     }
 
-    /// Initialize wpa_supplicant supervision with the supplied process adapter and recover configured interfaces.
-    pub async fn start_with_process(
+    /// Construct a recovery runtime with an injected process adapter.
+    pub fn open_with_process_for_recovery(
         config: &AppConfig,
         process: Arc<dyn SupervisedProcess>,
-    ) -> Result<Self, ClientSupervisorError> {
+    ) -> Self {
         let records_dir = config.runtime.state_dir.join("wifi");
-        let supervisor = Self {
+        Self {
             inner: Arc::new(Inner {
                 wpa_supplicant_binary: config.wifi_client.wpa_supplicant_binary.clone(),
                 runtime_dir: config.wifi_client.runtime_dir.clone(),
-
                 passphrase_store: PassphraseStore::new(records_dir.join("psk")),
                 records_dir,
                 restart_backoff_seconds: config.wifi_client.restart_backoff_seconds.max(1),
@@ -154,25 +153,30 @@ impl WifiClientSupervisor {
                 tasks: Mutex::new(HashMap::new()),
                 operation_lock: Mutex::new(()),
             }),
-        };
+        }
+    }
 
+    /// Perform normal startup cleanup and apply committed station state.
+    pub async fn reconcile_startup(&self, config: &AppConfig) -> Result<(), ClientSupervisorError> {
         let specs = Self::effective_specs(config)?;
         let configured_interfaces: HashSet<String> =
             specs.iter().map(|spec| spec.interface.clone()).collect();
         let no_interfaces = HashSet::new();
         cleanup_unconfigured_records(
-            &supervisor.inner.records_dir,
+            &self.inner.records_dir,
             WifiProcessKind::Scan,
             &no_interfaces,
-            supervisor.inner.process.as_ref(),
+            self.inner.process.as_ref(),
+            &self.inner.wpa_supplicant_binary,
         )
         .await
         .map_err(ClientSupervisorError::Configuration)?;
         cleanup_unconfigured_records(
-            &supervisor.inner.records_dir,
+            &self.inner.records_dir,
             WifiProcessKind::Client,
             &configured_interfaces,
-            supervisor.inner.process.as_ref(),
+            self.inner.process.as_ref(),
+            &self.inner.wpa_supplicant_binary,
         )
         .await
         .map_err(ClientSupervisorError::Configuration)?;
@@ -193,23 +197,32 @@ impl WifiClientSupervisor {
                 );
                 continue;
             }
-
-            // Same policy as the AP supervisor: one busy or refusing interface
-            // must not take the daemon down. Record a placeholder task so the
-            // liveness loop keeps retrying until the interface is free.
-            if let Err(error) = supervisor.configure(spec.clone()).await {
+            if let Err(error) = self.configure(spec.clone()).await {
                 tracing::warn!(
                     interface = %error.interface(),
                     %error,
-                    "failed to start Wi-Fi client at startup; \
-                     will keep retrying in the background"
+                    "failed to start Wi-Fi client at startup; will keep retrying in the background"
                 );
-                supervisor
-                    .record_failed_startup(&spec, &error.to_string())
-                    .await;
+                self.record_failed_startup(&spec, &error.to_string()).await;
             }
         }
+        Ok(())
+    }
 
+    /// Start the wpa_supplicant supervisor from effective configuration using the production process adapter.
+    pub async fn start(config: &AppConfig) -> Result<Self, ClientSupervisorError> {
+        let supervisor = Self::open_for_recovery(config);
+        supervisor.reconcile_startup(config).await?;
+        Ok(supervisor)
+    }
+
+    /// Initialize wpa_supplicant supervision with the supplied process adapter and recover configured interfaces.
+    pub async fn start_with_process(
+        config: &AppConfig,
+        process: Arc<dyn SupervisedProcess>,
+    ) -> Result<Self, ClientSupervisorError> {
+        let supervisor = Self::open_with_process_for_recovery(config, process);
+        supervisor.reconcile_startup(config).await?;
         Ok(supervisor)
     }
 
@@ -244,6 +257,7 @@ impl WifiClientSupervisor {
                 record: PersistedWifiRecord {
                     pid: 0,
                     started_at_unix: unix_now(),
+                    binary_path: Some(self.inner.wpa_supplicant_binary.clone()),
                     ctrl_path: self.ctrl_path(&spec.interface),
                     config_path: config_path(&self.inner.runtime_dir, &spec.interface),
                     config_digest: WifiDigest::of(&[]),
@@ -321,13 +335,20 @@ impl WifiClientSupervisor {
         if task.record.pid == 0 || !self.inner.process.is_alive(task.record.pid).await? {
             return Ok(false);
         }
+        let binary_path = task
+            .record
+            .binary_path
+            .as_deref()
+            .unwrap_or(self.inner.wpa_supplicant_binary.as_path());
         if !self
             .inner
             .process
-            .cmdline_matches_kind(
+            .identity_matches(
                 task.record.pid,
                 WifiProcessKind::Client,
+                binary_path,
                 &task.record.config_path,
+                task.record.started_at_unix,
             )
             .await?
         {
@@ -407,6 +428,7 @@ impl WifiClientSupervisor {
             &store,
             WifiProcessKind::Client,
             self.inner.process.as_ref(),
+            &self.inner.wpa_supplicant_binary,
             status.is_some(),
             |record| {
                 status
@@ -434,6 +456,7 @@ impl WifiClientSupervisor {
         let store = self.record_store(&spec.interface);
         save_launch_intent(
             &store,
+            &self.inner.wpa_supplicant_binary,
             ctrl_path,
             &rendered.path,
             rendered.config_digest,
@@ -467,6 +490,7 @@ impl WifiClientSupervisor {
             let record = save_spawned_record(
                 &store,
                 pid,
+                &self.inner.wpa_supplicant_binary,
                 ctrl_path,
                 &rendered.path,
                 rendered.config_digest,
@@ -639,6 +663,7 @@ impl WifiClientSupervisor {
         let key_digest = WifiDigest::of(&[]);
         save_launch_intent(
             &store,
+            &self.inner.wpa_supplicant_binary,
             &ctrl_path,
             &scan_config_path,
             config_digest,
@@ -673,6 +698,7 @@ impl WifiClientSupervisor {
         if let Err(error) = save_spawned_record(
             &store,
             pid,
+            &self.inner.wpa_supplicant_binary,
             &ctrl_path,
             &scan_config_path,
             config_digest,

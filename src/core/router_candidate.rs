@@ -180,6 +180,24 @@ impl RouterCandidate {
         committed: &RuntimeOverrides,
         proposal: &RouterIntentProposal,
     ) -> Result<Self> {
+        Self::build_inner(base, committed, proposal, false)
+    }
+
+    /// Recovery-only candidate construction that ignores unrelated API/auth/security admission.
+    pub(crate) fn build_for_recovery(
+        base: &AppConfig,
+        committed: &RuntimeOverrides,
+        proposal: &RouterIntentProposal,
+    ) -> Result<Self> {
+        Self::build_inner(base, committed, proposal, true)
+    }
+
+    fn build_inner(
+        base: &AppConfig,
+        committed: &RuntimeOverrides,
+        proposal: &RouterIntentProposal,
+        recovery: bool,
+    ) -> Result<Self> {
         if let RouterOverrideChange::Set(router) = &proposal.router {
             if router.enabled
                 && router.uplink.is_none()
@@ -191,15 +209,27 @@ impl RouterCandidate {
                 );
             }
         }
-        let committed_effective = committed.effective_config(base)?;
+        let committed_effective = if recovery {
+            committed.effective_router_recovery_config(base)?
+        } else {
+            committed.effective_config(base)?
+        };
         reject_unconfirmed_management_change(&committed_effective, proposal)?;
 
         let mut document = committed.clone();
         proposal.apply_to(&mut document);
 
         let document = document.normalized()?;
-        let effective = document.effective_config(base)?;
-        let desired = RouterDesired::from_effective_config(&effective)?;
+        let effective = if recovery {
+            document.effective_router_recovery_config(base)?
+        } else {
+            document.effective_config(base)?
+        };
+        let desired = if recovery {
+            RouterDesired::from_router_recovery_config(&effective)?
+        } else {
+            RouterDesired::from_effective_config(&effective)?
+        };
         let digest = CandidateDigest::of_intent(&document)?;
 
         Ok(Self {

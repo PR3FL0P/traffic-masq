@@ -24,7 +24,7 @@ use crate::api::model::{
     DhcpClientStatusView, DhcpEditRequest, InterfaceEditRequest, InterfaceStatus,
     ProvisioningDownstreamView, ProvisioningOutputView, ProvisioningStage, ProvisioningUplinkView,
     ProvisioningWarning, Request, Response, RouteStatus, RouterErrorDetail, RouterProposalRequest,
-    RouterProvisioningApplyRequest, RouterProvisioningErrorDetail,
+    RouterProvisioningApplyRequest, RouterProvisioningErrorDetail, RouterRecoveryNotice,
     RouterProvisioningPreviewRequest, RouterProvisioningPreviewView, RouterProvisioningRequest,
     RouterProvisioningStatusView, SecuritySettings, VpnErrorDetail, VpnPolicyErrorDetail,
     VpnPolicyStatusView, WifiClientEditRequest, WifiClientErrorDetail,
@@ -33,7 +33,7 @@ use crate::api::model::{
 use crate::config::{
     ApiConfig, AppConfig, DhcpClientInterfaceConfig, DhcpInterfaceConfig, InterfaceConfig,
     InterfaceRole, SecurityConfig, TcpApiConfig, UplinkMode, VpnPolicyMode, WifiApConfig,
-    WifiClientConfig,
+    WifiClientConfig, WifiSecurity,
 };
 use crate::core::desired::DesiredNetworkState;
 use crate::core::interface::{InterfaceManager, InterfaceSnapshot};
@@ -67,7 +67,7 @@ use crate::vpn::{
 use crate::wifi::client::render::ClientRenderError;
 use crate::wifi::client::ClientSupervisorError;
 use crate::wifi::render::RenderError;
-use crate::wifi::secret::WifiPassphrase;
+use crate::wifi::secret::{WifiPassphrase, WifiPassphraseUpdate};
 use crate::wifi::store::ResolvePassphraseError;
 use crate::wifi::{
     CtrlError, HostapdSupervisor, MacAddr, ProcessError, SupervisorError, WifiApSpec,

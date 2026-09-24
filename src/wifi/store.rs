@@ -11,7 +11,7 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::atomic_file::{self, PrivateDirError, PRIVATE_DIR_MODE, PRIVATE_FILE_MODE};
-use crate::config::validate_interface_name;
+use crate::config::{validate_interface_name, WifiSecurity};
 use crate::wifi::secret::{PassphraseError, WifiPassphrase};
 use crate::wifi::WifiApSpec;
 
@@ -205,6 +205,9 @@ pub fn resolve_passphrase(
     spec: &WifiApSpec,
     store: &PassphraseStore,
 ) -> Result<Option<WifiPassphrase>, ResolvePassphraseError> {
+    if spec.security == WifiSecurity::Open {
+        return Ok(None);
+    }
     resolve_passphrase_parts(&spec.interface, spec.passphrase_file.as_deref(), store)
 }
 

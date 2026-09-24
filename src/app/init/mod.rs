@@ -6,7 +6,7 @@ mod render;
 mod store;
 pub use command::{CommandRunner, CommandSpec, NativeRunner};
 pub use host::HostFacts;
-pub use store::ServiceStore;
+pub use store::{ServiceMutationGuard, ServiceStore};
 #[cfg(test)]
 mod tests;
 

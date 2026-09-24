@@ -682,3 +682,35 @@ async fn malformed_override_file_reports_its_path() {
     assert!(message.contains("failed to parse runtime overrides"));
     assert!(message.contains("runtime-overrides.json"));
 }
+
+#[tokio::test]
+async fn router_recovery_manager_ignores_unrelated_invalid_override_fields_until_hydration() {
+    let directory = tempdir().expect("tempdir");
+    let store = RuntimeOverrideStore::in_state_dir(directory.path());
+    tokio::fs::write(
+        store.path(),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": CURRENT_RUNTIME_OVERRIDES_SCHEMA,
+            "revision": 11,
+            "committed_router_transaction": "router-proof",
+            "interfaces": {},
+            "api": {"tcp": "invalid-for-normal-startup"},
+            "unknown_future_field": true
+        }))
+        .unwrap(),
+    )
+    .await
+    .expect("write recovery state");
+
+    let manager = RuntimeOverrideManager::load_for_router_recovery(directory.path(), &base_config())
+        .await
+        .expect("router recovery state");
+    let snapshot = manager.snapshot().await;
+    assert_eq!(snapshot.revision, 11);
+    assert_eq!(
+        snapshot.committed_router_transaction.as_deref(),
+        Some("router-proof")
+    );
+    assert!(snapshot.api.is_none());
+    assert!(manager.hydrate_strict().await.is_err());
+}

@@ -479,6 +479,45 @@ fn ap_request_is_atomic_and_enables_derived_dhcp_by_default() {
     ));
 }
 
+#[tokio::test]
+async fn ap_apply_enters_shared_commit_confirm_screen() {
+    let change = crate::core::transaction::PendingNetworkChange {
+        token: "ap-token".into(),
+        interface: "wlan0".into(),
+        rollback_timeout_seconds: 60,
+        expires_at_unix: super::super::current_unix_time() + 60,
+    };
+    let (_directory, client, server) = mock_api(vec![Response::NetworkChangePending {
+        change: change.clone(),
+    }])
+    .await;
+    let row = WifiRow {
+        interface: "wlan0".into(),
+        role: WifiRole::AccessPoint,
+        ap: None,
+        client: None,
+    };
+    let mut editor = WifiEditor::from_row(&row);
+    editor.passphrase = "correct horse battery".into();
+    editor.field = WifiField::Apply;
+    let mut app = TuiApp {
+        screen: Screen::WifiEditor,
+        wifi_editor: Some(editor),
+        ..Default::default()
+    };
+
+    handle_wifi_editor_key(&mut app, KeyCode::Enter, &client).await;
+
+    assert_eq!(
+        server.await.unwrap(),
+        vec!["POST /api/v1/wifi/wlan0/provision"]
+    );
+    assert_eq!(app.screen, Screen::PendingChange);
+    assert_eq!(app.pending_return_screen, Screen::Wifi);
+    assert_eq!(app.pending, Some(change));
+    assert!(app.wifi_editor.is_none());
+}
+
 #[test]
 fn existing_ap_request_preserves_unedited_radio_settings() {
     let row = WifiRow {
@@ -1377,4 +1416,28 @@ async fn request_simple_surfaces_wifi_error_and_client_error() {
     assert!(last_log.message.contains("HostapdMissing"));
 
     let _ = server.await;
+}
+
+#[test]
+fn open_ap_request_discards_typed_passphrase_and_requests_clear() {
+    let row = WifiRow {
+        interface: "wlan0".into(),
+        role: WifiRole::AccessPoint,
+        ap: None,
+        client: None,
+    };
+    let mut editor = WifiEditor::from_row(&row);
+    editor.security = WifiSecurity::Open;
+    editor.passphrase = "stale password".into();
+    match ap_provision_request(&editor) {
+        Request::ProvisionWifiAccessPoint {
+            passphrase,
+            clear_passphrase,
+            ..
+        } => {
+            assert!(passphrase.is_none());
+            assert!(clear_passphrase);
+        }
+        other => panic!("unexpected request: {other:?}"),
+    }
 }

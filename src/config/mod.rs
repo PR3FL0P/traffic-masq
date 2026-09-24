@@ -298,6 +298,8 @@ pub struct WifiConfig {
 
     pub hostapd_binary: PathBuf,
 
+    pub iw_binary: PathBuf,
+
     pub runtime_dir: PathBuf,
 
     pub restart_backoff_seconds: u64,
@@ -308,6 +310,7 @@ impl Default for WifiConfig {
         Self {
             enabled: false,
             hostapd_binary: PathBuf::from("/usr/sbin/hostapd"),
+            iw_binary: PathBuf::from("/usr/sbin/iw"),
             runtime_dir: PathBuf::from("/run/traffic-masq/hostapd"),
             restart_backoff_seconds: 5,
         }
@@ -517,15 +520,37 @@ pub struct SecurityConfig {
 }
 
 impl AppConfig {
-    /// Read and deserialize a TOML configuration file, reporting path and parse errors.
-    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+    /// Read and deserialize a TOML configuration file without admitting it for normal runtime use.
+    ///
+    /// Startup recovery needs durable paths and router state even when an unrelated API/auth
+    /// setting is semantically invalid. Call [`Self::validate`] before normal startup or mutation.
+    pub fn load_unvalidated(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let content = fs::read_to_string(path)
             .with_context(|| format!("failed to read config file {}", path.display()))?;
-        let config: Self = toml::from_str(&content)
-            .with_context(|| format!("failed to parse config file {}", path.display()))?;
+        toml::from_str(&content)
+            .with_context(|| format!("failed to parse config file {}", path.display()))
+    }
+
+    /// Read, deserialize, and fully validate a TOML configuration file.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let config = Self::load_unvalidated(path)?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// Validate only state required to reconstruct router recovery intent.
+    ///
+    /// API/auth/security admission is deliberately excluded: those subsystems are not needed to
+    /// prove or roll back a durable router transaction. Full validation remains mandatory before
+    /// listeners, authentication, or normal convergence start.
+    pub(crate) fn validate_router_recovery(&self) -> Result<()> {
+        self.network.validate()?;
+        self.router.validate(&self.network)?;
+        if self.dhcp.default_lease_seconds == 0 {
+            bail!("dhcp.default_lease_seconds must be greater than zero");
+        }
+        Ok(())
     }
 
     /// Check configuration invariants and reject incompatible or unsafe settings before application.
@@ -989,6 +1014,15 @@ impl WifiConfig {
             bail!(
                 "wifi.hostapd_binary must be an absolute path, got {}",
                 self.hostapd_binary.display()
+            );
+        }
+        if self.iw_binary.as_os_str().is_empty() {
+            bail!("wifi.iw_binary must not be empty");
+        }
+        if !self.iw_binary.is_absolute() {
+            bail!(
+                "wifi.iw_binary must be an absolute path, got {}",
+                self.iw_binary.display()
             );
         }
         if self.runtime_dir.as_os_str().is_empty() {

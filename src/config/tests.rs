@@ -908,6 +908,10 @@ fn rejects_a_global_wifi_section_that_cannot_work() {
     relative_binary.wifi.hostapd_binary = PathBuf::from("hostapd");
     assert!(relative_binary.validate().is_err());
 
+    let mut relative_iw = AppConfig::default();
+    relative_iw.wifi.iw_binary = PathBuf::from("iw");
+    assert!(relative_iw.validate().is_err());
+
     let mut relative_runtime = AppConfig::default();
     relative_runtime.wifi.runtime_dir = PathBuf::from("hostapd");
     assert!(relative_runtime.validate().is_err());
@@ -1283,4 +1287,37 @@ fn vpn_chain_longer_than_the_cap_is_rejected() {
 
     let error = config.validate().expect_err("chain longer than the cap");
     assert!(error.to_string().contains("exceeds the maximum"));
+}
+
+
+#[test]
+fn unvalidated_load_preserves_recovery_paths_when_unrelated_admission_fails() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let path = directory.path().join("config.toml");
+    let mut config = AppConfig::default();
+    config.runtime.state_dir = directory.path().join("state");
+    config.auth.argon2_iterations = 0;
+    std::fs::write(&path, toml::to_string_pretty(&config).unwrap()).expect("write config");
+
+    let decoded = AppConfig::load_unvalidated(&path).expect("decode without admission");
+    assert_eq!(decoded.runtime.state_dir, config.runtime.state_dir);
+    assert!(decoded.validate().is_err());
+    assert!(AppConfig::load(&path).is_err());
+}
+
+#[test]
+fn router_recovery_validation_ignores_unrelated_auth_and_api_settings() {
+    let mut config = AppConfig::default();
+    config.auth.argon2_iterations = 0;
+    config.api.tcp = Some(TcpApiConfig {
+        enabled: true,
+        listen: "127.0.0.1:9443".parse().unwrap(),
+        certificate_path: Some("/tmp/same.pem".into()),
+        private_key_path: Some("/tmp/same.pem".into()),
+    });
+
+    assert!(config.validate().is_err());
+    config
+        .validate_router_recovery()
+        .expect("unrelated auth/API admission must not suppress router recovery");
 }

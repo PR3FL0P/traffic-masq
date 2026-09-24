@@ -23,8 +23,19 @@ pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
 /// Dispatch router-screen input to editing, planning, apply, confirmation, and rollback actions.
 pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
     match key {
+        KeyCode::Char('r') if app.router.recovery_blocks_mutations() => {
+            handle_router_recovery_action(app, client).await;
+            return;
+        }
         KeyCode::Char('e') => {
-            toggle_router_enabled(app, client).await;
+            if app.router.recovery_blocks_mutations() {
+                app.push_message(
+                    LogLevel::Warn,
+                    "Router changes are blocked until recovery completes; press r for recovery status/action",
+                );
+            } else {
+                toggle_router_enabled(app, client).await;
+            }
             return;
         }
         KeyCode::Char('1') => {
@@ -132,20 +143,105 @@ pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &A
                     app.router.warning_message = None;
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => match app.router.action {
+                    RouterAction::ToggleEnabled if app.router.recovery_blocks_mutations() => {
+                        app.push_message(
+                            LogLevel::Warn,
+                            "Router changes are blocked until recovery completes; press r for recovery status/action",
+                        );
+                    },
                     RouterAction::ToggleEnabled => toggle_router_enabled(app, client).await,
                     RouterAction::AddRoute => open_route_editor_for_add(app, client).await,
                     RouterAction::EditRoute => open_route_editor_for_selected(app, client).await,
                     RouterAction::DeleteRoute => delete_selected_route(app),
+                    RouterAction::PlanApply if app.router.recovery_blocks_mutations() => {
+                        app.push_message(
+                            LogLevel::Warn,
+                            "Router apply is blocked until recovery completes; press r for recovery status/action",
+                        );
+                    },
                     RouterAction::PlanApply => open_router_plan(app, client).await,
                     RouterAction::ShareViaRoute => {
                         super::super::forwarding::open_from_route(app, client).await
-                    }
+                    },
                     RouterAction::Refresh => refresh_router_data(app, client).await,
                     RouterAction::Topology => select_pane(app, RouterPane::Topology),
                 },
                 _ => {}
             },
         },
+    }
+}
+
+async fn handle_router_recovery_action(app: &mut TuiApp, client: &ApiClient) {
+    match client.request(&Request::RouterPendingTransaction).await {
+        Ok(Response::RouterPendingTransaction {
+            token: Some(token),
+            status: CoordinatorStatus::RollbackFailed,
+            recovery,
+            ..
+        }) => {
+            if let Some(recovery) = recovery {
+                app.router.recovery = Some(recovery);
+            }
+            match client.request(&Request::RouterRollback { token }).await {
+                Ok(Response::RouterRolledBack) => {
+                    app.push_message(LogLevel::Info, "Router rollback recovery completed");
+                    app.router_pending = None;
+                    app.router.staged = false;
+                    load_router_data(app, client).await;
+                }
+                Ok(Response::RouterError { detail }) => {
+                    app.push_message(LogLevel::Error, describe_router_error(&detail));
+                    load_router_data(app, client).await;
+                }
+                Ok(response) => app.push_message(
+                    LogLevel::Error,
+                    format!("Unexpected recovery response: {response:?}"),
+                ),
+                Err(error) => app.push_message(LogLevel::Error, error.to_string()),
+            }
+        }
+        Ok(Response::RouterPendingTransaction {
+            status: CoordinatorStatus::RecoveredButJournalCleanupPending,
+            ..
+        }) => {
+            app.push_message(
+                LogLevel::Info,
+                "Router recovery is complete; journal cleanup retries automatically",
+            );
+            app.router_pending = None;
+            app.router.staged = false;
+            load_router_data(app, client).await;
+        }
+        Ok(Response::RouterPendingTransaction {
+            status: CoordinatorStatus::Idle,
+            ..
+        }) => {
+            app.push_message(LogLevel::Info, "Router recovery is already complete");
+            app.router_pending = None;
+            app.router.staged = false;
+            load_router_data(app, client).await;
+        }
+        Ok(Response::RouterPendingTransaction {
+            status: CoordinatorStatus::RollbackFailed,
+            token: None,
+            ..
+        }) => app.push_message(
+            LogLevel::Error,
+            "Rollback recovery is required but the daemon did not provide a transaction token",
+        ),
+        Ok(Response::RouterPendingTransaction {
+            status: CoordinatorStatus::Pending,
+            ..
+        }) => app.push_message(
+            LogLevel::Warn,
+            "Router transaction is still pending confirmation; open the pending transaction screen",
+        ),
+        Ok(response) => app.push_message(
+            LogLevel::Error,
+            format!("Unexpected recovery status response: {response:?}"),
+        ),
+        Err(error) => app.push_message(LogLevel::Error, error.to_string()),
     }
 }
 
@@ -192,10 +288,12 @@ pub(crate) async fn load_router_data(app: &mut TuiApp, client: &ApiClient) {
             ready,
             coordinator_status,
             health,
+            recovery,
         }) => {
             app.router.enabled = enabled;
             app.router.ready = ready;
             app.router.coordinator_status = Some(coordinator_status);
+            app.router.recovery = recovery;
             app.router.health = health;
         }
         Ok(Response::RouterError { detail }) => {

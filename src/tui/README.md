@@ -17,7 +17,7 @@ The TUI serves as the primary operational console for the `traffic-masq` network
    - Communicates with `traffic-masqd` over a local Unix domain socket (`/run/traffic-masq/traffic-masqd.sock`).
    - Fully interactive: supports all tabs (Interfaces, DHCP Server, DHCP Client (configurable in Settings), Router, VPN, Wi-Fi, Settings, Logs).
    - Authenticated via shared device password; supports secure session caching in `$XDG_STATE_HOME`.
-   - Interface/router applies use commit-confirm rollback timers; standalone DHCP, Wi-Fi and VPN mutations apply immediately and rely on daemon-side ownership recovery.
+   - Interface/router applies and AP provisioning use commit-confirm rollback timers; standalone DHCP, other Wi-Fi mutations, and VPN mutations apply immediately and rely on daemon-side ownership recovery.
 
 2. **Direct / Recovery Mode (`--direct`):**
    - Directly binds to Linux Netlink via `RtnetlinkNetworkProvider`.
@@ -77,7 +77,7 @@ In a terminal application, performing long-running network operations directly i
    - Non-cancellable writes: `"Operation in progress Xs; rollback deadline in Ys. Q: exit after result; other actions disabled"`
 3. **Cancellable vs. Non-Cancellable Operations:**
    - **Reads/Refreshes (`cancellable = true`):** If the user presses any key during a background refresh, the future is dropped immediately, returning the input event so the operator's action is processed without latency.
-   - **Mutations/Applies (`cancellable = false`):** Network mutations are **never** cancelled or retried on timeout. A lost or delayed Unix socket response does not mean the daemon failed to apply the change. The UI permits pressing `q` to queue an exit after the response arrives, but blocks other inputs.
+   - **Mutations/Applies (`cancellable = false`):** The TUI never cancels or retries network mutations. The control client's mutation deadline is deliberately outside the server's hard HTTP connection deadline, so an admitted mutation normally resolves server-side before the client can report an unknown outcome. The UI permits pressing `q` to queue an exit after the response arrives, but blocks other inputs.
 4. **Resize-Safe Progress Rendering:** At the same terminal size, the progress banner reuses the last rendered frame so footer/status context stays intact. After a resize, the stale snapshot is discarded and progress is rendered against the new geometry instead of replaying old coordinates.
 
 ### 3.2. Commit-Confirm & Immediate Mutation Flows
@@ -92,6 +92,8 @@ Because misconfiguring an IP address or firewall rule can sever SSH access, inte
    - Pressing **Enter** sends a commit request, making the change permanent.
    - Pressing **Esc** immediately triggers a rollback.
    - If the connection drops or the operator does not respond, the daemon automatically rolls back to the previous state when the timer expires.
+   - If rollback itself fails, the router pending screen switches to recovery mode: commit is removed, the `TM-REC-207` notice and individual failures are shown, **Enter** retries rollback, and **Esc** returns to the Router screen without discarding recovery state.
+   - On the Router screen, degraded recovery shows the recovery code, invariant, blocked operation, action and runbook. Press **r** to retry a failed rollback; for `TM-REC-208` journal-cleanup-pending, cleanup retries automatically and **r** refreshes status.
 3. **Disconnect Handling:** If the daemon becomes unreachable while on a pending screen, the TUI retains the pending change state and warns the operator that the outcome is unverified rather than falsely claiming success.
 
 Standalone DHCP, Wi-Fi and VPN actions do not enter these pending screens and do not expose a commit timer. Once accepted, they are non-cancellable immediate mutations; crash safety is provided by the daemon's durable ownership/recovery mechanisms rather than TUI rollback state.

@@ -2,6 +2,8 @@ use std::os::unix::fs::symlink;
 
 use tempfile::tempdir;
 
+use crate::config::WifiSecurity;
+
 use super::*;
 
 fn passphrase(value: &str) -> WifiPassphrase {
@@ -141,9 +143,13 @@ fn refuses_to_follow_a_preexisting_symlink_at_the_target() {
     assert!(!outside.exists());
 }
 
-fn spec_with(interface: &str, passphrase_file: Option<PathBuf>) -> WifiApSpec {
+fn spec_with_security(
+    interface: &str,
+    passphrase_file: Option<PathBuf>,
+    security: WifiSecurity,
+) -> WifiApSpec {
     use crate::config::{
-        InterfaceConfig, InterfaceRole, WifiApConfig, WifiBand, WifiChannelWidth, WifiSecurity,
+        InterfaceConfig, InterfaceRole, WifiApConfig, WifiBand, WifiChannelWidth,
     };
 
     let config = InterfaceConfig {
@@ -158,7 +164,7 @@ fn spec_with(interface: &str, passphrase_file: Option<PathBuf>) -> WifiApSpec {
             band: WifiBand::Ghz2,
             channel: 6,
             channel_width: WifiChannelWidth::Ht20,
-            security: WifiSecurity::Wpa2,
+            security,
             hidden: false,
             client_isolation: false,
             max_stations: 32,
@@ -170,6 +176,23 @@ fn spec_with(interface: &str, passphrase_file: Option<PathBuf>) -> WifiApSpec {
     WifiApSpec::from_interface_config(interface, &config)
         .expect("valid")
         .expect("spec")
+}
+
+fn spec_with(interface: &str, passphrase_file: Option<PathBuf>) -> WifiApSpec {
+    spec_with_security(interface, passphrase_file, WifiSecurity::Wpa2)
+}
+
+#[test]
+fn open_ap_ignores_a_stale_stored_passphrase() {
+    let dir = tempdir().expect("tempdir");
+    let store = PassphraseStore::new(dir.path().join("psk"));
+    store
+        .set("wlan0", &passphrase("stale protected secret"))
+        .expect("set stale secret");
+
+    let spec = spec_with_security("wlan0", None, WifiSecurity::Open);
+    assert_eq!(resolve_passphrase(&spec, &store).expect("resolve"), None);
+    assert!(store.get("wlan0").expect("get").is_some());
 }
 
 #[test]

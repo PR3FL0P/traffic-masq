@@ -33,6 +33,7 @@ use tokio_rustls::TlsAcceptor;
 use zeroize::Zeroizing;
 
 use crate::api::control::ControlService;
+use crate::api::HTTP_CONNECTION_TIMEOUT;
 use crate::api::model::{
     ApiHttpsSettings, DhcpClientConfigRequest, DhcpEditRequest, InterfaceEditRequest,
     ProvisionWifiAccessPointRequest, Request, Response, RouterProposalRequest,
@@ -47,7 +48,6 @@ use crate::config::{AppConfig, DhcpInterfaceConfig, InterfaceConfig, TcpApiConfi
 
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const HTTP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 const MAX_CONCURRENT_TLS_CONNECTIONS: usize = 128;
@@ -1169,6 +1169,7 @@ async fn provision_wifi_access_point(
             interface,
             settings: request.settings,
             passphrase: request.passphrase,
+            clear_passphrase: request.clear_passphrase,
             configure_dhcp: request.configure_dhcp,
         },
     )

@@ -136,6 +136,7 @@ impl PhysicalWifiFixture {
         self.config.wifi_client.enabled = false;
         self.config.wifi.enabled = true;
         self.config.wifi.hostapd_binary = command_path("hostapd")?;
+        self.config.wifi.iw_binary = command_path("iw")?;
         self.config.wifi.runtime_dir = self.temp.path().join("hostapd");
         self.config.wifi.restart_backoff_seconds = 1;
         self.config.dhcp.leases_dir = self.temp.path().join("dhcp-leases");

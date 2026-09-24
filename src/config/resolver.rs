@@ -51,18 +51,29 @@ pub struct ResolvedConfig {
 }
 
 impl ResolvedConfig {
-    /// Resolve configuration in CLI, environment, system-file, then built-in order.
-    /// Validate the result; an explicitly selected unreadable or invalid file is an error.
+    /// Resolve configuration in CLI, environment, system-file, then built-in order and fully
+    /// validate it for normal runtime use.
     pub fn load(explicit: Option<PathBuf>) -> Result<Self> {
         let environment = std::env::var_os(CONFIG_ENV).map(PathBuf::from);
-        Self::load_from(explicit, environment, PathBuf::from(DEFAULT_CONFIG_PATH))
+        Self::load_from(explicit, environment, PathBuf::from(DEFAULT_CONFIG_PATH), true)
     }
 
-    /// Select the highest-priority configuration source and validate its contents.
+    /// Resolve and deserialize configuration without semantic admission.
+    ///
+    /// Daemon recovery uses this path so an unrelated invalid API/auth setting cannot prevent
+    /// rollback of durable network journals. Syntax errors are still fatal because recovery paths
+    /// cannot be recovered reliably from an undecodable file.
+    pub fn load_unvalidated(explicit: Option<PathBuf>) -> Result<Self> {
+        let environment = std::env::var_os(CONFIG_ENV).map(PathBuf::from);
+        Self::load_from(explicit, environment, PathBuf::from(DEFAULT_CONFIG_PATH), false)
+    }
+
+    /// Select the highest-priority configuration source and optionally admit its contents.
     fn load_from(
         explicit: Option<PathBuf>,
         environment: Option<PathBuf>,
         system_path: PathBuf,
+        validate: bool,
     ) -> Result<Self> {
         let source = if let Some(path) = explicit {
             ConfigSource::CommandLine(path)
@@ -74,10 +85,13 @@ impl ResolvedConfig {
             ConfigSource::BuiltIn
         };
         let config = match source.path() {
-            Some(path) => AppConfig::load(path)?,
+            Some(path) if validate => AppConfig::load(path)?,
+            Some(path) => AppConfig::load_unvalidated(path)?,
             None => AppConfig::default(),
         };
-        config.validate()?;
+        if validate {
+            config.validate()?;
+        }
         Ok(Self { config, source })
     }
 }

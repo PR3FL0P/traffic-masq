@@ -694,8 +694,13 @@ fn dependency_plan(
             "Kernel nftables support",
         ));
     }
-    if presets.contains(&DependencyPreset::WifiAp) && !is_executable(&config.wifi.hostapd_binary) {
-        missing.push("hostapd");
+    if presets.contains(&DependencyPreset::WifiAp) {
+        if !is_executable(&config.wifi.hostapd_binary) {
+            missing.push("hostapd");
+        }
+        if !is_executable(&config.wifi.iw_binary) {
+            missing.push("iw");
+        }
     }
     if presets.contains(&DependencyPreset::WifiClient)
         && !is_executable(&config.wifi_client.wpa_supplicant_binary)
@@ -952,6 +957,10 @@ async fn apply_plan_inner(plan: &mut InstallPlan, completed: &mut Vec<&'static s
         );
     }
     if plan.start {
+        let _startup_attempt = service::acquire_startup_attempt(&plan.config)?;
+        let report_preparation_error = service::clear_startup_recovery_report(&plan.config)
+            .err()
+            .map(|error| format!("{error:#}"));
         let started = if let Some(registration) = &plan.init.desired {
             init::start(registration, &plan.config, Duration::from_secs(10)).await
         } else {
@@ -965,7 +974,14 @@ async fn apply_plan_inner(plan: &mut InstallPlan, completed: &mut Vec<&'static s
         };
         match started {
             Ok(_) => println!("Daemon started and ready."),
-            Err(error) => bail!("installation completed, but daemon startup failed: {error}. Inspect diagnostics with: sudo {} --config {} logs", shell_path(&plan.daemon_destination), shell_path(&plan.config_path)),
+            Err(error) => {
+                let error = service::augment_start_error(
+                    &plan.config,
+                    error,
+                    report_preparation_error.as_deref(),
+                );
+                bail!("installation completed, but daemon startup failed: {error:#}. Inspect diagnostics with: sudo {} --config {} logs", shell_path(&plan.daemon_destination), shell_path(&plan.config_path));
+            }
         }
     }
     if let Some(registration) = &plan.init.desired {

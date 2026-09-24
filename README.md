@@ -48,7 +48,7 @@ You need Linux, Rust 1.95.0 and a C compiler. The toolchain is pinned in
 `rust-toolchain.toml`. Some build targets also need CMake.
 
 The daemon needs `nft` with JSON support and kernel support for the features you
-use. For Wi-Fi, install `hostapd` for AP mode or `wpa_supplicant` for client mode.
+use. For Wi-Fi, install `hostapd` and `iw` for AP mode or `wpa_supplicant` for client mode.
 DHCP server and client are built in. WireGuard uses the kernel's netlink API;
 `wireguard-tools` is not needed to run the application.
 
@@ -222,8 +222,9 @@ It keeps configuration, passwords, state, logs and dependency packages.
 ## More documentation
 
 - [Operating guide](docs/usage.md): installation options, configuration and TUI behavior.
+- [Recovery runbook](docs/recovery.md): `TM-REC-xxx` operator procedures for startup-blocking and degraded recovery.
 - [Service integration](packaging/INIT.md): init systems, updates and service ownership.
-- [Security and recovery](SECURITY.md): access control, rollback and vulnerability reports.
+- [Security and recovery](SECURITY.md): access control, rollback and recovery policy.
 - [Architecture](docs/architecture.md): modules and how network changes are applied.
 - [Releases](docs/release.md): testing and packaging.
 

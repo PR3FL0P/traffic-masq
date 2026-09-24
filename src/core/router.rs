@@ -49,6 +49,16 @@ impl RouterDesired {
     /// Derive and validate router intent, including interfaces, VPN chain, routes, and forwarding.
     pub fn from_effective_config(config: &AppConfig) -> Result<Self> {
         config.validate()?;
+        Self::from_validated_config(config)
+    }
+
+    /// Derive router intent during startup recovery without admitting unrelated subsystems.
+    pub(crate) fn from_router_recovery_config(config: &AppConfig) -> Result<Self> {
+        config.validate_router_recovery()?;
+        Self::from_validated_config(config)
+    }
+
+    fn from_validated_config(config: &AppConfig) -> Result<Self> {
         if config.router.enabled && !config.vpn.enabled && !config.router.vpn_chain.is_empty() {
             anyhow::bail!("Enable VPN before enabling a router VPN chain");
         }

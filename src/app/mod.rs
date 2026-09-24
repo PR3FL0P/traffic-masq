@@ -54,7 +54,7 @@ use crate::netlink::{
 };
 use crate::state::overrides::RuntimeOverrides;
 use crate::vpn::{
-    ActiveProfileStore, NetlinkVpnProvider, ProductionVpnManager, VpnManager, VpnProvider,
+    ActiveProfileStore, LazyNetlinkVpnProvider, ProductionVpnManager, VpnManager, VpnProvider,
     WireGuardProfileStore, WireGuardVpnDriver,
 };
 use crate::wifi::{HostapdSupervisor, WifiApSpec, WifiClientSpec, WifiClientSupervisor};
@@ -64,7 +64,7 @@ use process::ProcessGuard;
 type ProductionDataplaneProvider = LinuxRouterDataplaneProvider<
     ProcSysIpv4ForwardingIo,
     NftCommandExecutor,
-    RtnetlinkNetworkProvider,
+    Arc<dyn NetworkProvider>,
 >;
 type ProductionVpnPolicyManager = VpnPolicyManager<WireGuardVpnDriver, Arc<dyn NftExecutor>>;
 
@@ -449,6 +449,7 @@ fn production_router_coordinator(
     desired: &RouterDesired,
     vpn_store_dir: &Path,
     state_dir: &Path,
+    network: Arc<dyn NetworkProvider>,
     journal: AddressOwnershipJournal,
     dhcp: DhcpSupervisor,
     dhcp_client: DhcpClientSupervisor,
@@ -457,14 +458,9 @@ fn production_router_coordinator(
     overrides: RuntimeOverrideManager,
     rollback_timeout: Duration,
 ) -> Result<RouterTransactionCoordinator> {
-    let network: Arc<dyn NetworkProvider> = Arc::new(
-        RtnetlinkNetworkProvider::connect()
-            .context("failed to open rtnetlink connection for router transaction coordinator")?,
-    );
     let interfaces = InterfaceManager::new(network.clone(), journal);
     let routes = RouteManager::new(network.clone());
-    let dataplane_provider = production_dataplane_provider()
-        .context("failed to build router dataplane provider for transaction coordinator")?;
+    let dataplane_provider = production_dataplane_provider(network.clone());
     let dataplane = RouterDataplaneManager::new(dataplane_provider);
     let router_interfaces = desired
         .interfaces
@@ -494,10 +490,7 @@ fn production_router_coordinator(
     // Keep VPN control-plane dependencies available for runtime enablement.
     // RouterDesired still rejects a VPN chain while VPN is disabled.
     {
-        let vpn_provider: Arc<dyn VpnProvider> =
-            Arc::new(NetlinkVpnProvider::connect().context(
-                "failed to open VPN netlink connection for router transaction coordinator",
-            )?);
+        let vpn_provider: Arc<dyn VpnProvider> = Arc::new(LazyNetlinkVpnProvider::new());
         subsystems = subsystems.with_vpn_chain(VpnChainDeps {
             vpn_provider,
             wireguard_store: WireGuardProfileStore::new(vpn_store_dir.to_path_buf()),
@@ -519,7 +512,7 @@ async fn build_vpn_manager(config: &AppConfig) -> Result<Option<Arc<ProductionVp
     let store = WireGuardProfileStore::new(config.vpn.wireguard_config_dir.clone());
     let active_profile_store =
         ActiveProfileStore::new(config.runtime.state_dir.join("vpn-active-profile.json"));
-    let provider: Arc<dyn VpnProvider> = Arc::new(NetlinkVpnProvider::connect()?);
+    let provider: Arc<dyn VpnProvider> = Arc::new(LazyNetlinkVpnProvider::new());
     let driver = WireGuardVpnDriver::new(provider, store);
     let manager = Arc::new(VpnManager::new(driver, active_profile_store));
 
@@ -606,14 +599,12 @@ async fn apply_vpn_policy_startup<E: NftExecutor>(
     }
 }
 
-fn production_dataplane_provider() -> Result<ProductionDataplaneProvider> {
-    let network = RtnetlinkNetworkProvider::connect()
-        .context("failed to open rtnetlink connection for router dataplane preflight")?;
-    Ok(LinuxRouterDataplaneProvider::new(
+fn production_dataplane_provider(network: Arc<dyn NetworkProvider>) -> ProductionDataplaneProvider {
+    LinuxRouterDataplaneProvider::new(
         Ipv4ForwardingBackend::new(ProcSysIpv4ForwardingIo),
         NftablesBackend::new(NftCommandExecutor),
         network,
-    ))
+    )
 }
 
 fn management_allowlist(snapshot: &RuntimeOverrides) -> BTreeSet<String> {
@@ -1308,6 +1299,16 @@ async fn preflight_hostapd_binary(binary: &Path) -> Result<()> {
     Ok(())
 }
 
+async fn preflight_iw_binary(binary: &Path) -> Result<()> {
+    crate::command::probe(binary).await.with_context(|| {
+        format!(
+            "iw binary {} is not runnable — install iw or fix wifi.iw_binary",
+            binary.display()
+        )
+    })?;
+    Ok(())
+}
+
 async fn build_wifi_supervisor(effective_config: &AppConfig) -> Result<Option<HostapdSupervisor>> {
     // Built regardless of `wifi.enabled`: constructing the supervisor has no
     // side effects, and gating it made enabling Wi-Fi a boot-time decision —
@@ -1319,6 +1320,7 @@ async fn build_wifi_supervisor(effective_config: &AppConfig) -> Result<Option<Ho
     // first attempt to configure an access point.
     if effective_config.wifi.enabled {
         preflight_hostapd_binary(&effective_config.wifi.hostapd_binary).await?;
+        preflight_iw_binary(&effective_config.wifi.iw_binary).await?;
     }
     let supervisor = HostapdSupervisor::start(effective_config).await?;
     Ok(Some(supervisor))
@@ -1470,39 +1472,172 @@ fn router_recovery_allows_degraded_startup(
 /// Drain accepted operations before applying configured shutdown and restoration policies.
 pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     migrate_vpn_policy_mode_to_chain(&mut config).await;
-    config.validate()?;
     let shutdown = install_shutdown_signal()?;
     let _process_guard = ProcessGuard::acquire(&config.runtime.pid_path)?;
     let _logging_guard = init_logging(&config)?;
 
-    let overrides = RuntimeOverrideManager::load(&config.runtime.state_dir, &config).await?;
-    let override_snapshot = overrides.snapshot().await;
-    // Provisioning passphrases are journaled separately because they are
-    // intentionally not stored in runtime-overrides.json. Resolve that journal
-    // before starting either Wi-Fi supervisor so a crashed, uncommitted
-    // transaction can never boot with its staged credentials.
-    crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore::in_state_dir(
-        &config.runtime.state_dir,
-    )
-    .recover(override_snapshot.committed_router_transaction.as_deref())
-    .await
-    .context("invariant=restore_provisioning_secrets; object=router-provisioning-secrets.json; operation=startup_recovery; metadata_safe_to_remove=false; operator_action=inspect_or_restore_journal; preserve journal for inspection")?;
-    let effective_config = override_snapshot.effective_config(&config)?;
-    let bindings = HttpApiBindings::bind(&effective_config)?;
-    let auth = AuthService::open(&config.auth).await?;
-    if shutdown_requested(&shutdown) {
-        tracing::info!("shutdown requested before network initialization");
-        return Ok(());
-    }
-    let management_allowlist = management_allowlist(&override_snapshot);
+    // Decode the durable proof envelope without admitting unrelated runtime settings. Individual
+    // proof fields are handled independently below so one recovery scope cannot suppress another.
+    let recovery_store =
+        crate::state::overrides::RuntimeOverrideStore::in_state_dir(&config.runtime.state_dir);
+    let recovery_proof = recovery_store.load_recovery_commit_proof().await?;
+    let committed_router_transaction = recovery_proof.committed_router_transaction();
+    let committed_interface_transactions = recovery_proof.committed_interface_transactions();
 
     let network_provider: Arc<dyn NetworkProvider> = Arc::new(RtnetlinkNetworkProvider::connect()?);
-    // Opened before anything is configured, and checked against the machine
-    // before anything is configured: what the last run wrote down is only worth
-    // acting on once it has been compared with what is actually on the links.
-    let ownership_journal = AddressOwnershipJournal::open(&config.runtime.state_dir)
+    // The directory itself is still a global invariant: if it cannot be enumerated, ownership is
+    // unknowable. Damage to one named document is isolated to that interface and fenced below.
+    let ownership_open = AddressOwnershipJournal::open_isolated(&config.runtime.state_dir)
         .context("failed to open the IPv4 address ownership journal")?;
+    let ownership_blocked_interfaces = ownership_open
+        .blocked_interfaces
+        .iter()
+        .map(|(interface, _)| interface.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    for (interface, reason) in &ownership_open.blocked_interfaces {
+        let ownership_path = config
+            .runtime
+            .state_dir
+            .join("address-ownership")
+            .join(format!("{interface}.json"));
+        crate::core::recovery::block_interface_nonretryable(
+            &config.runtime.state_dir,
+            interface,
+            &ownership_path,
+            format!("address_ownership={}; {reason}", ownership_path.display()),
+        );
+    }
+    let ownership_journal = ownership_open.journal;
     reconcile_address_ownership(&ownership_journal, network_provider.as_ref()).await;
+
+    let interface_manager =
+        InterfaceManager::new(network_provider.clone(), ownership_journal.clone());
+    match committed_interface_transactions {
+        Ok(committed) => {
+            crate::core::transaction::recover_interface_transactions_with_commit_tokens_excluding(
+                &config.runtime.state_dir,
+                &interface_manager,
+                &committed,
+                &ownership_blocked_interfaces,
+            )
+            .await?;
+        }
+        Err(error) => {
+            // Never guess that a journal is uncommitted when the independent proof field is
+            // malformed. Fence only the interfaces that actually have pending journals and keep
+            // unrelated router recovery available.
+            crate::core::transaction::block_interface_transactions_without_commit_proof(
+                &config.runtime.state_dir,
+                &format!("runtime override interface commit proof is invalid: {error:#}"),
+            )
+            .await?;
+            tracing::error!(
+                operation = "recover_interface_transactions",
+                invariant = "independent_commit_proof",
+                error = %format!("{error:#}"),
+                "interface commit proof is untrusted; pending interface scopes were fenced"
+            );
+        }
+    }
+
+    let router_journal = config.runtime.state_dir.join("router-transaction.json");
+    let router_recovery_pending = crate::atomic_file::regular_file_exists(&router_journal).context(
+        crate::core::recovery::RecoveryDiagnostic::fatal(
+            crate::core::recovery::StartupRecoveryCode::AccessibleRouterRecoveryJournal,
+            "inspect",
+            crate::core::recovery::RecoveryAction::RepairStorageAccess,
+        )
+        .journal(router_journal.clone())
+        .object("router")
+        .detail("expected_type", "regular_file_when_present")
+        .detail("expected_mode", format!("{:04o}", crate::atomic_file::PRIVATE_FILE_MODE))
+        .detail("symlink_allowed", false),
+    )?;
+    let provisioning_journal = config
+        .runtime
+        .state_dir
+        .join("wifi")
+        .join("router-provisioning-secrets.json");
+    let provisioning_recovery_pending =
+        crate::atomic_file::regular_file_exists(&provisioning_journal).context(
+            crate::core::recovery::RecoveryDiagnostic::fatal(
+                crate::core::recovery::StartupRecoveryCode::RestoreProvisioningSecrets,
+                "inspect",
+                crate::core::recovery::RecoveryAction::RepairStorageAccess,
+            )
+            .journal(provisioning_journal.clone())
+            .object("router-provisioning-secrets")
+            .detail("expected_type", "regular_file_when_present")
+            .detail("expected_mode", format!("{:04o}", crate::atomic_file::PRIVATE_FILE_MODE))
+            .detail("symlink_allowed", false),
+        )?;
+
+    let committed_router_transaction = match committed_router_transaction {
+        Ok(token) => token,
+        Err(error) if router_recovery_pending || provisioning_recovery_pending => {
+            return Err(crate::core::recovery::context_if_missing(
+                error,
+                crate::core::recovery::RecoveryDiagnostic::fatal(
+                    crate::core::recovery::StartupRecoveryCode::ProvableRouterRecovery,
+                    "startup_recovery",
+                    crate::core::recovery::RecoveryAction::InspectRecoveryState,
+                )
+                .journal(router_journal.clone())
+                .object("router")
+                .detail("required_proof", "independent_committed_transaction_token"),
+            ));
+        }
+        Err(error) => {
+            // There is no router recovery metadata to act on. Preserve the field error for strict
+            // admission later, but do not let it suppress already-completed interface recovery.
+            tracing::warn!(
+                error = %format!("{error:#}"),
+                "router commit proof is invalid but no router recovery journal is pending"
+            );
+            None
+        }
+    };
+
+    // Provisioning secrets belong to the router recovery scope. Run this only after independent
+    // interface recovery, so a router-secret problem cannot suppress interface rollback.
+    let provisioning_recovery =
+        crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore::in_state_dir(
+            &config.runtime.state_dir,
+        )
+        .recover(committed_router_transaction.as_deref())
+        .await;
+    if let Err(error) = provisioning_recovery {
+        return Err(crate::core::recovery::context_if_missing(
+            error,
+            crate::core::recovery::RecoveryDiagnostic::fatal(
+                crate::core::recovery::StartupRecoveryCode::RestoreProvisioningSecrets,
+                "startup_recovery",
+                crate::core::recovery::RecoveryAction::InspectRecoveryState,
+            )
+            .journal(provisioning_journal)
+            .object("router-provisioning-secrets")
+            .detail("next_step", "inspect_nested_recovery_diagnostic_before_restoring_state"),
+        ));
+    }
+
+    // Build only router-relevant state first. When no router journal is pending, recovery is already
+    // complete and normal startup must pass strict admission before it mutates the network. With a
+    // pending router journal, strict admission remains deferred until rollback has finished.
+    let overrides = RuntimeOverrideManager::from_router_recovery_proof(
+        recovery_store,
+        &config,
+        &recovery_proof,
+        committed_router_transaction,
+    )?;
+    let (effective_config, strict_admitted) = if router_recovery_pending {
+        let snapshot = overrides.snapshot().await;
+        (snapshot.effective_router_recovery_config(&config)?, false)
+    } else {
+        config.validate()?;
+        (overrides.hydrate_strict().await?, true)
+    };
+    let override_snapshot = overrides.snapshot().await;
+    let management_allowlist = management_allowlist(&override_snapshot);
 
     // Teardown for everything brought up during startup, unwound in reverse
     // order on any later failure or shutdown-requested check. Each step below
@@ -1510,23 +1645,12 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     // never has to re-derive what the previous N-1 steps were.
     let mut stack = StartupRollback::new();
 
-    let interface_manager =
-        InterfaceManager::new(network_provider.clone(), ownership_journal.clone());
-    crate::core::transaction::recover_interface_transactions(
-        &config.runtime.state_dir,
-        &interface_manager,
-        &override_snapshot,
-    )
-    .await
-    .context("invariant=accessible_interface_recovery_store; object=interface-transactions; operation=startup_recovery; metadata_safe_to_remove=false; operator_action=inspect_state_directory_layout_permissions_or_storage")?;
     let mut startup_config = effective_config.clone();
     startup_config.network.interfaces.retain(|name, _| {
         crate::core::recovery::check_scope(&config.runtime.state_dir, Some(name)).is_ok()
     });
     // Defer legacy interface/dataplane bootstrap when a router snapshot exists;
     // the coordinator owns restoration and subsequent committed-state repair.
-    let router_recovery_pending =
-        tokio::fs::try_exists(config.runtime.state_dir.join("router-transaction.json")).await?;
     let startup_baselines = if router_recovery_pending {
         Vec::new()
     } else {
@@ -1543,18 +1667,22 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         async move { rollback_interfaces(&interface_manager, &startup_baselines).await }
     });
 
-    if shutdown_requested(&shutdown) {
+    if shutdown_requested(&shutdown) && !router_recovery_pending {
         stack.unwind().await;
         tracing::info!("shutdown requested during network initialization");
         return Ok(());
     }
 
-    let wifi_supervisor = match build_wifi_supervisor(&startup_config).await {
-        Ok(supervisor) => supervisor,
-        Err(error) => {
-            tracing::error!(subsystem = "wifi_ap", operation = "initialize_supervisor",
-                error = %format!("{error:#}"), "Wi-Fi subsystem unavailable; other subsystems will still start");
-            None
+    let wifi_supervisor = if router_recovery_pending {
+        Some(HostapdSupervisor::open_for_recovery(&startup_config))
+    } else {
+        match build_wifi_supervisor(&startup_config).await {
+            Ok(supervisor) => supervisor,
+            Err(error) => {
+                tracing::error!(subsystem = "wifi_ap", operation = "initialize_supervisor",
+                    error = %format!("{error:#}"), "Wi-Fi subsystem unavailable; other subsystems will still start");
+                None
+            }
         }
     };
     if let Some(wifi) = &wifi_supervisor {
@@ -1562,18 +1690,22 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         stack.push(async move { wifi.shutdown(ShutdownPolicy::RestoreInterfaces).await });
     }
 
-    if shutdown_requested(&shutdown) {
+    if shutdown_requested(&shutdown) && !router_recovery_pending {
         stack.unwind().await;
         tracing::info!("shutdown requested during Wi-Fi initialization");
         return Ok(());
     }
 
-    let wifi_client_supervisor = match build_wifi_client_supervisor(&startup_config).await {
-        Ok(supervisor) => supervisor,
-        Err(error) => {
-            tracing::error!(subsystem = "wifi_client", operation = "initialize_supervisor",
-                error = %format!("{error:#}"), "Wi-Fi subsystem unavailable; other subsystems will still start");
-            None
+    let wifi_client_supervisor = if router_recovery_pending {
+        Some(WifiClientSupervisor::open_for_recovery(&startup_config))
+    } else {
+        match build_wifi_client_supervisor(&startup_config).await {
+            Ok(supervisor) => supervisor,
+            Err(error) => {
+                tracing::error!(subsystem = "wifi_client", operation = "initialize_supervisor",
+                    error = %format!("{error:#}"), "Wi-Fi subsystem unavailable; other subsystems will still start");
+                None
+            }
         }
     };
     if let Some(wifi_client) = &wifi_client_supervisor {
@@ -1585,17 +1717,21 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         });
     }
 
-    if shutdown_requested(&shutdown) {
+    if shutdown_requested(&shutdown) && !router_recovery_pending {
         stack.unwind().await;
         tracing::info!("shutdown requested during Wi-Fi client initialization");
         return Ok(());
     }
 
-    let dhcp = match DhcpSupervisor::start(&startup_config).await {
-        Ok(supervisor) => supervisor,
-        Err(error) => {
-            stack.unwind().await;
-            return Err(error);
+    let dhcp = if router_recovery_pending {
+        DhcpSupervisor::open_for_recovery(&startup_config)
+    } else {
+        match DhcpSupervisor::start(&startup_config).await {
+            Ok(supervisor) => supervisor,
+            Err(error) => {
+                stack.unwind().await;
+                return Err(error);
+            }
         }
     };
     stack.push({
@@ -1603,20 +1739,29 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         async move { dhcp.shutdown().await }
     });
 
-    if shutdown_requested(&shutdown) {
+    if shutdown_requested(&shutdown) && !router_recovery_pending {
         stack.unwind().await;
         tracing::info!("shutdown requested during DHCP initialization");
         return Ok(());
     }
 
-    let dhcp_client =
+    let dhcp_client = if router_recovery_pending {
+        match DhcpClientSupervisor::open_for_recovery(&startup_config, network_provider.clone()) {
+            Ok(supervisor) => supervisor,
+            Err(error) => {
+                stack.unwind().await;
+                return Err(error);
+            }
+        }
+    } else {
         match DhcpClientSupervisor::start(&startup_config, network_provider.clone()).await {
             Ok(supervisor) => supervisor,
             Err(error) => {
                 stack.unwind().await;
                 return Err(error);
             }
-        };
+        }
+    };
     stack.push({
         let dhcp_client = dhcp_client.clone();
         async move {
@@ -1632,13 +1777,17 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     // address writers through InterfaceMutationLocks instead.
     let network_mutations = Arc::new(NetworkMutationGate::default());
 
-    if shutdown_requested(&shutdown) {
+    if shutdown_requested(&shutdown) && !router_recovery_pending {
         stack.unwind().await;
         tracing::info!("shutdown requested during DHCP client initialization");
         return Ok(());
     }
 
-    let desired = match RouterDesired::from_effective_config(&effective_config) {
+    let desired = match if strict_admitted {
+        RouterDesired::from_effective_config(&effective_config)
+    } else {
+        RouterDesired::from_router_recovery_config(&effective_config)
+    } {
         Ok(desired) => desired,
         Err(error) => {
             stack.unwind().await;
@@ -1654,13 +1803,7 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         && !router_recovery_pending
         && crate::core::recovery::check_scope(&config.runtime.state_dir, None).is_ok()
     {
-        let dataplane_provider = match production_dataplane_provider() {
-            Ok(provider) => provider,
-            Err(error) => {
-                stack.unwind().await;
-                return Err(error);
-            }
-        };
+        let dataplane_provider = production_dataplane_provider(network_provider.clone());
         match apply_router_dataplane(&desired, network_provider.clone(), dataplane_provider).await {
             Ok(state) => Some(Arc::new(state)),
             Err(error)
@@ -1685,7 +1828,7 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         stack.push(async move { rollback_router_dataplane(&state).await });
     }
 
-    if shutdown_requested(&shutdown) {
+    if shutdown_requested(&shutdown) && !router_recovery_pending {
         stack.unwind().await;
         tracing::info!("shutdown requested during router dataplane initialization");
         return Ok(());
@@ -1696,45 +1839,25 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     // `router.enabled` made enabling the router a boot-time decision: with no
     // coordinator every router request answers RouterDisabled, which is exactly
     // the state you are in when you want to provision one. Building it is pure
-    // wiring — it opens a netlink socket and touches no data plane.
+    // wiring — it reuses the already-open network provider and touches no data plane.
     let router_coordinator = match production_router_coordinator(
         &desired,
         &effective_config.vpn.wireguard_config_dir,
         &effective_config.runtime.state_dir,
+        network_provider.clone(),
         ownership_journal.clone(),
         dhcp.clone(),
         dhcp_client.clone(),
         wifi_client_supervisor.clone(),
         wifi_supervisor.clone(),
         overrides.clone(),
-        Duration::from_secs(config.security.rollback_timeout_seconds),
+        Duration::from_secs(config.security.rollback_timeout_seconds.max(1)),
     ) {
         Ok(coordinator) => {
             coordinator.set_timeout_mutation_gate(network_mutations.clone());
             let recovered = async {
                 let _network_mutation = network_mutations.write().await;
-                coordinator.recover().await?;
-                // Reconcile the complete committed router intent through the
-                // same staged manager used by transactions. Startup's legacy
-                // bootstrap covers interfaces/routes/dataplane separately;
-                // this pass also brings up Wi-Fi and the VPN hop chain and is
-                // idempotent for stages already converged.
-                let missing = missing_router_repair_interfaces(
-                    &desired, network_provider.as_ref(),
-                ).await?;
-                if missing.is_empty() {
-                    if let Err(error) = coordinator.repair(desired.clone()).await {
-                        tracing::error!(operation = "repair_committed_router", error = %format!("{error:#}"),
-                            "router convergence degraded; control plane remains available");
-                    }
-                } else {
-                    tracing::warn!(
-                        interfaces = %missing.join(", "),
-                        hint = "Check ip link; reconnect the adapters or correct the interface names in router configuration. Runtime convergence will retry when they appear.",
-                        "router startup repair convergence is deferred: configured interfaces are absent; daemon startup will continue"
-                    );
-                }
-                Ok::<_, anyhow::Error>(())
+                coordinator.recover().await
             }
             .await;
             if let Err(error) = recovered {
@@ -1753,7 +1876,17 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
                         "router dataplane blocked; control plane remains available");
                 } else {
                     stack.unwind().await;
-                    return Err(error).context("invariant=provable_router_recovery; operation=startup_recovery; metadata_safe_to_remove=false; preserve recovery metadata");
+                    return Err(crate::core::recovery::context_if_missing(
+                        error,
+                        crate::core::recovery::RecoveryDiagnostic::fatal(
+                            crate::core::recovery::StartupRecoveryCode::ProvableRouterRecovery,
+                            "startup_recovery",
+                            crate::core::recovery::RecoveryAction::InspectRecoveryState,
+                        )
+                        .journal(config.runtime.state_dir.join("router-transaction.json"))
+                        .object("router")
+                        .detail("next_step", "inspect_nested_recovery_diagnostic_before_restoring_state"),
+                    ));
                 }
             }
             Some(coordinator)
@@ -1761,6 +1894,114 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         Err(error) => {
             stack.unwind().await;
             return Err(error);
+        }
+    };
+
+    if shutdown_requested(&shutdown) {
+        stack.unwind().await;
+        tracing::info!("shutdown requested after startup recovery completed");
+        return Ok(());
+    }
+
+    // Router recovery is now complete. A pending recovery path has intentionally postponed full
+    // admission until this point; a normal-start path was admitted before any network mutation.
+    let effective_config = if strict_admitted {
+        effective_config
+    } else {
+        if let Err(error) = config.validate() {
+            stack.unwind().await;
+            return Err(error);
+        }
+        match overrides.hydrate_strict().await {
+            Ok(effective_config) => effective_config,
+            Err(error) => {
+                stack.unwind().await;
+                return Err(error);
+            }
+        }
+    };
+    let strict_desired = match RouterDesired::from_effective_config(&effective_config) {
+        Ok(desired) => desired,
+        Err(error) => {
+            stack.unwind().await;
+            return Err(error);
+        }
+    };
+    if !strict_admitted && strict_desired != desired {
+        stack.unwind().await;
+        anyhow::bail!(
+            "router-relevant runtime overrides changed during startup recovery; refusing to continue with mixed recovery state"
+        );
+    }
+    let desired = strict_desired;
+
+    if router_recovery_pending {
+        // The rollback coordinator was given inert runtime adapters. Only after the journal is
+        // resolved and strict admission succeeds may normal startup cleanup/configuration run.
+        if let Some(wifi) = &wifi_supervisor {
+            if let Err(error) = wifi.reconcile_startup(&effective_config).await {
+                tracing::error!(subsystem = "wifi_ap", operation = "reconcile_startup_after_recovery",
+                    error = %format!("{error:#}"), "Wi-Fi subsystem unavailable; other subsystems will still start");
+            }
+        }
+        if let Some(wifi_client) = &wifi_client_supervisor {
+            if let Err(error) = wifi_client.reconcile_startup(&effective_config).await {
+                tracing::error!(subsystem = "wifi_client", operation = "reconcile_startup_after_recovery",
+                    error = %format!("{error:#}"), "Wi-Fi client subsystem unavailable; other subsystems will still start");
+            }
+        }
+        if let Err(error) = dhcp.reconcile_startup(&effective_config).await {
+            stack.unwind().await;
+            return Err(error);
+        }
+        if let Err(error) = dhcp_client.reconcile_startup(&effective_config).await {
+            stack.unwind().await;
+            return Err(error);
+        }
+    }
+
+    // Normal committed-state repair is deliberately after strict hydration:
+    // recovery may run with a damaged unrelated API/security override, but
+    // convergence must not mutate the network for a configuration normal
+    // startup would reject.
+    if let Some(coordinator) = &router_coordinator {
+        let _network_mutation = network_mutations.write().await;
+        match missing_router_repair_interfaces(&desired, network_provider.as_ref()).await {
+            Ok(missing) if missing.is_empty() => {
+                if let Err(error) = coordinator.repair(desired.clone()).await {
+                    tracing::error!(operation = "repair_committed_router", error = %format!("{error:#}"),
+                        "router convergence degraded; control plane remains available");
+                }
+            }
+            Ok(missing) => {
+                tracing::warn!(
+                    interfaces = %missing.join(", "),
+                    hint = "Check ip link; reconnect the adapters or correct the interface names in router configuration. Runtime convergence will retry when they appear.",
+                    "router startup repair convergence is deferred: configured interfaces are absent; daemon startup will continue"
+                );
+            }
+            Err(error) => {
+                tracing::error!(operation = "inspect_router_repair_interfaces", error = %format!("{error:#}"),
+                    "router startup repair inspection failed; control plane remains available");
+            }
+        }
+    }
+
+    // Recovery is complete before opening API listeners or the auth database.
+    // A local control-plane failure must never prevent rollback of durable
+    // network journals from a previous run.
+    let bindings = match HttpApiBindings::bind(&effective_config) {
+        Ok(bindings) => bindings,
+        Err(error) => {
+            stack.unwind().await;
+            return Err(error);
+        }
+    };
+    let auth = match AuthService::open(&config.auth).await {
+        Ok(auth) => auth,
+        Err(error) => {
+            stack.unwind().await;
+            return Err(error.into());
         }
     };
 

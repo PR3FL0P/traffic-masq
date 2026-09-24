@@ -252,9 +252,54 @@ impl Inner {
 
 impl DhcpClientSupervisor {
     #[cfg(target_os = "linux")]
+    /// Construct DHCP client supervision without enumerating persisted leases or starting clients.
+    pub fn open_for_recovery(
+        config: &AppConfig,
+        network: Arc<dyn NetworkProvider>,
+    ) -> Result<Self> {
+        Self::open_with_launcher_for_recovery(config, network, Arc::new(LinuxDhcpClientLauncher))
+    }
+
+    /// Construct a recovery runtime using an injected launcher, without normal startup reconcile.
+    pub fn open_with_launcher_for_recovery(
+        config: &AppConfig,
+        network: Arc<dyn NetworkProvider>,
+        launcher: Arc<dyn DhcpClientLauncher>,
+    ) -> Result<Self> {
+        let store = DhcpClientLeaseStore::new(&config.runtime.state_dir)
+            .context("failed to open the DHCP client lease store")?;
+        Ok(Self {
+            inner: Arc::new(Inner {
+                applier: Arc::new(DhcpClientOwnershipApplier::new(network.clone(), store)),
+                network,
+                launcher,
+                tasks: Mutex::new(HashMap::new()),
+                operation_lock: Mutex::new(()),
+            }),
+        })
+    }
+
+    /// Recover persisted DHCP ownership and apply committed clients after router recovery.
+    pub async fn reconcile_startup(&self, config: &AppConfig) -> Result<()> {
+        let specs = Self::effective_specs(config)?;
+        self.recover_persisted_leases(&specs).await?;
+        for spec in specs {
+            let link_ready = config
+                .network
+                .interfaces
+                .get(&spec.interface)
+                .is_some_and(|interface| interface.wifi_client.is_none());
+            self.configure_with_link_ready(spec, link_ready).await;
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
     /// Initialize DHCP client supervision with the production launcher and recover persisted leases.
     pub async fn start(config: &AppConfig, network: Arc<dyn NetworkProvider>) -> Result<Self> {
-        Self::start_with_launcher(config, network, Arc::new(LinuxDhcpClientLauncher)).await
+        let supervisor = Self::open_for_recovery(config, network)?;
+        supervisor.reconcile_startup(config).await?;
+        Ok(supervisor)
     }
 
     /// Recover lease ownership and configure effective clients using an injected runtime launcher.
@@ -263,29 +308,8 @@ impl DhcpClientSupervisor {
         network: Arc<dyn NetworkProvider>,
         launcher: Arc<dyn DhcpClientLauncher>,
     ) -> Result<Self> {
-        let store = DhcpClientLeaseStore::new(&config.runtime.state_dir)
-            .context("failed to open the DHCP client lease store")?;
-        let supervisor = Self {
-            inner: Arc::new(Inner {
-                applier: Arc::new(DhcpClientOwnershipApplier::new(network.clone(), store)),
-                network,
-                launcher,
-                tasks: Mutex::new(HashMap::new()),
-                operation_lock: Mutex::new(()),
-            }),
-        };
-
-        let specs = Self::effective_specs(config)?;
-        supervisor.recover_persisted_leases(&specs).await?;
-        for spec in specs {
-            let link_ready = config
-                .network
-                .interfaces
-                .get(&spec.interface)
-                .is_some_and(|interface| interface.wifi_client.is_none());
-
-            supervisor.configure_with_link_ready(spec, link_ready).await;
-        }
+        let supervisor = Self::open_with_launcher_for_recovery(config, network, launcher)?;
+        supervisor.reconcile_startup(config).await?;
         Ok(supervisor)
     }
 

@@ -248,13 +248,31 @@ pub struct WifiEditRequest {
     pub max_stations: u16,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+
+/// Apply AP, credential, and optional derived-DHCP changes tentatively.
+/// A successful request returns `Response::NetworkChangePending`; callers must
+/// commit the returned token before its rollback deadline.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ProvisionWifiAccessPointRequest {
     pub settings: WifiEditRequest,
     #[serde(default)]
     pub passphrase: Option<String>,
     #[serde(default)]
+    pub clear_passphrase: bool,
+    #[serde(default)]
     pub configure_dhcp: bool,
+}
+
+impl fmt::Debug for ProvisionWifiAccessPointRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProvisionWifiAccessPointRequest")
+            .field("settings", &self.settings)
+            .field("passphrase", &redacted(self.passphrase.is_some()))
+            .field("clear_passphrase", &self.clear_passphrase)
+            .field("configure_dhcp", &self.configure_dhcp)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -602,6 +620,31 @@ pub enum ProvisioningStage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouterRecoveryNotice {
+    pub recovery_code: String,
+    pub invariant: String,
+    #[serde(default)]
+    pub summary: String,
+    #[serde(default)]
+    pub blocked_operation: String,
+    pub operator_action: String,
+    pub operator_guidance: String,
+    pub runbook: String,
+    #[serde(default)]
+    pub failures: Vec<String>,
+}
+
+impl RouterRecoveryNotice {
+    pub fn known_action(&self) -> Option<crate::core::recovery::RecoveryAction> {
+        self.operator_action.parse().ok()
+    }
+
+    pub fn known_code(&self) -> Option<crate::core::recovery::RecoveryCode> {
+        crate::core::recovery::RecoveryCode::from_code(&self.recovery_code)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouterProvisioningStatusView {
     pub stage: ProvisioningStage,
     pub enabled: bool,
@@ -696,7 +739,7 @@ pub enum RouterProvisioningErrorDetail {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     Ping,
@@ -835,6 +878,8 @@ pub enum Request {
         interface: String,
         settings: WifiEditRequest,
         passphrase: Option<String>,
+        #[serde(default)]
+        clear_passphrase: bool,
         configure_dhcp: bool,
     },
     DisableWifi {
@@ -896,6 +941,39 @@ pub enum Request {
     DeactivateWifiClientProfile {
         interface: String,
     },
+}
+
+impl fmt::Debug for Request {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut value = serde_json::to_value(self).map_err(|_| fmt::Error)?;
+        redact_debug_secrets(&mut value);
+        write!(formatter, "{value}")
+    }
+}
+
+fn redact_debug_secrets(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for (name, value) in fields {
+                if matches!(
+                    name.as_str(),
+                    "passphrase" | "uplink_passphrase" | "output_passphrase" | "password"
+                ) {
+                    if !value.is_null() {
+                        *value = serde_json::Value::String("<redacted>".to_string());
+                    }
+                } else {
+                    redact_debug_secrets(value);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_debug_secrets(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -975,6 +1053,8 @@ pub enum Response {
         ready: bool,
         coordinator_status: CoordinatorStatus,
         health: RouterHealthReport,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recovery: Option<RouterRecoveryNotice>,
     },
     RouterPlan {
         plan: RouterPlan,
@@ -991,6 +1071,8 @@ pub enum Response {
         token: Option<String>,
         status: CoordinatorStatus,
         rollback_failure: Option<Vec<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recovery: Option<RouterRecoveryNotice>,
     },
     Routes {
         routes: Vec<RouteStatus>,
@@ -1056,6 +1138,9 @@ pub enum Response {
     WifiConfigured {
         spec: WifiApSpec,
     },
+    /// Legacy response retained for wire compatibility with older daemons that
+    /// committed AP provisioning immediately. Current provisioning returns
+    /// `NetworkChangePending` and requires an explicit commit.
     WifiAccessPointProvisioned {
         spec: WifiApSpec,
         dhcp: Option<DhcpServiceSpec>,

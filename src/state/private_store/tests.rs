@@ -58,6 +58,18 @@ fn refuses_traversal_and_symlinked_documents() {
     assert_eq!(fs::read(&target).expect("read target"), b"do not replace");
 }
 
+
+#[test]
+fn enumeration_refuses_a_symlink_disguised_as_a_document() {
+    let root = tempdir().expect("tempdir");
+    let store = PrivateJsonDirectory::open(root.path(), "records").expect("store");
+    let target = root.path().join("target.json");
+    fs::write(&target, b"{}").expect("target");
+    symlink(&target, store.directory().join("eth0.json")).expect("symlink");
+
+    assert!(matches!(store.keys(), Err(PrivateStoreError::Symlink(_))));
+}
+
 #[test]
 fn refuses_a_symlinked_store_directory() {
     let root = tempdir().expect("tempdir");

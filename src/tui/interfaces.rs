@@ -525,7 +525,7 @@ pub(crate) fn render_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
         Line::from(format!("Automatic rollback in: {seconds}s / {timeout}s")),
     ];
 
-    let block = panel("Interface change pending confirmation");
+    let block = panel("Network change pending confirmation");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let chunks = Layout::default()

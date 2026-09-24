@@ -145,9 +145,12 @@ async fn uncommitted_unknown_schema_remains_operator_blocking() {
         .recover(Some("different"))
         .await
         .expect_err("unsupported uncommitted schema must remain blocked");
-    assert!(error
-        .to_string()
-        .contains("supported_provisioning_secret_schema"));
+    let diagnostic = format!("{error:#}");
+    assert!(diagnostic.contains("recovery_code=TM-REC-303"));
+    assert!(diagnostic.contains("supported_provisioning_secret_schema"));
+    assert!(diagnostic.contains("journal_schema=999"));
+    assert!(diagnostic.contains("supported_schemas=1"));
+    assert!(diagnostic.contains("operator_action=use_compatible_daemon"));
     assert!(journal.exists());
 }
 
@@ -190,8 +193,12 @@ async fn malformed_json_never_infers_commit_from_token_text() {
         .recover(Some("committed"))
         .await
         .expect_err("malformed JSON has no trustworthy token proof");
-    assert!(error
-        .to_string()
-        .contains("valid_provisioning_secret_snapshot"));
+    let diagnostic = error.to_string();
+    assert!(diagnostic.contains("recovery_code=TM-REC-302"));
+    assert!(diagnostic.contains("invariant=valid_provisioning_secret_snapshot"));
+    assert!(diagnostic.contains(&format!("journal={}", journal.display())));
+    assert!(diagnostic.contains("backup_scope=complete_state_directory"));
+    assert!(diagnostic.contains("do_not_edit_journal=true"));
+    assert!(diagnostic.contains("operator_action=restore_coherent_backup"));
     assert!(journal.exists());
 }

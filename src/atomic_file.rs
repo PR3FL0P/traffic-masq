@@ -87,6 +87,27 @@ pub fn reject_symlink(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Return whether `path` is an existing regular file without following symlinks.
+///
+/// Recovery callers use this instead of `Path::exists`/`try_exists`: those APIs
+/// follow symlinks, so a dangling link can look exactly like a missing journal.
+/// Existing non-regular objects are rejected as unsafe recovery metadata.
+pub fn regular_file_exists(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unsafe symlink at {}", path.display()),
+        )),
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular file", path.display()),
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 /// Create `path` if it is missing and force `mode` on it.
 ///
 /// An existing symlink or non-directory is refused rather than replaced: this

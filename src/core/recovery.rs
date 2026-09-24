@@ -7,7 +7,388 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryCode {
+    AccessibleInterfaceRecoveryStore,
+    ProvableRouterRecovery,
+    AccessibleRouterRecoveryJournal,
+    DecodableRecoverySnapshot,
+    ValidRecoverySnapshot,
+    SupportedSchema,
+    RevisionOrder,
+    RouterRollbackFailed,
+    RouterJournalCleanupPending,
+    RestoreProvisioningSecrets,
+    ValidProvisioningSecretSnapshot,
+    SupportedProvisioningSecretSchema,
+}
+
+impl RecoveryCode {
+    pub const ALL: &'static [Self] = &[
+        Self::AccessibleInterfaceRecoveryStore,
+        Self::ProvableRouterRecovery,
+        Self::AccessibleRouterRecoveryJournal,
+        Self::DecodableRecoverySnapshot,
+        Self::ValidRecoverySnapshot,
+        Self::SupportedSchema,
+        Self::RevisionOrder,
+        Self::RouterRollbackFailed,
+        Self::RouterJournalCleanupPending,
+        Self::RestoreProvisioningSecrets,
+        Self::ValidProvisioningSecretSnapshot,
+        Self::SupportedProvisioningSecretSchema,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AccessibleInterfaceRecoveryStore => "TM-REC-101",
+            Self::ProvableRouterRecovery => "TM-REC-201",
+            Self::AccessibleRouterRecoveryJournal => "TM-REC-202",
+            Self::DecodableRecoverySnapshot => "TM-REC-203",
+            Self::ValidRecoverySnapshot => "TM-REC-204",
+            Self::SupportedSchema => "TM-REC-205",
+            Self::RevisionOrder => "TM-REC-206",
+            Self::RouterRollbackFailed => "TM-REC-207",
+            Self::RouterJournalCleanupPending => "TM-REC-208",
+            Self::RestoreProvisioningSecrets => "TM-REC-301",
+            Self::ValidProvisioningSecretSnapshot => "TM-REC-302",
+            Self::SupportedProvisioningSecretSchema => "TM-REC-303",
+        }
+    }
+
+    pub fn from_code(value: &str) -> Option<Self> {
+        Some(match value {
+            "TM-REC-101" => Self::AccessibleInterfaceRecoveryStore,
+            "TM-REC-201" => Self::ProvableRouterRecovery,
+            "TM-REC-202" => Self::AccessibleRouterRecoveryJournal,
+            "TM-REC-203" => Self::DecodableRecoverySnapshot,
+            "TM-REC-204" => Self::ValidRecoverySnapshot,
+            "TM-REC-205" => Self::SupportedSchema,
+            "TM-REC-206" => Self::RevisionOrder,
+            "TM-REC-207" => Self::RouterRollbackFailed,
+            "TM-REC-208" => Self::RouterJournalCleanupPending,
+            "TM-REC-301" => Self::RestoreProvisioningSecrets,
+            "TM-REC-302" => Self::ValidProvisioningSecretSnapshot,
+            "TM-REC-303" => Self::SupportedProvisioningSecretSchema,
+            _ => return None,
+        })
+    }
+
+    pub const fn invariant(self) -> &'static str {
+        match self {
+            Self::AccessibleInterfaceRecoveryStore => "accessible_interface_recovery_store",
+            Self::ProvableRouterRecovery => "provable_router_recovery",
+            Self::AccessibleRouterRecoveryJournal => "accessible_router_recovery_journal",
+            Self::DecodableRecoverySnapshot => "decodable_recovery_snapshot",
+            Self::ValidRecoverySnapshot => "valid_recovery_snapshot",
+            Self::SupportedSchema => "supported_schema",
+            Self::RevisionOrder => "revision_order",
+            Self::RouterRollbackFailed => "router_rollback_failed",
+            Self::RouterJournalCleanupPending => "router_journal_cleanup_pending",
+            Self::RestoreProvisioningSecrets => "restore_provisioning_secrets",
+            Self::ValidProvisioningSecretSnapshot => "valid_provisioning_secret_snapshot",
+            Self::SupportedProvisioningSecretSchema => "supported_provisioning_secret_schema",
+        }
+    }
+
+    pub const fn is_startup_blocking(self) -> bool {
+        !matches!(
+            self,
+            Self::RouterRollbackFailed | Self::RouterJournalCleanupPending
+        )
+    }
+
+    pub const fn runbook_ref(self) -> &'static str {
+        match self {
+            Self::AccessibleInterfaceRecoveryStore => "docs/recovery.md#tm-rec-101",
+            Self::ProvableRouterRecovery => "docs/recovery.md#tm-rec-201",
+            Self::AccessibleRouterRecoveryJournal => "docs/recovery.md#tm-rec-202",
+            Self::DecodableRecoverySnapshot => "docs/recovery.md#tm-rec-203",
+            Self::ValidRecoverySnapshot => "docs/recovery.md#tm-rec-204",
+            Self::SupportedSchema => "docs/recovery.md#tm-rec-205",
+            Self::RevisionOrder => "docs/recovery.md#tm-rec-206",
+            Self::RouterRollbackFailed => "docs/recovery.md#tm-rec-207",
+            Self::RouterJournalCleanupPending => "docs/recovery.md#tm-rec-208",
+            Self::RestoreProvisioningSecrets => "docs/recovery.md#tm-rec-301",
+            Self::ValidProvisioningSecretSnapshot => "docs/recovery.md#tm-rec-302",
+            Self::SupportedProvisioningSecretSchema => "docs/recovery.md#tm-rec-303",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupRecoveryCode {
+    AccessibleInterfaceRecoveryStore,
+    ProvableRouterRecovery,
+    AccessibleRouterRecoveryJournal,
+    DecodableRecoverySnapshot,
+    ValidRecoverySnapshot,
+    SupportedSchema,
+    RevisionOrder,
+    RestoreProvisioningSecrets,
+    ValidProvisioningSecretSnapshot,
+    SupportedProvisioningSecretSchema,
+}
+
+impl StartupRecoveryCode {
+    pub const ALL: &'static [Self] = &[
+        Self::AccessibleInterfaceRecoveryStore,
+        Self::ProvableRouterRecovery,
+        Self::AccessibleRouterRecoveryJournal,
+        Self::DecodableRecoverySnapshot,
+        Self::ValidRecoverySnapshot,
+        Self::SupportedSchema,
+        Self::RevisionOrder,
+        Self::RestoreProvisioningSecrets,
+        Self::ValidProvisioningSecretSnapshot,
+        Self::SupportedProvisioningSecretSchema,
+    ];
+}
+
+impl From<StartupRecoveryCode> for RecoveryCode {
+    fn from(code: StartupRecoveryCode) -> Self {
+        match code {
+            StartupRecoveryCode::AccessibleInterfaceRecoveryStore => {
+                Self::AccessibleInterfaceRecoveryStore
+            }
+            StartupRecoveryCode::ProvableRouterRecovery => Self::ProvableRouterRecovery,
+            StartupRecoveryCode::AccessibleRouterRecoveryJournal => {
+                Self::AccessibleRouterRecoveryJournal
+            }
+            StartupRecoveryCode::DecodableRecoverySnapshot => Self::DecodableRecoverySnapshot,
+            StartupRecoveryCode::ValidRecoverySnapshot => Self::ValidRecoverySnapshot,
+            StartupRecoveryCode::SupportedSchema => Self::SupportedSchema,
+            StartupRecoveryCode::RevisionOrder => Self::RevisionOrder,
+            StartupRecoveryCode::RestoreProvisioningSecrets => {
+                Self::RestoreProvisioningSecrets
+            }
+            StartupRecoveryCode::ValidProvisioningSecretSnapshot => {
+                Self::ValidProvisioningSecretSnapshot
+            }
+            StartupRecoveryCode::SupportedProvisioningSecretSchema => {
+                Self::SupportedProvisioningSecretSchema
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for RecoveryCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryAction {
+    InspectRecoveryState,
+    RepairStorageAccess,
+    RestoreCoherentBackup,
+    RetryRollback,
+    AwaitCleanup,
+    UseCompatibleDaemon,
+}
+
+impl RecoveryAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InspectRecoveryState => "inspect_recovery_state",
+            Self::RepairStorageAccess => "repair_storage_access",
+            Self::RestoreCoherentBackup => "restore_coherent_backup",
+            Self::RetryRollback => "retry_rollback",
+            Self::AwaitCleanup => "await_cleanup",
+            Self::UseCompatibleDaemon => "use_compatible_daemon",
+        }
+    }
+
+    pub const fn guidance(self) -> &'static str {
+        match self {
+            Self::InspectRecoveryState => {
+                "preserve recovery metadata and inspect the nested recovery diagnostic before changing state"
+            }
+            Self::RepairStorageAccess => {
+                "preserve recovery metadata and repair the reported path type permissions or storage access"
+            }
+            Self::RestoreCoherentBackup => {
+                "restore the complete state directory from one coherent backup and do not replace a journal alone"
+            }
+            Self::RetryRollback => {
+                "repair the reported runtime failure and retry rollback without deleting the journal"
+            }
+            Self::AwaitCleanup => {
+                "preserve recovered state, repair storage access if needed, and wait for automatic journal cleanup"
+            }
+            Self::UseCompatibleDaemon => {
+                "use a daemon that supports the reported journal schema or restore one coherent state backup"
+            }
+        }
+    }
+}
+
+impl std::str::FromStr for RecoveryAction {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(match value {
+            "inspect_recovery_state" => Self::InspectRecoveryState,
+            "repair_storage_access" => Self::RepairStorageAccess,
+            "restore_coherent_backup" => Self::RestoreCoherentBackup,
+            "retry_rollback" => Self::RetryRollback,
+            "await_cleanup" | "retry_cleanup" => Self::AwaitCleanup,
+            "use_compatible_daemon" => Self::UseCompatibleDaemon,
+            _ => return Err(()),
+        })
+    }
+}
+
+impl std::fmt::Display for RecoveryAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+pub const RECOVERY_DIAGNOSTIC_RECORD_VERSION: u8 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryDiagnosticRecord {
+    pub version: u8,
+    #[serde(default)]
+    pub recovery_code: String,
+    #[serde(default)]
+    pub runbook: String,
+    pub invariant: String,
+    pub object: Option<String>,
+    pub journal: Option<PathBuf>,
+    pub path: Option<PathBuf>,
+    pub operation: String,
+    pub metadata_safe_to_remove: bool,
+    pub details: BTreeMap<String, String>,
+    pub operator_action: String,
+    pub operator_guidance: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecoveryDiagnostic {
+    recovery_code: RecoveryCode,
+    object: Option<&'static str>,
+    journal: Option<PathBuf>,
+    path: Option<PathBuf>,
+    operation: &'static str,
+    metadata_safe_to_remove: bool,
+    details: Vec<(&'static str, String)>,
+    operator_action: RecoveryAction,
+}
+
+impl RecoveryDiagnostic {
+    pub fn fatal(
+        recovery_code: StartupRecoveryCode,
+        operation: &'static str,
+        operator_action: RecoveryAction,
+    ) -> Self {
+        Self {
+            recovery_code: recovery_code.into(),
+            object: None,
+            journal: None,
+            path: None,
+            operation,
+            metadata_safe_to_remove: false,
+            details: Vec::new(),
+            operator_action,
+        }
+    }
+
+    pub fn object(mut self, object: &'static str) -> Self {
+        self.object = Some(object);
+        self
+    }
+
+    pub fn journal(mut self, journal: impl Into<PathBuf>) -> Self {
+        self.journal = Some(journal.into());
+        self
+    }
+
+    pub fn path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+
+    pub fn detail(mut self, key: &'static str, value: impl ToString) -> Self {
+        self.details.push((key, value.to_string()));
+        self
+    }
+
+    pub fn record(&self) -> RecoveryDiagnosticRecord {
+        RecoveryDiagnosticRecord {
+            version: RECOVERY_DIAGNOSTIC_RECORD_VERSION,
+            recovery_code: self.recovery_code.as_str().to_owned(),
+            runbook: self.recovery_code.runbook_ref().to_owned(),
+            invariant: self.recovery_code.invariant().to_owned(),
+            object: self.object.map(str::to_owned),
+            journal: self.journal.clone(),
+            path: self.path.clone(),
+            operation: self.operation.to_owned(),
+            metadata_safe_to_remove: self.metadata_safe_to_remove,
+            details: self
+                .details
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), value.clone()))
+                .collect(),
+            operator_action: self.operator_action.as_str().to_owned(),
+            operator_guidance: self.operator_action.guidance().to_owned(),
+        }
+    }
+}
+
+impl std::error::Error for RecoveryDiagnostic {}
+
+pub fn diagnostic_from_error(error: &anyhow::Error) -> Option<&RecoveryDiagnostic> {
+    error.downcast_ref::<RecoveryDiagnostic>()
+}
+
+pub fn context_if_missing(
+    error: anyhow::Error,
+    fallback: RecoveryDiagnostic,
+) -> anyhow::Error {
+    if diagnostic_from_error(&error).is_some() {
+        error
+    } else {
+        error.context(fallback)
+    }
+}
+
+impl std::fmt::Display for RecoveryDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "recovery_code={}; invariant={}; runbook={}; operation={}; metadata_safe_to_remove={}",
+            self.recovery_code,
+            self.recovery_code.invariant(),
+            self.recovery_code.runbook_ref(),
+            self.operation,
+            self.metadata_safe_to_remove
+        )?;
+        if let Some(object) = self.object {
+            write!(f, "; object={object}")?;
+        }
+        if let Some(path) = &self.path {
+            write!(f, "; path={}", path.display())?;
+        }
+        if let Some(journal) = &self.journal {
+            write!(f, "; journal={}", journal.display())?;
+        }
+        for (key, value) in &self.details {
+            write!(f, "; {key}={value}")?;
+        }
+        write!(
+            f,
+            "; operator_action={}; operator_guidance={}",
+            self.operator_action,
+            self.operator_action.guidance()
+        )
+    }
+}
 
 fn pending() -> &'static Mutex<BTreeMap<PathBuf, Vec<u8>>> {
     static PENDING: OnceLock<Mutex<BTreeMap<PathBuf, Vec<u8>>>> = OnceLock::new();
@@ -174,13 +555,26 @@ pub async fn quarantine(path: &Path, suffix: &str) -> Result<()> {
     retire(path).await
 }
 
-fn blocked() -> &'static Mutex<BTreeMap<PathBuf, BTreeMap<String, String>>> {
-    static BLOCKED: OnceLock<Mutex<BTreeMap<PathBuf, BTreeMap<String, String>>>> = OnceLock::new();
+#[derive(Debug, Clone)]
+struct InterfaceBlock {
+    reason: String,
+    retry_transaction: bool,
+}
+
+fn blocked() -> &'static Mutex<BTreeMap<PathBuf, BTreeMap<String, InterfaceBlock>>> {
+    static BLOCKED: OnceLock<Mutex<BTreeMap<PathBuf, BTreeMap<String, InterfaceBlock>>>> =
+        OnceLock::new();
     BLOCKED.get_or_init(Mutex::default)
 }
 
-pub fn block_interface(root: &Path, interface: &str, reason: String) {
-    tracing::error!(object = %interface, journal = %root.join("interface-transactions").join(format!("{interface}.json")).display(),
+fn block_interface_inner(
+    root: &Path,
+    interface: &str,
+    recovery_path: &Path,
+    reason: String,
+    retry_transaction: bool,
+) {
+    tracing::error!(object = %interface, journal = %recovery_path.display(),
         invariant = "restore_before_mutation", operation = "recover_interface",
         metadata_safe_to_remove = false, error = %reason, "interface blocked; other interfaces remain available");
     blocked()
@@ -188,7 +582,33 @@ pub fn block_interface(root: &Path, interface: &str, reason: String) {
         .expect("recovery scope lock")
         .entry(root.to_owned())
         .or_default()
-        .insert(interface.to_owned(), reason);
+        .insert(
+            interface.to_owned(),
+            InterfaceBlock {
+                reason,
+                retry_transaction,
+            },
+        );
+}
+
+pub fn block_interface(root: &Path, interface: &str, reason: String) {
+    let recovery_path = root
+        .join("interface-transactions")
+        .join(format!("{interface}.json"));
+    block_interface_inner(root, interface, &recovery_path, reason, true);
+}
+
+/// Fence an interface for recovery metadata outside the interface-transaction store.
+///
+/// The transaction retry loop must not clear this block: the foreign metadata must be repaired and
+/// reloaded first.
+pub fn block_interface_nonretryable(
+    root: &Path,
+    interface: &str,
+    recovery_path: &Path,
+    reason: String,
+) {
+    block_interface_inner(root, interface, recovery_path, reason, false);
 }
 
 /// Interfaces with unresolved startup recovery, excluding cleanup-only work.
@@ -198,6 +618,22 @@ pub(crate) fn blocked_interfaces(root: &Path) -> Vec<String> {
         .expect("recovery scope lock")
         .get(root)
         .map(|scopes| scopes.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Interface-transaction failures that the background retry loop is allowed to retry.
+pub(crate) fn retryable_blocked_interfaces(root: &Path) -> Vec<String> {
+    blocked()
+        .lock()
+        .expect("recovery scope lock")
+        .get(root)
+        .map(|scopes| {
+            scopes
+                .iter()
+                .filter(|(_, block)| block.retry_transaction)
+                .map(|(name, _)| name.clone())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -219,9 +655,9 @@ pub fn check_scope(root: &Path, interface: Option<&str>) -> Result<()> {
     drop(cleanup);
     let guard = blocked().lock().expect("recovery scope lock");
     if let Some(scopes) = guard.get(root) {
-        for (name, reason) in scopes {
+        for (name, block) in scopes {
             if interface.is_none_or(|interface| interface == name) {
-                anyhow::bail!("interface={name}; invariant=restore_before_mutation; operation=admit_mutation; metadata_safe_to_remove=false; recovery blocked: {reason}");
+                anyhow::bail!("interface={name}; invariant=restore_before_mutation; operation=admit_mutation; metadata_safe_to_remove=false; recovery blocked: {}", block.reason);
             }
         }
     }
@@ -231,6 +667,205 @@ pub fn check_scope(root: &Path, interface: Option<&str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nonretryable_interface_block_is_visible_but_not_transaction_retryable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("address-ownership/lan0.json");
+        block_interface_nonretryable(dir.path(), "lan0", &path, "invalid ownership".into());
+
+        assert_eq!(blocked_interfaces(dir.path()), vec!["lan0".to_string()]);
+        assert!(retryable_blocked_interfaces(dir.path()).is_empty());
+        assert!(check_scope(dir.path(), Some("lan0")).is_err());
+        unblock_interface(dir.path(), "lan0");
+    }
+
+    #[test]
+    fn fatal_diagnostic_has_stable_journal_format() {
+        let diagnostic = RecoveryDiagnostic::fatal(
+            StartupRecoveryCode::RevisionOrder,
+            "validate",
+            crate::core::recovery::RecoveryAction::RestoreCoherentBackup,
+        )
+        .journal("/state/router-transaction.json")
+        .object("router")
+        .detail("journal_base_revision", 15)
+        .detail("committed_revision", 14)
+        .to_string();
+        assert_eq!(
+            diagnostic,
+            "recovery_code=TM-REC-206; invariant=revision_order; runbook=docs/recovery.md#tm-rec-206; operation=validate; metadata_safe_to_remove=false; object=router; journal=/state/router-transaction.json; journal_base_revision=15; committed_revision=14; operator_action=restore_coherent_backup; operator_guidance=restore the complete state directory from one coherent backup and do not replace a journal alone"
+        );
+    }
+
+    #[test]
+    fn fatal_diagnostic_distinguishes_resource_path_from_journal() {
+        let diagnostic = RecoveryDiagnostic::fatal(
+            StartupRecoveryCode::AccessibleInterfaceRecoveryStore,
+            "open",
+            crate::core::recovery::RecoveryAction::RepairStorageAccess,
+        )
+        .path("/state/interface-transactions")
+        .object("interface-transactions")
+        .detail("expected_type", "directory")
+        .detail("expected_mode", "0700")
+        .detail("symlink_allowed", false)
+        .to_string();
+        assert_eq!(
+            diagnostic,
+            "recovery_code=TM-REC-101; invariant=accessible_interface_recovery_store; runbook=docs/recovery.md#tm-rec-101; operation=open; metadata_safe_to_remove=false; object=interface-transactions; path=/state/interface-transactions; expected_type=directory; expected_mode=0700; symlink_allowed=false; operator_action=repair_storage_access; operator_guidance=preserve recovery metadata and repair the reported path type permissions or storage access"
+        );
+        assert!(!diagnostic.contains("journal="));
+    }
+
+    #[test]
+    fn typed_diagnostic_survives_anyhow_context() {
+        let diagnostic = RecoveryDiagnostic::fatal(
+            StartupRecoveryCode::RevisionOrder,
+            "validate",
+            RecoveryAction::RestoreCoherentBackup,
+        )
+        .journal("/state/router-transaction.json")
+        .detail("journal_base_revision", 15);
+        let error = anyhow::Error::msg("revision mismatch").context(diagnostic);
+        let recovered = diagnostic_from_error(&error).expect("typed recovery diagnostic");
+        let record = recovered.record();
+        assert_eq!(record.version, RECOVERY_DIAGNOSTIC_RECORD_VERSION);
+        assert_eq!(record.recovery_code, "TM-REC-206");
+        assert_eq!(record.runbook, "docs/recovery.md#tm-rec-206");
+        assert_eq!(record.invariant, "revision_order");
+        assert_eq!(record.operator_action, "restore_coherent_backup");
+        assert_eq!(
+            record.details.get("journal_base_revision").map(String::as_str),
+            Some("15")
+        );
+    }
+
+    #[test]
+    fn recovery_fallback_does_not_hide_specific_diagnostic() {
+        let specific = RecoveryDiagnostic::fatal(
+            StartupRecoveryCode::RevisionOrder,
+            "validate",
+            RecoveryAction::RestoreCoherentBackup,
+        );
+        let error = anyhow::Error::msg("revision mismatch").context(specific);
+        let wrapped = context_if_missing(
+            error,
+            RecoveryDiagnostic::fatal(
+                crate::core::recovery::StartupRecoveryCode::ProvableRouterRecovery,
+                "startup_recovery",
+                RecoveryAction::InspectRecoveryState,
+            ),
+        );
+        assert_eq!(
+            diagnostic_from_error(&wrapped)
+                .expect("specific diagnostic")
+                .record()
+                .invariant,
+            "revision_order"
+        );
+    }
+
+    #[test]
+    fn recovery_code_assignments_are_stable() {
+        let assignments: Vec<_> = RecoveryCode::ALL
+            .iter()
+            .map(|code| (code.as_str(), code.invariant()))
+            .collect();
+        assert_eq!(
+            assignments,
+            vec![
+                ("TM-REC-101", "accessible_interface_recovery_store"),
+                ("TM-REC-201", "provable_router_recovery"),
+                ("TM-REC-202", "accessible_router_recovery_journal"),
+                ("TM-REC-203", "decodable_recovery_snapshot"),
+                ("TM-REC-204", "valid_recovery_snapshot"),
+                ("TM-REC-205", "supported_schema"),
+                ("TM-REC-206", "revision_order"),
+                ("TM-REC-207", "router_rollback_failed"),
+                ("TM-REC-208", "router_journal_cleanup_pending"),
+                ("TM-REC-301", "restore_provisioning_secrets"),
+                ("TM-REC-302", "valid_provisioning_secret_snapshot"),
+                ("TM-REC-303", "supported_provisioning_secret_schema"),
+            ]
+        );
+    }
+
+    #[test]
+    fn recovery_codes_are_unique_round_trip_and_have_runbook_sections() {
+        let runbook = include_str!("../../docs/recovery.md");
+        let mut codes = std::collections::BTreeSet::new();
+        let mut invariants = std::collections::BTreeSet::new();
+
+        for code in RecoveryCode::ALL {
+            assert!(codes.insert(code.as_str()), "duplicate recovery code {}", code);
+            assert!(
+                invariants.insert(code.invariant()),
+                "duplicate recovery invariant {}",
+                code.invariant()
+            );
+            assert_eq!(RecoveryCode::from_code(code.as_str()), Some(*code));
+            let anchor = code
+                .runbook_ref()
+                .split_once('#')
+                .expect("runbook reference has anchor")
+                .1;
+            assert!(
+                runbook.contains(&format!("<a id=\"{anchor}\"></a>")),
+                "missing runbook anchor for {}",
+                code
+            );
+        }
+
+        assert_eq!(codes.len(), 12);
+        assert_eq!(invariants.len(), 12);
+        assert_eq!(RecoveryCode::from_code("TM-REC-999"), None);
+    }
+
+    #[test]
+    fn only_degraded_router_codes_are_non_blocking() {
+        for code in RecoveryCode::ALL {
+            let expected = !matches!(
+                code,
+                RecoveryCode::RouterRollbackFailed | RecoveryCode::RouterJournalCleanupPending
+            );
+            assert_eq!(code.is_startup_blocking(), expected, "{code}");
+        }
+    }
+
+    #[test]
+    fn startup_recovery_codes_cover_exactly_the_blocking_codes() {
+        let startup = StartupRecoveryCode::ALL
+            .iter()
+            .copied()
+            .map(|code| RecoveryCode::from(code).as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let expected = RecoveryCode::ALL
+            .iter()
+            .copied()
+            .filter(|code| code.is_startup_blocking())
+            .map(RecoveryCode::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(startup, expected);
+    }
+
+    #[test]
+    fn recovery_actions_have_stable_operator_values() {
+        assert_eq!(RecoveryAction::InspectRecoveryState.as_str(), "inspect_recovery_state");
+        assert_eq!(RecoveryAction::RepairStorageAccess.as_str(), "repair_storage_access");
+        assert_eq!(RecoveryAction::RestoreCoherentBackup.as_str(), "restore_coherent_backup");
+        assert_eq!(RecoveryAction::RetryRollback.as_str(), "retry_rollback");
+        assert_eq!(RecoveryAction::AwaitCleanup.as_str(), "await_cleanup");
+        assert_eq!(RecoveryAction::UseCompatibleDaemon.as_str(), "use_compatible_daemon");
+        assert_eq!("retry_rollback".parse(), Ok(RecoveryAction::RetryRollback));
+        assert_eq!("await_cleanup".parse(), Ok(RecoveryAction::AwaitCleanup));
+        assert_eq!("retry_cleanup".parse(), Ok(RecoveryAction::AwaitCleanup));
+        assert!("future_action".parse::<RecoveryAction>().is_err());
+        assert_eq!(
+            RecoveryAction::RestoreCoherentBackup.guidance(),
+            "restore the complete state directory from one coherent backup and do not replace a journal alone"
+        );
+    }
 
     #[tokio::test]
     async fn receipt_proves_only_the_exact_journal() {

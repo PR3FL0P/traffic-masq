@@ -1,5 +1,37 @@
 use super::provisioning::*;
 use super::*;
+use crate::core::recovery::{RecoveryAction, RecoveryCode};
+
+fn router_recovery_notice(
+    status: CoordinatorStatus,
+    failures: Vec<String>,
+) -> Option<RouterRecoveryNotice> {
+    let (code, action, summary) = match status {
+        CoordinatorStatus::RollbackFailed => (
+            RecoveryCode::RouterRollbackFailed,
+            RecoveryAction::RetryRollback,
+            "Previous router rollback did not fully restore runtime state.",
+        ),
+        CoordinatorStatus::RecoveredButJournalCleanupPending => (
+            RecoveryCode::RouterJournalCleanupPending,
+            RecoveryAction::AwaitCleanup,
+            "Router recovery completed, but journal cleanup is still pending.",
+        ),
+        CoordinatorStatus::Idle | CoordinatorStatus::Pending => return None,
+    };
+
+    Some(RouterRecoveryNotice {
+        recovery_code: code.as_str().to_owned(),
+        invariant: code.invariant().to_owned(),
+        summary: summary.to_owned(),
+        blocked_operation: "new router transactions".to_owned(),
+        operator_action: action.as_str().to_owned(),
+        operator_guidance: action.guidance().to_owned(),
+        runbook: code.runbook_ref().to_owned(),
+        failures,
+    })
+}
+
 use crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore;
 
 impl ControlService {
@@ -12,12 +44,17 @@ impl ControlService {
             Err(response) => return response,
         };
         let health = router.manager().health(&desired).await;
-        let coordinator_status = router.status().await;
+        let coordinator = router.view().await;
+        let recovery = router_recovery_notice(
+            coordinator.status,
+            coordinator.rollback_failures.clone(),
+        );
         Response::RouterStatus {
             enabled: desired.enabled,
             ready: desired.enabled && health.ready(),
-            coordinator_status,
+            coordinator_status: coordinator.status,
             health,
+            recovery,
         }
     }
 
@@ -239,10 +276,11 @@ impl ControlService {
                         }
                     }
                 }
-                if let Some(failure) = router.rollback_failure().await {
+                let coordinator = router.view().await;
+                if coordinator.status == CoordinatorStatus::RollbackFailed {
                     Response::RouterError {
                         detail: RouterErrorDetail::RollbackFailed {
-                            failures: failure.failures,
+                            failures: coordinator.rollback_failures,
                         },
                     }
                 } else {
@@ -256,15 +294,18 @@ impl ControlService {
         let Some(router) = &self.router else {
             return router_disabled();
         };
-        let status = router.status().await;
-        let rollback_failure = router
-            .rollback_failure()
-            .await
-            .map(|failure| failure.failures);
+        let coordinator = router.view().await;
+        let status = coordinator.status;
+        let token = coordinator.token;
+        let rollback_failures = coordinator.rollback_failures;
+        let rollback_failure = (status == CoordinatorStatus::RollbackFailed)
+            .then(|| rollback_failures.clone());
+        let recovery = router_recovery_notice(status, rollback_failures);
         Response::RouterPendingTransaction {
-            token: router.pending_token().await,
+            token,
             status,
             rollback_failure,
+            recovery,
         }
     }
 
@@ -612,14 +653,11 @@ impl ControlService {
         };
 
         let readiness = router.manager().health(&desired).await;
-        let coordinator = router.status().await;
-        let failures = router
-            .rollback_failure()
-            .await
-            .map(|failure| failure.failures)
-            .unwrap_or_default();
+        let coordinator = router.view().await;
+        let status = coordinator.status;
+        let failures = coordinator.rollback_failures;
         let ready = desired.enabled && readiness.ready() && !unconfigured;
-        let stage = match coordinator {
+        let stage = match status {
             CoordinatorStatus::RollbackFailed => ProvisioningStage::RollbackFailed,
             CoordinatorStatus::RecoveredButJournalCleanupPending => ProvisioningStage::Degraded,
             CoordinatorStatus::Pending => ProvisioningStage::AwaitingConfirmation,
@@ -634,7 +672,7 @@ impl ControlService {
                 stage,
                 enabled: desired.enabled,
                 ready,
-                coordinator,
+                coordinator: status,
                 readiness,
                 failures,
             },
@@ -942,4 +980,54 @@ pub(super) fn classify_router_error(error: anyhow::Error) -> Response {
         }
     };
     Response::RouterError { detail }
+}
+
+#[cfg(test)]
+mod recovery_notice_tests {
+    use super::*;
+
+    #[test]
+    fn rollback_failed_notice_is_actionable() {
+        let notice = router_recovery_notice(
+            CoordinatorStatus::RollbackFailed,
+            vec!["route restore failed".to_owned()],
+        )
+        .expect("rollback recovery notice");
+        assert_eq!(notice.recovery_code, "TM-REC-207");
+        assert_eq!(notice.invariant, "router_rollback_failed");
+        assert_eq!(notice.blocked_operation, "new router transactions");
+        assert!(!notice.summary.is_empty());
+        assert_eq!(notice.operator_action, "retry_rollback");
+        assert_eq!(notice.known_action(), Some(RecoveryAction::RetryRollback));
+        assert_eq!(notice.known_code(), Some(RecoveryCode::RouterRollbackFailed));
+        assert_eq!(notice.runbook, "docs/recovery.md#tm-rec-207");
+        assert_eq!(notice.failures, vec!["route restore failed"]);
+    }
+
+    #[test]
+    fn cleanup_pending_notice_does_not_request_another_rollback() {
+        let notice = router_recovery_notice(
+            CoordinatorStatus::RecoveredButJournalCleanupPending,
+            Vec::new(),
+        )
+        .expect("cleanup recovery notice");
+        assert_eq!(notice.recovery_code, "TM-REC-208");
+        assert_eq!(notice.invariant, "router_journal_cleanup_pending");
+        assert_eq!(notice.blocked_operation, "new router transactions");
+        assert!(!notice.summary.is_empty());
+        assert_eq!(notice.operator_action, "await_cleanup");
+        assert_eq!(notice.known_action(), Some(RecoveryAction::AwaitCleanup));
+        assert_eq!(
+            notice.known_code(),
+            Some(RecoveryCode::RouterJournalCleanupPending)
+        );
+        assert_eq!(notice.runbook, "docs/recovery.md#tm-rec-208");
+        assert!(notice.failures.is_empty());
+    }
+
+    #[test]
+    fn healthy_and_pending_transactions_do_not_emit_recovery_notice() {
+        assert!(router_recovery_notice(CoordinatorStatus::Idle, Vec::new()).is_none());
+        assert!(router_recovery_notice(CoordinatorStatus::Pending, Vec::new()).is_none());
+    }
 }

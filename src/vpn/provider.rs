@@ -135,6 +135,103 @@ impl VpnProvider for Arc<dyn VpnProvider> {
     }
 }
 
+/// Lazily opens the rtnetlink/genetlink handles used by the WireGuard provider.
+///
+/// Router recovery and control-plane construction should not fail merely because VPN is unused.
+/// The first operation that actually needs WireGuard performs the connection and later calls reuse
+/// it. A failed connection is not cached, so a later retry can recover after the kernel/runtime
+/// dependency becomes available.
+pub struct LazyNetlinkVpnProvider {
+    inner: tokio::sync::Mutex<Option<Arc<NetlinkVpnProvider>>>,
+}
+
+impl LazyNetlinkVpnProvider {
+    pub fn new() -> Self {
+        Self {
+            inner: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    async fn provider(&self) -> Result<Arc<NetlinkVpnProvider>, ProviderError> {
+        let mut inner = self.inner.lock().await;
+        if let Some(provider) = inner.as_ref() {
+            return Ok(provider.clone());
+        }
+        let provider = Arc::new(NetlinkVpnProvider::connect()?);
+        *inner = Some(provider.clone());
+        Ok(provider)
+    }
+}
+
+impl Default for LazyNetlinkVpnProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl VpnProvider for LazyNetlinkVpnProvider {
+    async fn link_exists(&self, name: &str) -> Result<bool, ProviderError> {
+        self.provider().await?.link_exists(name).await
+    }
+
+    async fn create_link(
+        &self,
+        name: &str,
+        private_key: &WireGuardKey,
+        listen_port: Option<u16>,
+        launch_marker: &str,
+    ) -> Result<(), ProviderError> {
+        self.provider()
+            .await?
+            .create_link(name, private_key, listen_port, launch_marker)
+            .await
+    }
+
+    async fn delete_link_if_launch_marker(
+        &self,
+        name: &str,
+        launch_marker: &str,
+    ) -> Result<bool, ProviderError> {
+        self.provider()
+            .await?
+            .delete_link_if_launch_marker(name, launch_marker)
+            .await
+    }
+
+    async fn set_addresses(&self, name: &str, addresses: &[IpNet]) -> Result<(), ProviderError> {
+        self.provider().await?.set_addresses(name, addresses).await
+    }
+
+    async fn set_peers(
+        &self,
+        name: &str,
+        peers: &[WireGuardPeerConfig],
+    ) -> Result<(), ProviderError> {
+        self.provider().await?.set_peers(name, peers).await
+    }
+
+    async fn set_link_up(&self, name: &str) -> Result<(), ProviderError> {
+        self.provider().await?.set_link_up(name).await
+    }
+
+    async fn set_link_down(&self, name: &str) -> Result<(), ProviderError> {
+        self.provider().await?.set_link_down(name).await
+    }
+
+    async fn delete_link(&self, name: &str) -> Result<(), ProviderError> {
+        self.provider().await?.delete_link(name).await
+    }
+
+    async fn public_key(&self, name: &str) -> Result<Option<WireGuardKey>, ProviderError> {
+        self.provider().await?.public_key(name).await
+    }
+
+    async fn is_up(&self, name: &str) -> Result<bool, ProviderError> {
+        self.provider().await?.is_up(name).await
+    }
+}
+
 pub struct NetlinkVpnProvider {
     rt_handle: Handle,
     genl_handle: GenetlinkHandle,

@@ -142,7 +142,17 @@ async fn main() -> Result<()> {
         return init_config(&path, *force);
     }
 
-    let resolved = ResolvedConfig::load(args.config)?;
+    let strict_config = matches!(
+        &command,
+        Command::Config {
+            command: ConfigCommand::Validate
+        }
+    );
+    let resolved = if strict_config {
+        ResolvedConfig::load(args.config)?
+    } else {
+        ResolvedConfig::load_unvalidated(args.config)?
+    };
     let config = &resolved.config;
     match command {
         Command::Install(_) | Command::Uninstall(_) | Command::Reset(_) => {
@@ -170,7 +180,11 @@ async fn main() -> Result<()> {
             if resolved.source.is_built_in() {
                 eprintln!("Safe mode: no interfaces are configured or managed.");
             }
-            run_daemon(resolved.config).await
+            let result = run_daemon(config.clone()).await;
+            if let Err(error) = &result {
+                let _ = service::persist_startup_recovery_report(config, error).await;
+            }
+            result
         }
         Command::Start {
             timeout_seconds,
@@ -180,21 +194,32 @@ async fn main() -> Result<()> {
             if timeout_seconds == 0 {
                 bail!("start timeout must be greater than zero");
             }
+            let _startup_attempt = service::acquire_startup_attempt(config)?;
+            let report_preparation_error = service::clear_startup_recovery_report(config)
+                .err()
+                .map(|error| format!("{error:#}"));
             let registration = if direct {
                 None
             } else {
                 ServiceStore::host().matching(resolved.source.path())?
             };
-            let pid = if let Some(registration) = registration {
-                init::start(&registration, config, Duration::from_secs(timeout_seconds)).await?
+            let start_result = if let Some(registration) = registration {
+                init::start(&registration, config, Duration::from_secs(timeout_seconds)).await
             } else {
                 service::start(
                     config,
                     resolved.source.path(),
                     Duration::from_secs(timeout_seconds),
                 )
-                .await?
+                .await
             };
+            let pid = start_result.map_err(|error| {
+                service::augment_start_error(
+                    config,
+                    error,
+                    report_preparation_error.as_deref(),
+                )
+            })?;
             println!(
                 "traffic-masqd started (PID {pid}); config: {}",
                 resolved.source

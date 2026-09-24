@@ -1,18 +1,23 @@
 use std::collections::VecDeque;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use fs2::FileExt;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::{setsid, Pid};
 
 use crate::api::client::ApiClient;
 use crate::api::model::Request;
 use crate::config::AppConfig;
+use crate::core::recovery::{
+    RecoveryCode, RecoveryDiagnosticRecord, RECOVERY_DIAGNOSTIC_RECORD_VERSION,
+};
 
 use super::process::process_lock_is_held;
 
@@ -21,6 +26,206 @@ pub enum ServiceStatus {
     Stopped,
     StartingOrUnhealthy { pid: Option<u32> },
     Ready { pid: Option<u32> },
+}
+
+const STARTUP_RECOVERY_REPORT: &str = "traffic-masqd-startup-recovery.json";
+
+#[derive(Debug)]
+pub struct StartupAttemptGuard {
+    lock: File,
+}
+
+impl Drop for StartupAttemptGuard {
+    fn drop(&mut self) {
+        if let Err(error) = FileExt::unlock(&self.lock) {
+            tracing::warn!(%error, "failed to release startup-attempt lock");
+        }
+    }
+}
+
+pub fn acquire_startup_attempt(config: &AppConfig) -> Result<StartupAttemptGuard> {
+    let parent = config
+        .runtime
+        .pid_path
+        .parent()
+        .context("daemon PID path has no parent")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create runtime directory {}", parent.display()))?;
+    let file_name = config
+        .runtime
+        .pid_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("traffic-masqd.pid");
+    let lock_path = config
+        .runtime
+        .pid_path
+        .with_file_name(format!("{file_name}.start.lock"));
+    crate::atomic_file::reject_symlink(&lock_path)
+        .with_context(|| format!("refusing unsafe startup-attempt lock {}", lock_path.display()))?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(crate::atomic_file::PRIVATE_FILE_MODE)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open startup-attempt lock {}", lock_path.display()))?;
+    lock.try_lock_exclusive().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            anyhow::anyhow!("another traffic-masqd start attempt is already in progress")
+        } else {
+            anyhow::Error::new(error)
+                .context(format!("failed to lock startup-attempt file {}", lock_path.display()))
+        }
+    })?;
+    Ok(StartupAttemptGuard { lock })
+}
+
+fn startup_recovery_report_path(config: &AppConfig) -> PathBuf {
+    config.runtime.log_dir.join(STARTUP_RECOVERY_REPORT)
+}
+
+pub fn clear_startup_recovery_report(config: &AppConfig) -> Result<()> {
+    let path = startup_recovery_report_path(config);
+    crate::atomic_file::remove_durable(&path)
+        .map(|_| ())
+        .with_context(|| format!("failed to clear startup recovery report {}", path.display()))
+}
+
+pub async fn persist_startup_recovery_report(
+    config: &AppConfig,
+    error: &anyhow::Error,
+) -> Result<bool> {
+    let Some(diagnostic) = crate::core::recovery::diagnostic_from_error(error) else {
+        return Ok(false);
+    };
+    fs::create_dir_all(&config.runtime.log_dir).with_context(|| {
+        format!(
+            "failed to create log directory {} for startup recovery report",
+            config.runtime.log_dir.display()
+        )
+    })?;
+    let path = startup_recovery_report_path(config);
+    let mut bytes = serde_json::to_vec_pretty(&diagnostic.record())?;
+    bytes.push(b'\n');
+    crate::atomic_file::replace_preserving_on_error_async(
+        &path,
+        &bytes,
+        crate::atomic_file::PRIVATE_FILE_MODE,
+    )
+    .await
+    .with_context(|| format!("failed to write startup recovery report {}", path.display()))?;
+    Ok(true)
+}
+
+fn read_startup_recovery_report(config: &AppConfig) -> Result<Option<RecoveryDiagnosticRecord>> {
+    let path = startup_recovery_report_path(config);
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to open startup recovery report {}", path.display()))
+        }
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let report: RecoveryDiagnosticRecord = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid startup recovery report {}", path.display()))?;
+    anyhow::ensure!(
+        report.version == RECOVERY_DIAGNOSTIC_RECORD_VERSION,
+        "unsupported startup recovery report version {}",
+        report.version
+    );
+    let recovery_code = RecoveryCode::from_code(&report.recovery_code).with_context(|| {
+        format!(
+            "unknown recovery code {} in startup recovery report",
+            report.recovery_code
+        )
+    })?;
+    anyhow::ensure!(
+        recovery_code.is_startup_blocking(),
+        "non-blocking recovery code {} is invalid in a startup recovery report",
+        report.recovery_code
+    );
+    anyhow::ensure!(
+        report.invariant == recovery_code.invariant(),
+        "startup recovery report code/invariant mismatch: {} maps to {}, not {}",
+        report.recovery_code,
+        recovery_code.invariant(),
+        report.invariant
+    );
+    anyhow::ensure!(
+        report.runbook == recovery_code.runbook_ref(),
+        "startup recovery report code/runbook mismatch: {} maps to {}, not {}",
+        report.recovery_code,
+        recovery_code.runbook_ref(),
+        report.runbook
+    );
+    Ok(Some(report))
+}
+
+fn render_startup_recovery_report(report: &RecoveryDiagnosticRecord) -> String {
+    let mut message = String::from(
+        "traffic-masqd startup is blocked by persisted recovery state.\n\nRecovery:\n",
+    );
+    message.push_str(&format!("  recovery_code: {}\n", report.recovery_code));
+    message.push_str(&format!("  invariant: {}\n", report.invariant));
+    message.push_str(&format!("  operation: {}\n", report.operation));
+    if let Some(object) = &report.object {
+        message.push_str(&format!("  object: {object}\n"));
+    }
+    if let Some(journal) = &report.journal {
+        message.push_str(&format!("  journal: {}\n", journal.display()));
+    }
+    if let Some(path) = &report.path {
+        message.push_str(&format!("  path: {}\n", path.display()));
+    }
+    if !report.details.is_empty() {
+        message.push_str("\nDetected:\n");
+        for (key, value) in &report.details {
+            message.push_str(&format!("  {key}: {value}\n"));
+        }
+    }
+    message.push_str(&format!(
+        "\nRequired action:\n  {}\n  {}\n",
+        report.operator_action, report.operator_guidance
+    ));
+    if !report.metadata_safe_to_remove {
+        message.push_str(
+            "\nRecovery metadata must be preserved. Do not delete or edit the reported journal or recovery path manually.\n",
+        );
+    }
+    message.push_str(&format!("\nRunbook: {}", report.runbook));
+    message.push_str("\nFor additional daemon logs, run `traffic-masqd logs --lines 100`.");
+    message
+}
+
+pub fn augment_start_error(
+    config: &AppConfig,
+    error: anyhow::Error,
+    report_preparation_error: Option<&str>,
+) -> anyhow::Error {
+    if let Some(report_error) = report_preparation_error {
+        return error.context(format!(
+            "startup recovery diagnostic is unavailable because the previous report could not be cleared safely: {report_error}; inspect daemon logs with `traffic-masqd logs --lines 100`"
+        ));
+    }
+    match read_startup_recovery_report(config) {
+        Ok(Some(report)) => error.context(render_startup_recovery_report(&report)),
+        Ok(None) => error.context(
+            "traffic-masqd did not publish a recovery diagnostic; inspect daemon logs with `traffic-masqd logs --lines 100`",
+        ),
+        Err(report_error) => error.context(format!(
+            "failed to read startup recovery diagnostic: {report_error:#}; inspect daemon logs with `traffic-masqd logs --lines 100`"
+        )),
+    }
 }
 
 /// Inspect the daemon PID and process lock to report service state.

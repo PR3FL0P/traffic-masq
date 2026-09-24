@@ -646,10 +646,14 @@ async fn run_loop(
 // retried: a lost response does not imply that a mutation was not applied.
 fn pending_deadline(app: &TuiApp) -> Option<u64> {
     app.pending.as_ref().map(|p| p.expires_at_unix).or_else(|| {
-        app.router_pending.as_ref().map(|p| {
-            p.applied_at_unix
-                .saturating_add(app.router_rollback_timeout_seconds)
-        })
+        app.router_pending
+            .as_ref()
+            .filter(|pending| !pending.recovery_required())
+            .map(|pending| {
+                pending
+                    .applied_at_unix
+                    .saturating_add(app.router_rollback_timeout_seconds)
+            })
     })
 }
 

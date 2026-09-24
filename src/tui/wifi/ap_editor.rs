@@ -113,7 +113,7 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
         Style::default().fg(theme::WARN),
     ));
     lines.push(Line::styled(
-        "Apply updates the AP immediately; no commit-confirm timer is provided by this API.",
+        "Apply is tentative. Confirm on the next screen or it will roll back automatically.",
         Style::default().fg(theme::MUTED),
     ));
     frame.render_widget(
@@ -230,7 +230,9 @@ pub(super) fn ap_provision_request(editor: &WifiEditor) -> Request {
     Request::ProvisionWifiAccessPoint {
         interface: editor.interface.clone(),
         settings: ap_settings(editor),
-        passphrase: (!editor.passphrase.is_empty()).then(|| editor.passphrase.clone()),
+        passphrase: (editor.security != WifiSecurity::Open && !editor.passphrase.is_empty())
+            .then(|| editor.passphrase.clone()),
+        clear_passphrase: editor.security == WifiSecurity::Open,
         configure_dhcp: editor.configure_dhcp,
     }
 }
@@ -284,18 +286,15 @@ async fn apply_ap_editor(app: &mut TuiApp, client: &ApiClient) {
         return;
     }
     match client.request(&ap_provision_request(&editor)).await {
-        Ok(Response::WifiAccessPointProvisioned { dhcp, .. }) => {
+        Ok(Response::NetworkChangePending { change }) => {
             app.push_message(
                 LogLevel::Info,
-                if dhcp.is_some() {
-                    "Access point and derived DHCP configured"
-                } else {
-                    "Access point configured"
-                },
+                "Access point change applied tentatively; confirm it before the rollback timer expires",
             );
+            app.pending = Some(change);
+            app.pending_return_screen = Screen::Wifi;
             app.wifi_editor = None;
-            app.screen = Screen::Wifi;
-            load_wifi_data(app, client).await;
+            app.screen = Screen::PendingChange;
         }
         Ok(Response::WifiError { detail }) => {
             app.push_message(LogLevel::Error, format!("{detail:?}"))

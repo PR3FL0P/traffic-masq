@@ -53,6 +53,57 @@ impl RuntimeOverrideManager {
         })
     }
 
+    /// Build a manager from only router-relevant recovery state.
+    ///
+    /// This is used before the full override document is admitted for normal
+    /// startup, so unrelated API/security corruption cannot suppress router
+    /// journal recovery. The same manager is hydrated with the strict document
+    /// once recovery has completed.
+    pub(crate) async fn load_for_router_recovery(
+        state_dir: impl AsRef<Path>,
+        base: &AppConfig,
+    ) -> Result<Self> {
+        let store = RuntimeOverrideStore::in_state_dir(state_dir);
+        let proof = store.load_recovery_commit_proof().await?;
+        let committed_router_transaction = proof.committed_router_transaction()?;
+        Self::from_router_recovery_proof(store, base, &proof, committed_router_transaction)
+    }
+
+    /// Build a recovery manager from an already-inspected proof envelope.
+    ///
+    /// The router commit token is supplied separately so another proof field can fail without
+    /// forcing startup to reparse or conflate recovery scopes.
+    pub(crate) fn from_router_recovery_proof(
+        store: RuntimeOverrideStore,
+        base: &AppConfig,
+        proof: &crate::state::overrides::RecoveryCommitProof,
+        committed_router_transaction: Option<String>,
+    ) -> Result<Self> {
+        let state = proof
+            .router_recovery_overrides_with_commit_token(committed_router_transaction)?;
+        Ok(Self {
+            store,
+            base: base.clone(),
+            state: Arc::new(Mutex::new(state)),
+            changed: Arc::new(Notify::new()),
+        })
+    }
+
+    /// Replace recovery-only state with the strict persisted document after
+    /// router recovery, preserving manager identity held by the coordinator.
+    pub(crate) async fn hydrate_strict(&self) -> Result<AppConfig> {
+        let state = self.store.load().await?;
+        validate_candidate(&state, &self.base).with_context(|| {
+            format!(
+                "runtime overrides in {} are invalid",
+                self.store.path().display()
+            )
+        })?;
+        let effective = state.effective_config(&self.base)?;
+        *self.state.lock().await = state;
+        Ok(effective)
+    }
+
     /// Clone the committed override document under its state lock.
     pub async fn snapshot(&self) -> RuntimeOverrides {
         self.state.lock().await.clone()
@@ -107,6 +158,15 @@ impl RuntimeOverrideManager {
     ) -> Result<RouterCandidate> {
         let state = self.state.lock().await;
         RouterCandidate::build(&self.base, &state, proposal)
+    }
+
+    /// Build a router candidate using recovery-scoped validation only.
+    pub(crate) async fn build_recovery_candidate(
+        &self,
+        proposal: &RouterIntentProposal,
+    ) -> Result<RouterCandidate> {
+        let state = self.state.lock().await;
+        RouterCandidate::build_for_recovery(&self.base, &state, proposal)
     }
 
     /// Persist a validated candidate only if its base revision is still current.

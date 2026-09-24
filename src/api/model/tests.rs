@@ -56,3 +56,81 @@ fn request_and_response_route_variants_roundtrip() {
         _ => panic!("wrong variant"),
     }
 }
+
+#[test]
+fn provision_request_body_keeps_wire_format_and_redacts_debug() {
+    let secret = "correct horse battery";
+    let body = ProvisionWifiAccessPointRequest {
+        settings: WifiEditRequest {
+            ssid: "test".to_string(),
+            country_code: None,
+            band: WifiBand::Ghz2,
+            channel: 6,
+            channel_width: WifiChannelWidth::Ht20,
+            security: WifiSecurity::Wpa2,
+            hidden: false,
+            client_isolation: false,
+            max_stations: 32,
+        },
+        passphrase: Some(secret.to_string()),
+        clear_passphrase: false,
+        configure_dhcp: false,
+    };
+    let json = serde_json::to_value(&body).expect("serialize");
+    assert_eq!(json["passphrase"], secret);
+    let debug = format!("{body:?}");
+    assert!(!debug.contains(secret), "{debug}");
+    assert!(debug.contains("redacted"), "{debug}");
+}
+
+#[test]
+fn provision_request_debug_redacts_the_ap_passphrase() {
+    let secret = "correct horse battery";
+    let request = Request::ProvisionWifiAccessPoint {
+        interface: "wlan0".to_string(),
+        settings: WifiEditRequest {
+            ssid: "test".to_string(),
+            country_code: None,
+            band: WifiBand::Ghz2,
+            channel: 1,
+            channel_width: WifiChannelWidth::Ht20,
+            security: WifiSecurity::Wpa2,
+            hidden: false,
+            client_isolation: false,
+            max_stations: 32,
+        },
+        passphrase: Some(secret.into()),
+        clear_passphrase: false,
+        configure_dhcp: false,
+    };
+    let debug = format!("{request:?}");
+    assert!(!debug.contains(secret), "{debug}");
+    assert!(debug.contains("redacted"), "{debug}");
+}
+
+#[test]
+fn provision_request_without_clear_flag_remains_backward_compatible() {
+    let json = serde_json::json!({
+        "settings": {
+            "ssid": "legacy-open",
+            "max_stations": 32
+        },
+        "configure_dhcp": false
+    });
+    let request: ProvisionWifiAccessPointRequest =
+        serde_json::from_value(json).expect("legacy request");
+    assert!(!request.clear_passphrase);
+    assert!(request.passphrase.is_none());
+}
+
+#[test]
+fn wifi_set_passphrase_request_debug_is_redacted() {
+    let secret = "correct horse battery";
+    let request = Request::WifiSetPassphrase {
+        interface: "wlan0".to_string(),
+        passphrase: secret.into(),
+    };
+    let debug = format!("{request:?}");
+    assert!(!debug.contains(secret), "{debug}");
+    assert!(debug.contains("redacted"), "{debug}");
+}

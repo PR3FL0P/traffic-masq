@@ -16,6 +16,19 @@ use std::{
 pub struct ServiceStore {
     pub(super) root: PathBuf,
 }
+
+#[derive(Debug)]
+pub struct ServiceMutationGuard {
+    lock: fs::File,
+}
+
+impl Drop for ServiceMutationGuard {
+    fn drop(&mut self) {
+        if let Err(error) = FileExt::unlock(&self.lock) {
+            tracing::warn!(%error, "failed to release service mutation lock");
+        }
+    }
+}
 impl ServiceStore {
     pub fn host() -> Self {
         Self { root: "/".into() }
@@ -30,7 +43,7 @@ impl ServiceStore {
                 .expect("absolute service path"),
         )
     }
-    pub fn lock_mutation(&self) -> Result<fs::File> {
+    pub fn lock_mutation(&self) -> Result<ServiceMutationGuard> {
         let path = self.path("/etc/traffic-masq/service-install.lock");
         regular_or_missing(&path)?;
         fs::create_dir_all(path.parent().unwrap())?;
@@ -43,7 +56,7 @@ impl ServiceStore {
             .open(path)?;
         file.try_lock_exclusive()
             .context("another traffic-masq service administration operation is in progress")?;
-        Ok(file)
+        Ok(ServiceMutationGuard { lock: file })
     }
     pub fn ensure_unchanged(&self, expected: Option<&Registration>) -> Result<()> {
         if self.load()?.as_ref() != expected {

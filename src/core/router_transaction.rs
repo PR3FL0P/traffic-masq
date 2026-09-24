@@ -70,6 +70,13 @@ pub enum CoordinatorStatus {
     RecoveredButJournalCleanupPending,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoordinatorView {
+    pub status: CoordinatorStatus,
+    pub token: Option<String>,
+    pub rollback_failures: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RollbackFailure {
     pub token: String,
@@ -422,6 +429,32 @@ impl RouterTransactionCoordinator {
             .await
     }
 
+    /// Return an internally consistent view of coordinator state under one lock.
+    pub async fn view(&self) -> CoordinatorView {
+        let state = self.inner.state.lock().await;
+        match &*state {
+            CoordinatorState::Idle => CoordinatorView {
+                status: if crate::core::recovery::cleanup_pending(&self.inner.journal) {
+                    CoordinatorStatus::RecoveredButJournalCleanupPending
+                } else {
+                    CoordinatorStatus::Idle
+                },
+                token: None,
+                rollback_failures: Vec::new(),
+            },
+            CoordinatorState::Pending(pending) => CoordinatorView {
+                status: CoordinatorStatus::Pending,
+                token: Some(pending.token.clone()),
+                rollback_failures: Vec::new(),
+            },
+            CoordinatorState::RollbackFailed(failure) => CoordinatorView {
+                status: CoordinatorStatus::RollbackFailed,
+                token: Some(failure.token.clone()),
+                rollback_failures: failure.failures.clone(),
+            },
+        }
+    }
+
     /// Return the token for a pending transaction or failed rollback, or `None` when idle.
     pub async fn pending_token(&self) -> Option<String> {
         match &*self.inner.state.lock().await {
@@ -614,6 +647,22 @@ impl RouterTransactionCoordinator {
         Ok(())
     }
 
+    async fn retain_committed_router_interfaces_for_recovery(&self) -> Result<()> {
+        let committed = self
+            .inner
+            .overrides
+            .build_recovery_candidate(&crate::core::router_candidate::RouterIntentProposal::new())
+            .await?;
+        let owned = committed
+            .desired()
+            .interfaces
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
+        self.inner.manager.retain_router_interfaces(&owned).await;
+        Ok(())
+    }
+
     async fn rollback_timeout_fired(&self, token: &str) {
         let gate = self
             .inner
@@ -656,8 +705,11 @@ impl RouterTransactionCoordinator {
         current_desired: &RouterDesired,
     ) -> Result<()> {
         crate::core::recovery::before_write(&self.inner.journal).await?;
-        anyhow::ensure!(!tokio::fs::try_exists(&self.inner.journal).await?,
-            "invariant=retain_recovery_proof; journal={}; operation=write_journal; metadata_safe_to_remove=false: unresolved journal", self.inner.journal.display());
+        anyhow::ensure!(
+            !crate::atomic_file::regular_file_exists(&self.inner.journal)?,
+            "invariant=retain_recovery_proof; journal={}; operation=write_journal; metadata_safe_to_remove=false: unresolved journal",
+            self.inner.journal.display()
+        );
         let journal = TransactionJournal {
             version: 2,
             base_revision,
@@ -689,14 +741,32 @@ impl RouterTransactionCoordinator {
     /// Restore an interrupted transaction before accepting control requests.
     pub async fn recover(&self) -> Result<bool> {
         let mut state = self.inner.state.lock().await;
-        crate::atomic_file::reject_symlink(&self.inner.journal)?;
+        let journal_access_diagnostic = || {
+            crate::core::recovery::RecoveryDiagnostic::fatal(
+                crate::core::recovery::StartupRecoveryCode::AccessibleRouterRecoveryJournal,
+                "inspect",
+                crate::core::recovery::RecoveryAction::RepairStorageAccess,
+            )
+            .journal(self.inner.journal.clone())
+            .object("router")
+            .detail("expected_type", "regular_file_when_present")
+            .detail("expected_mode", format!("{:04o}", crate::atomic_file::PRIVATE_FILE_MODE))
+            .detail("symlink_allowed", false)
+        };
+        if !crate::atomic_file::regular_file_exists(&self.inner.journal)
+            .with_context(|| journal_access_diagnostic())?
+        {
+            return Ok(false);
+        }
         let bytes = match tokio::fs::read(&self.inner.journal).await {
             Ok(bytes) => bytes,
+            // The parent state directory is trusted, but tolerate a concurrent
+            // housekeeping unlink between metadata inspection and read.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error.into()),
+            Err(error) => return Err(error).context(journal_access_diagnostic()),
         };
         if crate::core::recovery::completed(&self.inner.journal, &bytes).await? {
-            self.retain_committed_router_interfaces().await?;
+            self.retain_committed_router_interfaces_for_recovery().await?;
             self.clear_journal().await?;
             *state = CoordinatorState::Idle;
             self.notify_idle();
@@ -710,8 +780,17 @@ impl RouterTransactionCoordinator {
             .snapshot()
             .await
             .committed_router_transaction;
-        let header: serde_json::Value = serde_json::from_slice(&bytes).with_context(|| format!(
-            "invariant=decodable_recovery_snapshot; journal={}; object=router; operation=decode; metadata_safe_to_remove=false; operator_action=restore_matching_journal_or_backup_and_verify_commit; preserve journal for operator inspection", self.inner.journal.display()))?;
+        let header: serde_json::Value = serde_json::from_slice(&bytes).with_context(|| {
+            crate::core::recovery::RecoveryDiagnostic::fatal(
+                crate::core::recovery::StartupRecoveryCode::DecodableRecoverySnapshot,
+                "decode",
+                crate::core::recovery::RecoveryAction::RestoreCoherentBackup,
+            )
+            .journal(self.inner.journal.clone())
+            .object("router")
+            .detail("required_proof", "independent_committed_transaction_token")
+            .detail("backup_scope", "complete_state_directory")
+        })?;
         if header
             .get("token")
             .and_then(|value| value.as_str())
@@ -728,22 +807,53 @@ impl RouterTransactionCoordinator {
                     "quarantine unavailable; retiring committed metadata separately");
                 self.clear_journal().await?;
             }
-            self.retain_committed_router_interfaces().await?;
+            self.retain_committed_router_interfaces_for_recovery().await?;
             *state = CoordinatorState::Idle;
             self.notify_idle();
             return Ok(false);
         }
-        let journal: TransactionJournal = serde_json::from_value(header).with_context(|| format!(
-            "invariant=valid_recovery_snapshot; journal={}; object=router; operation=decode; metadata_safe_to_remove=false; operator_action=restore_matching_journal_or_backup_and_verify_commit", self.inner.journal.display()))?;
-        anyhow::ensure!(
-            matches!(journal.version, 1 | 2),
-            "invariant=supported_schema; journal={}; object=router; operation=decode; metadata_safe_to_remove=false; operator_action=upgrade_daemon_or_restore_matching_backup: unsupported router transaction journal version", self.inner.journal.display()
-        );
+        let journal: TransactionJournal = serde_json::from_value(header).with_context(|| {
+            crate::core::recovery::RecoveryDiagnostic::fatal(
+                crate::core::recovery::StartupRecoveryCode::ValidRecoverySnapshot,
+                "decode",
+                crate::core::recovery::RecoveryAction::RestoreCoherentBackup,
+            )
+            .journal(self.inner.journal.clone())
+            .object("router")
+            .detail("required_proof", "independent_committed_transaction_token")
+            .detail("backup_scope", "complete_state_directory")
+        })?;
+        if !matches!(journal.version, 1 | 2) {
+            let diagnostic = crate::core::recovery::RecoveryDiagnostic::fatal(
+                crate::core::recovery::StartupRecoveryCode::SupportedSchema,
+                "decode",
+                crate::core::recovery::RecoveryAction::UseCompatibleDaemon,
+            )
+            .journal(self.inner.journal.clone())
+            .object("router")
+            .detail("journal_schema", journal.version)
+            .detail("supported_schemas", "1,2")
+            .detail("fallback_action", "restore_coherent_backup");
+            return Err(anyhow::anyhow!("unsupported router transaction journal version")
+                .context(diagnostic));
+        }
         let revision = self.inner.overrides.committed_revision().await;
-        anyhow::ensure!(
-            revision >= journal.base_revision,
-            "invariant=revision_order; journal={}; object=router; operation=validate; metadata_safe_to_remove=false; operator_action=restore_matching_state_backup: transaction journal is newer than committed configuration", self.inner.journal.display()
-        );
+        if revision < journal.base_revision {
+            let diagnostic = crate::core::recovery::RecoveryDiagnostic::fatal(
+                crate::core::recovery::StartupRecoveryCode::RevisionOrder,
+                "validate",
+                crate::core::recovery::RecoveryAction::RestoreCoherentBackup,
+            )
+            .journal(self.inner.journal.clone())
+            .object("router")
+            .detail("journal_base_revision", journal.base_revision)
+            .detail("committed_revision", revision)
+            .detail("backup_scope", "complete_state_directory");
+            return Err(anyhow::anyhow!(
+                "transaction journal is newer than committed configuration"
+            )
+            .context(diagnostic));
+        }
         let committed = self
             .inner
             .overrides
@@ -756,7 +866,7 @@ impl RouterTransactionCoordinator {
             let candidate = self
                 .inner
                 .overrides
-                .build_candidate(&crate::core::router_candidate::RouterIntentProposal::new())
+                .build_recovery_candidate(&crate::core::router_candidate::RouterIntentProposal::new())
                 .await?;
             *state = CoordinatorState::RollbackFailed(RollbackFailure {
                 recovery_desired: journal.current_desired.clone(),
@@ -787,7 +897,7 @@ impl RouterTransactionCoordinator {
         // Rebuild volatile ownership from the durable committed intent for both
         // aborted and already-committed journals. This keeps recovery correct
         // even if the manager was constructed with a wider transient scope.
-        self.retain_committed_router_interfaces()
+        self.retain_committed_router_interfaces_for_recovery()
             .await
             .context("failed to restore committed router ownership during recovery")?;
         self.clear_journal().await?;

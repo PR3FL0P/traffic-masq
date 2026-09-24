@@ -31,13 +31,22 @@ pub(super) fn router_action_buttons(router: &RouterData) -> [(RouterAction, &'st
                 "[Delete route]"
             },
         ),
-        (RouterAction::PlanApply, "[Plan / Apply]"),
+        (
+            RouterAction::PlanApply,
+            if router.recovery_blocks_mutations() {
+                "[Apply blocked: recovery]"
+            } else {
+                "[Plan / Apply]"
+            },
+        ),
         (RouterAction::ShareViaRoute, "[Share via: n]"),
         (RouterAction::Refresh, "[Refresh]"),
         (RouterAction::Topology, "[Topology: t]"),
         (
             RouterAction::ToggleEnabled,
-            if router.proposed_router_config.enabled {
+            if router.recovery_blocks_mutations() {
+                "[Routing change blocked]"
+            } else if router.proposed_router_config.enabled {
                 "[Disable routing: e]"
             } else {
                 "[Enable routing: e]"
@@ -166,6 +175,41 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         ));
     }
 
+    if let Some(recovery) = &router.recovery {
+        for (index, text) in recovery_notice_summary(recovery).into_iter().enumerate() {
+            let style = if index == 0 {
+                Style::default().fg(theme::BAD).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::WARN)
+            };
+            status_lines.push(Line::styled(text, style));
+        }
+        let recovery_hint = match recovery.known_action() {
+            Some(RecoveryAction::RetryRollback) => {
+                "Press r to retry rollback after repairing the reported cause"
+            }
+            Some(RecoveryAction::AwaitCleanup) => {
+                "Cleanup retries automatically; press r to refresh recovery status"
+            }
+            _ => "Follow the required recovery action before starting new router mutations",
+        };
+        status_lines.push(Line::styled(
+            recovery_hint,
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ));
+    } else if router.recovery_blocks_mutations() {
+        status_lines.push(Line::styled(
+            "Router recovery is active; this daemon does not expose structured recovery details",
+            Style::default().fg(theme::BAD).add_modifier(Modifier::BOLD),
+        ));
+        status_lines.push(Line::styled(
+            "Press r to refresh or retry the current recovery action",
+            Style::default().fg(theme::ACCENT),
+        ));
+    }
+
     for (subsystem, detail) in health_report_details(&router.health) {
         status_lines.push(Line::styled(
             format!("  {subsystem}: {detail}"),
@@ -187,7 +231,7 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         u16::from(router.warning_message.is_some() && area.height >= base_actions_height + 4);
     let actions_height = base_actions_height + warning_rows;
     let status_height = (status_lines.len() as u16 + 2)
-        .clamp(3, 8)
+        .clamp(3, 12)
         .min(area.height.saturating_sub(actions_height + 3));
 
     let chunks = Layout::default()
@@ -388,6 +432,63 @@ pub(super) fn health_report_details(health: &RouterHealthReport) -> Vec<(&'stati
     details
 }
 
+pub(super) fn recovery_notice_summary(notice: &RouterRecoveryNotice) -> Vec<String> {
+    let mut lines = vec![if notice.summary.is_empty() {
+        format!("Recovery {} [{}]", notice.recovery_code, notice.invariant)
+    } else {
+        format!("Recovery {}: {}", notice.recovery_code, notice.summary)
+    }];
+    if !notice.blocked_operation.is_empty() {
+        lines.push(format!("Blocked: {}", notice.blocked_operation));
+    }
+    lines.push(format!("Action: {}", notice.operator_action));
+    if !notice.failures.is_empty() {
+        lines.push(format!(
+            "Failures: {} (see recovery screen/logs)",
+            notice.failures.len()
+        ));
+    }
+    if !notice.runbook.is_empty() {
+        lines.push(format!("Runbook: {}", notice.runbook));
+    }
+    lines
+}
+
+pub(super) fn recovery_notice_text(
+    notice: &RouterRecoveryNotice,
+    max_failures: Option<usize>,
+) -> Vec<String> {
+    let mut lines = vec![format!(
+        "Recovery {} [{}]",
+        notice.recovery_code, notice.invariant
+    )];
+    if !notice.summary.is_empty() {
+        lines.push(format!("Reason: {}", notice.summary));
+    }
+    if !notice.blocked_operation.is_empty() {
+        lines.push(format!("Blocked: {}", notice.blocked_operation));
+    }
+    lines.push(format!("Required action: {}", notice.operator_action));
+    if !notice.operator_guidance.is_empty() {
+        lines.push(format!("  {}", notice.operator_guidance));
+    }
+
+    let failure_limit = max_failures.unwrap_or(usize::MAX);
+    for failure in notice.failures.iter().take(failure_limit) {
+        lines.push(format!("  failure: {failure}"));
+    }
+    if notice.failures.len() > failure_limit {
+        lines.push(format!(
+            "  ... {} more failure(s)",
+            notice.failures.len() - failure_limit
+        ));
+    }
+    if !notice.runbook.is_empty() {
+        lines.push(format!("Runbook: {}", notice.runbook));
+    }
+    lines
+}
+
 pub(super) fn format_coordinator_status(status: CoordinatorStatus) -> &'static str {
     match status {
         CoordinatorStatus::RecoveredButJournalCleanupPending => {
@@ -448,7 +549,7 @@ pub(super) fn describe_router_error(detail: &RouterErrorDetail) -> String {
                 .to_string()
         }
         RouterErrorDetail::RollbackRecoveryRequired => {
-            "A previous rollback failed; the coordinator needs recovery before a new transaction"
+            "A previous rollback failed; repair the reported cause and retry rollback before starting a new transaction"
                 .to_string()
         }
         RouterErrorDetail::StaleCandidate {

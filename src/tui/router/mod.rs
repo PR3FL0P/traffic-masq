@@ -8,8 +8,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Gauge, Paragraph, Row, Table};
 
 use crate::api::client::ApiClient;
-use crate::api::model::{Request, Response, RouteStatus, RouterErrorDetail, RouterProposalRequest};
+use crate::api::model::{
+    Request, Response, RouteStatus, RouterErrorDetail, RouterProposalRequest, RouterRecoveryNotice,
+};
 use crate::config::{InterfaceRole, OwnedIpv4RouteConfig, RouterConfig};
+use crate::core::recovery::RecoveryAction;
 use crate::core::router::{RouterDesired, RouterHealthReport, RouterInterfaceDesired, RouterPlan};
 use crate::core::router_transaction::CoordinatorStatus;
 use crate::dhcp::supervisor::DhcpServiceSpec;
@@ -41,13 +44,16 @@ pub(crate) use view::render_router;
 
 // Internal cross-module helpers are re-exported only within the router module tree.
 use editor::{delete_selected_route, open_route_editor_for_add, open_route_editor_for_selected};
-use view::{describe_router_error, format_forwarding_status, summarize_uplink};
+use view::{
+    describe_router_error, format_forwarding_status, recovery_notice_text, summarize_uplink,
+};
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct RouterData {
     pub(crate) enabled: bool,
     pub(crate) ready: bool,
     pub(crate) coordinator_status: Option<CoordinatorStatus>,
+    pub(crate) recovery: Option<RouterRecoveryNotice>,
     pub(crate) health: RouterHealthReport,
     pub(crate) routes: Vec<RouteStatus>,
     pub(crate) selected_route: usize,
@@ -68,6 +74,19 @@ pub(crate) struct RouterData {
     pub(crate) selected_connection: usize,
     pub(crate) sharing_action: usize,
     pub(crate) sharing_actions_focused: bool,
+}
+
+impl RouterData {
+    pub(crate) fn recovery_blocks_mutations(&self) -> bool {
+        self.recovery.is_some()
+            || matches!(
+                self.coordinator_status,
+                Some(
+                    CoordinatorStatus::RollbackFailed
+                        | CoordinatorStatus::RecoveredButJournalCleanupPending
+                )
+            )
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -227,8 +246,15 @@ pub(crate) struct RouterPendingView {
     pub(crate) plan: RouterPlan,
     pub(crate) applied_at_unix: u64,
     pub(crate) rollback_failure: Option<Vec<String>>,
+    pub(crate) recovery: Option<RouterRecoveryNotice>,
     pub(crate) scroll: usize,
     pub(crate) max_scroll: usize,
+}
+
+impl RouterPendingView {
+    pub(crate) fn recovery_required(&self) -> bool {
+        self.recovery.is_some() || self.rollback_failure.is_some()
+    }
 }
 
 const ROUTER_APPLY_LABEL: &str = "[Apply]  apply changes (Enter)";

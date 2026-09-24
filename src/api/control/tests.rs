@@ -1983,10 +1983,13 @@ impl SupervisedProcess for FakeWifiProcess {
         Ok(self.responders.lock().unwrap().contains_key(&pid))
     }
 
-    async fn cmdline_contains(
+    async fn identity_matches(
         &self,
         pid: u32,
+        _kind: crate::wifi::record::WifiProcessKind,
+        _binary_path: &std::path::Path,
         config_path: &std::path::Path,
+        _started_at_unix: u64,
     ) -> Result<bool, WifiProcessError> {
         Ok(self
             .configs
@@ -1996,10 +1999,12 @@ impl SupervisedProcess for FakeWifiProcess {
             .is_some_and(|recorded| recorded == config_path))
     }
 
-    async fn pids_with_config_path(
+    async fn pids_matching_identity(
         &self,
         _kind: crate::wifi::record::WifiProcessKind,
+        _binary_path: &std::path::Path,
         config_path: &std::path::Path,
+        _started_at_unix: u64,
     ) -> Result<Vec<u32>, WifiProcessError> {
         let mut pids: Vec<u32> = self
             .configs
@@ -2010,6 +2015,19 @@ impl SupervisedProcess for FakeWifiProcess {
             .collect();
         pids.sort_unstable();
         Ok(pids)
+    }
+
+    async fn owns_unix_socket(
+        &self,
+        pid: u32,
+        socket_path: &std::path::Path,
+    ) -> Result<bool, WifiProcessError> {
+        Ok(self
+            .responders
+            .lock()
+            .unwrap()
+            .get(&pid)
+            .is_some_and(|responder| responder.ctrl_path.as_path() == socket_path))
     }
 
     async fn terminate(&self, pid: u32) -> Result<(), WifiProcessError> {
@@ -2046,6 +2064,7 @@ fn wifi_base_config(directory: &std::path::Path) -> AppConfig {
     config.wifi = WifiConfig {
         enabled: true,
         hostapd_binary: PathBuf::from("/usr/sbin/hostapd"),
+        iw_binary: PathBuf::from("/usr/sbin/iw"),
         runtime_dir: directory.join("hostapd"),
         restart_backoff_seconds: 1,
     };
@@ -2096,7 +2115,11 @@ async fn wifi_enabled_fixture() -> WifiFixture {
         addresses: Vec::new(),
     });
     let process = FakeWifiProcess::new();
-    let wifi = WifiSupervisor::start_with_process(&config, process.clone())
+    let wifi = WifiSupervisor::start_with_process_and_radio(
+        &config,
+        process.clone(),
+        Arc::new(crate::wifi::radio::AllowAllRadioValidator),
+    )
         .await
         .expect("wifi supervisor");
     configure_wlan0(&wifi, &config).await;
@@ -2243,7 +2266,11 @@ async fn get_wifi_config_reports_none_for_an_interface_without_a_wifi_block() {
         addresses: Vec::new(),
     });
     let process = FakeWifiProcess::new();
-    let wifi = WifiSupervisor::start_with_process(&config, process)
+    let wifi = WifiSupervisor::start_with_process_and_radio(
+        &config,
+        process,
+        Arc::new(crate::wifi::radio::AllowAllRadioValidator),
+    )
         .await
         .expect("wifi supervisor");
     let service = ControlService::new(config, network, dhcp, overrides).with_wifi_supervisor(wifi);
@@ -2313,6 +2340,98 @@ async fn configure_wifi_reconfigures_and_persists_the_new_ssid() {
         Response::WifiConfig {
             spec: Some(spec), ..
         } => assert_eq!(spec.ssid, "net-b"),
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn provision_wifi_access_point_stays_pending_until_explicit_commit() {
+    let directory = tempdir().expect("tempdir");
+    let mut config = wifi_base_config(directory.path());
+    config.wifi.hostapd_binary = PathBuf::from("/bin/true");
+    let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+        .await
+        .expect("overrides");
+    let dhcp = DhcpSupervisor::start(&config)
+        .await
+        .expect("dhcp supervisor");
+    let network = Arc::new(crate::test_support::FakeNetworkProvider::default());
+    network.add_interface("wlan0", 1).await;
+    network
+        .interfaces
+        .lock()
+        .await
+        .get_mut("wlan0")
+        .expect("wlan0")
+        .is_wireless = true;
+    let process = FakeWifiProcess::new();
+    let wifi = WifiSupervisor::start_with_process_and_radio(
+        &config,
+        process,
+        Arc::new(crate::wifi::radio::AllowAllRadioValidator),
+    )
+        .await
+        .expect("wifi supervisor");
+    configure_wlan0(&wifi, &config).await;
+    let service = ControlService::new(config, network, dhcp, overrides.clone())
+        .with_wifi_supervisor(wifi);
+
+    let response = service
+        .dispatch(Request::ProvisionWifiAccessPoint {
+            interface: "wlan0".into(),
+            settings: WifiEditRequest {
+                ssid: "net-b".into(),
+                country_code: Some("PL".into()),
+                band: WifiBand::Ghz2,
+                channel: 11,
+                channel_width: WifiChannelWidth::Ht20,
+                security: WifiSecurity::Open,
+                hidden: false,
+                client_isolation: false,
+                max_stations: 32,
+            },
+            passphrase: None,
+            clear_passphrase: true,
+            configure_dhcp: false,
+        })
+        .await;
+    let token = match response {
+        Response::NetworkChangePending { change } => change.token,
+        other => panic!("unexpected response: {other:?}"),
+    };
+
+    assert!(!overrides.snapshot().await.interfaces.contains_key("wlan0"));
+    match service
+        .dispatch(Request::GetWifiConfig {
+            interface: "wlan0".into(),
+        })
+        .await
+    {
+        Response::WifiConfig {
+            spec: Some(spec), ..
+        } => assert_eq!(spec.ssid, "net-a"),
+        other => panic!("unexpected response: {other:?}"),
+    }
+
+    assert!(matches!(
+        service
+            .dispatch(Request::CommitNetworkChange { token })
+            .await,
+        Response::NetworkChangeCommitted { .. }
+    ));
+    assert!(overrides.snapshot().await.interfaces.contains_key("wlan0"));
+    match service
+        .dispatch(Request::GetWifiConfig {
+            interface: "wlan0".into(),
+        })
+        .await
+    {
+        Response::WifiConfig {
+            spec: Some(spec), ..
+        } => {
+            assert_eq!(spec.ssid, "net-b");
+            assert_eq!(spec.channel, 11);
+        }
         other => panic!("unexpected response: {other:?}"),
     }
 }
@@ -2425,6 +2544,150 @@ async fn wifi_reload_sends_reload_and_returns_the_current_spec() {
     }
 }
 
+
+#[test]
+fn open_ap_passphrase_update_clears_stale_secret_for_legacy_clients() {
+    let update = super::wifi::ap_passphrase_update(WifiSecurity::Open, None, false)
+        .expect("open AP update");
+    assert!(matches!(update, crate::wifi::WifiPassphraseUpdate::Clear));
+}
+
+
+#[test]
+fn replacing_or_clearing_ap_secret_removes_legacy_passphrase_file_fallback() {
+    let previous = std::path::PathBuf::from("/run/legacy.psk");
+    assert_eq!(
+        super::wifi::ap_passphrase_file_update(
+            Some(&previous),
+            &crate::wifi::WifiPassphraseUpdate::Keep,
+        ),
+        Some(previous.clone())
+    );
+    assert!(super::wifi::ap_passphrase_file_update(
+        Some(&previous),
+        &crate::wifi::WifiPassphraseUpdate::Clear,
+    )
+    .is_none());
+    assert!(super::wifi::ap_passphrase_file_update(
+        Some(&previous),
+        &crate::wifi::WifiPassphraseUpdate::Set(
+            crate::wifi::WifiPassphrase::new("replacement password").unwrap(),
+        ),
+    )
+    .is_none());
+}
+
+#[test]
+fn ap_passphrase_update_rejects_set_and_clear_together() {
+    let error = super::wifi::ap_passphrase_update(
+        WifiSecurity::Wpa2,
+        Some("correct horse battery".into()),
+        true,
+    )
+    .expect_err("set and clear must conflict");
+    assert!(matches!(error, WifiErrorDetail::InvalidSpec { .. }));
+}
+
+#[test]
+fn secured_ap_passphrase_update_rejects_clear_without_replacement() {
+    let error = super::wifi::ap_passphrase_update(WifiSecurity::Wpa2, None, true)
+        .expect_err("secured AP cannot clear its only credential");
+    assert!(matches!(error, WifiErrorDetail::InvalidSpec { .. }));
+}
+
+#[tokio::test]
+async fn configure_wifi_wpa2_to_open_clears_the_stored_passphrase() {
+    let directory = tempdir().expect("tempdir");
+    let mut config = wifi_base_config(directory.path());
+    config.network.interfaces.get_mut("wlan0").unwrap().wifi =
+        Some(wifi_ap_config("net-a", WifiSecurity::Wpa2));
+    let store = crate::wifi::PassphraseStore::new(directory.path().join("wifi/psk"));
+    store
+        .set(
+            "wlan0",
+            &crate::wifi::WifiPassphrase::new("original password").unwrap(),
+        )
+        .unwrap();
+    let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+        .await
+        .expect("overrides");
+    let dhcp = DhcpSupervisor::start(&config)
+        .await
+        .expect("dhcp supervisor");
+    let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
+        addresses: Vec::new(),
+    });
+    let wifi = WifiSupervisor::start_with_process_and_radio(
+        &config,
+        FakeWifiProcess::new(),
+        Arc::new(crate::wifi::radio::AllowAllRadioValidator),
+    )
+        .await
+        .expect("wifi supervisor");
+    configure_wlan0(&wifi, &config).await;
+    let service = ControlService::new(config, network, dhcp, overrides).with_wifi_supervisor(wifi);
+
+    let response = service
+        .dispatch(Request::ConfigureWifi {
+            interface: "wlan0".to_string(),
+            settings: WifiEditRequest {
+                ssid: "net-a".to_string(),
+                country_code: Some("PL".to_string()),
+                band: WifiBand::Ghz2,
+                channel: 6,
+                channel_width: WifiChannelWidth::Ht20,
+                security: WifiSecurity::Open,
+                hidden: false,
+                client_isolation: false,
+                max_stations: 32,
+            },
+        })
+        .await;
+    assert!(matches!(response, Response::WifiConfigured { .. }), "{response:?}");
+    assert!(store.get("wlan0").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn disable_wifi_clears_stale_secret_and_open_recreate_stays_clean() {
+    let fixture = wifi_enabled_fixture().await;
+    let store = crate::wifi::PassphraseStore::new(fixture._directory.path().join("wifi/psk"));
+    store
+        .set(
+            "wlan0",
+            &crate::wifi::WifiPassphrase::new("stale password").unwrap(),
+        )
+        .unwrap();
+
+    let disabled = fixture
+        .service
+        .dispatch(Request::DisableWifi {
+            interface: "wlan0".to_string(),
+        })
+        .await;
+    assert!(matches!(disabled, Response::WifiDisabled { .. }), "{disabled:?}");
+    assert!(store.get("wlan0").unwrap().is_none());
+
+    let recreated = fixture
+        .service
+        .dispatch(Request::ConfigureWifi {
+            interface: "wlan0".to_string(),
+            settings: WifiEditRequest {
+                ssid: "open-again".to_string(),
+                country_code: Some("PL".to_string()),
+                band: WifiBand::Ghz2,
+                channel: 6,
+                channel_width: WifiChannelWidth::Ht20,
+                security: WifiSecurity::Open,
+                hidden: false,
+                client_isolation: false,
+                max_stations: 32,
+            },
+        })
+        .await;
+    assert!(matches!(recreated, Response::WifiConfigured { .. }), "{recreated:?}");
+    assert!(store.get("wlan0").unwrap().is_none());
+}
+
 #[tokio::test]
 async fn configure_wifi_to_wpa2_without_a_passphrase_is_refused_and_changes_nothing() {
     let fixture = wifi_enabled_fixture().await;
@@ -2496,7 +2759,11 @@ async fn wifi_set_passphrase_applies_live_via_reload() {
         addresses: Vec::new(),
     });
     let process = FakeWifiProcess::new();
-    let wifi = WifiSupervisor::start_with_process(&config, process)
+    let wifi = WifiSupervisor::start_with_process_and_radio(
+        &config,
+        process,
+        Arc::new(crate::wifi::radio::AllowAllRadioValidator),
+    )
         .await
         .expect("wifi supervisor");
 
@@ -2577,7 +2844,11 @@ async fn wifi_configured_response_never_serializes_the_passphrase_that_was_just_
             &crate::wifi::WifiPassphrase::new("seed passphrase").unwrap(),
         )
         .unwrap();
-    let wifi = WifiSupervisor::start_with_process(&config, process)
+    let wifi = WifiSupervisor::start_with_process_and_radio(
+        &config,
+        process,
+        Arc::new(crate::wifi::radio::AllowAllRadioValidator),
+    )
         .await
         .expect("wifi supervisor");
     configure_wlan0(&wifi, &config).await;
@@ -2807,10 +3078,13 @@ impl SupervisedProcess for FakeSupplicantProcess {
         Ok(self.responders.lock().unwrap().contains_key(&pid))
     }
 
-    async fn cmdline_contains(
+    async fn identity_matches(
         &self,
         pid: u32,
+        _kind: crate::wifi::record::WifiProcessKind,
+        _binary_path: &std::path::Path,
         config_path: &std::path::Path,
+        _started_at_unix: u64,
     ) -> Result<bool, WifiProcessError> {
         Ok(self
             .configs
@@ -2820,10 +3094,12 @@ impl SupervisedProcess for FakeSupplicantProcess {
             .is_some_and(|recorded| recorded == config_path))
     }
 
-    async fn pids_with_config_path(
+    async fn pids_matching_identity(
         &self,
         _kind: crate::wifi::record::WifiProcessKind,
+        _binary_path: &std::path::Path,
         config_path: &std::path::Path,
+        _started_at_unix: u64,
     ) -> Result<Vec<u32>, WifiProcessError> {
         let mut pids: Vec<u32> = self
             .configs
@@ -2834,6 +3110,19 @@ impl SupervisedProcess for FakeSupplicantProcess {
             .collect();
         pids.sort_unstable();
         Ok(pids)
+    }
+
+    async fn owns_unix_socket(
+        &self,
+        pid: u32,
+        socket_path: &std::path::Path,
+    ) -> Result<bool, WifiProcessError> {
+        Ok(self
+            .responders
+            .lock()
+            .unwrap()
+            .get(&pid)
+            .is_some_and(|responder| responder.ctrl_path.as_path() == socket_path))
     }
 
     async fn terminate(&self, pid: u32) -> Result<(), WifiProcessError> {
@@ -4564,6 +4853,7 @@ fn provisioning_base_config(directory: &std::path::Path) -> AppConfig {
     config.wifi = WifiConfig {
         enabled: true,
         hostapd_binary: PathBuf::from("/usr/sbin/hostapd"),
+        iw_binary: PathBuf::from("/usr/sbin/iw"),
         runtime_dir: directory.join("hostapd"),
         restart_backoff_seconds: 1,
     };

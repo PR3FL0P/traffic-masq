@@ -20,7 +20,7 @@ pub use manager::{
     ManagerError, OwnedInterfaceRecord, ReconcileOutcome, VpnActiveStatus, VpnInterfaceSnapshot,
     VpnManager,
 };
-pub use provider::{NetlinkVpnProvider, ProviderError, VpnProvider};
+pub use provider::{LazyNetlinkVpnProvider, NetlinkVpnProvider, ProviderError, VpnProvider};
 pub use store::{StoreError, WireGuardProfileStore, WireGuardProfileSummary};
 pub use wireguard::{
     ProfileError, WireGuardDriver, WireGuardInterfaceConfig, WireGuardPeerConfig, WireGuardProfile,

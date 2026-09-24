@@ -74,5 +74,22 @@ impl fmt::Display for WifiPassphrase {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub enum WifiPassphraseUpdate {
+    Keep,
+    Set(WifiPassphrase),
+    Clear,
+}
+
+impl fmt::Debug for WifiPassphraseUpdate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Keep => f.write_str("Keep"),
+            Self::Set(_) => f.write_str("Set([REDACTED])"),
+            Self::Clear => f.write_str("Clear"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;

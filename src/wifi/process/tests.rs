@@ -1,40 +1,144 @@
+use std::os::unix::net::UnixDatagram;
 use std::time::Duration;
 
 use tempfile::NamedTempFile;
 
 use super::*;
 
+async fn proc_cmdline_contains(pid: u32, argument: &Path) -> bool {
+    tokio::fs::read(format!("/proc/{pid}/cmdline"))
+        .await
+        .ok()
+        .is_some_and(|raw| {
+            raw.split(|byte| *byte == 0)
+                .any(|candidate| candidate == argument.as_os_str().as_encoded_bytes())
+        })
+}
+
+#[tokio::test]
+async fn unix_socket_ownership_is_tied_to_the_pid_holding_the_kernel_socket() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let socket_path = temp.path().join("hostapd.ctrl");
+    let socket = UnixDatagram::bind(&socket_path).expect("bind ctrl socket");
+    let process = TokioSupervisedProcess::new();
+
+    assert!(process
+        .owns_unix_socket(std::process::id(), &socket_path)
+        .await
+        .expect("owned socket"));
+    let foreign_pid = process
+        .spawn(Path::new("/bin/sleep"), Path::new("300"))
+        .await
+        .expect("spawn foreign process");
+    assert!(!process
+        .owns_unix_socket(foreign_pid, &socket_path)
+        .await
+        .expect("foreign pid"));
+
+    process.kill(foreign_pid).await.expect("cleanup foreign process");
+    drop(socket);
+}
+
+#[tokio::test]
+async fn unix_socket_ownership_fails_closed_during_unlink_rebind_ambiguity() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let socket_path = temp.path().join("hostapd.ctrl");
+    let first = UnixDatagram::bind(&socket_path).expect("bind first socket");
+    std::fs::remove_file(&socket_path).expect("unlink first socket path");
+    let second = UnixDatagram::bind(&socket_path).expect("bind replacement socket");
+    let process = TokioSupervisedProcess::new();
+
+    assert!(!process
+        .owns_unix_socket(std::process::id(), &socket_path)
+        .await
+        .expect("ambiguous socket ownership"));
+
+    drop(first);
+    drop(second);
+}
+
 #[test]
 fn wifi_process_kind_matching_distinguishes_hostapd_from_supplicant() {
     let config = Path::new("/run/traffic-masq/wlan0.conf");
+    let scan_config = Path::new("/run/traffic-masq/wlan0-scan.conf");
     let hostapd = b"/usr/sbin/hostapd\0/run/traffic-masq/wlan0.conf\0";
     let supplicant = b"/usr/sbin/wpa_supplicant\0-i\0wlan0\0-c\0/run/traffic-masq/wlan0.conf\0";
+    let scan = b"/usr/sbin/wpa_supplicant\0-i\0wlan0\0-c\0/run/traffic-masq/wlan0-scan.conf\0";
 
-    assert!(cmdline_matches_kind(
+    assert!(argv_matches_kind(
         hostapd,
         WifiProcessKind::AccessPoint,
         config
     ));
-    assert!(!cmdline_matches_kind(
+    assert!(!argv_matches_kind(
         hostapd,
         WifiProcessKind::Client,
         config
     ));
-    assert!(cmdline_matches_kind(
+    assert!(argv_matches_kind(
         supplicant,
         WifiProcessKind::Client,
         config
     ));
-    assert!(cmdline_matches_kind(
-        supplicant,
+    assert!(argv_matches_kind(
+        scan,
         WifiProcessKind::Scan,
-        config
+        scan_config
     ));
-    assert!(!cmdline_matches_kind(
+    assert!(!argv_matches_kind(
         supplicant,
         WifiProcessKind::AccessPoint,
         config
     ));
+    assert!(!argv_matches_kind(
+        b"/usr/sbin/hostapd\0-d\0/run/traffic-masq/wlan0.conf\0",
+        WifiProcessKind::AccessPoint,
+        config
+    ));
+}
+
+#[tokio::test]
+async fn process_identity_requires_the_expected_executable_not_just_config_argv() {
+    let process = TokioSupervisedProcess::new();
+    let config = Path::new("300");
+    let pid = process
+        .spawn(Path::new("/bin/sleep"), config)
+        .await
+        .expect("spawn");
+    let started_at_unix = crate::wifi::lifecycle::unix_now();
+
+    assert!(process
+        .identity_matches(
+            pid,
+            WifiProcessKind::AccessPoint,
+            Path::new("/bin/sleep"),
+            config,
+            started_at_unix,
+        )
+        .await
+        .expect("matching executable"));
+    assert!(!process
+        .identity_matches(
+            pid,
+            WifiProcessKind::AccessPoint,
+            Path::new("/bin/true"),
+            config,
+            started_at_unix,
+        )
+        .await
+        .expect("foreign executable"));
+    assert!(!process
+        .identity_matches(
+            pid,
+            WifiProcessKind::AccessPoint,
+            Path::new("/bin/sleep"),
+            config,
+            1,
+        )
+        .await
+        .expect("stale process identity"));
+
+    process.kill(pid).await.expect("cleanup");
 }
 
 #[tokio::test]
@@ -49,11 +153,7 @@ async fn a_freshly_spawned_process_is_alive_and_visible_in_proc() {
     assert!(process.is_alive(pid).await.expect("is_alive"));
     let mut found = false;
     for _ in 0..50 {
-        if process
-            .cmdline_contains(pid, Path::new("300"))
-            .await
-            .unwrap_or(false)
-        {
+        if proc_cmdline_contains(pid, Path::new("300")).await {
             found = true;
             break;
         }
@@ -76,11 +176,7 @@ async fn cmdline_contains_is_false_for_a_config_path_not_in_argv() {
 
     let mut ready = false;
     for _ in 0..50 {
-        if process
-            .cmdline_contains(pid, Path::new("300"))
-            .await
-            .unwrap_or(false)
-        {
+        if proc_cmdline_contains(pid, Path::new("300")).await {
             ready = true;
             break;
         }
@@ -88,10 +184,7 @@ async fn cmdline_contains_is_false_for_a_config_path_not_in_argv() {
     }
     assert!(ready, "spawned process should be visible in proc cmdline");
 
-    assert!(!process
-        .cmdline_contains(pid, Path::new("600"))
-        .await
-        .expect("cmdline_contains"));
+    assert!(!proc_cmdline_contains(pid, Path::new("600")).await);
 
     process.kill(pid).await.expect("cleanup");
 }
@@ -116,10 +209,7 @@ async fn is_alive_and_cmdline_contains_are_false_for_a_pid_never_spawned_here() 
     let process = TokioSupervisedProcess::new();
 
     assert!(process.is_alive(1).await.expect("pid 1 exists"));
-    assert!(!process
-        .cmdline_contains(1, config.path())
-        .await
-        .expect("pid 1 is not hostapd"));
+    assert!(!proc_cmdline_contains(1, config.path()).await);
 
     assert!(!process.is_alive(u32::MAX / 2).await.expect("is_alive"));
 }

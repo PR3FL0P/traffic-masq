@@ -11,8 +11,14 @@ use crate::config::{AppConfig, InterfaceConfig, InterfaceRole};
 use crate::core::override_manager::RuntimeOverrideManager;
 use crate::core::ownership::AddressOwnershipJournal;
 use crate::netlink::{Ipv4AddressInfo, NetworkInterface, NetworkProvider};
+use crate::wifi::{PassphraseStore, WifiPassphrase, WifiPassphraseUpdate};
 
 use super::*;
+
+#[test]
+fn convergence_deadline_exceeds_wifi_startup_budget() {
+    assert!(CONVERGENCE_DEADLINE > crate::wifi::lifecycle::STARTUP_READY_TIMEOUT);
+}
 
 #[derive(Debug)]
 struct FakeNetwork {
@@ -237,6 +243,46 @@ async fn restart_removes_unconfirmed_address_on_previously_unmanaged_interface()
         addresses(&provider).await,
         vec![Ipv4Addr::new(192, 168, 1, 10)]
     );
+}
+
+#[tokio::test]
+async fn independently_blocked_interface_is_not_rolled_back_by_transaction_recovery() {
+    let directory = tempdir().unwrap();
+    let provider = fake_network();
+    let interfaces = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
+    let desired = desired_state(directory.path()).await;
+    let transactions =
+        NetworkTransactionManager::new(interfaces.clone(), Duration::from_secs(60), desired);
+    transactions
+        .write_journal("interrupted", interfaces.snapshot("test0").await.unwrap())
+        .await
+        .unwrap();
+    interfaces
+        .apply_interface(
+            "test0",
+            &interface_config(PROPOSED),
+            Some(InterfaceRole::Output),
+            true,
+        )
+        .await
+        .unwrap();
+    let before = addresses(&provider).await;
+    let excluded = std::collections::BTreeSet::from(["test0".to_string()]);
+
+    recover_interface_transactions_with_commit_tokens_excluding(
+        directory.path(),
+        &interfaces,
+        &Default::default(),
+        &excluded,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(addresses(&provider).await, before);
+    assert!(directory
+        .path()
+        .join("interface-transactions/test0.json")
+        .exists());
 }
 
 #[tokio::test]
@@ -612,6 +658,53 @@ async fn failed_apply_with_failed_compensation_stays_pending_and_rollback_only()
     assert!(manager.pending().await.is_empty());
 }
 
+
+#[tokio::test]
+async fn clear_passphrase_is_journaled_and_restored_on_rollback() {
+    let directory = tempdir().expect("tempdir");
+    let desired = desired_state(directory.path()).await;
+    let manager = NetworkTransactionManager::new(
+        InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory()),
+        Duration::from_secs(60),
+        desired,
+    );
+    let store = PassphraseStore::new(directory.path().join("wifi/psk"));
+    store
+        .set(
+            "test0",
+            &WifiPassphrase::new("original-password").expect("passphrase"),
+        )
+        .expect("seed passphrase");
+
+    let previous = interface_config(COMMITTED);
+    let proposed = interface_config(PROPOSED);
+    let pending = manager
+        .apply_with_passphrase_update(
+            "test0",
+            &proposed,
+            Some(&previous),
+            Some(InterfaceRole::Output),
+            false,
+            WifiPassphraseUpdate::Clear,
+        )
+        .await
+        .expect("apply clear");
+    assert!(store.get("test0").expect("read cleared secret").is_none());
+
+    manager
+        .rollback(&pending.token)
+        .await
+        .expect("rollback clear");
+    assert_eq!(
+        store
+            .get("test0")
+            .expect("read restored secret")
+            .expect("secret restored")
+            .expose(),
+        "original-password"
+    );
+}
+
 #[tokio::test]
 async fn rollback_publishes_restore_intent_even_when_secret_restore_fails() {
     let directory = tempdir().expect("tempdir");
@@ -759,4 +852,25 @@ fn interface_recovery_store_retries_only_explicitly_transient_io_errors() {
     assert!(!retryable_interface_store_error(&PrivateStoreError::Symlink(
         std::path::PathBuf::from("interface-transactions")
     )));
+}
+
+#[test]
+fn interface_recovery_store_error_uses_resource_path_not_journal() {
+    let state_dir = std::path::Path::new("/state");
+    let error = interface_recovery_store_error(
+        state_dir,
+        "open",
+        crate::state::private_store::PrivateStoreError::Symlink(
+            state_dir.join("interface-transactions"),
+        ),
+    );
+    let diagnostic = error.to_string();
+    assert!(diagnostic.contains("recovery_code=TM-REC-101"));
+    assert!(diagnostic.contains("invariant=accessible_interface_recovery_store"));
+    assert!(diagnostic.contains("path=/state/interface-transactions"));
+    assert!(diagnostic.contains("expected_type=directory"));
+    assert!(diagnostic.contains("expected_mode=0700"));
+    assert!(diagnostic.contains("symlink_allowed=false"));
+    assert!(diagnostic.contains("operator_action=repair_storage_access"));
+    assert!(!diagnostic.contains("journal="));
 }

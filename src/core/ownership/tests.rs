@@ -1,3 +1,5 @@
+use std::os::unix::fs::symlink;
+
 use tempfile::tempdir;
 
 use crate::netlink::{AddressOwnership, TRAFFIC_MASQ_DHCP_ADDRESS_PROTOCOL};
@@ -143,4 +145,40 @@ async fn a_document_from_a_future_version_is_refused_rather_than_guessed_at() {
         AddressOwnershipJournal::open(directory.path()),
         Err(OwnershipJournalError::UnsupportedSchema(99))
     ));
+}
+
+
+#[tokio::test]
+async fn isolated_open_blocks_only_the_corrupt_ownership_document() {
+    let directory = tempdir().expect("tempdir");
+    let store = PrivateJsonDirectory::open(directory.path(), "address-ownership").expect("dir");
+    store
+        .write(
+            "lan0",
+            br#"{"schema_version":1,"interface":"lan0","claims":[{"address":"192.0.2.1","prefix_len":24,"state":"held"}]}"#,
+        )
+        .expect("valid record");
+    store.write("bad0", b"{broken").expect("corrupt record");
+
+    let outcome = AddressOwnershipJournal::open_isolated(directory.path()).expect("isolated open");
+    assert_eq!(outcome.blocked_interfaces.len(), 1);
+    assert_eq!(outcome.blocked_interfaces[0].0, "bad0");
+    assert!(outcome
+        .journal
+        .owns("lan0", Ipv4Addr::new(192, 0, 2, 1), 24)
+        .await);
+}
+
+#[test]
+fn isolated_open_reports_a_symlinked_interface_document_without_hiding_it() {
+    let directory = tempdir().expect("tempdir");
+    let store = PrivateJsonDirectory::open(directory.path(), "address-ownership").expect("dir");
+    let target = directory.path().join("target.json");
+    std::fs::write(&target, b"{}").expect("target");
+    symlink(&target, store.directory().join("lan0.json")).expect("symlink");
+
+    let outcome = AddressOwnershipJournal::open_isolated(directory.path()).expect("isolated open");
+    assert_eq!(outcome.blocked_interfaces.len(), 1);
+    assert_eq!(outcome.blocked_interfaces[0].0, "lan0");
+    assert!(outcome.blocked_interfaces[0].1.contains("symlink"));
 }

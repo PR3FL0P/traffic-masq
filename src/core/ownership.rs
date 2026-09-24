@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::netlink::{AddressOwner, Ipv4AddressInfo};
-use crate::state::private_store::{PrivateJsonDirectory, PrivateStoreError};
+use crate::state::private_store::{valid_document_key, PrivateJsonDirectory, PrivateStoreError};
 
 pub const ADDRESS_CLAIM_SCHEMA_VERSION: u32 = 1;
 
@@ -97,6 +97,14 @@ impl InterfaceAddressClaims {
 }
 
 /// What one interface's claims were reconciled into at startup.
+#[derive(Debug, Clone)]
+pub struct OwnershipJournalOpenOutcome {
+    pub journal: AddressOwnershipJournal,
+    /// Per-interface documents that could not be trusted. The caller must block mutation of these
+    /// interfaces, but unrelated interfaces may continue recovery.
+    pub blocked_interfaces: Vec<(String, String)>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReconciledClaims {
     /// Claims confirmed against the machine and kept.
@@ -153,6 +161,89 @@ impl AddressOwnershipJournal {
                 claims: Mutex::new(claims),
                 store: Some(store),
             }),
+        })
+    }
+
+    /// Open ownership state while isolating damage to a single interface document.
+    ///
+    /// Failure to open or enumerate the directory remains global because the set of ownership
+    /// records is then unknown. Once an entry name is known, malformed JSON, a future schema,
+    /// interface/name mismatch, read failure, symlink, or non-file entry blocks only that scope.
+    pub fn open_isolated(
+        state_root: impl AsRef<Path>,
+    ) -> Result<OwnershipJournalOpenOutcome, OwnershipJournalError> {
+        let store = PrivateJsonDirectory::open(state_root, "address-ownership")?;
+        let mut claims = BTreeMap::new();
+        let mut blocked_interfaces = Vec::new();
+        let entries = std::fs::read_dir(store.directory())
+            .map_err(PrivateStoreError::from)?;
+
+        for entry in entries {
+            let entry = entry.map_err(PrivateStoreError::from)?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(interface) = name.strip_suffix(".json") else {
+                continue;
+            };
+            if !valid_document_key(interface) {
+                continue;
+            }
+            let interface = interface.to_owned();
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    blocked_interfaces.push((
+                        interface,
+                        format!("failed to inspect {}: {error}", path.display()),
+                    ));
+                    continue;
+                }
+            };
+            if file_type.is_symlink() {
+                blocked_interfaces.push((
+                    interface,
+                    format!("unsafe symlink at {}", path.display()),
+                ));
+                continue;
+            }
+            if !file_type.is_file() {
+                blocked_interfaces.push((
+                    interface,
+                    format!("ownership document is not a regular file: {}", path.display()),
+                ));
+                continue;
+            }
+
+            let loaded = (|| -> Result<InterfaceAddressClaims, OwnershipJournalError> {
+                let bytes = store.read(&interface)?.ok_or_else(|| {
+                    OwnershipJournalError::InvalidRecord(
+                        "ownership document disappeared during startup inspection".into(),
+                    )
+                })?;
+                let record: InterfaceAddressClaims = serde_json::from_slice(&bytes)?;
+                record.validate(&interface)?;
+                Ok(record)
+            })();
+            match loaded {
+                Ok(record) => {
+                    if !record.claims.is_empty() {
+                        claims.insert(interface, record.claims);
+                    }
+                }
+                Err(error) => blocked_interfaces.push((interface, error.to_string())),
+            }
+        }
+        blocked_interfaces.sort_by(|left, right| left.0.cmp(&right.0));
+
+        Ok(OwnershipJournalOpenOutcome {
+            journal: Self {
+                inner: Arc::new(Inner {
+                    claims: Mutex::new(claims),
+                    store: Some(store),
+                }),
+            },
+            blocked_interfaces,
         })
     }
 

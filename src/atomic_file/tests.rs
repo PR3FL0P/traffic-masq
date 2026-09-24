@@ -153,3 +153,29 @@ fn parent_directory_handles_bare_and_nested_paths() {
         Path::new("state")
     );
 }
+
+#[test]
+fn regular_file_exists_distinguishes_missing_regular_and_dangling_symlink() {
+    let directory = tempdir().expect("tempdir");
+    let path = directory.path().join("journal.json");
+
+    assert!(!regular_file_exists(&path).expect("missing path"));
+    fs::write(&path, b"{}").expect("seed journal");
+    assert!(regular_file_exists(&path).expect("regular file"));
+
+    fs::remove_file(&path).expect("remove journal");
+    std::os::unix::fs::symlink(directory.path().join("missing-target"), &path)
+        .expect("dangling symlink");
+    let error = regular_file_exists(&path).expect_err("symlink must be rejected");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn regular_file_exists_rejects_directory() {
+    let directory = tempdir().expect("tempdir");
+    let path = directory.path().join("journal.json");
+    fs::create_dir(&path).expect("mkdir");
+
+    let error = regular_file_exists(&path).expect_err("directory must be rejected");
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+}

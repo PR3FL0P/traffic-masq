@@ -38,6 +38,18 @@ async fn silent_api_times_out_and_closes_connection() {
 }
 
 #[test]
+fn control_mutation_timeout_outlives_the_server_connection_deadline() {
+    assert_eq!(control_request_timeout(&Method::GET), DEFAULT_REQUEST_TIMEOUT);
+    for method in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
+        assert_eq!(
+            control_request_timeout(&method),
+            CONTROL_MUTATION_REQUEST_TIMEOUT
+        );
+    }
+    assert!(CONTROL_MUTATION_REQUEST_TIMEOUT > crate::api::HTTP_CONNECTION_TIMEOUT);
+}
+
+#[test]
 fn percent_encodes_path_segments() {
     assert_eq!(encode_path_segment("eth0.100-guest_~"), "eth0.100-guest_~");
     assert_eq!(encode_path_segment("vlan/guest %"), "vlan%2Fguest%20%25");

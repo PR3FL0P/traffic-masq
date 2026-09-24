@@ -36,6 +36,8 @@ struct PersistedWifiRecordDocument {
     schema_version: u32,
     pid: u32,
     started_at_unix: u64,
+    #[serde(default)]
+    binary_path: Option<PathBuf>,
     ctrl_path: PathBuf,
     config_path: PathBuf,
     config_digest: WifiDigest,
@@ -47,6 +49,7 @@ struct PersistedWifiRecordDocument {
 pub struct PersistedWifiRecord {
     pub pid: u32,
     pub started_at_unix: u64,
+    pub binary_path: Option<PathBuf>,
     pub ctrl_path: PathBuf,
     pub config_path: PathBuf,
     pub config_digest: WifiDigest,
@@ -159,6 +162,7 @@ impl WifiRecordStore {
         Ok(Some(PersistedWifiRecord {
             pid: document.pid,
             started_at_unix: document.started_at_unix,
+            binary_path: document.binary_path,
             ctrl_path: document.ctrl_path,
             config_path: document.config_path,
             config_digest: document.config_digest,
@@ -285,6 +289,7 @@ impl WifiRecordStore {
             schema_version: CURRENT_WIFI_RECORD_SCHEMA,
             pid: record.pid,
             started_at_unix: record.started_at_unix,
+            binary_path: record.binary_path.clone(),
             ctrl_path: record.ctrl_path.clone(),
             config_path: record.config_path.clone(),
             config_digest: record.config_digest,

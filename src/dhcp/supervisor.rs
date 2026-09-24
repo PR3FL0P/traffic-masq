@@ -117,7 +117,11 @@ struct Inner {
 impl DhcpSupervisor {
     /// Build enabled per-interface DHCP specifications independently of the global enabled flag.
     pub fn service_specs(config: &AppConfig) -> Result<Vec<DhcpServiceSpec>> {
-        config.validate()?;
+        config.network.validate()?;
+        anyhow::ensure!(
+            config.dhcp.default_lease_seconds > 0,
+            "dhcp.default_lease_seconds must be greater than zero"
+        );
 
         let mut specs = Vec::new();
         for (name, interface) in &config.network.interfaces {
@@ -147,17 +151,23 @@ impl DhcpSupervisor {
         Ok(specs.into_values().collect())
     }
 
-    /// Initialize lease storage and the shared DHCP runtime, then configure effective services.
-    pub async fn start(config: &AppConfig) -> Result<Self> {
-        let supervisor = Self {
+    /// Construct the DHCP runtime without applying committed services.
+    ///
+    /// Router crash recovery uses this form so the rollback coordinator has a runtime adapter but
+    /// normal DHCP startup cannot mutate the machine before the durable router journal is resolved.
+    pub fn open_for_recovery(config: &AppConfig) -> Self {
+        Self {
             inner: Arc::new(Inner {
                 leases_dir: config.dhcp.leases_dir.clone(),
                 tasks: Mutex::new(HashMap::new()),
                 runtime: Mutex::new(None),
                 operation_lock: Mutex::new(()),
             }),
-        };
+        }
+    }
 
+    /// Apply committed DHCP startup state to an already constructed runtime.
+    pub async fn reconcile_startup(&self, config: &AppConfig) -> Result<()> {
         for spec in Self::effective_specs(config)? {
             if resolve_interface_index(&spec.interface).is_err() {
                 tracing::warn!(
@@ -168,12 +178,18 @@ impl DhcpSupervisor {
                 continue;
             }
             let interface = spec.interface.clone();
-            if let Err(error) = supervisor.configure(spec).await {
+            if let Err(error) = self.configure(spec).await {
                 tracing::warn!(%interface, error = %format!("{error:#}"), operation = "dhcp_startup",
                     "DHCP interface degraded; runtime convergence will retry");
             }
         }
+        Ok(())
+    }
 
+    /// Initialize lease storage and the shared DHCP runtime, then configure effective services.
+    pub async fn start(config: &AppConfig) -> Result<Self> {
+        let supervisor = Self::open_for_recovery(config);
+        supervisor.reconcile_startup(config).await?;
         Ok(supervisor)
     }
 

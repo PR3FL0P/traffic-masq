@@ -211,6 +211,7 @@ fn app_config(state_dir: &Path, runtime_dir: &Path) -> AppConfig {
         wifi: WifiConfig {
             enabled: true,
             hostapd_binary: PathBuf::from("/usr/sbin/hostapd"),
+            iw_binary: PathBuf::from("/usr/sbin/iw"),
             runtime_dir: runtime_dir.to_path_buf(),
             restart_backoff_seconds: 1,
         },
@@ -244,6 +245,7 @@ async fn test_supervisor(
         restart_backoff_seconds: 1,
         ctrl_timeout: Duration::from_millis(500),
         process,
+        radio: Arc::new(crate::wifi::radio::AllowAllRadioValidator),
         tasks: Mutex::new(HashMap::new()),
         operation_lock: Mutex::new(()),
     };
@@ -520,7 +522,7 @@ async fn failed_restart_can_be_rolled_back_to_the_previous_ap() {
 }
 
 #[tokio::test]
-async fn adopts_a_process_that_passes_the_two_factor_check() {
+async fn adopts_and_upgrades_a_legacy_process_record_after_strong_identity_check() {
     let temp = tempdir().expect("tempdir");
     let runtime_dir = temp.path().join("hostapd");
     let process = fake_process();
@@ -535,6 +537,7 @@ async fn adopts_a_process_that_passes_the_two_factor_check() {
         .save(&PersistedWifiRecord {
             pid: 4242,
             started_at_unix: 0,
+            binary_path: None,
             ctrl_path: supervisor.ctrl_path("wlan0"),
             config_path: rendered.path.clone(),
             config_digest: rendered.config_digest,
@@ -552,6 +555,16 @@ async fn adopts_a_process_that_passes_the_two_factor_check() {
     );
     let status = supervisor.status("wlan0").await.expect("status");
     assert_eq!(status.pid, 4242);
+    let upgraded = supervisor
+        .record_store("wlan0")
+        .load()
+        .await
+        .expect("load upgraded record")
+        .expect("record");
+    assert_eq!(
+        upgraded.binary_path.as_deref(),
+        Some(Path::new("/usr/sbin/hostapd"))
+    );
 }
 
 #[tokio::test]
@@ -569,6 +582,7 @@ async fn recovers_a_process_spawned_after_a_durable_launch_intent() {
         .save(&PersistedWifiRecord {
             pid: 0,
             started_at_unix: 1,
+            binary_path: Some(std::path::PathBuf::from("/usr/sbin/hostapd")),
             ctrl_path: supervisor.ctrl_path("wlan0"),
             config_path: rendered.path.clone(),
             config_digest: rendered.config_digest,
@@ -619,6 +633,7 @@ async fn interrupted_reload_is_restarted_from_committed_state() {
         .save(&PersistedWifiRecord {
             pid: 4243,
             started_at_unix: 1,
+            binary_path: Some(std::path::PathBuf::from("/usr/sbin/hostapd")),
             ctrl_path: supervisor.ctrl_path("wlan0"),
             config_path: rendered.path.clone(),
             config_digest: rendered.config_digest,
@@ -661,6 +676,7 @@ async fn startup_stops_owned_ap_absent_from_committed_configuration() {
         .save(&PersistedWifiRecord {
             pid: 0,
             started_at_unix: 1,
+            binary_path: Some(std::path::PathBuf::from("/usr/sbin/hostapd")),
             ctrl_path: runtime_dir.join("wlan0"),
             config_path,
             config_digest: WifiDigest::from_bytes([1; 32]),
@@ -702,6 +718,45 @@ async fn refuses_a_live_ctrl_socket_with_no_matching_record() {
 }
 
 #[tokio::test]
+async fn adoption_refuses_a_rebound_ctrl_socket_even_when_the_recorded_pid_still_matches() {
+    let temp = tempdir().expect("tempdir");
+    let runtime_dir = temp.path().join("hostapd");
+    let process = fake_process();
+    let supervisor = test_supervisor(temp.path(), &runtime_dir, process.clone()).await;
+
+    let target = spec("wlan0", "net-a");
+    let rendered = supervisor.render_for(&target).await.expect("render");
+    seed_process(&process, 4242, rendered.path.clone(), "net-a");
+    supervisor
+        .record_store("wlan0")
+        .save(&PersistedWifiRecord {
+            pid: 4242,
+            started_at_unix: 1,
+            binary_path: Some(PathBuf::from("/usr/sbin/hostapd")),
+            ctrl_path: supervisor.ctrl_path("wlan0"),
+            config_path: rendered.path.clone(),
+            config_digest: rendered.config_digest,
+            key_digest: rendered.key_digest,
+            ssid: "net-a".to_string(),
+        })
+        .await
+        .expect("seed record");
+
+    process.detach_ctrl_socket(4242);
+    let _foreign = FakeHostapdCtrl::spawn_fixed(supervisor.ctrl_path("wlan0"), "net-a");
+
+    let error = supervisor
+        .configure(target)
+        .await
+        .expect_err("matching PID is insufficient when the ctrl socket was rebound");
+    assert!(matches!(error, SupervisorError::NotOwned { .. }));
+    assert!(
+        process.calls().is_empty(),
+        "foreign ctrl ownership must not trigger a signal or replacement spawn"
+    );
+}
+
+#[tokio::test]
 async fn a_digest_mismatch_restarts_with_the_new_config() {
     let temp = tempdir().expect("tempdir");
     let runtime_dir = temp.path().join("hostapd");
@@ -717,6 +772,7 @@ async fn a_digest_mismatch_restarts_with_the_new_config() {
         .save(&PersistedWifiRecord {
             pid: 4242,
             started_at_unix: 0,
+            binary_path: Some(std::path::PathBuf::from("/usr/sbin/hostapd")),
             ctrl_path: supervisor.ctrl_path("wlan0"),
             config_path: rendered.path.clone(),
             config_digest: WifiDigest::from_bytes([9; 32]),
@@ -749,6 +805,7 @@ async fn absent_ctrl_socket_clears_any_stale_record_and_spawns_fresh() {
         .save(&PersistedWifiRecord {
             pid: 9999,
             started_at_unix: 0,
+            binary_path: Some(std::path::PathBuf::from("/usr/sbin/hostapd")),
             ctrl_path: supervisor.ctrl_path("wlan0"),
             config_path: render::config_path(&runtime_dir, "wlan0"),
             config_digest: WifiDigest::from_bytes([1; 32]),
@@ -956,6 +1013,74 @@ async fn reload_sends_reload_even_when_nothing_changed() {
 
     let spec = supervisor.reload("wlan0").await.expect("reload");
     assert_eq!(spec.ssid, "net-a");
+}
+
+#[tokio::test]
+async fn ctrl_operations_wait_for_the_supervisor_mutation_lock() {
+    let temp = tempdir().expect("tempdir");
+    let runtime_dir = temp.path().join("hostapd");
+    let process = fake_process();
+    let supervisor = test_supervisor(temp.path(), &runtime_dir, process).await;
+    supervisor
+        .configure(spec("wlan0", "net-a"))
+        .await
+        .expect("configure");
+
+    let guard = supervisor.inner.operation_lock.lock().await;
+    let concurrent = supervisor.clone();
+    let mut reload = tokio::spawn(async move { concurrent.reload("wlan0").await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut reload)
+            .await
+            .is_err(),
+        "RELOAD must wait while configure/restart owns operation_lock"
+    );
+    drop(guard);
+    reload.await.expect("join").expect("reload after unlock");
+}
+
+#[tokio::test]
+async fn ctrl_operations_reject_a_socket_not_owned_by_the_recorded_hostapd() {
+    let temp = tempdir().expect("tempdir");
+    let runtime_dir = temp.path().join("hostapd");
+    let process = fake_process();
+    let supervisor = test_supervisor(temp.path(), &runtime_dir, process.clone()).await;
+    supervisor
+        .configure(spec("wlan0", "net-a"))
+        .await
+        .expect("configure");
+
+    process.detach_ctrl_socket(1000);
+    let ctrl_path = runtime_dir.join("wlan0");
+    let _foreign = FakeHostapdCtrl::spawn_fixed(ctrl_path, "foreign-net");
+
+    let reload = supervisor.reload("wlan0").await.unwrap_err();
+    assert!(matches!(reload, SupervisorError::NotOwned { .. }));
+
+    let stations = supervisor.stations("wlan0").await.unwrap_err();
+    assert!(matches!(stations, SupervisorError::NotOwned { .. }));
+
+    let mac = MacAddr::new([0x02, 0, 0, 0, 0, 1]);
+    let deauth = supervisor.deauthenticate("wlan0", mac).await.unwrap_err();
+    assert!(matches!(deauth, SupervisorError::NotOwned { .. }));
+
+    let status = supervisor.status("wlan0").await.expect("configured status");
+    assert_eq!(
+        status.hostapd_state,
+        HostapdState::Other("unreachable".to_string()),
+        "STATUS must not be read from the foreign ctrl socket"
+    );
+
+    let configure = supervisor
+        .configure(spec("wlan0", "net-b"))
+        .await
+        .unwrap_err();
+    assert!(matches!(configure, SupervisorError::NotOwned { .. }));
+    assert_eq!(
+        read_ssid_from_config(&render::config_path(&runtime_dir, "wlan0")),
+        "net-a",
+        "reload path must prove ctrl ownership before rewriting hostapd config"
+    );
 }
 
 #[tokio::test]

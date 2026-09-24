@@ -14,6 +14,7 @@ fn record(pid: u32) -> PersistedWifiRecord {
     PersistedWifiRecord {
         pid,
         started_at_unix: 1_700_000_000,
+        binary_path: Some(std::path::PathBuf::from("/usr/sbin/hostapd")),
         ctrl_path: PathBuf::from("/run/traffic-masq/hostapd/wlan0"),
         config_path: PathBuf::from("/run/traffic-masq/hostapd/wlan0.conf"),
         config_digest: digest(1),
@@ -27,6 +28,7 @@ async fn write_document(path: &Path, record: &PersistedWifiRecord) {
         schema_version: CURRENT_WIFI_RECORD_SCHEMA,
         pid: record.pid,
         started_at_unix: record.started_at_unix,
+        binary_path: record.binary_path.clone(),
         ctrl_path: record.ctrl_path.clone(),
         config_path: record.config_path.clone(),
         config_digest: record.config_digest,
@@ -216,4 +218,33 @@ async fn rejects_unsupported_schema_version() {
 
     let error = store.load().await.expect_err("unsupported schema");
     assert!(matches!(error, WifiRecordError::UnsupportedSchema(_, 99)));
+}
+
+#[tokio::test]
+async fn legacy_record_without_executable_identity_loads_unproven() {
+    let directory = tempdir().expect("tempdir");
+    let store = WifiRecordStore::for_access_point(directory.path(), "wlan0");
+    tokio::fs::create_dir_all(store.path().parent().unwrap())
+        .await
+        .unwrap();
+    tokio::fs::write(
+        store.path(),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "pid": 4242,
+            "started_at_unix": 1_700_000_000u64,
+            "ctrl_path": "/run/traffic-masq/hostapd/wlan0",
+            "config_path": "/run/traffic-masq/hostapd/wlan0.conf",
+            "config_digest": hex_of(&[1; 32]),
+            "key_digest": hex_of(&[2; 32]),
+            "ssid": "traffic-masq",
+        }))
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let record = store.load().await.expect("legacy record loads").expect("record");
+    assert_eq!(record.pid, 4242);
+    assert_eq!(record.binary_path, None);
 }

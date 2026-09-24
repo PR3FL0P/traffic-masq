@@ -31,6 +31,7 @@ type ResponderFactory<R> = dyn Fn(&str, &Path, &str) -> R + Send + Sync;
 /// the same process ownership, failure, termination, and call-recording model.
 pub(crate) struct FakeSupervisedProcess<R: Send + 'static> {
     configs: StdMutex<HashMap<u32, PathBuf>>,
+    ctrl_sockets: StdMutex<HashMap<u32, PathBuf>>,
     responders: StdMutex<HashMap<u32, R>>,
     calls: StdMutex<Vec<FakeProcessCall>>,
     next_pid: AtomicU32,
@@ -51,6 +52,7 @@ impl<R: Send + 'static> FakeSupervisedProcess<R> {
     ) -> Arc<Self> {
         Arc::new(Self {
             configs: StdMutex::new(HashMap::new()),
+            ctrl_sockets: StdMutex::new(HashMap::new()),
             responders: StdMutex::new(HashMap::new()),
             calls: StdMutex::new(Vec::new()),
             next_pid: AtomicU32::new(first_pid),
@@ -81,12 +83,28 @@ impl<R: Send + 'static> FakeSupervisedProcess<R> {
     }
 
     pub(crate) fn seed(&self, pid: u32, config_path: PathBuf, responder: R) {
+        let interface = config_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(|stem| stem.strip_suffix("-scan").unwrap_or(stem))
+            .unwrap_or("wlan0");
+        let ctrl_path = config_path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(interface);
         self.configs.lock().unwrap().insert(pid, config_path);
+        self.ctrl_sockets.lock().unwrap().insert(pid, ctrl_path);
         self.responders.lock().unwrap().insert(pid, responder);
+    }
+
+    pub(crate) fn detach_ctrl_socket(&self, pid: u32) {
+        self.responders.lock().unwrap().remove(&pid);
+        self.ctrl_sockets.lock().unwrap().remove(&pid);
     }
 
     pub(crate) fn kill_externally(&self, pid: u32) {
         self.responders.lock().unwrap().remove(&pid);
+        self.ctrl_sockets.lock().unwrap().remove(&pid);
         self.configs.lock().unwrap().remove(&pid);
     }
 
@@ -107,6 +125,13 @@ impl<R: Send + 'static> FakeSupervisedProcess<R> {
             let profile = self.spawn_profile.lock().unwrap().clone();
             let responder = (self.responder_factory)(interface, config_path, &profile);
             self.responders.lock().unwrap().insert(pid, responder);
+            self.ctrl_sockets.lock().unwrap().insert(
+                pid,
+                config_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new(""))
+                    .join(interface),
+            );
         }
         self.configs
             .lock()
@@ -144,7 +169,14 @@ impl<R: Send + 'static> SupervisedProcess for FakeSupervisedProcess<R> {
             && self.configs.lock().unwrap().contains_key(&pid))
     }
 
-    async fn cmdline_contains(&self, pid: u32, config_path: &Path) -> Result<bool, ProcessError> {
+    async fn identity_matches(
+        &self,
+        pid: u32,
+        _kind: crate::wifi::record::WifiProcessKind,
+        _binary_path: &Path,
+        config_path: &Path,
+        _started_at_unix: u64,
+    ) -> Result<bool, ProcessError> {
         Ok(self
             .configs
             .lock()
@@ -153,10 +185,12 @@ impl<R: Send + 'static> SupervisedProcess for FakeSupervisedProcess<R> {
             .is_some_and(|recorded| recorded == config_path))
     }
 
-    async fn pids_with_config_path(
+    async fn pids_matching_identity(
         &self,
         _kind: crate::wifi::record::WifiProcessKind,
+        _binary_path: &Path,
         config_path: &Path,
+        _started_at_unix: u64,
     ) -> Result<Vec<u32>, ProcessError> {
         let mut pids: Vec<u32> = self
             .configs
@@ -169,6 +203,15 @@ impl<R: Send + 'static> SupervisedProcess for FakeSupervisedProcess<R> {
         Ok(pids)
     }
 
+    async fn owns_unix_socket(&self, pid: u32, socket_path: &Path) -> Result<bool, ProcessError> {
+        Ok(self
+            .ctrl_sockets
+            .lock()
+            .unwrap()
+            .get(&pid)
+            .is_some_and(|owned| owned == socket_path))
+    }
+
     async fn terminate(&self, pid: u32) -> Result<(), ProcessError> {
         self.calls
             .lock()
@@ -176,6 +219,7 @@ impl<R: Send + 'static> SupervisedProcess for FakeSupervisedProcess<R> {
             .push(FakeProcessCall::Terminate(pid));
         if !self.persistent_responder.load(Ordering::Relaxed) {
             self.responders.lock().unwrap().remove(&pid);
+            self.ctrl_sockets.lock().unwrap().remove(&pid);
             self.configs.lock().unwrap().remove(&pid);
         }
         Ok(())
@@ -184,6 +228,7 @@ impl<R: Send + 'static> SupervisedProcess for FakeSupervisedProcess<R> {
     async fn kill(&self, pid: u32) -> Result<(), ProcessError> {
         self.calls.lock().unwrap().push(FakeProcessCall::Kill(pid));
         self.responders.lock().unwrap().remove(&pid);
+        self.ctrl_sockets.lock().unwrap().remove(&pid);
         self.configs.lock().unwrap().remove(&pid);
         Ok(())
     }

@@ -12,11 +12,13 @@ use serde::{Deserialize, Serialize};
 use tokio::net::UnixStream;
 use tokio::sync::RwLock;
 
+use crate::api::CONTROL_MUTATION_REQUEST_TIMEOUT;
 use crate::auth::LoginSession;
 
 const API_PREFIX: &str = "/api/v1";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const HOST_VALUE: &str = "localhost";
+const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct ClientAuthentication {
@@ -177,7 +179,10 @@ impl ApiClient {
             body,
             synthesize_pong,
         } = map_request(request)?;
-        let response = self.send(method, &path, body).await?;
+        let deadline = control_request_timeout(&method);
+        let response = self
+            .send_with_timeout(method, &path, body, deadline)
+            .await?;
         let body = into_success_body(response)?;
 
         if synthesize_pong {
@@ -187,9 +192,9 @@ impl ApiClient {
         serde_json::from_slice(&body).context("failed to decode response from the API")
     }
 
-    /// Send an HTTP request with the default ten-second deadline.
+    /// Send a short request with the default ten-second deadline.
     async fn send(&self, method: Method, path: &str, body: Option<Vec<u8>>) -> Result<RawResponse> {
-        self.send_with_timeout(method, path, body, std::time::Duration::from_secs(10))
+        self.send_with_timeout(method, path, body, DEFAULT_REQUEST_TIMEOUT)
             .await
     }
 
@@ -347,6 +352,7 @@ struct WifiSetPassphraseRequestBody<'a> {
 struct ProvisionWifiAccessPointRequestBody<'a> {
     settings: &'a crate::api::model::WifiEditRequest,
     passphrase: &'a Option<String>,
+    clear_passphrase: bool,
     configure_dhcp: bool,
 }
 
@@ -366,6 +372,18 @@ struct RawResponse {
 struct ErrorResponse {
     #[serde(alias = "error")]
     message: String,
+}
+
+fn control_request_timeout(method: &Method) -> std::time::Duration {
+    if method == &Method::POST
+        || method == &Method::PUT
+        || method == &Method::DELETE
+        || method == &Method::PATCH
+    {
+        CONTROL_MUTATION_REQUEST_TIMEOUT
+    } else {
+        DEFAULT_REQUEST_TIMEOUT
+    }
 }
 
 fn map_request(request: &crate::api::model::Request) -> Result<RestRequest> {
@@ -746,6 +764,7 @@ fn map_request(request: &crate::api::model::Request) -> Result<RestRequest> {
             interface,
             settings,
             passphrase,
+            clear_passphrase,
             configure_dhcp,
         } => RestRequest {
             method: Method::POST,
@@ -753,6 +772,7 @@ fn map_request(request: &crate::api::model::Request) -> Result<RestRequest> {
             body: Some(serialize_json(&ProvisionWifiAccessPointRequestBody {
                 settings,
                 passphrase,
+                clear_passphrase: *clear_passphrase,
                 configure_dhcp: *configure_dhcp,
             })?),
             synthesize_pong: false,

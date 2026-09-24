@@ -22,17 +22,19 @@ The supported build toolchain is Rust 1.95.0, pinned in `rust-toolchain.toml`.
 - kernel support for nftables and WireGuard
 - `nft` in `PATH`, built with JSON support
 - two or more network interfaces for router operation
-- `hostapd` for Wi-Fi access point mode
+- `hostapd` and `iw` for Wi-Fi access point mode
 - `wpa_supplicant` for Wi-Fi client mode
 
 The firewall is read back as JSON (`nft --json list ruleset`), so an nftables
 built without libjansson fails at the first firewall change rather than at
 startup.
 
-`hostapd` and `wpa_supplicant` are looked up at absolute paths, not through
-`PATH`. The defaults are `/usr/sbin/hostapd` and `/usr/sbin/wpa_supplicant`;
-distributions that ship them elsewhere need `wifi.hostapd_binary` and
-`wifi_client.wpa_supplicant_binary` set in the configuration file.
+`hostapd`, `iw` and `wpa_supplicant` are looked up at absolute paths, not through
+`PATH`. The defaults are `/usr/sbin/hostapd`, `/usr/sbin/iw` and
+`/usr/sbin/wpa_supplicant`; distributions that ship them elsewhere need
+`wifi.hostapd_binary`, `wifi.iw_binary` and `wifi_client.wpa_supplicant_binary`
+set in the configuration file. `iw` is used to validate AP channel/width against
+the selected PHY and the kernel's effective regulatory restrictions before hostapd is changed.
 
 WireGuard is configured over netlink, and both DHCP server and DHCP client are
 part of the daemon, so `wireguard-tools`, `dhcpcd` and `dhclient` are not used.
@@ -447,7 +449,8 @@ If an interface/router change cuts off your connection, the daemon rolls it
 back locally when the timer expires. The daemon must still be running for the
 timer to fire; after a crash, recovery runs on restart. Immediate DHCP/Wi-Fi/VPN
 operations also run their ownership recovery during startup. See
-[recovery](../SECURITY.md#rollback-and-recovery).
+[recovery](../SECURITY.md#rollback-and-recovery) and the
+[operator recovery runbook](recovery.md).
 
 ### What the daemon considers its own
 
@@ -506,10 +509,16 @@ subsystem is enabled; this switch alone does not prove a tunnel is connected.
 An absent router dataplane interface defers startup convergence after successful
 rollback instead of stopping the daemon. The daemon retries when the interface
 appears. Check `ip link`, reconnect the adapter, or correct its name in the router
-configuration. Logs identify the missing interface and its role, include the
-underlying error, and suggest these recovery steps. Other apply or rollback
-failures still fail startup. TUI session logs wrap long diagnostics and hints;
-use **Up/Down**, **PageUp/PageDown**, or **Home/End** to read them.
+configuration. Logs identify the missing interface and its role and include the
+underlying error. A router rollback that has already reached `RollbackFailed`
+can also leave the control plane available in degraded mode so the failure can
+be inspected and rollback retried. By contrast, startup remains blocked when
+persisted recovery evidence cannot be read or safely interpreted, such as an
+inaccessible recovery store, an unproven corrupt/unsupported router journal, or
+a revision contradiction. Startup diagnostics include a stable `TM-REC-xxx`
+recovery code that maps directly to the matching section of the
+[operator recovery runbook](recovery.md). TUI session logs wrap long diagnostics
+and hints; use **Up/Down**, **PageUp/PageDown**, or **Home/End** to read them.
 
 ### DHCP editor defaults
 

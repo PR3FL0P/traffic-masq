@@ -4,6 +4,7 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
     let Some(view) = app.router_pending.as_mut() else {
         return;
     };
+    let recovery_required = view.recovery_required();
     let now = current_unix_time();
     let timeout = app.router_rollback_timeout_seconds;
     let remaining = router_pending_seconds_remaining(view.applied_at_unix, timeout, now);
@@ -23,14 +24,34 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
 
     let mut detail_lines = vec![
         Line::styled(
-            format!("Pending transaction: {}", view.token),
+            if recovery_required {
+                format!("Recovery transaction: {}", view.token)
+            } else {
+                format!("Pending transaction: {}", view.token)
+            },
             Style::default()
                 .fg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
-        Line::from(format!("Automatic rollback in: {remaining}s / {timeout}s")),
+        Line::from(if recovery_required {
+            "Rollback failed; new router transactions are blocked".to_owned()
+        } else {
+            format!("Automatic rollback in: {remaining}s / {timeout}s")
+        }),
     ];
-    if let Some(failures) = &view.rollback_failure {
+    if let Some(recovery) = &view.recovery {
+        detail_lines.push(Line::from(""));
+        for (index, text) in recovery_notice_text(recovery, None).into_iter().enumerate() {
+            let style = if index == 0 {
+                Style::default().fg(theme::BAD).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::WARN)
+            };
+            detail_lines.push(Line::styled(text, style));
+        }
+    } else if let Some(failures) = &view.rollback_failure {
+        // Compatibility fallback for an older daemon that does not expose a
+        // structured recovery notice yet.
         detail_lines.push(Line::from(""));
         detail_lines.push(Line::styled(
             "ROLLBACK FAILED — manual recovery required:",
@@ -44,7 +65,11 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
         }
     }
 
-    let block = panel("Router change pending confirmation");
+    let block = panel(if recovery_required {
+        "Router rollback recovery"
+    } else {
+        "Router change pending confirmation"
+    });
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let chunks = Layout::default()
@@ -57,10 +82,22 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
         .split(inner);
 
     let gauge = Gauge::default()
-        .block(panel("Rollback countdown"))
-        .gauge_style(Style::default().fg(gauge_color))
-        .ratio(ratio)
-        .label(format!("{remaining}s"));
+        .block(panel(if recovery_required {
+            "Rollback recovery"
+        } else {
+            "Rollback countdown"
+        }))
+        .gauge_style(Style::default().fg(if recovery_required {
+            theme::BAD
+        } else {
+            gauge_color
+        }))
+        .ratio(if recovery_required { 0.0 } else { ratio })
+        .label(if recovery_required {
+            "recovery required".to_owned()
+        } else {
+            format!("{remaining}s")
+        });
     frame.render_widget(gauge, chunks[0]);
 
     let visible_rows = chunks[1].height.max(1) as usize;
@@ -71,39 +108,75 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
         chunks[1],
     );
 
-    let action_lines = vec![
-        Line::styled(
-            "[Commit]  persist changes (Enter)",
-            Style::default()
-                .fg(theme::SELECTED_FG)
-                .bg(theme::GOOD)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Line::styled(
-            "[Rollback]  restore previous state (Esc)",
-            Style::default()
-                .fg(theme::SELECTED_FG)
-                .bg(theme::WARN)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Line::styled(
-            "Up/Down or PgUp/PgDn scrolls diagnostics",
-            Style::default().fg(theme::MUTED),
-        ),
-    ];
-    app.ui.buttons.push((
-        Rect::new(chunks[2].x, chunks[2].y, "[Commit]".len() as u16, 1),
-        0,
-    ));
-    app.ui.buttons.push((
-        Rect::new(
-            chunks[2].x,
-            chunks[2].y.saturating_add(1),
-            "[Rollback]".len() as u16,
+    let action_lines = if recovery_required {
+        vec![
+            Line::styled(
+                "[Retry rollback]  retry recovery (Enter)",
+                Style::default()
+                    .fg(theme::SELECTED_FG)
+                    .bg(theme::WARN)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(
+                "[Back]  leave recovery pending (Esc)",
+                Style::default().fg(theme::MUTED),
+            ),
+            Line::styled(
+                "Up/Down or PgUp/PgDn scrolls diagnostics",
+                Style::default().fg(theme::MUTED),
+            ),
+        ]
+    } else {
+        vec![
+            Line::styled(
+                "[Commit]  persist changes (Enter)",
+                Style::default()
+                    .fg(theme::SELECTED_FG)
+                    .bg(theme::GOOD)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(
+                "[Rollback]  restore previous state (Esc)",
+                Style::default()
+                    .fg(theme::SELECTED_FG)
+                    .bg(theme::WARN)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(
+                "Up/Down or PgUp/PgDn scrolls diagnostics",
+                Style::default().fg(theme::MUTED),
+            ),
+        ]
+    };
+    if recovery_required {
+        app.ui.buttons.push((
+            Rect::new(chunks[2].x, chunks[2].y, "[Retry rollback]".len() as u16, 1),
+            0,
+        ));
+        app.ui.buttons.push((
+            Rect::new(
+                chunks[2].x,
+                chunks[2].y.saturating_add(1),
+                "[Back]".len() as u16,
+                1,
+            ),
             1,
-        ),
-        1,
-    ));
+        ));
+    } else {
+        app.ui.buttons.push((
+            Rect::new(chunks[2].x, chunks[2].y, "[Commit]".len() as u16, 1),
+            0,
+        ));
+        app.ui.buttons.push((
+            Rect::new(
+                chunks[2].x,
+                chunks[2].y.saturating_add(1),
+                "[Rollback]".len() as u16,
+                1,
+            ),
+            1,
+        ));
+    }
     frame.render_widget(Paragraph::new(action_lines), chunks[2]);
 }
 
@@ -148,8 +221,25 @@ pub(crate) async fn handle_router_pending_key(app: &mut TuiApp, key: KeyCode, cl
                 view.scroll = view.max_scroll;
             }
         }
-        KeyCode::Enter => finish_router_pending(app, client, true).await,
-        KeyCode::Esc => finish_router_pending(app, client, false).await,
+        KeyCode::Enter => {
+            let recovery_required = app
+                .router_pending
+                .as_ref()
+                .is_some_and(|view| view.recovery_required());
+            finish_router_pending(app, client, !recovery_required).await;
+        }
+        KeyCode::Esc => {
+            let recovery_required = app
+                .router_pending
+                .as_ref()
+                .is_some_and(|view| view.recovery_required());
+            if recovery_required {
+                app.screen = Screen::Router;
+                load_router_data(app, client).await;
+            } else {
+                finish_router_pending(app, client, false).await;
+            }
+        }
         _ => {}
     }
 }
@@ -185,15 +275,25 @@ async fn finish_router_pending(app: &mut TuiApp, client: &ApiClient, commit: boo
             load_router_data(app, client).await;
         }
         Ok(Response::RouterError { detail }) => {
+            let rollback_failed = matches!(
+                &detail,
+                RouterErrorDetail::RollbackFailed { .. }
+                    | RouterErrorDetail::RollbackRecoveryRequired
+            );
             app.push_message(LogLevel::Error, describe_router_error(&detail));
+            if rollback_failed {
+                refresh_router_pending_screen(app, client).await;
+            }
         }
         Ok(Response::RouterPendingTransaction {
             status: CoordinatorStatus::RollbackFailed,
             rollback_failure,
+            recovery,
             ..
         }) => {
             if let Some(view) = app.router_pending.as_mut() {
                 view.rollback_failure = rollback_failure;
+                view.recovery = recovery;
             }
         }
         Ok(response) => {
@@ -214,7 +314,8 @@ pub(crate) async fn refresh_router_pending_screen(app: &mut TuiApp, client: &Api
     }
     match client.request(&Request::RouterPendingTransaction).await {
         Ok(Response::RouterPendingTransaction {
-            status: CoordinatorStatus::Idle,
+            status:
+                CoordinatorStatus::Idle | CoordinatorStatus::RecoveredButJournalCleanupPending,
             ..
         }) => {
             app.router_pending = None;
@@ -227,10 +328,12 @@ pub(crate) async fn refresh_router_pending_screen(app: &mut TuiApp, client: &Api
         Ok(Response::RouterPendingTransaction {
             status: CoordinatorStatus::RollbackFailed,
             rollback_failure,
+            recovery,
             ..
         }) => {
             if let Some(view) = app.router_pending.as_mut() {
                 view.rollback_failure = rollback_failure;
+                view.recovery = recovery;
             }
         }
         Ok(Response::RouterPendingTransaction {

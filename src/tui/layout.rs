@@ -204,6 +204,26 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Tu
             ("Tab/S-Tab", "field"),
             ("Enter/Esc", "finish"),
         ]
+    } else if app.screen == Screen::RouterPending
+        && app.router_pending.as_ref().is_some_and(|view| {
+            view.recovery_required()
+        })
+    {
+        vec![
+            ("↑/↓", "details"),
+            ("PgUp/Dn", "page"),
+            ("Enter", "retry rollback"),
+            ("Esc", "back"),
+        ]
+    } else if app.screen == Screen::Router && app.router.recovery_blocks_mutations() {
+        vec![
+            ("r", "recovery action"),
+            ("1/2/3", "router section"),
+            ("↑/↓", "move"),
+            ("Tab", "focus"),
+            ("Enter", "activate"),
+            ("Esc", "back"),
+        ]
     } else {
         screen_help_pairs(app.screen)
     };

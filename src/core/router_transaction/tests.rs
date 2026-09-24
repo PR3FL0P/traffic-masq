@@ -437,8 +437,79 @@ async fn invalid_recovery_record_is_not_discarded() {
     tokio::fs::write(&coordinator.inner.journal, b"invalid")
         .await
         .unwrap();
-    assert!(coordinator.recover().await.is_err());
+    let error = coordinator
+        .recover()
+        .await
+        .expect_err("invalid recovery record must remain operator-blocking");
+    let diagnostic = error.to_string();
+    assert!(diagnostic.contains("recovery_code=TM-REC-203"));
+    assert!(diagnostic.contains("invariant=decodable_recovery_snapshot"));
+    assert!(diagnostic.contains(&format!(
+        "journal={}",
+        coordinator.inner.journal.display()
+    )));
+    assert!(diagnostic.contains("required_proof=independent_committed_transaction_token"));
+    assert!(diagnostic.contains("backup_scope=complete_state_directory"));
+    assert!(diagnostic.contains("operator_action=restore_coherent_backup"));
     assert!(coordinator.inner.journal.exists());
+}
+
+#[tokio::test]
+async fn unsupported_uncommitted_router_schema_reports_versions_and_action() {
+    let fake = FakeSubsystems::new();
+    let (coordinator, overrides, _directory) = coordinator_with(fake).await;
+    let candidate = build_candidate(&overrides).await;
+    let snapshot = coordinator
+        .manager()
+        .snapshot_for(candidate.desired())
+        .await
+        .unwrap();
+    let journal = TransactionJournal {
+        version: 999,
+        base_revision: candidate.base_revision(),
+        token: "uncommitted".to_string(),
+        snapshot,
+        current_desired: Some(candidate.desired().clone()),
+    };
+    tokio::fs::write(
+        &coordinator.inner.journal,
+        serde_json::to_vec(&journal).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let error = coordinator.recover().await.expect_err("unsupported schema must block");
+    let diagnostic = format!("{error:#}");
+    assert!(diagnostic.contains("recovery_code=TM-REC-205"));
+    assert!(diagnostic.contains("invariant=supported_schema"));
+    assert!(diagnostic.contains("journal_schema=999"));
+    assert!(diagnostic.contains("supported_schemas=1,2"));
+    assert!(diagnostic.contains("operator_action=use_compatible_daemon"));
+}
+
+#[tokio::test]
+async fn newer_router_journal_reports_both_revisions() {
+    let fake = FakeSubsystems::new();
+    let (coordinator, overrides, _directory) = coordinator_with(fake).await;
+    let candidate = build_candidate(&overrides).await;
+    let snapshot = coordinator
+        .manager()
+        .snapshot_for(candidate.desired())
+        .await
+        .unwrap();
+    coordinator
+        .write_journal(1, "uncommitted", &snapshot, candidate.desired())
+        .await
+        .unwrap();
+
+    let error = coordinator.recover().await.expect_err("newer journal must block");
+    let diagnostic = format!("{error:#}");
+    assert!(diagnostic.contains("recovery_code=TM-REC-206"));
+    assert!(diagnostic.contains("invariant=revision_order"));
+    assert!(diagnostic.contains("journal_base_revision=1"));
+    assert!(diagnostic.contains("committed_revision=0"));
+    assert!(diagnostic.contains("backup_scope=complete_state_directory"));
+    assert!(diagnostic.contains("operator_action=restore_coherent_backup"));
 }
 
 #[tokio::test]
@@ -1046,6 +1117,11 @@ async fn incomplete_rollback_enters_recovery_state_and_can_be_retried() {
         .expect("recorded failure");
     assert!(failure.failures.iter().any(|f| f.contains("rollback_dhcp")));
 
+    let view = coordinator.view().await;
+    assert_eq!(view.status, CoordinatorStatus::RollbackFailed);
+    assert_eq!(view.token.as_deref(), Some(failure.token.as_str()));
+    assert_eq!(view.rollback_failures, failure.failures);
+
     let blocked_candidate = build_candidate(&overrides).await;
     let blocked_plan = coordinator
         .plan(blocked_candidate)
@@ -1212,4 +1288,24 @@ async fn manual_rollback_retries_failed_startup_preparation_before_restoring() {
         .any(|event| event.starts_with("rollback_")));
     assert!(!coordinator.inner.journal.exists());
     assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
+}
+
+#[tokio::test]
+async fn dangling_router_journal_symlink_is_not_treated_as_missing() {
+    let fake = FakeSubsystems::new();
+    let (coordinator, _, directory) = coordinator_with(fake.clone()).await;
+    std::os::unix::fs::symlink(
+        directory.path().join("missing-router-journal-target"),
+        &coordinator.inner.journal,
+    )
+    .expect("dangling journal symlink");
+
+    let error = coordinator
+        .recover()
+        .await
+        .expect_err("dangling journal symlink must block recovery");
+    let diagnostic = format!("{error:#}");
+    assert!(diagnostic.contains("recovery_code=TM-REC-202"));
+    assert!(diagnostic.contains("invariant=accessible_router_recovery_journal"));
+    assert!(fake.events().is_empty(), "recovery must not mutate the network");
 }

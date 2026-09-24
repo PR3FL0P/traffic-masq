@@ -60,6 +60,7 @@ impl ControlService {
                 message: error.to_string(),
             });
         }
+        let clear_stored_passphrase = settings.security == WifiSecurity::Open;
         let effective = match self.effective_config().await {
             Ok(effective) => effective,
             Err(message) => return wifi_error(WifiErrorDetail::Other { message }),
@@ -118,6 +119,18 @@ impl ControlService {
                 ),
             });
         }
+        // Persist Open mode before removing the credential. If the process dies
+        // between these operations, the leftover secret is inert because Open
+        // AP rendering never resolves credentials from the secret store.
+        if clear_stored_passphrase {
+            if let Err(error) = wifi.clear_passphrase(&interface).await {
+                return wifi_error(WifiErrorDetail::Other {
+                    message: format!(
+                        "Wi-Fi was configured as open, but the obsolete stored passphrase could not be erased: {error}; credential cleanup required"
+                    ),
+                });
+            }
+        }
         Response::WifiConfigured { spec }
     }
 
@@ -126,21 +139,19 @@ impl ControlService {
         interface: String,
         settings: WifiEditRequest,
         passphrase: Option<String>,
+        clear_passphrase: bool,
         configure_dhcp: bool,
     ) -> Response {
         let Some(wifi) = &self.wifi else {
             return wifi_disabled();
         };
-        let staged_passphrase = match passphrase {
-            Some(value) => match WifiPassphrase::new(value) {
-                Ok(value) => Some(value),
-                Err(error) => {
-                    return wifi_error(WifiErrorDetail::InvalidSpec {
-                        message: error.to_string(),
-                    })
-                }
-            },
-            None => None,
+        let passphrase_update = match ap_passphrase_update(
+            settings.security,
+            passphrase,
+            clear_passphrase,
+        ) {
+            Ok(update) => update,
+            Err(detail) => return wifi_error(detail),
         };
         let effective = match self.effective_config().await {
             Ok(effective) => effective,
@@ -167,7 +178,10 @@ impl ControlService {
         if let (Some(next), Some(previous)) =
             (target.wifi.as_mut(), previous_interface.wifi.as_ref())
         {
-            next.passphrase_file = previous.passphrase_file.clone();
+            next.passphrase_file = ap_passphrase_file_update(
+                previous.passphrase_file.as_ref(),
+                &passphrase_update,
+            );
         }
         if configure_dhcp {
             let settings = match default_dhcp_settings(cidr) {
@@ -189,48 +203,38 @@ impl ControlService {
                 })
             }
         };
-        let dhcp = match DhcpServiceSpec::from_interface_config(
+        if let Err(error) = wifi.validate_radio(&spec).await {
+            return classify_wifi_error(error);
+        }
+        if let Err(error) = DhcpServiceSpec::from_interface_config(
             &interface,
             &target,
             self.base_config.dhcp.default_lease_seconds,
         ) {
-            Ok(spec) => spec,
-            Err(error) => return super::runtime::error_response(error),
-        };
-        // The legacy endpoint is an immediate commit, but its runtime and
-        // secret changes use the same durable interface transaction protocol.
+            return super::runtime::error_response(error);
+        }
+        // AP provisioning can sever the very connection used to administer the
+        // daemon (SSID/security/channel changes are the common case). Keep the
+        // converged candidate tentative and reuse the normal interface
+        // commit-confirm timer instead of persisting it immediately. The same
+        // transaction also journals the passphrase update, so timeout/manual
+        // rollback restores both network state and the previous secret.
         let pending = match self
             .transactions
-            .apply_with_passphrase(
+            .apply_with_passphrase_update(
                 &interface,
                 &target,
                 Some(&previous_interface),
                 Some(previous_interface.role),
                 false,
-                staged_passphrase,
+                passphrase_update,
             )
             .await
         {
             Ok(pending) => pending,
             Err(error) => return super::runtime::error_response(error),
         };
-        let result = self
-            .transactions
-            .commit_with(&pending.token, |name, config, allow| {
-                self.overrides
-                    .commit_interface(name, config, allow, &pending.token)
-            })
-            .await;
-        if let Err(error) = result {
-            let restored = self.transactions.rollback(&pending.token).await.map(|_| ());
-            return wifi_error(WifiErrorDetail::Other {
-                message: compensation_message("failed to commit AP provisioning", &error, restored),
-            });
-        }
-        Response::WifiAccessPointProvisioned {
-            spec,
-            dhcp: if configure_dhcp { dhcp } else { None },
-        }
+        Response::NetworkChangePending { change: pending }
     }
 
     pub(super) async fn disable_wifi(&self, interface: String) -> Response {
@@ -262,24 +266,34 @@ impl ControlService {
             });
         }
 
-        let Some(mut interface_config) = committed else {
-            return Response::WifiDisabled { interface };
-        };
-        interface_config.wifi = None;
-        if let Err(error) = self
-            .overrides
-            .set_interface(interface.clone(), interface_config, false)
-            .await
-        {
-            let restoration = match previous {
-                Some(previous) => wifi.configure(previous).await.map(|_| ()),
-                None => Ok(()),
-            };
+        if let Some(mut interface_config) = committed {
+            interface_config.wifi = None;
+            if let Err(error) = self
+                .overrides
+                .set_interface(interface.clone(), interface_config, false)
+                .await
+            {
+                let restoration = match previous {
+                    Some(previous) => wifi.configure(previous).await.map(|_| ()),
+                    None => Ok(()),
+                };
+                return wifi_error(WifiErrorDetail::Other {
+                    message: compensation_message(
+                        "failed to persist Wi-Fi disable",
+                        &error,
+                        restoration,
+                    ),
+                });
+            }
+        }
+
+        // The disabled state is durable before the credential is erased. A
+        // crash can therefore leave only an inert stale secret, never a
+        // persisted protected AP whose required secret has disappeared.
+        if let Err(error) = wifi.clear_passphrase(&interface).await {
             return wifi_error(WifiErrorDetail::Other {
-                message: compensation_message(
-                    "failed to persist Wi-Fi disable",
-                    &error,
-                    restoration,
+                message: format!(
+                    "Wi-Fi is disabled, but the stored passphrase could not be erased: {error}; credential cleanup required"
                 ),
             });
         }
@@ -389,6 +403,53 @@ impl ControlService {
     }
 }
 
+pub(super) fn ap_passphrase_file_update(
+    previous: Option<&std::path::PathBuf>,
+    update: &WifiPassphraseUpdate,
+) -> Option<std::path::PathBuf> {
+    match update {
+        WifiPassphraseUpdate::Keep => previous.cloned(),
+        WifiPassphraseUpdate::Set(_) | WifiPassphraseUpdate::Clear => None,
+    }
+}
+
+pub(super) fn ap_passphrase_update(
+    security: WifiSecurity,
+    passphrase: Option<String>,
+    clear_passphrase: bool,
+) -> Result<WifiPassphraseUpdate, WifiErrorDetail> {
+    if clear_passphrase && passphrase.is_some() {
+        return Err(WifiErrorDetail::InvalidSpec {
+            message: "passphrase and clear_passphrase are mutually exclusive".to_string(),
+        });
+    }
+    if security == WifiSecurity::Open {
+        if passphrase.is_some() {
+            return Err(WifiErrorDetail::InvalidSpec {
+                message: "an open access point cannot use a passphrase".to_string(),
+            });
+        }
+        // Open mode must actively remove stale per-interface credentials.
+        // This also keeps older REST clients safe because clear_passphrase
+        // defaults to false when the field is absent.
+        return Ok(WifiPassphraseUpdate::Clear);
+    }
+    if clear_passphrase {
+        return Err(WifiErrorDetail::InvalidSpec {
+            message: "a secured access point cannot clear its passphrase without a replacement"
+                .to_string(),
+        });
+    }
+    match passphrase {
+        Some(value) => WifiPassphrase::new(value)
+            .map(WifiPassphraseUpdate::Set)
+            .map_err(|error| WifiErrorDetail::InvalidSpec {
+                message: error.to_string(),
+            }),
+        None => Ok(WifiPassphraseUpdate::Keep),
+    }
+}
+
 pub(super) fn wifi_disabled() -> Response {
     Response::WifiError {
         detail: WifiErrorDetail::WifiDisabled,
@@ -415,6 +476,12 @@ pub(super) fn classify_wifi_error(error: SupervisorError) -> Response {
             WifiErrorDetail::HostapdMissing
         }
         SupervisorError::Process(error) => WifiErrorDetail::HostapdFailed {
+            message: error.to_string(),
+        },
+        SupervisorError::Radio(error) if error.is_unsupported() => WifiErrorDetail::InvalidSpec {
+            message: error.to_string(),
+        },
+        SupervisorError::Radio(error) => WifiErrorDetail::Other {
             message: error.to_string(),
         },
         SupervisorError::Render(RenderError::PassphraseRequired { .. }) => {
