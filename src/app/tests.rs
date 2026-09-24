@@ -1790,3 +1790,33 @@ async fn runtime_retries_startup_recovery_after_replug_without_replaying_live_jo
     }
     assert!(network.list_interfaces().await.unwrap()[0].is_up);
 }
+
+#[test]
+fn unrelated_interface_recovery_never_downgrades_fatal_router_recovery() {
+    let dir = tempdir().expect("tempdir");
+    crate::core::recovery::block_interface(dir.path(), "wlan0", "invalid snapshot".into());
+    assert!(crate::core::recovery::check_scope(dir.path(), None).is_err());
+    assert!(!router_recovery_allows_degraded_startup(
+        crate::core::router_transaction::CoordinatorStatus::Idle,
+        false,
+    ));
+    crate::core::recovery::unblock_interface(dir.path(), "wlan0");
+}
+
+#[test]
+fn explicit_router_recovery_states_may_keep_control_plane_available() {
+    use crate::core::router_transaction::CoordinatorStatus;
+
+    assert!(router_recovery_allows_degraded_startup(
+        CoordinatorStatus::RollbackFailed,
+        false,
+    ));
+    assert!(router_recovery_allows_degraded_startup(
+        CoordinatorStatus::Idle,
+        true,
+    ));
+    assert!(router_recovery_allows_degraded_startup(
+        CoordinatorStatus::RecoveredButJournalCleanupPending,
+        false,
+    ));
+}

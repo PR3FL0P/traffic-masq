@@ -272,6 +272,44 @@ async fn restart_keeps_address_whose_commit_token_was_persisted() {
 }
 
 #[tokio::test]
+async fn committed_invalid_interface_schema_is_retired_without_rollback() {
+    let directory = tempdir().unwrap();
+    let provider = fake_network();
+    let interfaces = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
+    interfaces
+        .apply_interface(
+            "test0",
+            &interface_config(PROPOSED),
+            Some(InterfaceRole::Output),
+            true,
+        )
+        .await
+        .unwrap();
+    let before = addresses(&provider).await;
+    let journal_dir = directory.path().join("interface-transactions");
+    tokio::fs::create_dir_all(&journal_dir).await.unwrap();
+    let journal = journal_dir.join("test0.json");
+    tokio::fs::write(
+        &journal,
+        br#"{"version":999,"token":"confirmed","future_field":true}"#,
+    )
+    .await
+    .unwrap();
+    let mut committed = crate::state::overrides::RuntimeOverrides::default();
+    committed
+        .committed_interface_transactions
+        .insert("test0".into(), "confirmed".into());
+
+    recover_interface_transactions(directory.path(), &interfaces, &committed)
+        .await
+        .unwrap();
+
+    assert_eq!(addresses(&provider).await, before);
+    assert!(!journal.exists());
+    assert!(crate::core::recovery::check_scope(directory.path(), Some("test0")).is_ok());
+}
+
+#[tokio::test]
 async fn direct_commit_persists_the_configuration_and_recovery_token() {
     let directory = tempdir().unwrap();
     let desired = desired_state(directory.path()).await;
@@ -694,4 +732,31 @@ async fn corrupt_interface_journal_does_not_prevent_another_recovery() {
     recover_interface_transactions(directory.path(), &interfaces, &Default::default())
         .await
         .unwrap();
+}
+
+#[test]
+fn interface_recovery_store_retries_only_explicitly_transient_io_errors() {
+    use crate::state::private_store::PrivateStoreError;
+    use std::io::{Error, ErrorKind};
+
+    for kind in [ErrorKind::Interrupted, ErrorKind::WouldBlock, ErrorKind::TimedOut] {
+        assert!(retryable_interface_store_error(&PrivateStoreError::Io(
+            Error::new(kind, "retry")
+        )));
+    }
+    for kind in [
+        ErrorKind::NotFound,
+        ErrorKind::PermissionDenied,
+        ErrorKind::NotADirectory,
+        ErrorKind::InvalidInput,
+        ErrorKind::InvalidData,
+        ErrorKind::Other,
+    ] {
+        assert!(!retryable_interface_store_error(&PrivateStoreError::Io(
+            Error::new(kind, "operator action")
+        )));
+    }
+    assert!(!retryable_interface_store_error(&PrivateStoreError::Symlink(
+        std::path::PathBuf::from("interface-transactions")
+    )));
 }

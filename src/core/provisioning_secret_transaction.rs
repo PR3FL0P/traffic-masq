@@ -20,6 +20,12 @@ pub struct ProvisioningSecretTransactionStore {
     passphrases: PassphraseStore,
 }
 
+#[derive(Deserialize)]
+struct ProvisioningSecretJournalHeader {
+    #[serde(default)]
+    token: Option<String>,
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProvisioningSecretJournal {
@@ -76,14 +82,10 @@ impl ProvisioningSecretTransactionStore {
         &self,
         committed_token: Option<&str>,
     ) -> Result<bool> {
-        let Some(journal) = self.load().await? else {
-            return Ok(false);
-        };
-        if journal.token.as_deref().is_some() && journal.token.as_deref() == committed_token {
-            self.clear().await?;
-            return Ok(false);
-        }
-        Ok(true)
+        Ok(self
+            .load_uncommitted_for_recovery(committed_token)
+            .await?
+            .is_some())
     }
 
     pub async fn bind_token(&self, token: &str) -> Result<()> {
@@ -201,13 +203,9 @@ impl ProvisioningSecretTransactionStore {
     /// A token already recorded as committed owns the staged secrets; every other
     /// journal represents an uncommitted transaction and must be restored.
     pub async fn recover(&self, committed_token: Option<&str>) -> Result<bool> {
-        let Some(journal) = self.load().await? else {
+        let Some(journal) = self.load_uncommitted_for_recovery(committed_token).await? else {
             return Ok(false);
         };
-        if journal.token.as_deref().is_some() && journal.token.as_deref() == committed_token {
-            self.clear().await?;
-            return Ok(false);
-        }
         self.restore_and_clear(journal).await?;
         Ok(true)
     }
@@ -248,6 +246,41 @@ impl ProvisioningSecretTransactionStore {
     }
 
     async fn load(&self) -> Result<Option<ProvisioningSecretJournal>> {
+        let Some(bytes) = self.load_pending_bytes().await? else {
+            return Ok(None);
+        };
+        self.decode(&bytes).map(Some)
+    }
+
+    /// Return only recovery metadata that can still require rollback. A journal
+    /// proven committed by the durable router token is retired before full-schema
+    /// decoding. This deliberately does not infer a token from malformed JSON.
+    async fn load_uncommitted_for_recovery(
+        &self,
+        committed_token: Option<&str>,
+    ) -> Result<Option<ProvisioningSecretJournal>> {
+        let Some(bytes) = self.load_pending_bytes().await? else {
+            return Ok(None);
+        };
+        let committed = serde_json::from_slice::<ProvisioningSecretJournalHeader>(&bytes)
+            .ok()
+            .and_then(|header| header.token)
+            .is_some_and(|token| Some(token.as_str()) == committed_token);
+        if committed {
+            tracing::warn!(
+                journal = %self.journal.display(),
+                operation = "retire_committed_provisioning_journal",
+                invariant = "committed_token_proof",
+                metadata_safe_to_remove = true,
+                "retiring provisioning recovery metadata proven obsolete by committed router token"
+            );
+            self.clear().await?;
+            return Ok(None);
+        }
+        self.decode(&bytes).map(Some)
+    }
+
+    async fn load_pending_bytes(&self) -> Result<Option<Zeroizing<Vec<u8>>>> {
         // Merely checking for crash-recovery state must not create or chmod the
         // runtime state directory. This matters for read-only/test setups and
         // also avoids turning every network API request into a filesystem
@@ -298,21 +331,24 @@ impl ProvisioningSecretTransactionStore {
             crate::core::recovery::retire(&self.journal).await?;
             return Ok(None);
         }
-        let journal: ProvisioningSecretJournal =
-            serde_json::from_slice(&bytes).with_context(|| {
-                format!(
-                    "failed to parse provisioning secret journal {}",
-                    self.journal.display()
-                )
-            })?;
+        Ok(Some(bytes))
+    }
+
+    fn decode(&self, bytes: &[u8]) -> Result<ProvisioningSecretJournal> {
+        let journal: ProvisioningSecretJournal = serde_json::from_slice(bytes).with_context(|| {
+            format!(
+                "invariant=valid_provisioning_secret_snapshot; journal={}; object=router-provisioning-secrets; operation=decode; metadata_safe_to_remove=false; operator_action=inspect_or_restore_journal",
+                self.journal.display()
+            )
+        })?;
         if journal.version != JOURNAL_VERSION {
             bail!(
-                "unsupported provisioning secret journal version {} in {}",
-                journal.version,
-                self.journal.display()
+                "invariant=supported_provisioning_secret_schema; journal={}; object=router-provisioning-secrets; operation=decode; metadata_safe_to_remove=false; operator_action=inspect_or_restore_journal: unsupported provisioning secret journal version {}",
+                self.journal.display(),
+                journal.version
             );
         }
-        Ok(Some(journal))
+        Ok(journal)
     }
 
     async fn save(&self, journal: &ProvisioningSecretJournal) -> Result<()> {

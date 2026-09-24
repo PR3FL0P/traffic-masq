@@ -52,3 +52,26 @@ and `wifi/client` namespaces.
 Rollback cannot run while the daemon is stopped or killed; recovery resumes
 when it starts again. Test recovery on the kernel, init system and hardware you
 plan to use.
+
+### Operator recovery boundary
+
+Recovery heals automatically only when the daemon has an independent proof that
+no rollback data is still needed. A matching committed router token or an exact
+recovery receipt can therefore retire stale metadata even when the full journal
+schema is no longer readable. Cleanup failures and transient interface-journal
+store I/O are retried. A corrupt journal is never treated as proof by itself.
+
+Manual intervention is required when the daemon cannot prove whether an
+interrupted change committed, when journal revisions contradict committed state,
+when route ownership is ambiguous, or when the recovery store has a structural
+or permission error. In those cases preserve the state directory first. Check
+the log fields `invariant`, `journal`, `operation`, `metadata_safe_to_remove`, and
+`operator_action`; repair the reported filesystem/layout problem or restore a
+matching journal/state backup, then restart the daemon. Do not delete an
+unresolved router or provisioning journal merely to make startup continue.
+
+A corrupt per-interface journal is scoped to that interface. Repair or restore
+that interface's journal while leaving the daemon and unaffected interfaces
+running. Router rollback failures and foreign-route conflicts similarly keep the
+control plane available so the pending transaction can be inspected and an
+explicit rollback retried without deleting recovery evidence.

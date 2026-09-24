@@ -33,6 +33,11 @@ pub struct PendingNetworkChange {
     pub expires_at_unix: u64,
 }
 
+#[derive(Deserialize)]
+struct InterfaceJournalHeader {
+    token: String,
+}
+
 #[derive(Serialize, Deserialize)]
 struct InterfaceJournal {
     version: u32,
@@ -57,6 +62,91 @@ impl SecretSnapshot {
     }
 }
 
+const INTERFACE_RECOVERY_STORE_ATTEMPTS: usize = 3;
+const INTERFACE_RECOVERY_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+fn retryable_interface_store_error(
+    error: &crate::state::private_store::PrivateStoreError,
+) -> bool {
+    matches!(
+        error,
+        crate::state::private_store::PrivateStoreError::Io(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::TimedOut
+            )
+    )
+}
+
+fn interface_recovery_store_error(
+    operation: &'static str,
+    error: crate::state::private_store::PrivateStoreError,
+) -> anyhow::Error {
+    anyhow::Error::new(error).context(format!(
+        "invariant=accessible_interface_recovery_store; object=interface-transactions; operation={operation}; metadata_safe_to_remove=false; operator_action=inspect_state_directory_layout_permissions_or_storage"
+    ))
+}
+
+async fn open_interface_recovery_store(
+    state_dir: &std::path::Path,
+) -> Result<crate::state::private_store::PrivateJsonDirectory> {
+    for attempt in 1..=INTERFACE_RECOVERY_STORE_ATTEMPTS {
+        let root = state_dir.to_path_buf();
+        let opened = tokio::task::spawn_blocking(move || {
+            crate::state::private_store::PrivateJsonDirectory::open(root, "interface-transactions")
+        })
+        .await?;
+
+        match opened {
+            Ok(store) => return Ok(store),
+            Err(error)
+                if attempt < INTERFACE_RECOVERY_STORE_ATTEMPTS
+                    && retryable_interface_store_error(&error) =>
+            {
+                tracing::warn!(
+                    attempt,
+                    max_attempts = INTERFACE_RECOVERY_STORE_ATTEMPTS,
+                    operation = "open_interface_recovery_store",
+                    error = %error,
+                    "transient interface recovery store error; retrying"
+                );
+                tokio::time::sleep(INTERFACE_RECOVERY_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(interface_recovery_store_error("open", error)),
+        }
+    }
+    unreachable!("interface recovery retry loop always returns on its final attempt")
+}
+
+async fn enumerate_interface_recovery_journals(
+    store: &crate::state::private_store::PrivateJsonDirectory,
+) -> Result<Vec<String>> {
+    for attempt in 1..=INTERFACE_RECOVERY_STORE_ATTEMPTS {
+        let store = store.clone();
+        let names = tokio::task::spawn_blocking(move || store.keys()).await?;
+        match names {
+            Ok(names) => return Ok(names),
+            Err(error)
+                if attempt < INTERFACE_RECOVERY_STORE_ATTEMPTS
+                    && retryable_interface_store_error(&error) =>
+            {
+                tracing::warn!(
+                    attempt,
+                    max_attempts = INTERFACE_RECOVERY_STORE_ATTEMPTS,
+                    operation = "enumerate_interface_recovery_journals",
+                    error = %error,
+                    "transient interface recovery store error; retrying"
+                );
+                tokio::time::sleep(INTERFACE_RECOVERY_RETRY_DELAY).await;
+            }
+            Err(error) => return Err(interface_recovery_store_error("enumerate", error)),
+        }
+    }
+    unreachable!("interface recovery retry loop always returns on its final attempt")
+}
+
 /// Restore unconfirmed interface snapshots before applying startup configuration.
 /// In particular, startup otherwise skips interfaces that were previously unmanaged.
 pub async fn recover_interface_transactions(
@@ -64,12 +154,8 @@ pub async fn recover_interface_transactions(
     manager: &InterfaceManager,
     committed: &crate::state::overrides::RuntimeOverrides,
 ) -> Result<()> {
-    let root = state_dir.to_path_buf();
-    let store = tokio::task::spawn_blocking(move || {
-        crate::state::private_store::PrivateJsonDirectory::open(root, "interface-transactions")
-    })
-    .await??;
-    let names = store.keys()?;
+    let store = open_interface_recovery_store(state_dir).await?;
+    let names = enumerate_interface_recovery_journals(&store).await?;
     recover_interface_journals(state_dir, manager, committed, &store, names).await;
     Ok(())
 }
@@ -84,11 +170,7 @@ pub(crate) async fn retry_interface_recovery(
     if names.is_empty() {
         return Ok(());
     }
-    let root = state_dir.to_path_buf();
-    let store = tokio::task::spawn_blocking(move || {
-        crate::state::private_store::PrivateJsonDirectory::open(root, "interface-transactions")
-    })
-    .await??;
+    let store = open_interface_recovery_store(state_dir).await?;
     recover_interface_journals(state_dir, manager, committed, &store, names).await;
     Ok(())
 }
@@ -107,6 +189,21 @@ async fn recover_interface_journals(
                 anyhow::anyhow!("recovery journal disappeared before restoration")
             })?;
             if crate::core::recovery::completed(&path, &bytes).await? {
+                return crate::core::recovery::retire(&path).await;
+            }
+            let committed_token = committed.committed_interface_transactions.get(&name);
+            let committed_proof = serde_json::from_slice::<InterfaceJournalHeader>(&bytes)
+                .ok()
+                .is_some_and(|header| Some(&header.token) == committed_token);
+            if committed_proof {
+                tracing::warn!(
+                    interface = %name,
+                    journal = %path.display(),
+                    operation = "retire_committed_interface_journal",
+                    invariant = "committed_token_proof",
+                    metadata_safe_to_remove = true,
+                    "retiring interface recovery metadata proven obsolete by committed token"
+                );
                 return crate::core::recovery::retire(&path).await;
             }
             let record: InterfaceJournal = serde_json::from_slice(&bytes)?;

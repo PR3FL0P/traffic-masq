@@ -93,3 +93,105 @@ async fn reconvergence_restore_keeps_journal_until_explicit_completion() {
         .await
         .expect("journal cleared"));
 }
+
+#[tokio::test]
+async fn committed_unknown_schema_is_retired_before_full_decode() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
+    let passphrases = PassphraseStore::new(temp.path().join("wifi/psk"));
+    let current = WifiPassphrase::new("current-password").expect("current");
+    passphrases.set("wlan0", &current).expect("current write");
+    tokio::fs::create_dir_all(temp.path().join("wifi"))
+        .await
+        .expect("wifi dir");
+    tokio::fs::write(
+        temp.path().join("wifi/router-provisioning-secrets.json"),
+        br#"{"version":999,"token":"committed","future_field":true}"#,
+    )
+    .await
+    .expect("journal");
+
+    assert!(!store.recover(Some("committed")).await.expect("recover"));
+    assert!(!temp
+        .path()
+        .join("wifi/router-provisioning-secrets.json")
+        .exists());
+    assert_eq!(
+        passphrases
+            .get("wlan0")
+            .expect("read")
+            .expect("secret")
+            .expose(),
+        "current-password"
+    );
+}
+
+#[tokio::test]
+async fn uncommitted_unknown_schema_remains_operator_blocking() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
+    tokio::fs::create_dir_all(temp.path().join("wifi"))
+        .await
+        .expect("wifi dir");
+    let journal = temp.path().join("wifi/router-provisioning-secrets.json");
+    tokio::fs::write(
+        &journal,
+        br#"{"version":999,"token":"uncommitted","previous":{}}"#,
+    )
+    .await
+    .expect("journal");
+
+    let error = store
+        .recover(Some("different"))
+        .await
+        .expect_err("unsupported uncommitted schema must remain blocked");
+    assert!(error
+        .to_string()
+        .contains("supported_provisioning_secret_schema"));
+    assert!(journal.exists());
+}
+
+
+#[tokio::test]
+async fn missing_committed_token_never_proves_null_journal_token_committed() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
+    tokio::fs::create_dir_all(temp.path().join("wifi"))
+        .await
+        .expect("wifi dir");
+    let journal = temp.path().join("wifi/router-provisioning-secrets.json");
+    tokio::fs::write(&journal, br#"{"version":999,"token":null,"previous":{}}"#)
+        .await
+        .expect("journal");
+
+    let error = store
+        .recover(None)
+        .await
+        .expect_err("None == None is not independent commit proof");
+    assert!(error
+        .to_string()
+        .contains("supported_provisioning_secret_schema"));
+    assert!(journal.exists());
+}
+
+#[tokio::test]
+async fn malformed_json_never_infers_commit_from_token_text() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
+    tokio::fs::create_dir_all(temp.path().join("wifi"))
+        .await
+        .expect("wifi dir");
+    let journal = temp.path().join("wifi/router-provisioning-secrets.json");
+    tokio::fs::write(&journal, br#"{"token":"committed""#)
+        .await
+        .expect("journal");
+
+    let error = store
+        .recover(Some("committed"))
+        .await
+        .expect_err("malformed JSON has no trustworthy token proof");
+    assert!(error
+        .to_string()
+        .contains("valid_provisioning_secret_snapshot"));
+    assert!(journal.exists());
+}

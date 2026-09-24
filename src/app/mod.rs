@@ -1455,6 +1455,17 @@ async fn migrate_vpn_policy_mode_to_chain(config: &mut AppConfig) {
     }];
 }
 
+fn router_recovery_allows_degraded_startup(
+    status: crate::core::router_transaction::CoordinatorStatus,
+    foreign_route_conflict: bool,
+) -> bool {
+    matches!(
+        status,
+        crate::core::router_transaction::CoordinatorStatus::RollbackFailed
+            | crate::core::router_transaction::CoordinatorStatus::RecoveredButJournalCleanupPending
+    ) || foreign_route_conflict
+}
+
 /// Initialize services, recover interrupted changes, and drive network convergence until shutdown.
 /// Drain accepted operations before applying configured shutdown and restoration policies.
 pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
@@ -1475,7 +1486,7 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     )
     .recover(override_snapshot.committed_router_transaction.as_deref())
     .await
-    .context("invariant=restore_provisioning_secrets; object=router-provisioning-secrets.json; operation=startup_recovery; metadata_safe_to_remove=false; preserve journal for inspection")?;
+    .context("invariant=restore_provisioning_secrets; object=router-provisioning-secrets.json; operation=startup_recovery; metadata_safe_to_remove=false; operator_action=inspect_or_restore_journal; preserve journal for inspection")?;
     let effective_config = override_snapshot.effective_config(&config)?;
     let bindings = HttpApiBindings::bind(&effective_config)?;
     let auth = AuthService::open(&config.auth).await?;
@@ -1507,7 +1518,7 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         &override_snapshot,
     )
     .await
-    .context("invariant=enumerable_interface_journals; object=interface-transactions; operation=startup_recovery; metadata_safe_to_remove=false")?;
+    .context("invariant=accessible_interface_recovery_store; object=interface-transactions; operation=startup_recovery; metadata_safe_to_remove=false; operator_action=inspect_state_directory_layout_permissions_or_storage")?;
     let mut startup_config = effective_config.clone();
     startup_config.network.interfaces.retain(|name, _| {
         crate::core::recovery::check_scope(&config.runtime.state_dir, Some(name)).is_ok()
@@ -1727,16 +1738,15 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
             }
             .await;
             if let Err(error) = recovered {
-                if coordinator.status().await
-                    == crate::core::router_transaction::CoordinatorStatus::RollbackFailed
-                    || error
+                // Interface recovery is deliberately isolated. A blocked interface
+                // must never downgrade an unrelated, unproven router journal error
+                // from fatal to degraded startup.
+                if router_recovery_allows_degraded_startup(
+                    coordinator.status().await,
+                    error
                         .downcast_ref::<crate::core::route::ForeignRouteConflict>()
-                        .is_some()
-                    || crate::core::recovery::check_scope(&config.runtime.state_dir, None).is_err()
-                    || crate::core::recovery::cleanup_pending(
-                        &config.runtime.state_dir.join("router-transaction.json"),
-                    )
-                {
+                        .is_some(),
+                ) {
                     tracing::error!(journal = %config.runtime.state_dir.join("router-transaction.json").display(),
                         operation = "startup_recovery", invariant = "preserve_unresolved_snapshot",
                         metadata_safe_to_remove = false, error = %format!("{error:#}"),

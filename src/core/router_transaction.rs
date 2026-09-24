@@ -711,7 +711,7 @@ impl RouterTransactionCoordinator {
             .await
             .committed_router_transaction;
         let header: serde_json::Value = serde_json::from_slice(&bytes).with_context(|| format!(
-            "invariant=decodable_recovery_snapshot; journal={}; object=router; operation=decode; metadata_safe_to_remove=false; preserve journal for operator inspection", self.inner.journal.display()))?;
+            "invariant=decodable_recovery_snapshot; journal={}; object=router; operation=decode; metadata_safe_to_remove=false; operator_action=restore_matching_journal_or_backup_and_verify_commit; preserve journal for operator inspection", self.inner.journal.display()))?;
         if header
             .get("token")
             .and_then(|value| value.as_str())
@@ -734,15 +734,15 @@ impl RouterTransactionCoordinator {
             return Ok(false);
         }
         let journal: TransactionJournal = serde_json::from_value(header).with_context(|| format!(
-            "invariant=valid_recovery_snapshot; journal={}; object=router; operation=decode; metadata_safe_to_remove=false", self.inner.journal.display()))?;
+            "invariant=valid_recovery_snapshot; journal={}; object=router; operation=decode; metadata_safe_to_remove=false; operator_action=restore_matching_journal_or_backup_and_verify_commit", self.inner.journal.display()))?;
         anyhow::ensure!(
             matches!(journal.version, 1 | 2),
-            "invariant=supported_schema; journal={}; object=router; operation=decode; metadata_safe_to_remove=false: unsupported router transaction journal version", self.inner.journal.display()
+            "invariant=supported_schema; journal={}; object=router; operation=decode; metadata_safe_to_remove=false; operator_action=upgrade_daemon_or_restore_matching_backup: unsupported router transaction journal version", self.inner.journal.display()
         );
         let revision = self.inner.overrides.committed_revision().await;
         anyhow::ensure!(
             revision >= journal.base_revision,
-            "invariant=revision_order; journal={}; object=router; operation=validate; metadata_safe_to_remove=false: transaction journal is newer than committed configuration", self.inner.journal.display()
+            "invariant=revision_order; journal={}; object=router; operation=validate; metadata_safe_to_remove=false; operator_action=restore_matching_state_backup: transaction journal is newer than committed configuration", self.inner.journal.display()
         );
         let committed = self
             .inner
