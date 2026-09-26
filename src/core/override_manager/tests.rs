@@ -187,6 +187,7 @@ async fn dhcp_client_interface_override_normalizes_saves_and_round_trips() {
             InterfaceOverride {
                 config: interface.clone(),
                 allow_management_change: false,
+                dhcp_client_only: false,
             },
         )]),
         ..RuntimeOverrides::default()
@@ -460,6 +461,7 @@ async fn router_and_interface_conflict_is_rejected_without_state_change() {
                 wifi_client: None,
             },
             allow_management_change: true,
+            dhcp_client_only: false,
         },
     );
 

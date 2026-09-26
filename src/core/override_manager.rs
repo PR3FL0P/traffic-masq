@@ -315,6 +315,7 @@ impl RuntimeOverrideManager {
             InterfaceOverride {
                 config,
                 allow_management_change,
+                dhcp_client_only: false,
             },
         );
         self.save_locked(&mut state, candidate).await
@@ -338,6 +339,7 @@ impl RuntimeOverrideManager {
             InterfaceOverride {
                 config,
                 allow_management_change,
+                dhcp_client_only: false,
             },
         );
         self.save_locked(&mut state, candidate).await
@@ -358,6 +360,7 @@ impl RuntimeOverrideManager {
             InterfaceOverride {
                 config: config.clone(),
                 allow_management_change,
+                dhcp_client_only: false,
             },
         );
         let candidate = candidate.normalized()?;

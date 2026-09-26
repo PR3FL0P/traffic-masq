@@ -306,6 +306,36 @@ fn dhcp_uplink_materializes_dhcp_client_from_the_same_candidate_snapshot() {
         .expect("derived wan0 override");
     assert!(wan.config.dhcp_client.as_ref().unwrap().enabled);
     assert!(!wan.allow_management_change);
+    assert!(wan.dhcp_client_only);
+}
+
+#[test]
+fn derived_dhcp_client_follows_later_base_interface_changes() {
+    let mut base = base_config();
+    base.network.interfaces.get_mut("wan0").unwrap().managed = true;
+    let candidate = RouterCandidate::build(
+        &base,
+        &committed(),
+        &RouterIntentProposal::new().set_router(dhcp_router()),
+    )
+    .expect("DHCP uplink candidate");
+
+    let mut updated_base = base.clone();
+    let wan = updated_base.network.interfaces.get_mut("wan0").unwrap();
+    wan.nat = false;
+    wan.dhcp_client = Some(DhcpClientInterfaceConfig {
+        enabled: false,
+        route_metric: 777,
+        ..Default::default()
+    });
+
+    let persisted = serde_json::to_vec(candidate.document()).unwrap();
+    let committed: RuntimeOverrides = serde_json::from_slice(&persisted).unwrap();
+    let effective = committed.effective_config(&updated_base).unwrap();
+    let wan = &effective.network.interfaces["wan0"];
+    assert!(!wan.nat);
+    assert_eq!(wan.dhcp_client.as_ref().unwrap().route_metric, 777);
+    assert!(wan.dhcp_client.as_ref().unwrap().enabled);
 }
 
 #[test]
@@ -328,6 +358,7 @@ fn dhcp_uplink_preserves_existing_override_metadata_and_policy_options() {
         InterfaceOverride {
             config: wan,
             allow_management_change: true,
+            dhcp_client_only: false,
         },
     );
 

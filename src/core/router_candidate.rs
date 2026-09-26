@@ -53,6 +53,7 @@ impl RouterIntentProposal {
             Some(InterfaceOverride {
                 config,
                 allow_management_change,
+                dhcp_client_only: false,
             }),
         );
         self
@@ -183,6 +184,7 @@ fn apply_derived_router_requirements(
         InterfaceOverride {
             config,
             allow_management_change: false,
+            dhcp_client_only: true,
         },
     );
     Ok(())

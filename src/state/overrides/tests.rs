@@ -96,6 +96,7 @@ fn effective_config_revalidates_router_against_interface_overrides() {
                 nat: true,
             },
             allow_management_change: true,
+            dhcp_client_only: false,
         },
     );
 

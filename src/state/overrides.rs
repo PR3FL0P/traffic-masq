@@ -186,6 +186,13 @@ pub struct InterfaceOverride {
     pub config: InterfaceConfig,
     #[serde(default)]
     pub allow_management_change: bool,
+    /// Router-created DHCP enablement; all interface settings follow the base config.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dhcp_client_only: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl RuntimeOverrides {
@@ -225,10 +232,20 @@ impl RuntimeOverrides {
     pub fn effective_network(&self, base: &NetworkConfig) -> Result<NetworkConfig> {
         let mut effective = base.clone();
         for (interface, value) in &self.interfaces {
-            value.config.validate(interface)?;
-            effective
-                .interfaces
-                .insert(interface.clone(), value.config.clone());
+            let config = if value.dhcp_client_only {
+                let mut config = base.interfaces.get(interface).cloned().with_context(|| {
+                    format!("base interface {interface} for derived DHCP client is missing")
+                })?;
+                config
+                    .dhcp_client
+                    .get_or_insert_with(Default::default)
+                    .enabled = true;
+                config
+            } else {
+                value.config.clone()
+            };
+            config.validate(interface)?;
+            effective.interfaces.insert(interface.clone(), config);
         }
         effective.validate()?;
         Ok(effective)
