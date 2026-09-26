@@ -66,13 +66,13 @@ and SysVinit.
 If you skipped startup, start it manually:
 
 ```sh
-sudo /usr/local/bin/traffic-masqd start
+sudo /usr/local/sbin/traffic-masqd start
 ```
 
 Check that it is running:
 
 ```sh
-sudo /usr/local/bin/traffic-masqd status
+sudo /usr/local/sbin/traffic-masqd status
 ```
 
 ### 3. Open the terminal client

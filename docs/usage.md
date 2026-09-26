@@ -157,8 +157,9 @@ side-effect-free binary package staging: staging never discovers, enables, or
 starts host services. See [init integration](../packaging/INIT.md) for lifecycle,
 file ownership, recovery, and native commands.
 
-The release workflow builds an archive containing both binaries and SHA-256
-checksums. See [release procedure](release.md). Target machines do not need Rust
+The manual compile workflow builds an archive containing both binaries. Use the
+local release script to produce a versioned archive and SHA-256 checksum. See
+[release procedure](release.md). Target machines do not need Rust
 or a C compiler.
 
 ## Reset all settings
@@ -409,13 +410,14 @@ traffic-masqd [--config <path>] <command>
 ## Client commands
 
 ```text
-traffic-masq [--socket <path>] [--direct | --change-password]
+traffic-masq [--socket <path>] [--direct | --change-password | --check-conflicts]
 ```
 
 | Option | Function |
 | --- | --- |
 | `--direct` | Read interface state without the daemon. |
 | `--change-password` | Change the password through a running daemon. |
+| `--check-conflicts` | Report detected competing network managers and resolution advice. |
 
 Direct mode is read-only. DHCP, router, VPN, and settings operations are not
 available in this mode.
