@@ -163,10 +163,7 @@ impl ControlService {
         if previous.is_none() {
             return dhcp_client_error(DhcpClientErrorDetail::Disabled);
         }
-        config.dhcp_client = Some(dhcp_client_request_to_config(
-            &DhcpClientConfigRequest::default(),
-            false,
-        ));
+        config.dhcp_client.get_or_insert_with(Default::default).enabled = false;
 
         if let Err(error) = self
             .overrides

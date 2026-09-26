@@ -4237,6 +4237,15 @@ async fn dhcp_client_control_configure_compensates_runtime_when_persistence_fail
 #[tokio::test]
 async fn dhcp_client_control_delete_cleans_runtime_and_persists_disabled_intent() {
     let fixture = dhcp_client_control_fixture(true).await;
+    let mut original = fixture.overrides.effective_interface("wan0").await.unwrap().unwrap();
+    let policy = original.dhcp_client.as_mut().unwrap();
+    policy.route_metric = 777;
+    policy.install_default_route = false;
+    policy.request_dns = false;
+    policy.send_release_on_shutdown = false;
+    let mut expected = policy.clone();
+    expected.enabled = false;
+    fixture.overrides.set_interface("wan0".into(), original, false).await.unwrap();
     let response = fixture
         .service
         .dispatch(Request::DisableDhcpClient {
@@ -4255,7 +4264,7 @@ async fn dhcp_client_control_delete_cleans_runtime_and_persists_disabled_intent(
         persisted.managed,
         "managed interface remains managed when dhcp client is disabled"
     );
-    assert!(!persisted.dhcp_client.unwrap().enabled);
+    assert_eq!(persisted.dhcp_client.unwrap(), expected);
     assert_eq!(persisted.wifi_client.unwrap().ssid, "upstream");
 }
 
