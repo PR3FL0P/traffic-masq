@@ -1255,7 +1255,10 @@ fn spawn_router_dataplane_integrity_checks(
             tokio::select! {
                 _ = interval.tick() => {
                     if shutdown_requested(&shutdown) { break; }
-                    let _network_mutation = network_mutations.read().await;
+                    // This audit is an autonomous writer when it repairs drift.
+                    // Take exclusive runtime execution so it cannot race interface
+                    // convergence or another background repair pass.
+                    let _network_mutation = network_mutations.execute().await;
                     let router_busy = match &router {
                         Some(router) => router.status().await
                             != crate::core::router_transaction::CoordinatorStatus::Idle,
