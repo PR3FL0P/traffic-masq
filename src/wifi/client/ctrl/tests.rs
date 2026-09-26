@@ -237,3 +237,11 @@ fn scan_decodes_unicode_and_literal_backslashes_without_loss() {
         parse_status("wpa_state=COMPLETED\nssid=\\xd0\\x94\\xd1\\x96\\xd0\\xbc\n").unwrap();
     assert_eq!(status.ssid.as_deref(), Some("Дім"));
 }
+
+#[test]
+fn binary_ssids_are_retained_with_exact_bytes_and_an_escaped_display() {
+    let rows = parse_scan_results("02:00:00:00:00:01\t2412\t-40\t[ESS]\t\\xff\\x80\n");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].ssid_bytes, vec![0xff, 0x80]);
+    assert_eq!(rows[0].ssid, r"\xff\x80");
+}

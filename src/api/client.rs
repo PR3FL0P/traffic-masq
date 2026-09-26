@@ -354,6 +354,8 @@ struct ProvisionWifiAccessPointRequestBody<'a> {
     passphrase: &'a Option<String>,
     clear_passphrase: bool,
     configure_dhcp: bool,
+    subnet: Option<ipnet::Ipv4Net>,
+    disable_dhcp: bool,
 }
 
 struct RestRequest {
@@ -766,6 +768,8 @@ fn map_request(request: &crate::api::model::Request) -> Result<RestRequest> {
             passphrase,
             clear_passphrase,
             configure_dhcp,
+            subnet,
+            disable_dhcp,
         } => RestRequest {
             method: Method::POST,
             path: format!("{}/provision", wifi_path(interface)),
@@ -774,6 +778,8 @@ fn map_request(request: &crate::api::model::Request) -> Result<RestRequest> {
                 passphrase,
                 clear_passphrase: *clear_passphrase,
                 configure_dhcp: *configure_dhcp,
+                subnet: *subnet,
+                disable_dhcp: *disable_dhcp,
             })?),
             synthesize_pong: false,
         },
@@ -925,6 +931,15 @@ fn map_request(request: &crate::api::model::Request) -> Result<RestRequest> {
             method: Method::DELETE,
             path: wifi_client_profile_path(id),
             body: None,
+            synthesize_pong: false,
+        },
+        Request::ProvisionWifiClient {
+            interface,
+            settings,
+        } => RestRequest {
+            method: Method::PUT,
+            path: format!("{}/provision", wifi_client_path(interface)),
+            body: Some(serialize_json(settings)?),
             synthesize_pong: false,
         },
         Request::ActivateWifiClientProfile {

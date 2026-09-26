@@ -101,6 +101,8 @@ fn summary(p: &WifiApProfileWriteRequest) -> WifiApProfileSummary {
         id: p.id.clone(),
         settings: p.configuration.settings.clone(),
         configure_dhcp: p.configuration.configure_dhcp,
+        subnet: p.configuration.subnet,
+        disable_dhcp: p.configuration.disable_dhcp,
         has_passphrase: p.configuration.passphrase.is_some(),
     }
 }
@@ -130,6 +132,8 @@ mod tests {
                 passphrase: Some("guest-secret".into()),
                 clear_passphrase: false,
                 configure_dhcp: true,
+                subnet: None,
+                disable_dhcp: false,
             },
         }
     }

@@ -239,6 +239,7 @@ pub(super) fn dhcp_client_request_to_config(
     enabled: bool,
 ) -> DhcpClientInterfaceConfig {
     DhcpClientInterfaceConfig {
+        wifi_owned: false,
         enabled,
         route_metric: request.route_metric,
         install_default_route: request.install_default_route,

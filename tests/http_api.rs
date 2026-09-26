@@ -2457,6 +2457,8 @@ async fn ap_profiles_roundtrip_over_http_without_disclosing_credentials() -> Res
             passphrase: Some("private-guest-password".into()),
             clear_passphrase: false,
             configure_dhcp: true,
+            subnet: None,
+            disable_dhcp: false,
         },
     };
     let response = client

@@ -75,6 +75,8 @@ fn provision_request_body_keeps_wire_format_and_redacts_debug() {
         passphrase: Some(secret.to_string()),
         clear_passphrase: false,
         configure_dhcp: false,
+        subnet: None,
+        disable_dhcp: false,
     };
     let json = serde_json::to_value(&body).expect("serialize");
     assert_eq!(json["passphrase"], secret);
@@ -102,6 +104,8 @@ fn provision_request_debug_redacts_the_ap_passphrase() {
         passphrase: Some(secret.into()),
         clear_passphrase: false,
         configure_dhcp: false,
+        subnet: None,
+        disable_dhcp: false,
     };
     let debug = format!("{request:?}");
     assert!(!debug.contains(secret), "{debug}");

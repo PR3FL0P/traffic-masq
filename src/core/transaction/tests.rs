@@ -874,3 +874,59 @@ fn interface_recovery_store_error_uses_resource_path_not_journal() {
     assert!(diagnostic.contains("operator_action=repair_storage_access"));
     assert!(!diagnostic.contains("journal="));
 }
+
+#[tokio::test]
+async fn rejected_wifi_candidate_restores_credentials_and_both_ip_policy_transitions() {
+    for was_dhcp in [true, false] {
+        let directory = tempdir().unwrap();
+        let mut previous = interface_config(COMMITTED);
+        previous.role = InterfaceRole::Input;
+        previous.dhcp = None;
+        previous.ipv4 = (!was_dhcp).then(|| COMMITTED.parse().unwrap());
+        previous.dhcp_client = Some(crate::config::DhcpClientInterfaceConfig {
+            enabled: was_dhcp,
+            route_metric: 777,
+            install_default_route: false,
+            request_dns: false,
+            ..Default::default()
+        });
+        previous.wifi_client = Some(crate::config::WifiClientConfig {
+            ssid: "original".into(), country_code: None,
+            security: crate::config::WifiClientSecurity::Wpa2, passphrase_file: None,
+        });
+        let mut base = AppConfig::default();
+        base.network.interfaces.insert("test0".into(), previous.clone());
+        let overrides = RuntimeOverrideManager::load(directory.path(), &base).await.unwrap();
+        let desired = DesiredNetworkState::new(base, overrides.clone());
+        desired.attach_converger();
+        let manager = NetworkTransactionManager::new(
+            InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory()),
+            Duration::from_secs(60), desired.clone(),
+        );
+        let store = PassphraseStore::new(directory.path().join("wifi/psk"));
+        store.set("test0", &WifiPassphrase::new("original-password").unwrap()).unwrap();
+        let mut candidate = previous.clone();
+        candidate.ipv4 = was_dhcp.then(|| PROPOSED.parse().unwrap());
+        candidate.dhcp_client.as_mut().unwrap().enabled = !was_dhcp;
+        candidate.wifi_client.as_mut().unwrap().ssid = "wrong-credentials".into();
+        let apply_manager = manager.clone();
+        let old = previous.clone();
+        let apply = tokio::spawn(async move {
+            apply_manager.apply_with_passphrase_update("test0", &candidate, Some(&old), Some(InterfaceRole::Input), true,
+                WifiPassphraseUpdate::Set(WifiPassphrase::new("wrong-password").unwrap())).await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while desired.version() < 1 { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        desired.report_result(1, Err(anyhow::anyhow!("Wi-Fi authentication failed")));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while desired.version() < 2 { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        desired.report_pass(2, BTreeMap::new());
+        assert!(apply.await.unwrap().is_err());
+        assert_eq!(desired.effective().await.unwrap().network.interfaces["test0"], previous);
+        assert_eq!(overrides.effective_interface("test0").await.unwrap().unwrap(), previous);
+        assert_eq!(store.get("test0").unwrap().unwrap().expose(), "original-password");
+        assert!(manager.pending().await.is_empty());
+    }
+}

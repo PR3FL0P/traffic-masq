@@ -149,6 +149,8 @@ impl ControlService {
         passphrase: Option<String>,
         clear_passphrase: bool,
         configure_dhcp: bool,
+        subnet: Option<ipnet::Ipv4Net>,
+        disable_dhcp: bool,
     ) -> Response {
         let Some(wifi) = &self.wifi else {
             return wifi_disabled();
@@ -162,27 +164,48 @@ impl ControlService {
             Ok(effective) => effective,
             Err(message) => return wifi_error(WifiErrorDetail::Other { message }),
         };
-        let Some(previous_interface) = effective.network.interfaces.get(&interface).cloned() else {
-            return wifi_error(WifiErrorDetail::InterfaceNotFound);
-        };
-        let Some(cidr) = previous_interface.ipv4 else {
+        if configure_dhcp && disable_dhcp {
             return wifi_error(WifiErrorDetail::InvalidSpec {
-                message: "AP provisioning requires a configured IPv4 CIDR".to_string(),
-            });
-        };
-        if !previous_interface.managed || previous_interface.role != InterfaceRole::Output {
-            return wifi_error(WifiErrorDetail::InvalidSpec {
-                message: "AP provisioning requires a managed output interface".to_string(),
+                message: "DHCP enable and disable are mutually exclusive".into(),
             });
         }
+        let previous_interface = effective.network.interfaces.get(&interface).cloned();
+        let mut target = previous_interface.clone().unwrap_or(InterfaceConfig {
+            role: InterfaceRole::Output,
+            managed: true,
+            ipv4: None,
+            dhcp: None,
+            dhcp_client: None,
+            wifi: None,
+            wifi_client: None,
+            nat: true,
+        });
+        let Some(cidr) = subnet.or(target.ipv4) else {
+            return wifi_error(WifiErrorDetail::InvalidSpec {
+                message: "AP provisioning requires an IPv4 subnet".into(),
+            });
+        };
         if let Err(error) = wifi.preflight_binary().await {
             return classify_wifi_error(error);
         }
-        let mut target = previous_interface.clone();
+        target.managed = true;
+        target.role = InterfaceRole::Output;
+        target.ipv4 = Some(cidr);
+        target.wifi_client = None;
+        if let Some(policy) = target.dhcp_client.as_mut() {
+            policy.enabled = false;
+            policy.wifi_owned = false;
+        }
+        if disable_dhcp {
+            target.dhcp = None;
+        }
         target.wifi = Some(wifi_edit_request_to_config(settings));
-        if let (Some(next), Some(previous)) =
-            (target.wifi.as_mut(), previous_interface.wifi.as_ref())
-        {
+        if let (Some(next), Some(previous)) = (
+            target.wifi.as_mut(),
+            previous_interface
+                .as_ref()
+                .and_then(|config| config.wifi.as_ref()),
+        ) {
             next.passphrase_file =
                 ap_passphrase_file_update(previous.passphrase_file.as_ref(), &passphrase_update);
         }
@@ -227,9 +250,9 @@ impl ControlService {
             .apply_with_passphrase_update(
                 &interface,
                 &target,
-                Some(&previous_interface),
-                Some(previous_interface.role),
-                false,
+                previous_interface.as_ref(),
+                previous_interface.as_ref().map(|config| config.role),
+                true,
                 passphrase_update,
             )
             .await

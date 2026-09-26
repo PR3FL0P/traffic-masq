@@ -257,6 +257,8 @@ fn every_control_request_has_the_expected_authorization_class() {
             passphrase: Some("write-only-secret".into()),
             clear_passphrase: false,
             configure_dhcp: true,
+            subnet: None,
+            disable_dhcp: false,
         },
         Request::ConfigureWifiClient {
             interface: "wlan0".to_owned(),

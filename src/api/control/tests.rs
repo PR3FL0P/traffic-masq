@@ -2393,6 +2393,8 @@ async fn provision_wifi_access_point_stays_pending_until_explicit_commit() {
             passphrase: None,
             clear_passphrase: true,
             configure_dhcp: false,
+            subnet: None,
+            disable_dhcp: false,
         })
         .await;
     let token = match response {
@@ -4329,7 +4331,10 @@ async fn disabling_wifi_client_also_cleans_up_and_disables_active_dhcp_client() 
         .expect("wlan1 declared")
         .clone();
     wlan1_cfg.managed = true;
-    wlan1_cfg.dhcp_client = Some(DhcpClientInterfaceConfig::default());
+    wlan1_cfg.dhcp_client = Some(DhcpClientInterfaceConfig {
+        wifi_owned: true,
+        ..Default::default()
+    });
     config
         .network
         .interfaces
@@ -4447,7 +4452,10 @@ async fn disabling_wifi_client_restores_dhcp_and_wifi_if_persistence_fails() {
         .expect("wlan1 declared")
         .clone();
     wlan1_cfg.managed = true;
-    wlan1_cfg.dhcp_client = Some(DhcpClientInterfaceConfig::default());
+    wlan1_cfg.dhcp_client = Some(DhcpClientInterfaceConfig {
+        wifi_owned: true,
+        ..Default::default()
+    });
     config
         .network
         .interfaces
@@ -4522,7 +4530,10 @@ async fn disabling_wifi_client_fails_and_restores_state_if_dhcp_disable_fails() 
         .expect("wlan1 declared")
         .clone();
     wlan1_cfg.managed = true;
-    wlan1_cfg.dhcp_client = Some(DhcpClientInterfaceConfig::default());
+    wlan1_cfg.dhcp_client = Some(DhcpClientInterfaceConfig {
+        wifi_owned: true,
+        ..Default::default()
+    });
     config
         .network
         .interfaces
@@ -5981,6 +5992,8 @@ async fn saved_ap_profile_activation_stays_pending_until_explicit_commit() {
                     passphrase: None,
                     clear_passphrase: true,
                     configure_dhcp: false,
+                    subnet: None,
+                    disable_dhcp: false,
                 },
             },
         })
@@ -6059,4 +6072,191 @@ async fn configure_client_open_erases_obsolete_stored_credentials() {
         "{response:?}"
     );
     assert!(wifi.stored_passphrase("wlan1").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn wifi_client_provision_keeps_ip_policy_tentative_and_restores_on_rollback() {
+    let directory = tempdir().unwrap();
+    let mut config = wifi_client_base_config(directory.path());
+    config.wifi_client.wpa_supplicant_binary = PathBuf::from("/bin/true");
+    let original = config.network.interfaces["wlan1"].clone();
+    let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+        .await
+        .unwrap();
+    let dhcp = DhcpSupervisor::start(&config).await.unwrap();
+    let network = Arc::new(crate::test_support::FakeNetworkProvider::default());
+    network.add_interface("wlan1", 1).await;
+    let wifi = ClientSupervisor::start_with_process(&config, FakeSupplicantProcess::new())
+        .await
+        .unwrap();
+    let service = ControlService::new(config, network, dhcp, overrides.clone())
+        .with_wifi_client_supervisor(wifi);
+    assert!(matches!(
+        service
+            .dispatch(Request::CreateWifiClientProfile {
+                profile: WifiClientProfileWriteRequest {
+                    id: "candidate".into(),
+                    ssid: "candidate".into(),
+                    country_code: None,
+                    security: WifiClientSecurity::Open,
+                    priority: 0,
+                    autoconnect: false,
+                    passphrase: None,
+                    clear_passphrase: false,
+                }
+            })
+            .await,
+        Response::WifiClientProfile { .. }
+    ));
+    let response = service
+        .dispatch(Request::ProvisionWifiClient {
+            interface: "wlan1".into(),
+            settings: crate::api::model::ProvisionWifiClientRequest {
+                profile_id: "candidate".into(),
+                ip_policy: crate::api::model::WifiClientIpPolicy::Static {
+                    cidr: "192.168.77.2/24".parse().unwrap(),
+                },
+            },
+        })
+        .await;
+    let Response::NetworkChangePending { change } = response else {
+        panic!("{response:?}")
+    };
+    assert_eq!(
+        overrides
+            .effective_interface("wlan1")
+            .await
+            .unwrap()
+            .unwrap(),
+        original
+    );
+    assert!(matches!(
+        service
+            .dispatch(Request::RollbackNetworkChange {
+                token: change.token
+            })
+            .await,
+        Response::NetworkChangeRolledBack { .. }
+    ));
+    assert_eq!(
+        overrides
+            .effective_interface("wlan1")
+            .await
+            .unwrap()
+            .unwrap(),
+        original
+    );
+}
+
+#[tokio::test]
+async fn wifi_deactivate_preserves_independent_dhcp_intent() {
+    let fixture = wifi_client_enabled_fixture().await;
+    let before = fixture
+        .service
+        .overrides
+        .effective_interface("wlan1")
+        .await
+        .unwrap()
+        .unwrap()
+        .dhcp_client;
+    let response = fixture
+        .service
+        .dispatch(Request::DeactivateWifiClientProfile {
+            interface: "wlan1".into(),
+        })
+        .await;
+    assert!(
+        matches!(response, Response::WifiClientDisabled { .. }),
+        "{response:?}"
+    );
+    let after = fixture
+        .service
+        .overrides
+        .effective_interface("wlan1")
+        .await
+        .unwrap()
+        .unwrap()
+        .dhcp_client;
+    assert_eq!(before, after);
+    assert!(after.unwrap().enabled);
+}
+
+#[tokio::test]
+async fn hotspot_provision_manages_an_unconfigured_radio_and_subnet_atomically() {
+    let directory = tempdir().unwrap();
+    let mut config = wifi_base_config(directory.path());
+    config.wifi.hostapd_binary = PathBuf::from("/bin/true");
+    config.network.interfaces.remove("wlan0");
+    let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+        .await
+        .unwrap();
+    let dhcp = DhcpSupervisor::start(&config).await.unwrap();
+    let network = Arc::new(crate::test_support::FakeNetworkProvider::default());
+    network.add_interface("wlan0", 1).await;
+    network
+        .interfaces
+        .lock()
+        .await
+        .get_mut("wlan0")
+        .unwrap()
+        .is_wireless = true;
+    let wifi = WifiSupervisor::start_with_process_and_radio(
+        &config,
+        FakeWifiProcess::new(),
+        Arc::new(crate::wifi::radio::AllowAllRadioValidator),
+    )
+    .await
+    .unwrap();
+    let service =
+        ControlService::new(config, network, dhcp, overrides.clone()).with_wifi_supervisor(wifi);
+    let response = service
+        .dispatch(Request::ProvisionWifiAccessPoint {
+            interface: "wlan0".into(),
+            settings: WifiEditRequest {
+                ssid: "hotspot".into(),
+                country_code: Some("PL".into()),
+                band: WifiBand::Ghz2,
+                channel: 6,
+                channel_width: WifiChannelWidth::Ht20,
+                security: WifiSecurity::Open,
+                hidden: false,
+                client_isolation: false,
+                max_stations: 32,
+            },
+            passphrase: None,
+            clear_passphrase: true,
+            configure_dhcp: true,
+            subnet: Some("192.168.50.1/24".parse().unwrap()),
+            disable_dhcp: false,
+        })
+        .await;
+    let Response::NetworkChangePending { change } = response else {
+        panic!("{response:?}")
+    };
+    assert!(overrides
+        .effective_interface("wlan0")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(matches!(
+        service
+            .dispatch(Request::CommitNetworkChange {
+                token: change.token
+            })
+            .await,
+        Response::NetworkChangeCommitted { .. }
+    ));
+    let committed = overrides
+        .effective_interface("wlan0")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(committed.managed);
+    assert_eq!(committed.role, InterfaceRole::Output);
+    assert_eq!(committed.ipv4, Some("192.168.50.1/24".parse().unwrap()));
+    assert_eq!(committed.wifi.unwrap().ssid, "hotspot");
+    assert_eq!(
+        committed.dhcp.unwrap().router,
+        "192.168.50.1".parse::<Ipv4Addr>().unwrap()
+    );
 }

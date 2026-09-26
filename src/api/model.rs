@@ -254,6 +254,10 @@ pub struct WifiApProfileSummary {
     pub id: String,
     pub settings: WifiEditRequest,
     pub configure_dhcp: bool,
+    #[serde(default)]
+    pub subnet: Option<ipnet::Ipv4Net>,
+    #[serde(default)]
+    pub disable_dhcp: bool,
     pub has_passphrase: bool,
 }
 
@@ -285,6 +289,10 @@ pub struct ProvisionWifiAccessPointRequest {
     pub clear_passphrase: bool,
     #[serde(default)]
     pub configure_dhcp: bool,
+    #[serde(default)]
+    pub subnet: Option<ipnet::Ipv4Net>,
+    #[serde(default)]
+    pub disable_dhcp: bool,
 }
 
 impl fmt::Debug for ProvisionWifiAccessPointRequest {
@@ -356,6 +364,29 @@ impl fmt::Debug for WifiClientProfileWriteRequest {
         redact_debug_secrets(&mut value);
         write!(formatter, "{value}")
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WifiClientIpPolicy {
+    Preserve,
+    Dhcp,
+    Static { cidr: ipnet::Ipv4Net },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvisionWifiClientRequest {
+    pub profile_id: String,
+    pub ip_policy: WifiClientIpPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WifiClientActivationPhase {
+    #[default]
+    ActivationStarted,
+    Associated,
+    IpReady,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -913,6 +944,10 @@ pub enum Request {
         #[serde(default)]
         clear_passphrase: bool,
         configure_dhcp: bool,
+        #[serde(default)]
+        subnet: Option<ipnet::Ipv4Net>,
+        #[serde(default)]
+        disable_dhcp: bool,
     },
     DisableWifi {
         interface: String,
@@ -976,6 +1011,10 @@ pub enum Request {
     },
     DeleteWifiClientProfile {
         id: String,
+    },
+    ProvisionWifiClient {
+        interface: String,
+        settings: ProvisionWifiClientRequest,
     },
     ActivateWifiClientProfile {
         interface: String,
@@ -1239,6 +1278,8 @@ pub enum Response {
         id: String,
     },
     WifiClientProfileActivated {
+        #[serde(default)]
+        phase: WifiClientActivationPhase,
         interface: String,
         profile: WifiClientProfileSummary,
         status: WifiClientStatus,

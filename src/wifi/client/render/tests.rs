@@ -255,3 +255,19 @@ fn the_scan_config_renders_ctrl_interface_and_update_config() {
     let rendered = render_scan_config(Path::new("/run/wpa"));
     assert_eq!(rendered, "ctrl_interface=/run/wpa\nupdate_config=0\n");
 }
+
+#[test]
+fn transition_network_offers_sae_and_psk_with_optional_pmf() {
+    let rendered = render(&spec(WifiClientSecurity::Wpa2Wpa3), Some(&passphrase()));
+    let network = network_directives(&rendered.text);
+    assert_eq!(network["key_mgmt"], "SAE WPA-PSK");
+    assert_eq!(network["ieee80211w"], "1");
+    assert_eq!(network["psk"].len(), 64);
+    let encoded = &network["sae_password"];
+    let decoded: Vec<u8> = encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect();
+    assert_eq!(decoded, passphrase().expose().as_bytes());
+}

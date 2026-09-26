@@ -56,9 +56,17 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
         ),
         (
             WifiField::Dhcp,
-            "Configure DHCP",
-            editor.configure_dhcp.to_string(),
+            "DHCP policy",
+            if editor.configure_dhcp {
+                "Enable / configure"
+            } else if editor.disable_dhcp {
+                "Disable"
+            } else {
+                "Preserve existing"
+            }
+            .into(),
         ),
+        (WifiField::Subnet, "IPv4 subnet", editor.subnet.clone()),
         (
             WifiField::ProfileId,
             "Profile ID",
@@ -83,7 +91,7 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
             WifiField::Apply,
             "",
             if editor.loaded_profile {
-                "Save profile changes and apply AP"
+                "Apply saved profile (save edits separately)"
             } else if editor.configure_dhcp {
                 "Apply AP + passphrase + DHCP"
             } else {
@@ -100,7 +108,7 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
         if active
             && matches!(
                 field,
-                WifiField::Ssid | WifiField::CountryCode | WifiField::ProfileId
+                WifiField::Ssid | WifiField::CountryCode | WifiField::ProfileId | WifiField::Subnet
             )
         {
             spans.extend(input::render_value_with_cursor(
@@ -181,6 +189,8 @@ pub(crate) async fn handle_wifi_editor_key(app: &mut TuiApp, key: KeyCode, clien
                 editor.country_code = profile.settings.country_code.clone().unwrap_or_default();
                 editor.security = profile.settings.security;
                 editor.configure_dhcp = profile.configure_dhcp;
+                editor.disable_dhcp = profile.disable_dhcp;
+                editor.subnet = profile.subnet.map(|ip| ip.to_string()).unwrap_or_default();
                 editor.existing = profile.has_passphrase;
                 editor.radio_settings = Some(profile.settings);
                 editor.passphrase.zeroize();
@@ -283,7 +293,16 @@ pub(crate) async fn handle_wifi_editor_key(app: &mut TuiApp, key: KeyCode, clien
                             .min(crate::config::MAX_WIFI_STATIONS)
                     }
                 }
-                WifiField::Dhcp => editor.configure_dhcp = !editor.configure_dhcp,
+                WifiField::Dhcp => {
+                    if editor.configure_dhcp {
+                        editor.configure_dhcp = false;
+                        editor.disable_dhcp = true;
+                    } else if editor.disable_dhcp {
+                        editor.disable_dhcp = false;
+                    } else {
+                        editor.configure_dhcp = true;
+                    }
+                }
                 _ => unreachable!(),
             }
             editor.radio_settings = Some(settings);
@@ -309,6 +328,8 @@ pub(super) fn ap_provision_request(editor: &WifiEditor) -> Request {
             .then(|| editor.passphrase.clone()),
         clear_passphrase: editor.security == WifiSecurity::Open,
         configure_dhcp: editor.configure_dhcp,
+        subnet: editor.subnet.trim().parse().ok(),
+        disable_dhcp: editor.disable_dhcp,
     }
 }
 
@@ -360,10 +381,11 @@ async fn apply_ap_editor(app: &mut TuiApp, client: &ApiClient) {
         app.push_message(LogLevel::Warn, "This security mode requires a passphrase");
         return;
     }
+    if !editor.subnet.trim().is_empty() && editor.subnet.trim().parse::<ipnet::Ipv4Net>().is_err() {
+        app.push_message(LogLevel::Warn, "Invalid IPv4 subnet / CIDR");
+        return;
+    }
     let request = if editor.loaded_profile {
-        if !save_ap_profile(app, client).await {
-            return;
-        }
         Request::ActivateWifiApProfile {
             interface: editor.interface.clone(),
             profile_id: editor.profile_id.clone(),
@@ -404,6 +426,8 @@ async fn save_ap_profile(app: &mut TuiApp, client: &ApiClient) -> bool {
                 .then(|| editor.passphrase.clone()),
                 clear_passphrase: !editor.security.requires_passphrase(),
                 configure_dhcp: editor.configure_dhcp,
+                subnet: editor.subnet.trim().parse().ok(),
+                disable_dhcp: editor.disable_dhcp,
             },
         },
     };

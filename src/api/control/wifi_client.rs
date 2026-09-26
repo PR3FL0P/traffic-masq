@@ -1,4 +1,3 @@
-use super::dhcp_client::dhcp_client_request_to_config;
 use super::runtime::compensation_message;
 use super::*;
 
@@ -26,6 +25,93 @@ pub(super) fn validate_wifi_client_interface(
 }
 
 impl ControlService {
+    pub(super) async fn provision_wifi_client(
+        &self,
+        interface: String,
+        settings: crate::api::model::ProvisionWifiClientRequest,
+    ) -> Response {
+        use crate::api::model::WifiClientIpPolicy;
+        use crate::wifi::secret::WifiPassphraseUpdate;
+        let Some(wifi_client) = &self.wifi_client else {
+            return wifi_client_disabled();
+        };
+        if let Err(error) = wifi_client.preflight_binary().await {
+            return classify_wifi_client_error(error);
+        }
+        let profile = match self.wifi_client_profiles.get(&settings.profile_id) {
+            Ok(profile) => profile,
+            Err(error) => return classify_wifi_client_profile_error(error),
+        };
+        let secret = match self
+            .wifi_client_profiles
+            .get_passphrase(&settings.profile_id)
+        {
+            Ok(secret) => secret,
+            Err(error) => return classify_wifi_client_profile_error(error),
+        };
+        let effective = match self.effective_config().await {
+            Ok(config) => config,
+            Err(message) => return wifi_client_error(WifiClientErrorDetail::Other { message }),
+        };
+        let previous = effective.network.interfaces.get(&interface);
+        let mut target = previous.cloned().unwrap_or(InterfaceConfig {
+            role: InterfaceRole::Input,
+            managed: true,
+            ipv4: None,
+            dhcp: None,
+            dhcp_client: None,
+            wifi: None,
+            wifi_client: None,
+            nat: false,
+        });
+        target.managed = true;
+        target.role = InterfaceRole::Input;
+        target.wifi = None;
+        target.dhcp = None;
+        match settings.ip_policy {
+            WifiClientIpPolicy::Preserve => {}
+            WifiClientIpPolicy::Dhcp => {
+                target.ipv4 = None;
+                let policy = target.dhcp_client.get_or_insert_with(Default::default);
+                policy.enabled = true;
+                policy.wifi_owned = false;
+            }
+            WifiClientIpPolicy::Static { cidr } => {
+                target.ipv4 = Some(cidr);
+                if let Some(policy) = target.dhcp_client.as_mut() {
+                    policy.enabled = false;
+                }
+            }
+        }
+        if let Err(message) = validate_wifi_client_interface(&interface, &target) {
+            return wifi_client_error(WifiClientErrorDetail::InvalidSpec { message });
+        }
+        target.wifi_client = Some(WifiClientConfig {
+            ssid: profile.ssid,
+            country_code: profile.country_code,
+            security: profile.security,
+            passphrase_file: None,
+        });
+        let update = secret
+            .map(WifiPassphraseUpdate::Set)
+            .unwrap_or(WifiPassphraseUpdate::Clear);
+        match self
+            .transactions
+            .apply_with_passphrase_update(
+                &interface,
+                &target,
+                previous,
+                previous.map(|config| config.role),
+                true,
+                update,
+            )
+            .await
+        {
+            Ok(change) => Response::NetworkChangePending { change },
+            Err(error) => super::runtime::error_response(error),
+        }
+    }
+
     pub(super) async fn wifi_client_status(&self) -> Response {
         let Some(wifi_client) = &self.wifi_client else {
             return wifi_client_disabled();
@@ -195,68 +281,17 @@ impl ControlService {
             }
         };
         let Some(mut interface_config) = committed else {
-            let previous_wifi_status = wifi_client.status(&interface).await;
-            let previous_link_ready = previous_wifi_status
-                .as_ref()
-                .is_none_or(|status| status.wpa_state.is_connected());
-            let previous_wifi = previous_wifi_status.map(|status| status.spec);
-            let mut previous_dhcp = None;
-            if let Some(dhcp_client) = &self.dhcp_client {
-                let before = dhcp_client.spec(&interface).await;
-                match dhcp_client.disable(&interface).await {
-                    Ok(spec) => previous_dhcp = spec.or(before),
-                    Err(error) => {
-                        let restoration = restore_dhcp_client(
-                            dhcp_client,
-                            &interface,
-                            before,
-                            previous_link_ready,
-                        )
-                        .await;
-                        return wifi_client_error(WifiClientErrorDetail::Other {
-                            message: compensation_message(
-                                "failed to disable DHCP client",
-                                &error,
-                                restoration,
-                            ),
-                        });
-                    }
-                }
-            }
-            if let Err(error) = wifi_client.disable(&interface).await {
-                let mut rollback_failures = Vec::new();
-                if let Some(dhcp_client) = &self.dhcp_client {
-                    if let Err(rollback) = restore_dhcp_client(
-                        dhcp_client,
-                        &interface,
-                        previous_dhcp,
-                        previous_link_ready,
-                    )
-                    .await
-                    {
-                        rollback_failures.push(format!("DHCP client: {rollback:#}"));
-                    }
-                }
-                let restoration = match previous_wifi {
-                    Some(previous) => wifi_client.configure(previous).await.map(|_| ()),
-                    None => Ok(()),
-                };
-                if let Err(rollback) = restoration {
-                    rollback_failures.push(format!("Wi-Fi client: {rollback:#}"));
-                }
-                let message = if rollback_failures.is_empty() {
-                    format!("failed to disable Wi-Fi client: {error}")
-                } else {
-                    format!(
-                        "failed to disable Wi-Fi client: {error}; rollback was incomplete: {}; recovery required",
-                        rollback_failures.join("; ")
-                    )
-                };
-                return wifi_client_error(WifiClientErrorDetail::Other { message });
-            }
-            return Response::WifiClientDisabled { interface };
+            // Without persisted provenance this subsystem cannot claim DHCP ownership.
+            return match wifi_client.disable(&interface).await {
+                Ok(_) => Response::WifiClientDisabled { interface },
+                Err(error) => classify_wifi_client_error(error),
+            };
         };
 
+        let owns_dhcp = interface_config
+            .dhcp_client
+            .as_ref()
+            .is_some_and(|policy| policy.wifi_owned);
         let had_enabled_dhcp = interface_config
             .dhcp_client
             .as_ref()
@@ -283,7 +318,7 @@ impl ControlService {
         let previous = previous_status.map(|status| status.spec);
 
         let mut previous_dhcp = None;
-        if let Some(dhcp_client) = &self.dhcp_client {
+        if let Some(dhcp_client) = self.dhcp_client.as_ref().filter(|_| owns_dhcp) {
             match dhcp_client.disable(&interface).await {
                 Ok(disabled_spec) => {
                     previous_dhcp = disabled_spec.or(previous_dhcp_spec.clone());
@@ -307,16 +342,16 @@ impl ControlService {
                 }
             }
         }
-        if had_enabled_dhcp {
-            interface_config.dhcp_client = Some(dhcp_client_request_to_config(
-                &DhcpClientConfigRequest::default(),
-                false,
-            ));
+        if let Some(policy) = interface_config.dhcp_client.as_mut() {
+            if policy.wifi_owned {
+                policy.enabled = false;
+                policy.wifi_owned = false;
+            }
         }
 
         if let Err(error) = wifi_client.disable(&interface).await {
             let mut rollback_failures = Vec::new();
-            if let Some(dhcp_client) = &self.dhcp_client {
+            if let Some(dhcp_client) = self.dhcp_client.as_ref().filter(|_| owns_dhcp) {
                 if let Err(rollback) = restore_dhcp_client(
                     dhcp_client,
                     &interface,
@@ -359,7 +394,7 @@ impl ControlService {
             if let Err(rollback) = restoration {
                 rollback_failures.push(format!("Wi-Fi client: {rollback:#}"));
             }
-            if let Some(dhcp_client) = &self.dhcp_client {
+            if let Some(dhcp_client) = self.dhcp_client.as_ref().filter(|_| owns_dhcp) {
                 if let Err(rollback) =
                     restore_dhcp_client(dhcp_client, &interface, previous_dhcp, previous_link_ready)
                         .await
@@ -611,8 +646,11 @@ impl ControlService {
                     message: "profile activation requires the DHCP client service because the interface has no static IPv4 address".to_owned(),
                 });
             }
-            interface_config.dhcp_client =
-                Some(crate::config::DhcpClientInterfaceConfig::default());
+            let policy = interface_config
+                .dhcp_client
+                .get_or_insert_with(Default::default);
+            policy.enabled = true;
+            policy.wifi_owned = true;
         }
 
         if let Err(message) = validate_wifi_client_interface(&interface, &interface_config) {
@@ -812,6 +850,7 @@ impl ControlService {
         }
         match wifi_client.status(&interface).await {
             Some(status) => Response::WifiClientProfileActivated {
+                phase: self.wifi_client_activation_phase(&interface, &status).await,
                 interface,
                 profile,
                 status,
@@ -820,6 +859,48 @@ impl ControlService {
                 message: "supplicant disappeared after profile activation".to_string(),
             }),
         }
+    }
+
+    async fn wifi_client_activation_phase(
+        &self,
+        interface: &str,
+        status: &crate::wifi::WifiClientStatus,
+    ) -> crate::api::model::WifiClientActivationPhase {
+        use crate::api::model::WifiClientActivationPhase as Phase;
+        if !status.wpa_state.is_connected() {
+            return Phase::ActivationStarted;
+        }
+        if let Ok(Some(config)) = self.overrides.effective_interface(interface).await {
+            if config
+                .dhcp_client
+                .as_ref()
+                .is_some_and(|policy| policy.enabled)
+            {
+                if let Some(dhcp) = &self.dhcp_client {
+                    if let Some(lease) =
+                        dhcp.status(interface).await.and_then(|status| status.lease)
+                    {
+                        if dhcp.verify_bound_lease(&lease).await.is_ok() {
+                            return Phase::IpReady;
+                        }
+                    }
+                }
+            } else if let Some(ip) = config.ipv4 {
+                if self
+                    .network
+                    .list_ipv4_addresses(interface)
+                    .await
+                    .is_ok_and(|addresses| {
+                        addresses.iter().any(|address| {
+                            address.address == ip.addr() && address.prefix_len == ip.prefix_len()
+                        })
+                    })
+                {
+                    return Phase::IpReady;
+                }
+            }
+        }
+        Phase::Associated
     }
 
     pub(super) async fn wifi_client_scan(&self, interface: String) -> Response {

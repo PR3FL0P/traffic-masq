@@ -26,6 +26,9 @@ pub struct WpaSupplicantScanResult {
     pub frequency_mhz: u32,
     pub signal_dbm: i32,
     pub ssid: String,
+    /// Exact SSID octets; `ssid` is the display representation for binary names.
+    #[serde(default)]
+    pub ssid_bytes: Vec<u8>,
 
     pub raw_flags: String,
     pub security: WpaSupplicantScanSecurity,
@@ -72,7 +75,7 @@ fn classify_scan_security(flags: &str) -> WpaSupplicantScanSecurity {
 
 // wpa_supplicant exposes SSIDs using printf_encode, not literal UTF-8.
 // Reject invalid UTF-8 rather than connecting to a different, lossy SSID.
-fn decode_ssid(value: &str) -> Option<String> {
+fn decode_ssid_bytes(value: &str) -> Option<Vec<u8>> {
     let mut bytes = value.bytes();
     let mut decoded = Vec::with_capacity(value.len());
     while let Some(byte) = bytes.next() {
@@ -95,7 +98,11 @@ fn decode_ssid(value: &str) -> Option<String> {
             _ => return None,
         });
     }
-    String::from_utf8(decoded).ok()
+    Some(decoded)
+}
+
+fn decode_ssid(value: &str) -> Option<String> {
+    String::from_utf8(decode_ssid_bytes(value)?).ok()
 }
 
 fn parse_scan_results(reply: &str) -> Vec<WpaSupplicantScanResult> {
@@ -110,13 +117,20 @@ fn parse_scan_results(reply: &str) -> Vec<WpaSupplicantScanResult> {
             let frequency_mhz = fields.next()?.parse().ok()?;
             let signal_dbm = fields.next()?.parse().ok()?;
             let raw_flags = fields.next()?.to_string();
-            let ssid = decode_ssid(fields.next()?)?;
+            let ssid_bytes = decode_ssid_bytes(fields.next()?)?;
+            let ssid = String::from_utf8(ssid_bytes.clone()).unwrap_or_else(|_| {
+                ssid_bytes
+                    .iter()
+                    .map(|byte| format!("\\x{byte:02x}"))
+                    .collect()
+            });
             let security = classify_scan_security(&raw_flags);
             Some(WpaSupplicantScanResult {
                 bssid,
                 frequency_mhz,
                 signal_dbm,
                 ssid,
+                ssid_bytes,
                 raw_flags,
                 security,
             })

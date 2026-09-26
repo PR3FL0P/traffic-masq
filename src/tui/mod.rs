@@ -1128,7 +1128,7 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
         MouseEventKind::ScrollUp => match app.screen {
             Screen::Preview => interfaces::handle_preview_key(app, KeyCode::Up, client).await,
             Screen::Wifi => wifi::handle_wifi_key(app, KeyCode::Up, client).await,
-            Screen::WifiScan => wifi::handle_wifi_scan_key(app, KeyCode::Up),
+            Screen::WifiScan => wifi::handle_wifi_scan_key(app, KeyCode::Up, client).await,
             Screen::WifiProfiles => wifi::handle_wifi_profiles_key(app, KeyCode::Up, client).await,
             Screen::Dashboard => {
                 dashboard::handle_dashboard_key(app, KeyCode::Up, client, direct).await;
@@ -1158,7 +1158,7 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
         MouseEventKind::ScrollDown => match app.screen {
             Screen::Preview => interfaces::handle_preview_key(app, KeyCode::Down, client).await,
             Screen::Wifi => wifi::handle_wifi_key(app, KeyCode::Down, client).await,
-            Screen::WifiScan => wifi::handle_wifi_scan_key(app, KeyCode::Down),
+            Screen::WifiScan => wifi::handle_wifi_scan_key(app, KeyCode::Down, client).await,
             Screen::WifiProfiles => {
                 wifi::handle_wifi_profiles_key(app, KeyCode::Down, client).await
             }
@@ -1495,7 +1495,7 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
         Screen::VpnPolicy => vpn_policy::handle_vpn_policy_key(app, key, client).await,
         Screen::Wifi => wifi::handle_wifi_key(app, key, client).await,
         Screen::WifiEditor => wifi::handle_wifi_editor_key(app, key, client).await,
-        Screen::WifiScan => wifi::handle_wifi_scan_key(app, key),
+        Screen::WifiScan => wifi::handle_wifi_scan_key(app, key, client).await,
         Screen::WifiProfiles => wifi::handle_wifi_profiles_key(app, key, client).await,
         Screen::WifiProfileEditor => wifi::handle_wifi_profile_editor_key(app, key, client).await,
         Screen::WifiConnectPrompt => wifi::handle_wifi_connect_prompt_key(app, key, client).await,

@@ -151,7 +151,12 @@ impl PhysicalWifiFixture {
                 wifi_client: Some(WifiClientConfig {
                     ssid: self.ssid.clone(),
                     country_code: None,
-                    security: WifiClientSecurity::Wpa2,
+                    security: match env::var("TRAFFIC_MASQ_WIFI_SECURITY").as_deref() {
+                        Ok("wpa3") => WifiClientSecurity::Wpa3,
+                        Ok("wpa2_wpa3") => WifiClientSecurity::Wpa2Wpa3,
+                        Ok("wpa2") | Err(_) => WifiClientSecurity::Wpa2,
+                        Ok(other) => bail!("unsupported TRAFFIC_MASQ_WIFI_SECURITY: {other}"),
+                    },
                     passphrase_file: Some(psk_file),
                 }),
             },

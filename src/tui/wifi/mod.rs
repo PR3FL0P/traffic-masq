@@ -7,10 +7,10 @@ use zeroize::Zeroize;
 
 use crate::api::client::ApiClient;
 use crate::api::model::{
-    DhcpClientConfigRequest, InterfaceEditRequest, InterfaceStatus, Request, Response,
-    WifiClientProfileWriteRequest, WifiEditRequest, WifiErrorDetail,
+    InterfaceStatus, Request, Response, WifiClientProfileWriteRequest, WifiEditRequest,
+    WifiErrorDetail,
 };
-use crate::config::{InterfaceRole, WifiBand, WifiChannelWidth, WifiClientSecurity, WifiSecurity};
+use crate::config::{WifiBand, WifiChannelWidth, WifiClientSecurity, WifiSecurity};
 use crate::wifi::supervisor::WifiHealth;
 use crate::wifi::{
     WifiApStatus, WifiClientProfileSummary, WifiClientStatus, WpaSupplicantScanResult,
@@ -40,7 +40,7 @@ use profiles::open_profiles;
 #[cfg(test)]
 use ap_editor::{ap_provision_request, ap_settings};
 #[cfg(test)]
-use connect::{apply_wifi_static_ip, submit_wifi_connect};
+use connect::submit_wifi_connect;
 
 const DEFAULT_BAND: WifiBand = WifiBand::Ghz2;
 const DEFAULT_CHANNEL: u8 = 0;
@@ -133,6 +133,7 @@ pub(crate) enum WifiField {
     ClientIsolation,
     MaxStations,
     Dhcp,
+    Subnet,
     ProfileId,
     SavedProfile,
     SaveProfile,
@@ -140,7 +141,7 @@ pub(crate) enum WifiField {
     Apply,
 }
 
-const WIFI_FIELDS: [WifiField; 16] = [
+const WIFI_FIELDS: [WifiField; 17] = [
     WifiField::Ssid,
     WifiField::Security,
     WifiField::Passphrase,
@@ -152,6 +153,7 @@ const WIFI_FIELDS: [WifiField; 16] = [
     WifiField::ClientIsolation,
     WifiField::MaxStations,
     WifiField::Dhcp,
+    WifiField::Subnet,
     WifiField::ProfileId,
     WifiField::SavedProfile,
     WifiField::SaveProfile,
@@ -173,6 +175,8 @@ pub(crate) struct WifiEditor {
     pub(crate) country_code: String,
     pub(crate) existing: bool,
     pub(crate) configure_dhcp: bool,
+    disable_dhcp: bool,
+    subnet: String,
     profile_id: String,
     loaded_profile: bool,
     profiles: Vec<crate::api::model::WifiApProfileSummary>,
@@ -219,6 +223,8 @@ impl WifiEditor {
                 .as_ref()
                 .is_some_and(|s| s.spec.requires_passphrase()),
             configure_dhcp: row.ap.is_none() && CONFIGURE_DHCP_BY_DEFAULT,
+            disable_dhcp: false,
+            subnet: String::new(),
             profile_id: String::new(),
             loaded_profile: false,
             profiles: Vec::new(),
@@ -230,6 +236,7 @@ impl WifiEditor {
 
     pub(crate) fn active_value(&self) -> Option<&str> {
         match self.field {
+            WifiField::Subnet => Some(&self.subnet),
             WifiField::ProfileId => Some(&self.profile_id),
             WifiField::Ssid => Some(&self.ssid),
             WifiField::Passphrase => Some(&self.passphrase),
@@ -245,6 +252,7 @@ impl WifiEditor {
     pub(crate) fn active_editor(&mut self) -> Option<super::input::TextEditor<'_>> {
         let cursor = &mut self.cursor;
         match self.field {
+            WifiField::Subnet => Some(super::input::TextEditor::new(&mut self.subnet, cursor)),
             WifiField::ProfileId => {
                 Some(super::input::TextEditor::new(&mut self.profile_id, cursor))
             }
@@ -295,7 +303,7 @@ impl WifiProfilesMenuAction {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Management => "Management",
-            Self::CreateNew => "Create new",
+            Self::CreateNew => "Create new / hidden network",
         }
     }
 
@@ -409,6 +417,11 @@ impl WifiProfileEditor {
         interface: String,
         network: &WpaSupplicantScanResult,
     ) -> Result<Self, &'static str> {
+        if std::str::from_utf8(&network.ssid_bytes).is_err() {
+            return Err(
+                "Binary SSID is visible but cannot be represented by a UTF-8 client profile",
+            );
+        }
         let security = map_scan_security(network.security)?;
         let id = profile_id_for_ssid(&network.ssid);
         let cursor = super::input::grapheme_count(&id);
@@ -595,6 +608,7 @@ fn actions(role: WifiRole) -> &'static [(PrimaryAction, &'static str)] {
     match role {
         WifiRole::AccessPoint => &[
             (PrimaryAction::ConfigureAp, "Configure access point"),
+            (PrimaryAction::Profiles, "Use as client (saved profile)"),
             (PrimaryAction::Reload, "Reload access point"),
             (PrimaryAction::Deactivate, "Deactivate access point"),
             (PrimaryAction::Refresh, "Refresh"),
@@ -602,11 +616,17 @@ fn actions(role: WifiRole) -> &'static [(PrimaryAction, &'static str)] {
         WifiRole::Client => &[
             (PrimaryAction::Scan, "Scan networks"),
             (PrimaryAction::Profiles, "Saved profiles"),
+            (PrimaryAction::ConfigureAp, "Use as access point"),
             (PrimaryAction::Reconnect, "Reconnect"),
             (PrimaryAction::Deactivate, "Deactivate"),
             (PrimaryAction::Refresh, "Refresh"),
         ],
-        WifiRole::Unknown => &[(PrimaryAction::Refresh, "Refresh role and status")],
+        WifiRole::Unknown => &[
+            (PrimaryAction::Scan, "Scan / connect"),
+            (PrimaryAction::Profiles, "Saved profiles"),
+            (PrimaryAction::ConfigureAp, "Create hotspot"),
+            (PrimaryAction::Refresh, "Refresh"),
+        ],
     }
 }
 
@@ -677,7 +697,10 @@ pub(crate) fn render_wifi(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
                 ));
             }
             if row.role == WifiRole::Unknown {
-                lines.push(Line::styled("Role is unknown; configure the interface as managed output (AP) or managed input (client) first.", Style::default().fg(theme::WARN)));
+                lines.push(Line::styled(
+                    "Not configured: scan and connect, or create a hotspot.",
+                    Style::default().fg(theme::WARN),
+                ));
             }
         }
     }
@@ -838,7 +861,7 @@ async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
     };
     match action {
         PrimaryAction::ConfigureAp => {
-            if !subsystem_disabled(app, row.role) {
+            if !subsystem_disabled(app, WifiRole::AccessPoint) {
                 match client
                     .request(&Request::GetInterfaceConfig {
                         interface: row.interface.clone(),
@@ -867,6 +890,7 @@ async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
                             editor.security = spec.security;
                             editor.country_code = spec.country_code.clone().unwrap_or_default();
                         }
+                        editor.subnet = config.ipv4.map(|ip| ip.to_string()).unwrap_or_default();
                         editor.original_spec = spec;
                         match client.request(&Request::ListWifiApProfiles).await {
                             Ok(Response::WifiApProfiles { profiles }) => editor.profiles = profiles,
@@ -875,6 +899,10 @@ async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
                         }
                         editor.reset_cursor();
                         app.wifi_editor = Some(editor);
+                        app.screen = Screen::WifiEditor;
+                    }
+                    Ok(Response::InterfaceConfig { config: None, .. }) => {
+                        app.wifi_editor = Some(WifiEditor::from_row(&row));
                         app.screen = Screen::WifiEditor;
                     }
                     Ok(response) => report_unexpected(app, response),
@@ -1038,7 +1066,6 @@ pub(crate) async fn load_wifi_data(app: &mut TuiApp, client: &ApiClient) {
         }
     };
     let mut rows = build_rows(&interfaces, &ap, &clients);
-    let mut managed = std::collections::HashMap::new();
     for row in rows.iter_mut() {
         let config = match client
             .request(&Request::GetInterfaceConfig {
@@ -1059,21 +1086,18 @@ pub(crate) async fn load_wifi_data(app: &mut TuiApp, client: &ApiClient) {
                 return;
             }
         };
-        managed.insert(
-            row.interface.clone(),
-            config.as_ref().is_some_and(|c| c.managed),
-        );
-        if let Some(config) = &config {
-            if config.role == InterfaceRole::Input && config.managed {
-                row.role = WifiRole::Client;
-            } else if config.role == InterfaceRole::Output && config.managed {
-                row.role = WifiRole::AccessPoint;
-            } else if row.role == WifiRole::Unknown {
-                row.role = role_from_interface(config.role, config.managed);
+        if row.role == WifiRole::Unknown {
+            if let Some(config) = &config {
+                row.role = if config.wifi.is_some() {
+                    WifiRole::AccessPoint
+                } else if config.wifi_client.is_some() {
+                    WifiRole::Client
+                } else {
+                    WifiRole::Unknown
+                };
             }
         }
     }
-    rows.retain(|row| managed.get(&row.interface).copied().unwrap_or(false));
     app.wifi.replace_rows(rows);
 }
 
@@ -1109,14 +1133,6 @@ pub(crate) fn build_rows(
         .collect()
 }
 
-fn role_from_interface(role: InterfaceRole, managed: bool) -> WifiRole {
-    match (role, managed) {
-        (InterfaceRole::Output, true) => WifiRole::AccessPoint,
-        (InterfaceRole::Input, true) => WifiRole::Client,
-        _ => WifiRole::Unknown,
-    }
-}
-
 fn sort_scan_results(results: &mut [WpaSupplicantScanResult]) {
     results.sort_by(|a, b| {
         let hidden = a.ssid.is_empty().cmp(&b.ssid.is_empty());
@@ -1132,9 +1148,8 @@ fn map_scan_security(
 ) -> Result<WifiClientSecurity, &'static str> {
     match security {
         WpaSupplicantScanSecurity::Open => Ok(WifiClientSecurity::Open),
-        WpaSupplicantScanSecurity::Wpa2Psk | WpaSupplicantScanSecurity::Wpa2Wpa3Transition => {
-            Ok(WifiClientSecurity::Wpa2)
-        }
+        WpaSupplicantScanSecurity::Wpa2Psk => Ok(WifiClientSecurity::Wpa2),
+        WpaSupplicantScanSecurity::Wpa2Wpa3Transition => Ok(WifiClientSecurity::Wpa2Wpa3),
         WpaSupplicantScanSecurity::Wpa3Sae => Ok(WifiClientSecurity::Wpa3),
         WpaSupplicantScanSecurity::EnterpriseOrUnsupported => {
             Err("Enterprise Wi-Fi is not supported by this client")
@@ -1190,7 +1205,8 @@ fn cycle_ap_security(value: WifiSecurity) -> WifiSecurity {
 fn cycle_client_security(value: WifiClientSecurity) -> WifiClientSecurity {
     match value {
         WifiClientSecurity::Wpa2 => WifiClientSecurity::Wpa3,
-        WifiClientSecurity::Wpa3 => WifiClientSecurity::Open,
+        WifiClientSecurity::Wpa3 => WifiClientSecurity::Wpa2Wpa3,
+        WifiClientSecurity::Wpa2Wpa3 => WifiClientSecurity::Open,
         WifiClientSecurity::Open => WifiClientSecurity::Wpa2,
     }
 }
@@ -1206,6 +1222,7 @@ fn client_security_label(value: WifiClientSecurity) -> &'static str {
     match value {
         WifiClientSecurity::Wpa2 => "wpa2",
         WifiClientSecurity::Wpa3 => "wpa3",
+        WifiClientSecurity::Wpa2Wpa3 => "wpa2/wpa3",
         WifiClientSecurity::Open => "open",
     }
 }
@@ -1215,16 +1232,15 @@ fn scan_security_label(value: WpaSupplicantScanSecurity) -> &'static str {
         WpaSupplicantScanSecurity::Wpa2Psk => "wpa2",
         WpaSupplicantScanSecurity::Wpa2Wpa3Transition => "wpa2/wpa3 transition",
         WpaSupplicantScanSecurity::Wpa3Sae => "wpa3",
-        WpaSupplicantScanSecurity::EnterpriseOrUnsupported | WpaSupplicantScanSecurity::Unknown => {
-            "unsupported"
-        }
+        WpaSupplicantScanSecurity::EnterpriseOrUnsupported => "unsupported: enterprise",
+        WpaSupplicantScanSecurity::Unknown => "unsupported: unknown security",
     }
 }
 fn role_label(role: WifiRole) -> &'static str {
     match role {
         WifiRole::AccessPoint => "AP",
         WifiRole::Client => "client",
-        WifiRole::Unknown => "unknown",
+        WifiRole::Unknown => "not configured",
     }
 }
 fn describe_row_state(row: &WifiRow) -> String {

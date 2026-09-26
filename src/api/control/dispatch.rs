@@ -516,6 +516,8 @@ impl ControlService {
                 passphrase,
                 clear_passphrase,
                 configure_dhcp,
+                subnet,
+                disable_dhcp,
             } => {
                 self.provision_wifi_access_point(
                     interface,
@@ -523,6 +525,8 @@ impl ControlService {
                     passphrase,
                     clear_passphrase,
                     configure_dhcp,
+                    subnet,
+                    disable_dhcp,
                 )
                 .await
             }
@@ -569,6 +573,10 @@ impl ControlService {
                 self.update_wifi_client_profile(id, profile).await
             }
             Request::DeleteWifiClientProfile { id } => self.delete_wifi_client_profile(id).await,
+            Request::ProvisionWifiClient {
+                interface,
+                settings,
+            } => self.provision_wifi_client(interface, settings).await,
             Request::ActivateWifiClientProfile {
                 interface,
                 profile_id,
@@ -627,6 +635,7 @@ fn is_network_mutation(request: &Request) -> bool {
             | Request::CreateWifiClientProfile { .. }
             | Request::UpdateWifiClientProfile { .. }
             | Request::DeleteWifiClientProfile { .. }
+            | Request::ProvisionWifiClient { .. }
             | Request::ActivateWifiClientProfile { .. }
             | Request::DeactivateWifiClientProfile { .. }
     )
@@ -636,7 +645,8 @@ fn is_network_mutation(request: &Request) -> bool {
 fn is_converged_network_transaction_request(request: &Request) -> bool {
     matches!(
         request,
-        Request::ProvisionWifiAccessPoint { .. }
+        Request::ProvisionWifiClient { .. }
+            | Request::ProvisionWifiAccessPoint { .. }
             | Request::ActivateWifiApProfile { .. }
             | Request::ApplyInterface { .. }
             | Request::ApplyInterfaceEdit { .. }
@@ -700,6 +710,7 @@ fn recovery_interface(request: &Request) -> Option<&str> {
         | Request::WifiClientSetPassphrase { interface, .. }
         | Request::WifiClientReconnect { interface, .. }
         | Request::WifiClientScan { interface, .. }
+        | Request::ProvisionWifiClient { interface, .. }
         | Request::ActivateWifiClientProfile { interface, .. }
         | Request::DeactivateWifiClientProfile { interface, .. } => Some(interface),
         _ => None,

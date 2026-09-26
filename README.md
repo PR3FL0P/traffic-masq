@@ -195,11 +195,11 @@ connectivity test.
 
 ### Applying and confirming changes
 
-Interface and router changes use **Apply → Commit**. Apply changes the running
+Interface, router, Wi-Fi Connect and hotspot provisioning use **Apply → Commit**. Apply changes the running
 network and starts a timer, normally 60 seconds. Commit keeps the change. If
 you lose access and cannot confirm, the daemon rolls it back when time runs out.
 
-Standalone DHCP, Wi-Fi and VPN operations apply immediately and do not use the
+Low-level DHCP, Wi-Fi and VPN operations apply immediately and do not use the
 interface/router confirmation timer. They instead persist ownership information
 before creating durable runtime state and reconcile it on restart. The timer
 itself needs a running daemon; crash recovery for both transaction journals and

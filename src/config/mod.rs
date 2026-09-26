@@ -256,6 +256,8 @@ pub struct OwnedIpv4RouteConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DhcpClientInterfaceConfig {
+    /// True only when Wi-Fi activation enabled this previously disabled policy.
+    pub wifi_owned: bool,
     pub enabled: bool,
     pub route_metric: u32,
     pub install_default_route: bool,
@@ -266,6 +268,7 @@ pub struct DhcpClientInterfaceConfig {
 impl Default for DhcpClientInterfaceConfig {
     fn default() -> Self {
         Self {
+            wifi_owned: false,
             enabled: true,
             route_metric: 100,
             install_default_route: true,
@@ -459,6 +462,7 @@ pub enum WifiClientSecurity {
     #[default]
     Wpa2,
     Wpa3,
+    Wpa2Wpa3,
     Open,
 }
 

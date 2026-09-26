@@ -26,7 +26,11 @@ pub(crate) fn render_wifi_scan(frame: &mut ratatui::Frame<'_>, area: Rect, app: 
                     } else {
                         &network.ssid
                     },
-                    scan_security_label(network.security)
+                    if std::str::from_utf8(&network.ssid_bytes).is_err() {
+                        "unsupported: binary SSID"
+                    } else {
+                        scan_security_label(network.security)
+                    }
                 ),
                 selected_style(index == scan.selected),
             )
@@ -38,7 +42,7 @@ pub(crate) fn render_wifi_scan(frame: &mut ratatui::Frame<'_>, area: Rect, app: 
     );
 }
 
-pub(crate) fn handle_wifi_scan_key(app: &mut TuiApp, key: KeyCode) {
+pub(crate) async fn handle_wifi_scan_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
     let Some(scan) = app.wifi_scan.as_mut() else {
         app.screen = Screen::Wifi;
         return;
@@ -58,7 +62,44 @@ pub(crate) fn handle_wifi_scan_key(app: &mut TuiApp, key: KeyCode) {
             let Some(network) = scan.networks.get(scan.selected) else {
                 return;
             };
-            match WifiProfileEditor::from_scan(scan.interface.clone(), network) {
+            let interface = scan.interface.clone();
+            let network = network.clone();
+            if !network.ssid.is_empty()
+                && std::str::from_utf8(&network.ssid_bytes).is_ok()
+                && map_scan_security(network.security).is_ok()
+            {
+                match client.request(&Request::ListWifiClientProfiles).await {
+                    Ok(Response::WifiClientProfiles { mut profiles }) => {
+                        profiles.sort_by(|a, b| {
+                            b.priority.cmp(&a.priority).then_with(|| a.id.cmp(&b.id))
+                        });
+                        if let Some(profile) = profiles.into_iter().find(|profile| {
+                            profile.ssid == network.ssid
+                                && Some(profile.security)
+                                    == map_scan_security(network.security).ok()
+                        }) {
+                            open_wifi_connect_prompt(
+                                app,
+                                client,
+                                interface,
+                                profile.id,
+                                profile.ssid,
+                            )
+                            .await;
+                            return;
+                        }
+                    }
+                    Ok(response) => {
+                        report_unexpected(app, response);
+                        return;
+                    }
+                    Err(error) => {
+                        app.push_message(LogLevel::Warn, error.to_string());
+                        return;
+                    }
+                }
+            }
+            match WifiProfileEditor::from_scan(interface, &network) {
                 Ok(editor) => {
                     app.wifi_profile_editor = Some(editor);
                     app.screen = Screen::WifiProfileEditor;

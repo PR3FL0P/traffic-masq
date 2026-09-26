@@ -161,12 +161,23 @@ fn append_security_lines(
                 lines.push(Line::secret("psk", hex_encode(psk)));
             }
         }
-        WifiClientSecurity::Wpa3 => {
+        WifiClientSecurity::Wpa3 | WifiClientSecurity::Wpa2Wpa3 => {
             lines.push(Line::plain("proto", "RSN"));
-            lines.push(Line::plain("key_mgmt", "SAE"));
+            let transition = spec.security == WifiClientSecurity::Wpa2Wpa3;
+            lines.push(Line::plain(
+                "key_mgmt",
+                if transition { "SAE WPA-PSK" } else { "SAE" },
+            ));
+            if transition {
+                if let Some(psk) = psk {
+                    lines.push(Line::secret("psk", hex_encode(psk)));
+                }
+            }
             lines.push(Line::plain("pairwise", "CCMP"));
 
-            lines.push(Line::plain("ieee80211w", 2));
+            lines.push(Line::plain("ieee80211w", if transition { 1 } else { 2 }));
+            // sae_password is STR_KEY in wpa_supplicant/config.c: the string
+            // parser decodes an unquoted hex value to the original bytes.
             if let Some(passphrase) = passphrase {
                 lines.push(Line::secret(
                     "sae_password",

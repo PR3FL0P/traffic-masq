@@ -1040,6 +1040,8 @@ impl PhysicalWifiFixture {
                 passphrase: Some(self.ap_psk_secret.clone()),
                 clear_passphrase: false,
                 configure_dhcp: true,
+                subnet: None,
+                disable_dhcp: false,
             })
             .await
             .context("supported AP reconfiguration API request failed")?

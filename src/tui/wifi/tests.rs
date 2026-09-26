@@ -172,26 +172,10 @@ async fn connect_navigation_does_not_change_choice_or_submit() {
 }
 
 #[tokio::test]
-async fn dhcp_is_configured_before_profile_activation() {
-    use crate::api::model::{DhcpClientOperationalState, DhcpClientStatusView};
-    let (_directory, client, server) = mock_api(vec![
-        Response::DhcpClientInterface {
-            status: DhcpClientStatusView {
-                interface: "wlan0".into(),
-                state: DhcpClientOperationalState::Waiting,
-                address: None,
-                prefix_length: None,
-                server: None,
-                expires_at_unix: None,
-                dns_servers: Vec::new(),
-                degraded_reason: None,
-                config: Default::default(),
-            },
-        },
-        Response::Error {
-            message: "activation failed".into(),
-        },
-    ])
+async fn connect_failure_uses_one_backend_operation() {
+    let (_directory, client, server) = mock_api(vec![Response::Error {
+        message: "activation failed".into(),
+    }])
     .await;
     let mut app = TuiApp {
         screen: Screen::WifiConnectPrompt,
@@ -204,25 +188,24 @@ async fn dhcp_is_configured_before_profile_activation() {
         ..Default::default()
     };
     submit_wifi_connect(&mut app, &client).await;
-    let paths = server.await.unwrap();
-    assert_eq!(paths[0], "PUT /api/v1/dhcp-client/wlan0");
-    assert!(paths[1].ends_with("/active-profile"));
+    assert_eq!(
+        server.await.unwrap(),
+        vec!["PUT /api/v1/wifi-client/wlan0/provision"]
+    );
     assert!(app.wifi_connect.is_some());
-    assert!(app
-        .message
-        .as_deref()
-        .unwrap()
-        .contains("IP configuration was updated"));
+    assert!(app.message.as_deref().unwrap().contains("not confirmed"));
 }
 
 #[tokio::test]
-async fn failed_dhcp_stop_blocks_static_edit_and_activation() {
-    let (_directory, client, server) = mock_api(vec![Response::DhcpClientError {
-        detail: crate::api::model::DhcpClientErrorDetail::OwnershipConflict {
-            message: "not owned".into(),
-        },
-    }])
-    .await;
+async fn static_connect_retains_pending_transaction_without_auto_commit() {
+    let change = crate::core::transaction::PendingNetworkChange {
+        token: "pending-token".into(),
+        interface: "wlan0".into(),
+        rollback_timeout_seconds: 60,
+        expires_at_unix: super::super::current_unix_time() + 60,
+    };
+    let (_directory, client, server) =
+        mock_api(vec![Response::NetworkChangePending { change }]).await;
     let mut prompt = WifiConnectPrompt::new("wlan0".into(), "home".into(), "Home".into(), None);
     prompt.choice = WifiIpChoice::NewStatic;
     prompt.static_cidr = "192.168.1.5/24".into();
@@ -234,71 +217,11 @@ async fn failed_dhcp_stop_blocks_static_edit_and_activation() {
     submit_wifi_connect(&mut app, &client).await;
     assert_eq!(
         server.await.unwrap(),
-        vec!["DELETE /api/v1/dhcp-client/wlan0"]
+        vec!["PUT /api/v1/wifi-client/wlan0/provision"]
     );
-    assert_eq!(app.screen, Screen::WifiConnectPrompt);
-    assert!(app.message.as_deref().unwrap().contains("not stopped"));
-}
-
-#[tokio::test]
-async fn static_ip_is_committed_before_profile_activation() {
-    let change = crate::core::transaction::PendingNetworkChange {
-        token: "static-token".into(),
-        interface: "wlan0".into(),
-        rollback_timeout_seconds: 60,
-        expires_at_unix: super::super::current_unix_time() + 60,
-    };
-    let (_directory, client, server) = mock_api(vec![
-        Response::DhcpClientDisabled {
-            interface: "wlan0".into(),
-        },
-        Response::NetworkChangePending {
-            change: change.clone(),
-        },
-        Response::NetworkChangeCommitted { change },
-        Response::Error {
-            message: "activation failed".into(),
-        },
-    ])
-    .await;
-    let mut prompt = WifiConnectPrompt::new("wlan0".into(), "home".into(), "Home".into(), None);
-    prompt.choice = WifiIpChoice::NewStatic;
-    prompt.static_cidr = "192.168.1.5/24".into();
-    let mut app = TuiApp {
-        screen: Screen::WifiConnectPrompt,
-        wifi_connect: Some(prompt),
-        ..Default::default()
-    };
-    submit_wifi_connect(&mut app, &client).await;
-    let paths = server.await.unwrap();
-    assert_eq!(paths.len(), 4);
-    assert_eq!(paths[0], "DELETE /api/v1/dhcp-client/wlan0");
-    assert_eq!(paths[1], "POST /api/v1/interfaces/wlan0/edit/apply");
-    assert_eq!(paths[2], "POST /api/v1/network-transactions/commit");
-    assert!(paths[3].ends_with("/active-profile"));
-    assert!(app.wifi_connect.is_some());
-}
-
-#[tokio::test]
-async fn failed_static_commit_retains_pending_transaction() {
-    let change = crate::core::transaction::PendingNetworkChange {
-        token: "pending-token".into(),
-        interface: "wlan0".into(),
-        rollback_timeout_seconds: 60,
-        expires_at_unix: super::super::current_unix_time() + 60,
-    };
-    let (_directory, client, server) = mock_api(vec![
-        Response::NetworkChangePending { change },
-        Response::Error {
-            message: "commit rejected".into(),
-        },
-    ])
-    .await;
-    let mut app = TuiApp::default();
-    assert!(!apply_wifi_static_ip(&mut app, &client, "wlan0", "192.168.1.5/24").await);
-    assert_eq!(server.await.unwrap().len(), 2);
     assert_eq!(app.screen, Screen::PendingChange);
     assert_eq!(app.pending.as_ref().unwrap().token, "pending-token");
+    assert!(app.wifi_connect.is_none());
 }
 
 fn scan(
@@ -312,6 +235,7 @@ fn scan(
         frequency_mhz: 2412,
         signal_dbm: signal,
         ssid: ssid.into(),
+        ssid_bytes: Vec::new(),
         raw_flags: String::new(),
         security,
     }
@@ -474,6 +398,8 @@ fn ap_request_is_atomic_and_enables_derived_dhcp_by_default() {
         ap_provision_request(&editor),
         Request::ProvisionWifiAccessPoint {
             configure_dhcp: true,
+            subnet: None,
+            disable_dhcp: false,
             ..
         }
     ));
@@ -803,22 +729,12 @@ fn unconfigured_radio_never_defaults_to_ap_and_role_mapping_is_strict() {
         has_default_route: false,
     };
     assert_eq!(build_rows(&[status], &[], &[])[0].role, WifiRole::Unknown);
-    assert_eq!(
-        role_from_interface(InterfaceRole::Output, true),
-        WifiRole::AccessPoint
-    );
-    assert_eq!(
-        role_from_interface(InterfaceRole::Input, false),
-        WifiRole::Unknown
-    );
-    assert_eq!(
-        role_from_interface(InterfaceRole::Input, true),
-        WifiRole::Client
-    );
-    assert_eq!(
-        role_from_interface(InterfaceRole::Output, false),
-        WifiRole::Unknown
-    );
+    assert!(actions(WifiRole::Unknown)
+        .iter()
+        .any(|(action, _)| matches!(action, PrimaryAction::Scan)));
+    assert!(actions(WifiRole::Unknown)
+        .iter()
+        .any(|(action, _)| matches!(action, PrimaryAction::ConfigureAp)));
 }
 
 #[test]
@@ -844,7 +760,10 @@ fn primary_navigation_moves_from_radios_into_role_actions() {
         ..WifiData::default()
     };
     assert_eq!(data.focused_radio().unwrap().interface, "wlan0");
-    assert_eq!(data.cursor_limit(), 6);
+    assert_eq!(
+        data.cursor_limit(),
+        data.rows.len() + actions(WifiRole::Client).len() - 1
+    );
     assert_eq!(actions(WifiRole::Client)[0].1, "Scan networks");
 }
 
@@ -1465,6 +1384,8 @@ async fn ap_profile_load_restores_radio_options_without_exposing_password() {
             id: "guest".into(),
             settings,
             configure_dhcp: false,
+            subnet: None,
+            disable_dhcp: false,
             has_passphrase: true,
         });
     editor.field = WifiField::SavedProfile;
@@ -1517,6 +1438,7 @@ fn open_client_profile_discards_password_typed_before_security_change() {
         frequency_mhz: 2412,
         signal_dbm: -40,
         ssid: "guest".into(),
+        ssid_bytes: Vec::new(),
         raw_flags: "[ESS]".into(),
         security: WpaSupplicantScanSecurity::Open,
     };

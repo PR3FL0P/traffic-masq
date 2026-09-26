@@ -28,6 +28,7 @@ fn sample_network(ssid: &str, security: WpaSupplicantScanSecurity) -> WpaSupplic
         frequency_mhz: 2412,
         signal_dbm: -50,
         ssid: ssid.to_string(),
+        ssid_bytes: Vec::new(),
         raw_flags: String::new(),
         security,
     }

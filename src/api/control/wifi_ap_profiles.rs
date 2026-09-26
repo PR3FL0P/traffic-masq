@@ -36,6 +36,8 @@ impl ControlService {
             c.passphrase,
             c.clear_passphrase,
             c.configure_dhcp,
+            c.subnet,
+            c.disable_dhcp,
         )
         .await
     }

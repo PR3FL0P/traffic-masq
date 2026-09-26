@@ -33,12 +33,17 @@ impl AutoconnectState {
 
 fn matching_network(profile: &WifiClientProfileSummary, network: &WpaSupplicantScanResult) -> bool {
     use WpaSupplicantScanSecurity as Scan;
-    profile.ssid == network.ssid
+    (network.ssid_bytes.is_empty() || network.ssid_bytes == profile.ssid.as_bytes())
+        && profile.ssid == network.ssid
         && match profile.security {
             WifiClientSecurity::Open => network.security == Scan::Open,
             WifiClientSecurity::Wpa2 => {
                 matches!(network.security, Scan::Wpa2Psk | Scan::Wpa2Wpa3Transition)
             }
+            WifiClientSecurity::Wpa2Wpa3 => matches!(
+                network.security,
+                Scan::Wpa2Psk | Scan::Wpa3Sae | Scan::Wpa2Wpa3Transition
+            ),
             WifiClientSecurity::Wpa3 => {
                 matches!(network.security, Scan::Wpa3Sae | Scan::Wpa2Wpa3Transition)
             }

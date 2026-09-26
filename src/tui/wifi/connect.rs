@@ -17,6 +17,7 @@ pub(crate) async fn open_wifi_connect_prompt(
         Ok(Response::InterfaceConfig {
             config: Some(cfg), ..
         }) => cfg.ipv4.map(|ip| ip.to_string()),
+        Ok(Response::InterfaceConfig { config: None, .. }) => None,
         Ok(response) => {
             report_unexpected(app, response);
             return;
@@ -128,83 +129,6 @@ pub(crate) async fn handle_wifi_connect_prompt_key(
     }
 }
 
-async fn disable_dhcp_for_static(app: &mut TuiApp, client: &ApiClient, interface: &str) -> bool {
-    use crate::api::model::DhcpClientErrorDetail;
-    match client
-        .request(&Request::DisableDhcpClient {
-            interface: interface.to_string(),
-        })
-        .await
-    {
-        Ok(Response::DhcpClientDisabled { .. })
-        | Ok(Response::DhcpClientError {
-            detail: DhcpClientErrorDetail::Disabled | DhcpClientErrorDetail::DhcpClientDisabled,
-        }) => true,
-        Ok(response) => {
-            app.push_message(
-                LogLevel::Warn,
-                format!("Cannot configure static IP: DHCP client was not stopped: {response:?}"),
-            );
-            false
-        }
-        Err(error) => {
-            app.push_message(
-                LogLevel::Warn,
-                format!("Cannot configure static IP: DHCP client was not stopped: {error}"),
-            );
-            false
-        }
-    }
-}
-
-pub(super) async fn apply_wifi_static_ip(
-    app: &mut TuiApp,
-    client: &ApiClient,
-    interface: &str,
-    cidr: &str,
-) -> bool {
-    match client
-        .request(&Request::ApplyInterfaceEdit {
-            interface: interface.to_string(),
-            edit: InterfaceEditRequest {
-                cidr: cidr.to_string(),
-                role: InterfaceRole::Input,
-                managed: true,
-                allow_management_change: true,
-            },
-        })
-        .await
-    {
-        Ok(Response::NetworkChangePending { change }) => {
-            match client
-                .request(&Request::CommitNetworkChange {
-                    token: change.token.clone(),
-                })
-                .await
-            {
-                Ok(Response::NetworkChangeCommitted { .. }) => true,
-                result => {
-                    // Retain the token and deadline so the user can inspect/roll back
-                    // an ambiguous commit instead of losing the pending transaction.
-                    app.pending = Some(change);
-                    app.pending_return_screen = Screen::Wifi;
-                    app.screen = Screen::PendingChange;
-                    app.push_message(LogLevel::Warn, format!("Static IP commit was not confirmed: {result:?}. Inspect pending state before retrying."));
-                    false
-                }
-            }
-        }
-        Ok(Response::NetworkChangeCommitted { .. }) => true,
-        result => {
-            app.push_message(
-                LogLevel::Warn,
-                format!("Static IP configuration failed: {result:?}"),
-            );
-            false
-        }
-    }
-}
-
 pub(super) async fn submit_wifi_connect(app: &mut TuiApp, client: &ApiClient) {
     let Some(prompt) = app.wifi_connect.clone() else {
         return;
@@ -228,55 +152,34 @@ pub(super) async fn submit_wifi_connect(app: &mut TuiApp, client: &ApiClient) {
         }
     }
 
-    // Activation validates that an IP configuration already exists. Configure
-    // it first, and stop immediately if any prerequisite fails.
-    if let Some(cidr) = static_cidr {
-        if !disable_dhcp_for_static(app, client, &prompt.interface).await
-            || !apply_wifi_static_ip(app, client, &prompt.interface, cidr).await
-        {
-            return;
-        }
-    } else {
-        match client
-            .request(&Request::ConfigureDhcpClient {
-                interface: prompt.interface.clone(),
-                config: DhcpClientConfigRequest::default(),
-            })
-            .await
-        {
-            Ok(Response::DhcpClientInterface { .. }) => {}
-            result => {
-                app.push_message(
-                    LogLevel::Warn,
-                    format!("DHCP client configuration failed: {result:?}"),
-                );
-                return;
-            }
-        }
-    }
-
+    use crate::api::model::{ProvisionWifiClientRequest, WifiClientIpPolicy};
+    let ip_policy = match static_cidr {
+        Some(cidr) => WifiClientIpPolicy::Static {
+            cidr: cidr.parse().expect("validated CIDR"),
+        },
+        None => WifiClientIpPolicy::Dhcp,
+    };
     match client
-        .request(&Request::ActivateWifiClientProfile {
+        .request(&Request::ProvisionWifiClient {
             interface: prompt.interface.clone(),
-            profile_id: prompt.profile_id.clone(),
+            settings: ProvisionWifiClientRequest {
+                profile_id: prompt.profile_id,
+                ip_policy,
+            },
         })
         .await
     {
-        Ok(Response::WifiClientProfileActivated { .. }) => {
-            app.push_message(
-                LogLevel::Info,
-                format!(
-                    "Profile '{}' activated; waiting for Wi-Fi connection and IP readiness.",
-                    prompt.ssid
-                ),
-            );
+        Ok(Response::NetworkChangePending { change }) => {
+            app.pending = Some(change);
+            app.pending_return_screen = Screen::Wifi;
             app.wifi_connect = None;
-            app.screen = Screen::Wifi;
-            load_wifi_data(app, client).await;
+            app.screen = Screen::PendingChange;
+            app.push_message(LogLevel::Info, "Wi-Fi candidate applied. Verify connectivity before confirming; otherwise it will roll back.");
         }
-        result => {
-            app.push_message(LogLevel::Warn, format!("IP configuration was updated, but profile activation was not confirmed: {result:?}. Inspect interface state before retrying."));
-        }
+        result => app.push_message(
+            LogLevel::Warn,
+            format!("Wi-Fi connection was not confirmed: {result:?}"),
+        ),
     }
 }
 

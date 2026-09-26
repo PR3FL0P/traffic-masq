@@ -334,6 +334,10 @@ fn build_router(state: AppState) -> Router {
                 .delete(delete_wifi_client_profile),
         )
         .route(
+            "/wifi-client/{interface}/provision",
+            put(provision_wifi_client),
+        )
+        .route(
             "/wifi-client/{interface}/active-profile",
             put(activate_wifi_client_profile).delete(deactivate_wifi_client_profile),
         )
@@ -1180,6 +1184,8 @@ async fn provision_wifi_access_point(
             passphrase: request.passphrase,
             clear_passphrase: request.clear_passphrase,
             configure_dhcp: request.configure_dhcp,
+            subnet: request.subnet,
+            disable_dhcp: request.disable_dhcp,
         },
     )
     .await
@@ -1356,6 +1362,23 @@ async fn delete_wifi_client_profile(
     dispatch_control(&state, &principal, Request::DeleteWifiClientProfile { id }).await
 }
 
+async fn provision_wifi_client(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    AxumPath(interface): AxumPath<String>,
+    Json(settings): Json<crate::api::model::ProvisionWifiClientRequest>,
+) -> Result<Json<Response>, ApiError> {
+    dispatch_control(
+        &state,
+        &principal,
+        Request::ProvisionWifiClient {
+            interface,
+            settings,
+        },
+    )
+    .await
+}
+
 async fn activate_wifi_client_profile(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1472,6 +1495,7 @@ fn control_request_requires_administrator(request: &Request) -> bool {
             | Request::CreateWifiClientProfile { .. }
             | Request::UpdateWifiClientProfile { .. }
             | Request::DeleteWifiClientProfile { .. }
+            | Request::ProvisionWifiClient { .. }
             | Request::ActivateWifiClientProfile { .. }
             | Request::DeactivateWifiClientProfile { .. }
     )

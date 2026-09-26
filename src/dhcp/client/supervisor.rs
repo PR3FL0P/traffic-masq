@@ -91,6 +91,7 @@ impl DhcpClientSpec {
 
     pub fn interface_config(&self) -> DhcpClientInterfaceConfig {
         DhcpClientInterfaceConfig {
+            wifi_owned: false,
             enabled: true,
             route_metric: self.route_metric,
             install_default_route: self.install_default_route,

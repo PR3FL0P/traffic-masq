@@ -117,7 +117,19 @@ pub struct WifiClientSupervisor {
     inner: Arc<Inner>,
 }
 
+struct AssociationMonitor {
+    pid: u32,
+    task: tokio::task::JoinHandle<()>,
+}
+impl Drop for AssociationMonitor {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 struct Inner {
+    association_events: tokio::sync::broadcast::Sender<(String, u32)>,
+    association_monitors: Mutex<HashMap<String, AssociationMonitor>>,
     wpa_supplicant_binary: PathBuf,
     runtime_dir: PathBuf,
     records_dir: PathBuf,
@@ -143,6 +155,8 @@ impl WifiClientSupervisor {
         let records_dir = config.runtime.state_dir.join("wifi");
         Self {
             inner: Arc::new(Inner {
+                association_events: tokio::sync::broadcast::channel(64).0,
+                association_monitors: Mutex::new(HashMap::new()),
                 wpa_supplicant_binary: config.wifi_client.wpa_supplicant_binary.clone(),
                 runtime_dir: config.wifi_client.runtime_dir.clone(),
                 passphrase_store: PassphraseStore::new(records_dir.join("psk")),
@@ -331,8 +345,64 @@ impl WifiClientSupervisor {
             }
         };
 
-        self.inner.tasks.lock().await.insert(interface, task);
+        let pid = task.record.pid;
+        self.inner
+            .tasks
+            .lock()
+            .await
+            .insert(interface.clone(), task);
+        self.monitor_association(&interface, pid).await;
         Ok(())
+    }
+
+    pub fn subscribe_association_changes(&self) -> tokio::sync::broadcast::Receiver<(String, u32)> {
+        self.inner.association_events.subscribe()
+    }
+
+    async fn monitor_association(&self, interface: &str, pid: u32) {
+        if pid == 0 {
+            return;
+        }
+        if self
+            .inner
+            .association_monitors
+            .lock()
+            .await
+            .get(interface)
+            .is_some_and(|monitor| monitor.pid == pid && !monitor.task.is_finished())
+        {
+            return;
+        }
+        let Ok((events, mut receiver)) =
+            WpaSupplicantEventClient::attach(&self.ctrl_path(interface), self.inner.ctrl_timeout)
+                .await
+        else {
+            // Periodic reconciliation retries attachment and recovers missed events.
+            return;
+        };
+        let sender = self.inner.association_events.clone();
+        let name = interface.to_owned();
+        let task = tokio::spawn(async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(
+                        WpaSupplicantEvent::Connected { .. }
+                        | WpaSupplicantEvent::Disconnected { .. },
+                    ) => {
+                        let _ = sender.send((name.clone(), pid));
+                    }
+                    Ok(WpaSupplicantEvent::Terminating) => break,
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            events.close().await;
+        });
+        self.inner
+            .association_monitors
+            .lock()
+            .await
+            .insert(interface.to_owned(), AssociationMonitor { pid, task });
     }
 
     async fn task_identity_matches(
@@ -604,6 +674,11 @@ impl WifiClientSupervisor {
                 )))
             }
         }
+        self.inner
+            .association_monitors
+            .lock()
+            .await
+            .remove(interface);
         self.inner.tasks.lock().await.remove(interface);
         Ok(Some(task.spec))
     }
@@ -896,6 +971,16 @@ impl WifiClientSupervisor {
             if self.ensure_interface_alive(&interface).await? {
                 restarted_any = true;
             }
+            let pid = self
+                .inner
+                .tasks
+                .lock()
+                .await
+                .get(&interface)
+                .map(|task| task.record.pid);
+            if let Some(pid) = pid {
+                self.monitor_association(&interface, pid).await;
+            }
         }
         Ok(restarted_any)
     }
@@ -1035,6 +1120,7 @@ impl WifiClientSupervisor {
     /// Apply the shutdown policy to supervised processes and their ownership records.
     pub async fn shutdown(&self, policy: ShutdownPolicy) {
         let _operation = self.inner.operation_lock.lock().await;
+        self.inner.association_monitors.lock().await.clear();
         let tasks = std::mem::take(&mut *self.inner.tasks.lock().await);
 
         for (interface, task) in tasks {

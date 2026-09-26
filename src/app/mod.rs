@@ -1162,11 +1162,40 @@ fn spawn_process_liveness_checks(
     mut shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut association_events = wifi_client
+            .as_ref()
+            .map(|wifi| wifi.subscribe_association_changes());
         let mut interval = time::interval(PROCESS_LIVENESS_INTERVAL);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
+                event = async {
+                    match association_events.as_mut() {
+                        Some(receiver) => receiver.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                        association_events = None;
+                    }
+                    if let Ok((interface, pid)) = event {
+                        let _network_mutation = network_mutations.execute().await;
+                        if let Some(router) = &router {
+                            if router.status().await != crate::core::router_transaction::CoordinatorStatus::Idle { continue; }
+                        }
+                        if let Some(wifi) = &wifi_client {
+                            // Re-read status under the gate: queued events may belong to a
+                            // replaced supplicant or precede a network transaction.
+                            if let Some(status) = wifi.status(&interface).await.filter(|status| status.pid == pid) {
+                                if let Some(spec) = dhcp_client.spec(&interface).await {
+                                    dhcp_client.reconcile_with_link_ready(spec, status.wpa_state.is_connected()).await;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 _ = interval.tick() => {
                     if shutdown_requested(&shutdown) {
                         break;

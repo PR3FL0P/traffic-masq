@@ -370,9 +370,22 @@ currently observed DHCP lease.
 
 ### Wi-Fi access points
 
-Editing an AP keeps radio and DHCP settings you have not changed. For a new AP,
-DHCP defaults are filled in only when no DHCP configuration exists. **Apply**
-takes effect immediately, without the interface/router confirmation timer.
+The Wi-Fi screen includes unconfigured radios. **Create hotspot** accepts an IPv4
+subnet and prepares a managed output interface in one backend transaction. DHCP
+policy explicitly selects preserve, enable/configure, or disable. **Apply** is
+tentative: verify connectivity and commit before the rollback timer expires.
+Saving a reusable AP profile is separate from applying the saved profile.
+
+Client **Connect** sends the profile and IPv4 policy to
+`PUT /api/v1/wifi-client/{interface}/provision`. The backend stages the interface,
+credential, Wi-Fi and DHCP state together and returns `NetworkChangePending`.
+Confirm the candidate only after checking connectivity. Failure or rollback
+restores the preceding configuration and credential. DHCP mode reuses existing
+route/DNS policy; switching to static disables DHCP without discarding it.
+
+The low-level `active-profile` endpoint starts activation and returns runtime
+status; its legacy `WifiClientProfileActivated` response does not prove IP
+readiness. Use the provisioning endpoint for interactive management changes.
 
 ## Daemon commands
 
@@ -438,7 +451,7 @@ the machine to the requested state and starts a timer, 60 seconds by default.
 Committing within that window keeps the change; letting the timer expire
 returns the interface/router state to the previous committed configuration.
 
-Standalone DHCP, Wi-Fi and VPN operations are different: they take effect
+Low-level DHCP, Wi-Fi and VPN operations are different: they take effect
 immediately and do not have an interface/router confirmation timer. Those
 subsystems write durable ownership or launch records before persistent runtime
 state is created, then reconcile those records against committed configuration

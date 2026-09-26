@@ -102,7 +102,13 @@ impl FakeSupplicantCtrl {
                     "SCAN_RESULTS" => "bssid / frequency / signal level / flags / ssid\n\
                          02:00:00:00:00:01\t2412\t-42\t[WPA2-PSK-CCMP][SAE][ESS]\tupstream\n"
                         .to_string(),
-                    "RECONNECT" | "DISCONNECT" | "REASSOCIATE" => "OK\n".to_string(),
+                    "RECONNECT" => {
+                        for addr in &attached {
+                            let _ = socket.send_to_addr(b"<3>CTRL-EVENT-CONNECTED - Connection to 02:00:00:00:00:01 completed\n", addr);
+                        }
+                        "OK\n".to_string()
+                    }
+                    "DISCONNECT" | "REASSOCIATE" => "OK\n".to_string(),
                     _ => "UNKNOWN COMMAND\n".to_string(),
                 };
                 let _ = socket.send_to_addr(reply.as_bytes(), &from);
@@ -1284,4 +1290,30 @@ async fn disabling_client_never_signals_a_pid_with_mismatched_identity() {
         .calls()
         .iter()
         .any(|c| matches!(c, FakeCall::Terminate(_) | FakeCall::Kill(_))));
+}
+
+#[tokio::test]
+async fn association_events_identify_the_current_supplicant_and_stop_on_disable() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("run");
+    let supervisor = supervisor(temp.path(), &runtime, fake_process()).await;
+    let mut changes = supervisor.subscribe_association_changes();
+    supervisor
+        .configure(spec("wlan0", "upstream"))
+        .await
+        .unwrap();
+    supervisor.reconnect("wlan0").await.unwrap();
+    let (interface, pid) = tokio::time::timeout(Duration::from_secs(2), changes.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(interface, "wlan0");
+    assert_eq!(pid, supervisor.status("wlan0").await.unwrap().pid);
+    supervisor.disable("wlan0").await.unwrap();
+    assert!(supervisor
+        .inner
+        .association_monitors
+        .lock()
+        .await
+        .is_empty());
 }
