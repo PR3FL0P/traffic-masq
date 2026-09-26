@@ -1289,7 +1289,6 @@ fn vpn_chain_longer_than_the_cap_is_rejected() {
     assert!(error.to_string().contains("exceeds the maximum"));
 }
 
-
 #[test]
 fn unvalidated_load_preserves_recovery_paths_when_unrelated_admission_fails() {
     let directory = tempfile::tempdir().expect("tempdir");

@@ -704,9 +704,10 @@ async fn router_recovery_manager_ignores_unrelated_invalid_override_fields_until
     .await
     .expect("write recovery state");
 
-    let manager = RuntimeOverrideManager::load_for_router_recovery(directory.path(), &base_config())
-        .await
-        .expect("router recovery state");
+    let manager =
+        RuntimeOverrideManager::load_for_router_recovery(directory.path(), &base_config())
+            .await
+            .expect("router recovery state");
     let snapshot = manager.snapshot().await;
     assert_eq!(snapshot.revision, 11);
     assert_eq!(

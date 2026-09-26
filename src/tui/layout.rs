@@ -205,9 +205,10 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Tu
             ("Enter/Esc", "finish"),
         ]
     } else if app.screen == Screen::RouterPending
-        && app.router_pending.as_ref().is_some_and(|view| {
-            view.recovery_required()
-        })
+        && app
+            .router_pending
+            .as_ref()
+            .is_some_and(|view| view.recovery_required())
     {
         vec![
             ("↑/↓", "details"),

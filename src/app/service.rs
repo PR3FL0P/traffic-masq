@@ -61,8 +61,12 @@ pub fn acquire_startup_attempt(config: &AppConfig) -> Result<StartupAttemptGuard
         .runtime
         .pid_path
         .with_file_name(format!("{file_name}.start.lock"));
-    crate::atomic_file::reject_symlink(&lock_path)
-        .with_context(|| format!("refusing unsafe startup-attempt lock {}", lock_path.display()))?;
+    crate::atomic_file::reject_symlink(&lock_path).with_context(|| {
+        format!(
+            "refusing unsafe startup-attempt lock {}",
+            lock_path.display()
+        )
+    })?;
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -71,13 +75,20 @@ pub fn acquire_startup_attempt(config: &AppConfig) -> Result<StartupAttemptGuard
         .mode(crate::atomic_file::PRIVATE_FILE_MODE)
         .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
         .open(&lock_path)
-        .with_context(|| format!("failed to open startup-attempt lock {}", lock_path.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to open startup-attempt lock {}",
+                lock_path.display()
+            )
+        })?;
     lock.try_lock_exclusive().map_err(|error| {
         if error.kind() == std::io::ErrorKind::WouldBlock {
             anyhow::anyhow!("another traffic-masqd start attempt is already in progress")
         } else {
-            anyhow::Error::new(error)
-                .context(format!("failed to lock startup-attempt file {}", lock_path.display()))
+            anyhow::Error::new(error).context(format!(
+                "failed to lock startup-attempt file {}",
+                lock_path.display()
+            ))
         }
     })?;
     Ok(StartupAttemptGuard { lock })
@@ -130,8 +141,9 @@ fn read_startup_recovery_report(config: &AppConfig) -> Result<Option<RecoveryDia
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to open startup recovery report {}", path.display()))
+            return Err(error).with_context(|| {
+                format!("failed to open startup recovery report {}", path.display())
+            })
         }
     };
     let mut bytes = Vec::new();

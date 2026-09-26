@@ -148,9 +148,7 @@ fn spec_with_security(
     passphrase_file: Option<PathBuf>,
     security: WifiSecurity,
 ) -> WifiApSpec {
-    use crate::config::{
-        InterfaceConfig, InterfaceRole, WifiApConfig, WifiBand, WifiChannelWidth,
-    };
+    use crate::config::{InterfaceConfig, InterfaceRole, WifiApConfig, WifiBand, WifiChannelWidth};
 
     let config = InterfaceConfig {
         role: InterfaceRole::Output,

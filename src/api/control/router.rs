@@ -45,10 +45,8 @@ impl ControlService {
         };
         let health = router.manager().health(&desired).await;
         let coordinator = router.view().await;
-        let recovery = router_recovery_notice(
-            coordinator.status,
-            coordinator.rollback_failures.clone(),
-        );
+        let recovery =
+            router_recovery_notice(coordinator.status, coordinator.rollback_failures.clone());
         Response::RouterStatus {
             enabled: desired.enabled,
             ready: desired.enabled && health.ready(),
@@ -298,8 +296,8 @@ impl ControlService {
         let status = coordinator.status;
         let token = coordinator.token;
         let rollback_failures = coordinator.rollback_failures;
-        let rollback_failure = (status == CoordinatorStatus::RollbackFailed)
-            .then(|| rollback_failures.clone());
+        let rollback_failure =
+            (status == CoordinatorStatus::RollbackFailed).then(|| rollback_failures.clone());
         let recovery = router_recovery_notice(status, rollback_failures);
         Response::RouterPendingTransaction {
             token,
@@ -999,7 +997,10 @@ mod recovery_notice_tests {
         assert!(!notice.summary.is_empty());
         assert_eq!(notice.operator_action, "retry_rollback");
         assert_eq!(notice.known_action(), Some(RecoveryAction::RetryRollback));
-        assert_eq!(notice.known_code(), Some(RecoveryCode::RouterRollbackFailed));
+        assert_eq!(
+            notice.known_code(),
+            Some(RecoveryCode::RouterRollbackFailed)
+        );
         assert_eq!(notice.runbook, "docs/recovery.md#tm-rec-207");
         assert_eq!(notice.failures, vec!["route restore failed"]);
     }

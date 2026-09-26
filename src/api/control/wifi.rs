@@ -142,6 +142,7 @@ impl ControlService {
         Response::WifiConfigured { spec }
     }
 
+    #[allow(clippy::too_many_arguments)] // Mirrors the API request's independent provisioning options.
     pub(super) async fn provision_wifi_access_point(
         &self,
         interface: String,

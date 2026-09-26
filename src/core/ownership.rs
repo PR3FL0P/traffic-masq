@@ -175,8 +175,7 @@ impl AddressOwnershipJournal {
         let store = PrivateJsonDirectory::open(state_root, "address-ownership")?;
         let mut claims = BTreeMap::new();
         let mut blocked_interfaces = Vec::new();
-        let entries = std::fs::read_dir(store.directory())
-            .map_err(PrivateStoreError::from)?;
+        let entries = std::fs::read_dir(store.directory()).map_err(PrivateStoreError::from)?;
 
         for entry in entries {
             let entry = entry.map_err(PrivateStoreError::from)?;
@@ -201,16 +200,17 @@ impl AddressOwnershipJournal {
                 }
             };
             if file_type.is_symlink() {
-                blocked_interfaces.push((
-                    interface,
-                    format!("unsafe symlink at {}", path.display()),
-                ));
+                blocked_interfaces
+                    .push((interface, format!("unsafe symlink at {}", path.display())));
                 continue;
             }
             if !file_type.is_file() {
                 blocked_interfaces.push((
                     interface,
-                    format!("ownership document is not a regular file: {}", path.display()),
+                    format!(
+                        "ownership document is not a regular file: {}",
+                        path.display()
+                    ),
                 ));
                 continue;
             }

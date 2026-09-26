@@ -147,7 +147,6 @@ async fn a_document_from_a_future_version_is_refused_rather_than_guessed_at() {
     ));
 }
 
-
 #[tokio::test]
 async fn isolated_open_blocks_only_the_corrupt_ownership_document() {
     let directory = tempdir().expect("tempdir");
@@ -163,10 +162,12 @@ async fn isolated_open_blocks_only_the_corrupt_ownership_document() {
     let outcome = AddressOwnershipJournal::open_isolated(directory.path()).expect("isolated open");
     assert_eq!(outcome.blocked_interfaces.len(), 1);
     assert_eq!(outcome.blocked_interfaces[0].0, "bad0");
-    assert!(outcome
-        .journal
-        .owns("lan0", Ipv4Addr::new(192, 0, 2, 1), 24)
-        .await);
+    assert!(
+        outcome
+            .journal
+            .owns("lan0", Ipv4Addr::new(192, 0, 2, 1), 24)
+            .await
+    );
 }
 
 #[test]

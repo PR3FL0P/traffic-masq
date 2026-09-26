@@ -1047,7 +1047,10 @@ impl PhysicalWifiFixture {
             .context("supported AP reconfiguration API request failed")?
         {
             Response::NetworkChangePending { change }
-                if change.interface == self.output_interface => change,
+                if change.interface == self.output_interface =>
+            {
+                change
+            }
             response => bail!("AP reconfiguration returned unexpected response: {response:?}"),
         };
         match client
@@ -1058,9 +1061,9 @@ impl PhysicalWifiFixture {
             .context("AP reconfiguration commit request failed")?
         {
             Response::NetworkChangeCommitted { .. } => {}
-            response => bail!(
-                "AP reconfiguration commit returned unexpected response: {response:?}"
-            ),
+            response => {
+                bail!("AP reconfiguration commit returned unexpected response: {response:?}")
+            }
         }
 
         let (retained_address, retained_prefix, retained_gateway) = self

@@ -88,6 +88,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Identity and digest evidence must be checked together.
 pub(crate) async fn classify_ownership<F>(
     store: &WifiRecordStore,
     kind: WifiProcessKind,
@@ -109,10 +110,7 @@ where
     // exact configured executable plus private config-path argument. Never
     // guess when more than one process matches.
     if let Some(pending) = record.clone().filter(|record| record.pid == 0) {
-        let binary_path = pending
-            .binary_path
-            .as_deref()
-            .unwrap_or(expected_binary);
+        let binary_path = pending.binary_path.as_deref().unwrap_or(expected_binary);
         match process
             .pids_matching_identity(
                 kind,
@@ -158,10 +156,7 @@ where
         let Some(record) = record else {
             return Ok(OwnershipOutcome::Absent);
         };
-        let binary_path = record
-            .binary_path
-            .as_deref()
-            .unwrap_or(expected_binary);
+        let binary_path = record.binary_path.as_deref().unwrap_or(expected_binary);
         return match process
             .identity_matches(
                 record.pid,
@@ -196,10 +191,7 @@ where
     let Some(record) = record else {
         return Ok(OwnershipOutcome::ForeignPresent);
     };
-    let binary_path = record
-        .binary_path
-        .as_deref()
-        .unwrap_or(expected_binary);
+    let binary_path = record.binary_path.as_deref().unwrap_or(expected_binary);
 
     let process_matches = process
         .identity_matches(
@@ -266,6 +258,7 @@ pub(crate) async fn save_launch_intent(
     Ok(record)
 }
 
+#[allow(clippy::too_many_arguments)] // Keep all persisted process identity fields explicit at call sites.
 pub(crate) async fn save_spawned_record(
     store: &WifiRecordStore,
     pid: u32,

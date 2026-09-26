@@ -314,8 +314,7 @@ pub(crate) async fn refresh_router_pending_screen(app: &mut TuiApp, client: &Api
     }
     match client.request(&Request::RouterPendingTransaction).await {
         Ok(Response::RouterPendingTransaction {
-            status:
-                CoordinatorStatus::Idle | CoordinatorStatus::RecoveredButJournalCleanupPending,
+            status: CoordinatorStatus::Idle | CoordinatorStatus::RecoveredButJournalCleanupPending,
             ..
         }) => {
             app.router_pending = None;

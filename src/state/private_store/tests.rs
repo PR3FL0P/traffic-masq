@@ -58,7 +58,6 @@ fn refuses_traversal_and_symlinked_documents() {
     assert_eq!(fs::read(&target).expect("read target"), b"do not replace");
 }
 
-
 #[test]
 fn enumeration_refuses_a_symlink_disguised_as_a_document() {
     let root = tempdir().expect("tempdir");

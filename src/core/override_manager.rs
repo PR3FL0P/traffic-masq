@@ -59,6 +59,7 @@ impl RuntimeOverrideManager {
     /// startup, so unrelated API/security corruption cannot suppress router
     /// journal recovery. The same manager is hydrated with the strict document
     /// once recovery has completed.
+    #[cfg(test)]
     pub(crate) async fn load_for_router_recovery(
         state_dir: impl AsRef<Path>,
         base: &AppConfig,
@@ -79,8 +80,8 @@ impl RuntimeOverrideManager {
         proof: &crate::state::overrides::RecoveryCommitProof,
         committed_router_transaction: Option<String>,
     ) -> Result<Self> {
-        let state = proof
-            .router_recovery_overrides_with_commit_token(committed_router_transaction)?;
+        let state =
+            proof.router_recovery_overrides_with_commit_token(committed_router_transaction)?;
         Ok(Self {
             store,
             base: base.clone(),

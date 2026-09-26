@@ -377,10 +377,10 @@ struct ErrorResponse {
 }
 
 fn control_request_timeout(method: &Method) -> std::time::Duration {
-    if method == &Method::POST
-        || method == &Method::PUT
-        || method == &Method::DELETE
-        || method == &Method::PATCH
+    if method == Method::POST
+        || method == Method::PUT
+        || method == Method::DELETE
+        || method == Method::PATCH
     {
         CONTROL_MUTATION_REQUEST_TIMEOUT
     } else {

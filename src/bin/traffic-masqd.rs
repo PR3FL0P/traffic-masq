@@ -214,11 +214,7 @@ async fn main() -> Result<()> {
                 .await
             };
             let pid = start_result.map_err(|error| {
-                service::augment_start_error(
-                    config,
-                    error,
-                    report_preparation_error.as_deref(),
-                )
+                service::augment_start_error(config, error, report_preparation_error.as_deref())
             })?;
             println!(
                 "traffic-masqd started (PID {pid}); config: {}",

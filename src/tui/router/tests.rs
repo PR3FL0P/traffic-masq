@@ -677,23 +677,27 @@ fn router_buttons_wrap_and_remain_visible_at_supported_sizes() {
     }
 }
 
-
 #[test]
 fn degraded_recovery_marks_router_mutations_as_blocked() {
-    let mut router = RouterData::default();
-    router.recovery = Some(RouterRecoveryNotice {
-        recovery_code: "TM-REC-207".into(),
-        invariant: "router_rollback_failed".into(),
-        summary: "rollback failed".into(),
-        blocked_operation: "new router transactions".into(),
-        operator_action: "retry_rollback".into(),
-        operator_guidance: "retry rollback".into(),
-        runbook: "docs/recovery.md#tm-rec-207".into(),
-        failures: Vec::new(),
-    });
+    let router = RouterData {
+        recovery: Some(RouterRecoveryNotice {
+            recovery_code: "TM-REC-207".into(),
+            invariant: "router_rollback_failed".into(),
+            summary: "rollback failed".into(),
+            blocked_operation: "new router transactions".into(),
+            operator_action: "retry_rollback".into(),
+            operator_guidance: "retry rollback".into(),
+            runbook: "docs/recovery.md#tm-rec-207".into(),
+            failures: Vec::new(),
+        }),
+        ..Default::default()
+    };
 
     let buttons = router_action_buttons(&router);
-    assert_eq!(buttons[3], (RouterAction::PlanApply, "[Apply blocked: recovery]"));
+    assert_eq!(
+        buttons[3],
+        (RouterAction::PlanApply, "[Apply blocked: recovery]")
+    );
     assert_eq!(
         buttons[7],
         (RouterAction::ToggleEnabled, "[Routing change blocked]")
@@ -760,12 +764,17 @@ fn coordinator_status_blocks_mutations_without_structured_notice() {
         CoordinatorStatus::RollbackFailed,
         CoordinatorStatus::RecoveredButJournalCleanupPending,
     ] {
-        let mut router = RouterData::default();
-        router.coordinator_status = Some(status);
+        let router = RouterData {
+            coordinator_status: Some(status),
+            ..Default::default()
+        };
 
         assert!(router.recovery_blocks_mutations());
         let buttons = router_action_buttons(&router);
-        assert_eq!(buttons[3], (RouterAction::PlanApply, "[Apply blocked: recovery]"));
+        assert_eq!(
+            buttons[3],
+            (RouterAction::PlanApply, "[Apply blocked: recovery]")
+        );
         assert_eq!(
             buttons[7],
             (RouterAction::ToggleEnabled, "[Routing change blocked]")
@@ -985,7 +994,6 @@ fn health_report_details_is_empty_when_every_subsystem_is_healthy() {
     assert!(health_report_details(&health).is_empty());
 }
 
-
 #[test]
 fn main_router_recovery_summary_stays_compact() {
     let notice = RouterRecoveryNotice {
@@ -1026,14 +1034,28 @@ fn formats_structured_router_recovery_notice() {
 
     let lines = recovery_notice_text(&notice, Some(2));
     assert!(lines.iter().any(|line| line.contains("TM-REC-207")));
-    assert!(lines.iter().any(|line| line.contains("router_rollback_failed")));
-    assert!(lines.iter().any(|line| line.contains("new router transactions")));
+    assert!(lines
+        .iter()
+        .any(|line| line.contains("router_rollback_failed")));
+    assert!(lines
+        .iter()
+        .any(|line| line.contains("new router transactions")));
     assert!(lines.iter().any(|line| line.contains("retry_rollback")));
-    assert!(lines.iter().any(|line| line.contains("dhcp restart failed")));
-    assert!(lines.iter().any(|line| line.contains("route restore failed")));
-    assert!(!lines.iter().any(|line| line.contains("firewall restore failed")));
-    assert!(lines.iter().any(|line| line.contains("... 1 more failure(s)")));
-    assert!(lines.iter().any(|line| line.contains("docs/recovery.md#tm-rec-207")));
+    assert!(lines
+        .iter()
+        .any(|line| line.contains("dhcp restart failed")));
+    assert!(lines
+        .iter()
+        .any(|line| line.contains("route restore failed")));
+    assert!(!lines
+        .iter()
+        .any(|line| line.contains("firewall restore failed")));
+    assert!(lines
+        .iter()
+        .any(|line| line.contains("... 1 more failure(s)")));
+    assert!(lines
+        .iter()
+        .any(|line| line.contains("docs/recovery.md#tm-rec-207")));
 }
 
 #[test]

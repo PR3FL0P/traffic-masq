@@ -55,7 +55,12 @@ impl ResolvedConfig {
     /// validate it for normal runtime use.
     pub fn load(explicit: Option<PathBuf>) -> Result<Self> {
         let environment = std::env::var_os(CONFIG_ENV).map(PathBuf::from);
-        Self::load_from(explicit, environment, PathBuf::from(DEFAULT_CONFIG_PATH), true)
+        Self::load_from(
+            explicit,
+            environment,
+            PathBuf::from(DEFAULT_CONFIG_PATH),
+            true,
+        )
     }
 
     /// Resolve and deserialize configuration without semantic admission.
@@ -65,7 +70,12 @@ impl ResolvedConfig {
     /// cannot be recovered reliably from an undecodable file.
     pub fn load_unvalidated(explicit: Option<PathBuf>) -> Result<Self> {
         let environment = std::env::var_os(CONFIG_ENV).map(PathBuf::from);
-        Self::load_from(explicit, environment, PathBuf::from(DEFAULT_CONFIG_PATH), false)
+        Self::load_from(
+            explicit,
+            environment,
+            PathBuf::from(DEFAULT_CONFIG_PATH),
+            false,
+        )
     }
 
     /// Select the highest-priority configuration source and optionally admit its contents.

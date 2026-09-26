@@ -444,10 +444,7 @@ async fn invalid_recovery_record_is_not_discarded() {
     let diagnostic = error.to_string();
     assert!(diagnostic.contains("recovery_code=TM-REC-203"));
     assert!(diagnostic.contains("invariant=decodable_recovery_snapshot"));
-    assert!(diagnostic.contains(&format!(
-        "journal={}",
-        coordinator.inner.journal.display()
-    )));
+    assert!(diagnostic.contains(&format!("journal={}", coordinator.inner.journal.display())));
     assert!(diagnostic.contains("required_proof=independent_committed_transaction_token"));
     assert!(diagnostic.contains("backup_scope=complete_state_directory"));
     assert!(diagnostic.contains("operator_action=restore_coherent_backup"));
@@ -478,7 +475,10 @@ async fn unsupported_uncommitted_router_schema_reports_versions_and_action() {
     .await
     .unwrap();
 
-    let error = coordinator.recover().await.expect_err("unsupported schema must block");
+    let error = coordinator
+        .recover()
+        .await
+        .expect_err("unsupported schema must block");
     let diagnostic = format!("{error:#}");
     assert!(diagnostic.contains("recovery_code=TM-REC-205"));
     assert!(diagnostic.contains("invariant=supported_schema"));
@@ -502,7 +502,10 @@ async fn newer_router_journal_reports_both_revisions() {
         .await
         .unwrap();
 
-    let error = coordinator.recover().await.expect_err("newer journal must block");
+    let error = coordinator
+        .recover()
+        .await
+        .expect_err("newer journal must block");
     let diagnostic = format!("{error:#}");
     assert!(diagnostic.contains("recovery_code=TM-REC-206"));
     assert!(diagnostic.contains("invariant=revision_order"));
@@ -1307,5 +1310,8 @@ async fn dangling_router_journal_symlink_is_not_treated_as_missing() {
     let diagnostic = format!("{error:#}");
     assert!(diagnostic.contains("recovery_code=TM-REC-202"));
     assert!(diagnostic.contains("invariant=accessible_router_recovery_journal"));
-    assert!(fake.events().is_empty(), "recovery must not mutate the network");
+    assert!(
+        fake.events().is_empty(),
+        "recovery must not mutate the network"
+    );
 }

@@ -22,9 +22,13 @@ fn precedence_is_cli_then_environment_then_system_then_builtin() {
     write_config(&environment);
     write_config(&system);
 
-    let resolved =
-        ResolvedConfig::load_from(Some(cli.clone()), Some(environment.clone()), system.clone(), true)
-            .expect("CLI resolution");
+    let resolved = ResolvedConfig::load_from(
+        Some(cli.clone()),
+        Some(environment.clone()),
+        system.clone(),
+        true,
+    )
+    .expect("CLI resolution");
     assert_eq!(resolved.source, ConfigSource::CommandLine(cli));
 
     let resolved = ResolvedConfig::load_from(None, Some(environment.clone()), system.clone(), true)
@@ -36,7 +40,8 @@ fn precedence_is_cli_then_environment_then_system_then_builtin() {
     assert_eq!(resolved.source, ConfigSource::SystemFile(system));
 
     let missing = directory.path().join("missing.toml");
-    let resolved = ResolvedConfig::load_from(None, None, missing, true).expect("built-in resolution");
+    let resolved =
+        ResolvedConfig::load_from(None, None, missing, true).expect("built-in resolution");
     assert_eq!(resolved.source, ConfigSource::BuiltIn);
     assert!(resolved.config.network.interfaces.is_empty());
 }

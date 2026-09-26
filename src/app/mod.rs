@@ -1573,18 +1573,22 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     }
 
     let router_journal = config.runtime.state_dir.join("router-transaction.json");
-    let router_recovery_pending = crate::atomic_file::regular_file_exists(&router_journal).context(
-        crate::core::recovery::RecoveryDiagnostic::fatal(
-            crate::core::recovery::StartupRecoveryCode::AccessibleRouterRecoveryJournal,
-            "inspect",
-            crate::core::recovery::RecoveryAction::RepairStorageAccess,
-        )
-        .journal(router_journal.clone())
-        .object("router")
-        .detail("expected_type", "regular_file_when_present")
-        .detail("expected_mode", format!("{:04o}", crate::atomic_file::PRIVATE_FILE_MODE))
-        .detail("symlink_allowed", false),
-    )?;
+    let router_recovery_pending = crate::atomic_file::regular_file_exists(&router_journal)
+        .context(
+            crate::core::recovery::RecoveryDiagnostic::fatal(
+                crate::core::recovery::StartupRecoveryCode::AccessibleRouterRecoveryJournal,
+                "inspect",
+                crate::core::recovery::RecoveryAction::RepairStorageAccess,
+            )
+            .journal(router_journal.clone())
+            .object("router")
+            .detail("expected_type", "regular_file_when_present")
+            .detail(
+                "expected_mode",
+                format!("{:04o}", crate::atomic_file::PRIVATE_FILE_MODE),
+            )
+            .detail("symlink_allowed", false),
+        )?;
     let provisioning_journal = config
         .runtime
         .state_dir
@@ -1600,7 +1604,10 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
             .journal(provisioning_journal.clone())
             .object("router-provisioning-secrets")
             .detail("expected_type", "regular_file_when_present")
-            .detail("expected_mode", format!("{:04o}", crate::atomic_file::PRIVATE_FILE_MODE))
+            .detail(
+                "expected_mode",
+                format!("{:04o}", crate::atomic_file::PRIVATE_FILE_MODE),
+            )
             .detail("symlink_allowed", false),
         )?;
 
@@ -1648,7 +1655,10 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
             )
             .journal(provisioning_journal)
             .object("router-provisioning-secrets")
-            .detail("next_step", "inspect_nested_recovery_diagnostic_before_restoring_state"),
+            .detail(
+                "next_step",
+                "inspect_nested_recovery_diagnostic_before_restoring_state",
+            ),
         ));
     }
 
@@ -1917,7 +1927,10 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
                         )
                         .journal(config.runtime.state_dir.join("router-transaction.json"))
                         .object("router")
-                        .detail("next_step", "inspect_nested_recovery_diagnostic_before_restoring_state"),
+                        .detail(
+                            "next_step",
+                            "inspect_nested_recovery_diagnostic_before_restoring_state",
+                        ),
                     ));
                 }
             }

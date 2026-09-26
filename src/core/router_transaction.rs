@@ -94,6 +94,7 @@ struct PendingTransaction {
     snapshot: RouterSnapshot,
 }
 
+#[allow(clippy::large_enum_variant)] // Avoid changing transaction state ownership solely to shrink the enum.
 enum CoordinatorState {
     Idle,
     Pending(PendingTransaction),
@@ -750,11 +751,14 @@ impl RouterTransactionCoordinator {
             .journal(self.inner.journal.clone())
             .object("router")
             .detail("expected_type", "regular_file_when_present")
-            .detail("expected_mode", format!("{:04o}", crate::atomic_file::PRIVATE_FILE_MODE))
+            .detail(
+                "expected_mode",
+                format!("{:04o}", crate::atomic_file::PRIVATE_FILE_MODE),
+            )
             .detail("symlink_allowed", false)
         };
         if !crate::atomic_file::regular_file_exists(&self.inner.journal)
-            .with_context(|| journal_access_diagnostic())?
+            .with_context(journal_access_diagnostic)?
         {
             return Ok(false);
         }
@@ -766,7 +770,8 @@ impl RouterTransactionCoordinator {
             Err(error) => return Err(error).context(journal_access_diagnostic()),
         };
         if crate::core::recovery::completed(&self.inner.journal, &bytes).await? {
-            self.retain_committed_router_interfaces_for_recovery().await?;
+            self.retain_committed_router_interfaces_for_recovery()
+                .await?;
             self.clear_journal().await?;
             *state = CoordinatorState::Idle;
             self.notify_idle();
@@ -807,7 +812,8 @@ impl RouterTransactionCoordinator {
                     "quarantine unavailable; retiring committed metadata separately");
                 self.clear_journal().await?;
             }
-            self.retain_committed_router_interfaces_for_recovery().await?;
+            self.retain_committed_router_interfaces_for_recovery()
+                .await?;
             *state = CoordinatorState::Idle;
             self.notify_idle();
             return Ok(false);
@@ -834,8 +840,10 @@ impl RouterTransactionCoordinator {
             .detail("journal_schema", journal.version)
             .detail("supported_schemas", "1,2")
             .detail("fallback_action", "restore_coherent_backup");
-            return Err(anyhow::anyhow!("unsupported router transaction journal version")
-                .context(diagnostic));
+            return Err(
+                anyhow::anyhow!("unsupported router transaction journal version")
+                    .context(diagnostic),
+            );
         }
         let revision = self.inner.overrides.committed_revision().await;
         if revision < journal.base_revision {
@@ -866,7 +874,9 @@ impl RouterTransactionCoordinator {
             let candidate = self
                 .inner
                 .overrides
-                .build_recovery_candidate(&crate::core::router_candidate::RouterIntentProposal::new())
+                .build_recovery_candidate(
+                    &crate::core::router_candidate::RouterIntentProposal::new(),
+                )
                 .await?;
             *state = CoordinatorState::RollbackFailed(RollbackFailure {
                 recovery_desired: journal.current_desired.clone(),

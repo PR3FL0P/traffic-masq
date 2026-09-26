@@ -244,7 +244,11 @@ async fn legacy_record_without_executable_identity_loads_unproven() {
     .await
     .unwrap();
 
-    let record = store.load().await.expect("legacy record loads").expect("record");
+    let record = store
+        .load()
+        .await
+        .expect("legacy record loads")
+        .expect("record");
     assert_eq!(record.pid, 4242);
     assert_eq!(record.binary_path, None);
 }

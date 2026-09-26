@@ -35,7 +35,10 @@ async fn unix_socket_ownership_is_tied_to_the_pid_holding_the_kernel_socket() {
         .await
         .expect("foreign pid"));
 
-    process.kill(foreign_pid).await.expect("cleanup foreign process");
+    process
+        .kill(foreign_pid)
+        .await
+        .expect("cleanup foreign process");
     drop(socket);
 }
 
@@ -70,21 +73,13 @@ fn wifi_process_kind_matching_distinguishes_hostapd_from_supplicant() {
         WifiProcessKind::AccessPoint,
         config
     ));
-    assert!(!argv_matches_kind(
-        hostapd,
-        WifiProcessKind::Client,
-        config
-    ));
+    assert!(!argv_matches_kind(hostapd, WifiProcessKind::Client, config));
     assert!(argv_matches_kind(
         supplicant,
         WifiProcessKind::Client,
         config
     ));
-    assert!(argv_matches_kind(
-        scan,
-        WifiProcessKind::Scan,
-        scan_config
-    ));
+    assert!(argv_matches_kind(scan, WifiProcessKind::Scan, scan_config));
     assert!(!argv_matches_kind(
         supplicant,
         WifiProcessKind::AccessPoint,

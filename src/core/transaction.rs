@@ -15,7 +15,10 @@ use crate::core::interface::{
 };
 use crate::core::mutation::NetworkMutationGate;
 use crate::dhcp::supervisor::{DhcpServiceSpec, DhcpSupervisor};
-use crate::wifi::{secret::{WifiPassphrase, WifiPassphraseUpdate}, store::PassphraseStore};
+use crate::wifi::{
+    secret::{WifiPassphrase, WifiPassphraseUpdate},
+    store::PassphraseStore,
+};
 
 /// How long an apply waits for convergence to reach what it proposed.
 ///
@@ -68,9 +71,7 @@ impl SecretSnapshot {
 const INTERFACE_RECOVERY_STORE_ATTEMPTS: usize = 3;
 const INTERFACE_RECOVERY_RETRY_DELAY: Duration = Duration::from_millis(100);
 
-fn retryable_interface_store_error(
-    error: &crate::state::private_store::PrivateStoreError,
-) -> bool {
+fn retryable_interface_store_error(error: &crate::state::private_store::PrivateStoreError) -> bool {
     matches!(
         error,
         crate::state::private_store::PrivateStoreError::Io(error)
@@ -97,7 +98,10 @@ fn interface_recovery_store_error(
         .path(state_dir.join("interface-transactions"))
         .object("interface-transactions")
         .detail("expected_type", "directory")
-        .detail("expected_mode", format!("{:04o}", crate::atomic_file::PRIVATE_DIR_MODE))
+        .detail(
+            "expected_mode",
+            format!("{:04o}", crate::atomic_file::PRIVATE_DIR_MODE),
+        )
         .detail("symlink_allowed", false),
     )
 }
@@ -156,7 +160,11 @@ async fn enumerate_interface_recovery_journals(
                 tokio::time::sleep(INTERFACE_RECOVERY_RETRY_DELAY).await;
             }
             Err(error) => {
-                return Err(interface_recovery_store_error(state_dir, "enumerate", error));
+                return Err(interface_recovery_store_error(
+                    state_dir,
+                    "enumerate",
+                    error,
+                ));
             }
         }
     }

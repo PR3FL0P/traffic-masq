@@ -100,8 +100,11 @@ async fn startup_recovery_report_rejects_code_invariant_mismatch() {
     let bytes = fs::read(&path).expect("report bytes");
     let mut value: serde_json::Value = serde_json::from_slice(&bytes).expect("report json");
     value["invariant"] = serde_json::Value::String("supported_schema".to_string());
-    fs::write(&path, serde_json::to_vec_pretty(&value).expect("serialize report"))
-        .expect("rewrite report");
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&value).expect("serialize report"),
+    )
+    .expect("rewrite report");
 
     let error = read_startup_recovery_report(&config)
         .expect_err("mismatched recovery code/invariant must be rejected");
@@ -128,8 +131,11 @@ async fn startup_recovery_report_rejects_code_runbook_mismatch() {
     let bytes = fs::read(&path).expect("report bytes");
     let mut value: serde_json::Value = serde_json::from_slice(&bytes).expect("report json");
     value["runbook"] = serde_json::Value::String("docs/recovery.md#tm-rec-205".to_string());
-    fs::write(&path, serde_json::to_vec_pretty(&value).expect("serialize report"))
-        .expect("rewrite report");
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&value).expect("serialize report"),
+    )
+    .expect("rewrite report");
 
     let error = read_startup_recovery_report(&config)
         .expect_err("mismatched recovery code/runbook must be rejected");
@@ -196,8 +202,11 @@ async fn version_one_startup_recovery_report_is_rejected_as_old_format() {
         .as_object_mut()
         .expect("report object")
         .remove("runbook");
-    fs::write(&path, serde_json::to_vec_pretty(&value).expect("serialize report"))
-        .expect("rewrite report");
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&value).expect("serialize report"),
+    )
+    .expect("rewrite report");
 
     let error = read_startup_recovery_report(&config)
         .expect_err("version one receipt must not be accepted as current");

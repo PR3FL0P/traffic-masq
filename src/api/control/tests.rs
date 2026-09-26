@@ -927,7 +927,14 @@ async fn dhcp_uplink_plan_auto_enables_interface_dhcp_client() {
     let (service, _directory) =
         router_service_with_config(Arc::new(FakeRouterSubsystems::default()), config).await;
     let mut proposal = router_proposal();
-    proposal.set_router.as_mut().unwrap().uplink.as_mut().unwrap().mode = UplinkMode::Dhcp;
+    proposal
+        .set_router
+        .as_mut()
+        .unwrap()
+        .uplink
+        .as_mut()
+        .unwrap()
+        .mode = UplinkMode::Dhcp;
 
     match service.dispatch(Request::RouterPlan { proposal }).await {
         Response::RouterPlan { plan } => {
@@ -954,7 +961,14 @@ async fn dhcp_uplink_plan_preserves_explicit_interface_override_while_enabling_d
     let (service, _directory) =
         router_service_with_config(Arc::new(FakeRouterSubsystems::default()), config).await;
     let mut proposal = router_proposal();
-    proposal.set_router.as_mut().unwrap().uplink.as_mut().unwrap().mode = UplinkMode::Dhcp;
+    proposal
+        .set_router
+        .as_mut()
+        .unwrap()
+        .uplink
+        .as_mut()
+        .unwrap()
+        .mode = UplinkMode::Dhcp;
 
     let mut override_config = proposal
         .set_interfaces
@@ -4327,7 +4341,12 @@ async fn dhcp_client_control_configure_compensates_runtime_when_persistence_fail
 #[tokio::test]
 async fn dhcp_client_control_delete_cleans_runtime_and_persists_disabled_intent() {
     let fixture = dhcp_client_control_fixture(true).await;
-    let mut original = fixture.overrides.effective_interface("wan0").await.unwrap().unwrap();
+    let mut original = fixture
+        .overrides
+        .effective_interface("wan0")
+        .await
+        .unwrap()
+        .unwrap();
     let policy = original.dhcp_client.as_mut().unwrap();
     policy.route_metric = 777;
     policy.install_default_route = false;
@@ -4335,7 +4354,11 @@ async fn dhcp_client_control_delete_cleans_runtime_and_persists_disabled_intent(
     policy.send_release_on_shutdown = false;
     let mut expected = policy.clone();
     expected.enabled = false;
-    fixture.overrides.set_interface("wan0".into(), original, false).await.unwrap();
+    fixture
+        .overrides
+        .set_interface("wan0".into(), original, false)
+        .await
+        .unwrap();
     let response = fixture
         .service
         .dispatch(Request::DisableDhcpClient {

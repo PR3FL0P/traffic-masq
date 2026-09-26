@@ -162,9 +162,7 @@ impl From<StartupRecoveryCode> for RecoveryCode {
             StartupRecoveryCode::ValidRecoverySnapshot => Self::ValidRecoverySnapshot,
             StartupRecoveryCode::SupportedSchema => Self::SupportedSchema,
             StartupRecoveryCode::RevisionOrder => Self::RevisionOrder,
-            StartupRecoveryCode::RestoreProvisioningSecrets => {
-                Self::RestoreProvisioningSecrets
-            }
+            StartupRecoveryCode::RestoreProvisioningSecrets => Self::RestoreProvisioningSecrets,
             StartupRecoveryCode::ValidProvisioningSecretSnapshot => {
                 Self::ValidProvisioningSecretSnapshot
             }
@@ -347,10 +345,7 @@ pub fn diagnostic_from_error(error: &anyhow::Error) -> Option<&RecoveryDiagnosti
     error.downcast_ref::<RecoveryDiagnostic>()
 }
 
-pub fn context_if_missing(
-    error: anyhow::Error,
-    fallback: RecoveryDiagnostic,
-) -> anyhow::Error {
+pub fn context_if_missing(error: anyhow::Error, fallback: RecoveryDiagnostic) -> anyhow::Error {
     if diagnostic_from_error(&error).is_some() {
         error
     } else {
@@ -736,7 +731,10 @@ mod tests {
         assert_eq!(record.invariant, "revision_order");
         assert_eq!(record.operator_action, "restore_coherent_backup");
         assert_eq!(
-            record.details.get("journal_base_revision").map(String::as_str),
+            record
+                .details
+                .get("journal_base_revision")
+                .map(String::as_str),
             Some("15")
         );
     }
@@ -798,7 +796,11 @@ mod tests {
         let mut invariants = std::collections::BTreeSet::new();
 
         for code in RecoveryCode::ALL {
-            assert!(codes.insert(code.as_str()), "duplicate recovery code {}", code);
+            assert!(
+                codes.insert(code.as_str()),
+                "duplicate recovery code {}",
+                code
+            );
             assert!(
                 invariants.insert(code.invariant()),
                 "duplicate recovery invariant {}",
@@ -851,12 +853,24 @@ mod tests {
 
     #[test]
     fn recovery_actions_have_stable_operator_values() {
-        assert_eq!(RecoveryAction::InspectRecoveryState.as_str(), "inspect_recovery_state");
-        assert_eq!(RecoveryAction::RepairStorageAccess.as_str(), "repair_storage_access");
-        assert_eq!(RecoveryAction::RestoreCoherentBackup.as_str(), "restore_coherent_backup");
+        assert_eq!(
+            RecoveryAction::InspectRecoveryState.as_str(),
+            "inspect_recovery_state"
+        );
+        assert_eq!(
+            RecoveryAction::RepairStorageAccess.as_str(),
+            "repair_storage_access"
+        );
+        assert_eq!(
+            RecoveryAction::RestoreCoherentBackup.as_str(),
+            "restore_coherent_backup"
+        );
         assert_eq!(RecoveryAction::RetryRollback.as_str(), "retry_rollback");
         assert_eq!(RecoveryAction::AwaitCleanup.as_str(), "await_cleanup");
-        assert_eq!(RecoveryAction::UseCompatibleDaemon.as_str(), "use_compatible_daemon");
+        assert_eq!(
+            RecoveryAction::UseCompatibleDaemon.as_str(),
+            "use_compatible_daemon"
+        );
         assert_eq!("retry_rollback".parse(), Ok(RecoveryAction::RetryRollback));
         assert_eq!("await_cleanup".parse(), Ok(RecoveryAction::AwaitCleanup));
         assert_eq!("retry_cleanup".parse(), Ok(RecoveryAction::AwaitCleanup));

@@ -148,7 +148,7 @@ pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &A
                             LogLevel::Warn,
                             "Router changes are blocked until recovery completes; press r for recovery status/action",
                         );
-                    },
+                    }
                     RouterAction::ToggleEnabled => toggle_router_enabled(app, client).await,
                     RouterAction::AddRoute => open_route_editor_for_add(app, client).await,
                     RouterAction::EditRoute => open_route_editor_for_selected(app, client).await,
@@ -158,11 +158,11 @@ pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &A
                             LogLevel::Warn,
                             "Router apply is blocked until recovery completes; press r for recovery status/action",
                         );
-                    },
+                    }
                     RouterAction::PlanApply => open_router_plan(app, client).await,
                     RouterAction::ShareViaRoute => {
                         super::super::forwarding::open_from_route(app, client).await
-                    },
+                    }
                     RouterAction::Refresh => refresh_router_data(app, client).await,
                     RouterAction::Topology => select_pane(app, RouterPane::Topology),
                 },

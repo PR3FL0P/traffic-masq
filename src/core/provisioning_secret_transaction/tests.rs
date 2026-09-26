@@ -154,7 +154,6 @@ async fn uncommitted_unknown_schema_remains_operator_blocking() {
     assert!(journal.exists());
 }
 
-
 #[tokio::test]
 async fn missing_committed_token_never_proves_null_journal_token_committed() {
     let temp = tempfile::tempdir().expect("tempdir");

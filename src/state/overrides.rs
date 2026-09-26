@@ -352,9 +352,8 @@ impl RuntimeOverrideStore {
     }
 
     pub async fn load(&self) -> Result<RuntimeOverrides> {
-        atomic_file::reject_symlink(&self.path).with_context(|| {
-            format!("unsafe runtime override path {}", self.path.display())
-        })?;
+        atomic_file::reject_symlink(&self.path)
+            .with_context(|| format!("unsafe runtime override path {}", self.path.display()))?;
         let content = match fs::read(&self.path).await {
             Ok(content) => content,
             Err(error) if error.kind() == ErrorKind::NotFound => {

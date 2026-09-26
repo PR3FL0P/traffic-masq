@@ -2,11 +2,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use thiserror::Error;
 use crate::config::{vht80_center_channel, WifiBand, WifiChannelWidth};
 use crate::netlink::wireless_phy;
 use crate::wifi::WifiApSpec;
+use async_trait::async_trait;
+use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum RadioError {
@@ -51,16 +51,12 @@ impl IwCapabilitiesProvider {
     }
 
     async fn output(&self, args: &[&str]) -> Result<String, RadioError> {
-        let output = crate::command::run(
-            &self.iw_binary,
-            args,
-            &[],
-            crate::command::COMMAND_TIMEOUT,
-        )
-        .await
-        .map_err(|error| RadioError::ProbeFailed {
-            message: error.to_string(),
-        })?;
+        let output =
+            crate::command::run(&self.iw_binary, args, &[], crate::command::COMMAND_TIMEOUT)
+                .await
+                .map_err(|error| RadioError::ProbeFailed {
+                    message: error.to_string(),
+                })?;
         Ok(String::from_utf8_lossy(&output).into_owned())
     }
 }
@@ -162,8 +158,7 @@ impl WifiPhyCapabilities {
         spec: &WifiApSpec,
         regulatory_domain: &RegulatoryDomain,
     ) -> bool {
-        let (effective_country, self_managed) =
-            self.effective_regdomain(regulatory_domain);
+        let (effective_country, self_managed) = self.effective_regdomain(regulatory_domain);
         if self_managed {
             return true;
         }
@@ -226,7 +221,13 @@ impl WifiPhyCapabilities {
             )));
         }
 
-        self.validate_primary(spec.band, spec.channel, spec.channel_width, band, enforce_regulatory)
+        self.validate_primary(
+            spec.band,
+            spec.channel,
+            spec.channel_width,
+            band,
+            enforce_regulatory,
+        )
     }
 
     fn any_usable_primary(
@@ -276,7 +277,11 @@ impl WifiPhyCapabilities {
                 } else {
                     channel.checked_sub(4)
                 }
-                .ok_or_else(|| self.unsupported(format!("channel {channel} has no valid HT40 secondary channel")))?;
+                .ok_or_else(|| {
+                    self.unsupported(format!(
+                        "channel {channel} has no valid HT40 secondary channel"
+                    ))
+                })?;
                 let Some(secondary_caps) = band.channels.get(&secondary) else {
                     return Err(self.unsupported(format!(
                         "channel {channel} requires secondary channel {secondary}, which the PHY does not advertise"
@@ -373,11 +378,14 @@ fn parse_phy_info(phy: &str, text: &str) -> Result<WifiPhyCapabilities, RadioErr
 
     let mut bands = BTreeMap::new();
     for raw in raw_bands {
-        let band_kind = raw.frequencies.iter().find_map(|channel| match channel.frequency_mhz {
-            2_400..=2_500 => Some(WifiBand::Ghz2),
-            4_900..=5_900 => Some(WifiBand::Ghz5),
-            _ => None,
-        });
+        let band_kind = raw
+            .frequencies
+            .iter()
+            .find_map(|channel| match channel.frequency_mhz {
+                2_400..=2_500 => Some(WifiBand::Ghz2),
+                4_900..=5_900 => Some(WifiBand::Ghz5),
+                _ => None,
+            });
         let Some(band_kind) = band_kind else { continue };
         let entry = bands
             .entry(band_kind)
@@ -447,15 +455,21 @@ fn parse_reg_domains(text: &str) -> RegulatoryDomain {
             }
             continue;
         }
-        let Some(country) = trimmed.strip_prefix("country ") else { continue };
-        let Some(code) = country.get(..2) else { continue };
+        let Some(country) = trimmed.strip_prefix("country ") else {
+            continue;
+        };
+        let Some(code) = country.get(..2) else {
+            continue;
+        };
         if !code.bytes().all(|byte| byte.is_ascii_uppercase()) {
             continue;
         }
         match scope {
             Scope::Global => result.global_country = Some(code.to_string()),
             Scope::Phy(index, self_managed) => {
-                result.per_phy.insert(index, (code.to_string(), self_managed));
+                result
+                    .per_phy
+                    .insert(index, (code.to_string(), self_managed));
             }
         }
     }
@@ -575,8 +589,7 @@ Wiphy phy0
     #[test]
     fn accepts_vht80_only_when_the_whole_block_is_available() {
         let (caps, reg) = capabilities();
-        caps
-            .validate(&spec(WifiBand::Ghz5, 36, WifiChannelWidth::Vht80), &reg)
+        caps.validate(&spec(WifiBand::Ghz5, 36, WifiChannelWidth::Vht80), &reg)
             .expect("36-48 is a complete usable 80 MHz block");
 
         let error = caps

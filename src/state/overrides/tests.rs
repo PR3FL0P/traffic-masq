@@ -139,7 +139,10 @@ async fn recovery_commit_proof_ignores_unrelated_invalid_override_fields() {
             .map(String::as_str),
         Some("interface-token")
     );
-    assert!(store.load().await.is_err(), "full override load must stay strict");
+    assert!(
+        store.load().await.is_err(),
+        "full override load must stay strict"
+    );
 }
 
 #[tokio::test]
@@ -158,7 +161,10 @@ async fn recovery_commit_proof_fields_fail_independently() {
     .await
     .expect("write recovery proof");
 
-    let proof = store.load_recovery_commit_proof().await.expect("proof envelope");
+    let proof = store
+        .load_recovery_commit_proof()
+        .await
+        .expect("proof envelope");
     assert_eq!(
         proof.committed_router_transaction().unwrap().as_deref(),
         Some("router-token")
@@ -196,10 +202,12 @@ async fn recovery_commit_proof_rejects_dangling_override_symlink() {
 fn router_recovery_effective_config_ignores_unrelated_security_and_api_admission() {
     let mut base = AppConfig::default();
     base.auth.argon2_iterations = 0;
-    let mut overrides = RuntimeOverrides::default();
-    overrides.security = Some(crate::config::SecurityConfig {
-        rollback_timeout_seconds: 0,
-    });
+    let overrides = RuntimeOverrides {
+        security: Some(crate::config::SecurityConfig {
+            rollback_timeout_seconds: 0,
+        }),
+        ..Default::default()
+    };
 
     assert!(overrides.effective_config(&base).is_err());
     overrides
@@ -223,7 +231,10 @@ async fn router_recovery_state_can_use_a_separately_parsed_commit_token() {
     .await
     .expect("write recovery proof");
 
-    let proof = store.load_recovery_commit_proof().await.expect("proof envelope");
+    let proof = store
+        .load_recovery_commit_proof()
+        .await
+        .expect("proof envelope");
     assert!(proof.committed_router_transaction().is_err());
     let state = proof
         .router_recovery_overrides_with_commit_token(None)
