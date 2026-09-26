@@ -1229,7 +1229,7 @@ fn draw_app<'a, B: ratatui::backend::Backend>(
     terminal: &'a mut Terminal<B>,
     app: &mut TuiApp,
     direct: bool,
-) -> io::Result<ratatui::CompletedFrame<'a>> {
+) -> Result<ratatui::CompletedFrame<'a>, B::Error> {
     let view = ViewIdentity {
         screen: app.screen,
         message_open: app.message_open,
