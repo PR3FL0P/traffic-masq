@@ -1,8 +1,8 @@
 use std::net::Ipv4Addr;
 
 use crate::config::{
-    DhcpInterfaceConfig, ForwardingConfig, InterfaceRole, OwnedIpv4RouteConfig, UplinkConfig,
-    UplinkMode,
+    DhcpClientInterfaceConfig, DhcpInterfaceConfig, ForwardingConfig, InterfaceRole,
+    OwnedIpv4RouteConfig, UplinkConfig, UplinkMode,
 };
 use crate::firewall::RouterDataplaneTarget;
 
@@ -67,6 +67,12 @@ fn enabled_router() -> RouterConfig {
         owned_routes: Vec::new(),
         allow_default_route_change: false,
     }
+}
+
+fn dhcp_router() -> RouterConfig {
+    let mut router = enabled_router();
+    router.uplink.as_mut().expect("uplink").mode = UplinkMode::Dhcp;
+    router
 }
 
 fn committed() -> RuntimeOverrides {
@@ -279,6 +285,87 @@ fn rejects_candidate_whose_owned_route_leaves_the_router_contract() {
     .expect_err("default route without permission must be rejected");
 
     assert!(format!("{error:#}").contains("allow_default_route_change"));
+}
+
+#[test]
+fn dhcp_uplink_materializes_dhcp_client_from_the_same_candidate_snapshot() {
+    let mut base = base_config();
+    base.network.interfaces.get_mut("wan0").unwrap().managed = true;
+
+    let candidate = RouterCandidate::build(
+        &base,
+        &committed(),
+        &RouterIntentProposal::new().set_router(dhcp_router()),
+    )
+    .expect("DHCP uplink candidate");
+
+    let wan = candidate
+        .document()
+        .interfaces
+        .get("wan0")
+        .expect("derived wan0 override");
+    assert!(wan.config.dhcp_client.as_ref().unwrap().enabled);
+    assert!(!wan.allow_management_change);
+}
+
+#[test]
+fn dhcp_uplink_preserves_existing_override_metadata_and_policy_options() {
+    let mut base = base_config();
+    base.network.interfaces.get_mut("wan0").unwrap().managed = true;
+
+    let mut committed = committed();
+    let mut wan = base.network.interfaces["wan0"].clone();
+    wan.dhcp_client = Some(DhcpClientInterfaceConfig {
+        wifi_owned: true,
+        enabled: false,
+        route_metric: 777,
+        install_default_route: false,
+        request_dns: false,
+        send_release_on_shutdown: true,
+    });
+    committed.interfaces.insert(
+        "wan0".to_owned(),
+        InterfaceOverride {
+            config: wan,
+            allow_management_change: true,
+        },
+    );
+
+    let candidate = RouterCandidate::build(
+        &base,
+        &committed,
+        &RouterIntentProposal::new().set_router(dhcp_router()),
+    )
+    .expect("DHCP uplink candidate");
+
+    let wan = candidate.document().interfaces.get("wan0").unwrap();
+    let policy = wan.config.dhcp_client.as_ref().unwrap();
+    assert!(wan.allow_management_change);
+    assert!(policy.enabled);
+    assert!(policy.wifi_owned);
+    assert_eq!(policy.route_metric, 777);
+    assert!(!policy.install_default_route);
+    assert!(!policy.request_dns);
+    assert!(policy.send_release_on_shutdown);
+}
+
+#[test]
+fn dhcp_uplink_rejects_removing_the_same_interface_in_one_proposal() {
+    let mut base = base_config();
+    base.network.interfaces.get_mut("wan0").unwrap().managed = true;
+
+    let error = RouterCandidate::build(
+        &base,
+        &committed(),
+        &RouterIntentProposal::new()
+            .set_router(dhcp_router())
+            .remove_interface("wan0"),
+    )
+    .expect_err("conflicting intent must be rejected");
+
+    assert!(error
+        .to_string()
+        .contains("cannot remove router uplink interface wan0"));
 }
 
 #[test]

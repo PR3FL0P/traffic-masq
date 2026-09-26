@@ -6,7 +6,7 @@ use serde::{Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::config::{AppConfig, InterfaceConfig, InterfaceRole, RouterConfig};
+use crate::config::{AppConfig, InterfaceConfig, InterfaceRole, RouterConfig, UplinkMode};
 use crate::core::interface::is_management_change;
 use crate::core::router::RouterDesired;
 use crate::state::overrides::{InterfaceOverride, RuntimeOverrides};
@@ -124,6 +124,70 @@ impl Serialize for CandidateDigest {
     }
 }
 
+fn apply_derived_router_requirements(
+    base: &AppConfig,
+    proposal: &RouterIntentProposal,
+    document: &mut RuntimeOverrides,
+) -> Result<()> {
+    let RouterOverrideChange::Set(router) = &proposal.router else {
+        return Ok(());
+    };
+    if !router.enabled {
+        return Ok(());
+    }
+    let Some(uplink) = router
+        .uplink
+        .as_ref()
+        .filter(|uplink| uplink.mode == UplinkMode::Dhcp)
+    else {
+        return Ok(());
+    };
+
+    if matches!(proposal.interfaces.get(&uplink.interface), Some(None)) {
+        bail!(
+            "cannot remove router uplink interface {} while configuring it as a DHCP uplink",
+            uplink.interface
+        );
+    }
+
+    if let Some(existing) = document.interfaces.get_mut(&uplink.interface) {
+        existing
+            .config
+            .dhcp_client
+            .get_or_insert_with(Default::default)
+            .enabled = true;
+        return Ok(());
+    }
+
+    let Some(base_config) = base.network.interfaces.get(&uplink.interface) else {
+        bail!(
+            "router uplink interface {} is not configured",
+            uplink.interface
+        );
+    };
+    if base_config
+        .dhcp_client
+        .as_ref()
+        .is_some_and(|policy| policy.enabled)
+    {
+        return Ok(());
+    }
+
+    let mut config = base_config.clone();
+    config
+        .dhcp_client
+        .get_or_insert_with(Default::default)
+        .enabled = true;
+    document.interfaces.insert(
+        uplink.interface.clone(),
+        InterfaceOverride {
+            config,
+            allow_management_change: false,
+        },
+    );
+    Ok(())
+}
+
 fn reject_unconfirmed_management_change(
     committed_effective: &AppConfig,
     proposal: &RouterIntentProposal,
@@ -218,6 +282,7 @@ impl RouterCandidate {
 
         let mut document = committed.clone();
         proposal.apply_to(&mut document);
+        apply_derived_router_requirements(base, proposal, &mut document)?;
 
         let document = document.normalized()?;
         let effective = if recovery {

@@ -914,6 +914,94 @@ async fn enabled_router_without_uplink_with_routes_reports_ready_provisioning_st
 }
 
 #[tokio::test]
+async fn dhcp_uplink_plan_auto_enables_interface_dhcp_client() {
+    let mut config = router_base_config();
+    let wan = config
+        .network
+        .interfaces
+        .get_mut("wan0")
+        .expect("wan0 interface");
+    wan.managed = true;
+    wan.dhcp_client = None;
+
+    let (service, _directory) =
+        router_service_with_config(Arc::new(FakeRouterSubsystems::default()), config).await;
+    let mut proposal = router_proposal();
+    proposal.set_router.as_mut().unwrap().uplink.as_mut().unwrap().mode = UplinkMode::Dhcp;
+
+    match service.dispatch(Request::RouterPlan { proposal }).await {
+        Response::RouterPlan { plan } => {
+            let dhcp = plan
+                .desired
+                .uplink_dhcp
+                .expect("DHCP uplink should be derived automatically");
+            assert_eq!(dhcp.interface, "wan0");
+        }
+        other => panic!("expected DHCP router plan, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn dhcp_uplink_plan_preserves_explicit_interface_override_while_enabling_dhcp() {
+    let mut config = router_base_config();
+    let wan = config
+        .network
+        .interfaces
+        .get_mut("wan0")
+        .expect("wan0 interface");
+    wan.managed = true;
+
+    let (service, _directory) =
+        router_service_with_config(Arc::new(FakeRouterSubsystems::default()), config).await;
+    let mut proposal = router_proposal();
+    proposal.set_router.as_mut().unwrap().uplink.as_mut().unwrap().mode = UplinkMode::Dhcp;
+
+    let mut override_config = proposal
+        .set_interfaces
+        .get("wan0")
+        .map(|request| request.config.clone())
+        .unwrap_or_else(|| InterfaceConfig {
+            role: InterfaceRole::Input,
+            managed: true,
+            ipv4: None,
+            dhcp: None,
+            dhcp_client: Some(DhcpClientInterfaceConfig {
+                enabled: false,
+                ..Default::default()
+            }),
+            wifi: None,
+            wifi_client: None,
+            nat: false,
+        });
+    override_config.nat = false;
+    proposal.set_interfaces.insert(
+        "wan0".to_string(),
+        crate::api::model::InterfaceOverrideRequest {
+            config: override_config,
+            allow_management_change: false,
+        },
+    );
+
+    match service.dispatch(Request::RouterPlan { proposal }).await {
+        Response::RouterPlan { plan } => {
+            let uplink = plan
+                .desired
+                .interfaces
+                .iter()
+                .find(|interface| interface.name == "wan0")
+                .expect("wan0 desired interface");
+            assert!(!uplink.config.nat);
+            assert!(uplink
+                .config
+                .dhcp_client
+                .as_ref()
+                .is_some_and(|policy| policy.enabled));
+        }
+        other => panic!("expected DHCP router plan, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn router_plan_apply_commit_workflow_dispatches_through_control_service() {
     let (service, _directory) = router_enabled_service().await;
 
