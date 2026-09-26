@@ -348,10 +348,7 @@ async fn process_started_near(pid: u32, started_at_unix: u64) -> Result<bool, Pr
     }))
 }
 
-async fn process_started_after_intent(
-    pid: u32,
-    intent_at_unix: u64,
-) -> Result<bool, ProcessError> {
+async fn process_started_after_intent(pid: u32, intent_at_unix: u64) -> Result<bool, ProcessError> {
     const MAX_LAUNCH_DELAY_SECONDS: u64 = 30;
     Ok(process_started_at(pid).await?.is_some_and(|actual| {
         actual.saturating_add(1) >= intent_at_unix
@@ -364,13 +361,16 @@ async fn unix_socket_owned_by(pid: u32, socket_path: &Path) -> Result<bool, Proc
         .await
         .map_err(|source| ProcessError::Inspect { pid, source })?;
     let expected_path = socket_path.as_os_str().as_encoded_bytes();
-    let mut matching_inodes = table.split(|byte| *byte == b'\n').skip(1).filter_map(|line| {
-        let fields: Vec<&[u8]> = line
-            .split(|byte| byte.is_ascii_whitespace())
-            .filter(|field| !field.is_empty())
-            .collect();
-        (fields.len() >= 8 && fields[7] == expected_path).then_some(fields[6])
-    });
+    let mut matching_inodes = table
+        .split(|byte| *byte == b'\n')
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<&[u8]> = line
+                .split(|byte| byte.is_ascii_whitespace())
+                .filter(|field| !field.is_empty())
+                .collect();
+            (fields.len() >= 8 && fields[7] == expected_path).then(|| fields[6])
+        });
     let Some(inode) = matching_inodes.next() else {
         return Ok(false);
     };
@@ -396,7 +396,9 @@ async fn unix_socket_owned_by(pid: u32, socket_path: &Path) -> Result<bool, Proc
         .map_err(|source| ProcessError::Inspect { pid, source })?
     {
         match tokio::fs::read_link(entry.path()).await {
-            Ok(target) if target.as_os_str() == std::ffi::OsStr::new(&expected_fd) => return Ok(true),
+            Ok(target) if target.as_os_str() == std::ffi::OsStr::new(&expected_fd) => {
+                return Ok(true)
+            }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(source) => return Err(ProcessError::Inspect { pid, source }),

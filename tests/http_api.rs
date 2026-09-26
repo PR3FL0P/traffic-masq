@@ -2415,3 +2415,103 @@ async fn pending_router_token(client: &ApiClient) -> Result<String> {
         other => anyhow::bail!("unexpected pending response: {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn ap_profiles_roundtrip_over_http_without_disclosing_credentials() -> Result<()> {
+    let directory = tempdir()?;
+    let mut config = AppConfig::default();
+    config.runtime.socket_path = directory.path().join("traffic-masqd.sock");
+    config.runtime.pid_path = directory.path().join("traffic-masqd.pid");
+    config.runtime.state_dir = directory.path().join("state");
+    config.dhcp.leases_dir = directory.path().join("leases");
+    config.auth.database_path = directory.path().join("auth.sqlite3");
+    config.auth.argon2_memory_kib = 1_024;
+    config.auth.argon2_iterations = 1;
+    let overrides = RuntimeOverrideManager::load(&config.runtime.state_dir, &config).await?;
+    let dhcp = DhcpSupervisor::start(&config).await?;
+    let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork);
+    let control = ControlService::new(config.clone(), network, dhcp.clone(), overrides);
+    let auth = AuthService::open(&config.auth).await?;
+    auth.initialize_device_password("correct horse battery")
+        .await?;
+    let server = HttpApiServer::bind(&config, control, auth)?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server_task = tokio::spawn(server.run(shutdown_rx));
+
+    let client = ApiClient::new(&config.runtime.socket_path);
+    client.login("correct horse battery").await?;
+    let profile = traffic_masq::api::model::WifiApProfileWriteRequest {
+        id: "guest".into(),
+        configuration: traffic_masq::api::model::ProvisionWifiAccessPointRequest {
+            settings: traffic_masq::api::model::WifiEditRequest {
+                ssid: "Guest".into(),
+                country_code: Some("UA".into()),
+                band: WifiBand::Ghz2,
+                channel: 6,
+                channel_width: WifiChannelWidth::Ht20,
+                security: WifiSecurity::Wpa2,
+                hidden: false,
+                client_isolation: true,
+                max_stations: 16,
+            },
+            passphrase: Some("private-guest-password".into()),
+            clear_passphrase: false,
+            configure_dhcp: true,
+        },
+    };
+    let response = client
+        .request(&Request::SaveWifiApProfile {
+            profile: profile.clone(),
+        })
+        .await?;
+    assert!(
+        matches!(response, Response::WifiApProfileSaved { .. }),
+        "{response:?}"
+    );
+    assert!(!serde_json::to_string(&response)?.contains("private-guest-password"));
+    let database_url = format!("sqlite://{}", config.auth.database_path.display());
+    let pool = sqlx::SqlitePool::connect(&database_url).await?;
+    sqlx::query("UPDATE users SET role = 'viewer' WHERE username = 'device'")
+        .execute(&pool)
+        .await?;
+    let response = client.request(&Request::ListWifiApProfiles).await?;
+    assert!(!serde_json::to_string(&response)?.contains("private-guest-password"));
+    let Response::WifiApProfiles { profiles } = response else {
+        panic!("{response:?}")
+    };
+    assert_eq!(profiles.len(), 1);
+    assert!(profiles[0].has_passphrase);
+    for request in [
+        Request::SaveWifiApProfile { profile },
+        Request::DeleteWifiApProfile { id: "guest".into() },
+        Request::ActivateWifiApProfile {
+            interface: "wlan0".into(),
+            profile_id: "guest".into(),
+        },
+    ] {
+        let error = client
+            .request(&request)
+            .await
+            .expect_err("viewer cannot mutate AP profiles");
+        assert!(error.to_string().contains("403"), "{error:#}");
+    }
+    sqlx::query("UPDATE users SET role = 'administrator' WHERE username = 'device'")
+        .execute(&pool)
+        .await?;
+    assert!(matches!(
+        client
+            .request(&Request::DeleteWifiApProfile { id: "guest".into() })
+            .await?,
+        Response::WifiApProfileDeleted { .. }
+    ));
+    let Response::WifiApProfiles { profiles } =
+        client.request(&Request::ListWifiApProfiles).await?
+    else {
+        panic!("expected profiles")
+    };
+    assert!(profiles.is_empty());
+    shutdown_tx.send(true)?;
+    server_task.await??;
+    dhcp.shutdown().await;
+    Ok(())
+}

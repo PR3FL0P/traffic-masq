@@ -19,14 +19,14 @@ pub(crate) async fn open_wifi_connect_prompt(
         }) => cfg.ipv4.map(|ip| ip.to_string()),
         Ok(response) => {
             report_unexpected(app, response);
-            None
+            return;
         }
         Err(error) => {
             app.push_message(
                 LogLevel::Warn,
                 format!("Could not read current IP configuration: {error}"),
             );
-            None
+            return;
         }
     };
 

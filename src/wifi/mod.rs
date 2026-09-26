@@ -3,6 +3,7 @@
 //! The subsystem generates hostapd/wpa_supplicant configuration, supervises
 //! both processes, records process ownership, and recovers after failures.
 
+pub mod ap_profile;
 pub mod client;
 pub mod ctrl;
 mod ctrl_transport;

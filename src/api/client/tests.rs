@@ -39,7 +39,10 @@ async fn silent_api_times_out_and_closes_connection() {
 
 #[test]
 fn control_mutation_timeout_outlives_the_server_connection_deadline() {
-    assert_eq!(control_request_timeout(&Method::GET), DEFAULT_REQUEST_TIMEOUT);
+    assert_eq!(
+        control_request_timeout(&Method::GET),
+        DEFAULT_REQUEST_TIMEOUT
+    );
     for method in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
         assert_eq!(
             control_request_timeout(&method),
@@ -222,4 +225,21 @@ fn maps_route_management_requests() {
     assert_eq!(get_router_cfg.method, Method::GET);
     assert_eq!(get_router_cfg.path, "/api/v1/router/config");
     assert!(get_router_cfg.body.is_none());
+}
+
+#[test]
+fn maps_ap_profile_activation_with_encoded_interface_and_profile_body() {
+    let mapped = map_request(&Request::ActivateWifiApProfile {
+        interface: "wlan/0".into(),
+        profile_id: "guest".into(),
+    })
+    .unwrap();
+    assert_eq!(mapped.method, Method::PUT);
+    assert_eq!(mapped.path, "/api/v1/wifi/wlan%2F0/profile");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&mapped.body.unwrap()).unwrap()["profile_id"],
+        "guest"
+    );
+    let mapped = map_request(&Request::ListWifiApProfiles).unwrap();
+    assert_eq!(mapped.path, "/api/v1/wifi-ap-profiles");
 }

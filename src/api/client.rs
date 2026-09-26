@@ -866,6 +866,37 @@ fn map_request(request: &crate::api::model::Request) -> Result<RestRequest> {
             body: None,
             synthesize_pong: false,
         },
+        Request::ListWifiApProfiles => RestRequest {
+            method: Method::GET,
+            path: format!("{API_PREFIX}/wifi-ap-profiles"),
+            body: None,
+            synthesize_pong: false,
+        },
+        Request::SaveWifiApProfile { profile } => RestRequest {
+            method: Method::PUT,
+            path: format!("{API_PREFIX}/wifi-ap-profiles"),
+            body: Some(serialize_json(profile)?),
+            synthesize_pong: false,
+        },
+        Request::DeleteWifiApProfile { id } => RestRequest {
+            method: Method::DELETE,
+            path: format!("{API_PREFIX}/wifi-ap-profiles/{}", encode_path_segment(id)),
+            body: None,
+            synthesize_pong: false,
+        },
+        Request::ActivateWifiApProfile {
+            interface,
+            profile_id,
+        } => RestRequest {
+            method: Method::PUT,
+            path: format!("{}/profile", wifi_path(interface)),
+            body: Some(serialize_json(
+                &crate::api::model::WifiClientProfileActivationRequest {
+                    profile_id: profile_id.clone(),
+                },
+            )?),
+            synthesize_pong: false,
+        },
         Request::ListWifiClientProfiles => RestRequest {
             method: Method::GET,
             path: format!("{API_PREFIX}/wifi-client/profiles"),

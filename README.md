@@ -124,6 +124,39 @@ Internet yet.
 For a Wi-Fi LAN, configure an access point in **Wi-Fi** as well. Assigning an
 address and a DHCP pool to a wireless interface alone does not create an AP.
 
+## Saved access-point profiles
+
+In **Wi-Fi**, select a managed output radio and choose **Configure AP**. Set
+SSID, security, password, country, band/channel/width and client options. Enter
+**Profile ID** (1–15 ASCII letters, digits, dots, underscores or hyphens) and
+choose **Save / update profile**. Saving does not change the running network.
+For a new protected profile, enter its password explicitly.
+
+**Load profile** cycles through saved profiles and fills the editor; the selected
+ID appears in **Profile ID**. A blank password keeps that profile's saved password.
+**Apply** saves edits to the loaded profile and applies it to the selected radio.
+Confirm the resulting network change before its deadline, or it rolls back.
+Deleting a profile leaves running APs unchanged. Profiles are reusable across
+radios; each target still needs a managed output role and an IPv4 subnet.
+
+Profiles include radio/security settings and the option to derive DHCP from the
+target interface's subnet. They do not copy IP addresses, routing or NAT rules.
+The existing DHCP configuration is preserved when **Configure DHCP** is off.
+
+The authenticated REST API provides:
+
+- `GET /api/v1/wifi-ap-profiles`: list profiles without passwords.
+- `PUT /api/v1/wifi-ap-profiles`: create/update a profile, with `id`, `settings`,
+  optional `passphrase`, `clear_passphrase` and `configure_dhcp`.
+- `DELETE /api/v1/wifi-ap-profiles/{id}`: delete a saved profile.
+- `PUT /api/v1/wifi/{interface}/profile`: apply `{ "profile_id": "guest" }` and
+  return the normal pending network-change token for confirmation.
+
+Mutations require administrator access. Profiles persist under
+`<state_dir>/ap-profiles/` (directory `0700`, atomic document writes `0600`).
+Credentials are stored with the settings so updates cannot split them across
+versions; they are omitted from API summaries and redacted from debug output.
+
 ## Short reference
 
 ### Where to configure things

@@ -1235,3 +1235,29 @@ fn restart_classification_matches_the_documented_reload_safe_set() {
     security_only.security = WifiSecurity::Wpa2;
     assert!(requires_restart(&base, &security_only));
 }
+
+#[tokio::test]
+async fn disabling_ap_never_signals_a_pid_with_mismatched_identity() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("run");
+    let process = fake_process();
+    let supervisor = test_supervisor(temp.path(), &runtime, process.clone()).await;
+    supervisor.configure(spec("wlan0", "test")).await.unwrap();
+    supervisor
+        .inner
+        .tasks
+        .lock()
+        .await
+        .get_mut("wlan0")
+        .unwrap()
+        .record
+        .config_path = runtime.join("different.conf");
+    assert!(matches!(
+        supervisor.disable("wlan0").await,
+        Err(SupervisorError::NotOwned { .. })
+    ));
+    assert!(!process
+        .calls()
+        .iter()
+        .any(|c| matches!(c, FakeCall::Terminate(_) | FakeCall::Kill(_))));
+}

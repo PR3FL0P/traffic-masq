@@ -133,10 +133,14 @@ pub(crate) enum WifiField {
     ClientIsolation,
     MaxStations,
     Dhcp,
+    ProfileId,
+    SavedProfile,
+    SaveProfile,
+    DeleteProfile,
     Apply,
 }
 
-const WIFI_FIELDS: [WifiField; 12] = [
+const WIFI_FIELDS: [WifiField; 16] = [
     WifiField::Ssid,
     WifiField::Security,
     WifiField::Passphrase,
@@ -148,6 +152,10 @@ const WIFI_FIELDS: [WifiField; 12] = [
     WifiField::ClientIsolation,
     WifiField::MaxStations,
     WifiField::Dhcp,
+    WifiField::ProfileId,
+    WifiField::SavedProfile,
+    WifiField::SaveProfile,
+    WifiField::DeleteProfile,
     WifiField::Apply,
 ];
 
@@ -165,6 +173,9 @@ pub(crate) struct WifiEditor {
     pub(crate) country_code: String,
     pub(crate) existing: bool,
     pub(crate) configure_dhcp: bool,
+    profile_id: String,
+    loaded_profile: bool,
+    profiles: Vec<crate::api::model::WifiApProfileSummary>,
     original_spec: Option<crate::wifi::WifiApSpec>,
     radio_settings: Option<WifiEditRequest>,
     pub(crate) cursor: usize,
@@ -203,8 +214,14 @@ impl WifiEditor {
             security,
             passphrase: String::new(),
             country_code,
-            existing: row.ap.is_some(),
+            existing: row
+                .ap
+                .as_ref()
+                .is_some_and(|s| s.spec.requires_passphrase()),
             configure_dhcp: row.ap.is_none() && CONFIGURE_DHCP_BY_DEFAULT,
+            profile_id: String::new(),
+            loaded_profile: false,
+            profiles: Vec::new(),
             original_spec: row.ap.as_ref().map(|status| status.spec.clone()),
             radio_settings: None,
             cursor,
@@ -213,6 +230,7 @@ impl WifiEditor {
 
     pub(crate) fn active_value(&self) -> Option<&str> {
         match self.field {
+            WifiField::ProfileId => Some(&self.profile_id),
             WifiField::Ssid => Some(&self.ssid),
             WifiField::Passphrase => Some(&self.passphrase),
             WifiField::CountryCode => Some(&self.country_code),
@@ -227,6 +245,9 @@ impl WifiEditor {
     pub(crate) fn active_editor(&mut self) -> Option<super::input::TextEditor<'_>> {
         let cursor = &mut self.cursor;
         match self.field {
+            WifiField::ProfileId => {
+                Some(super::input::TextEditor::new(&mut self.profile_id, cursor))
+            }
             WifiField::Ssid => Some(super::input::TextEditor::new(&mut self.ssid, cursor)),
             WifiField::Passphrase => {
                 Some(super::input::TextEditor::new(&mut self.passphrase, cursor))
@@ -478,8 +499,9 @@ impl WifiProfileEditor {
             security: self.security,
             priority,
             autoconnect: self.autoconnect,
-            passphrase: (!self.passphrase.is_empty()).then(|| self.passphrase.clone()),
-            clear_passphrase: self.security == WifiClientSecurity::Open && self.has_passphrase,
+            passphrase: (self.security != WifiClientSecurity::Open && !self.passphrase.is_empty())
+                .then(|| self.passphrase.clone()),
+            clear_passphrase: self.security == WifiClientSecurity::Open,
         })
     }
 }
@@ -838,7 +860,7 @@ async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
                             }
                         };
                         let mut editor = WifiEditor::from_row(&row);
-                        editor.existing = spec.is_some();
+                        editor.existing = spec.as_ref().is_some_and(|s| s.requires_passphrase());
                         editor.configure_dhcp = spec.is_none() && config.dhcp.is_none();
                         if let Some(spec) = &spec {
                             editor.ssid = spec.ssid.clone();
@@ -846,6 +868,12 @@ async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
                             editor.country_code = spec.country_code.clone().unwrap_or_default();
                         }
                         editor.original_spec = spec;
+                        match client.request(&Request::ListWifiApProfiles).await {
+                            Ok(Response::WifiApProfiles { profiles }) => editor.profiles = profiles,
+                            Ok(response) => report_unexpected(app, response),
+                            Err(error) => app.push_message(LogLevel::Error, error.to_string()),
+                        }
+                        editor.reset_cursor();
                         app.wifi_editor = Some(editor);
                         app.screen = Screen::WifiEditor;
                     }
@@ -1130,7 +1158,15 @@ fn profile_id_for_ssid(ssid: &str) -> String {
             }
         })
         .collect::<String>();
-    id.trim_matches('-').to_string()
+    let id = id.trim_matches('-');
+    if id.is_empty() {
+        // Non-Latin SSIDs still need a valid, deterministic profile identifier.
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(ssid.as_bytes());
+        format!("wifi-{:x}", digest)[..21].to_string()
+    } else {
+        id.to_string()
+    }
 }
 fn masked(value: &str, existing: bool) -> String {
     if value.is_empty() {

@@ -70,7 +70,15 @@ impl ControlService {
             return wifi_error(WifiErrorDetail::InterfaceNotFound);
         };
 
-        interface_config.wifi = Some(wifi_edit_request_to_config(settings));
+        let previous_passphrase_file = interface_config
+            .wifi
+            .as_ref()
+            .and_then(|c| c.passphrase_file.clone());
+        let mut next = wifi_edit_request_to_config(settings);
+        if next.security.requires_passphrase() {
+            next.passphrase_file = previous_passphrase_file;
+        }
+        interface_config.wifi = Some(next);
 
         let spec = match WifiApSpec::from_interface_config(&interface, &interface_config) {
             Ok(Some(spec)) => spec,
@@ -145,14 +153,11 @@ impl ControlService {
         let Some(wifi) = &self.wifi else {
             return wifi_disabled();
         };
-        let passphrase_update = match ap_passphrase_update(
-            settings.security,
-            passphrase,
-            clear_passphrase,
-        ) {
-            Ok(update) => update,
-            Err(detail) => return wifi_error(detail),
-        };
+        let passphrase_update =
+            match ap_passphrase_update(settings.security, passphrase, clear_passphrase) {
+                Ok(update) => update,
+                Err(detail) => return wifi_error(detail),
+            };
         let effective = match self.effective_config().await {
             Ok(effective) => effective,
             Err(message) => return wifi_error(WifiErrorDetail::Other { message }),
@@ -178,10 +183,8 @@ impl ControlService {
         if let (Some(next), Some(previous)) =
             (target.wifi.as_mut(), previous_interface.wifi.as_ref())
         {
-            next.passphrase_file = ap_passphrase_file_update(
-                previous.passphrase_file.as_ref(),
-                &passphrase_update,
-            );
+            next.passphrase_file =
+                ap_passphrase_file_update(previous.passphrase_file.as_ref(), &passphrase_update);
         }
         if configure_dhcp {
             let settings = match default_dhcp_settings(cidr) {

@@ -223,3 +223,17 @@ fn a_connected_event_without_a_parsable_bssid_is_still_a_connection() {
         WpaSupplicantEvent::Connected { bssid: None }
     );
 }
+
+#[test]
+fn scan_decodes_unicode_and_literal_backslashes_without_loss() {
+    let results = parse_scan_results(
+        "02:00:00:00:00:01\t2412\t-41\t[ESS]\t\\xd0\\x94\\xd1\\x96\\xd0\\xbc\\\\wifi\n",
+    );
+    assert_eq!(results[0].ssid, "Дім\\wifi");
+    assert_eq!(decode_ssid(r#"a\"b\tc"#), Some("a\"b\tc".into()));
+    assert_eq!(decode_ssid(r"\xff"), None);
+    assert_eq!(decode_ssid(r"\xzz"), None);
+    let status =
+        parse_status("wpa_state=COMPLETED\nssid=\\xd0\\x94\\xd1\\x96\\xd0\\xbc\n").unwrap();
+    assert_eq!(status.ssid.as_deref(), Some("Дім"));
+}

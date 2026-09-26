@@ -144,6 +144,11 @@ impl WifiClientProfileStore {
             }
             let metadata = read_metadata(&path)?;
             validate_metadata(&metadata)?;
+            if path.file_stem().and_then(|name| name.to_str()) != Some(metadata.id.as_str()) {
+                return Err(WifiClientProfileError::InvalidProfile(
+                    "stored id does not match its filename".into(),
+                ));
+            }
             profiles.push(self.summary(&dirs, metadata)?);
         }
         profiles.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.id.cmp(&b.id)));
@@ -170,8 +175,12 @@ impl WifiClientProfileStore {
         validate_id(id)?;
         let dirs = self.ensure_directories()?;
 
-        if !metadata_path(&dirs, id).exists() {
-            return Err(WifiClientProfileError::NotFound);
+        let metadata = read_metadata(&metadata_path(&dirs, id)).map_err(map_not_found)?;
+        validate_metadata(&metadata)?;
+        if metadata.id != id {
+            return Err(WifiClientProfileError::InvalidProfile(
+                "stored id does not match its filename".into(),
+            ));
         }
         read_passphrase(&secret_path(&dirs, id))
     }
@@ -232,6 +241,11 @@ impl WifiClientProfileStore {
         let old_metadata_bytes = read_regular_bytes(&metadata_target).map_err(map_not_found)?;
         let old: WifiClientProfileMetadata = serde_json::from_slice(&old_metadata_bytes)?;
         validate_metadata(&old)?;
+        if old.id != input.id {
+            return Err(WifiClientProfileError::InvalidProfile(
+                "stored id does not match its filename".into(),
+            ));
+        }
         let secret_target = secret_path(&dirs, &input.id);
         let old_secret = read_passphrase(&secret_target)?;
         let resulting_secret = match &secret_update {
@@ -300,6 +314,11 @@ impl WifiClientProfileStore {
         // Validate before mutating so corrupt state is never silently deleted.
         let old: WifiClientProfileMetadata = serde_json::from_slice(&old_metadata_bytes)?;
         validate_metadata(&old)?;
+        if old.id != id {
+            return Err(WifiClientProfileError::InvalidProfile(
+                "stored id does not match its filename".into(),
+            ));
+        }
         let old_secret = read_passphrase(&secret_target)?;
 
         let operation = remove_regular(&metadata_target, true)

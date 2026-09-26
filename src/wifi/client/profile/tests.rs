@@ -184,3 +184,23 @@ fn list_rejects_symlink_entries_instead_of_following_them() {
         Err(WifiClientProfileError::SymlinkRejected(_))
     ));
 }
+
+#[test]
+fn every_profile_operation_rejects_metadata_with_a_different_id() {
+    let dir = tempdir().unwrap();
+    let store = WifiClientProfileStore::new(dir.path().join("profiles"));
+    store.create(input("home"), Some(secret())).unwrap();
+    let target = store.root().join("metadata/home.json");
+    let mut metadata: serde_json::Value =
+        serde_json::from_slice(&fs::read(&target).unwrap()).unwrap();
+    metadata["id"] = "other".into();
+    fs::write(&target, serde_json::to_vec(&metadata).unwrap()).unwrap();
+    assert!(store.list().is_err());
+    assert!(store.get("home").is_err());
+    assert!(store.get_passphrase("home").is_err());
+    assert!(store
+        .update(input("home"), WifiClientProfileSecretUpdate::Clear)
+        .is_err());
+    assert!(store.delete("home").is_err());
+    assert!(store.root().join("secrets/home.psk").exists());
+}

@@ -1197,3 +1197,91 @@ async fn scan_on_configured_interface_reuses_running_supplicant() {
         .count();
     assert_eq!(terminate_count, 0);
 }
+
+#[tokio::test]
+async fn client_ctrl_operations_refuse_a_replaced_control_socket() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("run");
+    let process = fake_process();
+    let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
+    supervisor
+        .configure(spec("wlan0", "upstream"))
+        .await
+        .unwrap();
+    process.detach_ctrl_socket(2000);
+    let _foreign = FakeSupplicantCtrl::spawn(
+        runtime.join("wlan0"),
+        "COMPLETED",
+        &config_path(&runtime, "wlan0"),
+    );
+    assert!(matches!(
+        supervisor.reconnect("wlan0").await,
+        Err(ClientSupervisorError::NotOwned { .. })
+    ));
+    assert!(matches!(
+        supervisor.scan("wlan0").await,
+        Err(ClientSupervisorError::NotOwned { .. })
+    ));
+    assert!(!supervisor
+        .status("wlan0")
+        .await
+        .unwrap()
+        .wpa_state
+        .is_connected());
+    assert_eq!(process.spawn_count(), 1);
+}
+
+#[tokio::test]
+async fn ephemeral_scan_refuses_unowned_nodes_and_symlinked_configuration() {
+    use std::os::unix::fs::symlink;
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("run");
+    let process = fake_process();
+    let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
+    std::fs::create_dir_all(&runtime).unwrap();
+    std::fs::write(runtime.join("wlan0"), "unowned").unwrap();
+    assert!(matches!(
+        supervisor.scan("wlan0").await,
+        Err(ClientSupervisorError::NotOwned { .. })
+    ));
+    assert_eq!(
+        std::fs::read_to_string(runtime.join("wlan0")).unwrap(),
+        "unowned"
+    );
+    std::fs::remove_file(runtime.join("wlan0")).unwrap();
+    let outside = temp.path().join("outside");
+    std::fs::write(&outside, "untouched").unwrap();
+    symlink(&outside, scan_config_path(&runtime, "wlan0")).unwrap();
+    assert!(supervisor.scan("wlan0").await.is_err());
+    assert_eq!(std::fs::read_to_string(outside).unwrap(), "untouched");
+    assert_eq!(process.spawn_count(), 0);
+}
+
+#[tokio::test]
+async fn disabling_client_never_signals_a_pid_with_mismatched_identity() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("run");
+    let process = fake_process();
+    let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
+    supervisor
+        .configure(spec("wlan0", "upstream"))
+        .await
+        .unwrap();
+    supervisor
+        .inner
+        .tasks
+        .lock()
+        .await
+        .get_mut("wlan0")
+        .unwrap()
+        .record
+        .config_path = runtime.join("different.conf");
+    assert!(matches!(
+        supervisor.disable("wlan0").await,
+        Err(ClientSupervisorError::NotOwned { .. })
+    ));
+    assert!(!process
+        .calls()
+        .iter()
+        .any(|c| matches!(c, FakeCall::Terminate(_) | FakeCall::Kill(_))));
+}

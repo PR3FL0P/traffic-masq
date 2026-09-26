@@ -117,7 +117,7 @@ fn wpa3_needs_the_plaintext_and_says_so() {
     assert_eq!(directives["wpa_key_mgmt"], "SAE");
     assert_eq!(directives["ieee80211w"], "2");
 
-    assert_eq!(directives["sae_password"], passphrase.expose());
+    assert_eq!(directives["wpa_passphrase"], passphrase.expose());
     assert!(!directives.contains_key("wpa_psk"));
 }
 
@@ -132,7 +132,7 @@ fn transition_mode_serves_both_generations() {
     assert_eq!(directives["ieee80211w"], "1");
     assert_eq!(directives["sae_require_mfp"], "1");
     assert_eq!(directives["wpa_psk"].len(), 64);
-    assert_eq!(directives["sae_password"], passphrase.expose());
+    assert_eq!(directives["wpa_passphrase"], passphrase.expose());
 }
 
 #[test]
@@ -144,7 +144,7 @@ fn an_open_access_point_carries_no_security_directives() {
         "wpa",
         "wpa_key_mgmt",
         "wpa_psk",
-        "sae_password",
+        "wpa_passphrase",
         "ieee80211w",
     ] {
         assert!(
@@ -232,7 +232,7 @@ fn a_passphrase_cannot_inject_a_directive_into_the_sae_line() {
     let emitted = directives(&rendered);
 
     assert_eq!(emitted["wpa"], "2");
-    assert_eq!(emitted["sae_password"], "wpa=0 #comment");
+    assert_eq!(emitted["wpa_passphrase"], "wpa=0 #comment");
     assert_eq!(emitted.len(), rendered.text.lines().count());
 }
 
@@ -376,4 +376,15 @@ fn a_digest_round_trips_through_json() {
     assert_eq!(encoded, format!("\"{}\"", rendered.config_digest));
     let decoded: WifiDigest = serde_json::from_str(&encoded).expect("deserialize");
     assert_eq!(decoded, rendered.config_digest);
+}
+
+#[test]
+fn sae_password_metadata_characters_are_literal_credentials() {
+    let password = WifiPassphrase::new("secret|id=other").unwrap();
+    for security in [WifiSecurity::Wpa3, WifiSecurity::Wpa2Wpa3] {
+        let rendered = render(&spec(security), Some(&password));
+        let values = directives(&rendered);
+        assert_eq!(values["wpa_passphrase"], password.expose());
+        assert!(!values.contains_key("sae_password"));
+    }
 }

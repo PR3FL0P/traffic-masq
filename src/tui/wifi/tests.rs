@@ -1441,3 +1441,88 @@ fn open_ap_request_discards_typed_passphrase_and_requests_clear() {
         other => panic!("unexpected request: {other:?}"),
     }
 }
+
+#[test]
+fn unicode_ssids_have_nonempty_stable_distinct_profile_ids() {
+    let home = profile_id_for_ssid("Дім");
+    assert!(!home.is_empty());
+    assert!(home.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
+    assert_eq!(home, profile_id_for_ssid("Дім"));
+    assert_ne!(home, profile_id_for_ssid("Гості"));
+}
+
+#[tokio::test]
+async fn ap_profile_load_restores_radio_options_without_exposing_password() {
+    let mut editor = WifiEditor::from_row(&radio("wlan0"));
+    let mut settings = ap_settings(&editor);
+    settings.ssid = "Guests".into();
+    settings.hidden = true;
+    settings.client_isolation = true;
+    settings.channel = 11;
+    editor
+        .profiles
+        .push(crate::api::model::WifiApProfileSummary {
+            id: "guest".into(),
+            settings,
+            configure_dhcp: false,
+            has_passphrase: true,
+        });
+    editor.field = WifiField::SavedProfile;
+    editor.passphrase = "unsaved-secret".into();
+    let mut app = TuiApp {
+        screen: Screen::WifiEditor,
+        wifi_editor: Some(editor),
+        ..Default::default()
+    };
+    handle_wifi_editor_key(
+        &mut app,
+        KeyCode::Enter,
+        &ApiClient::new("/nonexistent.sock"),
+    )
+    .await;
+    let loaded = app.wifi_editor.as_ref().unwrap();
+    assert_eq!(loaded.ssid, "Guests");
+    assert_eq!(loaded.profile_id, "guest");
+    assert!(loaded.passphrase.is_empty());
+    assert!(loaded.loaded_profile);
+    assert!(loaded.existing);
+    assert!(!loaded.configure_dhcp);
+    assert_eq!(ap_settings(loaded).channel, 11);
+    assert!(ap_settings(loaded).hidden);
+}
+
+#[tokio::test]
+async fn failed_interface_read_does_not_open_connection_prompt() {
+    let (_dir, client, server) = mock_api(vec![Response::Error {
+        message: "read failed".into(),
+    }])
+    .await;
+    let mut app = TuiApp::default();
+    open_wifi_connect_prompt(
+        &mut app,
+        &client,
+        "wlan0".into(),
+        "home".into(),
+        "Home".into(),
+    )
+    .await;
+    assert!(app.wifi_connect.is_none());
+    assert_eq!(server.await.unwrap().len(), 1);
+}
+
+#[test]
+fn open_client_profile_discards_password_typed_before_security_change() {
+    let network = WpaSupplicantScanResult {
+        bssid: "02:00:00:00:00:01".parse().unwrap(),
+        frequency_mhz: 2412,
+        signal_dbm: -40,
+        ssid: "guest".into(),
+        raw_flags: "[ESS]".into(),
+        security: WpaSupplicantScanSecurity::Open,
+    };
+    let mut editor = WifiProfileEditor::from_scan("wlan0".into(), &network).unwrap();
+    editor.passphrase = "typed-password".into();
+    let request = editor.request().unwrap();
+    assert!(request.passphrase.is_none());
+    assert!(request.clear_passphrase);
+}

@@ -553,6 +553,13 @@ impl ControlService {
                 self.wifi_client_reconnect(interface).await
             }
             Request::WifiClientScan { interface } => self.wifi_client_scan(interface).await,
+            Request::ListWifiApProfiles => self.list_wifi_ap_profiles(),
+            Request::SaveWifiApProfile { profile } => self.save_wifi_ap_profile(profile),
+            Request::DeleteWifiApProfile { id } => self.delete_wifi_ap_profile(id),
+            Request::ActivateWifiApProfile {
+                interface,
+                profile_id,
+            } => self.activate_wifi_ap_profile(interface, profile_id).await,
             Request::ListWifiClientProfiles => self.list_wifi_client_profiles().await,
             Request::GetWifiClientProfile { id } => self.get_wifi_client_profile(id).await,
             Request::CreateWifiClientProfile { profile } => {
@@ -605,6 +612,9 @@ fn is_network_mutation(request: &Request) -> bool {
             | Request::VpnPolicyClearMode
             | Request::ConfigureWifi { .. }
             | Request::ProvisionWifiAccessPoint { .. }
+            | Request::SaveWifiApProfile { .. }
+            | Request::DeleteWifiApProfile { .. }
+            | Request::ActivateWifiApProfile { .. }
             | Request::DisableWifi { .. }
             | Request::WifiSetPassphrase { .. }
             | Request::WifiDeauthStation { .. }
@@ -627,6 +637,7 @@ fn is_converged_network_transaction_request(request: &Request) -> bool {
     matches!(
         request,
         Request::ProvisionWifiAccessPoint { .. }
+            | Request::ActivateWifiApProfile { .. }
             | Request::ApplyInterface { .. }
             | Request::ApplyInterfaceEdit { .. }
             | Request::CommitNetworkChange { .. }
@@ -677,6 +688,7 @@ fn recovery_interface(request: &Request) -> Option<&str> {
         | Request::GetWifiConfig { interface, .. }
         | Request::ConfigureWifi { interface, .. }
         | Request::ProvisionWifiAccessPoint { interface, .. }
+        | Request::ActivateWifiApProfile { interface, .. }
         | Request::DisableWifi { interface, .. }
         | Request::WifiSetPassphrase { interface, .. }
         | Request::ListWifiStations { interface, .. }

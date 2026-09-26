@@ -9,6 +9,7 @@ mod runtime;
 mod settings;
 mod vpn;
 mod wifi;
+mod wifi_ap_profiles;
 mod wifi_autoconnect;
 mod wifi_client;
 
@@ -24,10 +25,10 @@ use crate::api::model::{
     DhcpClientStatusView, DhcpEditRequest, InterfaceEditRequest, InterfaceStatus,
     ProvisioningDownstreamView, ProvisioningOutputView, ProvisioningStage, ProvisioningUplinkView,
     ProvisioningWarning, Request, Response, RouteStatus, RouterErrorDetail, RouterProposalRequest,
-    RouterProvisioningApplyRequest, RouterProvisioningErrorDetail, RouterRecoveryNotice,
+    RouterProvisioningApplyRequest, RouterProvisioningErrorDetail,
     RouterProvisioningPreviewRequest, RouterProvisioningPreviewView, RouterProvisioningRequest,
-    RouterProvisioningStatusView, SecuritySettings, VpnErrorDetail, VpnPolicyErrorDetail,
-    VpnPolicyStatusView, WifiClientEditRequest, WifiClientErrorDetail,
+    RouterProvisioningStatusView, RouterRecoveryNotice, SecuritySettings, VpnErrorDetail,
+    VpnPolicyErrorDetail, VpnPolicyStatusView, WifiClientEditRequest, WifiClientErrorDetail,
     WifiClientProfileErrorDetail, WifiClientProfileWriteRequest, WifiEditRequest, WifiErrorDetail,
 };
 use crate::config::{

@@ -370,3 +370,19 @@ fn bearer_header_parser_is_strict_and_case_insensitive() {
         None
     );
 }
+
+#[test]
+fn ap_profile_mutations_require_administrator() {
+    for request in [
+        Request::DeleteWifiApProfile { id: "guest".into() },
+        Request::ActivateWifiApProfile {
+            interface: "wlan0".into(),
+            profile_id: "guest".into(),
+        },
+    ] {
+        assert!(control_request_requires_administrator(&request));
+    }
+    assert!(!control_request_requires_administrator(
+        &Request::ListWifiApProfiles
+    ));
+}

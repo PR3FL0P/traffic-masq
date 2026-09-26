@@ -33,7 +33,6 @@ use tokio_rustls::TlsAcceptor;
 use zeroize::Zeroizing;
 
 use crate::api::control::ControlService;
-use crate::api::HTTP_CONNECTION_TIMEOUT;
 use crate::api::model::{
     ApiHttpsSettings, DhcpClientConfigRequest, DhcpEditRequest, InterfaceEditRequest,
     ProvisionWifiAccessPointRequest, Request, Response, RouterProposalRequest,
@@ -41,6 +40,7 @@ use crate::api::model::{
     WifiClientEditRequest, WifiClientProfileActivationRequest, WifiClientProfileWriteRequest,
     WifiEditRequest,
 };
+use crate::api::HTTP_CONNECTION_TIMEOUT;
 use crate::auth::{
     AuthError, AuthService, LoginSession, Principal, Role, MINIMUM_PASSWORD_CHARACTERS,
 };
@@ -280,6 +280,15 @@ fn build_router(state: AppState) -> Router {
             "/vpn-policy/mode",
             put(vpn_policy_set_mode).delete(vpn_policy_clear_mode),
         )
+        .route(
+            "/wifi-ap-profiles",
+            get(list_wifi_ap_profiles).put(save_wifi_ap_profile),
+        )
+        .route(
+            "/wifi-ap-profiles/{id}",
+            axum::routing::delete(delete_wifi_ap_profile),
+        )
+        .route("/wifi/{interface}/profile", put(activate_wifi_ap_profile))
         .route("/wifi", get(wifi_status))
         .route(
             "/wifi/{interface}",
@@ -1448,6 +1457,9 @@ fn control_request_requires_administrator(request: &Request) -> bool {
             | Request::ResetSecuritySettings
             | Request::ConfigureWifi { .. }
             | Request::ProvisionWifiAccessPoint { .. }
+            | Request::SaveWifiApProfile { .. }
+            | Request::DeleteWifiApProfile { .. }
+            | Request::ActivateWifiApProfile { .. }
             | Request::DisableWifi { .. }
             | Request::WifiSetPassphrase { .. }
             | Request::WifiDeauthStation { .. }
@@ -1921,3 +1933,40 @@ impl Drop for OwnedSocketPath {
 
 #[cfg(test)]
 mod tests;
+
+async fn list_wifi_ap_profiles(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<Response>, ApiError> {
+    dispatch_control(&state, &principal, Request::ListWifiApProfiles).await
+}
+async fn save_wifi_ap_profile(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Json(profile): Json<crate::api::model::WifiApProfileWriteRequest>,
+) -> Result<Json<Response>, ApiError> {
+    dispatch_control(&state, &principal, Request::SaveWifiApProfile { profile }).await
+}
+async fn delete_wifi_ap_profile(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Response>, ApiError> {
+    dispatch_control(&state, &principal, Request::DeleteWifiApProfile { id }).await
+}
+async fn activate_wifi_ap_profile(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    AxumPath(interface): AxumPath<String>,
+    Json(request): Json<WifiClientProfileActivationRequest>,
+) -> Result<Json<Response>, ApiError> {
+    dispatch_control(
+        &state,
+        &principal,
+        Request::ActivateWifiApProfile {
+            interface,
+            profile_id: request.profile_id,
+        },
+    )
+    .await
+}

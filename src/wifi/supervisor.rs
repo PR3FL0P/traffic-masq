@@ -373,10 +373,7 @@ impl HostapdSupervisor {
         Ok(())
     }
 
-    async fn task_process_identity_matches(
-        &self,
-        task: &ApTask,
-    ) -> Result<bool, SupervisorError> {
+    async fn task_process_identity_matches(&self, task: &ApTask) -> Result<bool, SupervisorError> {
         if task.record.pid == 0 || !self.inner.process.is_alive(task.record.pid).await? {
             return Ok(false);
         }
@@ -422,16 +419,14 @@ impl HostapdSupervisor {
         self.task_ctrl_socket_is_owned(task).await
     }
 
-    async fn owned_ctrl_client(
-        &self,
-        task: &ApTask,
-    ) -> Result<HostapdCtrlClient, SupervisorError> {
+    async fn owned_ctrl_client(&self, task: &ApTask) -> Result<HostapdCtrlClient, SupervisorError> {
         if !self.task_ctrl_is_owned(task).await? {
             return Err(SupervisorError::NotOwned {
                 interface: task.spec.interface.clone(),
             });
         }
-        let client = HostapdCtrlClient::connect(&task.record.ctrl_path, self.inner.ctrl_timeout).await?;
+        let client =
+            HostapdCtrlClient::connect(&task.record.ctrl_path, self.inner.ctrl_timeout).await?;
         // Re-check after connect. A connected AF_UNIX datagram remains bound to
         // the socket object it connected to even if the pathname is replaced;
         // this closes the ordinary unlink/rebind race around connect itself.
@@ -504,7 +499,7 @@ impl HostapdSupervisor {
         rendered: &RenderedApConfig,
         ctrl_path: &Path,
     ) -> Result<(), SupervisorError> {
-        self.graceful_stop(task.record.pid).await?;
+        self.stop_task(task).await?;
         let record = self.spawn_and_record(spec, rendered, ctrl_path).await?;
         task.spec = spec.clone();
         task.record = record;
@@ -599,10 +594,16 @@ impl HostapdSupervisor {
         ctrl_path: &Path,
     ) -> Result<OwnershipOutcome, SupervisorError> {
         let store = self.record_store(&spec.interface);
-        let safe_to_probe = self.recorded_ctrl_is_safe_to_probe(&store, ctrl_path).await?;
+        let safe_to_probe = self
+            .recorded_ctrl_is_safe_to_probe(&store, ctrl_path)
+            .await?;
         let status = if safe_to_probe {
             match HostapdCtrlClient::connect(ctrl_path, self.inner.ctrl_timeout).await {
-                Ok(client) if self.recorded_ctrl_is_safe_to_probe(&store, ctrl_path).await? => {
+                Ok(client)
+                    if self
+                        .recorded_ctrl_is_safe_to_probe(&store, ctrl_path)
+                        .await? =>
+                {
                     client.status().await.ok()
                 }
                 _ => None,
@@ -617,9 +618,12 @@ impl HostapdSupervisor {
                 Ok(_) => true,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
                 Err(error) => {
-                    return Err(SupervisorError::Configuration(anyhow::Error::from(error).context(
-                        format!("failed to inspect hostapd control socket {}", ctrl_path.display()),
-                    )))
+                    return Err(SupervisorError::Configuration(
+                        anyhow::Error::from(error).context(format!(
+                            "failed to inspect hostapd control socket {}",
+                            ctrl_path.display()
+                        )),
+                    ))
                 }
             }
         };
@@ -720,6 +724,18 @@ impl HostapdSupervisor {
         }
     }
 
+    async fn stop_task(&self, task: &ApTask) -> Result<(), SupervisorError> {
+        if task.record.pid == 0 || !self.inner.process.is_alive(task.record.pid).await? {
+            return Ok(());
+        }
+        if !self.task_process_identity_matches(task).await? {
+            return Err(SupervisorError::NotOwned {
+                interface: task.spec.interface.clone(),
+            });
+        }
+        self.graceful_stop(task.record.pid).await
+    }
+
     async fn graceful_stop(&self, pid: u32) -> Result<(), SupervisorError> {
         graceful_stop(self.inner.process.as_ref(), pid, "hostapd").await?;
         Ok(())
@@ -733,7 +749,7 @@ impl HostapdSupervisor {
             return Ok(None);
         };
 
-        self.graceful_stop(task.record.pid).await?;
+        self.stop_task(&task).await?;
         self.record_store(interface).clear().await?;
         let config_path = render::config_path(&self.inner.runtime_dir, interface);
         match tokio::fs::remove_file(&config_path).await {
@@ -921,9 +937,12 @@ impl HostapdSupervisor {
                 Ok(metadata) => Some((metadata.dev(), metadata.ino())),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                 Err(error) => {
-                    return Err(SupervisorError::Configuration(anyhow::Error::from(error).context(
-                        format!("failed to inspect hostapd control socket {}", ctrl_path.display()),
-                    )))
+                    return Err(SupervisorError::Configuration(
+                        anyhow::Error::from(error).context(format!(
+                            "failed to inspect hostapd control socket {}",
+                            ctrl_path.display()
+                        )),
+                    ))
                 }
             }
         } else {
@@ -970,22 +989,20 @@ impl HostapdSupervisor {
         // A placeholder task from a failed startup has pid 0; there is no
         // process to stop, and signalling pid 0 would signal the whole process
         // group — including this daemon.
-        if task.record.pid != 0 {
+        if task.record.pid != 0 && self.inner.process.is_alive(task.record.pid).await? {
             if !self.task_process_identity_matches(&task).await? {
                 return Err(SupervisorError::NotOwned {
                     interface: interface.to_string(),
                 });
             }
-            self.graceful_stop(task.record.pid).await?;
+            self.stop_task(&task).await?;
         }
 
         // Do not probe an unverified pathname after stopping our process. If
         // the exact filesystem socket node proven above survived daemon exit,
         // it is a stale node we can remove. A different/rebound node is foreign.
         match tokio::fs::symlink_metadata(&ctrl_path).await {
-            Ok(metadata)
-                if trusted_ctrl_node == Some((metadata.dev(), metadata.ino())) =>
-            {
+            Ok(metadata) if trusted_ctrl_node == Some((metadata.dev(), metadata.ino())) => {
                 tokio::fs::remove_file(&ctrl_path).await.map_err(|error| {
                     SupervisorError::Configuration(anyhow::Error::from(error).context(format!(
                         "failed to remove stale owned hostapd control socket {}",
@@ -1000,9 +1017,12 @@ impl HostapdSupervisor {
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                return Err(SupervisorError::Configuration(anyhow::Error::from(error).context(
-                    format!("failed to inspect hostapd control socket {}", ctrl_path.display()),
-                )))
+                return Err(SupervisorError::Configuration(
+                    anyhow::Error::from(error).context(format!(
+                        "failed to inspect hostapd control socket {}",
+                        ctrl_path.display()
+                    )),
+                ))
             }
         }
 
@@ -1037,7 +1057,7 @@ impl HostapdSupervisor {
 
         for (interface, task) in tasks {
             if policy == ShutdownPolicy::RestoreInterfaces {
-                if let Err(error) = self.graceful_stop(task.record.pid).await {
+                if let Err(error) = self.stop_task(&task).await {
                     tracing::error!(%interface, %error, "failed to stop hostapd during shutdown; ownership record retained");
                     continue;
                 }

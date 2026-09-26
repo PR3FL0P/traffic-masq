@@ -70,6 +70,34 @@ fn classify_scan_security(flags: &str) -> WpaSupplicantScanSecurity {
     }
 }
 
+// wpa_supplicant exposes SSIDs using printf_encode, not literal UTF-8.
+// Reject invalid UTF-8 rather than connecting to a different, lossy SSID.
+fn decode_ssid(value: &str) -> Option<String> {
+    let mut bytes = value.bytes();
+    let mut decoded = Vec::with_capacity(value.len());
+    while let Some(byte) = bytes.next() {
+        if byte != b'\\' {
+            decoded.push(byte);
+            continue;
+        }
+        decoded.push(match bytes.next()? {
+            b'\\' => b'\\',
+            b'"' => b'"',
+            b'n' => b'\n',
+            b'r' => b'\r',
+            b't' => b'\t',
+            b'e' => 27,
+            b'x' => {
+                let high = (bytes.next()? as char).to_digit(16)?;
+                let low = (bytes.next()? as char).to_digit(16)?;
+                (high * 16 + low) as u8
+            }
+            _ => return None,
+        });
+    }
+    String::from_utf8(decoded).ok()
+}
+
 fn parse_scan_results(reply: &str) -> Vec<WpaSupplicantScanResult> {
     reply
         .lines()
@@ -82,7 +110,7 @@ fn parse_scan_results(reply: &str) -> Vec<WpaSupplicantScanResult> {
             let frequency_mhz = fields.next()?.parse().ok()?;
             let signal_dbm = fields.next()?.parse().ok()?;
             let raw_flags = fields.next()?.to_string();
-            let ssid = fields.next()?.to_string();
+            let ssid = decode_ssid(fields.next()?)?;
             let security = classify_scan_security(&raw_flags);
             Some(WpaSupplicantScanResult {
                 bssid,
@@ -153,7 +181,7 @@ fn parse_status(reply: &str) -> Result<WpaSupplicantStatus, CtrlError> {
 
     let bssid = raw.get("bssid").map(|value| value.parse()).transpose()?;
     let freq = raw.get("freq").and_then(|value| value.parse().ok());
-    let ssid = raw.get("ssid").cloned();
+    let ssid = raw.get("ssid").and_then(|value| decode_ssid(value));
 
     Ok(WpaSupplicantStatus {
         wpa_state,

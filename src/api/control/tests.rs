@@ -2120,8 +2120,8 @@ async fn wifi_enabled_fixture() -> WifiFixture {
         process.clone(),
         Arc::new(crate::wifi::radio::AllowAllRadioValidator),
     )
-        .await
-        .expect("wifi supervisor");
+    .await
+    .expect("wifi supervisor");
     configure_wlan0(&wifi, &config).await;
     let service = ControlService::new(config, network, dhcp, overrides).with_wifi_supervisor(wifi);
     WifiFixture {
@@ -2271,8 +2271,8 @@ async fn get_wifi_config_reports_none_for_an_interface_without_a_wifi_block() {
         process,
         Arc::new(crate::wifi::radio::AllowAllRadioValidator),
     )
-        .await
-        .expect("wifi supervisor");
+    .await
+    .expect("wifi supervisor");
     let service = ControlService::new(config, network, dhcp, overrides).with_wifi_supervisor(wifi);
     let _ = &mut fixture_directory;
 
@@ -2370,11 +2370,11 @@ async fn provision_wifi_access_point_stays_pending_until_explicit_commit() {
         process,
         Arc::new(crate::wifi::radio::AllowAllRadioValidator),
     )
-        .await
-        .expect("wifi supervisor");
+    .await
+    .expect("wifi supervisor");
     configure_wlan0(&wifi, &config).await;
-    let service = ControlService::new(config, network, dhcp, overrides.clone())
-        .with_wifi_supervisor(wifi);
+    let service =
+        ControlService::new(config, network, dhcp, overrides.clone()).with_wifi_supervisor(wifi);
 
     let response = service
         .dispatch(Request::ProvisionWifiAccessPoint {
@@ -2544,14 +2544,12 @@ async fn wifi_reload_sends_reload_and_returns_the_current_spec() {
     }
 }
 
-
 #[test]
 fn open_ap_passphrase_update_clears_stale_secret_for_legacy_clients() {
-    let update = super::wifi::ap_passphrase_update(WifiSecurity::Open, None, false)
-        .expect("open AP update");
+    let update =
+        super::wifi::ap_passphrase_update(WifiSecurity::Open, None, false).expect("open AP update");
     assert!(matches!(update, crate::wifi::WifiPassphraseUpdate::Clear));
 }
-
 
 #[test]
 fn replacing_or_clearing_ap_secret_removes_legacy_passphrase_file_fallback() {
@@ -2622,8 +2620,8 @@ async fn configure_wifi_wpa2_to_open_clears_the_stored_passphrase() {
         FakeWifiProcess::new(),
         Arc::new(crate::wifi::radio::AllowAllRadioValidator),
     )
-        .await
-        .expect("wifi supervisor");
+    .await
+    .expect("wifi supervisor");
     configure_wlan0(&wifi, &config).await;
     let service = ControlService::new(config, network, dhcp, overrides).with_wifi_supervisor(wifi);
 
@@ -2643,7 +2641,10 @@ async fn configure_wifi_wpa2_to_open_clears_the_stored_passphrase() {
             },
         })
         .await;
-    assert!(matches!(response, Response::WifiConfigured { .. }), "{response:?}");
+    assert!(
+        matches!(response, Response::WifiConfigured { .. }),
+        "{response:?}"
+    );
     assert!(store.get("wlan0").unwrap().is_none());
 }
 
@@ -2664,7 +2665,10 @@ async fn disable_wifi_clears_stale_secret_and_open_recreate_stays_clean() {
             interface: "wlan0".to_string(),
         })
         .await;
-    assert!(matches!(disabled, Response::WifiDisabled { .. }), "{disabled:?}");
+    assert!(
+        matches!(disabled, Response::WifiDisabled { .. }),
+        "{disabled:?}"
+    );
     assert!(store.get("wlan0").unwrap().is_none());
 
     let recreated = fixture
@@ -2684,7 +2688,10 @@ async fn disable_wifi_clears_stale_secret_and_open_recreate_stays_clean() {
             },
         })
         .await;
-    assert!(matches!(recreated, Response::WifiConfigured { .. }), "{recreated:?}");
+    assert!(
+        matches!(recreated, Response::WifiConfigured { .. }),
+        "{recreated:?}"
+    );
     assert!(store.get("wlan0").unwrap().is_none());
 }
 
@@ -2764,8 +2771,8 @@ async fn wifi_set_passphrase_applies_live_via_reload() {
         process,
         Arc::new(crate::wifi::radio::AllowAllRadioValidator),
     )
-        .await
-        .expect("wifi supervisor");
+    .await
+    .expect("wifi supervisor");
 
     let passphrase_store = crate::wifi::PassphraseStore::new(directory.path().join("wifi/psk"));
     passphrase_store
@@ -2849,8 +2856,8 @@ async fn wifi_configured_response_never_serializes_the_passphrase_that_was_just_
         process,
         Arc::new(crate::wifi::radio::AllowAllRadioValidator),
     )
-        .await
-        .expect("wifi supervisor");
+    .await
+    .expect("wifi supervisor");
     configure_wlan0(&wifi, &config).await;
     let service = ControlService::new(config, network, dhcp, overrides).with_wifi_supervisor(wifi);
 
@@ -5912,4 +5919,135 @@ async fn unrelated_recovery_does_not_block_interface_commit_or_rollback() {
         }
         assert!(service.transactions.pending().await.is_empty());
     }
+}
+
+#[tokio::test]
+async fn saved_ap_profile_activation_stays_pending_until_explicit_commit() {
+    let directory = tempdir().expect("tempdir");
+    let mut config = wifi_base_config(directory.path());
+    config.wifi.hostapd_binary = PathBuf::from("/bin/true");
+    let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+        .await
+        .expect("overrides");
+    let dhcp = DhcpSupervisor::start(&config)
+        .await
+        .expect("dhcp supervisor");
+    let network = Arc::new(crate::test_support::FakeNetworkProvider::default());
+    network.add_interface("wlan0", 1).await;
+    network
+        .interfaces
+        .lock()
+        .await
+        .get_mut("wlan0")
+        .expect("wlan0")
+        .is_wireless = true;
+    let process = FakeWifiProcess::new();
+    let wifi = WifiSupervisor::start_with_process_and_radio(
+        &config,
+        process,
+        Arc::new(crate::wifi::radio::AllowAllRadioValidator),
+    )
+    .await
+    .expect("wifi supervisor");
+    configure_wlan0(&wifi, &config).await;
+    let service =
+        ControlService::new(config, network, dhcp, overrides.clone()).with_wifi_supervisor(wifi);
+
+    let saved = service
+        .dispatch(Request::SaveWifiApProfile {
+            profile: crate::api::model::WifiApProfileWriteRequest {
+                id: "guest".into(),
+                configuration: crate::api::model::ProvisionWifiAccessPointRequest {
+                    settings: WifiEditRequest {
+                        ssid: "net-b".into(),
+                        country_code: Some("PL".into()),
+                        band: WifiBand::Ghz2,
+                        channel: 11,
+                        channel_width: WifiChannelWidth::Ht20,
+                        security: WifiSecurity::Open,
+                        hidden: false,
+                        client_isolation: true,
+                        max_stations: 32,
+                    },
+                    passphrase: None,
+                    clear_passphrase: true,
+                    configure_dhcp: false,
+                },
+            },
+        })
+        .await;
+    assert!(
+        matches!(saved, Response::WifiApProfileSaved { .. }),
+        "{saved:?}"
+    );
+    let response = service
+        .dispatch(Request::ActivateWifiApProfile {
+            interface: "wlan0".into(),
+            profile_id: "guest".into(),
+        })
+        .await;
+    let token = match response {
+        Response::NetworkChangePending { change } => change.token,
+        other => panic!("unexpected response: {other:?}"),
+    };
+
+    assert!(!overrides.snapshot().await.interfaces.contains_key("wlan0"));
+    match service
+        .dispatch(Request::GetWifiConfig {
+            interface: "wlan0".into(),
+        })
+        .await
+    {
+        Response::WifiConfig {
+            spec: Some(spec), ..
+        } => assert_eq!(spec.ssid, "net-a"),
+        other => panic!("unexpected response: {other:?}"),
+    }
+
+    assert!(matches!(
+        service
+            .dispatch(Request::CommitNetworkChange { token })
+            .await,
+        Response::NetworkChangeCommitted { .. }
+    ));
+    assert!(overrides.snapshot().await.interfaces.contains_key("wlan0"));
+    match service
+        .dispatch(Request::GetWifiConfig {
+            interface: "wlan0".into(),
+        })
+        .await
+    {
+        Response::WifiConfig {
+            spec: Some(spec), ..
+        } => {
+            assert_eq!(spec.ssid, "net-b");
+            assert_eq!(spec.channel, 11);
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn configure_client_open_erases_obsolete_stored_credentials() {
+    let fixture = wifi_client_enabled_fixture().await;
+    let wifi = fixture.service.wifi_client.as_ref().unwrap();
+    wifi.set_passphrase("wlan1", &WifiPassphrase::new("obsolete-password").unwrap())
+        .await
+        .unwrap();
+    let response = fixture
+        .service
+        .dispatch(Request::ConfigureWifiClient {
+            interface: "wlan1".into(),
+            settings: WifiClientEditRequest {
+                ssid: "open-network".into(),
+                country_code: Some("PL".into()),
+                security: WifiClientSecurity::Open,
+            },
+        })
+        .await;
+    assert!(
+        matches!(response, Response::WifiClientConfigured { .. }),
+        "{response:?}"
+    );
+    assert!(wifi.stored_passphrase("wlan1").await.unwrap().is_none());
 }

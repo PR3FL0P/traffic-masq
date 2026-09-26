@@ -284,7 +284,7 @@ fn append_security_lines(
                 lines.push(Line::secret("wpa_psk", hex_encode(psk)));
             }
             if let Some(passphrase) = passphrase {
-                lines.push(Line::secret("sae_password", passphrase.expose()));
+                lines.push(Line::secret("wpa_passphrase", passphrase.expose()));
             }
         }
         WifiSecurity::Wpa3 => {
@@ -293,7 +293,7 @@ fn append_security_lines(
             lines.push(Line::plain("rsn_pairwise", "CCMP"));
             lines.push(Line::plain("ieee80211w", 2));
             if let Some(passphrase) = passphrase {
-                lines.push(Line::secret("sae_password", passphrase.expose()));
+                lines.push(Line::secret("wpa_passphrase", passphrase.expose()));
             }
         }
     }

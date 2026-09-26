@@ -95,7 +95,15 @@ impl ControlService {
             return wifi_client_error(WifiClientErrorDetail::InvalidSpec { message });
         }
 
-        interface_config.wifi_client = Some(wifi_client_edit_request_to_config(settings));
+        let previous_passphrase_file = interface_config
+            .wifi_client
+            .as_ref()
+            .and_then(|c| c.passphrase_file.clone());
+        let mut next = wifi_client_edit_request_to_config(settings);
+        if next.security.requires_passphrase() {
+            next.passphrase_file = previous_passphrase_file;
+        }
+        interface_config.wifi_client = Some(next);
 
         let spec = match WifiClientSpec::from_interface_config(&interface, &interface_config) {
             Ok(Some(spec)) => spec,
@@ -148,6 +156,13 @@ impl ControlService {
                     restoration,
                 ),
             });
+        }
+        if !spec.requires_passphrase() {
+            if let Err(error) = wifi_client.clear_passphrase(&interface).await {
+                return wifi_client_error(WifiClientErrorDetail::Other {
+                    message: format!("Wi-Fi client was configured as open, but obsolete credentials could not be erased: {error}; credential cleanup required"),
+                });
+            }
         }
         Response::WifiClientConfigured { spec }
     }

@@ -60,9 +60,31 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
             editor.configure_dhcp.to_string(),
         ),
         (
+            WifiField::ProfileId,
+            "Profile ID",
+            editor.profile_id.clone(),
+        ),
+        (
+            WifiField::SavedProfile,
+            "Load profile",
+            if editor.profiles.is_empty() {
+                "(none saved)".into()
+            } else {
+                "Enter: load next saved profile".into()
+            },
+        ),
+        (
+            WifiField::SaveProfile,
+            "",
+            "Save / update profile (no network changes)".into(),
+        ),
+        (WifiField::DeleteProfile, "", "Delete profile by ID".into()),
+        (
             WifiField::Apply,
             "",
-            if editor.configure_dhcp {
+            if editor.loaded_profile {
+                "Save profile changes and apply AP"
+            } else if editor.configure_dhcp {
                 "Apply AP + passphrase + DHCP"
             } else {
                 "Apply AP; preserve DHCP"
@@ -75,7 +97,12 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
         let style = selected_style(active);
         let prefix = format!("{}{label:<14}", if active { "▶ " } else { "  " });
         let mut spans = vec![Span::styled(prefix, style)];
-        if active && matches!(field, WifiField::Ssid | WifiField::CountryCode) {
+        if active
+            && matches!(
+                field,
+                WifiField::Ssid | WifiField::CountryCode | WifiField::ProfileId
+            )
+        {
             spans.extend(input::render_value_with_cursor(
                 &value,
                 editor.cursor,
@@ -142,11 +169,56 @@ pub(crate) async fn handle_wifi_editor_key(app: &mut TuiApp, key: KeyCode, clien
             app.wifi_editor = None;
             app.screen = Screen::Wifi;
         }
-        KeyCode::Up => {
+        KeyCode::Enter if editor.field == WifiField::SavedProfile => {
+            let next = editor
+                .profiles
+                .iter()
+                .position(|p| p.id == editor.profile_id)
+                .map_or(0, |index| (index + 1) % editor.profiles.len().max(1));
+            if let Some(profile) = editor.profiles.get(next).cloned() {
+                editor.profile_id = profile.id;
+                editor.ssid = profile.settings.ssid.clone();
+                editor.country_code = profile.settings.country_code.clone().unwrap_or_default();
+                editor.security = profile.settings.security;
+                editor.configure_dhcp = profile.configure_dhcp;
+                editor.existing = profile.has_passphrase;
+                editor.radio_settings = Some(profile.settings);
+                editor.passphrase.zeroize();
+                editor.passphrase.clear();
+                editor.loaded_profile = true;
+            }
+        }
+        KeyCode::Enter if editor.field == WifiField::SaveProfile => {
+            save_ap_profile(app, client).await;
+        }
+        KeyCode::Enter if editor.field == WifiField::DeleteProfile => {
+            let id = editor.profile_id.clone();
+            match client
+                .request(&Request::DeleteWifiApProfile { id: id.clone() })
+                .await
+            {
+                Ok(Response::WifiApProfileDeleted { .. }) => {
+                    let editor = app.wifi_editor.as_mut().unwrap();
+                    editor.profiles.retain(|p| p.id != id);
+                    editor.loaded_profile = false;
+                    editor.existing = editor
+                        .original_spec
+                        .as_ref()
+                        .is_some_and(|s| s.requires_passphrase());
+                    app.push_message(
+                        LogLevel::Info,
+                        "AP profile deleted; running AP is unchanged",
+                    );
+                }
+                Ok(response) => report_unexpected(app, response),
+                Err(error) => app.push_message(LogLevel::Error, error.to_string()),
+            }
+        }
+        KeyCode::Up | KeyCode::BackTab => {
             editor.field = move_field(&WIFI_FIELDS, editor.field, false);
             editor.reset_cursor();
         }
-        KeyCode::Down => {
+        KeyCode::Down | KeyCode::Tab => {
             editor.field = move_field(&WIFI_FIELDS, editor.field, true);
             editor.reset_cursor();
         }
@@ -205,7 +277,10 @@ pub(crate) async fn handle_wifi_editor_key(app: &mut TuiApp, key: KeyCode, clien
                     settings.max_stations = if key == KeyCode::Char('-') {
                         settings.max_stations.saturating_sub(1).max(1)
                     } else {
-                        settings.max_stations.saturating_add(1)
+                        settings
+                            .max_stations
+                            .saturating_add(1)
+                            .min(crate::config::MAX_WIFI_STATIONS)
                     }
                 }
                 WifiField::Dhcp => editor.configure_dhcp = !editor.configure_dhcp,
@@ -285,7 +360,18 @@ async fn apply_ap_editor(app: &mut TuiApp, client: &ApiClient) {
         app.push_message(LogLevel::Warn, "This security mode requires a passphrase");
         return;
     }
-    match client.request(&ap_provision_request(&editor)).await {
+    let request = if editor.loaded_profile {
+        if !save_ap_profile(app, client).await {
+            return;
+        }
+        Request::ActivateWifiApProfile {
+            interface: editor.interface.clone(),
+            profile_id: editor.profile_id.clone(),
+        }
+    } else {
+        ap_provision_request(&editor)
+    };
+    match client.request(&request).await {
         Ok(Response::NetworkChangePending { change }) => {
             app.push_message(
                 LogLevel::Info,
@@ -301,5 +387,44 @@ async fn apply_ap_editor(app: &mut TuiApp, client: &ApiClient) {
         }
         Ok(response) => report_unexpected(app, response),
         Err(error) => app.push_message(LogLevel::Error, error.to_string()),
+    }
+}
+
+async fn save_ap_profile(app: &mut TuiApp, client: &ApiClient) -> bool {
+    let Some(editor) = app.wifi_editor.as_ref() else {
+        return false;
+    };
+    let request = Request::SaveWifiApProfile {
+        profile: crate::api::model::WifiApProfileWriteRequest {
+            id: editor.profile_id.clone(),
+            configuration: crate::api::model::ProvisionWifiAccessPointRequest {
+                settings: ap_settings(editor),
+                passphrase: (editor.security.requires_passphrase()
+                    && !editor.passphrase.is_empty())
+                .then(|| editor.passphrase.clone()),
+                clear_passphrase: !editor.security.requires_passphrase(),
+                configure_dhcp: editor.configure_dhcp,
+            },
+        },
+    };
+    match client.request(&request).await {
+        Ok(Response::WifiApProfileSaved { profile }) => {
+            let editor = app.wifi_editor.as_mut().unwrap();
+            editor.profiles.retain(|p| p.id != profile.id);
+            editor.existing = profile.has_passphrase;
+            editor.profiles.push(profile);
+            editor.profiles.sort_by(|a, b| a.id.cmp(&b.id));
+            editor.loaded_profile = true;
+            app.push_message(LogLevel::Info, "AP profile saved");
+            true
+        }
+        Ok(response) => {
+            report_unexpected(app, response);
+            false
+        }
+        Err(error) => {
+            app.push_message(LogLevel::Error, error.to_string());
+            false
+        }
     }
 }

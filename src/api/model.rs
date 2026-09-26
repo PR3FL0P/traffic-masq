@@ -248,6 +248,30 @@ pub struct WifiEditRequest {
     pub max_stations: u16,
 }
 
+/// Reusable AP settings. Secrets are accepted on writes and never returned.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WifiApProfileSummary {
+    pub id: String,
+    pub settings: WifiEditRequest,
+    pub configure_dhcp: bool,
+    pub has_passphrase: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct WifiApProfileWriteRequest {
+    pub id: String,
+    #[serde(flatten)]
+    pub configuration: ProvisionWifiAccessPointRequest,
+}
+
+impl fmt::Debug for WifiApProfileWriteRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WifiApProfileWriteRequest")
+            .field("id", &self.id)
+            .field("configuration", &self.configuration)
+            .finish()
+    }
+}
 
 /// Apply AP, credential, and optional derived-DHCP changes tentatively.
 /// A successful request returns `Response::NetworkChangePending`; callers must
@@ -308,7 +332,7 @@ pub struct WifiClientEditRequest {
     pub security: WifiClientSecurity,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct WifiClientProfileWriteRequest {
     pub id: String,
     pub ssid: String,
@@ -324,6 +348,14 @@ pub struct WifiClientProfileWriteRequest {
     pub passphrase: Option<String>,
     #[serde(default)]
     pub clear_passphrase: bool,
+}
+
+impl fmt::Debug for WifiClientProfileWriteRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut value = serde_json::to_value(self).map_err(|_| fmt::Error)?;
+        redact_debug_secrets(&mut value);
+        write!(formatter, "{value}")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -920,6 +952,17 @@ pub enum Request {
     WifiClientScan {
         interface: String,
     },
+    ListWifiApProfiles,
+    SaveWifiApProfile {
+        profile: WifiApProfileWriteRequest,
+    },
+    DeleteWifiApProfile {
+        id: String,
+    },
+    ActivateWifiApProfile {
+        interface: String,
+        profile_id: String,
+    },
     ListWifiClientProfiles,
     GetWifiClientProfile {
         id: String,
@@ -959,9 +1002,14 @@ fn redact_debug_secrets(value: &mut serde_json::Value) {
                     name.as_str(),
                     "passphrase" | "uplink_passphrase" | "output_passphrase" | "password"
                 ) {
-                    if !value.is_null() {
-                        *value = serde_json::Value::String("<redacted>".to_string());
-                    }
+                    *value = serde_json::Value::String(
+                        if value.is_null() {
+                            "<absent>"
+                        } else {
+                            "<redacted>"
+                        }
+                        .to_string(),
+                    );
                 } else {
                     redact_debug_secrets(value);
                 }
@@ -1171,6 +1219,15 @@ pub enum Response {
     WifiClientScanResults {
         interface: String,
         results: Vec<WpaSupplicantScanResult>,
+    },
+    WifiApProfiles {
+        profiles: Vec<WifiApProfileSummary>,
+    },
+    WifiApProfileSaved {
+        profile: WifiApProfileSummary,
+    },
+    WifiApProfileDeleted {
+        id: String,
     },
     WifiClientProfiles {
         profiles: Vec<WifiClientProfileSummary>,
