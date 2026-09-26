@@ -277,11 +277,15 @@ impl WifiClientSupervisor {
         &self,
         spec: &WifiClientSpec,
     ) -> Result<RenderedClientConfig, ClientSupervisorError> {
-        let passphrase = resolve_passphrase_parts(
-            &spec.interface,
-            spec.passphrase_file.as_deref(),
-            &self.inner.passphrase_store,
-        )?;
+        let passphrase = if spec.requires_passphrase() {
+            resolve_passphrase_parts(
+                &spec.interface,
+                spec.passphrase_file.as_deref(),
+                &self.inner.passphrase_store,
+            )?
+        } else {
+            None
+        };
         Ok(render_wpa_supplicant_config(ClientRenderInput {
             spec,
             ctrl_interface: &self.inner.runtime_dir,
