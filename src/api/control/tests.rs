@@ -6407,3 +6407,84 @@ async fn uncertain_dhcp_commit_preserves_candidate_and_blocks_subsequent_mutatio
     );
     assert!(fixture.supervisor.spec("wan0").await.is_some());
 }
+
+#[tokio::test]
+async fn queued_autoconnect_observes_commit_fence_after_admission() {
+    let fixture = wifi_client_enabled_fixture().await;
+    let created = fixture
+        .service
+        .dispatch(Request::CreateWifiClientProfile {
+            profile: WifiClientProfileWriteRequest {
+                id: "saved".into(),
+                ssid: "saved-wifi".into(),
+                country_code: Some("US".into()),
+                security: WifiClientSecurity::Open,
+                priority: 0,
+                autoconnect: true,
+                passphrase: None,
+                clear_passphrase: false,
+            },
+        })
+        .await;
+    assert!(matches!(created, Response::WifiClientProfile { .. }));
+    fixture
+        .service
+        .wifi_client
+        .as_ref()
+        .unwrap()
+        .disable("wlan1")
+        .await
+        .unwrap();
+    let next_pid = fixture.process.next_pid.load(WifiOrdering::Relaxed);
+    let mutation = fixture.service.network_mutations.write().await;
+    let pass = fixture.service.autoconnect_wifi_once();
+    tokio::pin!(pass);
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut pass)
+        .await
+        .is_err());
+    crate::core::recovery::fence_commit(
+        &fixture.service.config.runtime.state_dir,
+        "commit failed while autoconnect waited for admission".into(),
+    );
+    drop(mutation);
+    tokio::time::timeout(Duration::from_secs(5), pass)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        fixture.process.next_pid.load(WifiOrdering::Relaxed),
+        next_pid,
+        "a queued scan must not launch a supplicant after an uncertain commit"
+    );
+}
+
+#[tokio::test]
+async fn settings_writes_wait_for_network_execution_and_observe_commit_fence() {
+    for request in [
+        Request::ResetApiHttpsSettings,
+        Request::ResetSecuritySettings,
+    ] {
+        let fixture = dhcp_client_control_fixture(false).await;
+        let revision = fixture.overrides.committed_revision().await;
+        let execution = fixture.service.network_mutations.execute().await;
+        let write = fixture.service.dispatch(request);
+        tokio::pin!(write);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut write)
+                .await
+                .is_err(),
+            "settings must not write shared intent during runtime execution"
+        );
+        crate::core::recovery::fence_commit(
+            &fixture.service.config.runtime.state_dir,
+            "uncertain network commit".into(),
+        );
+        drop(execution);
+        let response = write.await;
+        assert!(
+            matches!(response, Response::Error { ref message } if message.contains("commit_indeterminate")),
+            "{response:?}"
+        );
+        assert_eq!(fixture.overrides.committed_revision().await, revision);
+    }
+}

@@ -98,16 +98,16 @@ impl ControlService {
             .filter(|interface| interface.is_wireless)
         {
             let name = &interface.name;
-            if crate::core::recovery::check_scope(&self.config.runtime.state_dir, Some(name))
-                .is_err()
-            {
-                continue;
-            }
             // Scanning can launch a temporary supplicant, so it belongs to the
             // same mutation boundary as activation and timeout cleanup. Read
             // eligibility only after admission: a queued pass must not act on
             // an association timeout superseded by a newer control operation.
             let _network_mutation = self.network_mutations.write().await;
+            if crate::core::recovery::check_scope(&self.config.runtime.state_dir, Some(name))
+                .is_err()
+            {
+                continue;
+            }
             let secrets = crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore::in_state_dir(
                 &self.config.runtime.state_dir,
             );

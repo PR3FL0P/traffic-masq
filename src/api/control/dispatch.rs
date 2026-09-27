@@ -11,13 +11,24 @@ impl ControlService {
     pub(super) async fn dispatch_inner(&self, request: Request) -> Response {
         // Admission stays held across convergence waits. Execution is held only
         // by direct writers: the worker must remain able to realize proposals.
-        let _admission = if is_network_mutation(&request) {
+        // Settings share the committed document with network intent. Their
+        // writes can fence the entire daemon, so serialize them with runtime
+        // writers even though router/interface recovery scopes do not apply.
+        let writes_settings = matches!(
+            &request,
+            Request::ConfigureApiHttpsSettings { .. }
+                | Request::ResetApiHttpsSettings
+                | Request::ConfigureSecuritySettings { .. }
+                | Request::ResetSecuritySettings
+        );
+        let _admission = if is_network_mutation(&request) || writes_settings {
             Some(self.network_mutations.admit().await)
         } else {
             None
         };
-        let _execution = if is_network_mutation(&request)
-            && !is_converged_network_transaction_request(&request)
+        let _execution = if writes_settings
+            || (is_network_mutation(&request)
+                && !is_converged_network_transaction_request(&request))
         {
             Some(self.network_mutations.execute().await)
         } else {
