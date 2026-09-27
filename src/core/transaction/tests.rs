@@ -971,3 +971,57 @@ async fn rejected_wifi_candidate_restores_credentials_and_both_ip_policy_transit
         assert!(manager.pending().await.is_empty());
     }
 }
+
+#[tokio::test]
+async fn automatic_rollback_retries_after_converger_recovers() {
+    let directory = tempdir().unwrap();
+    let desired = desired_state(directory.path()).await;
+    let manager = NetworkTransactionManager::new(
+        InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory()),
+        Duration::from_millis(20),
+        desired.clone(),
+    );
+    let gate = Arc::new(NetworkMutationGate::default());
+    manager.set_runtime_gate(gate.clone());
+    let pending = manager
+        .apply("test0", &interface_config(PROPOSED), None, false)
+        .await
+        .unwrap();
+    desired.fail_converger("temporary failure");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if manager.inner.pending.lock().await[&pending.token].phase
+                == PendingPhase::RollbackRequired
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // A failed attempt must retain recovery proof but release admission.
+    let admission = tokio::time::timeout(Duration::from_millis(500), gate.admit())
+        .await
+        .unwrap();
+    assert!(directory
+        .path()
+        .join("interface-transactions/test0.json")
+        .exists());
+    assert!(manager.commit(&pending.token).await.is_err());
+    let converger = spawn_converger(desired.clone(), fake_network());
+    drop(admission);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !manager.pending().await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("automatic retry must finish recovery");
+    assert!(!desired.is_tentative("test0").await);
+    assert!(!directory
+        .path()
+        .join("interface-transactions/test0.json")
+        .exists());
+    converger.abort();
+}

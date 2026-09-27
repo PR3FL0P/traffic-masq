@@ -1315,3 +1315,59 @@ async fn dangling_router_journal_symlink_is_not_treated_as_missing() {
         "recovery must not mutate the network"
     );
 }
+
+#[tokio::test]
+async fn automatic_rollback_retries_after_transient_failure() {
+    let fake = FakeSubsystems::new();
+    let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
+    let gate = Arc::new(NetworkMutationGate::default());
+    coordinator.set_timeout_mutation_gate(gate.clone());
+    let plan = coordinator
+        .plan(build_candidate(&overrides).await)
+        .await
+        .unwrap();
+    let token = coordinator.apply(plan).await.unwrap();
+    fake.fail_rollback("rollback_routes");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while coordinator.status().await != CoordinatorStatus::RollbackFailed {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(coordinator.inner.journal.exists());
+    assert!(coordinator.commit(&token).await.is_err());
+    let admission = tokio::time::timeout(Duration::from_millis(500), gate.admit())
+        .await
+        .unwrap();
+    *fake.rollback_fail.lock().unwrap() = None;
+    drop(admission);
+    tokio::time::timeout(Duration::from_secs(3), coordinator.wait_until_idle())
+        .await
+        .expect("automatic retry must finish recovery");
+    assert!(!coordinator.inner.journal.exists());
+    assert_eq!(overrides.committed_revision().await, 0);
+}
+
+#[tokio::test]
+async fn failed_apply_compensation_is_retried_automatically() {
+    let fake = FakeSubsystems::new();
+    let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
+    let plan = coordinator
+        .plan(build_candidate(&overrides).await)
+        .await
+        .unwrap();
+    fake.fail_apply("apply_routes");
+    fake.fail_rollback("rollback_routes");
+    assert!(coordinator.apply(plan).await.is_err());
+    assert_eq!(
+        coordinator.status().await,
+        CoordinatorStatus::RollbackFailed
+    );
+    *fake.rollback_fail.lock().unwrap() = None;
+    tokio::time::timeout(Duration::from_secs(3), coordinator.wait_until_idle())
+        .await
+        .expect("failed apply must also schedule recovery");
+    assert!(!coordinator.inner.journal.exists());
+    assert_eq!(overrides.committed_revision().await, 0);
+}

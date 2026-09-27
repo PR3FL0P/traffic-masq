@@ -247,6 +247,7 @@ impl RouterTransactionCoordinator {
                             "failed to clear rollback journal: {cleanup_error:#}"
                         )],
                     });
+                    self.spawn_rollback_timer(token.clone());
                     return Err(error.context(format!(
                         "rollback journal cleanup failed: {cleanup_error:#}"
                     )));
@@ -260,6 +261,7 @@ impl RouterTransactionCoordinator {
                     snapshot: current_snapshot,
                     failures,
                 });
+                self.spawn_rollback_timer(token.clone());
                 return Err(error.context(format!(
                     "router rollback recovery remains required: {recovery}"
                 )));
@@ -664,7 +666,7 @@ impl RouterTransactionCoordinator {
         Ok(())
     }
 
-    async fn rollback_timeout_fired(&self, token: &str) {
+    async fn rollback_timeout_fired(&self, token: &str) -> bool {
         let gate = self
             .inner
             .timeout_mutation_gate
@@ -678,15 +680,17 @@ impl RouterTransactionCoordinator {
         let mut state = self.inner.state.lock().await;
         match &*state {
             CoordinatorState::Pending(pending) if pending.token == token => {}
-
-            _ => return,
+            CoordinatorState::RollbackFailed(failure) if failure.token == token => {}
+            _ => return false,
         }
         if let Err(error) = self
             .rollback_locked(&mut state, RollbackTrigger::Timeout)
             .await
         {
-            tracing::error!(%error, "automatic router rollback failed");
+            tracing::error!(%error, "automatic router rollback failed; will retry");
+            return true;
         }
+        false
     }
 
     fn spawn_rollback_timer(&self, token: String) {
@@ -694,7 +698,10 @@ impl RouterTransactionCoordinator {
         let timeout = self.inner.rollback_timeout;
         tokio::spawn(async move {
             tokio::time::sleep(timeout).await;
-            coordinator.rollback_timeout_fired(&token).await;
+            while coordinator.rollback_timeout_fired(&token).await {
+                // No mutation/state locks are retained between attempts.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
         });
     }
 

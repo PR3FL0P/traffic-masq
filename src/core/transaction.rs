@@ -1105,20 +1105,28 @@ impl NetworkTransactionManager {
         let manager = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(manager.inner.rollback_timeout).await;
-            // Match request lock ordering: admission precedes operation_lock.
-            // Keep admission through convergence, but let rollback acquire and
-            // release execution itself so the converger can restore the state.
-            let gate = manager.runtime_gate();
-            let _admission = match &gate {
-                Some(gate) => Some(gate.admit().await),
-                None => None,
-            };
-            if let Err(error) = manager.rollback(&token).await {
-                if !error.to_string().contains("not found") {
-                    tracing::error!(%token, %error, "automatic network rollback failed");
+            loop {
+                // Admission precedes operation_lock; execution must remain available
+                // to the converger. Release admission before the retry delay.
+                let gate = manager.runtime_gate();
+                let admission = match &gate {
+                    Some(gate) => Some(gate.admit().await),
+                    None => None,
+                };
+                if !manager.inner.pending.lock().await.contains_key(&token) {
+                    return;
                 }
-            } else {
-                tracing::warn!(%token, "network change automatically rolled back after timeout");
+                match manager.rollback(&token).await {
+                    Ok(_) => {
+                        tracing::warn!(%token, "network change automatically rolled back after timeout");
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::error!(%token, %error, "automatic network rollback failed; will retry");
+                    }
+                }
+                drop(admission);
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
     }
