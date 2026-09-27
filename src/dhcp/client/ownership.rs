@@ -18,8 +18,14 @@ use crate::{
 pub enum OwnershipConflict {
     #[error("interface {interface} was not found")]
     InterfaceMissing { interface: String },
-    #[error("interface identity changed for {interface}")]
-    InterfaceIdentity { interface: String },
+    #[error("interface identity changed for {interface}: expected ifindex={expected_index} mac={expected_mac:02x?}, observed ifindex={observed_index} mac={observed_mac:02x?}")]
+    InterfaceIdentity {
+        interface: String,
+        expected_index: u32,
+        expected_mac: Vec<u8>,
+        observed_index: u32,
+        observed_mac: Vec<u8>,
+    },
     #[error("address {address} already exists without exact ownership proof")]
     ForeignAddress { address: std::net::Ipv4Addr },
     #[error(
@@ -220,6 +226,9 @@ impl DhcpClientOwnershipApplier {
         let Some(lease) = self.store.load(interface)? else {
             return Ok(None);
         };
+        if self.retire_replaced_interface(&lease).await? {
+            return Ok(None);
+        }
         self.verify_identity(&lease).await?;
         if lease.expires_at_unix <= now_unix {
             self.cleanup_locked(interface).await?;
@@ -244,6 +253,9 @@ impl DhcpClientOwnershipApplier {
         let Some(mut lease) = self.store.load(interface)? else {
             return Ok(None);
         };
+        if self.retire_replaced_interface(&lease).await? {
+            return Ok(None);
+        }
         match self.verify_identity(&lease).await {
             Ok(()) => {}
             Err(OwnershipError::Conflict(OwnershipConflict::InterfaceMissing { .. })) => {
@@ -271,10 +283,71 @@ impl DhcpClientOwnershipApplier {
         self.cleanup_locked(interface).await
     }
 
+    /// An old actor must never clean ownership established by a replacement actor.
+    /// Returns false when the callback was superseded and must leave shared status alone.
+    pub(crate) async fn cleanup_for_identity(
+        &self,
+        interface: &str,
+        index: u32,
+        hardware_address: &[u8],
+    ) -> Result<bool, OwnershipError> {
+        let _mutation = self.mutation_locks.lock(interface).await;
+        if let Some(record) = self.store.load(interface)? {
+            if record.interface_index != index || record.hardware_address != hardware_address {
+                tracing::debug!(%interface, index, "skipping DHCP cleanup from a superseded actor");
+                return Ok(false);
+            }
+        }
+        self.cleanup_locked(interface).await?;
+        Ok(true)
+    }
+
+    /// Called only under the interface mutation lock. This retires a journal,
+    /// never transfers its ownership proof or DHCP memory to the replacement.
+    async fn retire_replaced_interface(
+        &self,
+        lease: &DhcpClientLease,
+    ) -> Result<bool, OwnershipError> {
+        let interfaces = self
+            .network
+            .list_interfaces()
+            .await
+            .map_err(OwnershipError::Network)?;
+        let Some(current) = interfaces.iter().find(|item| item.name == lease.interface) else {
+            return Ok(false);
+        };
+        if current.index == lease.interface_index
+            || interfaces
+                .iter()
+                .any(|item| item.index == lease.interface_index)
+        {
+            // The old netdev may have been renamed, or its index reused. Keep
+            // the journal for explicit recovery rather than orphaning its state.
+            return Ok(false);
+        }
+        let hardware = self
+            .network
+            .hardware_address(&lease.interface)
+            .await
+            .map_err(OwnershipError::Network)?;
+        if hardware != lease.hardware_address {
+            return Ok(false);
+        }
+        // Do not discard evidence if a provider still reports exact old state.
+        self.verify_absent(lease).await?;
+        self.store.remove(&lease.interface)?;
+        tracing::info!(interface = %lease.interface, previous_index = lease.interface_index,
+            current_index = current.index, "retired DHCP ownership for a vanished interface; fresh acquisition required");
+        Ok(true)
+    }
+
     async fn cleanup_locked(&self, interface: &str) -> Result<(), OwnershipError> {
         let Some(mut lease) = self.store.load(interface)? else {
             return Ok(());
         };
+        if self.retire_replaced_interface(&lease).await? {
+            return Ok(());
+        }
         match self.verify_identity(&lease).await {
             Ok(()) => {}
             Err(OwnershipError::Conflict(OwnershipConflict::InterfaceMissing { .. })) => {
@@ -348,6 +421,10 @@ impl DhcpClientOwnershipApplier {
         if interface.index != lease.interface_index || hardware != lease.hardware_address {
             return Err(OwnershipConflict::InterfaceIdentity {
                 interface: lease.interface.clone(),
+                expected_index: lease.interface_index,
+                expected_mac: lease.hardware_address.clone(),
+                observed_index: interface.index,
+                observed_mac: hardware,
             }
             .into());
         }

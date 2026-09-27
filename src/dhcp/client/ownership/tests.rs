@@ -23,6 +23,7 @@ struct FakeNetwork {
     route_adds: Mutex<usize>,
     fail_route_add: Mutex<Option<usize>>,
     hide_interface: Mutex<bool>,
+    extra_interfaces: Mutex<Vec<NetworkInterface>>,
 }
 
 impl FakeNetwork {
@@ -41,14 +42,16 @@ impl NetworkProvider for FakeNetwork {
         if *self.hide_interface.lock().unwrap() {
             return Ok(Vec::new());
         }
-        Ok(vec![NetworkInterface {
+        let mut interfaces = vec![NetworkInterface {
             index: *self.index.lock().unwrap(),
             name: "eth0".into(),
             is_up: true,
             rx_bytes: 0,
             tx_bytes: 0,
             is_wireless: false,
-        }])
+        }];
+        interfaces.extend(self.extra_interfaces.lock().unwrap().clone());
+        Ok(interfaces)
     }
     async fn hardware_address(&self, _interface: &str) -> Result<Vec<u8>> {
         Ok(self.mac.lock().unwrap().clone())
@@ -381,17 +384,16 @@ async fn pending_crash_state_is_not_adopted_but_cleanup_state_recovers() {
 }
 
 #[tokio::test]
-async fn identity_mismatch_prevents_adopt_and_cleanup() {
-    for mismatch_mac in [false, true] {
+async fn mac_mismatch_prevents_adopt_and_cleanup() {
+    for changed_index in [false, true] {
         let network = FakeNetwork::new();
         let (_dir, store, applier) = fixture(network.clone());
         let mut record = lease();
         record.state = DhcpClientLeaseState::Bound;
         store.save(&record).unwrap();
-        if mismatch_mac {
-            *network.mac.lock().unwrap() = vec![9; 6]
-        } else {
-            *network.index.lock().unwrap() = 9
+        *network.mac.lock().unwrap() = vec![9; 6];
+        if changed_index {
+            *network.index.lock().unwrap() = 9;
         }
         assert!(matches!(
             applier.adopt("eth0", 1).await,
@@ -435,4 +437,90 @@ async fn missing_interface_cleanup_removes_record_cleanly() {
         .await
         .expect("missing interface cleanup must succeed");
     assert!(store.load("eth0").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn replaced_interface_retires_journal_without_touching_replacement_state() {
+    for operation in ["adopt", "cleanup", "suspend"] {
+        let network = FakeNetwork::new();
+        let (_dir, store, applier) = fixture(network.clone());
+        store.save(&lease()).unwrap();
+        *network.index.lock().unwrap() = 9;
+        let address = Ipv4AddressInfo {
+            interface_index: 9,
+            address: lease().address,
+            prefix_len: 24,
+            protocol: Some(TRAFFIC_MASQ_DHCP_ADDRESS_PROTOCOL),
+        };
+        network.addresses.lock().unwrap().push(address.clone());
+        match operation {
+            "adopt" => assert!(applier.adopt("eth0", 1).await.unwrap().is_none()),
+            "suspend" => assert!(applier.suspend("eth0", 1).await.unwrap().is_none()),
+            _ => applier.cleanup("eth0").await.unwrap(),
+        }
+        assert!(store.load("eth0").unwrap().is_none());
+        assert_eq!(*network.addresses.lock().unwrap(), vec![address]);
+        // A retired record is not proof of ownership on the new interface.
+        let mut fresh = lease();
+        fresh.interface_index = 9;
+        fresh.owned_routes[0].output_interface_index = Some(9);
+        assert!(matches!(
+            applier.apply(fresh).await,
+            Err(OwnershipError::Conflict(
+                OwnershipConflict::ForeignAddress { .. }
+            ))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn replaced_interface_with_observed_old_state_keeps_journal() {
+    let network = FakeNetwork::new();
+    let (_dir, store, applier) = fixture(network.clone());
+    applier.apply(lease()).await.unwrap();
+    *network.index.lock().unwrap() = 9;
+    assert!(applier.cleanup("eth0").await.is_err());
+    assert!(store.load("eth0").unwrap().is_some());
+    assert_eq!(network.routes.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn stale_ack_is_rejected_before_mutation_with_identity_details() {
+    let network = FakeNetwork::new();
+    let (_dir, store, applier) = fixture(network.clone());
+    *network.index.lock().unwrap() = 9;
+    let error = applier.apply(lease()).await.unwrap_err();
+    assert!(error.to_string().contains("expected ifindex=2"));
+    assert!(error.to_string().contains("observed ifindex=9"));
+    assert!(store.load("eth0").unwrap().is_none());
+    assert!(network.addresses.lock().unwrap().is_empty());
+    assert!(network.routes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn old_index_still_present_under_another_name_blocks_retirement() {
+    let network = FakeNetwork::new();
+    let (_dir, store, applier) = fixture(network.clone());
+    store.save(&lease()).unwrap();
+    *network.index.lock().unwrap() = 9;
+    network
+        .extra_interfaces
+        .lock()
+        .unwrap()
+        .push(NetworkInterface {
+            index: 2,
+            name: "renamed0".into(),
+            is_up: true,
+            rx_bytes: 0,
+            tx_bytes: 0,
+            is_wireless: false,
+        });
+    assert!(matches!(
+        applier.adopt("eth0", 1).await,
+        Err(OwnershipError::Conflict(
+            OwnershipConflict::InterfaceIdentity { .. }
+        ))
+    ));
+    assert!(applier.cleanup("eth0").await.is_err());
+    assert!(store.load("eth0").unwrap().is_some());
 }

@@ -1040,11 +1040,21 @@ impl DhcpClientActionSink for OwnershipSink {
         // not independent control requests. DHCP ownership and interface
         // address writers serialize through the shared per-interface mutation
         // lock. Taking control admission here would deadlock lease readiness.
-        let result = self.applier.cleanup(&self.spec.interface).await;
+        let result = self
+            .applier
+            .cleanup_for_identity(
+                &self.spec.interface,
+                self.identity.index,
+                &self.identity.hardware_address,
+            )
+            .await;
+        if matches!(result, Ok(false)) {
+            return Ok(());
+        }
         let mut shared = self.shared.lock().await;
         shared.lease = None;
         match result {
-            Ok(()) => Ok(()),
+            Ok(_) => Ok(()),
             Err(error) => {
                 let reason = error.to_string();
                 shared.failure = Some(reason.clone());

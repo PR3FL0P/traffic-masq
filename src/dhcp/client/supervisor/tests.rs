@@ -75,13 +75,21 @@ impl NetworkProvider for FakeNetwork {
 
     async fn add_ipv4_address(
         &self,
-        _interface: &str,
+        interface: &str,
         address: Ipv4Addr,
         prefix_len: u8,
         ownership: AddressOwnership,
     ) -> Result<()> {
+        let index = self
+            .interfaces
+            .lock()
+            .await
+            .iter()
+            .find(|item| item.name == interface)
+            .unwrap()
+            .index;
         self.addresses.lock().await.push(Ipv4AddressInfo {
-            interface_index: 7,
+            interface_index: index,
             address,
             prefix_len,
             protocol: ownership.protocol(),
@@ -1067,4 +1075,81 @@ async fn consecutive_failures_and_backoff_are_preserved_across_restarts_with_rem
         let tasks = supervisor.inner.tasks.lock().await;
         assert_eq!(tasks.get("wan0").unwrap().consecutive_failures, 2);
     }
+}
+
+#[tokio::test]
+async fn persisted_replug_reacquires_and_old_callbacks_cannot_clean_new_ownership() {
+    let state_dir = TempDir::new().unwrap();
+    let network = FakeNetwork::present(7).await;
+    let launcher = Arc::new(FakeLauncher::default());
+    let supervisor = supervisor_with(&state_dir, network.clone(), launcher.clone()).await;
+    let mut old_sink = launcher.take_sink();
+    let acquired = lease(Ipv4Addr::new(192, 0, 2, 42));
+    old_sink.lease_acquired(acquired.clone()).await.unwrap();
+    network.detach("wan0").await;
+    network.addresses.lock().await.clear();
+    network.routes.lock().await.clear();
+    network.attach("wan0", 11).await;
+
+    assert!(old_sink.lease_acquired(acquired.clone()).await.is_err());
+    old_sink.cleanup_needed(acquired.clone()).await.unwrap();
+    assert!(supervisor.ensure_alive().await.unwrap());
+    assert_eq!(launcher.launch_count(), 2);
+    assert_eq!(launcher.remembered.lock().unwrap().last(), Some(&None));
+    assert!(supervisor.status("wan0").await.unwrap().lease.is_none());
+    let mut new_sink = launcher.take_sink();
+    new_sink.lease_acquired(acquired.clone()).await.unwrap();
+    old_sink.cleanup_needed(acquired).await.unwrap();
+    let store = DhcpClientLeaseStore::new(state_dir.path()).unwrap();
+    let record = store.load("wan0").unwrap().unwrap();
+    assert_eq!(record.interface_index, 11);
+    assert_eq!(
+        supervisor.status("wan0").await.unwrap().lease,
+        Some(record.clone())
+    );
+    assert!(record
+        .owned_routes
+        .iter()
+        .all(|route| route.output_interface_index == Some(11)));
+    assert_eq!(network.addresses.lock().await.len(), 1);
+    assert_eq!(network.routes.lock().await.len(), 2);
+    assert_eq!(
+        supervisor.status("wan0").await.unwrap().state,
+        DhcpClientRunState::Running
+    );
+    supervisor
+        .shutdown(ShutdownPolicy::PreserveInterfaces)
+        .await;
+}
+
+#[tokio::test]
+async fn restart_with_persisted_old_index_starts_fresh_without_reporting_old_lease() {
+    let state_dir = TempDir::new().unwrap();
+    let network = FakeNetwork::present(7).await;
+    let launcher = Arc::new(FakeLauncher::default());
+    let supervisor = supervisor_with(&state_dir, network.clone(), launcher.clone()).await;
+    launcher
+        .take_sink()
+        .lease_acquired(lease(Ipv4Addr::new(192, 0, 2, 42)))
+        .await
+        .unwrap();
+    supervisor
+        .shutdown(ShutdownPolicy::PreserveInterfaces)
+        .await;
+    network.detach("wan0").await;
+    network.addresses.lock().await.clear();
+    network.routes.lock().await.clear();
+    network.attach("wan0", 11).await;
+    let restarted = supervisor_with(&state_dir, network, launcher.clone()).await;
+    assert_eq!(launcher.launch_count(), 2);
+    assert_eq!(launcher.remembered.lock().unwrap().last(), Some(&None));
+    let status = restarted.status("wan0").await.unwrap();
+    assert_eq!(status.state, DhcpClientRunState::Running);
+    assert!(status.lease.is_none());
+    assert!(DhcpClientLeaseStore::new(state_dir.path())
+        .unwrap()
+        .load("wan0")
+        .unwrap()
+        .is_none());
+    restarted.shutdown(ShutdownPolicy::PreserveInterfaces).await;
 }
