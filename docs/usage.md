@@ -43,7 +43,7 @@ The DHCP client requires root or `CAP_NET_RAW`.
 ## Build
 
 ```sh
-cargo build --release
+cargo build --release --locked
 ```
 
 The binaries are written to:
@@ -212,7 +212,14 @@ Configuration lookup order:
 3. `/etc/traffic-masq/config.toml`
 4. built-in defaults
 
-The built-in defaults do not manage network interfaces.
+An explicitly selected file (`--config` or `TRAFFIC_MASQ_CONFIG`) must exist
+and be readable; errors do not fall back to another source. The built-in
+defaults do not manage network interfaces.
+
+`config show` prints the selected file configuration (with defaults filled in),
+not the runtime overrides saved by the TUI or API. Inspect the effective
+interface/router settings through the TUI or API. `config validate` validates
+the file configuration; it does not test live connectivity.
 
 A complete configuration template is available at
 [`examples/config.toml`](../examples/config.toml). Replace all interface names and
@@ -359,27 +366,21 @@ During an API refresh, input takes priority. While an action is in progress,
 the TUI shows its elapsed time and rejects additional actions; Q requests exit
 after the result. A timeout does not prove that a change failed: inspect the
 current state before retrying. An expired session offers login again without
-discarding drafts or extending rollback deadlines. Windows smaller than 60×15
-disable hidden controls; Q still exits.
+discarding drafts or extending rollback deadlines. Terminals smaller than 80×24
+disable normal editing and mouse controls; Q still exits. An active confirmation
+deadline remains visible, with Enter to commit and Esc to roll back. Recovery
+states show their available recovery actions instead.
 
 ### Wi-Fi client connections
 
 Tab switches between wireless interfaces and their actions; Esc returns to the
 same interface. Lists and connection forms scroll to keep the selection visible.
 In the connection form, arrows move focus and Enter/Space selects an IP option.
-Use **Connect** or F10 to submit. IP configuration is applied before profile
-activation; activation alone does not confirm association or an assigned address.
-If activation fails after IP configuration, inspect the reported interface state
+Use **Connect** or F10 to submit. This provisions the profile, credentials and
+IPv4 policy together as a tentative change. Verify connectivity, then commit
+before the deadline. On failure, inspect the reported pending/recovery state
 before retrying. **Keep current static IP** uses the configured address, never a
 currently observed DHCP lease.
-
-### Wi-Fi access points
-
-The Wi-Fi screen includes unconfigured radios. **Create hotspot** accepts an IPv4
-subnet and prepares a managed output interface in one backend transaction. DHCP
-policy explicitly selects preserve, enable/configure, or disable. **Apply** is
-tentative: verify connectivity and commit before the rollback timer expires.
-Saving a reusable AP profile is separate from applying the saved profile.
 
 Client **Connect** sends the profile and IPv4 policy to
 `PUT /api/v1/wifi-client/{interface}/provision`. The backend stages the interface,
@@ -392,6 +393,14 @@ The low-level `active-profile` endpoint starts activation and returns runtime
 status; its legacy `WifiClientProfileActivated` response does not prove IP
 readiness. Use the provisioning endpoint for interactive management changes.
 
+### Wi-Fi access points
+
+The Wi-Fi screen includes unconfigured radios. **Create hotspot** accepts an IPv4
+subnet and prepares a managed output interface in one backend transaction. DHCP
+policy explicitly selects preserve, enable/configure, or disable. **Apply** is
+tentative: verify connectivity and commit before the rollback timer expires.
+Saving a reusable AP profile is separate from applying the saved profile.
+
 ## Daemon commands
 
 ```text
@@ -400,7 +409,10 @@ traffic-masqd [--config <path>] <command>
 
 | Command | Function |
 | --- | --- |
-| `run` | Run in the foreground. |
+| `install` | Install both binaries and configure service integration; see [installation](#install). |
+| `uninstall` | Remove installed binaries and service files, preserving configuration and state. |
+| `reset [--dry-run] [--yes] [--force-offline]` | Clear configuration and persistent state; see [reset requirements](#reset-all-settings). |
+| `run` | Run in the foreground (also the default when no command is supplied). |
 | `start [--timeout-seconds N]` | Start in the background. |
 | `stop [--timeout-seconds N]` | Stop the daemon. |
 | `status` | Print process and API state. |
@@ -526,9 +538,9 @@ Test configuration changes on a separate Linux host before production use.
 The dashboard's **Interfaces stat** panel shows link activity and
 `traffic-masq:on/off/?` (managed, unmanaged, or ownership unavailable).
 Press **2** for aggregate statistics, then **Down/Up** to browse individual
-interfaces; **Home** returns to the aggregate view. The separate **DHCP Clients**
-panel shows configured uplink DHCP clients. The overview reports whether the VPN
-subsystem is enabled; this switch alone does not prove a tunnel is connected.
+interfaces; **Home** returns to the aggregate view. The **DHCP Client** section
+shows configured uplink DHCP clients; DHCP status is not part of the Dashboard.
+The overview reports whether the VPN subsystem is enabled; this switch alone does not prove a tunnel is connected.
 
 An absent router dataplane interface defers startup convergence after successful
 rollback instead of stopping the daemon. The daemon retries when the interface

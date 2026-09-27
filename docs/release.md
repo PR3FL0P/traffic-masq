@@ -10,7 +10,8 @@ produce a checksum. Publishing a GitHub release is a separate step.
 2. Run the [standard checks](../README.md#checks) and
    `sh packaging/test-namespaces.sh` on a disposable VM. The latter includes
    both VPN test suites.
-3. Build a release archive locally:
+3. Build a release archive locally. The packaging script needs Python 3.11 or
+   newer (`tomllib`), `tar`, and `sha256sum`:
 
    ```sh
    cargo build --release --locked --bins
@@ -22,8 +23,7 @@ produce a checksum. Publishing a GitHub release is a separate step.
 4. Verify the locally generated checksum from the repository root:
 
    ```sh
-   cd release
-   sha256sum -c traffic-masq-*.tar.gz.sha256
+   (cd release && sha256sum -c traffic-masq-*.tar.gz.sha256)
    ```
 
 5. Test installation, upgrade and uninstall in a clean VM before publishing the

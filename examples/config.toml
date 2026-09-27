@@ -1,4 +1,4 @@
-# Safe example for a router with an externally configured uplink (wan0), a
+# Safe example for a router with an externally configured uplink (wan0), an
 # interface outside the router (eth0), and a traffic-masq LAN (wlan0). Replace interface
 # names and addresses before use.
 

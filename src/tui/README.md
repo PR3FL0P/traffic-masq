@@ -17,12 +17,12 @@ The TUI serves as the primary operational console for the `traffic-masq` network
    - Communicates with `traffic-masqd` over a local Unix domain socket (`/run/traffic-masq/traffic-masqd.sock`).
    - Fully interactive: supports all tabs (Interfaces, DHCP Server, DHCP Client (configurable in Settings), Router, VPN, Wi-Fi, Settings, Logs).
    - Authenticated via shared device password; supports secure session caching in `$XDG_STATE_HOME`.
-   - Interface/router applies and AP provisioning use commit-confirm rollback timers; standalone DHCP, other Wi-Fi mutations, and VPN mutations apply immediately and rely on daemon-side ownership recovery.
+   - Interface/router applies, Wi-Fi client Connect, and AP provisioning use commit-confirm rollback timers; standalone DHCP, other Wi-Fi mutations, and VPN mutations apply immediately and rely on daemon-side ownership recovery.
 
 2. **Direct / Recovery Mode (`--direct`):**
    - Directly binds to Linux Netlink via `RtnetlinkNetworkProvider`.
    - Read-only emergency inspection mode when `traffic-masqd` is down or unresponsive.
-   - Restricts mutation-capable navigation to Dashboard, Interfaces, and Log; daemon-dependent tabs are rendered muted and keyboard section navigation skips them. Clicking a disabled tab still produces an informational warning.
+   - Restricts navigation to Dashboard, Interfaces, and Log; daemon-dependent tabs are rendered muted and keyboard section navigation skips them. Clicking a disabled tab still produces an informational warning.
 
 ---
 
@@ -43,7 +43,7 @@ The TUI serves as the primary operational console for the `traffic-masq` network
 | [`wifi/`](wifi) | Wi-Fi screen implementations split by responsibility: AP editor, scan picker, saved profiles, profile editor, connect/IP prompt, and Wi-Fi-specific tests. | `ap_editor`, `scan`, `profiles`, `profile_editor`, `connect` |
 | [`vpn.rs`](vpn.rs) | WireGuard VPN profile management, connection lifecycle, configuration import wizard, deletion confirmation. | `VpnData`, `VpnFocus`, `VpnImportEditor` |
 | [`vpn_policy.rs`](vpn_policy.rs) | Policy routing rules for WireGuard (routing marks, table IDs, client bypass policies). | `VpnPolicyData`, `VpnPolicyEditor` |
-| [`settings.rs`](settings.rs) | Daemon configuration, rollback timeout settings, session preferences, device password update wizard, configuration reload/reset. | `SecurityEditor`, `SettingsField`, `PasswordChangeEditor` |
+| [`settings.rs`](settings.rs) | Daemon configuration, rollback timeout settings, session preferences, device password update wizard, security override reset. | `SecurityEditor`, `SettingsField`, `PasswordChangeEditor` |
 | [`access.rs`](access.rs) | Remote HTTPS access configuration (TLS listen socket, certificate and private key file paths). | `AccessEditor`, `AccessField` |
 | [`logs.rs`](logs.rs) | In-memory circular log buffer (`LOG_HISTORY_LEN = 500`), severity levels (`Info`, `Warn`, `Error`), F1 popup viewer, log export. | `LogEntry`, `LogLevel`, `LogFocus`, `render_log` |
 
@@ -96,7 +96,7 @@ Because misconfiguring an IP address or firewall rule can sever SSH access, inte
    - On the Router screen, degraded recovery shows the recovery code, invariant, blocked operation, action and runbook. Press **r** to retry a failed rollback; for `TM-REC-208` journal-cleanup-pending, cleanup retries automatically and **r** refreshes status.
 3. **Disconnect Handling:** If the daemon becomes unreachable while on a pending screen, the TUI retains the pending change state and warns the operator that the outcome is unverified rather than falsely claiming success.
 
-Standalone DHCP, Wi-Fi and VPN actions do not enter these pending screens and do not expose a commit timer. Once accepted, they are non-cancellable immediate mutations; crash safety is provided by the daemon's durable ownership/recovery mechanisms rather than TUI rollback state.
+Low-level DHCP, Wi-Fi and VPN actions do not enter these pending screens and do not expose a commit timer. Once accepted, they are non-cancellable immediate mutations; crash safety is provided by the daemon's durable ownership/recovery mechanisms rather than TUI rollback state.
 
 ### 3.3. Screen and Section State Machine
 
@@ -298,7 +298,7 @@ async fn resize_clears_hit_regions() {
 - **Terminal Left in Raw Mode on Crash:** If developing outside the standard harness, ensure `TerminalGuard` dropped cleanly. If a test or development binary panics before teardown, run `reset` in your shell.
 - **Lost Rollback Context:** If the daemon restarts while a rollback timer is running, the TUI detects the token invalidation and resets the pending screen with an explicit warning. Never assume an expired transaction succeeded.
 - **Double-Draw Artifacts:** Do not invoke `terminal.draw` inside sub-functions. All rendering must originate from the top-level `run_loop` or the snapshot callback in `drive_ui`.
-- **UTF-8 Panic on Slicing:** Avoid `&str[..cursor]`. Always use `input::TextEditor` or `text.chars().take(cursor).collect::<String>()`.
+- **UTF-8 Panic on Slicing:** Avoid `&str[..cursor]`. Use `input::TextEditor` for editing; a grapheme cursor cannot safely be treated as a byte or Unicode scalar index.
 
 ### UX safeguards
 
