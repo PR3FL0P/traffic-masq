@@ -325,6 +325,39 @@ pub(crate) fn accept_update(app: &mut TuiApp, mut updated: DashboardData) {
     if updated.interfaces_updated.is_none() {
         updated.interfaces = std::mem::take(&mut app.dashboard.interfaces);
     }
+    // A dashboard refresh is assembled from several independent API calls. A
+    // failed per-interface/configuration call must not turn a previously known
+    // managed interface into an apparently external one for a single frame.
+    // Keep the last known value only where this refresh has no answer; an
+    // explicit `false` from the daemon still replaces `true` immediately.
+    let present = updated
+        .interfaces
+        .iter()
+        .map(|status| status.interface.name.as_str())
+        .collect::<HashSet<_>>();
+    for (name, managed) in &app.dashboard.managed {
+        if present.contains(name.as_str()) {
+            updated.managed.entry(name.clone()).or_insert(*managed);
+        }
+    }
+    for (name, role) in &app.dashboard.roles {
+        if present.contains(name.as_str()) {
+            updated.roles.entry(name.clone()).or_insert(*role);
+        }
+    }
+    if updated.routes.is_none() {
+        updated.routes = app.dashboard.routes.clone();
+    }
+    if updated.vpn_enabled.is_none() {
+        updated.vpn_enabled = app.dashboard.vpn_enabled;
+    }
+    if updated.vpn_status.is_none() && updated.vpn_enabled == Some(true) {
+        updated.vpn_status = app.dashboard.vpn_status.clone();
+    }
+    if !updated.pending_known && app.dashboard.pending_known {
+        updated.pending_network_changes = app.dashboard.pending_network_changes.clone();
+        updated.pending_known = true;
+    }
     app.selected_interface = selected
         .as_ref()
         .and_then(|name| {

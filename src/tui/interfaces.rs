@@ -170,16 +170,11 @@ pub(crate) fn render_interface_list(frame: &mut ratatui::Frame<'_>, area: Rect, 
             } else {
                 Span::styled("down", Style::default().fg(theme::MUTED))
             };
-            let is_managed = app
-                .dashboard
-                .managed
-                .get(&status.interface.name)
-                .copied()
-                .unwrap_or(false);
-            let managed_span = if is_managed {
-                Span::styled("traffic-masq ", Style::default().fg(theme::GOOD))
-            } else {
-                Span::styled("external     ", Style::default().fg(theme::WARN))
+            let is_managed = app.dashboard.managed.get(&status.interface.name).copied();
+            let managed_span = match is_managed {
+                Some(true) => Span::styled("traffic-masq ", Style::default().fg(theme::GOOD)),
+                Some(false) => Span::styled("external     ", Style::default().fg(theme::WARN)),
+                None => Span::styled("unknown      ", Style::default().fg(theme::WARN)),
             };
             let mut line = Line::from(vec![
                 Span::styled(format!("{marker} {:<12}", status.interface.name), style),

@@ -78,6 +78,7 @@ Recovery conditions have stable `TM-REC-xxx` identifiers. Most are fatal startup
 | [`TM-REC-206`](#tm-rec-206) | `revision_order` | Router revision ordering |
 | [`TM-REC-207`](#tm-rec-207) | `router_rollback_failed` | Degraded router rollback recovery |
 | [`TM-REC-208`](#tm-rec-208) | `router_journal_cleanup_pending` | Recovered router state awaiting journal cleanup |
+| [`TM-REC-209`](#tm-rec-209) | `commit_indeterminate` | Router commit outcome cannot be proven from storage |
 | [`TM-REC-301`](#tm-rec-301) | `restore_provisioning_secrets` | Provisioning recovery umbrella |
 | [`TM-REC-302`](#tm-rec-302) | `valid_provisioning_secret_snapshot` | Provisioning journal decoding |
 | [`TM-REC-303`](#tm-rec-303) | `supported_provisioning_secret_schema` | Provisioning journal schema |

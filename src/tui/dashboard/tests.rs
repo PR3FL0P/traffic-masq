@@ -280,6 +280,46 @@ fn failed_update_retains_samples_and_reports_error() {
 }
 
 #[test]
+fn partial_update_retains_last_known_configuration_without_flicker() {
+    let mut app = TuiApp::default();
+    app.dashboard.interfaces.push(status(1));
+    app.dashboard.managed.insert("eth1".into(), true);
+    app.dashboard
+        .roles
+        .insert("eth1".into(), InterfaceRole::Input);
+
+    accept_update(
+        &mut app,
+        DashboardData {
+            interfaces: vec![status(1)],
+            interfaces_updated: Some(Instant::now()),
+            error: Some("Interface configuration unavailable (eth1)".into()),
+            ..Default::default()
+        },
+    );
+
+    assert_eq!(app.dashboard.managed.get("eth1"), Some(&true));
+    assert_eq!(app.dashboard.roles.get("eth1"), Some(&InterfaceRole::Input));
+}
+
+#[test]
+fn explicit_unmanaged_update_replaces_last_known_managed_state() {
+    let mut app = TuiApp::default();
+    app.dashboard.interfaces.push(status(1));
+    app.dashboard.managed.insert("eth1".into(), true);
+
+    let mut update = DashboardData {
+        interfaces: vec![status(1)],
+        interfaces_updated: Some(Instant::now()),
+        ..Default::default()
+    };
+    update.managed.insert("eth1".into(), false);
+    accept_update(&mut app, update);
+
+    assert_eq!(app.dashboard.managed.get("eth1"), Some(&false));
+}
+
+#[test]
 fn initial_selection_prefers_wan_and_refresh_preserves_interface_identity() {
     let mut app = TuiApp::default();
     let mut data = DashboardData {

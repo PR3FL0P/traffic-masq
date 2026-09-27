@@ -261,6 +261,7 @@ It keeps configuration, passwords, state, logs and dependency packages.
 ## More documentation
 
 - [Operating guide](docs/usage.md): installation options, configuration and TUI behavior.
+- [HTTP API](docs/api.md): authentication, endpoints, JSON schemas and commit-confirm flows.
 - [Recovery runbook](docs/recovery.md): `TM-REC-xxx` operator procedures for startup-blocking and degraded recovery.
 - [Service integration](packaging/INIT.md): init systems, updates and service ownership.
 - [Security and recovery](SECURITY.md): access control, rollback and recovery policy.

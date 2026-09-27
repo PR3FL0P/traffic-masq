@@ -218,6 +218,10 @@ A complete configuration template is available at
 [`examples/config.toml`](../examples/config.toml). Replace all interface names and
 addresses before use.
 
+The daemon also exposes a versioned JSON API on its Unix socket and, when
+explicitly enabled, over HTTPS. See the [HTTP API reference](api.md) for
+authentication, every route, request schemas, and transaction handling.
+
 ## Start
 
 Start the daemon in the background:
