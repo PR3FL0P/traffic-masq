@@ -22,29 +22,37 @@ curl --unix-socket /run/traffic-masq/traffic-masqd.sock \
   http://localhost/api/v1/auth/status
 ```
 
-Log in with the device password and keep the returned `token` out of shell
-history and logs:
+Log in with the device password. Run this example in **Bash**, with shell
+tracing (`set -x`) disabled. Your user must have access to the daemon socket;
+initialize the password first through `sudo traffic-masq` if needed.
+The subshell keeps credentials out of the parent shell, and pipes carry the
+password and authorization header without putting them in process arguments:
 
-```sh
-read -rsp 'Device password: ' TM_PASSWORD; printf '\n'
-TM_TOKEN=$(
-  export TM_PASSWORD
-  jq -n '{password: env.TM_PASSWORD, client: "api-example"}' |
-    curl --silent --show-error \
+```bash
+(
+  set -euo pipefail
+  read -rsp 'Device password: ' TM_PASSWORD; printf '\n'
+  TM_TOKEN=$(
+    printf '%s' "$TM_PASSWORD" |
+      jq -Rs '{password: ., client: "api-example"}' |
+      curl --fail --silent --show-error \
+        --unix-socket /run/traffic-masq/traffic-masqd.sock \
+        --json @- http://localhost/api/v1/auth/login |
+      jq -er '.token | select(type == "string" and length > 0)'
+  )
+  unset TM_PASSWORD
+
+  printf 'Authorization: Bearer %s\n' "$TM_TOKEN" |
+    curl --fail --silent --show-error \
       --unix-socket /run/traffic-masq/traffic-masqd.sock \
-      --json @- http://localhost/api/v1/auth/login | jq -r .token
+      --header @- http://localhost/api/v1/interfaces
 )
-unset TM_PASSWORD
-
-curl --unix-socket /run/traffic-masq/traffic-masqd.sock \
-  -H "Authorization: Bearer $TM_TOKEN" \
-  http://localhost/api/v1/interfaces
 ```
 
-The examples use `jq` only to build and read JSON safely. Over HTTPS, replace
-the Unix-socket option and URL with the configured address, for example
-`https://router.example:8443/api/v1/status`, and validate the daemon certificate
-with the appropriate CA settings.
+The examples need `curl` with `--json` support and `jq` to build and read JSON.
+Over HTTPS, replace the Unix-socket option and URL with the configured address,
+for example `https://router.example:8443/api/v1/status`, and validate the daemon
+certificate with the appropriate CA settings.
 
 ## Authentication and authorization
 
@@ -473,8 +481,8 @@ specify `interface_ipv4`, `pool_start`, `pool_end`, `dns_servers`, and
 
 ## Commit-confirm changes
 
-Interface apply, AP provisioning, saved AP profile activation, Wi-Fi client
-provisioning, and complete router provisioning return:
+Interface apply, AP provisioning, saved AP profile activation, and Wi-Fi client
+provisioning return:
 
 ```json
 {
@@ -490,10 +498,25 @@ provisioning, and complete router provisioning return:
 }
 ```
 
-Commit with `/network-transactions/commit`. Router apply instead returns
-`router_transaction_pending` and must be committed with `/router/commit`.
-Always send the exact returned token. A token cannot confirm a later or
-different transaction.
+Choose the transaction endpoints from the apply response:
+
+| Apply response `type` | Token field | Inspect pending state | Commit / rollback |
+| --- | --- | --- | --- |
+| `network_change_pending` | `change.token` | `GET /network-transactions` | `POST /network-transactions/commit` or `/network-transactions/rollback` |
+| `router_transaction_pending` | `token` | `GET /router/pending` | `POST /router/commit` or `/router/rollback` |
+| `router_provisioning_applied` | `token` | `GET /router/pending` | `POST /router/commit` or `/router/rollback` |
+
+Complete router provisioning (`POST /router/provisioning/apply`) returns
+`router_provisioning_applied` with `token` and `preview`; it uses the router
+transaction endpoints. Despite the word `applied`, the change still needs
+confirmation. All paths in the table are relative to `/api/v1`.
+
+Send `{ "token": "<returned token>" }` to commit or roll back. A token cannot
+confirm a later or different transaction. For network changes, `phase` is
+`awaiting_commit`, `rollback_required`, or `commit_indeterminate`. Commit is
+available only in `awaiting_commit`; `commit_indeterminate` also blocks rollback
+until storage is repaired and startup recovery resolves the outcome. See the
+[recovery runbook](recovery.md#tm-rec-209).
 
 `expires_at_unix` is for display. Rollback scheduling uses a monotonic clock,
 and admitted operations can finish after that timestamp. A timeout or broken
