@@ -92,7 +92,7 @@ fn dashboard_interface_rows_show_management_ownership() {
     let text: String = (0..24)
         .flat_map(|y| (0..100).map(move |x| buffer[(x, y)].symbol()))
         .collect();
-    assert!(text.contains("managed"));
+    assert!(text.contains("traffic-masq:on"));
 }
 
 #[test]
@@ -199,23 +199,35 @@ fn render_text(app: &mut TuiApp, width: u16, height: u16) -> String {
 }
 
 #[test]
-fn dashboard_has_no_dhcp_panel_and_graph_has_labels_and_common_scale() {
-    for (width, height) in [(80, 24), (120, 36)] {
+fn dashboard_graphs_follow_each_interface_and_hide_in_small_windows() {
+    use ratatui::{backend::TestBackend, Terminal};
+    for (width, height, row_height) in [(100, 30, 3), (80, 12, 1), (50, 30, 3)] {
         let mut app = TuiApp::default();
-        app.dashboard.interfaces.push(status(1));
-        let mut history = TrafficHistory::default();
-        let now = Instant::now();
-        history.record(0, 0, now);
-        history.record(2048, 4096, now + Duration::from_secs(1));
-        history.record(4096, 8192, now + Duration::from_secs(2));
-        app.traffic.insert(1, history);
-        let text = render_text(&mut app, width, height);
-        assert!(!text.contains("DHCP Clients"));
-        assert!(!text.contains("dhcp server"));
-        assert!(text.contains("RX/TX scale 0–4.0 KB/s"), "{text}");
-        assert!(text.contains("last 1s"));
-        assert!(text.contains("Oldest → newest"));
-        assert!(text.contains("RX") && text.contains("TX"));
+        app.dashboard.interfaces = vec![status(1), status(2)];
+        for index in [1, 2] {
+            let mut history = TrafficHistory::default();
+            let now = Instant::now();
+            history.record(0, 0, now);
+            history.record(2048, 4096, now + Duration::from_secs(1));
+            app.traffic.insert(index, history);
+        }
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| render_dashboard_traffic(frame, frame.area(), &mut app))
+            .unwrap();
+        assert_eq!(app.ui.list_row_height, row_height);
+        let buffer = terminal.backend().buffer();
+        let area = app.ui.list_area.unwrap();
+        if row_height == 3 {
+            for row in 0..2 {
+                let y = area.y + row * 3;
+                // The original layout auto-scales each graph independently.
+                assert_eq!(buffer[(area.x, y + 1)].symbol(), "█");
+                assert_eq!(buffer[(area.x, y + 2)].symbol(), "█");
+            }
+        } else {
+            assert_eq!(area.height, 2);
+        }
     }
 }
 
@@ -245,7 +257,7 @@ async fn all_statistics_remain_reachable_at_80x24() {
 }
 
 #[test]
-fn failed_update_retains_samples_and_labels_data_stale() {
+fn failed_update_retains_samples_and_reports_error() {
     let mut app = TuiApp::default();
     app.dashboard.interfaces.push(status(1));
     app.dashboard.last_success = Some(Instant::now());
@@ -263,7 +275,7 @@ fn failed_update_retains_samples_and_labels_data_stale() {
     assert_eq!(app.dashboard.interfaces.len(), 1);
     assert_eq!(app.traffic[&1].first.as_ref().unwrap().rx_bytes, 100);
     let text = render_text(&mut app, 80, 24);
-    assert!(text.contains("STALE / partial data"), "{text}");
+    assert!(text.contains("disconnected"), "{text}");
     assert!(!text.contains("No interfaces detected"));
 }
 
@@ -290,20 +302,26 @@ fn initial_selection_prefers_wan_and_refresh_preserves_interface_identity() {
 }
 
 #[test]
-fn pending_notice_identifies_interface_and_vpn_enabled_is_not_connected() {
+fn overview_shows_pending_count_and_vpn_configuration_without_dhcp() {
     let mut app = TuiApp::default();
     app.dashboard.vpn_enabled = Some(true);
     app.dashboard
         .pending_network_changes
         .push(PendingNetworkChange {
+            phase: Default::default(),
+            last_error: None,
             interface: "eth1".into(),
             token: "secret-token".into(),
             rollback_timeout_seconds: 60,
             expires_at_unix: super::super::current_unix_time() + 60,
         });
     let text = render_text(&mut app, 80, 24);
-    assert!(text.contains("CONFIRM eth1: rollback in"));
-    assert!(text.contains("enabled; tunnel/policy unknown"));
+    assert!(text.contains("Overview"));
+    assert!(text.contains("pending"));
+    assert!(text.contains("ON"));
+    assert!(!text.contains("dhcp server"));
+    assert!(!text.contains("DHCP Clients"));
+    assert!(!text.contains("ATTENTION"));
     assert!(!text.contains("secret-token"));
 }
 
@@ -368,17 +386,4 @@ async fn partial_api_failure_does_not_clear_other_status_or_fetch_dhcp() {
     assert!(data.pending_known);
     assert!(data.routes.is_none());
     assert!(data.error.unwrap().contains("Routes unavailable"));
-}
-
-#[test]
-fn wan_without_address_needs_attention_and_long_summaries_mark_truncation() {
-    let mut data = DashboardData {
-        interfaces: vec![status(1)],
-        ..Default::default()
-    };
-    data.roles.insert("eth1".into(), InterfaceRole::Input);
-    assert!(attention(&data).unwrap().contains("no IPv4 address"));
-    data.interfaces[0].interface.is_up = false;
-    assert!(attention(&data).unwrap().contains("DOWN"));
-    assert_eq!(fit_summary("абвгд".into(), 4), "абв…");
 }

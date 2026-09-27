@@ -171,11 +171,11 @@ versions; they are omitted from API summaries and redacted from debug output.
 | **VPN** | Enable/disable VPN, WireGuard profiles and VPN traffic policy |
 | **Settings** | Application and session preferences |
 
-The Dashboard shows WAN/LAN/VPN state, pending-change deadlines and data freshness.
+The Dashboard shows the connection mode, interface count, pending-change count and VPN setting.
 DHCP status is available in its dedicated sections. **1 / 2 / Tab** switches
 between traffic and detailed statistics; Up/Down selects an interface. The
-traffic view plots only the selected interface, with labeled RX/TX and a shared
-scale. **PgUp/PgDn** scrolls detailed statistics at smaller terminal sizes;
+traffic view plots RX/TX below each interface, with independently scaled graphs.
+Short windows hide graphs and use compact rows. **PgUp/PgDn** scrolls detailed statistics at smaller terminal sizes;
 Home selects the explicitly labeled sum of all interface counters. These sums
 can count forwarded traffic more than once and are not Internet usage totals.
 VPN interface/policy state is observed; Internet, DNS and handshake connectivity

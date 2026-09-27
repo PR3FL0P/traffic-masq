@@ -2,8 +2,8 @@ use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Sparkline};
 
@@ -16,7 +16,7 @@ use crate::core::transaction::PendingNetworkChange;
 
 use super::layout::panel;
 use super::theme;
-use super::{Screen, TuiApp};
+use super::{format_addresses, Screen, TuiApp};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DashboardPane {
@@ -372,54 +372,6 @@ pub(crate) fn record_traffic_samples(app: &mut TuiApp) {
     app.dashboard.connections = read_connection_stats();
 }
 
-fn attention(data: &DashboardData) -> Option<String> {
-    for status in &data.interfaces {
-        if data.roles.get(&status.interface.name) == Some(&InterfaceRole::Input) {
-            if !status.interface.is_up {
-                return Some(format!(
-                    "WAN {} is DOWN — check interface/link",
-                    status.interface.name
-                ));
-            }
-            if status.ipv4_addresses.is_empty() {
-                return Some(format!(
-                    "WAN {} has no IPv4 address — open Interfaces",
-                    status.interface.name
-                ));
-            }
-        }
-    }
-    if let Some(vpn) = &data.vpn_status {
-        if vpn.mode == crate::config::VpnPolicyMode::Vpn
-            && (!vpn.tunnel_healthy || !vpn.policy_active)
-        {
-            return Some("VPN policy is not ready — inspect VPN".into());
-        }
-    }
-    None
-}
-
-fn fit_summary(text: String, width: u16) -> String {
-    use unicode_segmentation::UnicodeSegmentation;
-    use unicode_width::UnicodeWidthStr;
-    if text.width() <= width as usize {
-        return text;
-    }
-    let mut result = String::new();
-    let mut used = 0;
-    for g in text.graphemes(true) {
-        if used + g.width() > width.saturating_sub(1) as usize {
-            break;
-        }
-        result.push_str(g);
-        used += g.width();
-    }
-    if width > 0 {
-        result.push('…');
-    }
-    result
-}
-
 pub(crate) fn render_dashboard(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
@@ -427,64 +379,19 @@ pub(crate) fn render_dashboard(
     direct: bool,
 ) {
     let sections = Layout::vertical([
-        Constraint::Length(1),
         Constraint::Length(5),
         Constraint::Length(1),
         Constraint::Min(0),
     ])
     .split(area);
-    let data = &app.dashboard;
-    let age = data
-        .last_success
-        .map(|at| format!("{}s ago", at.elapsed().as_secs()))
-        .unwrap_or_else(|| "never".into());
-    let pending = data
-        .pending_network_changes
-        .iter()
-        .min_by_key(|p| p.expires_at_unix);
-    let issue = attention(data);
-    let notice = if let Some(pending) = pending {
-        format!(
-            "CONFIRM {}: rollback in {}s | {}",
-            pending.interface,
-            pending
-                .expires_at_unix
-                .saturating_sub(super::current_unix_time()),
-            if data.error.is_some() {
-                "data stale; F1"
-            } else {
-                "review pending change"
-            }
-        )
-    } else if data.error.is_some() {
-        format!("STALE / partial data — last complete update {age}; F1: details")
-    } else if let Some(issue) = &issue {
-        format!("ATTENTION: {issue}")
-    } else if direct {
-        format!("Updated {age} | Read-only recovery; Internet/DNS not tested")
-    } else if !data.pending_known {
-        "Pending changes unknown | waiting for status".into()
-    } else {
-        format!("Updated {age} | Internet/DNS not tested")
-    };
-    frame.render_widget(
-        Paragraph::new(fit_summary(notice, sections[0].width)).style(Style::default().fg(
-            if pending.is_some() || data.error.is_some() || issue.is_some() {
-                theme::WARN
-            } else {
-                theme::MUTED
-            },
-        )),
-        sections[0],
-    );
-    render_dashboard_summary(frame, sections[1], app, direct);
+    render_dashboard_summary(frame, sections[0], app, direct);
     app.dashboard.pane_tabs.clear();
-    let mut x = sections[2].x;
+    let mut x = sections[1].x;
     for (label, pane) in [
-        ("[1 Traffic]", DashboardPane::Traffic),
+        ("[1 Interfaces stat]", DashboardPane::Traffic),
         ("[2 Statistics]", DashboardPane::Statistics),
     ] {
-        let rect = Rect::new(x, sections[2].y, label.len() as u16, 1);
+        let rect = Rect::new(x, sections[1].y, label.len() as u16, 1);
         app.dashboard.pane_tabs.push((rect, pane));
         frame.render_widget(
             Paragraph::new(label).style(if app.dashboard_pane == pane {
@@ -498,9 +405,10 @@ pub(crate) fn render_dashboard(
         );
         x += rect.width + 1;
     }
+
     match app.dashboard_pane {
-        DashboardPane::Traffic => render_dashboard_traffic(frame, sections[3], app),
-        DashboardPane::Statistics => render_numeric_statistics(frame, sections[3], app),
+        DashboardPane::Traffic => render_dashboard_traffic(frame, sections[2], app),
+        DashboardPane::Statistics => render_numeric_statistics(frame, sections[2], app),
     }
 }
 
@@ -959,156 +867,58 @@ fn format_bytes(bytes: u64) -> String {
     format_rate(bytes).trim_end_matches("/s").to_owned()
 }
 
-fn interface_role(data: &DashboardData, status: &InterfaceStatus) -> &'static str {
-    match data.roles.get(&status.interface.name) {
-        Some(InterfaceRole::Input) => "WAN",
-        Some(InterfaceRole::Output) => "LAN",
-        Some(InterfaceRole::Middle) => "VPN",
-        _ if status.has_default_route => "route",
-        _ => "other",
-    }
-}
-
-fn addresses(status: &InterfaceStatus) -> String {
-    if status.ipv4_addresses.is_empty() {
-        return "no IPv4".into();
-    }
-    status
-        .ipv4_addresses
-        .iter()
-        .map(|ip| format!("{}/{}", ip.address, ip.prefix_len))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 pub(crate) fn render_dashboard_summary(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     app: &TuiApp,
     direct: bool,
 ) {
-    let data = &app.dashboard;
-    let summarize = |wan: bool| {
-        let items: Vec<_> = data
-            .interfaces
-            .iter()
-            .filter(|s| {
-                if wan {
-                    data.roles.get(&s.interface.name) == Some(&InterfaceRole::Input)
-                        || (s.has_default_route
-                            && data.roles.get(&s.interface.name) != Some(&InterfaceRole::Middle)
-                            && data
-                                .vpn_status
-                                .as_ref()
-                                .and_then(|v| v.tunnel.as_ref())
-                                .is_none_or(|t| t.interface != s.interface.name))
-                } else {
-                    data.roles.get(&s.interface.name) == Some(&InterfaceRole::Output)
-                }
-            })
-            .map(|s| {
-                let gateway = if wan {
-                    match &data.routes {
-                        Some(routes) => routes
-                            .iter()
-                            .filter(|r| {
-                                r.destination.prefix_len() == 0
-                                    && (r.output_interface.as_deref()
-                                        == Some(s.interface.name.as_str())
-                                        || r.output_interface_index == Some(s.interface.index))
-                            })
-                            .min_by_key(|r| r.metric.unwrap_or(0))
-                            .map(|r| {
-                                format!(
-                                    " via {}",
-                                    r.gateway
-                                        .map(|g| g.to_string())
-                                        .unwrap_or_else(|| "on-link".into())
-                                )
-                            })
-                            .unwrap_or_else(|| " no default route".into()),
-                        None => " gateway unknown".into(),
-                    }
-                } else {
-                    String::new()
-                };
-                format!(
-                    "{} {} {}{}",
-                    s.interface.name,
-                    if s.interface.is_up { "up" } else { "DOWN" },
-                    addresses(s),
-                    gateway
-                )
-            })
-            .collect();
-        if items.is_empty() {
-            if data.interfaces_updated.is_none()
-                || (direct && !wan)
-                || data.roles.len() < data.interfaces.len()
-            {
-                "unknown".into()
-            } else if wan {
-                "no uplink/default route detected".into()
-            } else {
-                "no LAN role configured".into()
-            }
-        } else {
-            items.join("; ")
-        }
-    };
-    let vpn = if direct {
-        "unavailable in recovery mode".into()
-    } else {
-        match (&data.vpn_status, data.vpn_enabled) {
-            (Some(status), _) => {
-                let tunnel = status
-                    .tunnel
-                    .as_ref()
-                    .map(|t| {
-                        format!(
-                            "{}: {}",
-                            t.profile_name,
-                            if t.up {
-                                "interface up"
-                            } else {
-                                "interface DOWN"
-                            }
-                        )
-                    })
-                    .unwrap_or_else(|| "no tunnel".into());
-                format!(
-                    "{tunnel}; policy {:?} {}; handshake n/a",
-                    status.mode,
-                    if status.policy_active {
-                        "active"
-                    } else {
-                        "inactive"
-                    }
-                )
-            }
-            (None, Some(false)) => "disabled".into(),
-            (None, Some(true)) => "enabled; tunnel/policy unknown".into(),
-            _ => "unknown".into(),
-        }
-    };
-    let block = panel("Network state (observed, not a connectivity test)");
+    let block = panel("Overview");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    // Each summary stays one row; full addresses and counters are in Statistics.
-    let lines = [
-        format!("WAN  {}", summarize(true)),
-        format!("LAN  {}", summarize(false)),
-        format!("VPN  {vpn}"),
-    ];
+
+    let mode_text = if direct { "direct" } else { "daemon" };
+    let pending_count = app.dashboard.pending_network_changes.len();
+    let iface_count = app.dashboard.interfaces.len();
+    let (vpn_text, vpn_color) = match app.dashboard.vpn_enabled {
+        Some(true) => ("ON".to_string(), theme::GOOD),
+        Some(false) => ("OFF".to_string(), theme::MUTED),
+        None if direct => ("n/a".to_string(), theme::MUTED),
+        None => ("?".to_string(), theme::WARN),
+    };
+
+    let card = |value: String, label: &'static str, color: Color| {
+        Paragraph::new(vec![
+            Line::styled(
+                value,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Line::styled(label, Style::default().fg(theme::MUTED)),
+        ])
+        .alignment(Alignment::Center)
+    };
+
+    let pending_color = if pending_count > 0 {
+        theme::WARN
+    } else {
+        theme::TEXT
+    };
+
+    let cards = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Ratio(1, 4); 4])
+        .split(inner);
+
+    frame.render_widget(card(mode_text.to_string(), "mode", theme::ACCENT), cards[0]);
     frame.render_widget(
-        Paragraph::new(
-            lines
-                .into_iter()
-                .map(|line| Line::from(fit_summary(line, inner.width)))
-                .collect::<Vec<_>>(),
-        ),
-        inner,
+        card(iface_count.to_string(), "interfaces", theme::TEXT),
+        cards[1],
     );
+    frame.render_widget(
+        card(pending_count.to_string(), "pending", pending_color),
+        cards[2],
+    );
+    frame.render_widget(card(vpn_text, "vpn", vpn_color), cards[3]);
 }
 
 pub(crate) fn render_dashboard_traffic(
@@ -1117,161 +927,158 @@ pub(crate) fn render_dashboard_traffic(
     app: &mut TuiApp,
 ) {
     if app.dashboard.interfaces.is_empty() {
+        let block = panel("Interfaces stat");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
         frame.render_widget(
-            Paragraph::new(if app.dashboard.error.is_some() {
-                "Interface data unavailable"
-            } else {
-                "No interfaces detected"
-            })
-            .block(panel("Interfaces")),
-            area,
+            Paragraph::new("No interfaces detected").style(Style::default().fg(theme::MUTED)),
+            inner,
         );
+        app.ui.list_area = None;
+        app.ui.list_count = 0;
+        app.ui.list_scroll_offset = 0;
         return;
     }
-    let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(6)]).split(area);
+
+    let row_height = if area.height < 14 { 1 } else { 3 };
     let total = app.dashboard.interfaces.len();
-    let visible = parts[0].height.saturating_sub(2).max(1) as usize;
-    app.selected_interface = app.selected_interface.min(total - 1);
+    let max_visible = ((area.height.saturating_sub(2)) / row_height).max(1) as usize;
+    let visible = total.min(max_visible);
+    let max_offset = total.saturating_sub(visible);
     let offset = app
         .selected_interface
         .saturating_sub(visible / 2)
-        .min(total.saturating_sub(visible));
-    let block = panel(&format!(
-        "Interfaces {}-{}/{} | name / state / role / RX / TX",
-        offset + 1,
-        (offset + visible).min(total),
-        total
+        .min(max_offset);
+
+    let title = if visible < total {
+        format!(
+            "Interfaces stat ({}-{} of {total}, ↑/↓ to scroll)",
+            offset + 1,
+            offset + visible
+        )
+    } else {
+        "Interfaces stat | [ext] external, [?] ownership unknown".to_string()
+    };
+    let block = panel(&title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    app.ui.list_area = Some(Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        (visible as u16 * row_height).min(inner.height),
     ));
-    let inner = block.inner(parts[0]);
-    frame.render_widget(block, parts[0]);
-    app.ui.list_area = Some(inner);
-    app.ui.list_row_height = 1;
+    app.ui.list_row_height = row_height;
     app.ui.list_count = total;
     app.ui.list_scroll_offset = offset;
-    let lines: Vec<_> = app
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(vec![Constraint::Length(row_height); visible])
+        .split(inner);
+
+    let selected_interface = app.selected_interface;
+    for (row, (index, status)) in app
         .dashboard
         .interfaces
         .iter()
         .enumerate()
         .skip(offset)
         .take(visible)
-        .map(|(i, status)| {
-            let rates = app
-                .traffic
-                .get(&status.interface.index)
-                .filter(|h| !h.rx_rates().is_empty())
-                .map(|h| {
-                    format!(
-                        "RX {:>10} TX {:>10}",
-                        format_rate(h.current_rx_rate),
-                        format_rate(h.current_tx_rate)
-                    )
-                })
-                .unwrap_or_else(|| "RX collecting  TX collecting".into());
-            let ownership = match app.dashboard.managed.get(&status.interface.name) {
-                Some(true) => "managed",
-                Some(false) => "external",
-                None => "unknown",
-            };
-            Line::styled(
-                format!(
-                    "{} {:<15} {:<4} {:<5} {rates} {ownership}",
-                    if i == app.selected_interface {
-                        "▶"
-                    } else {
-                        " "
-                    },
-                    status.interface.name,
-                    if status.interface.is_up { "up" } else { "DOWN" },
-                    interface_role(&app.dashboard, status)
-                ),
-                if i == app.selected_interface {
-                    Style::default()
-                        .fg(theme::ACCENT)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(theme::TEXT)
-                },
-            )
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(lines), inner);
-    render_selected_graph(frame, parts[1], app);
-}
-
-fn render_selected_graph(frame: &mut ratatui::Frame<'_>, area: Rect, app: &TuiApp) {
-    let Some(status) = app.dashboard.interfaces.get(app.selected_interface) else {
-        return;
-    };
-    let history = app.traffic.get(&status.interface.index);
-    let width = area.width.saturating_sub(5) as usize;
-    let rx = history.map(TrafficHistory::rx_rates).unwrap_or(&[]);
-    let tx = history.map(TrafficHistory::tx_rates).unwrap_or(&[]);
-    let rx = &rx[rx.len().saturating_sub(width)..];
-    let tx = &tx[tx.len().saturating_sub(width)..];
-    let maximum = rx.iter().chain(tx).copied().max().unwrap_or(0).max(1);
-    let window = history
-        .and_then(|h| {
-            Some(
-                h.sample_times.back()?.saturating_duration_since(
-                    *h.sample_times
-                        .get(h.sample_times.len().saturating_sub(width))?,
-                ),
-            )
-        })
-        .unwrap_or_default();
-    let block = panel(&format!(
-        "{} | last {}s | RX/TX scale 0–{}",
-        status.interface.name,
-        window.as_secs(),
-        format_rate(maximum)
-    ));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    if inner.height < 4 {
-        return;
-    }
-    frame.render_widget(
-        Paragraph::new(format!(
-            "{} | default route {}",
-            addresses(status),
-            if status.has_default_route {
-                "yes"
-            } else {
-                "no"
-            }
-        )),
-        Rect::new(inner.x, inner.y, inner.width, 1),
-    );
-    for (i, (label, values, color)) in [("RX", rx, theme::ACCENT), ("TX", tx, theme::ACCENT_ALT)]
-        .into_iter()
         .enumerate()
     {
-        frame.render_widget(
-            Paragraph::new(label).style(Style::default().fg(color)),
-            Rect::new(inner.x, inner.y + 1 + i as u16, 3, 1),
-        );
-        frame.render_widget(
-            Sparkline::default()
-                .data(values)
-                .max(maximum)
-                .style(Style::default().fg(color)),
-            Rect::new(
-                inner.x + 3,
-                inner.y + 1 + i as u16,
-                inner.width.saturating_sub(3),
-                1,
-            ),
+        let history = app.traffic.get(&status.interface.index);
+        let managed = app.dashboard.managed.get(&status.interface.name).copied();
+        render_traffic_row(
+            frame,
+            rows[row],
+            status,
+            history,
+            managed,
+            index == selected_interface,
         );
     }
+}
+
+fn render_traffic_row(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    status: &InterfaceStatus,
+    history: Option<&TrafficHistory>,
+    managed: Option<bool>,
+    selected: bool,
+) {
+    let marker = if selected { "▶" } else { " " };
+    let name_style = if selected {
+        Style::default()
+            .fg(theme::ACCENT)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::BOLD)
+    };
+    let up_span = if status.interface.is_up {
+        Span::styled("● up", Style::default().fg(theme::GOOD))
+    } else {
+        Span::styled("● down", Style::default().fg(theme::MUTED))
+    };
+    let (rx_rate, tx_rate) = history
+        .map(|history| (history.current_rx_rate, history.current_tx_rate))
+        .unwrap_or((0, 0));
+
+    let mut header = Line::from(vec![
+        Span::styled(
+            format!("{marker} {:<12}", status.interface.name),
+            name_style,
+        ),
+        up_span,
+        Span::raw("   "),
+        Span::styled(
+            match managed {
+                Some(true) => "traffic-masq:on",
+                Some(false) => "traffic-masq:off",
+                None => "traffic-masq:?",
+            },
+            Style::default().fg(if managed == Some(true) {
+                theme::GOOD
+            } else {
+                theme::WARN
+            }),
+        ),
+        Span::raw("   "),
+        Span::styled(
+            format!("↓ {:>10}", format_rate(rx_rate)),
+            Style::default().fg(theme::ACCENT),
+        ),
+        Span::raw("   "),
+        Span::styled(
+            format!("↑ {:>10}", format_rate(tx_rate)),
+            Style::default().fg(theme::ACCENT_ALT),
+        ),
+        Span::raw("   "),
+    ]);
+    header.spans.extend(format_addresses(status));
     frame.render_widget(
-        Paragraph::new(if rx.is_empty() {
-            "Collecting samples…"
-        } else {
-            "Oldest → newest; rates per sample; 2: detailed statistics"
-        })
-        .style(Style::default().fg(theme::MUTED)),
-        Rect::new(inner.x, inner.y + 3, inner.width, 1),
+        Paragraph::new(header),
+        Rect::new(area.x, area.y, area.width, area.height.min(1)),
+    );
+    if area.height < 3 {
+        return;
+    }
+
+    let rx_slice = history.map(TrafficHistory::rx_rates).unwrap_or(&[]);
+    let tx_slice = history.map(TrafficHistory::tx_rates).unwrap_or(&[]);
+    frame.render_widget(
+        Sparkline::default()
+            .data(rx_slice)
+            .style(Style::default().fg(theme::ACCENT)),
+        Rect::new(area.x, area.y + 1, area.width, 1),
+    );
+    frame.render_widget(
+        Sparkline::default()
+            .data(tx_slice)
+            .style(Style::default().fg(theme::ACCENT_ALT)),
+        Rect::new(area.x, area.y + 2, area.width, 1),
     );
 }
 
