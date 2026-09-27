@@ -196,3 +196,21 @@ async fn failed_compensation_preserves_typed_uncertainty_through_async_context()
         "ordinary failure"
     )));
 }
+
+#[test]
+fn failure_before_publication_does_not_attempt_compensation() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("intent.json");
+    replace(&path, b"old", PRIVATE_FILE_MODE).unwrap();
+    // Fail before rename, leaving another fault to detect an unnecessary write.
+    write_faults().lock().unwrap().insert(path.clone(), 3);
+    let error = replace_preserving_on_error(&path, b"new", PRIVATE_FILE_MODE).unwrap_err();
+    let remaining_fault = write_faults().lock().unwrap().remove(&path);
+    assert!(!is_indeterminate_write(&anyhow::Error::new(error)));
+    assert_eq!(
+        remaining_fault,
+        Some(2),
+        "compensation must not run before publication"
+    );
+    assert_eq!(fs::read(&path).unwrap(), b"old");
+}

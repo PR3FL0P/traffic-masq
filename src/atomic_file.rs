@@ -174,6 +174,17 @@ pub fn ensure_private_dir(path: &Path, mode: u32) -> Result<(), PrivateDirError>
 /// The parent directory must already exist; use [`ensure_private_dir`] first if
 /// that is not guaranteed.
 pub fn replace(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
+    replace_tracking_publication(path, contents, mode, &mut false)
+}
+
+// Only rename publishes bytes. Failures before it leave the destination intact
+// and must not trigger another write on an already failing filesystem.
+fn replace_tracking_publication(
+    path: &Path,
+    contents: &[u8],
+    mode: u32,
+    published: &mut bool,
+) -> io::Result<()> {
     #[cfg(test)]
     let fault = {
         let mut faults = write_faults().lock().unwrap();
@@ -204,7 +215,12 @@ pub fn replace(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
         // first check and the rename is exactly when a symlink would be
         // planted.
         reject_symlink(path)?;
+        #[cfg(test)]
+        if fault == 3 {
+            return Err(io::Error::other("injected failure before rename"));
+        }
         fs::rename(&temporary, path)?;
+        *published = true;
         #[cfg(test)]
         if fault == 2 {
             return Err(io::Error::other("injected directory sync failure"));
@@ -248,9 +264,13 @@ pub fn replace_preserving_on_error(path: &Path, contents: &[u8], mode: u32) -> i
         Err(error) => return Err(error),
     };
 
-    let Err(operation) = replace(path, contents, mode) else {
+    let mut published = false;
+    let Err(operation) = replace_tracking_publication(path, contents, mode, &mut published) else {
         return Ok(());
     };
+    if !published {
+        return Err(operation);
+    }
     let rollback = match previous.as_deref() {
         Some(previous) => replace(path, previous, mode),
         None => remove_durable(path).map(|_| ()),
