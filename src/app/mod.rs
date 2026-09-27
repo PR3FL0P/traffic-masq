@@ -1153,6 +1153,7 @@ fn spawn_wifi_autoconnect(
 }
 
 /// Monitor supervised network processes and retry recoverable failures until shutdown.
+#[allow(clippy::too_many_arguments)]
 fn spawn_process_liveness_checks(
     state_dir: std::path::PathBuf,
     dhcp: DhcpSupervisor,

@@ -1069,12 +1069,11 @@ async fn indeterminate_commit_blocks_manual_timer_and_shutdown_rollback() {
             .get("test0"),
         Some(&pending.token)
     );
-    assert!(desired
+    assert!(!desired
         .committed_overrides()
         .await
         .committed_interface_transactions
-        .get("test0")
-        .is_none());
+        .contains_key("test0"));
     assert!(manager.commit(&pending.token).await.is_err());
     assert!(manager.rollback(&pending.token).await.is_err());
     assert!(manager.restore_baselines().await.is_err());
