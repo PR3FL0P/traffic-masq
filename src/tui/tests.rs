@@ -862,3 +862,118 @@ async fn mouse_scrolls_message_when_open_and_ignores_navigation() {
     assert_eq!(app.screen, Screen::Dashboard);
     assert!(app.message_open);
 }
+
+#[tokio::test]
+async fn small_terminal_escape_sends_rollback_request() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("api.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut bytes = [0; 1024];
+        while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+            let count = stream.read(&mut bytes).await.unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&bytes[..count]);
+        }
+        stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        String::from_utf8(request).unwrap()
+    });
+    let mut app = TuiApp {
+        screen: Screen::PendingChange,
+        pending: Some(crate::core::transaction::PendingNetworkChange {
+            token: "test-token".into(),
+            interface: "eth0".into(),
+            rollback_timeout_seconds: 30,
+            expires_at_unix: current_unix_time() + 30,
+        }),
+        ..Default::default()
+    };
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
+    terminal
+        .draw(|frame| render(frame, &mut app, false))
+        .unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(text.contains("Esc: rollback"));
+    assert!(text.contains("Rollback in"));
+    handle_key(&mut app, KeyCode::Esc, &ApiClient::new(socket), false).await;
+    let request = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(request.starts_with("POST /api/v1/network-transactions/rollback "));
+}
+
+#[tokio::test]
+async fn help_is_modal_and_does_not_activate_underlying_screen() {
+    let mut app = TuiApp::default();
+    let client = ApiClient::new("/nonexistent.sock");
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|f| render(f, &mut app, false)).unwrap();
+    handle_key(&mut app, KeyCode::F(4), &client, false).await;
+    terminal.draw(|f| render(f, &mut app, false)).unwrap();
+    assert!(app.help_open);
+    handle_key(&mut app, KeyCode::Enter, &client, false).await;
+    assert_eq!(app.screen, Screen::Dashboard);
+    assert!(app.ui.buttons.is_empty());
+    handle_key(&mut app, KeyCode::Esc, &client, false).await;
+    assert!(!app.help_open);
+    assert!(!app.should_quit);
+}
+
+#[tokio::test]
+async fn small_terminal_enter_sends_commit_request() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("api.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut bytes = [0; 1024];
+        while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+            let count = stream.read(&mut bytes).await.unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&bytes[..count]);
+        }
+        stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+        String::from_utf8(request).unwrap()
+    });
+    let mut app = TuiApp {
+        screen: Screen::PendingChange,
+        pending: Some(crate::core::transaction::PendingNetworkChange {
+            token: "test-token".into(),
+            interface: "eth0".into(),
+            rollback_timeout_seconds: 30,
+            expires_at_unix: current_unix_time() + 30,
+        }),
+        ..Default::default()
+    };
+    let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
+    terminal
+        .draw(|frame| render(frame, &mut app, false))
+        .unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(text.contains("Esc: rollback"));
+    assert!(text.contains("Rollback in"));
+    handle_key(&mut app, KeyCode::Enter, &ApiClient::new(socket), false).await;
+    let request = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(request.starts_with("POST /api/v1/network-transactions/commit "));
+}

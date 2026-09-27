@@ -132,9 +132,9 @@ SSID, security, password, country, band/channel/width and client options. Enter
 choose **Save / update profile**. Saving does not change the running network.
 For a new protected profile, enter its password explicitly.
 
-**Load profile** cycles through saved profiles and fills the editor; the selected
+**Load profile** opens a list: select a profile with Up/Down and press Enter; the selected
 ID appears in **Profile ID**. A blank password keeps that profile's saved password.
-**Apply** saves edits to the loaded profile and applies it to the selected radio.
+**Save / update profile** saves edits to a loaded profile; **Apply** applies the saved profile to the selected radio. Unsaved edits must be saved first. Esc asks before discarding edited AP settings.
 Confirm the resulting network change before its deadline, or it rolls back.
 Deleting a profile leaves running APs unchanged. Profiles are reusable across
 radios; each target still needs a managed output role and an IPv4 subnet.
@@ -171,9 +171,15 @@ versions; they are omitted from API summaries and redacted from debug output.
 | **VPN** | Enable/disable VPN, WireGuard profiles and VPN traffic policy |
 | **Settings** | Application and session preferences |
 
-The Dashboard shows interfaces and traffic statistics side by side at 120 columns
-or wider. On smaller terminals, **1 / 2 / Tab** switches between the panels;
-Up/Down selects the interface whose RX/TX rates, totals and graphs are shown.
+The Dashboard shows WAN/LAN/VPN state, pending-change deadlines and data freshness.
+DHCP status is available in its dedicated sections. **1 / 2 / Tab** switches
+between traffic and detailed statistics; Up/Down selects an interface. The
+traffic view plots only the selected interface, with labeled RX/TX and a shared
+scale. **PgUp/PgDn** scrolls detailed statistics at smaller terminal sizes;
+Home selects the explicitly labeled sum of all interface counters. These sums
+can count forwarded traffic more than once and are not Internet usage totals.
+VPN interface/policy state is observed; Internet, DNS and handshake connectivity
+are not actively tested by the Dashboard.
 
 In **VPN**, press **e** or choose **Enable VPN** even if `vpn.enabled` is false
 in the base configuration. This saves a runtime override and takes effect without
@@ -190,7 +196,7 @@ Use arrows to select items and Tab/Shift+Tab to move focus forward/backward
 between fields, lists and actions. Enter activates the focused control; Esc
 returns to the list or leaves the editor. F2/F3 selects the previous/next main
 tab; Left/Right also switches tabs when no field or action uses those arrows.
-F1 opens the full operation message; Ctrl+C exits (an in-flight action finishes first). Topology shows configuration and observed routes, not a
+F4 opens context help and the first-setup checklist. F1 opens the full operation message; Ctrl+C exits (an in-flight action finishes first). Topology shows configuration and observed routes, not a
 connectivity test.
 
 ### Applying and confirming changes

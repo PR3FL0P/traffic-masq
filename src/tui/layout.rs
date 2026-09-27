@@ -178,7 +178,69 @@ pub(crate) fn render_header(
 
 pub(crate) fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &TuiApp) {
     let mut spans = Vec::new();
-    let help = if app.screen == Screen::Router && app.router.topology.open {
+    let help = help_pairs(app);
+    let available_width = area.width.saturating_sub(2) as usize;
+    let mut used = 0;
+    // Keep meanings visible even when only the most relevant controls fit.
+    let help = if help
+        .iter()
+        .map(|(k, d)| k.width() + d.width() + 3)
+        .sum::<usize>()
+        > available_width
+    {
+        let mut compact: Vec<_> = help
+            .iter()
+            .copied()
+            .filter(|(key, _)| matches!(*key, "Enter" | "Esc" | "↑/↓"))
+            .collect();
+        compact.push(("F4", "all keys"));
+        compact
+    } else {
+        help
+    };
+    for (key, description) in help {
+        let width = key.width() + description.width() + 3;
+        if used + width > available_width {
+            break;
+        }
+        if used > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(
+            key,
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            format!(":{description}"),
+            Style::default().fg(theme::TEXT),
+        ));
+        used += width;
+    }
+
+    let message_line = if let Some(text) = app.message.as_deref() {
+        let color = app
+            .logs
+            .back()
+            .map(|entry| entry.level.color())
+            .unwrap_or(theme::WARN);
+        Line::styled(text, Style::default().fg(color))
+    } else if let Some(text) = app.dashboard.error.as_deref() {
+        Line::styled(text, Style::default().fg(theme::WARN))
+    } else {
+        Line::styled("Ready", Style::default().fg(theme::GOOD))
+    };
+
+    frame.render_widget(
+        Paragraph::new(vec![Line::from(spans), message_line])
+            .block(panel("F1:msg F4:help F2/3:tabs Tab:focus ^C:quit")),
+        area,
+    );
+}
+
+pub(crate) fn help_pairs(app: &TuiApp) -> Vec<(&'static str, &'static str)> {
+    if app.screen == Screen::Router && app.router.topology.open {
         vec![("Arrows", "scroll"), ("PgUp/Dn", "page"), ("Esc/t", "back")]
     } else if app.screen == Screen::Router && app.router.pane == super::router::RouterPane::Sharing
     {
@@ -227,64 +289,14 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Tu
         ]
     } else {
         screen_help_pairs(app.screen)
-    };
-    let available_width = area.width.saturating_sub(2) as usize;
-    let full_width = help
-        .iter()
-        .enumerate()
-        .map(|(index, (key, description))| {
-            (if index > 0 { 2 } else { 0 }) + key.width() + 1 + description.width()
-        })
-        .sum::<usize>()
-        + "   mouse enabled".width();
-    let compact = full_width > available_width;
-
-    for (index, (key, description)) in help.into_iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::styled("  ", Style::default().fg(theme::MUTED)));
-        }
-        spans.push(Span::styled(
-            key,
-            Style::default()
-                .fg(theme::ACCENT)
-                .add_modifier(Modifier::BOLD),
-        ));
-        if !compact {
-            spans.push(Span::styled(":", Style::default().fg(theme::MUTED)));
-            spans.push(Span::styled(description, Style::default().fg(theme::TEXT)));
-        }
     }
-    if !compact {
-        spans.push(Span::styled(
-            "   mouse enabled",
-            Style::default().fg(theme::MUTED),
-        ));
-    }
-
-    let message_line = if let Some(text) = app.message.as_deref() {
-        let color = app
-            .logs
-            .back()
-            .map(|entry| entry.level.color())
-            .unwrap_or(theme::WARN);
-        Line::styled(text, Style::default().fg(color))
-    } else if let Some(text) = app.dashboard.error.as_deref() {
-        Line::styled(text, Style::default().fg(theme::WARN))
-    } else {
-        Line::styled("Ready", Style::default().fg(theme::GOOD))
-    };
-
-    frame.render_widget(
-        Paragraph::new(vec![Line::from(spans), message_line])
-            .block(panel("F1:msg F2/3:tabs Tab/S-Tab:focus ^C:quit")),
-        area,
-    );
 }
 
-fn screen_help_pairs(screen: Screen) -> Vec<(&'static str, &'static str)> {
+pub(crate) fn screen_help_pairs(screen: Screen) -> Vec<(&'static str, &'static str)> {
     match screen {
         Screen::Dashboard => vec![
             ("1/2/Tab", "view"),
+            ("PgUp/Dn", "stats scroll"),
             ("↑/↓", "interface"),
             ("←/→", "section"),
             ("Enter", "open"),

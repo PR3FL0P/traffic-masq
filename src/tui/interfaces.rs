@@ -302,7 +302,14 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
     lines.extend([
         row(
             "Router role",
-            format!("{:?}", editor.role),
+            match editor.role {
+                InterfaceRole::Input => "Input — Internet / WAN",
+                InterfaceRole::Output => "Output — local network / LAN",
+                InterfaceRole::None => "None — outside the router",
+                InterfaceRole::Middle => "Middle — VPN hop",
+                InterfaceRole::Disabled => "Disabled",
+            }
+            .to_string(),
             InterfaceEditorField::Role,
         ),
         row(

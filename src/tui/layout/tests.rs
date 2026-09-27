@@ -80,3 +80,23 @@ fn clip_interactions_drops_list_outside_content() {
     assert!(ui.list_area.is_none());
     assert_eq!(ui.list_count, 0);
 }
+
+#[test]
+fn narrow_footer_keeps_action_meanings() {
+    let app = TuiApp {
+        screen: Screen::Router,
+        ..Default::default()
+    };
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 4)).unwrap();
+    terminal.draw(|f| render_footer(f, f.area(), &app)).unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(text.contains("Enter:activate"));
+    assert!(text.contains("Esc:back"));
+    assert!(text.contains("F4:all keys"));
+}

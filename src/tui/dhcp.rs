@@ -156,7 +156,6 @@ pub(crate) fn render_dhcp_interface_list(
                 Style::default()
             };
             let dhcp_active = app
-                .dashboard
                 .dhcp_interfaces
                 .iter()
                 .any(|name| name == &status.interface.name);
@@ -182,7 +181,7 @@ pub(crate) fn render_dhcp_interface_list(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-const DHCP_SAVE_LABEL: &str = "Save";
+const DHCP_SAVE_LABEL: &str = "Apply DHCP now";
 const DHCP_LEASES_LABEL: &str = "View leases";
 const DHCP_DISABLE_LABEL: &str = "Disable DHCP";
 
@@ -243,7 +242,7 @@ pub(crate) fn render_dhcp_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
             editor.field == DhcpField::LeaseSeconds,
         ),
         Line::styled(
-            "Configuration is validated against the interface's current IPv4 subnet.",
+            "Applies immediately; no automatic rollback timer.",
             Style::default().fg(theme::MUTED),
         ),
         Line::styled(

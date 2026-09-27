@@ -2,20 +2,21 @@ use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Sparkline};
 
 use crossterm::event::KeyCode;
 
 use crate::api::client::ApiClient;
-use crate::api::model::{DhcpClientOperationalState, DhcpClientStatusView, InterfaceStatus};
+use crate::api::model::{InterfaceStatus, RouteStatus, VpnPolicyStatusView};
+use crate::config::InterfaceRole;
 use crate::core::transaction::PendingNetworkChange;
 
 use super::layout::panel;
 use super::theme;
-use super::{format_addresses, Screen, TuiApp};
+use super::{Screen, TuiApp};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DashboardPane {
@@ -30,16 +31,38 @@ pub(crate) async fn handle_dashboard_key(
     _client: &ApiClient,
     _direct: bool,
 ) {
+    if matches!(
+        key,
+        KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Char('1' | '2')
+    ) {
+        app.dashboard.statistics_scroll = 0;
+    }
     match key {
+        KeyCode::PageDown if app.dashboard_pane == DashboardPane::Statistics => {
+            app.dashboard.statistics_scroll = app
+                .dashboard
+                .statistics_scroll
+                .saturating_add(5)
+                .min(app.dashboard.statistics_max_scroll);
+        }
+        KeyCode::PageUp if app.dashboard_pane == DashboardPane::Statistics => {
+            app.dashboard.statistics_scroll = app.dashboard.statistics_scroll.saturating_sub(5);
+        }
         KeyCode::Char('1') => app.dashboard_pane = DashboardPane::Traffic,
         KeyCode::Char('2') => {
             app.dashboard_pane = DashboardPane::Statistics;
-            app.dashboard_statistics_index = 0;
+            app.dashboard_statistics_index = app.selected_interface + 1;
         }
         KeyCode::Tab | KeyCode::BackTab => {
             app.dashboard_pane = match app.dashboard_pane {
                 DashboardPane::Traffic => {
-                    app.dashboard_statistics_index = 0;
+                    app.dashboard_statistics_index = app.selected_interface + 1;
                     DashboardPane::Statistics
                 }
                 DashboardPane::Statistics => DashboardPane::Traffic,
@@ -129,6 +152,7 @@ pub(crate) struct TrafficHistory {
     last: Option<TrafficSample>,
     rx_rate_history: VecDeque<u64>,
     tx_rate_history: VecDeque<u64>,
+    sample_times: VecDeque<Instant>,
     pub(crate) current_rx_rate: u64,
     pub(crate) current_tx_rate: u64,
     peak_rx_rate: u64,
@@ -201,6 +225,10 @@ impl TrafficHistory {
         self.peak_tx_rate = self.peak_tx_rate.max(self.current_tx_rate);
         push_capped(&mut self.rx_rate_history, self.current_rx_rate);
         push_capped(&mut self.tx_rate_history, self.current_tx_rate);
+        self.sample_times.push_back(now);
+        if self.sample_times.len() > TRAFFIC_HISTORY_LEN {
+            self.sample_times.pop_front();
+        }
         self.last = Some(TrafficSample {
             rx_bytes,
             tx_bytes,
@@ -268,9 +296,14 @@ pub(crate) fn format_rate(bytes_per_sec: u64) -> String {
 pub(crate) struct DashboardData {
     pub(crate) interfaces: Vec<InterfaceStatus>,
     pub(crate) managed: std::collections::HashMap<String, bool>,
-    pub(crate) dhcp_interfaces: Vec<String>,
-    pub(crate) dhcp_clients: Vec<DhcpClientStatusView>,
-    pub(crate) dhcp_client_error: Option<String>,
+    pub(crate) roles: std::collections::HashMap<String, InterfaceRole>,
+    pub(crate) routes: Option<Vec<RouteStatus>>,
+    pub(crate) vpn_status: Option<VpnPolicyStatusView>,
+    pub(crate) interfaces_updated: Option<Instant>,
+    pub(crate) last_success: Option<Instant>,
+    pub(crate) pending_known: bool,
+    pub(crate) statistics_scroll: u16,
+    pub(crate) statistics_max_scroll: u16,
     pub(crate) vpn_enabled: Option<bool>,
     pub(crate) pending_network_changes: Vec<PendingNetworkChange>,
     pub(crate) error: Option<String>,
@@ -278,7 +311,43 @@ pub(crate) struct DashboardData {
     pub(crate) connections: ConnectionStats,
 }
 
+pub(crate) fn accept_update(app: &mut TuiApp, mut updated: DashboardData) {
+    let selected = app
+        .dashboard
+        .interfaces
+        .get(app.selected_interface)
+        .map(|s| s.interface.name.clone());
+    updated.statistics_scroll = app.dashboard.statistics_scroll;
+    updated.statistics_max_scroll = app.dashboard.statistics_max_scroll;
+    if updated.error.is_some() {
+        updated.last_success = app.dashboard.last_success;
+    }
+    if updated.interfaces_updated.is_none() {
+        updated.interfaces = std::mem::take(&mut app.dashboard.interfaces);
+    }
+    app.selected_interface = selected
+        .as_ref()
+        .and_then(|name| {
+            updated
+                .interfaces
+                .iter()
+                .position(|s| &s.interface.name == name)
+        })
+        .or_else(|| {
+            updated
+                .interfaces
+                .iter()
+                .position(|s| updated.roles.get(&s.interface.name) == Some(&InterfaceRole::Input))
+        })
+        .or_else(|| updated.interfaces.iter().position(|s| s.has_default_route))
+        .unwrap_or(0);
+    app.dashboard = updated;
+}
+
 pub(crate) fn record_traffic_samples(app: &mut TuiApp) {
+    if app.dashboard.interfaces_updated.is_none() {
+        return;
+    }
     let now = Instant::now();
     let present: HashSet<u32> = app
         .dashboard
@@ -303,6 +372,54 @@ pub(crate) fn record_traffic_samples(app: &mut TuiApp) {
     app.dashboard.connections = read_connection_stats();
 }
 
+fn attention(data: &DashboardData) -> Option<String> {
+    for status in &data.interfaces {
+        if data.roles.get(&status.interface.name) == Some(&InterfaceRole::Input) {
+            if !status.interface.is_up {
+                return Some(format!(
+                    "WAN {} is DOWN — check interface/link",
+                    status.interface.name
+                ));
+            }
+            if status.ipv4_addresses.is_empty() {
+                return Some(format!(
+                    "WAN {} has no IPv4 address — open Interfaces",
+                    status.interface.name
+                ));
+            }
+        }
+    }
+    if let Some(vpn) = &data.vpn_status {
+        if vpn.mode == crate::config::VpnPolicyMode::Vpn
+            && (!vpn.tunnel_healthy || !vpn.policy_active)
+        {
+            return Some("VPN policy is not ready — inspect VPN".into());
+        }
+    }
+    None
+}
+
+fn fit_summary(text: String, width: u16) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    if text.width() <= width as usize {
+        return text;
+    }
+    let mut result = String::new();
+    let mut used = 0;
+    for g in text.graphemes(true) {
+        if used + g.width() > width.saturating_sub(1) as usize {
+            break;
+        }
+        result.push_str(g);
+        used += g.width();
+    }
+    if width > 0 {
+        result.push('…');
+    }
+    result
+}
+
 pub(crate) fn render_dashboard(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
@@ -310,19 +427,64 @@ pub(crate) fn render_dashboard(
     direct: bool,
 ) {
     let sections = Layout::vertical([
+        Constraint::Length(1),
         Constraint::Length(5),
         Constraint::Length(1),
         Constraint::Min(0),
     ])
     .split(area);
-    render_dashboard_summary(frame, sections[0], app, direct);
+    let data = &app.dashboard;
+    let age = data
+        .last_success
+        .map(|at| format!("{}s ago", at.elapsed().as_secs()))
+        .unwrap_or_else(|| "never".into());
+    let pending = data
+        .pending_network_changes
+        .iter()
+        .min_by_key(|p| p.expires_at_unix);
+    let issue = attention(data);
+    let notice = if let Some(pending) = pending {
+        format!(
+            "CONFIRM {}: rollback in {}s | {}",
+            pending.interface,
+            pending
+                .expires_at_unix
+                .saturating_sub(super::current_unix_time()),
+            if data.error.is_some() {
+                "data stale; F1"
+            } else {
+                "review pending change"
+            }
+        )
+    } else if data.error.is_some() {
+        format!("STALE / partial data — last complete update {age}; F1: details")
+    } else if let Some(issue) = &issue {
+        format!("ATTENTION: {issue}")
+    } else if direct {
+        format!("Updated {age} | Read-only recovery; Internet/DNS not tested")
+    } else if !data.pending_known {
+        "Pending changes unknown | waiting for status".into()
+    } else {
+        format!("Updated {age} | Internet/DNS not tested")
+    };
+    frame.render_widget(
+        Paragraph::new(fit_summary(notice, sections[0].width)).style(Style::default().fg(
+            if pending.is_some() || data.error.is_some() || issue.is_some() {
+                theme::WARN
+            } else {
+                theme::MUTED
+            },
+        )),
+        sections[0],
+    );
+    render_dashboard_summary(frame, sections[1], app, direct);
     app.dashboard.pane_tabs.clear();
-    let mut x = sections[1].x;
+    let mut x = sections[2].x;
     for (label, pane) in [
-        ("[1 Interfaces stat]", DashboardPane::Traffic),
+        ("[1 Traffic]", DashboardPane::Traffic),
         ("[2 Statistics]", DashboardPane::Statistics),
     ] {
-        let rect = Rect::new(x, sections[1].y, label.len() as u16, 1);
+        let rect = Rect::new(x, sections[2].y, label.len() as u16, 1);
         app.dashboard.pane_tabs.push((rect, pane));
         frame.render_widget(
             Paragraph::new(label).style(if app.dashboard_pane == pane {
@@ -336,14 +498,10 @@ pub(crate) fn render_dashboard(
         );
         x += rect.width + 1;
     }
-
-    let body = Layout::horizontal([Constraint::Percentage(78), Constraint::Percentage(22)])
-        .split(sections[2]);
     match app.dashboard_pane {
-        DashboardPane::Traffic => render_dashboard_traffic(frame, body[0], app),
-        DashboardPane::Statistics => render_numeric_statistics(frame, body[0], app),
+        DashboardPane::Traffic => render_dashboard_traffic(frame, sections[3], app),
+        DashboardPane::Statistics => render_numeric_statistics(frame, sections[3], app),
     }
-    render_dhcp_clients(frame, body[1], app, direct);
 }
 
 fn render_numeric_statistics(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
@@ -508,13 +666,16 @@ fn render_numeric_statistics(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
         "since interface creation/reset".to_string(),
     ));
 
-    let block = panel(&format!("Statistics: {name} | ↑/↓ all/interfaces"));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(lines), inner);
+    render_statistics_lines(
+        frame,
+        area,
+        &format!("Statistics: {name}"),
+        lines,
+        &mut app.dashboard,
+    );
 }
 
-fn render_global_statistics(frame: &mut ratatui::Frame<'_>, area: Rect, app: &TuiApp) {
+fn render_global_statistics(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
     let now = Instant::now();
     let mut observed = Duration::ZERO;
     let mut session_rx = 0u64;
@@ -660,10 +821,60 @@ fn render_global_statistics(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Tu
         "all interfaces".to_string(),
     ));
 
-    let block = panel("Statistics: all interfaces | ↓ per-interface");
+    lines.insert(
+        0,
+        Line::styled(
+            "Sum of interface counters; forwarded traffic is counted more than once.",
+            Style::default().fg(theme::WARN),
+        ),
+    );
+    render_statistics_lines(
+        frame,
+        area,
+        "Statistics: all interfaces",
+        lines,
+        &mut app.dashboard,
+    );
+}
+
+fn render_statistics_lines(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    title: &str,
+    lines: Vec<Line<'static>>,
+    data: &mut DashboardData,
+) {
+    let block = panel(&format!("{title} | ↑/↓ select; PgUp/Dn scroll"));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(lines), inner);
+    let mut wrapped = Vec::new();
+    for line in lines {
+        use unicode_segmentation::UnicodeSegmentation;
+        use unicode_width::UnicodeWidthStr;
+        let mut row = Vec::new();
+        let mut width = 0;
+        for span in line.spans {
+            for grapheme in span.content.graphemes(true) {
+                let size = grapheme.width();
+                if width + size > inner.width as usize && !row.is_empty() {
+                    wrapped.push(Line::from(std::mem::take(&mut row)));
+                    width = 0;
+                }
+                row.push(Span::styled(grapheme.to_owned(), span.style));
+                width += size;
+            }
+        }
+        wrapped.push(Line::from(row));
+    }
+    data.statistics_max_scroll = wrapped
+        .len()
+        .saturating_sub(inner.height as usize)
+        .min(u16::MAX as usize) as u16;
+    data.statistics_scroll = data.statistics_scroll.min(data.statistics_max_scroll);
+    frame.render_widget(
+        Paragraph::new(wrapped).scroll((data.statistics_scroll, 0)),
+        inner,
+    );
 }
 
 fn stat_line(label: &'static str, value: String, note: String) -> Line<'static> {
@@ -748,63 +959,156 @@ fn format_bytes(bytes: u64) -> String {
     format_rate(bytes).trim_end_matches("/s").to_owned()
 }
 
+fn interface_role(data: &DashboardData, status: &InterfaceStatus) -> &'static str {
+    match data.roles.get(&status.interface.name) {
+        Some(InterfaceRole::Input) => "WAN",
+        Some(InterfaceRole::Output) => "LAN",
+        Some(InterfaceRole::Middle) => "VPN",
+        _ if status.has_default_route => "route",
+        _ => "other",
+    }
+}
+
+fn addresses(status: &InterfaceStatus) -> String {
+    if status.ipv4_addresses.is_empty() {
+        return "no IPv4".into();
+    }
+    status
+        .ipv4_addresses
+        .iter()
+        .map(|ip| format!("{}/{}", ip.address, ip.prefix_len))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 pub(crate) fn render_dashboard_summary(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     app: &TuiApp,
     direct: bool,
 ) {
-    let block = panel("Overview");
+    let data = &app.dashboard;
+    let summarize = |wan: bool| {
+        let items: Vec<_> = data
+            .interfaces
+            .iter()
+            .filter(|s| {
+                if wan {
+                    data.roles.get(&s.interface.name) == Some(&InterfaceRole::Input)
+                        || (s.has_default_route
+                            && data.roles.get(&s.interface.name) != Some(&InterfaceRole::Middle)
+                            && data
+                                .vpn_status
+                                .as_ref()
+                                .and_then(|v| v.tunnel.as_ref())
+                                .is_none_or(|t| t.interface != s.interface.name))
+                } else {
+                    data.roles.get(&s.interface.name) == Some(&InterfaceRole::Output)
+                }
+            })
+            .map(|s| {
+                let gateway = if wan {
+                    match &data.routes {
+                        Some(routes) => routes
+                            .iter()
+                            .filter(|r| {
+                                r.destination.prefix_len() == 0
+                                    && (r.output_interface.as_deref()
+                                        == Some(s.interface.name.as_str())
+                                        || r.output_interface_index == Some(s.interface.index))
+                            })
+                            .min_by_key(|r| r.metric.unwrap_or(0))
+                            .map(|r| {
+                                format!(
+                                    " via {}",
+                                    r.gateway
+                                        .map(|g| g.to_string())
+                                        .unwrap_or_else(|| "on-link".into())
+                                )
+                            })
+                            .unwrap_or_else(|| " no default route".into()),
+                        None => " gateway unknown".into(),
+                    }
+                } else {
+                    String::new()
+                };
+                format!(
+                    "{} {} {}{}",
+                    s.interface.name,
+                    if s.interface.is_up { "up" } else { "DOWN" },
+                    addresses(s),
+                    gateway
+                )
+            })
+            .collect();
+        if items.is_empty() {
+            if data.interfaces_updated.is_none()
+                || (direct && !wan)
+                || data.roles.len() < data.interfaces.len()
+            {
+                "unknown".into()
+            } else if wan {
+                "no uplink/default route detected".into()
+            } else {
+                "no LAN role configured".into()
+            }
+        } else {
+            items.join("; ")
+        }
+    };
+    let vpn = if direct {
+        "unavailable in recovery mode".into()
+    } else {
+        match (&data.vpn_status, data.vpn_enabled) {
+            (Some(status), _) => {
+                let tunnel = status
+                    .tunnel
+                    .as_ref()
+                    .map(|t| {
+                        format!(
+                            "{}: {}",
+                            t.profile_name,
+                            if t.up {
+                                "interface up"
+                            } else {
+                                "interface DOWN"
+                            }
+                        )
+                    })
+                    .unwrap_or_else(|| "no tunnel".into());
+                format!(
+                    "{tunnel}; policy {:?} {}; handshake n/a",
+                    status.mode,
+                    if status.policy_active {
+                        "active"
+                    } else {
+                        "inactive"
+                    }
+                )
+            }
+            (None, Some(false)) => "disabled".into(),
+            (None, Some(true)) => "enabled; tunnel/policy unknown".into(),
+            _ => "unknown".into(),
+        }
+    };
+    let block = panel("Network state (observed, not a connectivity test)");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
-    let mode_text = if direct { "direct" } else { "daemon" };
-    let dhcp_count = app.dashboard.dhcp_interfaces.len();
-    let pending_count = app.dashboard.pending_network_changes.len();
-    let iface_count = app.dashboard.interfaces.len();
-    let (vpn_text, vpn_color) = match app.dashboard.vpn_enabled {
-        Some(true) => ("ON".to_string(), theme::GOOD),
-        Some(false) => ("OFF".to_string(), theme::MUTED),
-        None if direct => ("n/a".to_string(), theme::MUTED),
-        None => ("?".to_string(), theme::WARN),
-    };
-
-    let card = |value: String, label: &'static str, color: Color| {
-        Paragraph::new(vec![
-            Line::styled(
-                value,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Line::styled(label, Style::default().fg(theme::MUTED)),
-        ])
-        .alignment(Alignment::Center)
-    };
-
-    let pending_color = if pending_count > 0 {
-        theme::WARN
-    } else {
-        theme::TEXT
-    };
-
-    let cards = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Ratio(1, 5); 5])
-        .split(inner);
-
-    frame.render_widget(card(mode_text.to_string(), "mode", theme::ACCENT), cards[0]);
+    // Each summary stays one row; full addresses and counters are in Statistics.
+    let lines = [
+        format!("WAN  {}", summarize(true)),
+        format!("LAN  {}", summarize(false)),
+        format!("VPN  {vpn}"),
+    ];
     frame.render_widget(
-        card(iface_count.to_string(), "interfaces", theme::TEXT),
-        cards[1],
+        Paragraph::new(
+            lines
+                .into_iter()
+                .map(|line| Line::from(fit_summary(line, inner.width)))
+                .collect::<Vec<_>>(),
+        ),
+        inner,
     );
-    frame.render_widget(
-        card(dhcp_count.to_string(), "dhcp server", theme::GOOD),
-        cards[2],
-    );
-    frame.render_widget(
-        card(pending_count.to_string(), "pending", pending_color),
-        cards[3],
-    );
-    frame.render_widget(card(vpn_text, "vpn", vpn_color), cards[4]);
 }
 
 pub(crate) fn render_dashboard_traffic(
@@ -813,232 +1117,162 @@ pub(crate) fn render_dashboard_traffic(
     app: &mut TuiApp,
 ) {
     if app.dashboard.interfaces.is_empty() {
-        let block = panel("Interfaces stat");
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
         frame.render_widget(
-            Paragraph::new("No interfaces detected").style(Style::default().fg(theme::MUTED)),
-            inner,
+            Paragraph::new(if app.dashboard.error.is_some() {
+                "Interface data unavailable"
+            } else {
+                "No interfaces detected"
+            })
+            .block(panel("Interfaces")),
+            area,
         );
-        app.ui.list_area = None;
-        app.ui.list_count = 0;
-        app.ui.list_scroll_offset = 0;
         return;
     }
-
-    let row_height = if area.height < 14 { 1 } else { 3 };
+    let parts = Layout::vertical([Constraint::Min(3), Constraint::Length(6)]).split(area);
     let total = app.dashboard.interfaces.len();
-    let max_visible = ((area.height.saturating_sub(2)) / row_height).max(1) as usize;
-    let visible = total.min(max_visible);
-    let max_offset = total.saturating_sub(visible);
+    let visible = parts[0].height.saturating_sub(2).max(1) as usize;
+    app.selected_interface = app.selected_interface.min(total - 1);
     let offset = app
         .selected_interface
         .saturating_sub(visible / 2)
-        .min(max_offset);
-
-    let title = if visible < total {
-        format!(
-            "Interfaces stat ({}-{} of {total}, ↑/↓ to scroll)",
-            offset + 1,
-            offset + visible
-        )
-    } else {
-        "Interfaces stat | [ext] external, [?] ownership unknown".to_string()
-    };
-    let block = panel(&title);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    app.ui.list_area = Some(Rect::new(
-        inner.x,
-        inner.y,
-        inner.width,
-        (visible as u16 * row_height).min(inner.height),
+        .min(total.saturating_sub(visible));
+    let block = panel(&format!(
+        "Interfaces {}-{}/{} | name / state / role / RX / TX",
+        offset + 1,
+        (offset + visible).min(total),
+        total
     ));
-    app.ui.list_row_height = row_height;
+    let inner = block.inner(parts[0]);
+    frame.render_widget(block, parts[0]);
+    app.ui.list_area = Some(inner);
+    app.ui.list_row_height = 1;
     app.ui.list_count = total;
     app.ui.list_scroll_offset = offset;
-
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(vec![Constraint::Length(row_height); visible])
-        .split(inner);
-
-    let selected_interface = app.selected_interface;
-    for (row, (index, status)) in app
+    let lines: Vec<_> = app
         .dashboard
         .interfaces
         .iter()
         .enumerate()
         .skip(offset)
         .take(visible)
-        .enumerate()
-    {
-        let history = app.traffic.get(&status.interface.index);
-        let managed = app.dashboard.managed.get(&status.interface.name).copied();
-        render_traffic_row(
-            frame,
-            rows[row],
-            status,
-            history,
-            managed,
-            index == selected_interface,
-        );
-    }
+        .map(|(i, status)| {
+            let rates = app
+                .traffic
+                .get(&status.interface.index)
+                .filter(|h| !h.rx_rates().is_empty())
+                .map(|h| {
+                    format!(
+                        "RX {:>10} TX {:>10}",
+                        format_rate(h.current_rx_rate),
+                        format_rate(h.current_tx_rate)
+                    )
+                })
+                .unwrap_or_else(|| "RX collecting  TX collecting".into());
+            let ownership = match app.dashboard.managed.get(&status.interface.name) {
+                Some(true) => "managed",
+                Some(false) => "external",
+                None => "unknown",
+            };
+            Line::styled(
+                format!(
+                    "{} {:<15} {:<4} {:<5} {rates} {ownership}",
+                    if i == app.selected_interface {
+                        "▶"
+                    } else {
+                        " "
+                    },
+                    status.interface.name,
+                    if status.interface.is_up { "up" } else { "DOWN" },
+                    interface_role(&app.dashboard, status)
+                ),
+                if i == app.selected_interface {
+                    Style::default()
+                        .fg(theme::ACCENT)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme::TEXT)
+                },
+            )
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+    render_selected_graph(frame, parts[1], app);
 }
 
-fn render_traffic_row(
-    frame: &mut ratatui::Frame<'_>,
-    area: Rect,
-    status: &InterfaceStatus,
-    history: Option<&TrafficHistory>,
-    managed: Option<bool>,
-    selected: bool,
-) {
-    let marker = if selected { "▶" } else { " " };
-    let name_style = if selected {
-        Style::default()
-            .fg(theme::ACCENT)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().add_modifier(Modifier::BOLD)
-    };
-    let up_span = if status.interface.is_up {
-        Span::styled("● up", Style::default().fg(theme::GOOD))
-    } else {
-        Span::styled("● down", Style::default().fg(theme::MUTED))
-    };
-    let (rx_rate, tx_rate) = history
-        .map(|history| (history.current_rx_rate, history.current_tx_rate))
-        .unwrap_or((0, 0));
-
-    let mut header = Line::from(vec![
-        Span::styled(
-            format!("{marker} {:<12}", status.interface.name),
-            name_style,
-        ),
-        up_span,
-        Span::raw("   "),
-        Span::styled(
-            match managed {
-                Some(true) => "traffic-masq:on",
-                Some(false) => "traffic-masq:off",
-                None => "traffic-masq:?",
-            },
-            Style::default().fg(if managed == Some(true) {
-                theme::GOOD
-            } else {
-                theme::WARN
-            }),
-        ),
-        Span::raw("   "),
-        Span::styled(
-            format!("↓ {:>10}", format_rate(rx_rate)),
-            Style::default().fg(theme::ACCENT),
-        ),
-        Span::raw("   "),
-        Span::styled(
-            format!("↑ {:>10}", format_rate(tx_rate)),
-            Style::default().fg(theme::ACCENT_ALT),
-        ),
-        Span::raw("   "),
-    ]);
-    header.spans.extend(format_addresses(status));
-    frame.render_widget(
-        Paragraph::new(header),
-        Rect::new(area.x, area.y, area.width, area.height.min(1)),
-    );
-    if area.height < 3 {
+fn render_selected_graph(frame: &mut ratatui::Frame<'_>, area: Rect, app: &TuiApp) {
+    let Some(status) = app.dashboard.interfaces.get(app.selected_interface) else {
         return;
-    }
-
-    let rx_slice = history.map(TrafficHistory::rx_rates).unwrap_or(&[]);
-    let tx_slice = history.map(TrafficHistory::tx_rates).unwrap_or(&[]);
-    frame.render_widget(
-        Sparkline::default()
-            .data(rx_slice)
-            .style(Style::default().fg(theme::ACCENT)),
-        Rect::new(area.x, area.y + 1, area.width, 1),
-    );
-    frame.render_widget(
-        Sparkline::default()
-            .data(tx_slice)
-            .style(Style::default().fg(theme::ACCENT_ALT)),
-        Rect::new(area.x, area.y + 2, area.width, 1),
-    );
-}
-
-fn render_dhcp_clients(frame: &mut ratatui::Frame<'_>, area: Rect, app: &TuiApp, direct: bool) {
-    let title = format!("DHCP Clients ({})", app.dashboard.dhcp_clients.len());
-    let block = panel(&title);
+    };
+    let history = app.traffic.get(&status.interface.index);
+    let width = area.width.saturating_sub(5) as usize;
+    let rx = history.map(TrafficHistory::rx_rates).unwrap_or(&[]);
+    let tx = history.map(TrafficHistory::tx_rates).unwrap_or(&[]);
+    let rx = &rx[rx.len().saturating_sub(width)..];
+    let tx = &tx[tx.len().saturating_sub(width)..];
+    let maximum = rx.iter().chain(tx).copied().max().unwrap_or(0).max(1);
+    let window = history
+        .and_then(|h| {
+            Some(
+                h.sample_times.back()?.saturating_duration_since(
+                    *h.sample_times
+                        .get(h.sample_times.len().saturating_sub(width))?,
+                ),
+            )
+        })
+        .unwrap_or_default();
+    let block = panel(&format!(
+        "{} | last {}s | RX/TX scale 0–{}",
+        status.interface.name,
+        window.as_secs(),
+        format_rate(maximum)
+    ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
-    if direct {
-        frame.render_widget(
-            Paragraph::new("DHCP client status is available in daemon mode")
-                .style(Style::default().fg(theme::MUTED)),
-            inner,
-        );
+    if inner.height < 4 {
         return;
     }
-    if let Some(error) = &app.dashboard.dhcp_client_error {
-        frame.render_widget(
-            Paragraph::new(format!("Unavailable: {error}")).style(Style::default().fg(theme::WARN)),
-            inner,
-        );
-        return;
-    }
-    if app.dashboard.dhcp_clients.is_empty() {
-        frame.render_widget(
-            Paragraph::new("No configured DHCP clients").style(Style::default().fg(theme::MUTED)),
-            inner,
-        );
-        return;
-    }
-
-    let visible = inner.height as usize;
-    let lines = app
-        .dashboard
-        .dhcp_clients
-        .iter()
-        .take(visible)
-        .map(|status| {
-            let state = match status.state {
-                DhcpClientOperationalState::Waiting => "waiting",
-                DhcpClientOperationalState::Running => "running",
-                DhcpClientOperationalState::Degraded => "degraded",
-            };
-            let address = match (status.address, status.prefix_length) {
-                (Some(address), Some(prefix)) => format!("{address}/{prefix}"),
-                _ => "no address".to_string(),
-            };
-            let color = match status.state {
-                DhcpClientOperationalState::Running => theme::GOOD,
-                DhcpClientOperationalState::Waiting => theme::WARN,
-                DhcpClientOperationalState::Degraded => theme::BAD,
-            };
-            if inner.width < 30 {
-                Line::from(vec![
-                    Span::styled(
-                        format!("{} ", status.interface),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(state, Style::default().fg(color)),
-                ])
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{} | default route {}",
+            addresses(status),
+            if status.has_default_route {
+                "yes"
             } else {
-                Line::from(vec![
-                    Span::styled(
-                        format!("{:<12}", status.interface),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(format!("{state:<9}"), Style::default().fg(color)),
-                    Span::raw(address),
-                ])
+                "no"
             }
+        )),
+        Rect::new(inner.x, inner.y, inner.width, 1),
+    );
+    for (i, (label, values, color)) in [("RX", rx, theme::ACCENT), ("TX", tx, theme::ACCENT_ALT)]
+        .into_iter()
+        .enumerate()
+    {
+        frame.render_widget(
+            Paragraph::new(label).style(Style::default().fg(color)),
+            Rect::new(inner.x, inner.y + 1 + i as u16, 3, 1),
+        );
+        frame.render_widget(
+            Sparkline::default()
+                .data(values)
+                .max(maximum)
+                .style(Style::default().fg(color)),
+            Rect::new(
+                inner.x + 3,
+                inner.y + 1 + i as u16,
+                inner.width.saturating_sub(3),
+                1,
+            ),
+        );
+    }
+    frame.render_widget(
+        Paragraph::new(if rx.is_empty() {
+            "Collecting samples…"
+        } else {
+            "Oldest → newest; rates per sample; 2: detailed statistics"
         })
-        .collect::<Vec<_>>();
-    frame.render_widget(Paragraph::new(lines), inner);
+        .style(Style::default().fg(theme::MUTED)),
+        Rect::new(inner.x, inner.y + 3, inner.width, 1),
+    );
 }
 
 #[cfg(test)]

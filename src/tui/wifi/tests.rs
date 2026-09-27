@@ -1401,6 +1401,13 @@ async fn ap_profile_load_restores_radio_options_without_exposing_password() {
         &ApiClient::new("/nonexistent.sock"),
     )
     .await;
+    assert_eq!(app.wifi_editor.as_ref().unwrap().profile_picker, Some(0));
+    handle_wifi_editor_key(
+        &mut app,
+        KeyCode::Enter,
+        &ApiClient::new("/nonexistent.sock"),
+    )
+    .await;
     let loaded = app.wifi_editor.as_ref().unwrap();
     assert_eq!(loaded.ssid, "Guests");
     assert_eq!(loaded.profile_id, "guest");
@@ -1447,4 +1454,52 @@ fn open_client_profile_discards_password_typed_before_security_change() {
     let request = editor.request().unwrap();
     assert!(request.passphrase.is_none());
     assert!(request.clear_passphrase);
+}
+
+#[tokio::test]
+async fn ap_unsaved_edits_require_explicit_discard() {
+    let mut app = TuiApp {
+        screen: Screen::WifiEditor,
+        wifi_editor: Some(WifiEditor::from_row(&radio("wlan0"))),
+        ..Default::default()
+    };
+    let client = ApiClient::new("/nonexistent.sock");
+    handle_wifi_editor_key(&mut app, KeyCode::Char('x'), &client).await;
+    handle_wifi_editor_key(&mut app, KeyCode::Esc, &client).await;
+    assert!(app.wifi_editor.as_ref().unwrap().discard_requested);
+    handle_wifi_editor_key(&mut app, KeyCode::Esc, &client).await;
+    assert!(!app.wifi_editor.as_ref().unwrap().discard_requested);
+    assert!(app.wifi_editor.as_ref().unwrap().ssid.ends_with('x'));
+    app.wifi_editor.as_mut().unwrap().field = WifiField::SavedProfile;
+    handle_wifi_editor_key(&mut app, KeyCode::Enter, &client).await;
+    assert!(app.wifi_editor.as_ref().unwrap().profile_picker.is_none());
+    handle_wifi_editor_key(&mut app, KeyCode::Esc, &client).await;
+    handle_wifi_editor_key(&mut app, KeyCode::Enter, &client).await;
+    assert!(app.wifi_editor.is_none());
+    assert_eq!(app.screen, Screen::Wifi);
+}
+
+#[test]
+fn ap_warnings_and_focused_action_fit_minimum_terminal() {
+    let mut editor = WifiEditor::from_row(&radio("wlan0"));
+    editor.field = WifiField::Apply;
+    let mut app = TuiApp {
+        screen: Screen::WifiEditor,
+        wifi_editor: Some(editor),
+        ..Default::default()
+    };
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| crate::tui::render(frame, &mut app, false))
+        .unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(text.contains("Apply AP + passphrase + DHCP"));
+    assert!(text.contains("DNS is not advertised"));
+    assert!(text.contains("confirm before the rollback timer expires"));
 }

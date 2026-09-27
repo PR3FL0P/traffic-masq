@@ -227,6 +227,7 @@ fn adjacent_section(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ViewIdentity {
     screen: Screen,
+    help_open: bool,
     message_open: bool,
     router_pane: router::RouterPane,
     topology_open: bool,
@@ -247,6 +248,7 @@ struct TuiApp {
     dhcp_editor: Option<DhcpEditor>,
     dhcp_leases: Option<DhcpLeasesView>,
     dhcp_clients: Vec<DhcpClientStatusView>,
+    dhcp_interfaces: Vec<String>,
     dhcp_client_selected: Option<String>,
     dhcp_client_scroll: usize,
     preview: Option<InterfaceChangePlan>,
@@ -273,6 +275,7 @@ struct TuiApp {
     traffic: HashMap<u32, dashboard::TrafficHistory>,
     ui: UiLayout,
     message: Option<String>,
+    help_open: bool,
     message_open: bool,
     message_scroll: u16,
     should_quit: bool,
@@ -296,6 +299,7 @@ impl Default for TuiApp {
             dhcp_editor: None,
             dhcp_leases: None,
             dhcp_clients: Vec::new(),
+            dhcp_interfaces: Vec::new(),
             dhcp_client_selected: None,
             dhcp_client_scroll: 0,
             preview: None,
@@ -322,6 +326,7 @@ impl Default for TuiApp {
             traffic: HashMap::new(),
             ui: UiLayout::default(),
             message: None,
+            help_open: false,
             message_open: false,
             message_scroll: 0,
             should_quit: false,
@@ -548,12 +553,25 @@ async fn run_loop(
             let snapshot = draw_app(terminal, &mut app, direct)?.buffer.clone();
             let deadline = pending_deadline(&app);
             let refresh = async {
-                app.dashboard = if direct {
+                let updated = if direct {
                     load_direct_dashboard(direct_network.as_ref()).await
                 } else {
                     load_daemon_dashboard(client).await
                 };
-                app.dhcp_clients = app.dashboard.dhcp_clients.clone();
+                dashboard::accept_update(&mut app, updated);
+                if !direct
+                    && matches!(
+                        app.screen,
+                        Screen::DhcpInterfaceList | Screen::DhcpEditor | Screen::DhcpLeases
+                    )
+                {
+                    if let Ok(Response::DhcpStatus {
+                        running_interfaces, ..
+                    }) = client.request(&Request::DhcpStatus).await
+                    {
+                        app.dhcp_interfaces = running_interfaces;
+                    }
+                }
                 normalize_selection(&mut app);
                 refresh_pending_screen(&mut app);
                 dashboard::record_traffic_samples(&mut app);
@@ -952,7 +970,7 @@ async fn navigate_to_section(app: &mut TuiApp, section: Section, client: &ApiCli
 }
 
 async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, direct: bool) {
-    if !app.ui.input_enabled {
+    if !app.ui.input_enabled || app.help_open {
         return;
     }
     if app.message_open {
@@ -1019,7 +1037,8 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                 {
                     app.dashboard_pane = pane;
                     if pane == dashboard::DashboardPane::Statistics {
-                        app.dashboard_statistics_index = 0;
+                        app.dashboard_statistics_index = app.selected_interface + 1;
+                        app.dashboard.statistics_scroll = 0;
                     }
                     return;
                 }
@@ -1232,6 +1251,7 @@ fn draw_app<'a, B: ratatui::backend::Backend>(
 ) -> Result<ratatui::CompletedFrame<'a>, B::Error> {
     let view = ViewIdentity {
         screen: app.screen,
+        help_open: app.help_open,
         message_open: app.message_open,
         router_pane: app.router.pane,
         topology_open: app.router.topology.open,
@@ -1283,6 +1303,18 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp, direct: bool) {
     frame.render_widget(ratatui::widgets::Clear, area);
     app.ui = UiLayout::default();
     if area.width < MIN_TERMINAL_WIDTH || area.height < MIN_TERMINAL_HEIGHT {
+        if let Some(deadline) = pending_deadline(app) {
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "Rollback in {}s\nEnter: commit\nEsc: rollback\nQ: exit (timer continues)",
+                    deadline.saturating_sub(current_unix_time())
+                ))
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .style(Style::default().fg(theme::WARN)),
+                area,
+            );
+            return;
+        }
         frame.render_widget(
             Paragraph::new("Terminal too small — resize to at least 80x24. Q: exit. Pending changes keep their original rollback deadlines.")
                 .alignment(Alignment::Center)
@@ -1292,12 +1324,38 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp, direct: bool) {
         return;
     }
     app.ui.input_enabled = true;
+    if app.help_open {
+        let mut lines = vec![
+            Line::from("F2/F3: previous/next section | Ctrl+C: quit"),
+            Line::from("Tab/Shift+Tab: focus | F1: full operation message"),
+            Line::from(""),
+        ];
+        lines.extend(
+            layout::help_pairs(app)
+                .into_iter()
+                .map(|(key, action)| Line::from(format!("{key}: {action}"))),
+        );
+        lines.extend([
+            Line::from(""),
+            Line::from("First setup: Interfaces (LAN IP + Output role), then DHCP Server,"),
+            Line::from("then Router > Internet sharing (LAN through WAN)."),
+            Line::from("Verify connectivity before committing each tentative change."),
+        ]);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .block(layout::panel("Help — Esc/F4: close")),
+            area,
+        );
+        return;
+    }
     if app.message_open {
-        let text = app
-            .message
-            .as_deref()
-            .or(app.dashboard.error.as_deref())
-            .unwrap_or("No message");
+        let text = if app.screen == Screen::Dashboard {
+            app.dashboard.error.as_deref().or(app.message.as_deref())
+        } else {
+            app.message.as_deref().or(app.dashboard.error.as_deref())
+        }
+        .unwrap_or("No message");
         frame.render_widget(
             Paragraph::new(format_message_lines(text))
                 .wrap(ratatui::widgets::Wrap { trim: false })
@@ -1386,8 +1444,26 @@ fn focus_action_slot(app: &mut TuiApp, slot: usize) {
 
 async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: bool) {
     if !app.ui.input_enabled {
+        if pending_deadline(app).is_some() && matches!(key, KeyCode::Enter | KeyCode::Esc) {
+            match app.screen {
+                Screen::PendingChange => interfaces::handle_pending_key(app, key, client).await,
+                Screen::RouterPending => router::handle_router_pending_key(app, key, client).await,
+                _ => {}
+            }
+            return;
+        }
         if matches!(key, KeyCode::Char('q') | KeyCode::Char('Q')) {
             app.should_quit = true;
+        }
+        return;
+    }
+    if key == KeyCode::F(4) {
+        app.help_open = !app.help_open;
+        return;
+    }
+    if app.help_open {
+        if key == KeyCode::Esc {
+            app.help_open = false;
         }
         return;
     }
@@ -1589,25 +1665,40 @@ fn format_addresses(status: &InterfaceStatus) -> Vec<Span<'static>> {
 
 /// Collect dashboard state from the daemon, retaining request failures as visible status.
 async fn load_daemon_dashboard(client: &ApiClient) -> DashboardData {
-    let interfaces = match client.request(&Request::ListInterfaces).await {
-        Ok(Response::Interfaces { interfaces }) => interfaces,
-        Ok(Response::Error { message }) => {
-            return DashboardData {
-                error: Some(message),
-                ..DashboardData::default()
-            }
+    let mut data = DashboardData::default();
+    let mut errors = Vec::new();
+    let (interfaces, pending, routes, vpn_enabled) = tokio::join!(
+        client.request(&Request::ListInterfaces),
+        client.request(&Request::PendingNetworkChanges),
+        client.request(&Request::ListRoutes {
+            include_local_table: false
+        }),
+        client.request(&Request::GetVpnConfig),
+    );
+    match interfaces {
+        Ok(Response::Interfaces { interfaces }) => {
+            data.interfaces = interfaces;
+            data.interfaces_updated = Some(Instant::now());
         }
-        Ok(response) => return unexpected_dashboard_response(response),
-        Err(error) => {
-            return DashboardData {
-                error: Some(error.to_string()),
-                ..DashboardData::default()
-            }
+        other => errors.push(format!("Interfaces unavailable: {other:?}")),
+    }
+    match pending {
+        Ok(Response::PendingNetworkChanges { changes }) => {
+            data.pending_network_changes = changes;
+            data.pending_known = true;
         }
-    };
-
+        other => errors.push(format!("Pending changes unavailable: {other:?}")),
+    }
+    match routes {
+        Ok(Response::Routes { routes }) => data.routes = Some(routes),
+        other => errors.push(format!("Routes unavailable: {other:?}")),
+    }
+    match vpn_enabled {
+        Ok(Response::VpnConfig { enabled }) => data.vpn_enabled = Some(enabled),
+        other => errors.push(format!("VPN configuration unavailable: {other:?}")),
+    }
     use futures_util::StreamExt;
-    let configs = futures_util::stream::iter(interfaces.iter().map(|status| async move {
+    let configs = futures_util::stream::iter(data.interfaces.iter().map(|status| async move {
         let name = status.interface.name.clone();
         let result = client
             .request(&Request::GetInterfaceConfig {
@@ -1619,119 +1710,33 @@ async fn load_daemon_dashboard(client: &ApiClient) -> DashboardData {
     .buffer_unordered(4)
     .collect::<Vec<_>>()
     .await;
-    let mut managed = std::collections::HashMap::new();
     for (name, result) in configs {
         match result {
             Ok(Response::InterfaceConfig { config, .. }) => {
-                managed.insert(name, config.is_some_and(|c| c.managed));
+                data.managed
+                    .insert(name.clone(), config.as_ref().is_some_and(|c| c.managed));
+                data.roles.insert(
+                    name,
+                    config.map_or(crate::config::InterfaceRole::None, |c| c.role),
+                );
             }
-            other => {
-                return DashboardData {
-                    interfaces,
-                    error: Some(format!(
-                        "Could not refresh interface configuration: {other:?}"
-                    )),
-                    ..DashboardData::default()
-                }
-            }
+            other => errors.push(format!(
+                "Interface configuration unavailable ({name}): {other:?}"
+            )),
         }
     }
-
-    let dhcp_interfaces = match client.request(&Request::DhcpStatus).await {
-        Ok(Response::DhcpStatus {
-            running_interfaces,
-            unhealthy_interfaces,
-        }) => {
-            if !unhealthy_interfaces.is_empty() {
-                return DashboardData {
-                    interfaces,
-                    managed,
-                    error: Some(format!(
-                        "DHCP unhealthy on: {}",
-                        unhealthy_interfaces.join(", ")
-                    )),
-                    ..DashboardData::default()
-                };
-            }
-            running_interfaces
+    if data.vpn_enabled == Some(true) {
+        match client.request(&Request::VpnPolicyStatus).await {
+            Ok(Response::VpnPolicyStatus { status }) => data.vpn_status = Some(status),
+            other => errors.push(format!("VPN tunnel/policy unavailable: {other:?}")),
         }
-        Ok(Response::Error { message }) => {
-            return DashboardData {
-                interfaces,
-                managed,
-                error: Some(message),
-                ..DashboardData::default()
-            }
-        }
-        Ok(response) => return unexpected_dashboard_response(response),
-        Err(error) => {
-            return DashboardData {
-                interfaces,
-                managed,
-                error: Some(error.to_string()),
-                ..DashboardData::default()
-            }
-        }
-    };
-
-    let pending_network_changes = match client.request(&Request::PendingNetworkChanges).await {
-        Ok(Response::PendingNetworkChanges { changes }) => changes,
-        Ok(Response::Error { message }) => {
-            return DashboardData {
-                interfaces,
-                managed,
-                dhcp_interfaces,
-                error: Some(message),
-                ..DashboardData::default()
-            }
-        }
-        Ok(response) => return unexpected_dashboard_response(response),
-        Err(error) => {
-            return DashboardData {
-                interfaces,
-                managed,
-                dhcp_interfaces,
-                error: Some(error.to_string()),
-                ..DashboardData::default()
-            }
-        }
-    };
-
-    let (dhcp_clients, dhcp_client_error) = match client.request(&Request::DhcpClientStatus).await {
-        Ok(Response::DhcpClientStatus { interfaces }) => (interfaces, None),
-        Ok(Response::DhcpClientError { detail }) => (Vec::new(), Some(format!("{detail:?}"))),
-        Ok(Response::Error { message }) => (Vec::new(), Some(message)),
-        Ok(response) => (
-            Vec::new(),
-            Some(format!("Unexpected daemon response: {response:?}")),
-        ),
-        Err(error) => (Vec::new(), Some(error.to_string())),
-    };
-
-    let vpn_enabled = match client.request(&Request::GetVpnConfig).await {
-        Ok(Response::VpnConfig { enabled }) => Some(enabled),
-        _ => None,
-    };
-
-    DashboardData {
-        interfaces,
-        managed,
-        dhcp_interfaces,
-        dhcp_clients,
-        dhcp_client_error,
-        vpn_enabled,
-        pending_network_changes,
-        pane_tabs: Vec::new(),
-        connections: dashboard::ConnectionStats::default(),
-        error: None,
     }
-}
-
-fn unexpected_dashboard_response(response: Response) -> DashboardData {
-    DashboardData {
-        error: Some(format!("Unexpected daemon response: {response:?}")),
-        ..DashboardData::default()
+    if errors.is_empty() {
+        data.last_success = Some(Instant::now());
+    } else {
+        data.error = Some(errors.join("\n"));
     }
+    data
 }
 
 /// Observe local network state for the direct-mode dashboard without daemon mutations.
@@ -1753,7 +1758,10 @@ async fn load_direct_dashboard(network: Option<&RtnetlinkNetworkProvider>) -> Da
         }
     };
 
-    let routes = network.list_ipv4_routes().await.unwrap_or_default();
+    let (routes, route_error) = match network.list_ipv4_routes().await {
+        Ok(routes) => (routes, None),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    };
     let mut statuses = Vec::new();
     for interface in interfaces {
         match network.list_ipv4_addresses(&interface.name).await {
@@ -1776,17 +1784,23 @@ async fn load_direct_dashboard(network: Option<&RtnetlinkNetworkProvider>) -> Da
         }
     }
 
+    let route_statuses = routes
+        .iter()
+        .map(|route| {
+            let name = statuses
+                .iter()
+                .find(|s| Some(s.interface.index) == route.output_interface_index)
+                .map(|s| s.interface.name.clone());
+            crate::api::model::RouteStatus::from_info(route, name)
+        })
+        .collect();
     DashboardData {
         interfaces: statuses,
-        managed: std::collections::HashMap::new(),
-        dhcp_interfaces: Vec::new(),
-        dhcp_clients: Vec::new(),
-        dhcp_client_error: None,
-        vpn_enabled: None,
-        pending_network_changes: Vec::new(),
-        pane_tabs: Vec::new(),
-        connections: dashboard::ConnectionStats::default(),
-        error: None,
+        routes: route_error.is_none().then_some(route_statuses),
+        interfaces_updated: Some(Instant::now()),
+        last_success: route_error.is_none().then(Instant::now),
+        error: route_error,
+        ..Default::default()
     }
 }
 
