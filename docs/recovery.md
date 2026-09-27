@@ -429,3 +429,19 @@ following:
   deleted;
 - the preserved backup remains available until network behavior and committed
   configuration have been checked.
+
+<a id="tm-rec-209"></a>
+## TM-REC-209: commit outcome is indeterminate
+
+The override replacement failed and restoring its previous contents also failed.
+The file may contain the new commit token while the running daemon still holds
+its previous revision. The daemon blocks configuration writes, network mutations,
+confirmation and rollback, including timer and shutdown rollback. Shutdown preserves
+interface and dataplane ownership for startup recovery.
+
+Repair storage access, then restart the daemon. Keep the complete state directory;
+do not delete a transaction journal or replace an individual override file.
+Startup reloads the persisted commit proof: a matching token retains the committed
+change; an uncommitted journal is rolled back. Unreadable or invalid proof continues
+to block the affected recovery scope. A failed commit response in this state does
+not establish whether the configuration was committed.

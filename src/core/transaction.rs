@@ -36,7 +36,12 @@ pub struct PendingNetworkChange {
     pub token: String,
     pub interface: String,
     pub rollback_timeout_seconds: u64,
+    /// Advisory wall-clock display time; rollback waits for admitted operations.
     pub expires_at_unix: u64,
+    #[serde(default)]
+    pub phase: NetworkChangePhase,
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -245,6 +250,7 @@ async fn recover_interface_transactions_with_tokens(
     committed: &std::collections::BTreeMap<String, String>,
     excluded: &std::collections::BTreeSet<String>,
 ) -> Result<()> {
+    crate::core::recovery::check_commit(state_dir)?;
     let store = open_interface_recovery_store(state_dir).await?;
     let names = enumerate_interface_recovery_journals(state_dir, &store).await?;
     recover_interface_journals(state_dir, manager, committed, &store, names, excluded).await;
@@ -257,6 +263,7 @@ pub(crate) async fn retry_interface_recovery(
     manager: &InterfaceManager,
     committed: &crate::state::overrides::RuntimeOverrides,
 ) -> Result<()> {
+    crate::core::recovery::check_commit(state_dir)?;
     let names = crate::core::recovery::retryable_blocked_interfaces(state_dir);
     if names.is_empty() {
         return Ok(());
@@ -374,10 +381,23 @@ struct Inner {
     desired: std::sync::Mutex<DesiredNetworkState>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PendingPhase {
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkChangePhase {
+    #[default]
     AwaitingCommit,
     RollbackRequired,
+    CommitIndeterminate,
+}
+
+impl PendingNetworkChange {
+    pub fn can_commit(&self) -> bool {
+        self.phase == NetworkChangePhase::AwaitingCommit
+    }
+
+    pub fn can_rollback(&self) -> bool {
+        self.phase != NetworkChangePhase::CommitIndeterminate
+    }
 }
 
 #[derive(Clone)]
@@ -385,7 +405,6 @@ struct PendingTransaction {
     info: PendingNetworkChange,
     target: InterfaceConfig,
     allow_management_change: bool,
-    phase: PendingPhase,
     snapshot: InterfaceSnapshot,
     previous_config: Option<InterfaceConfig>,
     secret: Option<SecretSnapshot>,
@@ -756,6 +775,8 @@ impl NetworkTransactionManager {
                     interface: interface.to_string(),
                     rollback_timeout_seconds,
                     expires_at_unix: current_unix_time().saturating_add(rollback_timeout_seconds),
+                    phase: NetworkChangePhase::RollbackRequired,
+                    last_error: Some(format!("apply: {error:#}; rollback: {rollback_error:#}")),
                 };
                 self.inner.pending.lock().await.insert(
                     token.clone(),
@@ -763,7 +784,6 @@ impl NetworkTransactionManager {
                         info,
                         target: config.clone(),
                         allow_management_change,
-                        phase: PendingPhase::RollbackRequired,
                         snapshot: snapshot.clone(),
                         previous_config: previous_config.clone(),
                         secret: secret.clone(),
@@ -787,6 +807,8 @@ impl NetworkTransactionManager {
             interface: interface.to_string(),
             rollback_timeout_seconds,
             expires_at_unix: current_unix_time().saturating_add(rollback_timeout_seconds),
+            phase: NetworkChangePhase::AwaitingCommit,
+            last_error: None,
         };
 
         self.inner.pending.lock().await.insert(
@@ -795,7 +817,6 @@ impl NetworkTransactionManager {
                 info: info.clone(),
                 target: config.clone(),
                 allow_management_change,
-                phase: PendingPhase::AwaitingCommit,
                 snapshot,
                 previous_config,
                 secret,
@@ -879,13 +900,14 @@ impl NetworkTransactionManager {
             Some(gate) => Some(gate.execute().await),
             None => None,
         };
+        crate::core::recovery::check_commit(self.desired().state_dir())?;
         let (interface, target, allow_management_change) = {
             let pending = self.inner.pending.lock().await;
             let pending = pending
                 .get(token)
                 .ok_or_else(|| anyhow::anyhow!("pending network change not found: {token}"))?;
             anyhow::ensure!(
-                pending.phase == PendingPhase::AwaitingCommit,
+                pending.info.can_commit(),
                 "network change {token} failed during apply and is rollback-only"
             );
             (
@@ -895,7 +917,19 @@ impl NetworkTransactionManager {
             )
         };
 
-        persist(interface.clone(), target, allow_management_change).await?;
+        if let Err(error) = persist(interface.clone(), target, allow_management_change).await {
+            let mut pending = self.inner.pending.lock().await;
+            let entry = pending.get_mut(token).expect("operation lock held");
+            entry.info.last_error = Some(format!("{error:#}"));
+            if crate::atomic_file::is_indeterminate_write(&error) {
+                crate::core::recovery::fence_commit(
+                    self.desired().state_dir(),
+                    format!("{error:#}"),
+                );
+                entry.info.phase = NetworkChangePhase::CommitIndeterminate;
+            }
+            return Err(error);
+        }
 
         // Only once the override carries the change: withdrawing the tentative
         // layer first would make the desired state briefly describe the old
@@ -925,12 +959,13 @@ impl NetworkTransactionManager {
     /// is rollback-only and remains journaled and visible until a retry succeeds.
     pub async fn rollback(&self, token: &str) -> Result<PendingNetworkChange> {
         let _operation = self.inner.operation_lock.lock().await;
+        crate::core::recovery::check_commit(self.desired().state_dir())?;
         let pending = {
             let mut pending = self.inner.pending.lock().await;
             let entry = pending
                 .get_mut(token)
                 .ok_or_else(|| anyhow::anyhow!("pending network change not found: {token}"))?;
-            entry.phase = PendingPhase::RollbackRequired;
+            entry.info.phase = NetworkChangePhase::RollbackRequired;
             entry.clone()
         };
         tracing::info!(
@@ -970,6 +1005,14 @@ impl NetworkTransactionManager {
             Err(error) => Err(error),
         };
         if let Err(error) = restoration {
+            self.inner
+                .pending
+                .lock()
+                .await
+                .get_mut(token)
+                .expect("operation lock held")
+                .info
+                .last_error = Some(format!("{error:#}"));
             // Keep both the pending record and recovery journal. The desired
             // state already points back at the committed configuration, so a
             // later retry only needs to verify convergence; reporting success
@@ -980,7 +1023,17 @@ impl NetworkTransactionManager {
             );
         }
 
-        self.clear_journal(&pending.info.interface).await?;
+        if let Err(error) = self.clear_journal(&pending.info.interface).await {
+            self.inner
+                .pending
+                .lock()
+                .await
+                .get_mut(token)
+                .expect("operation lock held")
+                .info
+                .last_error = Some(format!("{error:#}"));
+            return Err(error);
+        }
         desired.withdraw(token).await;
         self.inner.pending.lock().await.remove(token);
         Ok(pending.info)
@@ -1006,8 +1059,10 @@ impl NetworkTransactionManager {
     /// Roll back pending changes, then restore startup interface snapshots in reverse name order.
     /// Continue after individual failures and return their combined errors.
     pub async fn restore_baselines(&self) -> Result<()> {
+        crate::core::recovery::check_commit(self.desired().state_dir())?;
         let rollback_error = self.rollback_all_pending().await.err();
         let _operation = self.inner.operation_lock.lock().await;
+        crate::core::recovery::check_commit(self.desired().state_dir())?;
         let mut baselines: Vec<_> = self
             .inner
             .baselines
@@ -1046,6 +1101,12 @@ impl NetworkTransactionManager {
             .values()
             .map(|pending| pending.info.clone())
             .collect();
+        if let Some(error) = crate::core::recovery::commit_uncertainty(self.desired().state_dir()) {
+            for change in &mut pending {
+                change.phase = NetworkChangePhase::CommitIndeterminate;
+                change.last_error = Some(error.clone());
+            }
+        }
         pending.sort_by(|left, right| left.token.cmp(&right.token));
         pending
     }
@@ -1113,6 +1174,9 @@ impl NetworkTransactionManager {
                     Some(gate) => Some(gate.admit().await),
                     None => None,
                 };
+                if crate::core::recovery::check_commit(manager.desired().state_dir()).is_err() {
+                    return;
+                }
                 if !manager.inner.pending.lock().await.contains_key(&token) {
                     return;
                 }

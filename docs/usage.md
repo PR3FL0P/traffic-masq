@@ -450,8 +450,10 @@ The daemon can manage:
 
 Interface and router changes use **Apply → Commit** transactions. Apply brings
 the machine to the requested state and starts a timer, 60 seconds by default.
-Committing within that window keeps the change; letting the timer expire
-returns the interface/router state to the previous committed configuration.
+Committing within that window keeps the change. Expiry schedules rollback to the
+previous committed configuration; rollback waits for already admitted operations
+and may need retries. An already admitted confirmation can finish after the
+displayed expiry. Inspect pending state to learn the outcome.
 
 Low-level DHCP, Wi-Fi and VPN operations are different: they take effect
 immediately and do not have an interface/router confirmation timer. Those
@@ -461,7 +463,10 @@ on startup. This lets recovery remove only traffic-masq-owned crash residue
 without treating foreign processes, leases or interfaces as its own.
 
 If an interface/router change cuts off your connection, the daemon rolls it
-back locally when the timer expires. The daemon must still be running for the
+back locally after the timer expires and admitted operations finish. If commit
+persistence and its compensation both fail, rollback is blocked until storage is
+repaired and the daemon is restarted; see [TM-REC-209](recovery.md#tm-rec-209).
+The daemon must still be running for the
 timer to fire; after a crash, recovery runs on restart. Immediate DHCP/Wi-Fi/VPN
 operations also run their ownership recovery during startup. See
 [recovery](../SECURITY.md#rollback-and-recovery) and the

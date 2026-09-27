@@ -6,6 +6,21 @@ fn router_recovery_notice(
     status: CoordinatorStatus,
     failures: Vec<String>,
 ) -> Option<RouterRecoveryNotice> {
+    if status == CoordinatorStatus::CommitIndeterminate {
+        return Some(RouterRecoveryNotice {
+            recovery_code: RecoveryCode::CommitIndeterminate.as_str().to_owned(),
+            invariant: RecoveryCode::CommitIndeterminate.invariant().to_owned(),
+            summary: "Commit persistence and compensation failed; the durable outcome is unknown."
+                .to_owned(),
+            blocked_operation: "mutations, confirmation and rollback".to_owned(),
+            operator_action: RecoveryAction::RepairStorageAndRestart.as_str().to_owned(),
+            operator_guidance: RecoveryAction::RepairStorageAndRestart
+                .guidance()
+                .to_owned(),
+            runbook: RecoveryCode::CommitIndeterminate.runbook_ref().to_owned(),
+            failures,
+        });
+    }
     let (code, action, summary) = match status {
         CoordinatorStatus::RollbackFailed => (
             RecoveryCode::RouterRollbackFailed,
@@ -17,7 +32,9 @@ fn router_recovery_notice(
             RecoveryAction::AwaitCleanup,
             "Router recovery completed, but journal cleanup is still pending.",
         ),
-        CoordinatorStatus::Idle | CoordinatorStatus::Pending => return None,
+        CoordinatorStatus::Idle
+        | CoordinatorStatus::Pending
+        | CoordinatorStatus::CommitIndeterminate => return None,
     };
 
     Some(RouterRecoveryNotice {
@@ -351,6 +368,7 @@ impl ControlService {
                 return provisioning_error(RouterProvisioningErrorDetail::TransactionPending);
             }
             CoordinatorStatus::RollbackFailed
+            | CoordinatorStatus::CommitIndeterminate
             | CoordinatorStatus::RecoveredButJournalCleanupPending => {
                 return provisioning_error(RouterProvisioningErrorDetail::RollbackRecoveryRequired);
             }
@@ -657,7 +675,8 @@ impl ControlService {
         let ready = desired.enabled && readiness.ready() && !unconfigured;
         let stage = match status {
             CoordinatorStatus::RollbackFailed => ProvisioningStage::RollbackFailed,
-            CoordinatorStatus::RecoveredButJournalCleanupPending => ProvisioningStage::Degraded,
+            CoordinatorStatus::RecoveredButJournalCleanupPending
+            | CoordinatorStatus::CommitIndeterminate => ProvisioningStage::Degraded,
             CoordinatorStatus::Pending => ProvisioningStage::AwaitingConfirmation,
             CoordinatorStatus::Idle if unconfigured => ProvisioningStage::Unconfigured,
             CoordinatorStatus::Idle if !desired.enabled => ProvisioningStage::Inactive,
@@ -849,6 +868,9 @@ impl ControlService {
             tokio::time::sleep(timeout).await;
             let _network_mutation = network_mutations.write().await;
 
+            if crate::core::recovery::check_commit(&state_dir).is_err() {
+                return;
+            }
             // Race safely with the coordinator's own timer/commit path. Both
             // router operations serialize on the coordinator state lock.
             let committed = overrides
@@ -983,6 +1005,21 @@ pub(super) fn classify_router_error(error: anyhow::Error) -> Response {
 #[cfg(test)]
 mod recovery_notice_tests {
     use super::*;
+
+    #[test]
+    fn uncertain_commit_notice_requires_storage_repair_and_restart() {
+        let notice = router_recovery_notice(
+            CoordinatorStatus::CommitIndeterminate,
+            vec!["I/O failed".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            notice.known_action(),
+            Some(RecoveryAction::RepairStorageAndRestart)
+        );
+        assert_eq!(notice.known_code(), Some(RecoveryCode::CommitIndeterminate));
+        assert!(notice.blocked_operation.contains("rollback"));
+    }
 
     #[test]
     fn rollback_failed_notice_is_actionable() {

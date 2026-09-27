@@ -175,6 +175,13 @@ pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &A
 async fn handle_router_recovery_action(app: &mut TuiApp, client: &ApiClient) {
     match client.request(&Request::RouterPendingTransaction).await {
         Ok(Response::RouterPendingTransaction {
+            status: CoordinatorStatus::CommitIndeterminate,
+            ..
+        }) => {
+            app.push_message(LogLevel::Error, "Commit outcome is unknown. Repair storage access and restart the daemon; rollback is blocked.");
+            load_router_data(app, client).await;
+        }
+        Ok(Response::RouterPendingTransaction {
             token: Some(token),
             status: CoordinatorStatus::RollbackFailed,
             recovery,

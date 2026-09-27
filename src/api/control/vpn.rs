@@ -264,6 +264,7 @@ impl ControlService {
             match router.status().await {
                 crate::core::router_transaction::CoordinatorStatus::Idle => {}
                 crate::core::router_transaction::CoordinatorStatus::Pending
+                | crate::core::router_transaction::CoordinatorStatus::CommitIndeterminate
                 | crate::core::router_transaction::CoordinatorStatus::RollbackFailed | crate::core::router_transaction::CoordinatorStatus::RecoveredButJournalCleanupPending => {
                     return vpn_policy_error(VpnPolicyErrorDetail::Other {
                         message: "a router transaction is pending; refusing to change VPN mode \
@@ -296,6 +297,11 @@ impl ControlService {
             return response;
         }
         if let Err(error) = self.overrides.set_vpn_mode(mode).await {
+            if crate::atomic_file::is_indeterminate_write(&error) {
+                return vpn_policy_error(VpnPolicyErrorDetail::Other {
+                    message: format!("{error:#}"),
+                });
+            }
             let rollback = policy.rollback(&rollback_desired, &snapshot).await;
             return vpn_policy_error(VpnPolicyErrorDetail::Other {
                 message: compensation_message(
@@ -339,6 +345,11 @@ impl ControlService {
             return response;
         }
         if let Err(error) = self.overrides.clear_vpn_mode().await {
+            if crate::atomic_file::is_indeterminate_write(&error) {
+                return vpn_policy_error(VpnPolicyErrorDetail::Other {
+                    message: format!("{error:#}"),
+                });
+            }
             let rollback = policy.rollback(&rollback_desired, &snapshot).await;
             return vpn_policy_error(VpnPolicyErrorDetail::Other {
                 message: compensation_message(

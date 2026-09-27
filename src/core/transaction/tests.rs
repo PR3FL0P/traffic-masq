@@ -467,7 +467,13 @@ async fn failed_commit_persistence_keeps_change_pending_for_rollback() {
         .expect_err("commit must fail");
 
     assert!(error.to_string().contains("persistence failed"));
-    assert_eq!(manager.pending().await, vec![change.clone()]);
+    let status = manager.pending().await;
+    assert_eq!(status[0].phase, NetworkChangePhase::AwaitingCommit);
+    assert!(status[0]
+        .last_error
+        .as_deref()
+        .unwrap()
+        .contains("persistence failed"));
     manager
         .rollback(&change.token)
         .await
@@ -752,7 +758,12 @@ async fn rollback_publishes_restore_intent_even_when_secret_restore_fails() {
             .ipv4,
         Some(COMMITTED.parse().expect("network"))
     );
-    assert_eq!(manager.pending().await, vec![pending.clone()]);
+    let status = manager.pending().await;
+    assert_eq!(status[0].token, pending.token);
+    assert_eq!(status[0].phase, NetworkChangePhase::RollbackRequired);
+    assert!(status[0].last_error.is_some());
+    assert!(!status[0].can_commit());
+    assert!(status[0].can_rollback());
     let commit_error = manager
         .commit(&pending.token)
         .await
@@ -990,8 +1001,10 @@ async fn automatic_rollback_retries_after_converger_recovers() {
     desired.fail_converger("temporary failure");
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if manager.inner.pending.lock().await[&pending.token].phase
-                == PendingPhase::RollbackRequired
+            if manager.inner.pending.lock().await[&pending.token]
+                .info
+                .phase
+                == NetworkChangePhase::RollbackRequired
             {
                 break;
             }
@@ -1024,4 +1037,74 @@ async fn automatic_rollback_retries_after_converger_recovers() {
         .join("interface-transactions/test0.json")
         .exists());
     converger.abort();
+}
+
+#[tokio::test]
+async fn indeterminate_commit_blocks_manual_timer_and_shutdown_rollback() {
+    let directory = tempdir().unwrap();
+    let store = crate::state::overrides::RuntimeOverrideStore::in_state_dir(directory.path());
+    store.save(&Default::default()).await.unwrap();
+    let desired = desired_state(directory.path()).await;
+    let provider = fake_network();
+    let converger = spawn_converger(desired.clone(), provider.clone());
+    let manager = NetworkTransactionManager::new(
+        InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory()),
+        Duration::from_secs(60),
+        desired.clone(),
+    );
+    let pending = manager
+        .apply("test0", &interface_config(PROPOSED), None, false)
+        .await
+        .unwrap();
+    let applied = addresses(&provider).await;
+    crate::atomic_file::fail_replacement_and_compensation(store.path());
+    let error = manager.commit(&pending.token).await.unwrap_err();
+    assert!(crate::atomic_file::is_indeterminate_write(&error));
+    assert_eq!(
+        store
+            .load()
+            .await
+            .unwrap()
+            .committed_interface_transactions
+            .get("test0"),
+        Some(&pending.token)
+    );
+    assert!(desired
+        .committed_overrides()
+        .await
+        .committed_interface_transactions
+        .get("test0")
+        .is_none());
+    assert!(manager.commit(&pending.token).await.is_err());
+    assert!(manager.rollback(&pending.token).await.is_err());
+    assert!(manager.restore_baselines().await.is_err());
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(61)).await;
+    tokio::task::yield_now().await;
+    let status = manager.pending().await;
+    assert_eq!(status[0].phase, NetworkChangePhase::CommitIndeterminate);
+    assert!(status[0].last_error.is_some());
+    assert!(!status[0].can_commit());
+    assert!(!status[0].can_rollback());
+    assert_eq!(addresses(&provider).await, applied);
+    assert!(directory
+        .path()
+        .join("interface-transactions/test0.json")
+        .exists());
+    assert!(crate::core::recovery::check_scope(directory.path(), Some("other0")).is_err());
+    converger.abort();
+}
+
+#[test]
+fn old_pending_response_defaults_to_awaiting_confirmation() {
+    let info: PendingNetworkChange = serde_json::from_str(
+        r#"{
+        "token":"old", "interface":"test0", "rollback_timeout_seconds":60,
+        "expires_at_unix":123
+    }"#,
+    )
+    .unwrap();
+    assert!(info.can_commit());
+    assert!(info.can_rollback());
+    assert_eq!(info.last_error, None);
 }

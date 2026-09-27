@@ -83,6 +83,7 @@ impl RouterData {
                 self.coordinator_status,
                 Some(
                     CoordinatorStatus::RollbackFailed
+                        | CoordinatorStatus::CommitIndeterminate
                         | CoordinatorStatus::RecoveredButJournalCleanupPending
                 )
             )
@@ -252,6 +253,12 @@ pub(crate) struct RouterPendingView {
 }
 
 impl RouterPendingView {
+    pub(crate) fn commit_indeterminate(&self) -> bool {
+        self.recovery
+            .as_ref()
+            .is_some_and(|notice| notice.invariant == "commit_indeterminate")
+    }
+
     pub(crate) fn recovery_required(&self) -> bool {
         self.recovery.is_some() || self.rollback_failure.is_some()
     }

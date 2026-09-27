@@ -33,10 +33,12 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
                 .fg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
-        Line::from(if recovery_required {
+        Line::from(if view.commit_indeterminate() {
+            "Commit outcome unknown; mutations and rollback are blocked".to_owned()
+        } else if recovery_required {
             "Rollback failed; new router transactions are blocked".to_owned()
         } else {
-            format!("Automatic rollback in: {remaining}s / {timeout}s")
+            format!("Rollback scheduled in: {remaining}s / {timeout}s")
         }),
     ];
     if let Some(recovery) = &view.recovery {
@@ -108,7 +110,12 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
         chunks[1],
     );
 
-    let action_lines = if recovery_required {
+    let action_lines = if view.commit_indeterminate() {
+        vec![
+            Line::from("Repair storage access and restart the daemon"),
+            Line::from("[Back] (Esc)"),
+        ]
+    } else if recovery_required {
         vec![
             Line::styled(
                 "[Retry rollback]  retry recovery (Enter)",
@@ -148,7 +155,12 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
             ),
         ]
     };
-    if recovery_required {
+    if view.commit_indeterminate() {
+        app.ui.buttons.push((
+            Rect::new(chunks[2].x, chunks[2].y.saturating_add(1), 6, 1),
+            1,
+        ));
+    } else if recovery_required {
         app.ui.buttons.push((
             Rect::new(chunks[2].x, chunks[2].y, "[Retry rollback]".len() as u16, 1),
             0,
@@ -249,6 +261,10 @@ async fn finish_router_pending(app: &mut TuiApp, client: &ApiClient, commit: boo
         app.screen = Screen::Router;
         return;
     };
+    if pending.commit_indeterminate() {
+        app.push_message(LogLevel::Error, "Commit outcome is unknown. Repair storage access and restart the daemon; rollback is blocked.");
+        return;
+    }
     let token = pending.token.clone();
     let request = if commit {
         Request::RouterCommit { token }
@@ -286,7 +302,7 @@ async fn finish_router_pending(app: &mut TuiApp, client: &ApiClient, commit: boo
             }
         }
         Ok(Response::RouterPendingTransaction {
-            status: CoordinatorStatus::RollbackFailed,
+            status: CoordinatorStatus::RollbackFailed | CoordinatorStatus::CommitIndeterminate,
             rollback_failure,
             recovery,
             ..
@@ -325,7 +341,7 @@ pub(crate) async fn refresh_router_pending_screen(app: &mut TuiApp, client: &Api
             }
         }
         Ok(Response::RouterPendingTransaction {
-            status: CoordinatorStatus::RollbackFailed,
+            status: CoordinatorStatus::RollbackFailed | CoordinatorStatus::CommitIndeterminate,
             rollback_failure,
             recovery,
             ..

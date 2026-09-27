@@ -115,6 +115,11 @@ impl ControlService {
             .set_interface(interface.clone(), interface_config, false)
             .await
         {
+            if crate::atomic_file::is_indeterminate_write(&error) {
+                return dhcp_client_error(DhcpClientErrorDetail::PersistenceFailure {
+                    message: format!("{error:#}"),
+                });
+            }
             let restoration =
                 restore_dhcp_client(supervisor, &interface, previous, link_ready).await;
             return dhcp_client_error(DhcpClientErrorDetail::PersistenceFailure {
@@ -189,6 +194,11 @@ impl ControlService {
             .set_interface(interface.clone(), config, false)
             .await
         {
+            if crate::atomic_file::is_indeterminate_write(&error) {
+                return dhcp_client_error(DhcpClientErrorDetail::PersistenceFailure {
+                    message: format!("{error:#}"),
+                });
+            }
             let restoration =
                 restore_dhcp_client(supervisor, &interface, previous, link_ready).await;
             return dhcp_client_error(DhcpClientErrorDetail::PersistenceFailure {

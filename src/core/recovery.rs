@@ -21,6 +21,7 @@ pub enum RecoveryCode {
     RevisionOrder,
     RouterRollbackFailed,
     RouterJournalCleanupPending,
+    CommitIndeterminate,
     RestoreProvisioningSecrets,
     ValidProvisioningSecretSnapshot,
     SupportedProvisioningSecretSchema,
@@ -37,6 +38,7 @@ impl RecoveryCode {
         Self::RevisionOrder,
         Self::RouterRollbackFailed,
         Self::RouterJournalCleanupPending,
+        Self::CommitIndeterminate,
         Self::RestoreProvisioningSecrets,
         Self::ValidProvisioningSecretSnapshot,
         Self::SupportedProvisioningSecretSchema,
@@ -53,6 +55,7 @@ impl RecoveryCode {
             Self::RevisionOrder => "TM-REC-206",
             Self::RouterRollbackFailed => "TM-REC-207",
             Self::RouterJournalCleanupPending => "TM-REC-208",
+            Self::CommitIndeterminate => "TM-REC-209",
             Self::RestoreProvisioningSecrets => "TM-REC-301",
             Self::ValidProvisioningSecretSnapshot => "TM-REC-302",
             Self::SupportedProvisioningSecretSchema => "TM-REC-303",
@@ -70,6 +73,7 @@ impl RecoveryCode {
             "TM-REC-206" => Self::RevisionOrder,
             "TM-REC-207" => Self::RouterRollbackFailed,
             "TM-REC-208" => Self::RouterJournalCleanupPending,
+            "TM-REC-209" => Self::CommitIndeterminate,
             "TM-REC-301" => Self::RestoreProvisioningSecrets,
             "TM-REC-302" => Self::ValidProvisioningSecretSnapshot,
             "TM-REC-303" => Self::SupportedProvisioningSecretSchema,
@@ -88,6 +92,7 @@ impl RecoveryCode {
             Self::RevisionOrder => "revision_order",
             Self::RouterRollbackFailed => "router_rollback_failed",
             Self::RouterJournalCleanupPending => "router_journal_cleanup_pending",
+            Self::CommitIndeterminate => "commit_indeterminate",
             Self::RestoreProvisioningSecrets => "restore_provisioning_secrets",
             Self::ValidProvisioningSecretSnapshot => "valid_provisioning_secret_snapshot",
             Self::SupportedProvisioningSecretSchema => "supported_provisioning_secret_schema",
@@ -97,7 +102,9 @@ impl RecoveryCode {
     pub const fn is_startup_blocking(self) -> bool {
         !matches!(
             self,
-            Self::RouterRollbackFailed | Self::RouterJournalCleanupPending
+            Self::RouterRollbackFailed
+                | Self::RouterJournalCleanupPending
+                | Self::CommitIndeterminate
         )
     }
 
@@ -112,6 +119,7 @@ impl RecoveryCode {
             Self::RevisionOrder => "docs/recovery.md#tm-rec-206",
             Self::RouterRollbackFailed => "docs/recovery.md#tm-rec-207",
             Self::RouterJournalCleanupPending => "docs/recovery.md#tm-rec-208",
+            Self::CommitIndeterminate => "docs/recovery.md#tm-rec-209",
             Self::RestoreProvisioningSecrets => "docs/recovery.md#tm-rec-301",
             Self::ValidProvisioningSecretSnapshot => "docs/recovery.md#tm-rec-302",
             Self::SupportedProvisioningSecretSchema => "docs/recovery.md#tm-rec-303",
@@ -183,6 +191,7 @@ impl std::fmt::Display for RecoveryCode {
 pub enum RecoveryAction {
     InspectRecoveryState,
     RepairStorageAccess,
+    RepairStorageAndRestart,
     RestoreCoherentBackup,
     RetryRollback,
     AwaitCleanup,
@@ -194,6 +203,7 @@ impl RecoveryAction {
         match self {
             Self::InspectRecoveryState => "inspect_recovery_state",
             Self::RepairStorageAccess => "repair_storage_access",
+            Self::RepairStorageAndRestart => "repair_storage_and_restart",
             Self::RestoreCoherentBackup => "restore_coherent_backup",
             Self::RetryRollback => "retry_rollback",
             Self::AwaitCleanup => "await_cleanup",
@@ -205,6 +215,9 @@ impl RecoveryAction {
         match self {
             Self::InspectRecoveryState => {
                 "preserve recovery metadata and inspect the nested recovery diagnostic before changing state"
+            }
+            Self::RepairStorageAndRestart => {
+                "repair storage access, then restart the daemon to resolve persisted commit proof; preserve the complete state directory"
             }
             Self::RepairStorageAccess => {
                 "preserve recovery metadata and repair the reported path type permissions or storage access"
@@ -232,6 +245,7 @@ impl std::str::FromStr for RecoveryAction {
         Ok(match value {
             "inspect_recovery_state" => Self::InspectRecoveryState,
             "repair_storage_access" => Self::RepairStorageAccess,
+            "repair_storage_and_restart" => Self::RepairStorageAndRestart,
             "restore_coherent_backup" => Self::RestoreCoherentBackup,
             "retry_rollback" => Self::RetryRollback,
             "await_cleanup" | "retry_cleanup" => Self::AwaitCleanup,
@@ -638,7 +652,38 @@ pub fn unblock_interface(root: &Path, interface: &str) {
     }
 }
 
+// A failed commit must never be compensated using an obsolete in-memory revision.
+// This fence lasts for the process lifetime. Startup independently reloads the
+// authoritative document and commit tokens after storage access is repaired.
+fn uncertain_commits() -> &'static Mutex<BTreeMap<PathBuf, String>> {
+    static COMMITS: OnceLock<Mutex<BTreeMap<PathBuf, String>>> = OnceLock::new();
+    COMMITS.get_or_init(Default::default)
+}
+
+pub(crate) fn fence_commit(root: &Path, reason: String) {
+    uncertain_commits()
+        .lock()
+        .expect("commit fence lock")
+        .insert(root.to_owned(), reason);
+}
+
+pub(crate) fn commit_uncertainty(root: &Path) -> Option<String> {
+    uncertain_commits()
+        .lock()
+        .expect("commit fence lock")
+        .get(root)
+        .cloned()
+}
+
+pub(crate) fn check_commit(root: &Path) -> Result<()> {
+    if let Some(reason) = commit_uncertainty(root) {
+        anyhow::bail!("state=commit_indeterminate; mutations and rollback blocked; repair storage access and restart the daemon to resolve persisted commit proof: {reason}");
+    }
+    Ok(())
+}
+
 pub fn check_scope(root: &Path, interface: Option<&str>) -> Result<()> {
+    check_commit(root)?;
     let cleanup = pending().lock().expect("recovery housekeeping lock");
     for path in cleanup.keys().filter(|path| path.starts_with(root)) {
         let scoped = path.parent() == Some(root.join("interface-transactions").as_path());
@@ -782,6 +827,7 @@ mod tests {
                 ("TM-REC-206", "revision_order"),
                 ("TM-REC-207", "router_rollback_failed"),
                 ("TM-REC-208", "router_journal_cleanup_pending"),
+                ("TM-REC-209", "commit_indeterminate"),
                 ("TM-REC-301", "restore_provisioning_secrets"),
                 ("TM-REC-302", "valid_provisioning_secret_snapshot"),
                 ("TM-REC-303", "supported_provisioning_secret_schema"),
@@ -819,8 +865,8 @@ mod tests {
             );
         }
 
-        assert_eq!(codes.len(), 12);
-        assert_eq!(invariants.len(), 12);
+        assert_eq!(codes.len(), 13);
+        assert_eq!(invariants.len(), 13);
         assert_eq!(RecoveryCode::from_code("TM-REC-999"), None);
     }
 
@@ -829,7 +875,9 @@ mod tests {
         for code in RecoveryCode::ALL {
             let expected = !matches!(
                 code,
-                RecoveryCode::RouterRollbackFailed | RecoveryCode::RouterJournalCleanupPending
+                RecoveryCode::RouterRollbackFailed
+                    | RecoveryCode::RouterJournalCleanupPending
+                    | RecoveryCode::CommitIndeterminate
             );
             assert_eq!(code.is_startup_blocking(), expected, "{code}");
         }

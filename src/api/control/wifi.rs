@@ -115,6 +115,11 @@ impl ControlService {
             .set_interface(interface.clone(), interface_config, false)
             .await
         {
+            if crate::atomic_file::is_indeterminate_write(&error) {
+                return wifi_error(WifiErrorDetail::Other {
+                    message: format!("{error:#}"),
+                });
+            }
             let restoration = match previous {
                 Some(previous) => wifi.configure(previous).await.map(|_| ()),
                 None => wifi.disable(&interface).await.map(|_| ()),
@@ -300,6 +305,11 @@ impl ControlService {
                 .set_interface(interface.clone(), interface_config, false)
                 .await
             {
+                if crate::atomic_file::is_indeterminate_write(&error) {
+                    return wifi_error(WifiErrorDetail::Other {
+                        message: format!("{error:#}"),
+                    });
+                }
                 let restoration = match previous {
                     Some(previous) => wifi.configure(previous).await.map(|_| ()),
                     None => Ok(()),

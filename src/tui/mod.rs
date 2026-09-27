@@ -663,16 +663,20 @@ async fn run_loop(
 // Reads may be cancelled to prioritize input. Actions are never cancelled or
 // retried: a lost response does not imply that a mutation was not applied.
 fn pending_deadline(app: &TuiApp) -> Option<u64> {
-    app.pending.as_ref().map(|p| p.expires_at_unix).or_else(|| {
-        app.router_pending
-            .as_ref()
-            .filter(|pending| !pending.recovery_required())
-            .map(|pending| {
-                pending
-                    .applied_at_unix
-                    .saturating_add(app.router_rollback_timeout_seconds)
-            })
-    })
+    app.pending
+        .as_ref()
+        .filter(|p| p.can_commit())
+        .map(|p| p.expires_at_unix)
+        .or_else(|| {
+            app.router_pending
+                .as_ref()
+                .filter(|pending| !pending.recovery_required())
+                .map(|pending| {
+                    pending
+                        .applied_at_unix
+                        .saturating_add(app.router_rollback_timeout_seconds)
+                })
+        })
 }
 
 async fn drive_ui(
@@ -1303,6 +1307,20 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp, direct: bool) {
     frame.render_widget(ratatui::widgets::Clear, area);
     app.ui = UiLayout::default();
     if area.width < MIN_TERMINAL_WIDTH || area.height < MIN_TERMINAL_HEIGHT {
+        let recovery_hint = app.pending.as_ref().filter(|change| !change.can_commit()).map(|change| {
+            if change.can_rollback() { "Rollback recovery required. Esc: retry rollback. Q: exit." }
+            else { "Commit outcome unknown. Repair storage and restart the daemon. Esc: back. Q: exit." }
+        }).or_else(|| app.router_pending.as_ref().filter(|view| view.recovery_required()).map(|view| {
+            if view.commit_indeterminate() { "Commit outcome unknown. Repair storage and restart the daemon. Esc: back. Q: exit." }
+            else { "Rollback recovery required. Enter: retry rollback. Esc: back. Q: exit." }
+        }));
+        if let Some(hint) = recovery_hint {
+            frame.render_widget(
+                Paragraph::new(hint).wrap(ratatui::widgets::Wrap { trim: false }),
+                area,
+            );
+            return;
+        }
         if let Some(deadline) = pending_deadline(app) {
             frame.render_widget(
                 Paragraph::new(format!(
@@ -1444,7 +1462,9 @@ fn focus_action_slot(app: &mut TuiApp, slot: usize) {
 
 async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: bool) {
     if !app.ui.input_enabled {
-        if pending_deadline(app).is_some() && matches!(key, KeyCode::Enter | KeyCode::Esc) {
+        if (app.pending.is_some() || app.router_pending.is_some())
+            && matches!(key, KeyCode::Enter | KeyCode::Esc)
+        {
             match app.screen {
                 Screen::PendingChange => interfaces::handle_pending_key(app, key, client).await,
                 Screen::RouterPending => router::handle_router_pending_key(app, key, client).await,
@@ -1593,12 +1613,16 @@ fn refresh_pending_screen(app: &mut TuiApp) {
         return;
     }
 
-    let still_pending = app
+    if let Some(current) = app
         .dashboard
         .pending_network_changes
         .iter()
-        .any(|pending| pending.token == change.token);
-    if !still_pending && current_unix_time() >= change.expires_at_unix {
+        .find(|pending| pending.token == change.token)
+    {
+        app.pending = Some(current.clone());
+        return;
+    }
+    if current_unix_time() >= change.expires_at_unix {
         app.push_message(
             LogLevel::Info,
             "Network transaction is no longer pending; outcome unknown. Inspect current interface state.",

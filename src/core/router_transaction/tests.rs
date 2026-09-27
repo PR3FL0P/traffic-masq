@@ -1371,3 +1371,81 @@ async fn failed_apply_compensation_is_retried_automatically() {
     assert!(!coordinator.inner.journal.exists());
     assert_eq!(overrides.committed_revision().await, 0);
 }
+
+#[tokio::test]
+async fn indeterminate_commit_fences_router_and_retains_recovery_evidence() {
+    let fake = FakeSubsystems::new();
+    let (original, overrides, directory) = coordinator_with(fake.clone()).await;
+    // Seed an existing document so compensation must replace it.
+    overrides
+        .save_committed(overrides.snapshot().await)
+        .await
+        .unwrap();
+    let coordinator = RouterTransactionCoordinator::new(
+        original.manager(),
+        overrides.clone(),
+        Duration::from_secs(60),
+    );
+    let plan = coordinator
+        .plan(build_candidate(&overrides).await)
+        .await
+        .unwrap();
+    let token = coordinator.apply(plan).await.unwrap();
+    let revision = overrides.committed_revision().await;
+    crate::atomic_file::fail_replacement_and_compensation(overrides.path());
+    assert!(crate::atomic_file::is_indeterminate_write(
+        &coordinator.commit(&token).await.unwrap_err()
+    ));
+    assert_eq!(
+        coordinator.status().await,
+        CoordinatorStatus::CommitIndeterminate
+    );
+    assert_eq!(
+        coordinator.view().await.token.as_deref(),
+        Some(token.as_str())
+    );
+    assert!(!coordinator.view().await.rollback_failures.is_empty());
+    assert!(coordinator.commit(&token).await.is_err());
+    assert!(coordinator.rollback_with_token(&token).await.is_err());
+    assert!(coordinator.rollback().await.is_err());
+    assert!(!coordinator.rollback_timeout_fired(&token).await);
+    assert!(overrides
+        .save_committed(overrides.snapshot().await)
+        .await
+        .is_err());
+    assert_eq!(overrides.committed_revision().await, revision);
+    let disk = crate::state::overrides::RuntimeOverrideStore::in_state_dir(directory.path())
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(
+        disk.committed_router_transaction.as_deref(),
+        Some(token.as_str())
+    );
+    assert_eq!(disk.revision, revision + 1);
+    assert!(coordinator.inner.journal.exists());
+    let restarted_dir = tempdir().unwrap();
+    let restarted_store =
+        crate::state::overrides::RuntimeOverrideStore::in_state_dir(restarted_dir.path());
+    std::fs::copy(overrides.path(), restarted_store.path()).unwrap();
+    std::fs::copy(
+        &coordinator.inner.journal,
+        restarted_dir.path().join("router-transaction.json"),
+    )
+    .unwrap();
+    let reloaded = RuntimeOverrideManager::load(restarted_dir.path(), &base_config())
+        .await
+        .unwrap();
+    let restarted =
+        RouterTransactionCoordinator::new(coordinator.manager(), reloaded, Duration::from_secs(60));
+    assert!(
+        !restarted.recover().await.unwrap(),
+        "persisted commit proof must prevent rollback after restart"
+    );
+    assert_eq!(restarted.status().await, CoordinatorStatus::Idle);
+    assert!(coordinator.recover().await.is_err());
+    assert!(!fake
+        .events()
+        .iter()
+        .any(|event| event.starts_with("rollback_")));
+}

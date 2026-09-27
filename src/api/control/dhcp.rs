@@ -47,6 +47,9 @@ pub(super) async fn configure_dhcp_persisted(
         .set_interface(interface.clone(), interface_config, false)
         .await
     {
+        if crate::atomic_file::is_indeterminate_write(&error) {
+            return Err(error);
+        }
         let restoration = match previous {
             Some(previous) => dhcp.configure(previous).await,
             None => dhcp.disable(&interface).await.map(|_| ()),
@@ -79,6 +82,9 @@ pub(super) async fn disable_dhcp_persisted(
         .set_interface(interface.to_string(), interface_config, false)
         .await
     {
+        if crate::atomic_file::is_indeterminate_write(&error) {
+            return Err(error);
+        }
         let restoration = match previous {
             Some(previous) => dhcp.configure(previous).await,
             None => Ok(()),

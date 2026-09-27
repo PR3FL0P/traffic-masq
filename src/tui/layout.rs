@@ -240,6 +240,24 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Tu
 }
 
 pub(crate) fn help_pairs(app: &TuiApp) -> Vec<(&'static str, &'static str)> {
+    if app.screen == Screen::PendingChange {
+        if let Some(change) = &app.pending {
+            if !change.can_rollback() {
+                return vec![("Esc", "back")];
+            }
+            if !change.can_commit() {
+                return vec![("Esc", "retry rollback")];
+            }
+        }
+    }
+    if app.screen == Screen::RouterPending
+        && app
+            .router_pending
+            .as_ref()
+            .is_some_and(|view| view.commit_indeterminate())
+    {
+        return vec![("↑/↓", "details"), ("PgUp/Dn", "page"), ("Esc", "back")];
+    }
     if app.screen == Screen::Router && app.router.topology.open {
         vec![("Arrows", "scroll"), ("PgUp/Dn", "page"), ("Esc/t", "back")]
     } else if app.screen == Screen::Router && app.router.pane == super::router::RouterPane::Sharing

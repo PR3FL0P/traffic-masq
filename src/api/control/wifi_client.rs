@@ -231,6 +231,9 @@ impl ControlService {
             .set_interface(interface.clone(), interface_config, false)
             .await
         {
+            if crate::atomic_file::is_indeterminate_write(&error) {
+                return super::runtime::error_response(error);
+            }
             let restoration = match previous {
                 Some(previous) => wifi_client.configure(previous).await.map(|_| ()),
                 None => wifi_client.disable(&interface).await.map(|_| ()),
@@ -386,6 +389,9 @@ impl ControlService {
             .set_interface(interface.clone(), interface_config, false)
             .await
         {
+            if crate::atomic_file::is_indeterminate_write(&error) {
+                return super::runtime::error_response(error);
+            }
             let mut rollback_failures = Vec::new();
             let restoration = match previous {
                 Some(previous) => wifi_client.configure(previous).await.map(|_| ()),
@@ -816,6 +822,9 @@ impl ControlService {
             .set_interface(interface.clone(), interface_config, false)
             .await
         {
+            if crate::atomic_file::is_indeterminate_write(&error) {
+                return super::runtime::error_response(error);
+            }
             let mut rollback_failures = Vec::new();
             if let Err(rollback) =
                 compensate_wifi_client(wifi_client, &interface, previous_spec, previous_secret)

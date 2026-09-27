@@ -204,13 +204,25 @@ impl RuntimeOverrideManager {
         state: &mut RuntimeOverrides,
         candidate: RuntimeOverrides,
     ) -> Result<()> {
+        let root = self
+            .store
+            .path()
+            .parent()
+            .expect("override state directory");
+        crate::core::recovery::check_commit(root)?;
         let mut candidate = candidate.normalized()?;
         validate_candidate(&candidate, &self.base)?;
         candidate.revision = state
             .revision
             .checked_add(1)
             .context("runtime override revision overflow")?;
-        self.store.save(&candidate).await?;
+        if let Err(error) = self.store.save(&candidate).await {
+            if crate::atomic_file::is_indeterminate_write(&error) {
+                crate::core::recovery::fence_commit(root, format!("{error:#}"));
+                return Err(error.context("commit_indeterminate: repair storage access and restart the daemon; confirmation and rollback are blocked"));
+            }
+            return Err(error);
+        }
         *state = candidate;
         // Every mutation funnels through here, so this is the one place that
         // has to announce that the desired state moved.

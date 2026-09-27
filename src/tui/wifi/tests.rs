@@ -199,6 +199,8 @@ async fn connect_failure_uses_one_backend_operation() {
 #[tokio::test]
 async fn static_connect_retains_pending_transaction_without_auto_commit() {
     let change = crate::core::transaction::PendingNetworkChange {
+        phase: Default::default(),
+        last_error: None,
         token: "pending-token".into(),
         interface: "wlan0".into(),
         rollback_timeout_seconds: 60,
@@ -408,6 +410,8 @@ fn ap_request_is_atomic_and_enables_derived_dhcp_by_default() {
 #[tokio::test]
 async fn ap_apply_enters_shared_commit_confirm_screen() {
     let change = crate::core::transaction::PendingNetworkChange {
+        phase: Default::default(),
+        last_error: None,
         token: "ap-token".into(),
         interface: "wlan0".into(),
         rollback_timeout_seconds: 60,

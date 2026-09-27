@@ -64,6 +64,7 @@ pub struct NoPendingTransactionError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CoordinatorStatus {
+    CommitIndeterminate,
     Idle,
     Pending,
     RollbackFailed,
@@ -384,6 +385,13 @@ impl RouterTransactionCoordinator {
     /// Persistence failure keeps the transaction pending; successful commit retires recovery state.
     pub async fn commit(&self, token: &str) -> Result<u64> {
         let mut state = self.inner.state.lock().await;
+        crate::core::recovery::check_commit(
+            self.inner
+                .overrides
+                .path()
+                .parent()
+                .expect("state directory"),
+        )?;
         let pending = match &*state {
             CoordinatorState::Pending(pending) => pending.clone(),
             CoordinatorState::Idle => return Err(NoPendingTransactionError.into()),
@@ -435,6 +443,24 @@ impl RouterTransactionCoordinator {
     /// Return an internally consistent view of coordinator state under one lock.
     pub async fn view(&self) -> CoordinatorView {
         let state = self.inner.state.lock().await;
+        if let Some(error) = crate::core::recovery::commit_uncertainty(
+            self.inner
+                .overrides
+                .path()
+                .parent()
+                .expect("state directory"),
+        ) {
+            let token = match &*state {
+                CoordinatorState::Pending(pending) => Some(pending.token.clone()),
+                CoordinatorState::RollbackFailed(failure) => Some(failure.token.clone()),
+                CoordinatorState::Idle => None,
+            };
+            return CoordinatorView {
+                status: CoordinatorStatus::CommitIndeterminate,
+                token,
+                rollback_failures: vec![error],
+            };
+        }
         match &*state {
             CoordinatorState::Idle => CoordinatorView {
                 status: if crate::core::recovery::cleanup_pending(&self.inner.journal) {
@@ -485,16 +511,7 @@ impl RouterTransactionCoordinator {
 
     /// Report whether the coordinator is idle, awaiting confirmation, or awaiting rollback recovery.
     pub async fn status(&self) -> CoordinatorStatus {
-        match &*self.inner.state.lock().await {
-            CoordinatorState::Idle
-                if crate::core::recovery::cleanup_pending(&self.inner.journal) =>
-            {
-                CoordinatorStatus::RecoveredButJournalCleanupPending
-            }
-            CoordinatorState::Idle => CoordinatorStatus::Idle,
-            CoordinatorState::Pending(_) => CoordinatorStatus::Pending,
-            CoordinatorState::RollbackFailed(_) => CoordinatorStatus::RollbackFailed,
-        }
+        self.view().await.status
     }
 
     /// Wait until a pending/recovery transaction has returned to idle.
@@ -536,6 +553,13 @@ impl RouterTransactionCoordinator {
         state: &mut MutexGuard<'_, CoordinatorState>,
         trigger: RollbackTrigger,
     ) -> Result<()> {
+        crate::core::recovery::check_commit(
+            self.inner
+                .overrides
+                .path()
+                .parent()
+                .expect("state directory"),
+        )?;
         // A failed startup prepare may have discovered only part of a VPN
         // chain. Never let a manual retry retire that journal using incomplete
         // volatile ownership; reconstruct it first and retain the intent on error.
@@ -678,6 +702,17 @@ impl RouterTransactionCoordinator {
             None => None,
         };
         let mut state = self.inner.state.lock().await;
+        if crate::core::recovery::check_commit(
+            self.inner
+                .overrides
+                .path()
+                .parent()
+                .expect("state directory"),
+        )
+        .is_err()
+        {
+            return false;
+        }
         match &*state {
             CoordinatorState::Pending(pending) if pending.token == token => {}
             CoordinatorState::RollbackFailed(failure) if failure.token == token => {}
@@ -748,6 +783,13 @@ impl RouterTransactionCoordinator {
 
     /// Restore an interrupted transaction before accepting control requests.
     pub async fn recover(&self) -> Result<bool> {
+        crate::core::recovery::check_commit(
+            self.inner
+                .overrides
+                .path()
+                .parent()
+                .expect("state directory"),
+        )?;
         let mut state = self.inner.state.lock().await;
         let journal_access_diagnostic = || {
             crate::core::recovery::RecoveryDiagnostic::fatal(

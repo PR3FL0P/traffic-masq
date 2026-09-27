@@ -521,7 +521,7 @@ pub(crate) fn render_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
     } else {
         theme::BAD
     };
-    let lines = vec![
+    let mut lines = vec![
         Line::styled(
             format!("Pending transaction: {}", change.token),
             Style::default()
@@ -529,9 +529,28 @@ pub(crate) fn render_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
                 .add_modifier(Modifier::BOLD),
         ),
         Line::from(format!("Interface: {}", change.interface)),
-        Line::from(format!("Automatic rollback in: {seconds}s / {timeout}s")),
+        Line::from(format!("Rollback scheduled in: {seconds}s / {timeout}s")),
     ];
 
+    if let Some(error) = &change.last_error {
+        lines.push(Line::from(format!("Last error: {error}")));
+    }
+    if !change.can_commit() {
+        let message = if change.can_rollback() {
+            "Rollback recovery required. Confirmation is disabled; Esc retries rollback."
+        } else {
+            "Commit outcome unknown. Repair storage access and restart the daemon."
+        };
+        lines[2] = Line::from(message);
+        let block = panel("Network change recovery");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        frame.render_widget(
+            Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+            inner,
+        );
+        return;
+    }
     let block = panel("Network change pending confirmation");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -894,6 +913,12 @@ async fn finish_pending(app: &mut TuiApp, client: &ApiClient, commit: bool) {
         app.screen = app.pending_return_screen;
         return;
     };
+    if (commit && !change.can_commit()) || (!commit && !change.can_rollback()) {
+        if !commit {
+            app.screen = app.pending_return_screen;
+        }
+        return;
+    }
     let request = if commit {
         Request::CommitNetworkChange {
             token: change.token.clone(),

@@ -6371,3 +6371,39 @@ async fn hotspot_provision_manages_an_unconfigured_radio_and_subnet_atomically()
         "192.168.50.1".parse::<Ipv4Addr>().unwrap()
     );
 }
+
+#[tokio::test]
+async fn uncertain_dhcp_commit_preserves_candidate_and_blocks_subsequent_mutations() {
+    let fixture = dhcp_client_control_fixture(false).await;
+    fixture
+        .overrides
+        .save_committed(fixture.overrides.snapshot().await)
+        .await
+        .unwrap();
+    crate::atomic_file::fail_replacement_and_compensation(fixture.overrides.path());
+    let response = fixture
+        .service
+        .dispatch(Request::ConfigureDhcpClient {
+            interface: "wan0".into(),
+            config: DhcpClientConfigRequest::default(),
+        })
+        .await;
+    assert!(
+        matches!(response, Response::DhcpClientError {
+        detail: DhcpClientErrorDetail::PersistenceFailure { ref message }
+    } if message.contains("commit_indeterminate")),
+        "{response:?}"
+    );
+    assert!(fixture.supervisor.spec("wan0").await.is_some());
+    let response = fixture
+        .service
+        .dispatch(Request::DisableDhcpClient {
+            interface: "wan0".into(),
+        })
+        .await;
+    assert!(
+        matches!(response, Response::Error { ref message } if message.contains("commit_indeterminate")),
+        "{response:?}"
+    );
+    assert!(fixture.supervisor.spec("wan0").await.is_some());
+}

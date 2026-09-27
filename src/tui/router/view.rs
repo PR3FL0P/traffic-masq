@@ -495,6 +495,9 @@ pub(super) fn format_coordinator_status(status: CoordinatorStatus) -> &'static s
             "recovered (journal cleanup pending)"
         }
         CoordinatorStatus::Idle => "idle",
+        CoordinatorStatus::CommitIndeterminate => {
+            "commit outcome unknown (repair storage and restart daemon)"
+        }
         CoordinatorStatus::Pending => "pending",
         CoordinatorStatus::RollbackFailed => "rollback failed (recovery required)",
     }

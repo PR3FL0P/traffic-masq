@@ -37,6 +37,37 @@ const TEMP_NAME_ATTEMPTS: u32 = 100;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Replacement and compensation both failed: the published bytes are uncertain.
+#[derive(Debug, thiserror::Error)]
+#[error("{operation}; rollback also failed: {rollback}; persisted state is indeterminate")]
+pub struct IndeterminateWrite {
+    operation: io::Error,
+    rollback: io::Error,
+}
+
+pub fn is_indeterminate_write(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<io::Error>().is_some_and(|error| {
+            error
+                .get_ref()
+                .is_some_and(|inner| inner.is::<IndeterminateWrite>())
+        })
+    })
+}
+
+#[cfg(test)]
+fn write_faults() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, u8>> {
+    static FAULTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, u8>>> =
+        std::sync::OnceLock::new();
+    FAULTS.get_or_init(Default::default)
+}
+
+/// Fail after publishing the next replacement, then before publishing its compensation.
+#[cfg(test)]
+pub(crate) fn fail_replacement_and_compensation(path: &Path) {
+    write_faults().lock().unwrap().insert(path.to_owned(), 2);
+}
+
 /// Why a directory could not be used as a private store.
 ///
 /// Kept separate from [`io::Error`] because every caller distinguishes these
@@ -143,6 +174,21 @@ pub fn ensure_private_dir(path: &Path, mode: u32) -> Result<(), PrivateDirError>
 /// The parent directory must already exist; use [`ensure_private_dir`] first if
 /// that is not guaranteed.
 pub fn replace(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
+    #[cfg(test)]
+    let fault = {
+        let mut faults = write_faults().lock().unwrap();
+        let fault = faults.get(path).copied().unwrap_or(0);
+        if fault > 1 {
+            faults.insert(path.to_owned(), fault - 1);
+        } else {
+            faults.remove(path);
+        }
+        fault
+    };
+    #[cfg(test)]
+    if fault == 1 {
+        return Err(io::Error::other("injected compensation failure"));
+    }
     let parent = parent_directory(path);
     reject_symlink(path)?;
 
@@ -159,6 +205,10 @@ pub fn replace(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
         // planted.
         reject_symlink(path)?;
         fs::rename(&temporary, path)?;
+        #[cfg(test)]
+        if fault == 2 {
+            return Err(io::Error::other("injected directory sync failure"));
+        }
         File::open(parent)?.sync_all()
     })();
 
@@ -207,9 +257,10 @@ pub fn replace_preserving_on_error(path: &Path, contents: &[u8], mode: u32) -> i
     };
     match rollback {
         Ok(()) => Err(operation),
-        Err(rollback) => Err(io::Error::other(format!(
-            "{operation}; rollback also failed: {rollback}"
-        ))),
+        Err(rollback) => Err(io::Error::other(IndeterminateWrite {
+            operation,
+            rollback,
+        })),
     }
 }
 

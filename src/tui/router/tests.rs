@@ -761,6 +761,7 @@ async fn failed_status_refresh_preserves_last_known_recovery() {
 #[test]
 fn coordinator_status_blocks_mutations_without_structured_notice() {
     for status in [
+        CoordinatorStatus::CommitIndeterminate,
         CoordinatorStatus::RollbackFailed,
         CoordinatorStatus::RecoveredButJournalCleanupPending,
     ] {

@@ -21,6 +21,8 @@ async fn rollback_click_sends_rollback_request() {
     let mut app = TuiApp {
         screen: Screen::PendingChange,
         pending: Some(crate::core::transaction::PendingNetworkChange {
+            phase: Default::default(),
+            last_error: None,
             token: "test-token".into(),
             interface: "eth0".into(),
             rollback_timeout_seconds: 30,
@@ -374,6 +376,8 @@ fn disconnected_dashboard_does_not_claim_rollback() {
     let mut app = TuiApp {
         screen: Screen::PendingChange,
         pending: Some(PendingNetworkChange {
+            phase: Default::default(),
+            last_error: None,
             token: "keep".into(),
             interface: "eth0".into(),
             rollback_timeout_seconds: 60,
@@ -884,6 +888,8 @@ async fn small_terminal_escape_sends_rollback_request() {
     let mut app = TuiApp {
         screen: Screen::PendingChange,
         pending: Some(crate::core::transaction::PendingNetworkChange {
+            phase: Default::default(),
+            last_error: None,
             token: "test-token".into(),
             interface: "eth0".into(),
             rollback_timeout_seconds: 30,
@@ -950,6 +956,8 @@ async fn small_terminal_enter_sends_commit_request() {
     let mut app = TuiApp {
         screen: Screen::PendingChange,
         pending: Some(crate::core::transaction::PendingNetworkChange {
+            phase: Default::default(),
+            last_error: None,
             token: "test-token".into(),
             interface: "eth0".into(),
             rollback_timeout_seconds: 30,
@@ -976,4 +984,51 @@ async fn small_terminal_enter_sends_commit_request() {
         .unwrap()
         .unwrap();
     assert!(request.starts_with("POST /api/v1/network-transactions/commit "));
+}
+
+#[test]
+fn pending_refresh_exposes_recovery_and_removes_confirmation_controls() {
+    use crate::core::transaction::{NetworkChangePhase, PendingNetworkChange};
+    let initial = PendingNetworkChange {
+        token: "recovering".into(),
+        interface: "eth0".into(),
+        rollback_timeout_seconds: 60,
+        expires_at_unix: current_unix_time() + 60,
+        phase: NetworkChangePhase::AwaitingCommit,
+        last_error: None,
+    };
+    for phase in [
+        NetworkChangePhase::RollbackRequired,
+        NetworkChangePhase::CommitIndeterminate,
+    ] {
+        let mut current = initial.clone();
+        current.phase = phase;
+        current.last_error = Some("storage unavailable".into());
+        let mut app = TuiApp {
+            screen: Screen::PendingChange,
+            pending: Some(initial.clone()),
+            ..Default::default()
+        };
+        app.dashboard.pending_network_changes.push(current.clone());
+        refresh_pending_screen(&mut app);
+        assert_eq!(app.pending, Some(current));
+        assert_eq!(pending_deadline(&app), None);
+        assert!(!layout::help_pairs(&app)
+            .iter()
+            .any(|(_, action)| *action == "commit"));
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &mut app, false))
+            .unwrap();
+        assert!(!app.ui.buttons.iter().any(|(_, slot)| *slot == 0));
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("storage unavailable"));
+        assert!(!text.contains("[Commit]"));
+    }
 }

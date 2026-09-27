@@ -62,3 +62,21 @@ passwords and session tokens in debug logs or operation messages.
 Network decisions belong in `core` or the service module responsible for them.
 HTTP handlers and TUI widgets translate input and show results; they do not
 change kernel state directly.
+
+### Commit uncertainty and confirmation timing
+
+If both override replacement and its compensation fail, the daemon fences the
+state directory as `commit_indeterminate`. It preserves pending journals and
+refuses further writes and rollback until storage is repaired and the daemon is
+restarted to resolve the on-disk commit proof. It must not compensate using its
+potentially obsolete in-memory revision. Interface pending responses expose
+`phase` (`awaiting_commit`, `rollback_required`, `commit_indeterminate`) and
+`last_error`. Confirmation is available only in `awaiting_commit`; rollback is
+blocked in `commit_indeterminate`.
+
+Confirmation timers schedule rollback after the configured interval; they do
+not promise that runtime restoration finishes by that time. Rollback waits for
+already admitted operations and may need retries. An already admitted confirmation
+can finish after the displayed expiry. `expires_at_unix` is an advisory wall-clock
+display value; scheduling uses a monotonic timer. Clients should inspect pending
+state after expiry or a request timeout, rather than infer a transaction outcome.

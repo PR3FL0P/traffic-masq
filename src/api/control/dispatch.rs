@@ -107,7 +107,7 @@ impl ControlService {
                             message: "kernel state recovered; journal housekeeping is pending and will retry automatically; overlapping mutations are temporarily blocked".to_owned(),
                         };
                     }
-                    CoordinatorStatus::RollbackFailed => {
+                    CoordinatorStatus::RollbackFailed | CoordinatorStatus::CommitIndeterminate => {
                         return Response::Error {
                             message: "router rollback recovery is required; direct network mutations are blocked until recovery completes".to_owned(),
                         };

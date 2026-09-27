@@ -179,3 +179,20 @@ fn regular_file_exists_rejects_directory() {
     let error = regular_file_exists(&path).expect_err("directory must be rejected");
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 }
+
+#[tokio::test]
+async fn failed_compensation_preserves_typed_uncertainty_through_async_context() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("intent.json");
+    replace(&path, b"old", PRIVATE_FILE_MODE).unwrap();
+    fail_replacement_and_compensation(&path);
+    let error = replace_preserving_on_error_async(&path, b"new", PRIVATE_FILE_MODE)
+        .await
+        .unwrap_err();
+    let error = anyhow::Error::new(error).context("persist intent");
+    assert!(is_indeterminate_write(&error));
+    assert_eq!(fs::read(&path).unwrap(), b"new");
+    assert!(!is_indeterminate_write(&anyhow::anyhow!(
+        "ordinary failure"
+    )));
+}

@@ -740,6 +740,7 @@ async fn reconcile_network_runtime_once<
     wifi_client: Option<&C>,
     dhcp_client: Option<&L>,
 ) -> Result<BTreeMap<String, String>> {
+    crate::core::recovery::check_commit(desired.state_dir())?;
     let effective = desired.effective().await?;
     let management_allowlist = desired.management_allowlist().await;
     let mut failures: BTreeMap<String, String> = BTreeMap::new();
@@ -1153,6 +1154,7 @@ fn spawn_wifi_autoconnect(
 
 /// Monitor supervised network processes and retry recoverable failures until shutdown.
 fn spawn_process_liveness_checks(
+    state_dir: std::path::PathBuf,
     dhcp: DhcpSupervisor,
     wifi: Option<HostapdSupervisor>,
     wifi_client: Option<WifiClientSupervisor>,
@@ -1181,6 +1183,7 @@ fn spawn_process_liveness_checks(
                     }
                     if let Ok((interface, pid)) = event {
                         let _network_mutation = network_mutations.execute().await;
+                    if crate::core::recovery::check_commit(&state_dir).is_err() { continue; }
                         if let Some(router) = &router {
                             if router.status().await != crate::core::router_transaction::CoordinatorStatus::Idle { continue; }
                         }
@@ -1205,6 +1208,7 @@ fn spawn_process_liveness_checks(
                     // otherwise a DHCP/Wi-Fi readiness pass can replay state it
                     // observed just before a transaction converged.
                     let _network_mutation = network_mutations.execute().await;
+                    if crate::core::recovery::check_commit(&state_dir).is_err() { continue; }
                     let router_busy = match &router {
                         Some(router) => router.status().await
                             != crate::core::router_transaction::CoordinatorStatus::Idle,
@@ -1259,6 +1263,7 @@ fn spawn_router_dataplane_integrity_checks(
                     // Take exclusive runtime execution so it cannot race interface
                     // convergence or another background repair pass.
                     let _network_mutation = network_mutations.execute().await;
+                    if crate::core::recovery::check_commit(desired.state_dir()).is_err() { continue; }
                     let router_busy = match &router {
                         Some(router) => router.status().await
                             != crate::core::router_transaction::CoordinatorStatus::Idle,
@@ -2184,6 +2189,7 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
 
     let (liveness_stop, liveness_shutdown) = watch::channel(false);
     let liveness_task = spawn_process_liveness_checks(
+        effective_config.runtime.state_dir.clone(),
         dhcp.clone(),
         wifi_supervisor.clone(),
         wifi_client_supervisor.clone(),
@@ -2313,9 +2319,17 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     let restore_requested = shutdown_request
         .as_ref()
         .is_some_and(|request| request.restores_interfaces());
-    let restore_interfaces = restore_requested
-        || !graceful_signal
-        || effective_config.runtime.shutdown_policy == ShutdownPolicy::RestoreInterfaces;
+    let commit_uncertain =
+        crate::core::recovery::check_commit(&effective_config.runtime.state_dir).err();
+    if let Some(error) = &commit_uncertain {
+        cleanup_errors.push(error.to_string());
+    }
+    // Preserve runtime ownership and all recovery evidence until startup can
+    // resolve the persisted commit token. Baseline cleanup would be an unsafe rollback.
+    let restore_interfaces = commit_uncertain.is_none()
+        && (restore_requested
+            || !graceful_signal
+            || effective_config.runtime.shutdown_policy == ShutdownPolicy::RestoreInterfaces);
     let shutdown_policy = if restore_interfaces {
         ShutdownPolicy::RestoreInterfaces
     } else {
