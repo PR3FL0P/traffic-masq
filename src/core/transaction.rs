@@ -188,12 +188,14 @@ pub async fn recover_interface_transactions(
     state_dir: &std::path::Path,
     manager: &InterfaceManager,
     committed: &crate::state::overrides::RuntimeOverrides,
+    wifi_runtime_dirs: &crate::wifi::WifiRuntimeDirs,
 ) -> Result<()> {
     recover_interface_transactions_with_tokens(
         state_dir,
         manager,
         &committed.committed_interface_transactions,
         &std::collections::BTreeSet::new(),
+        wifi_runtime_dirs,
     )
     .await
 }
@@ -204,12 +206,14 @@ pub async fn recover_interface_transactions_with_commit_tokens(
     state_dir: &std::path::Path,
     manager: &InterfaceManager,
     committed: &std::collections::BTreeMap<String, String>,
+    wifi_runtime_dirs: &crate::wifi::WifiRuntimeDirs,
 ) -> Result<()> {
     recover_interface_transactions_with_commit_tokens_excluding(
         state_dir,
         manager,
         committed,
         &std::collections::BTreeSet::new(),
+        wifi_runtime_dirs,
     )
     .await
 }
@@ -220,8 +224,16 @@ pub async fn recover_interface_transactions_with_commit_tokens_excluding(
     manager: &InterfaceManager,
     committed: &std::collections::BTreeMap<String, String>,
     excluded: &std::collections::BTreeSet<String>,
+    wifi_runtime_dirs: &crate::wifi::WifiRuntimeDirs,
 ) -> Result<()> {
-    recover_interface_transactions_with_tokens(state_dir, manager, committed, excluded).await
+    recover_interface_transactions_with_tokens(
+        state_dir,
+        manager,
+        committed,
+        excluded,
+        wifi_runtime_dirs,
+    )
+    .await
 }
 
 /// Preserve every pending interface journal when its independent commit proof is untrusted.
@@ -255,11 +267,21 @@ async fn recover_interface_transactions_with_tokens(
     manager: &InterfaceManager,
     committed: &std::collections::BTreeMap<String, String>,
     excluded: &std::collections::BTreeSet<String>,
+    wifi_runtime_dirs: &crate::wifi::WifiRuntimeDirs,
 ) -> Result<()> {
     crate::core::recovery::check_commit(state_dir)?;
     let store = open_interface_recovery_store(state_dir).await?;
     let names = enumerate_interface_recovery_journals(state_dir, &store).await?;
-    recover_interface_journals(state_dir, manager, committed, &store, names, excluded).await;
+    recover_interface_journals(
+        state_dir,
+        manager,
+        committed,
+        &store,
+        names,
+        excluded,
+        wifi_runtime_dirs,
+    )
+    .await;
     Ok(())
 }
 
@@ -268,6 +290,7 @@ pub(crate) async fn retry_interface_recovery(
     state_dir: &std::path::Path,
     manager: &InterfaceManager,
     committed: &crate::state::overrides::RuntimeOverrides,
+    wifi_runtime_dirs: &crate::wifi::WifiRuntimeDirs,
 ) -> Result<()> {
     crate::core::recovery::check_commit(state_dir)?;
     let names = crate::core::recovery::retryable_blocked_interfaces(state_dir);
@@ -282,6 +305,7 @@ pub(crate) async fn retry_interface_recovery(
         &store,
         names,
         &std::collections::BTreeSet::new(),
+        wifi_runtime_dirs,
     )
     .await;
     Ok(())
@@ -294,6 +318,7 @@ async fn recover_interface_journals(
     store: &crate::state::private_store::PrivateJsonDirectory,
     names: Vec<String>,
     excluded: &std::collections::BTreeSet<String>,
+    wifi_runtime_dirs: &crate::wifi::WifiRuntimeDirs,
 ) {
     for name in names {
         if excluded.contains(&name) {
@@ -331,7 +356,7 @@ async fn recover_interface_journals(
             }
             let record: InterfaceJournal = serde_json::from_slice(&bytes)?;
             anyhow::ensure!(
-                matches!(record.version, 1 | 2 | 3) && record.snapshot.name == name,
+                matches!(record.version, 1..=3) && record.snapshot.name == name,
                 "invariant=valid_interface_snapshot: unsupported schema or interface mismatch"
             );
             anyhow::ensure!(
@@ -346,7 +371,12 @@ async fn recover_interface_journals(
                 if let Some(secret) = &record.secret {
                     secret.restore(state_dir, &name)?;
                 }
-                crate::wifi::lifecycle::stop_recorded_interface(state_dir, &name).await?;
+                crate::wifi::lifecycle::stop_recorded_interface(
+                    state_dir,
+                    wifi_runtime_dirs,
+                    &name,
+                )
+                .await?;
                 manager.rollback(&record.snapshot).await?;
                 tracing::warn!(interface = %name, "restored interrupted interface transaction");
             }

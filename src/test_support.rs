@@ -42,6 +42,7 @@ pub(crate) struct FakeSupervisedProcess<R: Send + 'static> {
     after_terminate: StdMutex<Option<Box<ProcessHook>>>,
     after_socket_proof: StdMutex<Option<Box<ProcessHook>>>,
     pub(crate) fail_spawn: AtomicBool,
+    pub(crate) missing_start_ticks: AtomicBool,
     pub(crate) suppress_spawn_responder: AtomicBool,
     pub(crate) persistent_responder: AtomicBool,
     ownership_failure_countdown: AtomicU32,
@@ -66,6 +67,7 @@ impl<R: Send + 'static> FakeSupervisedProcess<R> {
             after_terminate: StdMutex::new(None),
             after_socket_proof: StdMutex::new(None),
             fail_spawn: AtomicBool::new(false),
+            missing_start_ticks: AtomicBool::new(false),
             suppress_spawn_responder: AtomicBool::new(false),
             persistent_responder: AtomicBool::new(false),
             ownership_failure_countdown: AtomicU32::new(0),
@@ -206,6 +208,22 @@ impl<R: Send + 'static> SupervisedProcess for FakeSupervisedProcess<R> {
             .unwrap()
             .get(&pid)
             .is_some_and(|recorded| recorded == config_path))
+    }
+
+    async fn process_start_ticks(&self, pid: u32) -> Result<Option<u64>, ProcessError> {
+        if self.missing_start_ticks.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        Ok(self
+            .configs
+            .lock()
+            .unwrap()
+            .contains_key(&pid)
+            .then_some(u64::from(pid)))
+    }
+
+    async fn boot_id(&self) -> Result<Option<String>, ProcessError> {
+        Ok(Some("test-boot".to_string()))
     }
 
     async fn pids_matching_identity(

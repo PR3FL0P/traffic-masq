@@ -38,7 +38,9 @@ pub use ctrl::{
 };
 pub use process::{ProcessError, SupervisedProcess, TokioSupervisedProcess};
 pub use radio::RadioError;
-pub use record::{PersistedWifiRecord, WifiProcessKind, WifiRecordError, WifiRecordStore};
+pub use record::{
+    PersistedWifiRecord, WifiProcessKind, WifiRecordError, WifiRecordStore, WifiRuntimeDirs,
+};
 pub use render::{
     config_path, render_hostapd_config, ApRenderInput, RenderError, RenderedApConfig, WifiDigest,
 };

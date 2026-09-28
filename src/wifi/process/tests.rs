@@ -102,6 +102,13 @@ async fn process_identity_requires_the_expected_executable_not_just_config_argv(
         .expect("spawn");
     let started_at_unix = crate::wifi::lifecycle::unix_now();
 
+    for _ in 0..50 {
+        if proc_cmdline_contains(pid, config).await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
     assert!(process
         .identity_matches(
             pid,
@@ -134,6 +141,54 @@ async fn process_identity_requires_the_expected_executable_not_just_config_argv(
         .expect("stale process identity"));
 
     process.kill(pid).await.expect("cleanup");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn adopted_stop_never_signals_a_process_after_the_recorded_lifetime_exits() {
+    let mut original = tokio::process::Command::new("/bin/sleep")
+        .arg("300")
+        .spawn()
+        .expect("original");
+    let pid = original.id().expect("pid");
+    let inspector = TokioSupervisedProcess::new();
+    let start_ticks = inspector
+        .process_start_ticks(pid)
+        .await
+        .expect("inspect starttime")
+        .expect("live process has starttime");
+    let boot_id = inspector
+        .boot_id()
+        .await
+        .expect("read boot id")
+        .expect("Linux boot id");
+    let record = crate::wifi::record::PersistedWifiRecord {
+        pid,
+        started_at_unix: crate::wifi::lifecycle::unix_now(),
+        process_start_ticks: Some(start_ticks),
+        boot_id: Some(boot_id),
+        binary_path: Some(PathBuf::from("/bin/sleep")),
+        ctrl_path: PathBuf::from("/tmp/unused-wifi-control"),
+        ctrl_dev: None,
+        ctrl_ino: None,
+        config_path: PathBuf::from("300"),
+        config_digest: crate::wifi::render::WifiDigest::of(&[]),
+        key_digest: crate::wifi::render::WifiDigest::of(&[]),
+        ssid: String::new(),
+    };
+    original.kill().await.expect("kill original");
+    original.wait().await.expect("reap original");
+    let mut other = tokio::process::Command::new("/bin/sleep")
+        .arg("300")
+        .spawn()
+        .expect("other");
+    let process = TokioSupervisedProcess::new();
+    process
+        .stop_recorded(&record, WifiProcessKind::AccessPoint, "test")
+        .await
+        .expect("stale lifetime");
+    assert!(other.try_wait().expect("other state").is_none());
+    other.kill().await.expect("cleanup other");
 }
 
 #[tokio::test]
@@ -271,4 +326,244 @@ fn advice_formatting_respects_init_systems() {
     );
     assert!(openrc_advice.contains("rc-service iwd stop"));
     assert!(openrc_advice.contains("rc-update del iwd default"));
+}
+
+#[test]
+fn proc_stat_starttime_parser_handles_spaces_and_closing_parens_in_comm() {
+    let raw =
+        b"123 (odd ) process name) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 424242 0 0\n";
+    assert_eq!(parse_proc_stat_start_ticks(raw), Some(424_242));
+}
+
+#[tokio::test]
+async fn persisted_process_identity_uses_exact_kernel_starttime() {
+    let process = TokioSupervisedProcess::new();
+    let config = Path::new("300");
+    let pid = process
+        .spawn(Path::new("/bin/sleep"), config)
+        .await
+        .expect("spawn");
+    let start_ticks = process
+        .process_start_ticks(pid)
+        .await
+        .expect("read starttime")
+        .expect("live process has starttime");
+    let boot_id = process
+        .boot_id()
+        .await
+        .expect("read boot id")
+        .expect("Linux boot id");
+    let mut record = crate::wifi::record::PersistedWifiRecord {
+        pid,
+        started_at_unix: crate::wifi::lifecycle::unix_now(),
+        process_start_ticks: Some(start_ticks),
+        boot_id: Some(boot_id.clone()),
+        binary_path: Some(PathBuf::from("/bin/sleep")),
+        ctrl_path: PathBuf::from("/tmp/unused-wifi-control"),
+        ctrl_dev: None,
+        ctrl_ino: None,
+        config_path: config.to_path_buf(),
+        config_digest: crate::wifi::render::WifiDigest::of(&[]),
+        key_digest: crate::wifi::render::WifiDigest::of(&[]),
+        ssid: String::new(),
+    };
+
+    assert!(process
+        .identity_matches_record(
+            &record,
+            WifiProcessKind::AccessPoint,
+            Path::new("/bin/sleep")
+        )
+        .await
+        .expect("exact identity"));
+
+    record.boot_id = Some("00000000-0000-0000-0000-000000000000".to_string());
+    assert!(!process
+        .identity_matches_record(
+            &record,
+            WifiProcessKind::AccessPoint,
+            Path::new("/bin/sleep")
+        )
+        .await
+        .expect("mismatched boot"));
+    record.boot_id = Some(boot_id);
+
+    record.process_start_ticks = Some(start_ticks.saturating_add(1));
+    assert!(!process
+        .identity_matches_record(
+            &record,
+            WifiProcessKind::AccessPoint,
+            Path::new("/bin/sleep")
+        )
+        .await
+        .expect("mismatched lifetime"));
+
+    process.kill(pid).await.expect("cleanup");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn pidfd_stop_refuses_a_record_with_the_wrong_starttime() {
+    let process = TokioSupervisedProcess::new();
+    let config = Path::new("300");
+    let pid = process
+        .spawn(Path::new("/bin/sleep"), config)
+        .await
+        .expect("spawn");
+    let start_ticks = process
+        .process_start_ticks(pid)
+        .await
+        .expect("read starttime")
+        .expect("live process has starttime");
+    let boot_id = process
+        .boot_id()
+        .await
+        .expect("read boot id")
+        .expect("Linux boot id");
+    let record = crate::wifi::record::PersistedWifiRecord {
+        pid,
+        started_at_unix: crate::wifi::lifecycle::unix_now(),
+        process_start_ticks: Some(start_ticks.saturating_add(1)),
+        boot_id: Some(boot_id),
+        binary_path: Some(PathBuf::from("/bin/sleep")),
+        ctrl_path: PathBuf::from("/tmp/unused-wifi-control"),
+        ctrl_dev: None,
+        ctrl_ino: None,
+        config_path: config.to_path_buf(),
+        config_digest: crate::wifi::render::WifiDigest::of(&[]),
+        key_digest: crate::wifi::render::WifiDigest::of(&[]),
+        ssid: String::new(),
+    };
+
+    assert!(matches!(
+        process
+            .stop_recorded(&record, WifiProcessKind::AccessPoint, "test")
+            .await,
+        Err(ProcessError::IdentityChanged { pid: rejected }) if rejected == pid
+    ));
+    assert!(process
+        .is_alive(pid)
+        .await
+        .expect("process survives rejected stop"));
+    process.kill(pid).await.expect("cleanup");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn pidfd_stop_refuses_a_record_from_another_boot() {
+    let process = TokioSupervisedProcess::new();
+    let config = Path::new("300");
+    let pid = process
+        .spawn(Path::new("/bin/sleep"), config)
+        .await
+        .expect("spawn");
+    let start_ticks = process
+        .process_start_ticks(pid)
+        .await
+        .expect("read starttime")
+        .expect("live process has starttime");
+    let record = crate::wifi::record::PersistedWifiRecord {
+        pid,
+        started_at_unix: crate::wifi::lifecycle::unix_now(),
+        process_start_ticks: Some(start_ticks),
+        boot_id: Some("00000000-0000-0000-0000-000000000000".to_string()),
+        binary_path: Some(PathBuf::from("/bin/sleep")),
+        ctrl_path: PathBuf::from("/tmp/unused-wifi-control"),
+        ctrl_dev: None,
+        ctrl_ino: None,
+        config_path: config.to_path_buf(),
+        config_digest: crate::wifi::render::WifiDigest::of(&[]),
+        key_digest: crate::wifi::render::WifiDigest::of(&[]),
+        ssid: String::new(),
+    };
+
+    assert!(matches!(
+        process
+            .stop_recorded(&record, WifiProcessKind::AccessPoint, "test")
+            .await,
+        Err(ProcessError::IdentityChanged { pid: rejected }) if rejected == pid
+    ));
+    assert!(process
+        .is_alive(pid)
+        .await
+        .expect("process survives rejected stop"));
+    process.kill(pid).await.expect("cleanup");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn pidfd_stop_accepts_the_exact_recorded_starttime() {
+    let process = TokioSupervisedProcess::new();
+    let config = Path::new("300");
+    let pid = process
+        .spawn(Path::new("/bin/sleep"), config)
+        .await
+        .expect("spawn");
+    let start_ticks = process
+        .process_start_ticks(pid)
+        .await
+        .expect("read starttime")
+        .expect("live process has starttime");
+    let boot_id = process
+        .boot_id()
+        .await
+        .expect("read boot id")
+        .expect("Linux boot id");
+    let record = crate::wifi::record::PersistedWifiRecord {
+        pid,
+        started_at_unix: crate::wifi::lifecycle::unix_now(),
+        process_start_ticks: Some(start_ticks),
+        boot_id: Some(boot_id),
+        binary_path: Some(PathBuf::from("/bin/sleep")),
+        ctrl_path: PathBuf::from("/tmp/unused-wifi-control"),
+        ctrl_dev: None,
+        ctrl_ino: None,
+        config_path: config.to_path_buf(),
+        config_digest: crate::wifi::render::WifiDigest::of(&[]),
+        key_digest: crate::wifi::render::WifiDigest::of(&[]),
+        ssid: String::new(),
+    };
+
+    process
+        .stop_recorded(&record, WifiProcessKind::AccessPoint, "test")
+        .await
+        .expect("exact lifetime is safe to signal");
+    assert!(!process.is_alive(pid).await.expect("process stopped"));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn pidfd_stop_refuses_legacy_record_without_exact_starttime() {
+    let process = TokioSupervisedProcess::new();
+    let config = Path::new("300");
+    let pid = process
+        .spawn(Path::new("/bin/sleep"), config)
+        .await
+        .expect("spawn");
+    let record = crate::wifi::record::PersistedWifiRecord {
+        pid,
+        started_at_unix: crate::wifi::lifecycle::unix_now(),
+        process_start_ticks: None,
+        boot_id: None,
+        binary_path: Some(PathBuf::from("/bin/sleep")),
+        ctrl_path: PathBuf::from("/tmp/unused-wifi-control"),
+        ctrl_dev: None,
+        ctrl_ino: None,
+        config_path: config.to_path_buf(),
+        config_digest: crate::wifi::render::WifiDigest::of(&[]),
+        key_digest: crate::wifi::render::WifiDigest::of(&[]),
+        ssid: String::new(),
+    };
+
+    assert!(matches!(
+        process
+            .stop_recorded(&record, WifiProcessKind::AccessPoint, "test")
+            .await,
+        Err(ProcessError::IdentityChanged { pid: rejected }) if rejected == pid
+    ));
+    assert!(process
+        .is_alive(pid)
+        .await
+        .expect("legacy record cannot signal process"));
+    process.kill(pid).await.expect("cleanup");
 }

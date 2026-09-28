@@ -2101,6 +2101,19 @@ impl SupervisedProcess for FakeWifiProcess {
             .is_some_and(|recorded| recorded == config_path))
     }
 
+    async fn process_start_ticks(&self, pid: u32) -> Result<Option<u64>, WifiProcessError> {
+        Ok(self
+            .configs
+            .lock()
+            .unwrap()
+            .contains_key(&pid)
+            .then_some(u64::from(pid)))
+    }
+
+    async fn boot_id(&self) -> Result<Option<String>, WifiProcessError> {
+        Ok(Some("test-boot".to_string()))
+    }
+
     async fn pids_matching_identity(
         &self,
         _kind: crate::wifi::record::WifiProcessKind,
@@ -3222,6 +3235,19 @@ impl SupervisedProcess for FakeSupplicantProcess {
             .unwrap()
             .get(&pid)
             .is_some_and(|recorded| recorded == config_path))
+    }
+
+    async fn process_start_ticks(&self, pid: u32) -> Result<Option<u64>, WifiProcessError> {
+        Ok(self
+            .configs
+            .lock()
+            .unwrap()
+            .contains_key(&pid)
+            .then_some(u64::from(pid)))
+    }
+
+    async fn boot_id(&self) -> Result<Option<String>, WifiProcessError> {
+        Ok(Some("test-boot".to_string()))
     }
 
     async fn pids_matching_identity(

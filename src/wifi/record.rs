@@ -9,7 +9,8 @@ use tokio::fs;
 use crate::atomic_file::{self, PRIVATE_FILE_MODE};
 use crate::wifi::render::WifiDigest;
 
-pub const CURRENT_WIFI_RECORD_SCHEMA: u32 = 1;
+pub const CURRENT_WIFI_RECORD_SCHEMA: u32 = 2;
+const LEGACY_WIFI_RECORD_SCHEMA: u32 = 1;
 
 #[derive(Debug, Error)]
 pub enum WifiRecordError {
@@ -29,16 +30,31 @@ pub enum WifiRecordError {
 
     #[error("failed to write persisted Wi-Fi process record {0}: {1}")]
     Write(PathBuf, std::io::Error),
+
+    #[error("persisted Wi-Fi process record {0} does not match its namespace or expected paths")]
+    MismatchedContext(PathBuf),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PersistedWifiRecordDocument {
     schema_version: u32,
+    #[serde(default)]
+    kind: Option<WifiProcessKind>,
+    #[serde(default)]
+    interface: Option<String>,
     pid: u32,
     started_at_unix: u64,
     #[serde(default)]
+    process_start_ticks: Option<u64>,
+    #[serde(default)]
+    boot_id: Option<String>,
+    #[serde(default)]
     binary_path: Option<PathBuf>,
     ctrl_path: PathBuf,
+    #[serde(default)]
+    ctrl_dev: Option<u64>,
+    #[serde(default)]
+    ctrl_ino: Option<u64>,
     config_path: PathBuf,
     config_digest: WifiDigest,
     key_digest: WifiDigest,
@@ -49,8 +65,12 @@ struct PersistedWifiRecordDocument {
 pub struct PersistedWifiRecord {
     pub pid: u32,
     pub started_at_unix: u64,
+    pub process_start_ticks: Option<u64>,
+    pub boot_id: Option<String>,
     pub binary_path: Option<PathBuf>,
     pub ctrl_path: PathBuf,
+    pub ctrl_dev: Option<u64>,
+    pub ctrl_ino: Option<u64>,
     pub config_path: PathBuf,
     pub config_digest: WifiDigest,
     pub key_digest: WifiDigest,
@@ -62,13 +82,39 @@ pub struct WifiRecordStore {
     path: PathBuf,
     legacy_path: Option<PathBuf>,
     expected_config_stem: String,
+    runtime_dir: PathBuf,
+    interface: String,
+    kind: WifiProcessKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WifiProcessKind {
     AccessPoint,
     Client,
     Scan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WifiRuntimeDirs {
+    access_point: PathBuf,
+    client: PathBuf,
+}
+
+impl WifiRuntimeDirs {
+    pub fn new(access_point: impl AsRef<Path>, client: impl AsRef<Path>) -> Self {
+        Self {
+            access_point: access_point.as_ref().to_path_buf(),
+            client: client.as_ref().to_path_buf(),
+        }
+    }
+
+    pub fn for_kind(&self, kind: WifiProcessKind) -> &Path {
+        match kind {
+            WifiProcessKind::AccessPoint => &self.access_point,
+            WifiProcessKind::Client | WifiProcessKind::Scan => &self.client,
+        }
+    }
 }
 
 impl WifiProcessKind {
@@ -99,7 +145,12 @@ impl WifiProcessKind {
 }
 
 impl WifiRecordStore {
-    pub fn new(kind: WifiProcessKind, directory: impl AsRef<Path>, interface: &str) -> Self {
+    pub fn new(
+        kind: WifiProcessKind,
+        directory: impl AsRef<Path>,
+        runtime_dir: impl AsRef<Path>,
+        interface: &str,
+    ) -> Self {
         let base = directory.as_ref();
         Self {
             path: kind
@@ -107,23 +158,47 @@ impl WifiRecordStore {
                 .join(format!("active-{interface}.json")),
             legacy_path: kind.legacy_path(base, interface),
             expected_config_stem: kind.expected_config_stem(interface),
+            runtime_dir: runtime_dir.as_ref().to_path_buf(),
+            interface: interface.to_string(),
+            kind,
         }
     }
 
-    pub fn for_access_point(directory: impl AsRef<Path>, interface: &str) -> Self {
-        Self::new(WifiProcessKind::AccessPoint, directory, interface)
+    pub fn for_access_point(
+        directory: impl AsRef<Path>,
+        runtime_dir: impl AsRef<Path>,
+        interface: &str,
+    ) -> Self {
+        Self::new(
+            WifiProcessKind::AccessPoint,
+            directory,
+            runtime_dir,
+            interface,
+        )
     }
 
-    pub fn for_client(directory: impl AsRef<Path>, interface: &str) -> Self {
-        Self::new(WifiProcessKind::Client, directory, interface)
+    pub fn for_client(
+        directory: impl AsRef<Path>,
+        runtime_dir: impl AsRef<Path>,
+        interface: &str,
+    ) -> Self {
+        Self::new(WifiProcessKind::Client, directory, runtime_dir, interface)
     }
 
-    pub fn for_scan(directory: impl AsRef<Path>, interface: &str) -> Self {
-        Self::new(WifiProcessKind::Scan, directory, interface)
+    pub fn for_scan(
+        directory: impl AsRef<Path>,
+        runtime_dir: impl AsRef<Path>,
+        interface: &str,
+    ) -> Self {
+        Self::new(WifiProcessKind::Scan, directory, runtime_dir, interface)
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub(crate) fn kind(&self) -> WifiProcessKind {
+        self.kind
     }
 
     fn transition_path_for(path: &Path) -> PathBuf {
@@ -134,15 +209,26 @@ impl WifiRecordStore {
         Self::transition_path_for(&self.path)
     }
 
-    fn record_matches_store(&self, record: &PersistedWifiRecord) -> bool {
-        record
-            .config_path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            == Some(self.expected_config_stem.as_str())
+    fn expected_ctrl_path(&self) -> PathBuf {
+        self.runtime_dir.join(&self.interface)
     }
 
-    async fn load_path(path: &Path) -> Result<Option<PersistedWifiRecord>, WifiRecordError> {
+    fn expected_config_path(&self) -> PathBuf {
+        self.runtime_dir
+            .join(format!("{}.conf", self.expected_config_stem))
+    }
+
+    fn record_matches_store(&self, record: &PersistedWifiRecord) -> bool {
+        record.ctrl_path == self.expected_ctrl_path()
+            && record.config_path == self.expected_config_path()
+            && record.ctrl_dev.is_some() == record.ctrl_ino.is_some()
+            && record.started_at_unix != 0
+    }
+
+    async fn load_path(
+        &self,
+        path: &Path,
+    ) -> Result<Option<(PersistedWifiRecord, u32)>, WifiRecordError> {
         let content = match fs::read(path).await {
             Ok(content) => content,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
@@ -152,23 +238,47 @@ impl WifiRecordStore {
         let document: PersistedWifiRecordDocument = serde_json::from_slice(&content)
             .map_err(|error| WifiRecordError::Parse(path.to_path_buf(), error))?;
 
-        if document.schema_version != CURRENT_WIFI_RECORD_SCHEMA {
+        if !matches!(
+            document.schema_version,
+            LEGACY_WIFI_RECORD_SCHEMA | CURRENT_WIFI_RECORD_SCHEMA
+        ) {
             return Err(WifiRecordError::UnsupportedSchema(
                 path.to_path_buf(),
                 document.schema_version,
             ));
         }
 
-        Ok(Some(PersistedWifiRecord {
-            pid: document.pid,
-            started_at_unix: document.started_at_unix,
-            binary_path: document.binary_path,
-            ctrl_path: document.ctrl_path,
-            config_path: document.config_path,
-            config_digest: document.config_digest,
-            key_digest: document.key_digest,
-            ssid: document.ssid,
-        }))
+        let context_matches = if document.schema_version == CURRENT_WIFI_RECORD_SCHEMA {
+            document.kind == Some(self.kind)
+                && document.interface.as_deref() == Some(self.interface.as_str())
+        } else {
+            document.kind.is_none_or(|kind| kind == self.kind)
+                && document
+                    .interface
+                    .as_deref()
+                    .is_none_or(|name| name == self.interface)
+        };
+        if !context_matches {
+            return Err(WifiRecordError::MismatchedContext(path.to_path_buf()));
+        }
+
+        Ok(Some((
+            PersistedWifiRecord {
+                pid: document.pid,
+                started_at_unix: document.started_at_unix,
+                process_start_ticks: document.process_start_ticks,
+                boot_id: document.boot_id,
+                binary_path: document.binary_path,
+                ctrl_path: document.ctrl_path,
+                ctrl_dev: document.ctrl_dev,
+                ctrl_ino: document.ctrl_ino,
+                config_path: document.config_path,
+                config_digest: document.config_digest,
+                key_digest: document.key_digest,
+                ssid: document.ssid,
+            },
+            document.schema_version,
+        )))
     }
 
     async fn path_exists(path: &Path) -> Result<bool, WifiRecordError> {
@@ -190,7 +300,7 @@ impl WifiRecordStore {
         let Some(path) = self.legacy_path.as_deref() else {
             return Ok(None);
         };
-        let Some(record) = Self::load_path(path).await? else {
+        let Some((record, _schema_version)) = self.load_path(path).await? else {
             return Ok(None);
         };
         Ok(self.record_matches_store(&record).then_some(record))
@@ -200,7 +310,7 @@ impl WifiRecordStore {
         let Some(path) = self.legacy_path.as_deref() else {
             return Ok(());
         };
-        let Some(record) = Self::load_path(path).await? else {
+        let Some((record, _schema_version)) = self.load_path(path).await? else {
             return Ok(());
         };
         if !self.record_matches_store(&record) {
@@ -264,7 +374,16 @@ impl WifiRecordStore {
     }
 
     pub async fn load(&self) -> Result<Option<PersistedWifiRecord>, WifiRecordError> {
-        if let Some(record) = Self::load_path(&self.path).await? {
+        if let Some((record, schema_version)) = self.load_path(&self.path).await? {
+            if !self.record_matches_store(&record) {
+                return Err(WifiRecordError::MismatchedContext(self.path.clone()));
+            }
+            // Schema v1 is accepted only after exact context/path validation,
+            // then immediately rewritten as v2 so future recovery requires
+            // explicit kind/interface metadata.
+            if schema_version == LEGACY_WIFI_RECORD_SCHEMA {
+                self.save_primary(&record).await?;
+            }
             // A crash after writing the new namespaced record but before
             // removing its legacy copy is harmless; finish that migration now.
             self.clear_matching_legacy().await?;
@@ -287,10 +406,16 @@ impl WifiRecordStore {
 
         let document = PersistedWifiRecordDocument {
             schema_version: CURRENT_WIFI_RECORD_SCHEMA,
+            kind: Some(self.kind),
+            interface: Some(self.interface.clone()),
             pid: record.pid,
             started_at_unix: record.started_at_unix,
+            process_start_ticks: record.process_start_ticks,
+            boot_id: record.boot_id.clone(),
             binary_path: record.binary_path.clone(),
             ctrl_path: record.ctrl_path.clone(),
+            ctrl_dev: record.ctrl_dev,
+            ctrl_ino: record.ctrl_ino,
             config_path: record.config_path.clone(),
             config_digest: record.config_digest,
             key_digest: record.key_digest,
@@ -306,6 +431,9 @@ impl WifiRecordStore {
     }
 
     pub async fn save(&self, record: &PersistedWifiRecord) -> Result<(), WifiRecordError> {
+        if !self.record_matches_store(record) {
+            return Err(WifiRecordError::MismatchedContext(self.path.clone()));
+        }
         self.save_primary(record).await?;
         self.clear_matching_legacy().await
     }
@@ -318,13 +446,15 @@ impl WifiRecordStore {
 
     /// Discover ownership records of one Wi-Fi process kind. AP and client
     /// records use separate namespaces. Legacy root-level names are considered
-    /// only long enough to validate their embedded config path and migrate them
-    /// into the unambiguous namespace.
+    /// only long enough to validate their exact configured runtime paths and
+    /// migrate them into the unambiguous schema-v2 namespace.
     pub async fn discover(
         kind: WifiProcessKind,
         directory: impl AsRef<Path>,
+        runtime_dir: impl AsRef<Path>,
     ) -> Result<Vec<(String, Self, PersistedWifiRecord)>, WifiRecordError> {
         let base = directory.as_ref();
+        let runtime_dir = runtime_dir.as_ref();
         let namespaced_directory = kind.storage_directory(base);
         let mut candidates = BTreeSet::new();
         collect_candidates(&namespaced_directory, false, kind, &mut candidates).await?;
@@ -334,7 +464,7 @@ impl WifiRecordStore {
 
         let mut records = Vec::new();
         for interface in candidates {
-            let store = Self::new(kind, base, &interface);
+            let store = Self::new(kind, base, runtime_dir, &interface);
             match store.load().await {
                 Ok(Some(record)) => records.push((interface, store, record)),
                 Ok(None) => {}

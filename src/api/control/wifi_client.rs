@@ -1171,6 +1171,14 @@ pub(super) fn classify_wifi_client_error(error: ClientSupervisorError) -> Respon
     let detail = match error {
         ClientSupervisorError::NotConfigured { .. } => WifiClientErrorDetail::InterfaceNotFound,
         ClientSupervisorError::NotOwned { .. } => WifiClientErrorDetail::NotOwned,
+        ClientSupervisorError::BinaryPreflight(
+            crate::wifi::lifecycle::BinaryPreflightError::NotFound { .. },
+        ) => WifiClientErrorDetail::WpaSupplicantMissing,
+        ClientSupervisorError::BinaryPreflight(error) => {
+            WifiClientErrorDetail::WpaSupplicantFailed {
+                message: error.to_string(),
+            }
+        }
         ClientSupervisorError::StartupTimeout { .. } => WifiClientErrorDetail::CtrlTimeout,
         ClientSupervisorError::ScanBusy { .. } => WifiClientErrorDetail::ScanBusy,
         ClientSupervisorError::ScanTimeout { .. } => WifiClientErrorDetail::ScanTimeout,

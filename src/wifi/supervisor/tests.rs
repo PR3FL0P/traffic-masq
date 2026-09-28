@@ -310,7 +310,7 @@ async fn configure_spawns_hostapd_and_persists_a_record() {
     let status = supervisor.status("wlan0").await.expect("status");
     assert_eq!(status.hostapd_state, HostapdState::Enabled);
 
-    let record = WifiRecordStore::for_access_point(temp.path().join("wifi"), "wlan0")
+    let record = WifiRecordStore::for_access_point(temp.path().join("wifi"), &runtime_dir, "wlan0")
         .load()
         .await
         .expect("load")
@@ -536,9 +536,13 @@ async fn adopts_and_upgrades_a_legacy_process_record_after_strong_identity_check
         .record_store("wlan0")
         .save(&PersistedWifiRecord {
             pid: 4242,
-            started_at_unix: 0,
+            started_at_unix: crate::wifi::lifecycle::unix_now(),
+            process_start_ticks: None,
+            boot_id: None,
             binary_path: None,
             ctrl_path: supervisor.ctrl_path("wlan0"),
+            ctrl_dev: None,
+            ctrl_ino: None,
             config_path: rendered.path.clone(),
             config_digest: rendered.config_digest,
             key_digest: rendered.key_digest,
@@ -582,8 +586,12 @@ async fn recovers_a_process_spawned_after_a_durable_launch_intent() {
         .save(&PersistedWifiRecord {
             pid: 0,
             started_at_unix: 1,
+            process_start_ticks: None,
+            boot_id: Some("test-boot".to_string()),
             binary_path: Some(std::path::PathBuf::from("/usr/sbin/hostapd")),
             ctrl_path: supervisor.ctrl_path("wlan0"),
+            ctrl_dev: None,
+            ctrl_ino: None,
             config_path: rendered.path.clone(),
             config_digest: rendered.config_digest,
             key_digest: rendered.key_digest,
@@ -633,8 +641,12 @@ async fn interrupted_reload_is_restarted_from_committed_state() {
         .save(&PersistedWifiRecord {
             pid: 4243,
             started_at_unix: 1,
+            process_start_ticks: None,
+            boot_id: None,
             binary_path: Some(std::path::PathBuf::from("/usr/sbin/hostapd")),
             ctrl_path: supervisor.ctrl_path("wlan0"),
+            ctrl_dev: None,
+            ctrl_ino: None,
             config_path: rendered.path.clone(),
             config_digest: rendered.config_digest,
             key_digest: rendered.key_digest,
@@ -671,13 +683,17 @@ async fn startup_stops_owned_ap_absent_from_committed_configuration() {
     let config = app_config(temp.path(), &runtime_dir);
     let config_path = render::config_path(&runtime_dir, "wlan0");
     seed_process(&process, 4244, config_path.clone(), "uncommitted-net");
-    let store = WifiRecordStore::for_access_point(temp.path().join("wifi"), "wlan0");
+    let store = WifiRecordStore::for_access_point(temp.path().join("wifi"), &runtime_dir, "wlan0");
     store
         .save(&PersistedWifiRecord {
             pid: 0,
             started_at_unix: 1,
+            process_start_ticks: None,
+            boot_id: Some("test-boot".to_string()),
             binary_path: Some(std::path::PathBuf::from("/usr/sbin/hostapd")),
             ctrl_path: runtime_dir.join("wlan0"),
+            ctrl_dev: None,
+            ctrl_ino: None,
             config_path,
             config_digest: WifiDigest::from_bytes([1; 32]),
             key_digest: WifiDigest::from_bytes([2; 32]),
@@ -732,8 +748,12 @@ async fn adoption_refuses_a_rebound_ctrl_socket_even_when_the_recorded_pid_still
         .save(&PersistedWifiRecord {
             pid: 4242,
             started_at_unix: 1,
+            process_start_ticks: None,
+            boot_id: None,
             binary_path: Some(PathBuf::from("/usr/sbin/hostapd")),
             ctrl_path: supervisor.ctrl_path("wlan0"),
+            ctrl_dev: None,
+            ctrl_ino: None,
             config_path: rendered.path.clone(),
             config_digest: rendered.config_digest,
             key_digest: rendered.key_digest,
@@ -771,9 +791,13 @@ async fn a_digest_mismatch_restarts_with_the_new_config() {
         .record_store("wlan0")
         .save(&PersistedWifiRecord {
             pid: 4242,
-            started_at_unix: 0,
+            started_at_unix: crate::wifi::lifecycle::unix_now(),
+            process_start_ticks: None,
+            boot_id: None,
             binary_path: Some(std::path::PathBuf::from("/usr/sbin/hostapd")),
             ctrl_path: supervisor.ctrl_path("wlan0"),
+            ctrl_dev: None,
+            ctrl_ino: None,
             config_path: rendered.path.clone(),
             config_digest: WifiDigest::from_bytes([9; 32]),
             key_digest: rendered.key_digest,
@@ -804,9 +828,13 @@ async fn absent_ctrl_socket_clears_any_stale_record_and_spawns_fresh() {
         .record_store("wlan0")
         .save(&PersistedWifiRecord {
             pid: 9999,
-            started_at_unix: 0,
+            started_at_unix: crate::wifi::lifecycle::unix_now(),
+            process_start_ticks: None,
+            boot_id: None,
             binary_path: Some(std::path::PathBuf::from("/usr/sbin/hostapd")),
             ctrl_path: supervisor.ctrl_path("wlan0"),
+            ctrl_dev: None,
+            ctrl_ino: None,
             config_path: render::config_path(&runtime_dir, "wlan0"),
             config_digest: WifiDigest::from_bytes([1; 32]),
             key_digest: WifiDigest::from_bytes([2; 32]),
@@ -825,7 +853,7 @@ async fn absent_ctrl_socket_clears_any_stale_record_and_spawns_fresh() {
         vec![FakeCall::Spawn(render::config_path(&runtime_dir, "wlan0"))]
     );
     assert_eq!(
-        WifiRecordStore::for_access_point(temp.path().join("wifi"), "wlan0")
+        WifiRecordStore::for_access_point(temp.path().join("wifi"), &runtime_dir, "wlan0")
             .load()
             .await
             .expect("load")
@@ -851,7 +879,7 @@ async fn disable_stops_hostapd_and_forgets_the_interface() {
     assert!(supervisor.status("wlan0").await.is_none());
     assert_eq!(process.calls().last(), Some(&FakeCall::Terminate(1000)));
     assert_eq!(
-        WifiRecordStore::for_access_point(temp.path().join("wifi"), "wlan0")
+        WifiRecordStore::for_access_point(temp.path().join("wifi"), &runtime_dir, "wlan0")
             .load()
             .await
             .expect("load"),
@@ -1147,7 +1175,7 @@ async fn shutdown_with_preserve_interfaces_leaves_hostapd_and_its_record_alone()
         "PreserveInterfaces must never signal hostapd"
     );
     assert!(
-        WifiRecordStore::for_access_point(temp.path().join("wifi"), "wlan0")
+        WifiRecordStore::for_access_point(temp.path().join("wifi"), &runtime_dir, "wlan0")
             .load()
             .await
             .expect("load")
@@ -1171,7 +1199,7 @@ async fn shutdown_with_restore_interfaces_stops_hostapd_and_clears_its_record() 
 
     assert_eq!(process.calls().last(), Some(&FakeCall::Terminate(1000)));
     assert_eq!(
-        WifiRecordStore::for_access_point(temp.path().join("wifi"), "wlan0")
+        WifiRecordStore::for_access_point(temp.path().join("wifi"), &runtime_dir, "wlan0")
             .load()
             .await
             .expect("load"),

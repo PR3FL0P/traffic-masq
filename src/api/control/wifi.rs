@@ -475,6 +475,12 @@ pub(super) fn classify_wifi_error(error: SupervisorError) -> Response {
     let detail = match error {
         SupervisorError::NotConfigured { .. } => WifiErrorDetail::InterfaceNotFound,
         SupervisorError::NotOwned { .. } => WifiErrorDetail::NotOwned,
+        SupervisorError::BinaryPreflight(
+            crate::wifi::lifecycle::BinaryPreflightError::NotFound { .. },
+        ) => WifiErrorDetail::HostapdMissing,
+        SupervisorError::BinaryPreflight(error) => WifiErrorDetail::HostapdFailed {
+            message: error.to_string(),
+        },
         SupervisorError::StartupTimeout { .. } => WifiErrorDetail::CtrlTimeout,
         SupervisorError::Ctrl(CtrlError::Timeout(_)) => WifiErrorDetail::CtrlTimeout,
         SupervisorError::Ctrl(error) => WifiErrorDetail::HostapdFailed {

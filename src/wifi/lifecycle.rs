@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -110,6 +111,21 @@ where
     // exact configured executable plus private config-path argument. Never
     // guess when more than one process matches.
     if let Some(pending) = record.clone().filter(|record| record.pid == 0) {
+        let Some(expected_boot) = pending.boot_id.as_deref() else {
+            return Ok(OwnershipOutcome::ForeignPresent);
+        };
+        match process.boot_id().await {
+            Ok(Some(current_boot)) if current_boot.as_str() == expected_boot => {}
+            Ok(Some(_)) => {
+                store.clear().await?;
+                return Ok(if ctrl_reachable {
+                    OwnershipOutcome::ForeignPresent
+                } else {
+                    OwnershipOutcome::Absent
+                });
+            }
+            Ok(None) | Err(_) => return Ok(OwnershipOutcome::ForeignPresent),
+        }
         let binary_path = pending.binary_path.as_deref().unwrap_or(expected_binary);
         match process
             .pids_matching_identity(
@@ -127,6 +143,28 @@ where
             Ok(pids) if pids.len() == 1 => {
                 let mut recovered = pending;
                 recovered.pid = pids[0];
+                recovered.process_start_ticks = match process.process_start_ticks(pids[0]).await {
+                    Ok(Some(ticks)) => Some(ticks),
+                    Ok(None) => {
+                        tracing::warn!(pid = pids[0], "could not capture exact Wi-Fi process starttime; retaining launch intent and refusing ownership recovery");
+                        return Ok(OwnershipOutcome::ForeignPresent);
+                    }
+                    Err(error) => {
+                        tracing::warn!(pid = pids[0], %error, "could not capture exact Wi-Fi process starttime; retaining launch intent and refusing ownership recovery");
+                        return Ok(OwnershipOutcome::ForeignPresent);
+                    }
+                };
+                recovered.boot_id = match process.boot_id().await {
+                    Ok(Some(boot_id)) => Some(boot_id),
+                    Ok(None) => {
+                        tracing::warn!(pid = pids[0], "could not capture Linux boot identity; retaining launch intent and refusing ownership recovery");
+                        return Ok(OwnershipOutcome::ForeignPresent);
+                    }
+                    Err(error) => {
+                        tracing::warn!(pid = pids[0], %error, "could not capture Linux boot identity; retaining launch intent and refusing ownership recovery");
+                        return Ok(OwnershipOutcome::ForeignPresent);
+                    }
+                };
                 if recovered.binary_path.is_none() {
                     recovered.binary_path = Some(expected_binary.to_path_buf());
                 }
@@ -152,19 +190,43 @@ where
         }
     }
 
+    if let Some(stale) = record.as_ref().filter(|record| record.pid != 0) {
+        let binary = stale.binary_path.as_deref().unwrap_or(expected_binary);
+        if !process
+            .identity_matches_record(stale, kind, binary)
+            .await
+            .unwrap_or(true)
+        {
+            match tokio::fs::symlink_metadata(&stale.ctrl_path).await {
+                Ok(node)
+                    if node.file_type().is_socket()
+                        && Some(node.dev()) == stale.ctrl_dev
+                        && Some(node.ino()) == stale.ctrl_ino
+                        && ctrl_socket_is_stale(&stale.ctrl_path) =>
+                {
+                    tokio::fs::remove_file(&stale.ctrl_path)
+                        .await
+                        .map_err(|error| WifiRecordError::Write(stale.ctrl_path.clone(), error))?;
+                    store.clear().await?;
+                    return Ok(OwnershipOutcome::Absent);
+                }
+                Ok(_) => return Ok(OwnershipOutcome::ForeignPresent),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    store.clear().await?;
+                    return Ok(OwnershipOutcome::Absent);
+                }
+                Err(error) => return Err(WifiRecordError::Read(stale.ctrl_path.clone(), error)),
+            }
+        }
+    }
+
     if !ctrl_reachable {
         let Some(record) = record else {
             return Ok(OwnershipOutcome::Absent);
         };
         let binary_path = record.binary_path.as_deref().unwrap_or(expected_binary);
         return match process
-            .identity_matches(
-                record.pid,
-                kind,
-                binary_path,
-                &record.config_path,
-                record.started_at_unix,
-            )
+            .identity_matches_record(&record, kind, binary_path)
             .await
         {
             Ok(true) => {
@@ -194,13 +256,7 @@ where
     let binary_path = record.binary_path.as_deref().unwrap_or(expected_binary);
 
     let process_matches = process
-        .identity_matches(
-            record.pid,
-            kind,
-            binary_path,
-            &record.config_path,
-            record.started_at_unix,
-        )
+        .identity_matches_record(&record, kind, binary_path)
         .await
         .unwrap_or(false);
     if !process_matches {
@@ -235,8 +291,10 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Persist the complete launch identity before spawning.
 pub(crate) async fn save_launch_intent(
     store: &WifiRecordStore,
+    boot_id: String,
     binary_path: &Path,
     ctrl_path: &Path,
     config_path: &Path,
@@ -247,8 +305,12 @@ pub(crate) async fn save_launch_intent(
     let record = PersistedWifiRecord {
         pid: 0,
         started_at_unix: unix_now(),
+        process_start_ticks: None,
+        boot_id: Some(boot_id),
         binary_path: Some(binary_path.to_path_buf()),
         ctrl_path: ctrl_path.to_path_buf(),
+        ctrl_dev: None,
+        ctrl_ino: None,
         config_path: config_path.to_path_buf(),
         config_digest,
         key_digest,
@@ -262,6 +324,8 @@ pub(crate) async fn save_launch_intent(
 pub(crate) async fn save_spawned_record(
     store: &WifiRecordStore,
     pid: u32,
+    process_start_ticks: u64,
+    boot_id: String,
     binary_path: &Path,
     ctrl_path: &Path,
     config_path: &Path,
@@ -272,13 +336,80 @@ pub(crate) async fn save_spawned_record(
     let record = PersistedWifiRecord {
         pid,
         started_at_unix: unix_now(),
+        process_start_ticks: Some(process_start_ticks),
+        boot_id: Some(boot_id),
         binary_path: Some(binary_path.to_path_buf()),
         ctrl_path: ctrl_path.to_path_buf(),
+        ctrl_dev: None,
+        ctrl_ino: None,
         config_path: config_path.to_path_buf(),
         config_digest,
         key_digest,
         ssid: ssid.to_string(),
     };
+    store.save(&record).await?;
+    Ok(record)
+}
+
+/// A retained pathname is stale only when the kernel confirms that no socket
+/// is bound to it. Connecting sends no control command to a foreign daemon.
+pub(crate) fn ctrl_socket_is_stale(path: &Path) -> bool {
+    std::os::unix::net::UnixDatagram::unbound()
+        .and_then(|socket| socket.connect(path))
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionRefused)
+}
+
+pub(crate) async fn persist_owned_ctrl_node(
+    store: &WifiRecordStore,
+    process: &dyn SupervisedProcess,
+    mut record: PersistedWifiRecord,
+) -> Result<PersistedWifiRecord, WifiRecordError> {
+    let binary = record
+        .binary_path
+        .clone()
+        .ok_or_else(|| WifiRecordError::MismatchedContext(store.path().to_path_buf()))?;
+    if !process
+        .identity_matches_record(&record, store.kind(), &binary)
+        .await
+        .unwrap_or(false)
+    {
+        return Err(WifiRecordError::MismatchedContext(
+            store.path().to_path_buf(),
+        ));
+    }
+    if !process
+        .owns_unix_socket(record.pid, &record.ctrl_path)
+        .await
+        .unwrap_or(false)
+    {
+        return Err(WifiRecordError::MismatchedContext(
+            store.path().to_path_buf(),
+        ));
+    }
+    if record.process_start_ticks.is_none() || record.boot_id.is_none() {
+        return Err(WifiRecordError::MismatchedContext(
+            store.path().to_path_buf(),
+        ));
+    }
+    let node = tokio::fs::symlink_metadata(&record.ctrl_path)
+        .await
+        .map_err(|error| WifiRecordError::Read(record.ctrl_path.clone(), error))?;
+    if !node.file_type().is_socket()
+        || !process
+            .identity_matches_record(&record, store.kind(), &binary)
+            .await
+            .unwrap_or(false)
+        || !process
+            .owns_unix_socket(record.pid, &record.ctrl_path)
+            .await
+            .unwrap_or(false)
+    {
+        return Err(WifiRecordError::MismatchedContext(
+            store.path().to_path_buf(),
+        ));
+    }
+    record.ctrl_dev = Some(node.dev());
+    record.ctrl_ino = Some(node.ino());
     store.save(&record).await?;
     Ok(record)
 }
@@ -309,23 +440,40 @@ pub(crate) async fn retry_health(
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum BinaryPreflightError {
+    #[error("binary {binary} does not exist")]
+    NotFound { binary: std::path::PathBuf },
+    #[error("binary {binary} is not runnable: {source}")]
+    ProbeFailed {
+        binary: std::path::PathBuf,
+        source: anyhow::Error,
+    },
+}
+
 pub(crate) async fn preflight_binary(
     binary: &Path,
     daemon: &str,
     setting: &str,
-) -> Result<(), anyhow::Error> {
-    crate::command::probe(binary).await.map_err(|error| {
-        anyhow::anyhow!(
-            "{daemon} binary {} is not runnable ({error}) — install {daemon} or fix {setting}",
-            binary.display()
-        )
-    })
+) -> Result<(), BinaryPreflightError> {
+    let _ = (daemon, setting);
+    if !binary.exists() {
+        return Err(BinaryPreflightError::NotFound {
+            binary: binary.to_path_buf(),
+        });
+    }
+    crate::command::probe(binary)
+        .await
+        .map_err(|source| BinaryPreflightError::ProbeFailed {
+            binary: binary.to_path_buf(),
+            source,
+        })
 }
 
 /// Send SIGTERM and wait for exit, escalating to SIGKILL after the grace period.
 /// Treat an absent process as stopped; report failure if it survives the kill deadline.
-pub(crate) async fn graceful_stop(
-    process: &dyn SupervisedProcess,
+pub(crate) async fn graceful_stop<P: SupervisedProcess + ?Sized>(
+    process: &P,
     pid: u32,
     daemon: &'static str,
 ) -> Result<(), crate::wifi::process::ProcessError> {
@@ -409,12 +557,15 @@ pub(crate) fn unix_now() -> u64 {
 /// process-kind/config proof used by normal adoption.
 pub(crate) async fn cleanup_unconfigured_records(
     records_dir: &Path,
+    runtime_dir: &Path,
     kind: WifiProcessKind,
     configured_interfaces: &HashSet<String>,
     process: &dyn SupervisedProcess,
     expected_binary: &Path,
 ) -> anyhow::Result<()> {
-    for (interface, store, record) in WifiRecordStore::discover(kind, records_dir).await? {
+    for (interface, store, record) in
+        WifiRecordStore::discover(kind, records_dir, runtime_dir).await?
+    {
         if configured_interfaces.contains(&interface)
             || records_dir.parent().is_some_and(|root| {
                 crate::core::recovery::check_scope(root, Some(&interface)).is_err()
@@ -428,8 +579,19 @@ pub(crate) async fn cleanup_unconfigured_records(
                 .binary_path
                 .as_deref()
                 .unwrap_or(expected_binary);
-            let pid = if record.pid == 0 {
-                let pids = process
+            let recovered_from_intent = record.pid == 0;
+            let pid = if recovered_from_intent {
+                let current_boot = process
+                    .boot_id()
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("Linux boot identity is unavailable"))?;
+                let Some(expected_boot) = record.boot_id.as_deref() else {
+                    anyhow::bail!("cannot recover legacy Wi-Fi launch intent for {interface}: boot identity is missing");
+                };
+                if expected_boot != current_boot.as_str() {
+                    None
+                } else {
+                    let pids = process
                     .pids_matching_identity(
                         kind,
                         binary_path,
@@ -437,23 +599,18 @@ pub(crate) async fn cleanup_unconfigured_records(
                         record.started_at_unix,
                     )
                     .await?;
-                match pids.as_slice() {
-                    [] => None,
-                    [pid] => Some(*pid),
-                    _ => anyhow::bail!(
-                        "cannot recover stale Wi-Fi launch on {interface}: multiple processes {:?} use {}",
-                        pids,
-                        record.config_path.display()
-                    ),
+                    match pids.as_slice() {
+                        [] => None,
+                        [pid] => Some(*pid),
+                        _ => anyhow::bail!(
+                            "cannot recover stale Wi-Fi launch on {interface}: multiple processes {:?} use {}",
+                            pids,
+                            record.config_path.display()
+                        ),
+                    }
                 }
             } else if process
-                .identity_matches(
-                    record.pid,
-                    kind,
-                    binary_path,
-                    &record.config_path,
-                    record.started_at_unix,
-                )
+                .identity_matches_record(&record, kind, binary_path)
                 .await?
             {
                 Some(record.pid)
@@ -468,7 +625,26 @@ pub(crate) async fn cleanup_unconfigured_records(
                     config_path = %record.config_path.display(),
                     "stopping Wi-Fi process absent from committed configuration"
                 );
-                graceful_stop(process, pid, "Wi-Fi startup recovery").await?;
+                let mut owned = record.clone();
+                owned.pid = pid;
+                if recovered_from_intent {
+                    owned.process_start_ticks = Some(
+                        process
+                            .process_start_ticks(pid)
+                            .await?
+                            .ok_or_else(|| anyhow::anyhow!("process {pid} disappeared before exact starttime could be captured"))?,
+                    );
+                    owned.boot_id = Some(
+                        process
+                            .boot_id()
+                            .await?
+                            .ok_or_else(|| anyhow::anyhow!("Linux boot identity is unavailable"))?,
+                    );
+                } else if owned.process_start_ticks.is_none() || owned.boot_id.is_none() {
+                    anyhow::bail!("cannot signal legacy Wi-Fi process record for {interface}: exact process lifetime identity is missing");
+                }
+                owned.binary_path = Some(binary_path.to_path_buf());
+                process.stop_recorded(&owned, kind, "Wi-Fi startup recovery").await?;
             }
             store.clear().await?;
             Ok(())
@@ -485,11 +661,13 @@ pub(crate) async fn cleanup_unconfigured_records(
 
 /// Recover interrupted interface transactions before starting any supervisor.
 /// A durable PID, or a write-ahead launch intent that resolves to exactly one
-/// process, plus its exact configured executable and kind/config argument is
-/// the ownership proof. Stale records are cleared without signalling a process
-/// that no longer matches.
+/// process, plus its exact configured executable, kind/config argument,
+/// Linux boot identity, and kernel process starttime is the ownership proof
+/// used for signalling. Stale
+/// records are cleared without signalling a process that no longer matches.
 pub(crate) async fn stop_recorded_interface(
     state_dir: &Path,
+    runtime_dirs: &crate::wifi::WifiRuntimeDirs,
     interface: &str,
 ) -> anyhow::Result<()> {
     let process = crate::wifi::process::TokioSupervisedProcess::new();
@@ -498,39 +676,50 @@ pub(crate) async fn stop_recorded_interface(
         WifiProcessKind::Client,
         WifiProcessKind::Scan,
     ] {
-        let store = WifiRecordStore::new(kind, state_dir.join("wifi"), interface);
+        let store = WifiRecordStore::new(
+            kind,
+            state_dir.join("wifi"),
+            runtime_dirs.for_kind(kind),
+            interface,
+        );
         if let Some(record) = store.load().await? {
             let Some(binary_path) = record.binary_path.as_deref() else {
                 anyhow::bail!(
                     "cannot recover Wi-Fi ownership on {interface}: legacy process record has no executable identity"
                 );
             };
-            let pid = if record.pid == 0 {
-                let pids = process
-                    .pids_matching_identity(
-                        kind,
-                        binary_path,
-                        &record.config_path,
-                        record.started_at_unix,
-                    )
-                    .await?;
-                match pids.as_slice() {
-                    [] => None,
-                    [pid] => Some(*pid),
-                    _ => anyhow::bail!(
-                        "cannot recover Wi-Fi ownership on {interface}: multiple processes {:?} use {}",
-                        pids,
-                        record.config_path.display()
-                    ),
+            let recovered_from_intent = record.pid == 0;
+            let pid = if recovered_from_intent {
+                let current_boot = process
+                    .boot_id()
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("Linux boot identity is unavailable"))?;
+                let Some(expected_boot) = record.boot_id.as_deref() else {
+                    anyhow::bail!("cannot recover legacy Wi-Fi launch intent for {interface}: boot identity is missing");
+                };
+                if expected_boot != current_boot.as_str() {
+                    None
+                } else {
+                    let pids = process
+                        .pids_matching_identity(
+                            kind,
+                            binary_path,
+                            &record.config_path,
+                            record.started_at_unix,
+                        )
+                        .await?;
+                    match pids.as_slice() {
+                        [] => None,
+                        [pid] => Some(*pid),
+                        _ => anyhow::bail!(
+                            "cannot recover Wi-Fi ownership on {interface}: multiple processes {:?} use {}",
+                            pids,
+                            record.config_path.display()
+                        ),
+                    }
                 }
             } else if process
-                .identity_matches(
-                    record.pid,
-                    kind,
-                    binary_path,
-                    &record.config_path,
-                    record.started_at_unix,
-                )
+                .identity_matches_record(&record, kind, binary_path)
                 .await?
             {
                 Some(record.pid)
@@ -538,7 +727,25 @@ pub(crate) async fn stop_recorded_interface(
                 None
             };
             if let Some(pid) = pid {
-                graceful_stop(&process, pid, "Wi-Fi recovery").await?;
+                let mut owned = record.clone();
+                owned.pid = pid;
+                if recovered_from_intent {
+                    owned.process_start_ticks = Some(
+                        process
+                            .process_start_ticks(pid)
+                            .await?
+                            .ok_or_else(|| anyhow::anyhow!("process {pid} disappeared before exact starttime could be captured"))?,
+                    );
+                    owned.boot_id =
+                        Some(process.boot_id().await?.ok_or_else(|| {
+                            anyhow::anyhow!("Linux boot identity is unavailable")
+                        })?);
+                } else if owned.process_start_ticks.is_none() || owned.boot_id.is_none() {
+                    anyhow::bail!("cannot signal legacy Wi-Fi process record for {interface}: exact process lifetime identity is missing");
+                }
+                process
+                    .stop_recorded(&owned, kind, "Wi-Fi recovery")
+                    .await?;
             }
             store.clear().await?;
         }

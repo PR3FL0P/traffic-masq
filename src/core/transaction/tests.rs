@@ -11,9 +11,16 @@ use crate::config::{AppConfig, InterfaceConfig, InterfaceRole};
 use crate::core::override_manager::RuntimeOverrideManager;
 use crate::core::ownership::AddressOwnershipJournal;
 use crate::netlink::{Ipv4AddressInfo, NetworkInterface, NetworkProvider};
-use crate::wifi::{PassphraseStore, WifiPassphrase, WifiPassphraseUpdate};
+use crate::wifi::{PassphraseStore, WifiPassphrase, WifiPassphraseUpdate, WifiRuntimeDirs};
 
 use super::*;
+
+fn wifi_runtime_dirs() -> WifiRuntimeDirs {
+    WifiRuntimeDirs::new(
+        "/run/traffic-masq/hostapd",
+        "/run/traffic-masq/wpa_supplicant",
+    )
+}
 
 #[test]
 fn convergence_deadline_exceeds_wifi_startup_budget() {
@@ -236,9 +243,14 @@ async fn restart_removes_unconfirmed_address_on_previously_unmanaged_interface()
     assert!(addresses(&provider)
         .await
         .contains(&interface_config(PROPOSED).ipv4.unwrap().addr()));
-    recover_interface_transactions(directory.path(), &interfaces, &Default::default())
-        .await
-        .unwrap();
+    recover_interface_transactions(
+        directory.path(),
+        &interfaces,
+        &Default::default(),
+        &wifi_runtime_dirs(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         addresses(&provider).await,
         vec![Ipv4Addr::new(192, 168, 1, 10)]
@@ -274,6 +286,7 @@ async fn independently_blocked_interface_is_not_rolled_back_by_transaction_recov
         &interfaces,
         &Default::default(),
         &excluded,
+        &wifi_runtime_dirs(),
     )
     .await
     .unwrap();
@@ -311,9 +324,14 @@ async fn restart_keeps_address_whose_commit_token_was_persisted() {
     committed
         .committed_interface_transactions
         .insert("test0".into(), "confirmed".into());
-    recover_interface_transactions(directory.path(), &interfaces, &committed)
-        .await
-        .unwrap();
+    recover_interface_transactions(
+        directory.path(),
+        &interfaces,
+        &committed,
+        &wifi_runtime_dirs(),
+    )
+    .await
+    .unwrap();
     assert_eq!(addresses(&provider).await, before);
 }
 
@@ -346,9 +364,14 @@ async fn committed_invalid_interface_schema_is_retired_without_rollback() {
         .committed_interface_transactions
         .insert("test0".into(), "confirmed".into());
 
-    recover_interface_transactions(directory.path(), &interfaces, &committed)
-        .await
-        .unwrap();
+    recover_interface_transactions(
+        directory.path(),
+        &interfaces,
+        &committed,
+        &wifi_runtime_dirs(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(addresses(&provider).await, before);
     assert!(!journal.exists());
@@ -819,9 +842,14 @@ async fn corrupt_interface_journal_does_not_prevent_another_recovery() {
     )
     .await
     .unwrap();
-    recover_interface_transactions(directory.path(), &interfaces, &Default::default())
-        .await
-        .unwrap();
+    recover_interface_transactions(
+        directory.path(),
+        &interfaces,
+        &Default::default(),
+        &wifi_runtime_dirs(),
+    )
+    .await
+    .unwrap();
     assert!(crate::core::recovery::check_scope(directory.path(), Some("bad0")).is_err());
     assert!(crate::core::recovery::check_scope(directory.path(), Some("test0")).is_ok());
     assert!(!directory
@@ -832,9 +860,14 @@ async fn corrupt_interface_journal_does_not_prevent_another_recovery() {
         .path()
         .join("interface-transactions/bad0.json")
         .exists());
-    recover_interface_transactions(directory.path(), &interfaces, &Default::default())
-        .await
-        .unwrap();
+    recover_interface_transactions(
+        directory.path(),
+        &interfaces,
+        &Default::default(),
+        &wifi_runtime_dirs(),
+    )
+    .await
+    .unwrap();
 }
 
 #[test]
@@ -1247,9 +1280,14 @@ async fn role_switch_rollback_and_crash_recovery_restore_only_the_target_namespa
                 "new-target-password"
             );
             if crash {
-                recover_interface_transactions(directory.path(), &interfaces, &Default::default())
-                    .await
-                    .unwrap();
+                recover_interface_transactions(
+                    directory.path(),
+                    &interfaces,
+                    &Default::default(),
+                    &wifi_runtime_dirs(),
+                )
+                .await
+                .unwrap();
             } else {
                 manager.rollback(&pending.token).await.unwrap();
             }
@@ -1292,9 +1330,14 @@ async fn legacy_interface_secret_journal_restores_legacy_namespace_only() {
     let ap = PassphraseStore::for_role(directory.path(), WifiCredentialRole::Ap);
     ap.set("test0", &WifiPassphrase::new("ap-password").unwrap())
         .unwrap();
-    recover_interface_transactions(directory.path(), &interfaces, &Default::default())
-        .await
-        .unwrap();
+    recover_interface_transactions(
+        directory.path(),
+        &interfaces,
+        &Default::default(),
+        &wifi_runtime_dirs(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         PassphraseStore::new(directory.path().join("wifi/psk"))
             .get("test0")

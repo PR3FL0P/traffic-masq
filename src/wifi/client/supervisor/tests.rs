@@ -271,7 +271,7 @@ async fn configure_spawns_and_records_ownership() {
         .expect("configure");
 
     assert_eq!(process.spawn_count(), 1);
-    let record = WifiRecordStore::for_client(temp.path().join("wifi"), "wlan0")
+    let record = WifiRecordStore::for_client(temp.path().join("wifi"), &runtime, "wlan0")
         .load()
         .await
         .expect("load")
@@ -328,13 +328,13 @@ async fn the_client_record_does_not_collide_with_an_access_point_one() {
         .expect("configure");
 
     let records = temp.path().join("wifi");
-    assert!(WifiRecordStore::for_client(&records, "wlan0")
+    assert!(WifiRecordStore::for_client(&records, &runtime, "wlan0")
         .load()
         .await
         .expect("load client")
         .is_some());
     assert!(
-        WifiRecordStore::for_access_point(&records, "wlan0")
+        WifiRecordStore::for_access_point(&records, &runtime, "wlan0")
             .load()
             .await
             .expect("load ap")
@@ -391,7 +391,7 @@ async fn changing_the_network_restarts_rather_than_reloading() {
         .iter()
         .any(|call| matches!(call, FakeCall::Terminate(2000))));
 
-    let record = WifiRecordStore::for_client(temp.path().join("wifi"), "wlan0")
+    let record = WifiRecordStore::for_client(temp.path().join("wifi"), &runtime, "wlan0")
         .load()
         .await
         .expect("load")
@@ -514,12 +514,16 @@ async fn an_unchanged_supplicant_from_a_previous_daemon_is_adopted() {
     let rendered = supervisor.render_for(&target).await.expect("render");
     write_config_file(&rendered).await.expect("write config");
     seed_process(&process, 4242, rendered.path.clone(), "COMPLETED");
-    WifiRecordStore::for_client(&records, "wlan0")
+    WifiRecordStore::for_client(&records, &runtime, "wlan0")
         .save(&PersistedWifiRecord {
             pid: 4242,
             started_at_unix: 1,
+            process_start_ticks: None,
+            boot_id: None,
             binary_path: Some(std::path::PathBuf::from("/usr/sbin/wpa_supplicant")),
             ctrl_path: runtime.join("wlan0"),
+            ctrl_dev: None,
+            ctrl_ino: None,
             config_path: rendered.path.clone(),
             config_digest: rendered.config_digest,
             key_digest: rendered.key_digest,
@@ -554,12 +558,16 @@ async fn recovers_supplicant_spawned_after_a_durable_launch_intent() {
     let rendered = supervisor.render_for(&target).await.expect("render");
     write_config_file(&rendered).await.expect("write config");
     seed_process(&process, 4242, rendered.path.clone(), "COMPLETED");
-    WifiRecordStore::for_client(&records, "wlan0")
+    WifiRecordStore::for_client(&records, &runtime, "wlan0")
         .save(&PersistedWifiRecord {
             pid: 0,
             started_at_unix: 1,
+            process_start_ticks: None,
+            boot_id: Some("test-boot".to_string()),
             binary_path: Some(std::path::PathBuf::from("/usr/sbin/wpa_supplicant")),
             ctrl_path: runtime.join("wlan0"),
+            ctrl_dev: None,
+            ctrl_ino: None,
             config_path: rendered.path.clone(),
             config_digest: rendered.config_digest,
             key_digest: rendered.key_digest,
@@ -592,13 +600,17 @@ async fn startup_stops_pending_client_absent_from_committed_configuration() {
     let config = app_config(temp.path(), &runtime);
     let process_config = config_path(&runtime, "wlan0");
     seed_process(&process, 4248, process_config.clone(), "COMPLETED");
-    let store = WifiRecordStore::for_client(temp.path().join("wifi"), "wlan0");
+    let store = WifiRecordStore::for_client(temp.path().join("wifi"), &runtime, "wlan0");
     store
         .save(&PersistedWifiRecord {
             pid: 0,
             started_at_unix: 1,
+            process_start_ticks: None,
+            boot_id: Some("test-boot".to_string()),
             binary_path: Some(std::path::PathBuf::from("/usr/sbin/wpa_supplicant")),
             ctrl_path: runtime.join("wlan0"),
+            ctrl_dev: None,
+            ctrl_ino: None,
             config_path: process_config,
             config_digest: WifiDigest::from_bytes([1; 32]),
             key_digest: WifiDigest::from_bytes([2; 32]),
@@ -631,12 +643,16 @@ async fn a_still_associating_supplicant_is_adopted_not_refused() {
     write_config_file(&rendered).await.expect("write config");
 
     seed_process(&process, 4243, rendered.path.clone(), "SCANNING");
-    WifiRecordStore::for_client(&records, "wlan0")
+    WifiRecordStore::for_client(&records, &runtime, "wlan0")
         .save(&PersistedWifiRecord {
             pid: 4243,
             started_at_unix: 1,
+            process_start_ticks: None,
+            boot_id: None,
             binary_path: Some(std::path::PathBuf::from("/usr/sbin/wpa_supplicant")),
             ctrl_path: runtime.join("wlan0"),
+            ctrl_dev: None,
+            ctrl_ino: None,
             config_path: rendered.path.clone(),
             config_digest: rendered.config_digest,
             key_digest: rendered.key_digest,
@@ -664,12 +680,16 @@ async fn a_supplicant_answering_for_a_different_network_is_refused() {
     write_config_file(&rendered).await.expect("write config");
     seed_process(&process, 4244, rendered.path.clone(), "COMPLETED");
 
-    WifiRecordStore::for_client(&records, "wlan0")
+    WifiRecordStore::for_client(&records, &runtime, "wlan0")
         .save(&PersistedWifiRecord {
             pid: 4244,
             started_at_unix: 1,
+            process_start_ticks: None,
+            boot_id: None,
             binary_path: Some(std::path::PathBuf::from("/usr/sbin/wpa_supplicant")),
             ctrl_path: runtime.join("wlan0"),
+            ctrl_dev: None,
+            ctrl_ino: None,
             config_path: rendered.path.clone(),
             config_digest: rendered.config_digest,
             key_digest: rendered.key_digest,
@@ -713,12 +733,16 @@ async fn a_stale_record_with_nothing_behind_it_is_a_fresh_start() {
     let process = fake_process();
     let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
 
-    WifiRecordStore::for_client(&records, "wlan0")
+    WifiRecordStore::for_client(&records, &runtime, "wlan0")
         .save(&PersistedWifiRecord {
             pid: 9999,
             started_at_unix: 1,
+            process_start_ticks: None,
+            boot_id: None,
             binary_path: Some(std::path::PathBuf::from("/usr/sbin/wpa_supplicant")),
             ctrl_path: runtime.join("wlan0"),
+            ctrl_dev: None,
+            ctrl_ino: None,
             config_path: runtime.join("wlan0.conf"),
             config_digest: WifiDigest::from_bytes([7; 32]),
             key_digest: WifiDigest::from_bytes([8; 32]),
@@ -747,12 +771,16 @@ async fn a_config_changed_while_the_daemon_was_stopped_restarts_the_supplicant()
     write_config_file(&rendered).await.expect("write config");
     seed_process(&process, 4246, rendered.path.clone(), "COMPLETED");
 
-    WifiRecordStore::for_client(&records, "wlan0")
+    WifiRecordStore::for_client(&records, &runtime, "wlan0")
         .save(&PersistedWifiRecord {
             pid: 4246,
             started_at_unix: 1,
+            process_start_ticks: None,
+            boot_id: None,
             binary_path: Some(std::path::PathBuf::from("/usr/sbin/wpa_supplicant")),
             ctrl_path: runtime.join("wlan0"),
+            ctrl_dev: None,
+            ctrl_ino: None,
             config_path: rendered.path.clone(),
             config_digest: WifiDigest::from_bytes([1; 32]),
             key_digest: WifiDigest::from_bytes([2; 32]),
@@ -979,7 +1007,7 @@ async fn disable_stops_the_supplicant_and_clears_its_record() {
         .iter()
         .any(|call| matches!(call, FakeCall::Terminate(2000))));
     assert!(
-        WifiRecordStore::for_client(temp.path().join("wifi"), "wlan0")
+        WifiRecordStore::for_client(temp.path().join("wifi"), &runtime, "wlan0")
             .load()
             .await
             .expect("load")
@@ -1078,7 +1106,7 @@ async fn shutdown_with_preserve_interfaces_leaves_the_supplicant_running() {
         .iter()
         .any(|call| matches!(call, FakeCall::Terminate(_) | FakeCall::Kill(_))));
     assert!(
-        WifiRecordStore::for_client(temp.path().join("wifi"), "wlan0")
+        WifiRecordStore::for_client(temp.path().join("wifi"), &runtime, "wlan0")
             .load()
             .await
             .expect("load")
@@ -1104,7 +1132,7 @@ async fn shutdown_with_restore_interfaces_stops_it_and_clears_the_record() {
         .iter()
         .any(|call| matches!(call, FakeCall::Terminate(2000))));
     assert!(
-        WifiRecordStore::for_client(temp.path().join("wifi"), "wlan0")
+        WifiRecordStore::for_client(temp.path().join("wifi"), &runtime, "wlan0")
             .load()
             .await
             .expect("load")
@@ -1132,11 +1160,13 @@ async fn scan_on_unconfigured_interface_performs_ephemeral_scan_and_cleans_up() 
     // Ephemeral config, socket, and durable ownership were removed:
     assert!(!runtime.join("wlan0-scan.conf").exists());
     assert!(!runtime.join("wlan0").exists());
-    assert!(WifiRecordStore::for_scan(temp.path().join("wifi"), "wlan0")
-        .load()
-        .await
-        .expect("load scan record")
-        .is_none());
+    assert!(
+        WifiRecordStore::for_scan(temp.path().join("wifi"), &runtime, "wlan0")
+            .load()
+            .await
+            .expect("load scan record")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -1162,11 +1192,13 @@ async fn ephemeral_scan_cleanup_preserves_rebound_foreign_socket() {
 
     assert!(runtime.join("wlan0").exists());
     assert!(!runtime.join("wlan0-scan.conf").exists());
-    assert!(WifiRecordStore::for_scan(temp.path().join("wifi"), "wlan0")
-        .load()
-        .await
-        .expect("load scan record")
-        .is_none());
+    assert!(
+        WifiRecordStore::for_scan(temp.path().join("wifi"), &runtime, "wlan0")
+            .load()
+            .await
+            .expect("load scan record")
+            .is_none()
+    );
 
     drop(foreign.lock().expect("foreign responder lock").take());
 }
@@ -1182,13 +1214,17 @@ async fn startup_recovers_an_interrupted_ephemeral_scan() {
     let config = app_config(temp.path(), &runtime);
     let scan_path = scan_config_path(&runtime, "wlan0");
     seed_process(&process, 4249, scan_path.clone(), "SCANNING");
-    let store = WifiRecordStore::for_scan(temp.path().join("wifi"), "wlan0");
+    let store = WifiRecordStore::for_scan(temp.path().join("wifi"), &runtime, "wlan0");
     store
         .save(&PersistedWifiRecord {
             pid: 0,
             started_at_unix: 1,
+            process_start_ticks: None,
+            boot_id: Some("test-boot".to_string()),
             binary_path: Some(std::path::PathBuf::from("/usr/sbin/wpa_supplicant")),
             ctrl_path: runtime.join("wlan0"),
+            ctrl_dev: None,
+            ctrl_ino: None,
             config_path: scan_path,
             config_digest: WifiDigest::from_bytes([3; 32]),
             key_digest: WifiDigest::from_bytes([4; 32]),
@@ -1329,14 +1365,18 @@ async fn startup_readiness_refuses_a_foreign_responder() {
     let record = PersistedWifiRecord {
         pid: 4242,
         started_at_unix: 1,
+        process_start_ticks: None,
+        boot_id: None,
         binary_path: Some(PathBuf::from("/usr/sbin/wpa_supplicant")),
         ctrl_path: runtime.join("wlan0"),
+        ctrl_dev: None,
+        ctrl_ino: None,
         config_path: config,
         config_digest: WifiDigest::from_bytes([1; 32]),
         key_digest: WifiDigest::from_bytes([2; 32]),
         ssid: "upstream".to_string(),
     };
-    WifiRecordStore::for_client(temp.path().join("wifi"), "wlan0")
+    WifiRecordStore::for_client(temp.path().join("wifi"), &runtime, "wlan0")
         .save(&record)
         .await
         .unwrap();
@@ -1614,5 +1654,35 @@ async fn ap_and_client_supervisors_keep_interface_credentials_separate() {
             .unwrap()
             .expose(),
         "ap-password"
+    );
+}
+
+#[tokio::test]
+async fn ephemeral_scan_cleans_up_when_start_identity_is_unavailable() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("run");
+    let process = fake_process();
+    process.missing_start_ticks.store(true, Ordering::SeqCst);
+    let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
+
+    assert!(matches!(
+        supervisor.scan("wlan0").await,
+        Err(ClientSupervisorError::Process(
+            ProcessError::IdentityChanged { .. }
+        ))
+    ));
+    assert_eq!(process.spawn_count(), 1);
+    assert!(process
+        .calls()
+        .iter()
+        .any(|call| matches!(call, FakeCall::Terminate(_))));
+    assert!(!runtime.join("wlan0-scan.conf").exists());
+    assert!(!runtime.join("wlan0").exists());
+    assert!(
+        WifiRecordStore::for_scan(temp.path().join("wifi"), &runtime, "wlan0")
+            .load()
+            .await
+            .unwrap()
+            .is_none()
     );
 }

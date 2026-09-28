@@ -748,10 +748,15 @@ async fn reconcile_network_runtime_once<
     let management_allowlist = desired.management_allowlist().await;
     let mut failures: BTreeMap<String, String> = BTreeMap::new();
     let interface_manager = InterfaceManager::new(network.clone(), journal.clone());
+    let wifi_runtime_dirs = crate::wifi::WifiRuntimeDirs::new(
+        &effective.wifi.runtime_dir,
+        &effective.wifi_client.runtime_dir,
+    );
     crate::core::transaction::retry_interface_recovery(
         desired.state_dir(),
         &interface_manager,
         &desired.committed_overrides().await,
+        &wifi_runtime_dirs,
     )
     .await?;
     // An old journal may just have restored a legacy secret. Use committed
@@ -1571,11 +1576,16 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         InterfaceManager::new(network_provider.clone(), ownership_journal.clone());
     match committed_interface_transactions {
         Ok(committed) => {
+            let wifi_runtime_dirs = crate::wifi::WifiRuntimeDirs::new(
+                &config.wifi.runtime_dir,
+                &config.wifi_client.runtime_dir,
+            );
             crate::core::transaction::recover_interface_transactions_with_commit_tokens_excluding(
                 &config.runtime.state_dir,
                 &interface_manager,
                 &committed,
                 &ownership_blocked_interfaces,
+                &wifi_runtime_dirs,
             )
             .await?;
         }

@@ -1747,10 +1747,15 @@ async fn runtime_retries_startup_recovery_after_replug_without_replaying_live_jo
             .unwrap(),
         )
         .unwrap();
+    let wifi_runtime_dirs = crate::wifi::WifiRuntimeDirs::new(
+        "/run/traffic-masq/hostapd",
+        "/run/traffic-masq/wpa_supplicant",
+    );
     crate::core::transaction::recover_interface_transactions(
         directory.path(),
         &manager,
         &overrides.snapshot().await,
+        &wifi_runtime_dirs,
     )
     .await
     .unwrap();
