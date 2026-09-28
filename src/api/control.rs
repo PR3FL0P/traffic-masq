@@ -116,6 +116,10 @@ pub struct ControlService {
 
     wifi_client_mutations: Arc<Mutex<()>>,
     wifi_autoconnect: Arc<Mutex<wifi_autoconnect::AutoconnectState>>,
+    /// Pending operator-requested client deactivations. Autoconnect is only
+    /// suspended after the corresponding tentative network change commits;
+    /// rollback/timeout must leave the previous autoconnect policy intact.
+    pending_wifi_client_deactivations: Arc<Mutex<BTreeMap<String, String>>>,
 }
 
 impl ControlService {
@@ -184,6 +188,7 @@ impl ControlService {
             wifi_client_profiles,
             wifi_client_mutations: Arc::new(Mutex::new(())),
             wifi_autoconnect: Default::default(),
+            pending_wifi_client_deactivations: Default::default(),
         }
     }
 

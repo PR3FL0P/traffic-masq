@@ -1,5 +1,4 @@
 use super::dhcp::{default_dhcp_settings, dhcp_edit_request_to_config};
-use super::runtime::compensation_message;
 use super::*;
 
 impl ControlService {
@@ -243,71 +242,39 @@ impl ControlService {
     }
 
     pub(super) async fn disable_wifi(&self, interface: String) -> Response {
-        let Some(wifi) = &self.wifi else {
+        if self.wifi.is_none() {
             return wifi_disabled();
+        }
+        let effective = match self.effective_config().await {
+            Ok(effective) => effective,
+            Err(message) => return wifi_error(WifiErrorDetail::Other { message }),
         };
-        let _mutation = self.wifi_mutations.lock().await;
-        let previous = wifi.status(&interface).await.map(|status| status.spec);
-        let committed = match self.overrides.effective_interface(&interface).await {
-            Ok(config) => config,
-            Err(error) => {
-                return wifi_error(WifiErrorDetail::Other {
-                    message: error.to_string(),
-                })
-            }
+        let Some(previous) = effective.network.interfaces.get(&interface) else {
+            return wifi_error(WifiErrorDetail::InterfaceNotFound);
         };
-
-        if let Err(error) = wifi.disable(&interface).await {
-            let restoration = match previous.clone() {
-                Some(previous) => wifi.configure(previous).await.map(|_| ()),
-                None => Ok(()),
-            };
-            return wifi_error(WifiErrorDetail::Other {
-                message: compensation_message(
-                    "failed to disable Wi-Fi access point",
-                    &error,
-                    restoration,
-                ),
-            });
+        if previous.wifi.is_none() {
+            return wifi_error(WifiErrorDetail::InterfaceNotFound);
         }
-
-        if let Some(mut interface_config) = committed {
-            interface_config.wifi = None;
-            if let Err(error) = self
-                .overrides
-                .set_interface(interface.clone(), interface_config, false)
-                .await
-            {
-                if crate::atomic_file::is_indeterminate_write(&error) {
-                    return wifi_error(WifiErrorDetail::Other {
-                        message: format!("{error:#}"),
-                    });
-                }
-                let restoration = match previous {
-                    Some(previous) => wifi.configure(previous).await.map(|_| ()),
-                    None => Ok(()),
-                };
-                return wifi_error(WifiErrorDetail::Other {
-                    message: compensation_message(
-                        "failed to persist Wi-Fi disable",
-                        &error,
-                        restoration,
-                    ),
-                });
-            }
+        let mut target = previous.clone();
+        target.wifi = None;
+        match self
+            .transactions
+            .apply_with_passphrase_update(
+                &interface,
+                &target,
+                Some(previous),
+                Some(previous.role),
+                true,
+                // Removing an AP is the point at which its stored credential
+                // becomes obsolete. The transaction journals it first, clears
+                // it while tentative, and restores it automatically on rollback.
+                WifiPassphraseUpdate::Clear,
+            )
+            .await
+        {
+            Ok(change) => Response::NetworkChangePending { change },
+            Err(error) => super::runtime::error_response(error),
         }
-
-        // The disabled state is durable before the credential is erased. A
-        // crash can therefore leave only an inert stale secret, never a
-        // persisted protected AP whose required secret has disappeared.
-        if let Err(error) = wifi.clear_passphrase(&interface).await {
-            return wifi_error(WifiErrorDetail::Other {
-                message: format!(
-                    "Wi-Fi is disabled, but the stored passphrase could not be erased: {error}; credential cleanup required"
-                ),
-            });
-        }
-        Response::WifiDisabled { interface }
     }
 
     pub(super) async fn wifi_set_passphrase(

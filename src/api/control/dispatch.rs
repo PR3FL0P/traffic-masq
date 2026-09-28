@@ -472,12 +472,29 @@ impl ControlService {
                 })
                 .await
             {
-                Ok(change) => Response::NetworkChangeCommitted { change },
+                Ok(change) => {
+                    let deactivated_interface = {
+                        self.pending_wifi_client_deactivations
+                            .lock()
+                            .await
+                            .remove(&token)
+                    };
+                    if let Some(interface) = deactivated_interface {
+                        self.wifi_autoconnect.lock().await.suspend(&interface);
+                    }
+                    Response::NetworkChangeCommitted { change }
+                }
                 Err(error) => error_response(error),
             },
             Request::RollbackNetworkChange { token } => {
                 match self.transactions.rollback(&token).await {
-                    Ok(change) => Response::NetworkChangeRolledBack { change },
+                    Ok(change) => {
+                        self.pending_wifi_client_deactivations
+                            .lock()
+                            .await
+                            .remove(&token);
+                        Response::NetworkChangeRolledBack { change }
+                    }
                     Err(error) => error_response(error),
                 }
             }
@@ -657,7 +674,10 @@ fn is_converged_network_transaction_request(request: &Request) -> bool {
     matches!(
         request,
         Request::ConfigureWifi { .. }
+            | Request::DisableWifi { .. }
             | Request::ConfigureWifiClient { .. }
+            | Request::DisableWifiClient { .. }
+            | Request::DeactivateWifiClientProfile { .. }
             | Request::ActivateWifiClientProfile { .. }
             | Request::ProvisionWifiClient { .. }
             | Request::ProvisionWifiAccessPoint { .. }

@@ -273,12 +273,87 @@ impl ControlService {
     }
 
     pub(super) async fn disable_wifi_client(&self, interface: String) -> Response {
-        let _mutation = self.wifi_client_mutations.lock().await;
-        let response = self.disable_wifi_client_locked(interface.clone()).await;
-        if matches!(response, Response::WifiClientDisabled { .. }) {
-            self.wifi_autoconnect.lock().await.suspend(&interface);
+        if self.wifi_client.is_none() {
+            return wifi_client_disabled();
         }
-        response
+        let effective = match self.effective_config().await {
+            Ok(effective) => effective,
+            Err(message) => return wifi_client_error(WifiClientErrorDetail::Other { message }),
+        };
+        let Some(previous) = effective.network.interfaces.get(&interface) else {
+            return wifi_client_error(WifiClientErrorDetail::InterfaceNotFound);
+        };
+        if previous.wifi_client.is_none() {
+            return wifi_client_error(WifiClientErrorDetail::InterfaceNotFound);
+        }
+        let mut target = previous.clone();
+        target.wifi_client = None;
+        // DHCP created implicitly for a Wi-Fi profile belongs to that
+        // connection and is disabled with it. Independently configured DHCP
+        // remains untouched.
+        if let Some(policy) = target.dhcp_client.as_mut() {
+            if policy.wifi_owned {
+                policy.enabled = false;
+                policy.wifi_owned = false;
+            }
+        }
+        match self
+            .transactions
+            .apply_with_passphrase_update(
+                &interface,
+                &target,
+                Some(previous),
+                Some(previous.role),
+                true,
+                // Client credentials belong to saved profiles / future
+                // reactivation and therefore survive a deactivation.
+                WifiPassphraseUpdate::Keep,
+            )
+            .await
+        {
+            Ok(change) => {
+                let token = change.token.clone();
+                self.pending_wifi_client_deactivations
+                    .lock()
+                    .await
+                    .insert(token.clone(), interface);
+                // Automatic timeout rollback happens inside the transaction
+                // manager and therefore does not pass through dispatch. Retire
+                // the post-commit marker after the confirmation window so a
+                // timed-out deactivation cannot leak state indefinitely.
+                let pending = self.pending_wifi_client_deactivations.clone();
+                let transactions = self.transactions.clone();
+                let mutations = self.network_mutations.clone();
+                let cleanup_after = std::time::Duration::from_secs(
+                    change.rollback_timeout_seconds.saturating_add(1),
+                );
+                tokio::spawn(async move {
+                    tokio::time::sleep(cleanup_after).await;
+                    loop {
+                        // Serialize marker retirement with commit dispatch, which
+                        // consumes the marker after the transaction is removed.
+                        let admission = mutations.admit().await;
+                        let still_committable = transactions
+                            .pending()
+                            .await
+                            .into_iter()
+                            .find(|change| change.token == token)
+                            .is_some_and(|change| change.can_commit());
+                        if !still_committable {
+                            pending.lock().await.remove(&token);
+                            break;
+                        }
+                        // The rollback timer can be delayed behind another
+                        // serialized network operation. Do not retire the
+                        // marker while a late commit is still legally possible.
+                        drop(admission);
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                });
+                Response::NetworkChangePending { change }
+            }
+            Err(error) => super::runtime::error_response(error),
+        }
     }
 
     pub(super) async fn disable_wifi_client_locked(&self, interface: String) -> Response {

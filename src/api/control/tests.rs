@@ -2246,30 +2246,45 @@ async fn wifi_enabled_fixture() -> WifiFixture {
 }
 
 #[tokio::test]
-async fn wifi_disable_reports_both_persistence_and_restoration_failure() {
+async fn wifi_disable_commit_failure_keeps_the_candidate_pending_until_rollback() {
     let fixture = wifi_enabled_fixture().await;
+    // Turn the override file path into a directory. The tentative apply should
+    // still succeed; persistence is deliberately deferred until commit.
     std::fs::create_dir(fixture.service.overrides.path()).unwrap();
-    fixture.process.fail_spawn.store(true, WifiOrdering::SeqCst);
     let response = fixture
         .service
         .dispatch(Request::DisableWifi {
             interface: "wlan0".into(),
         })
         .await;
-    match response {
-        Response::WifiError {
-            detail: WifiErrorDetail::Other { message },
-        } => {
-            assert!(
-                message.contains("failed to persist Wi-Fi disable"),
-                "{message}"
-            );
-            assert!(message.contains("runtime restoration failed"), "{message}");
-            assert!(message.contains("recovery required"), "{message}");
-            assert!(!message.contains("runtime state was restored"));
-        }
-        other => panic!("unexpected response: {other:?}"),
-    }
+    let Response::NetworkChangePending { change } = response else {
+        panic!("expected pending AP deactivation, got {response:?}");
+    };
+
+    let committed = fixture
+        .service
+        .dispatch(Request::CommitNetworkChange {
+            token: change.token.clone(),
+        })
+        .await;
+    assert!(matches!(committed, Response::Error { .. }), "{committed:?}");
+    assert!(fixture
+        .service
+        .transactions
+        .pending()
+        .await
+        .iter()
+        .any(|pending| pending.token == change.token));
+
+    assert!(matches!(
+        fixture
+            .service
+            .dispatch(Request::RollbackNetworkChange {
+                token: change.token
+            })
+            .await,
+        Response::NetworkChangeRolledBack { .. }
+    ));
 }
 
 #[tokio::test]
@@ -2603,7 +2618,7 @@ async fn configure_wifi_on_an_unknown_interface_is_interface_not_found() {
 }
 
 #[tokio::test]
-async fn disable_wifi_stops_the_access_point_and_persists_the_removal() {
+async fn disable_wifi_is_tentative_until_explicit_commit() {
     let fixture = wifi_enabled_fixture().await;
     let response = fixture
         .service
@@ -2611,15 +2626,31 @@ async fn disable_wifi_stops_the_access_point_and_persists_the_removal() {
             interface: "wlan0".to_string(),
         })
         .await;
-    assert!(matches!(
-        response,
-        Response::WifiDisabled { interface } if interface == "wlan0"
-    ));
+    let Response::NetworkChangePending { change } = response else {
+        panic!("expected pending AP deactivation, got {response:?}");
+    };
 
-    match fixture.service.dispatch(Request::WifiStatus).await {
-        Response::WifiStatus { interfaces } => assert!(interfaces.is_empty()),
+    // Committed intent is unchanged while the candidate is awaiting approval.
+    match fixture
+        .service
+        .dispatch(Request::GetWifiConfig {
+            interface: "wlan0".to_string(),
+        })
+        .await
+    {
+        Response::WifiConfig { spec, .. } => assert!(spec.is_some()),
         other => panic!("unexpected response: {other:?}"),
     }
+
+    assert!(matches!(
+        fixture
+            .service
+            .dispatch(Request::CommitNetworkChange {
+                token: change.token
+            })
+            .await,
+        Response::NetworkChangeCommitted { .. }
+    ));
     match fixture
         .service
         .dispatch(Request::GetWifiConfig {
@@ -2786,7 +2817,7 @@ async fn configure_wifi_wpa2_to_open_clears_the_stored_passphrase() {
 }
 
 #[tokio::test]
-async fn disable_wifi_clears_stale_secret_and_open_recreate_stays_clean() {
+async fn disable_wifi_secret_clear_rolls_back_and_commits_with_the_network_change() {
     let fixture = wifi_enabled_fixture().await;
     let store = crate::wifi::PassphraseStore::new(fixture._directory.path().join("wifi/psk-ap"));
     store
@@ -2796,39 +2827,48 @@ async fn disable_wifi_clears_stale_secret_and_open_recreate_stays_clean() {
         )
         .unwrap();
 
-    let disabled = fixture
+    let first = fixture
         .service
         .dispatch(Request::DisableWifi {
             interface: "wlan0".to_string(),
         })
         .await;
-    assert!(
-        matches!(disabled, Response::WifiDisabled { .. }),
-        "{disabled:?}"
-    );
+    let Response::NetworkChangePending { change } = first else {
+        panic!("expected pending AP deactivation, got {first:?}");
+    };
     assert!(store.get("wlan0").unwrap().is_none());
+    assert!(matches!(
+        fixture
+            .service
+            .dispatch(Request::RollbackNetworkChange {
+                token: change.token
+            })
+            .await,
+        Response::NetworkChangeRolledBack { .. }
+    ));
+    assert_eq!(
+        store.get("wlan0").unwrap().unwrap().expose(),
+        "stale password"
+    );
 
-    let recreated = fixture
+    let second = fixture
         .service
-        .dispatch(Request::ConfigureWifi {
+        .dispatch(Request::DisableWifi {
             interface: "wlan0".to_string(),
-            settings: WifiEditRequest {
-                ssid: "open-again".to_string(),
-                country_code: Some("PL".to_string()),
-                band: WifiBand::Ghz2,
-                channel: 6,
-                channel_width: WifiChannelWidth::Ht20,
-                security: WifiSecurity::Open,
-                hidden: false,
-                client_isolation: false,
-                max_stations: 32,
-            },
         })
         .await;
-    assert!(
-        matches!(recreated, Response::NetworkChangePending { .. }),
-        "{recreated:?}"
-    );
+    let Response::NetworkChangePending { change } = second else {
+        panic!("expected pending AP deactivation, got {second:?}");
+    };
+    assert!(matches!(
+        fixture
+            .service
+            .dispatch(Request::CommitNetworkChange {
+                token: change.token
+            })
+            .await,
+        Response::NetworkChangeCommitted { .. }
+    ));
     assert!(store.get("wlan0").unwrap().is_none());
 }
 
@@ -3430,29 +3470,43 @@ async fn wifi_client_enabled_fixture() -> WifiClientFixture {
 }
 
 #[tokio::test]
-async fn wifi_client_disable_reports_both_persistence_and_restoration_failure() {
+async fn wifi_client_disable_commit_failure_keeps_the_candidate_pending() {
     let fixture = wifi_client_enabled_fixture().await;
     std::fs::create_dir(fixture.service.overrides.path()).unwrap();
-    fixture.process.fail_spawn.store(true, WifiOrdering::SeqCst);
     let response = fixture
         .service
         .dispatch(Request::DisableWifiClient {
             interface: "wlan1".into(),
         })
         .await;
-    match response {
-        Response::WifiClientError {
-            detail: WifiClientErrorDetail::Other { message },
-        } => {
-            assert!(
-                message.contains("failed to persist Wi-Fi client disable"),
-                "{message}"
-            );
-            assert!(message.contains("runtime restoration failed"), "{message}");
-            assert!(!message.contains("runtime state was restored"));
-        }
-        other => panic!("unexpected response: {other:?}"),
-    }
+    let Response::NetworkChangePending { change } = response else {
+        panic!("expected pending client deactivation, got {response:?}");
+    };
+
+    let committed = fixture
+        .service
+        .dispatch(Request::CommitNetworkChange {
+            token: change.token.clone(),
+        })
+        .await;
+    assert!(matches!(committed, Response::Error { .. }), "{committed:?}");
+    assert!(fixture
+        .service
+        .transactions
+        .pending()
+        .await
+        .iter()
+        .any(|pending| pending.token == change.token));
+
+    assert!(matches!(
+        fixture
+            .service
+            .dispatch(Request::RollbackNetworkChange {
+                token: change.token
+            })
+            .await,
+        Response::NetworkChangeRolledBack { .. }
+    ));
 }
 
 #[tokio::test]
@@ -3541,11 +3595,10 @@ async fn saved_wifi_client_profile_crud_activation_and_active_delete_guard() {
         .service
         .activate_wifi_client_profile_internal("wlan1".to_string(), "office".to_string())
         .await;
-    let Response::WifiClientProfileActivated { status, .. } = activated else {
-        panic!("expected activation response, got {activated:?}");
-    };
-    assert_eq!(status.spec.ssid, "profile-network");
-
+    assert!(matches!(
+        activated,
+        Response::WifiClientProfileActivated { .. }
+    ));
     assert!(matches!(
         fixture
             .service
@@ -3557,15 +3610,37 @@ async fn saved_wifi_client_profile_crud_activation_and_active_delete_guard() {
             detail: WifiClientProfileErrorDetail::ProfileActive { .. }
         }
     ));
+
+    let response = fixture
+        .service
+        .dispatch(Request::DeactivateWifiClientProfile {
+            interface: "wlan1".to_string(),
+        })
+        .await;
+    let Response::NetworkChangePending { change } = response else {
+        panic!("expected pending client deactivation, got {response:?}");
+    };
     assert!(matches!(
         fixture
             .service
-            .dispatch(Request::DeactivateWifiClientProfile {
-                interface: "wlan1".to_string(),
+            .dispatch(Request::CommitNetworkChange {
+                token: change.token
             })
             .await,
-        Response::WifiClientDisabled { .. }
+        Response::NetworkChangeCommitted { .. }
     ));
+
+    // This fixture has no convergence worker. Realize the committed removal
+    // before checking the runtime-based active-profile deletion guard.
+    fixture
+        .service
+        .wifi_client
+        .as_ref()
+        .unwrap()
+        .disable("wlan1")
+        .await
+        .unwrap();
+
     assert!(matches!(
         fixture
             .service
@@ -3586,17 +3661,27 @@ async fn wifi_client_deactivate_preserves_managed_and_allows_subsequent_reactiva
             interface: "wlan1".to_string(),
         })
         .await;
-    assert!(matches!(deactivated, Response::WifiClientDisabled { .. }));
+    let Response::NetworkChangePending { change } = deactivated else {
+        panic!("expected pending client deactivation, got {deactivated:?}");
+    };
+    assert!(matches!(
+        fixture
+            .service
+            .dispatch(Request::CommitNetworkChange {
+                token: change.token
+            })
+            .await,
+        Response::NetworkChangeCommitted { .. }
+    ));
 
-    // Interface must remain managed
     let effective = fixture.service.effective_config().await.unwrap();
     let iface = effective.network.interfaces.get("wlan1").unwrap();
     assert!(
         iface.managed,
         "interface must remain managed after deactivation"
     );
+    assert!(iface.wifi_client.is_none());
 
-    // Reactivating a profile must succeed and auto-enable DHCP client
     let created = fixture
         .service
         .dispatch(Request::CreateWifiClientProfile {
@@ -3622,6 +3707,70 @@ async fn wifi_client_deactivate_preserves_managed_and_allows_subsequent_reactiva
         activated,
         Response::WifiClientProfileActivated { .. }
     ));
+}
+
+#[tokio::test]
+async fn manual_client_deactivation_suspends_autoconnect_only_after_commit() {
+    let fixture = wifi_client_enabled_fixture().await;
+
+    let first = fixture
+        .service
+        .dispatch(Request::DeactivateWifiClientProfile {
+            interface: "wlan1".to_string(),
+        })
+        .await;
+    let Response::NetworkChangePending { change } = first else {
+        panic!("expected pending client deactivation, got {first:?}");
+    };
+    assert!(!fixture
+        .service
+        .wifi_autoconnect
+        .lock()
+        .await
+        .suspended
+        .contains("wlan1"));
+    assert!(matches!(
+        fixture
+            .service
+            .dispatch(Request::RollbackNetworkChange {
+                token: change.token
+            })
+            .await,
+        Response::NetworkChangeRolledBack { .. }
+    ));
+    assert!(!fixture
+        .service
+        .wifi_autoconnect
+        .lock()
+        .await
+        .suspended
+        .contains("wlan1"));
+
+    let second = fixture
+        .service
+        .dispatch(Request::DeactivateWifiClientProfile {
+            interface: "wlan1".to_string(),
+        })
+        .await;
+    let Response::NetworkChangePending { change } = second else {
+        panic!("expected pending client deactivation, got {second:?}");
+    };
+    assert!(matches!(
+        fixture
+            .service
+            .dispatch(Request::CommitNetworkChange {
+                token: change.token
+            })
+            .await,
+        Response::NetworkChangeCommitted { .. }
+    ));
+    assert!(fixture
+        .service
+        .wifi_autoconnect
+        .lock()
+        .await
+        .suspended
+        .contains("wlan1"));
 }
 
 #[tokio::test]
@@ -4029,7 +4178,7 @@ async fn configuring_a_client_on_an_output_interface_is_an_invalid_spec() {
 }
 
 #[tokio::test]
-async fn disable_wifi_client_stops_it_and_clears_the_persisted_block() {
+async fn disable_wifi_client_is_tentative_until_explicit_commit() {
     let fixture = wifi_client_enabled_fixture().await;
     let response = fixture
         .service
@@ -4037,20 +4186,24 @@ async fn disable_wifi_client_stops_it_and_clears_the_persisted_block() {
             interface: "wlan1".to_string(),
         })
         .await;
-    assert!(
-        matches!(response, Response::WifiClientDisabled { .. }),
-        "got {response:?}"
-    );
-
-    let Response::WifiClientStatus { interfaces } =
-        fixture.service.dispatch(Request::WifiClientStatus).await
-    else {
-        panic!("expected a client status response");
+    let Response::NetworkChangePending { change } = response else {
+        panic!("expected pending client deactivation, got {response:?}");
     };
-    assert!(
-        interfaces.is_empty(),
-        "a disabled client must not still be reported"
-    );
+
+    let before = fixture.service.effective_config().await.unwrap();
+    assert!(before.network.interfaces["wlan1"].wifi_client.is_some());
+
+    assert!(matches!(
+        fixture
+            .service
+            .dispatch(Request::CommitNetworkChange {
+                token: change.token
+            })
+            .await,
+        Response::NetworkChangeCommitted { .. }
+    ));
+    let after = fixture.service.effective_config().await.unwrap();
+    assert!(after.network.interfaces["wlan1"].wifi_client.is_none());
 }
 
 #[tokio::test]
@@ -4531,7 +4684,190 @@ async fn dhcp_client_control_renew_and_release_dispatch_keep_intent() {
 }
 
 #[tokio::test]
-async fn disabling_wifi_client_also_cleans_up_and_disables_active_dhcp_client() {
+async fn wifi_client_deactivation_disables_only_wifi_owned_dhcp_on_commit() {
+    let directory = tempdir().expect("tempdir");
+    let mut config = wifi_client_base_config(directory.path());
+    let mut wlan1_cfg = config.network.interfaces["wlan1"].clone();
+    wlan1_cfg.dhcp_client = Some(DhcpClientInterfaceConfig {
+        wifi_owned: true,
+        ..Default::default()
+    });
+    config
+        .network
+        .interfaces
+        .insert("wlan1".to_string(), wlan1_cfg);
+    let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+        .await
+        .expect("overrides");
+    let dhcp = DhcpSupervisor::start(&config)
+        .await
+        .expect("dhcp supervisor");
+    let network: Arc<dyn NetworkProvider> = Arc::new(FakeWirelessNetwork {
+        interfaces: vec![NetworkInterface {
+            name: "wlan1".into(),
+            index: 1,
+            is_up: true,
+            rx_bytes: 0,
+            tx_bytes: 0,
+            is_wireless: true,
+        }],
+    });
+    let wifi_client = ClientSupervisor::start_with_process(&config, FakeSupplicantProcess::new())
+        .await
+        .expect("wifi client supervisor");
+    let service = ControlService::new(config, network, dhcp, overrides.clone())
+        .with_wifi_client_supervisor(wifi_client);
+
+    let response = service
+        .dispatch(Request::DeactivateWifiClientProfile {
+            interface: "wlan1".to_string(),
+        })
+        .await;
+    let Response::NetworkChangePending { change } = response else {
+        panic!("expected pending client deactivation, got {response:?}");
+    };
+    let committed_before = overrides
+        .effective_interface("wlan1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(committed_before.wifi_client.is_some());
+    assert!(committed_before.dhcp_client.unwrap().enabled);
+
+    assert!(matches!(
+        service
+            .dispatch(Request::CommitNetworkChange {
+                token: change.token
+            })
+            .await,
+        Response::NetworkChangeCommitted { .. }
+    ));
+    let committed = overrides
+        .effective_interface("wlan1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(committed.wifi_client.is_none());
+    let policy = committed.dhcp_client.expect("dhcp client policy");
+    assert!(!policy.enabled);
+    assert!(!policy.wifi_owned);
+}
+
+#[tokio::test]
+async fn wifi_client_deactivation_commit_failure_can_be_rolled_back_cleanly() {
+    let fixture = wifi_client_enabled_fixture().await;
+    std::fs::create_dir(fixture.service.overrides.path()).unwrap();
+    let original = fixture
+        .service
+        .effective_config()
+        .await
+        .unwrap()
+        .network
+        .interfaces["wlan1"]
+        .clone();
+
+    let response = fixture
+        .service
+        .dispatch(Request::DeactivateWifiClientProfile {
+            interface: "wlan1".to_string(),
+        })
+        .await;
+    let Response::NetworkChangePending { change } = response else {
+        panic!("expected pending client deactivation, got {response:?}");
+    };
+    assert!(matches!(
+        fixture
+            .service
+            .dispatch(Request::CommitNetworkChange {
+                token: change.token.clone()
+            })
+            .await,
+        Response::Error { .. }
+    ));
+    assert!(matches!(
+        fixture
+            .service
+            .dispatch(Request::RollbackNetworkChange {
+                token: change.token
+            })
+            .await,
+        Response::NetworkChangeRolledBack { .. }
+    ));
+    assert_eq!(
+        fixture
+            .service
+            .effective_config()
+            .await
+            .unwrap()
+            .network
+            .interfaces["wlan1"],
+        original
+    );
+}
+
+#[tokio::test]
+async fn wifi_client_deactivation_rollback_preserves_wifi_owned_dhcp_intent() {
+    let directory = tempdir().expect("tempdir");
+    let mut config = wifi_client_base_config(directory.path());
+    let mut wlan1_cfg = config.network.interfaces["wlan1"].clone();
+    wlan1_cfg.dhcp_client = Some(DhcpClientInterfaceConfig {
+        wifi_owned: true,
+        ..Default::default()
+    });
+    config
+        .network
+        .interfaces
+        .insert("wlan1".to_string(), wlan1_cfg.clone());
+    let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+        .await
+        .expect("overrides");
+    let dhcp = DhcpSupervisor::start(&config)
+        .await
+        .expect("dhcp supervisor");
+    let network: Arc<dyn NetworkProvider> = Arc::new(FakeWirelessNetwork {
+        interfaces: vec![NetworkInterface {
+            name: "wlan1".into(),
+            index: 1,
+            is_up: true,
+            rx_bytes: 0,
+            tx_bytes: 0,
+            is_wireless: true,
+        }],
+    });
+    let wifi_client = ClientSupervisor::start_with_process(&config, FakeSupplicantProcess::new())
+        .await
+        .expect("wifi client supervisor");
+    let service = ControlService::new(config, network, dhcp, overrides.clone())
+        .with_wifi_client_supervisor(wifi_client);
+
+    let response = service
+        .dispatch(Request::DeactivateWifiClientProfile {
+            interface: "wlan1".to_string(),
+        })
+        .await;
+    let Response::NetworkChangePending { change } = response else {
+        panic!("expected pending client deactivation, got {response:?}");
+    };
+    assert!(matches!(
+        service
+            .dispatch(Request::RollbackNetworkChange {
+                token: change.token
+            })
+            .await,
+        Response::NetworkChangeRolledBack { .. }
+    ));
+    assert_eq!(
+        overrides
+            .effective_interface("wlan1")
+            .await
+            .unwrap()
+            .unwrap(),
+        wlan1_cfg
+    );
+}
+
+#[tokio::test]
+async fn internal_wifi_client_disable_cleans_up_wifi_owned_dhcp() {
     let directory = tempdir().expect("tempdir");
     let mut config = wifi_client_base_config(directory.path());
     let mut wlan1_cfg = config
@@ -4584,9 +4920,7 @@ async fn disabling_wifi_client_also_cleans_up_and_disables_active_dhcp_client() 
         .with_dhcp_client_supervisor(dhcp_client.clone());
 
     let response = service
-        .dispatch(Request::DeactivateWifiClientProfile {
-            interface: "wlan1".to_string(),
-        })
+        .disable_wifi_client_locked("wlan1".to_string())
         .await;
     assert!(
         matches!(response, Response::WifiClientDisabled { .. }),
@@ -4647,7 +4981,7 @@ async fn disabling_wifi_client_also_cleans_up_and_disables_active_dhcp_client() 
 }
 
 #[tokio::test]
-async fn disabling_wifi_client_restores_dhcp_and_wifi_if_persistence_fails() {
+async fn internal_wifi_client_disable_restores_state_if_persistence_fails() {
     use std::os::unix::fs::PermissionsExt;
 
     let directory = tempdir().expect("tempdir");
@@ -4706,9 +5040,7 @@ async fn disabling_wifi_client_restores_dhcp_and_wifi_if_persistence_fails() {
         .with_dhcp_client_supervisor(dhcp_client.clone());
 
     let response = service
-        .dispatch(Request::DeactivateWifiClientProfile {
-            interface: "wlan1".to_string(),
-        })
+        .disable_wifi_client_locked("wlan1".to_string())
         .await;
     assert!(
         matches!(response, Response::WifiClientError { .. }),
@@ -4725,7 +5057,7 @@ async fn disabling_wifi_client_restores_dhcp_and_wifi_if_persistence_fails() {
 }
 
 #[tokio::test]
-async fn disabling_wifi_client_fails_and_restores_state_if_dhcp_disable_fails() {
+async fn internal_wifi_client_disable_restores_state_if_dhcp_disable_fails() {
     use std::os::unix::fs::PermissionsExt;
 
     let directory = tempdir().expect("tempdir");
@@ -4808,9 +5140,7 @@ async fn disabling_wifi_client_fails_and_restores_state_if_dhcp_disable_fails() 
         .with_dhcp_client_supervisor(dhcp_client.clone());
 
     let response = service
-        .dispatch(Request::DeactivateWifiClientProfile {
-            interface: "wlan1".to_string(),
-        })
+        .disable_wifi_client_locked("wlan1".to_string())
         .await;
     assert!(
         matches!(response, Response::WifiClientError { .. }),
@@ -6372,10 +6702,18 @@ async fn wifi_deactivate_preserves_independent_dhcp_intent() {
             interface: "wlan1".into(),
         })
         .await;
-    assert!(
-        matches!(response, Response::WifiClientDisabled { .. }),
-        "{response:?}"
-    );
+    let Response::NetworkChangePending { change } = response else {
+        panic!("expected pending client deactivation, got {response:?}");
+    };
+    assert!(matches!(
+        fixture
+            .service
+            .dispatch(Request::CommitNetworkChange {
+                token: change.token
+            })
+            .await,
+        Response::NetworkChangeCommitted { .. }
+    ));
     let after = fixture
         .service
         .overrides

@@ -795,7 +795,14 @@ impl NetworkTransactionManager {
             }
             update => update,
         };
-        let store = role.map(|role| PassphraseStore::for_role(desired.state_dir(), role));
+        // A pure Wi-Fi role removal has no target credential role, but an
+        // explicit Clear still needs to address the role being removed so the
+        // old secret can be journaled and restored on rollback.
+        let secret_role = match (&passphrase_update, role) {
+            (WifiPassphraseUpdate::Clear, None) => previous_role,
+            _ => role,
+        };
+        let store = secret_role.map(|role| PassphraseStore::for_role(desired.state_dir(), role));
         let secret = if matches!(&passphrase_update, WifiPassphraseUpdate::Keep) {
             None
         } else {
@@ -803,7 +810,7 @@ impl NetworkTransactionManager {
                 anyhow::anyhow!("a Wi-Fi secret update requires an unambiguous AP or client role")
             })?;
             Some(SecretSnapshot {
-                role,
+                role: secret_role,
                 previous: store
                     .get(interface)?
                     .map(|value| zeroize::Zeroizing::new(value.expose().to_owned())),

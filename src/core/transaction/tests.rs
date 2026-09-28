@@ -734,6 +734,61 @@ async fn clear_passphrase_is_journaled_and_restored_on_rollback() {
 }
 
 #[tokio::test]
+async fn clearing_a_removed_wifi_role_uses_the_previous_role_store_and_rolls_back() {
+    let directory = tempdir().expect("tempdir");
+    let previous = credential_config(WifiCredentialRole::Ap);
+    let mut base = AppConfig::default();
+    base.runtime.state_dir = directory.path().to_path_buf();
+    base.network
+        .interfaces
+        .insert("test0".to_string(), previous.clone());
+    let overrides = RuntimeOverrideManager::load(directory.path(), &base)
+        .await
+        .expect("overrides");
+    let desired = DesiredNetworkState::new(base, overrides);
+    let manager = NetworkTransactionManager::new(
+        InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory()),
+        Duration::from_secs(60),
+        desired,
+    );
+    let store = PassphraseStore::new(directory.path().join("wifi/psk-ap"));
+    store
+        .set(
+            "test0",
+            &WifiPassphrase::new("original-password").expect("passphrase"),
+        )
+        .expect("seed passphrase");
+
+    let mut target = previous.clone();
+    target.wifi = None;
+    let pending = manager
+        .apply_with_passphrase_update(
+            "test0",
+            &target,
+            Some(&previous),
+            Some(InterfaceRole::Output),
+            true,
+            WifiPassphraseUpdate::Clear,
+        )
+        .await
+        .expect("apply AP removal");
+    assert!(store.get("test0").expect("read cleared secret").is_none());
+
+    manager
+        .rollback(&pending.token)
+        .await
+        .expect("rollback AP removal");
+    assert_eq!(
+        store
+            .get("test0")
+            .expect("read restored secret")
+            .expect("secret restored")
+            .expose(),
+        "original-password"
+    );
+}
+
+#[tokio::test]
 async fn rollback_publishes_restore_intent_even_when_secret_restore_fails() {
     let directory = tempdir().expect("tempdir");
     let desired = desired_state(directory.path()).await;
