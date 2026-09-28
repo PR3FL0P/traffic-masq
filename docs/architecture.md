@@ -34,10 +34,11 @@ secret I/O or runtime failures keep the transaction in rollback recovery and
 prevent confirmation. This ordering also applies to timeout, shutdown and
 failed-apply compensation.
 
-Operator AP/client configuration and saved profile activation use the same
-commit-confirm interface transactions as provisioning. Internal autoconnect
-activation remains immediate. DHCP and VPN controls, Wi-Fi deactivation,
-passphrase updates and runtime controls also remain immediate. Since runtime
+Operator AP/client configuration, saved profile activation, and operator-triggered
+AP/client deactivation use the same commit-confirm interface transactions as
+provisioning. Internal autoconnect activation and timeout cleanup remain
+immediate. DHCP and VPN controls plus Wi-Fi passphrase/reconnect/reload runtime
+controls also remain immediate. Since runtime
 effects can survive a daemon crash, subsystems establish durable ownership
 proof before persistent runtime state is created: DHCP lease records include the applied route policy, Wi-Fi launches use
 write-ahead process records, and WireGuard activation uses a durable intent plus

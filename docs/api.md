@@ -221,7 +221,7 @@ endpoints. Use the endpoint corresponding to the apply response.
 | `GET` | `/wifi` | — | AP runtime status | Authenticated |
 | `GET` | `/wifi/{interface}` | — | AP specification | Authenticated |
 | `PUT` | `/wifi/{interface}` | `WifiEdit` | Tentatively configure AP; secret is separate | Administrator |
-| `DELETE` | `/wifi/{interface}` | — | Disable AP immediately | Administrator |
+| `DELETE` | `/wifi/{interface}` | — | Tentatively disable AP; commit or rollback required | Administrator |
 | `PUT` | `/wifi/{interface}/passphrase` | `{ "passphrase": string }` | Store AP passphrase | Administrator |
 | `POST` | `/wifi/{interface}/provision` | `WifiApProvision` | Tentatively apply AP, secret and optional DHCP | Administrator |
 | `GET` | `/wifi/{interface}/stations` | — | Associated stations | Authenticated |
@@ -244,7 +244,7 @@ transition.
 | `GET` | `/wifi-client` | — | Wi-Fi client runtime status | Authenticated |
 | `GET` | `/wifi-client/{interface}` | — | Client specification | Authenticated |
 | `PUT` | `/wifi-client/{interface}` | `WifiClientEdit` | Tentatively configure association; secret is separate | Administrator |
-| `DELETE` | `/wifi-client/{interface}` | — | Disable client immediately | Administrator |
+| `DELETE` | `/wifi-client/{interface}` | — | Tentatively disable client; commit or rollback required | Administrator |
 | `PUT` | `/wifi-client/{interface}/passphrase` | `{ "passphrase": string }` | Store client passphrase | Administrator |
 | `POST` | `/wifi-client/{interface}/reconnect` | — | Request reconnection | Administrator |
 | `POST` | `/wifi-client/{interface}/scan` | — | Scan and return networks | Administrator |
@@ -255,7 +255,7 @@ transition.
 | `DELETE` | `/wifi-client/profiles/{id}` | — | Delete an inactive profile | Administrator |
 | `PUT` | `/wifi-client/{interface}/provision` | `WifiClientProvision` | Tentatively apply profile plus IPv4 policy | Administrator |
 | `PUT` | `/wifi-client/{interface}/active-profile` | `{ "profile_id": string }` | Tentatively activate a saved profile | Administrator |
-| `DELETE` | `/wifi-client/{interface}/active-profile` | — | Deactivate the current profile | Administrator |
+| `DELETE` | `/wifi-client/{interface}/active-profile` | — | Tentatively deactivate the current profile; commit or rollback required | Administrator |
 
 ## Request schemas
 
@@ -529,10 +529,11 @@ connection does not prove that a mutation failed; inspect the matching pending
 endpoint and current state before retrying. Never automatically retry a
 mutation whose outcome is unknown.
 
-DHCP and VPN controls, Wi-Fi deactivation, passphrase updates, and runtime
-controls such as reconnect and reload still apply immediately. Their successful
-responses do not require a commit. Wi-Fi configuration and profile activation
-require confirmation even when called through the non-provisioning endpoints.
+DHCP and VPN controls plus Wi-Fi passphrase updates and runtime controls such
+as reconnect and reload still apply immediately. Their successful responses do
+not require a commit. Wi-Fi configuration, profile activation, and
+operator-triggered AP/client deactivation require confirmation even when called
+through the non-provisioning endpoints.
 
 ## Secrets and operational safety
 

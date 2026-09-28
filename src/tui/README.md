@@ -17,7 +17,7 @@ The TUI serves as the primary operational console for the `traffic-masq` network
    - Communicates with `traffic-masqd` over a local Unix domain socket (`/run/traffic-masq/traffic-masqd.sock`).
    - Fully interactive: supports all tabs (Interfaces, DHCP Server, DHCP Client (configurable in Settings), Router, VPN, Wi-Fi, Settings, Logs).
    - Authenticated via shared device password; supports secure session caching in `$XDG_STATE_HOME`.
-   - Interface/router applies, Wi-Fi client Connect, and AP provisioning use commit-confirm rollback timers; standalone DHCP, other Wi-Fi mutations, and VPN mutations apply immediately and rely on daemon-side ownership recovery.
+   - Interface/router applies, Wi-Fi client Connect, AP provisioning/profile activation, and operator-triggered Wi-Fi deactivation use commit-confirm rollback timers; standalone DHCP, Wi-Fi runtime controls such as reconnect/reload/passphrase updates, and VPN mutations apply immediately and rely on daemon-side ownership recovery.
 
 2. **Direct / Recovery Mode (`--direct`):**
    - Directly binds to Linux Netlink via `RtnetlinkNetworkProvider`.
@@ -96,7 +96,7 @@ Because misconfiguring an IP address or firewall rule can sever SSH access, inte
    - On the Router screen, degraded recovery shows the recovery code, invariant, blocked operation, action and runbook. Press **r** to retry a failed rollback; for `TM-REC-208` journal-cleanup-pending, cleanup retries automatically and **r** refreshes status.
 3. **Disconnect Handling:** If the daemon becomes unreachable while on a pending screen, the TUI retains the pending change state and warns the operator that the outcome is unverified rather than falsely claiming success.
 
-Low-level DHCP, Wi-Fi and VPN actions do not enter these pending screens and do not expose a commit timer. Once accepted, they are non-cancellable immediate mutations; crash safety is provided by the daemon's durable ownership/recovery mechanisms rather than TUI rollback state.
+Standalone DHCP, Wi-Fi runtime controls such as reconnect/reload/passphrase updates, and VPN actions do not enter these pending screens and do not expose a commit timer. Operator-triggered AP/client deactivation does enter the normal pending-change screen and must be committed or rolled back. Immediate mutations rely on the daemon's durable ownership/recovery mechanisms rather than TUI rollback state.
 
 ### 3.3. Screen and Section State Machine
 

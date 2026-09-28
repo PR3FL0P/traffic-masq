@@ -389,9 +389,11 @@ Confirm the candidate only after checking connectivity. Failure or rollback
 restores the preceding configuration and credential. DHCP mode reuses existing
 route/DNS policy; switching to static disables DHCP without discarding it.
 
-The low-level `active-profile` endpoint starts activation and returns runtime
-status; its legacy `WifiClientProfileActivated` response does not prove IP
-readiness. Use the provisioning endpoint for interactive management changes.
+The `active-profile` activation and deactivation endpoints are also tentative:
+they return `NetworkChangePending` and must be committed after connectivity is
+verified. Internal autoconnect uses a separate immediate activation path; the
+provisioning endpoint remains the preferred interactive flow when IPv4 policy
+must change together with the profile.
 
 ### Wi-Fi access points
 
@@ -408,7 +410,10 @@ requires confirmation and leaves the running AP unchanged. When editing, a blank
 passphrase retains that profile's saved password. Existing profile IDs are fixed.
 
 Scanning is unavailable on interfaces configured as access points, including
-when hostapd is stopped or has failed to start.
+when hostapd is stopped or has failed to start. Deactivating either an access
+point or an active Wi-Fi client from the TUI is tentative as well: the pending
+screen must be committed to keep the deactivation, otherwise rollback restores
+the previous interface state (and the AP credential when applicable).
 
 ## Daemon commands
 
@@ -480,20 +485,24 @@ previous committed configuration; rollback waits for already admitted operations
 and may need retries. An already admitted confirmation can finish after the
 displayed expiry. Inspect pending state to learn the outcome.
 
-Low-level DHCP, Wi-Fi and VPN operations are different: they take effect
-immediately and do not have an interface/router confirmation timer. Those
-subsystems write durable ownership or launch records before persistent runtime
-state is created, then reconcile those records against committed configuration
-on startup. This lets recovery remove only traffic-masq-owned crash residue
-without treating foreign processes, leases or interfaces as its own.
+Standalone DHCP and VPN controls plus Wi-Fi runtime controls such as
+reconnect/reload/passphrase updates take effect immediately and do not have an
+interface/router confirmation timer. Operator-triggered Wi-Fi configuration,
+profile activation, and AP/client deactivation instead use the same tentative
+commit-confirm flow as other connectivity-sensitive interface changes. The
+immediate subsystems write durable ownership or launch records before persistent
+runtime state is created, then reconcile those records against committed
+configuration on startup. This lets recovery remove only traffic-masq-owned
+crash residue without treating foreign processes, leases or interfaces as its
+own.
 
 If an interface/router change cuts off your connection, the daemon rolls it
 back locally after the timer expires and admitted operations finish. If commit
 persistence and its compensation both fail, rollback is blocked until storage is
 repaired and the daemon is restarted; see [TM-REC-209](recovery.md#tm-rec-209).
 The daemon must still be running for the
-timer to fire; after a crash, recovery runs on restart. Immediate DHCP/Wi-Fi/VPN
-operations also run their ownership recovery during startup. See
+timer to fire; after a crash, recovery runs on restart. Immediate DHCP/VPN and
+Wi-Fi runtime-control operations also run their ownership recovery during startup. See
 [recovery](../SECURITY.md#rollback-and-recovery) and the
 [operator recovery runbook](recovery.md).
 
