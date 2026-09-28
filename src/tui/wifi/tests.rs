@@ -1341,6 +1341,87 @@ async fn request_simple_surfaces_wifi_error_and_client_error() {
     let _ = server.await;
 }
 
+#[tokio::test]
+async fn request_simple_enters_pending_change_for_transactional_deactivation() {
+    let change = crate::core::transaction::PendingNetworkChange {
+        phase: Default::default(),
+        last_error: None,
+        token: "wifi-disable-token".into(),
+        interface: "wlan0".into(),
+        rollback_timeout_seconds: 60,
+        expires_at_unix: super::super::current_unix_time() + 60,
+    };
+    let (_directory, client, server) = mock_api(vec![Response::NetworkChangePending {
+        change: change.clone(),
+    }])
+    .await;
+    let mut app = TuiApp::default();
+
+    request_simple(
+        &mut app,
+        &client,
+        Request::DisableWifi {
+            interface: "wlan0".to_string(),
+        },
+        "Wi-Fi deactivated",
+    )
+    .await;
+
+    assert_eq!(app.pending, Some(change));
+    assert_eq!(app.screen, Screen::PendingChange);
+    assert_eq!(app.pending_return_screen, Screen::Wifi);
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn profile_deactivation_enters_pending_change_and_returns_to_profiles() {
+    let change = crate::core::transaction::PendingNetworkChange {
+        phase: Default::default(),
+        last_error: None,
+        token: "wifi-profile-disable-token".into(),
+        interface: "wlan0".into(),
+        rollback_timeout_seconds: 60,
+        expires_at_unix: super::super::current_unix_time() + 60,
+    };
+    let (_directory, client, server) = mock_api(vec![Response::NetworkChangePending {
+        change: change.clone(),
+    }])
+    .await;
+    let mut app = TuiApp {
+        screen: Screen::WifiProfiles,
+        wifi_profiles: Some(WifiProfilesView {
+            interface: "wlan0".into(),
+            mode: WifiProfilesMode::ProfileActions,
+            selected: 3,
+            selected_profile: 0,
+            delete_confirmation: None,
+            profiles: vec![WifiClientProfileSummary {
+                id: "home".into(),
+                ssid: "HomeNet".into(),
+                country_code: None,
+                security: WifiClientSecurity::Open,
+                priority: 0,
+                autoconnect: false,
+                created_at: 0,
+                modified_at: 0,
+                has_passphrase: false,
+            }],
+        }),
+        ..Default::default()
+    };
+
+    handle_wifi_profiles_key(&mut app, KeyCode::Enter, &client).await;
+
+    assert_eq!(app.pending, Some(change));
+    assert_eq!(app.screen, Screen::PendingChange);
+    assert_eq!(app.pending_return_screen, Screen::WifiProfiles);
+    let paths = server.await.unwrap();
+    assert_eq!(
+        paths,
+        vec!["DELETE /api/v1/wifi-client/wlan0/active-profile"]
+    );
+}
+
 #[test]
 fn open_ap_request_discards_typed_passphrase_and_requests_clear() {
     let row = WifiRow {

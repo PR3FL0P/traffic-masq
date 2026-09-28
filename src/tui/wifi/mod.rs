@@ -990,6 +990,15 @@ fn subsystem_disabled(app: &mut TuiApp, role: WifiRole) -> bool {
 
 async fn request_simple(app: &mut TuiApp, client: &ApiClient, request: Request, success: &str) {
     match client.request(&request).await {
+        Ok(Response::NetworkChangePending { change }) => {
+            app.pending = Some(change);
+            app.pending_return_screen = Screen::Wifi;
+            app.screen = Screen::PendingChange;
+            app.push_message(
+                LogLevel::Info,
+                "Wi-Fi change applied tentatively; confirm before the rollback timer expires",
+            );
+        }
         Ok(Response::WifiConfigured { .. })
         | Ok(Response::WifiClientConfigured { .. })
         | Ok(Response::WifiClientDisabled { .. })

@@ -490,6 +490,15 @@ async fn profile_request(
         }
     };
     match client.request(&request).await {
+        Ok(Response::NetworkChangePending { change }) => {
+            app.pending = Some(change);
+            app.pending_return_screen = Screen::WifiProfiles;
+            app.screen = Screen::PendingChange;
+            app.push_message(
+                LogLevel::Info,
+                "Wi-Fi client deactivation is tentative; confirm before the rollback timer expires",
+            );
+        }
         Ok(Response::WifiClientProfileActivated { .. })
         | Ok(Response::WifiClientDisabled { .. }) => {
             app.push_message(LogLevel::Info, "Wi-Fi profile action applied");
