@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -105,6 +106,7 @@ fn decode_ssid(value: &str) -> Option<String> {
     String::from_utf8(decode_ssid_bytes(value)?).ok()
 }
 
+#[cfg(test)]
 fn parse_scan_results(reply: &str) -> Vec<WpaSupplicantScanResult> {
     reply
         .lines()
@@ -136,6 +138,46 @@ fn parse_scan_results(reply: &str) -> Vec<WpaSupplicantScanResult> {
             })
         })
         .collect()
+}
+
+fn parse_bss(reply: &str) -> Result<(u32, WpaSupplicantScanResult), CtrlError> {
+    let fields = ctrl_transport::parse_kv_lines(reply);
+    let required = |key: &str| {
+        fields
+            .get(key)
+            .ok_or_else(|| CtrlError::MalformedReply(format!("BSS missing {key}")))
+    };
+    let id = required("id")?
+        .parse::<u32>()
+        .map_err(|_| CtrlError::MalformedReply("invalid BSS id".into()))?;
+    let bssid = required("bssid")?.parse()?;
+    let frequency_mhz = required("freq")?
+        .parse()
+        .map_err(|_| CtrlError::MalformedReply("invalid BSS frequency".into()))?;
+    let signal_dbm = required("level")?
+        .parse()
+        .map_err(|_| CtrlError::MalformedReply("invalid BSS signal".into()))?;
+    let raw_flags = required("flags")?.clone();
+    let ssid_bytes = decode_ssid_bytes(required("ssid")?)
+        .ok_or_else(|| CtrlError::MalformedReply("invalid BSS SSID encoding".into()))?;
+    let ssid = String::from_utf8(ssid_bytes.clone()).unwrap_or_else(|_| {
+        ssid_bytes
+            .iter()
+            .map(|byte| format!("\\x{byte:02x}"))
+            .collect()
+    });
+    Ok((
+        id,
+        WpaSupplicantScanResult {
+            bssid,
+            frequency_mhz,
+            signal_dbm,
+            ssid,
+            ssid_bytes,
+            security: classify_scan_security(&raw_flags),
+            raw_flags,
+        },
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,7 +282,31 @@ impl WpaSupplicantCtrlClient {
     }
 
     pub async fn scan_results(&self) -> Result<Vec<WpaSupplicantScanResult>, CtrlError> {
-        Ok(parse_scan_results(&self.request("SCAN_RESULTS").await?))
+        const MAX_BSS: usize = 4096;
+        let mut results = Vec::new();
+        let mut seen = HashSet::new();
+        let mut command = "BSS FIRST".to_string();
+        loop {
+            let reply = match self.request(&command).await {
+                Ok(reply) => reply,
+                Err(CtrlError::Failed) => return Ok(results),
+                Err(error) => return Err(error),
+            };
+            if reply.trim() == "FAIL" {
+                return Ok(results);
+            }
+            let (id, result) = parse_bss(&reply)?;
+            if !seen.insert(id) {
+                return Err(CtrlError::MalformedReply(format!("duplicate BSS id {id}")));
+            }
+            if results.len() >= MAX_BSS {
+                return Err(CtrlError::MalformedReply(format!(
+                    "BSS count exceeds {MAX_BSS}"
+                )));
+            }
+            results.push(result);
+            command = format!("BSS NEXT-{id}");
+        }
     }
 
     pub async fn reconnect(&self) -> Result<(), CtrlError> {

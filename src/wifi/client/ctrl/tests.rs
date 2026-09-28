@@ -1,5 +1,58 @@
 use super::*;
 
+#[tokio::test]
+async fn bss_iteration_reads_more_than_one_control_reply_can_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ctrl");
+    let socket = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+    let server = tokio::task::spawn_blocking(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            let (len, peer) = socket.recv_from(&mut buf).unwrap();
+            let command = std::str::from_utf8(&buf[..len]).unwrap();
+            let index = if command == "BSS FIRST" {
+                0
+            } else {
+                command
+                    .strip_prefix("BSS NEXT-")
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap()
+                    + 1
+            };
+            let reply = if index == 200 {
+                "FAIL\n".to_string()
+            } else {
+                format!("id={index}\nbssid=02:00:00:00:{:02x}:{:02x}\nfreq=2412\nlevel=-40\nflags=[ESS]\nssid=network-{index}\n", index / 256, index % 256)
+            };
+            socket.send_to_addr(reply.as_bytes(), &peer).unwrap();
+            if index == 200 {
+                break;
+            }
+        }
+    });
+    let client = WpaSupplicantCtrlClient::connect(&path, Duration::from_secs(2))
+        .await
+        .unwrap();
+    let results = client.scan_results().await.unwrap();
+    assert_eq!(results.len(), 200);
+    assert_eq!(results[199].ssid, "network-199");
+    server.await.unwrap();
+}
+
+#[test]
+fn bss_parser_handles_hidden_binary_and_malformed_replies() {
+    let (_, hidden) =
+        parse_bss("id=1\nbssid=02:00:00:00:00:01\nfreq=2412\nlevel=-40\nflags=[ESS]\nssid=\n")
+            .unwrap();
+    assert!(hidden.ssid_bytes.is_empty());
+    let (_, binary) =
+        parse_bss("id=2\nbssid=02:00:00:00:00:02\nfreq=2412\nlevel=-40\nflags=[ESS]\nssid=\\xff\n")
+            .unwrap();
+    assert_eq!(binary.ssid_bytes, vec![0xff]);
+    assert!(parse_bss("id=garbage\n").is_err());
+}
+
 #[test]
 fn parses_a_status_reply() {
     let reply = "bssid=02:00:00:00:00:01\n\
