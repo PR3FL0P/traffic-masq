@@ -323,6 +323,11 @@ impl Ipv4RuleSpec {
 
 #[async_trait]
 pub trait NetworkProvider: Send + Sync {
+    /// Physical radio identity used by common Wi-Fi admission.
+    fn wireless_phy(&self, interface: &str) -> Option<String> {
+        wireless_phy(interface)
+    }
+
     /// Whether address ownership tags can be trusted on this provider.
     ///
     /// Implementations must report observed truth, not intent: a provider that
@@ -418,6 +423,10 @@ impl<T> NetworkProvider for Arc<T>
 where
     T: NetworkProvider + ?Sized,
 {
+    fn wireless_phy(&self, interface: &str) -> Option<String> {
+        (**self).wireless_phy(interface)
+    }
+
     fn supports_ipv4_address_protocol(&self) -> bool {
         (**self).supports_ipv4_address_protocol()
     }

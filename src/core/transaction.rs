@@ -17,7 +17,7 @@ use crate::core::mutation::NetworkMutationGate;
 use crate::dhcp::supervisor::{DhcpServiceSpec, DhcpSupervisor};
 use crate::wifi::{
     secret::{WifiPassphrase, WifiPassphraseUpdate},
-    store::PassphraseStore,
+    store::{PassphraseStore, WifiCredentialRole},
 };
 
 /// How long an apply waits for convergence to reach what it proposed.
@@ -60,11 +60,17 @@ struct InterfaceJournal {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct SecretSnapshot {
+    #[serde(default)]
+    role: Option<WifiCredentialRole>,
     previous: Option<zeroize::Zeroizing<String>>,
 }
 
 impl SecretSnapshot {
-    fn restore(&self, store: &PassphraseStore, interface: &str) -> Result<()> {
+    fn restore(&self, state_dir: &std::path::Path, interface: &str) -> Result<()> {
+        let store = match self.role {
+            Some(role) => PassphraseStore::for_role(state_dir, role),
+            None => PassphraseStore::new(state_dir.join("wifi/psk")), // v1/v2 journal
+        };
         match &self.previous {
             Some(secret) => store.set(interface, &WifiPassphrase::new(secret.to_string())?)?,
             None => store.clear(interface)?,
@@ -325,12 +331,20 @@ async fn recover_interface_journals(
             }
             let record: InterfaceJournal = serde_json::from_slice(&bytes)?;
             anyhow::ensure!(
-                matches!(record.version, 1 | 2) && record.snapshot.name == name,
+                matches!(record.version, 1 | 2 | 3) && record.snapshot.name == name,
                 "invariant=valid_interface_snapshot: unsupported schema or interface mismatch"
+            );
+            anyhow::ensure!(
+                record.version < 3
+                    || record
+                        .secret
+                        .as_ref()
+                        .is_none_or(|secret| secret.role.is_some()),
+                "role missing from Wi-Fi secret snapshot"
             );
             if committed.get(&name) != Some(&record.token) {
                 if let Some(secret) = &record.secret {
-                    secret.restore(&PassphraseStore::new(state_dir.join("wifi/psk")), &name)?;
+                    secret.restore(state_dir, &name)?;
                 }
                 crate::wifi::lifecycle::stop_recorded_interface(state_dir, &name).await?;
                 manager.rollback(&record.snapshot).await?;
@@ -558,6 +572,13 @@ impl NetworkTransactionManager {
         current_role: Option<InterfaceRole>,
         allow_management_change: bool,
     ) -> Result<InterfaceChangePlan> {
+        let mut network = self.desired().effective().await?.network;
+        network
+            .interfaces
+            .insert(interface.to_owned(), config.clone());
+        self.inner
+            .interface_manager
+            .validate_wifi_radio_policy(&network)?;
         let mut plan = self
             .inner
             .interface_manager
@@ -712,11 +733,47 @@ impl NetworkTransactionManager {
         let token = self.next_token();
         let desired = self.desired();
         let previous_config = desired.committed_interface(interface).await?;
-        let store = PassphraseStore::new(desired.state_dir().join("wifi/psk"));
+        let role = WifiCredentialRole::from_config(config);
+        let previous_role = previous_config
+            .as_ref()
+            .and_then(WifiCredentialRole::from_config);
+        let protected = config
+            .wifi
+            .as_ref()
+            .is_some_and(|wifi| wifi.security.requires_passphrase())
+            || config
+                .wifi_client
+                .as_ref()
+                .is_some_and(|wifi| wifi.security.requires_passphrase());
+        let explicit_file = config
+            .wifi
+            .as_ref()
+            .and_then(|wifi| wifi.passphrase_file.as_ref())
+            .or_else(|| {
+                config
+                    .wifi_client
+                    .as_ref()
+                    .and_then(|wifi| wifi.passphrase_file.as_ref())
+            });
+        let passphrase_update = match passphrase_update {
+            WifiPassphraseUpdate::Keep if role.is_some() && role != previous_role => {
+                anyhow::ensure!(!protected || explicit_file.is_some(),
+                    "changing Wi-Fi credential role requires an explicit passphrase or passphrase_file");
+                // A newly selected external file must not be shadowed by an
+                // older credential left in the target role's store.
+                WifiPassphraseUpdate::Clear
+            }
+            update => update,
+        };
+        let store = role.map(|role| PassphraseStore::for_role(desired.state_dir(), role));
         let secret = if matches!(&passphrase_update, WifiPassphraseUpdate::Keep) {
             None
         } else {
+            let store = store.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("a Wi-Fi secret update requires an unambiguous AP or client role")
+            })?;
             Some(SecretSnapshot {
+                role,
                 previous: store
                     .get(interface)?
                     .map(|value| zeroize::Zeroizing::new(value.expose().to_owned())),
@@ -724,12 +781,15 @@ impl NetworkTransactionManager {
         };
         self.write_journal_record(&token, snapshot.clone(), secret.clone())
             .await?;
-        let staged = match passphrase_update {
-            WifiPassphraseUpdate::Keep => Ok(()),
-            WifiPassphraseUpdate::Set(passphrase) => store
-                .set(interface, &passphrase)
+        let staged = match (&passphrase_update, store.as_ref()) {
+            (WifiPassphraseUpdate::Keep, _) => Ok(()),
+            (WifiPassphraseUpdate::Set(passphrase), Some(store)) => store
+                .set(interface, passphrase)
                 .map_err(anyhow::Error::from),
-            WifiPassphraseUpdate::Clear => store.clear(interface).map_err(anyhow::Error::from),
+            (WifiPassphraseUpdate::Clear, Some(store)) => {
+                store.clear(interface).map_err(anyhow::Error::from)
+            }
+            _ => unreachable!("secret role checked before journaling"),
         };
         if staged.is_ok() {
             desired
@@ -747,7 +807,7 @@ impl NetworkTransactionManager {
                 None => None,
             };
             let secret_restored = match &secret {
-                Some(secret) => secret.restore(&store, interface),
+                Some(secret) => secret.restore(desired.state_dir(), interface),
                 None => Ok(()),
             };
             desired
@@ -980,10 +1040,7 @@ impl NetworkTransactionManager {
             None => None,
         };
         let secret_restored = match &pending.secret {
-            Some(secret) => secret.restore(
-                &PassphraseStore::new(desired.state_dir().join("wifi/psk")),
-                &pending.info.interface,
-            ),
+            Some(secret) => secret.restore(desired.state_dir(), &pending.info.interface),
             None => Ok(()),
         };
         // Publishing rollback intent must not depend on secret-store I/O. If
@@ -1131,7 +1188,7 @@ impl NetworkTransactionManager {
         )
         .await?;
         let record = InterfaceJournal {
-            version: 2,
+            version: 3,
             token: token.to_owned(),
             snapshot,
             secret,

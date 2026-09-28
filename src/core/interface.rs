@@ -92,6 +92,16 @@ pub struct InterfaceManager {
 }
 
 impl InterfaceManager {
+    pub(crate) fn validate_wifi_radio_policy(
+        &self,
+        network: &crate::config::NetworkConfig,
+    ) -> Result<()> {
+        crate::wifi::policy::WifiRadioPolicy::validate(network, |name| {
+            self.provider.wireless_phy(name)
+        })?;
+        Ok(())
+    }
+
     /// The journal is not optional and not a detail of construction: every
     /// manager that writes addresses has to record them where every manager
     /// that asks "is this mine" will look, or the answer depends on which

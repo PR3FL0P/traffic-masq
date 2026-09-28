@@ -220,7 +220,7 @@ endpoints. Use the endpoint corresponding to the apply response.
 | --- | --- | --- | --- | --- |
 | `GET` | `/wifi` | — | AP runtime status | Authenticated |
 | `GET` | `/wifi/{interface}` | — | AP specification | Authenticated |
-| `PUT` | `/wifi/{interface}` | `WifiEdit` | Configure AP immediately; secret is separate | Administrator |
+| `PUT` | `/wifi/{interface}` | `WifiEdit` | Tentatively configure AP; secret is separate | Administrator |
 | `DELETE` | `/wifi/{interface}` | — | Disable AP immediately | Administrator |
 | `PUT` | `/wifi/{interface}/passphrase` | `{ "passphrase": string }` | Store AP passphrase | Administrator |
 | `POST` | `/wifi/{interface}/provision` | `WifiApProvision` | Tentatively apply AP, secret and optional DHCP | Administrator |
@@ -232,13 +232,18 @@ endpoints. Use the endpoint corresponding to the apply response.
 | `DELETE` | `/wifi-ap-profiles/{id}` | — | Delete a profile; running AP is unchanged | Administrator |
 | `PUT` | `/wifi/{interface}/profile` | `{ "profile_id": string }` | Tentatively apply a saved profile | Administrator |
 
+AP and client passphrases are scoped to their respective roles. AP provisioning
+without a new passphrase can retain an existing AP credential, but cannot reuse
+a client credential during a role switch. Supply a new AP passphrase for that
+transition.
+
 ### Wi-Fi client
 
 | Method | Path | Body | Result or purpose | Access |
 | --- | --- | --- | --- | --- |
 | `GET` | `/wifi-client` | — | Wi-Fi client runtime status | Authenticated |
 | `GET` | `/wifi-client/{interface}` | — | Client specification | Authenticated |
-| `PUT` | `/wifi-client/{interface}` | `WifiClientEdit` | Configure association immediately; secret is separate | Administrator |
+| `PUT` | `/wifi-client/{interface}` | `WifiClientEdit` | Tentatively configure association; secret is separate | Administrator |
 | `DELETE` | `/wifi-client/{interface}` | — | Disable client immediately | Administrator |
 | `PUT` | `/wifi-client/{interface}/passphrase` | `{ "passphrase": string }` | Store client passphrase | Administrator |
 | `POST` | `/wifi-client/{interface}/reconnect` | — | Request reconnection | Administrator |
@@ -249,7 +254,7 @@ endpoints. Use the endpoint corresponding to the apply response.
 | `PUT` | `/wifi-client/profiles/{id}` | `WifiClientProfileWrite` | Update a profile; body `id` must match path | Administrator |
 | `DELETE` | `/wifi-client/profiles/{id}` | — | Delete an inactive profile | Administrator |
 | `PUT` | `/wifi-client/{interface}/provision` | `WifiClientProvision` | Tentatively apply profile plus IPv4 policy | Administrator |
-| `PUT` | `/wifi-client/{interface}/active-profile` | `{ "profile_id": string }` | Start low-level profile activation | Administrator |
+| `PUT` | `/wifi-client/{interface}/active-profile` | `{ "profile_id": string }` | Tentatively activate a saved profile | Administrator |
 | `DELETE` | `/wifi-client/{interface}/active-profile` | — | Deactivate the current profile | Administrator |
 
 ## Request schemas
@@ -481,8 +486,8 @@ specify `interface_ipv4`, `pool_start`, `pool_end`, `dns_servers`, and
 
 ## Commit-confirm changes
 
-Interface apply, AP provisioning, saved AP profile activation, and Wi-Fi client
-provisioning return:
+Interface apply, AP and client configuration or provisioning, and saved AP or
+client profile activation return:
 
 ```json
 {
@@ -524,9 +529,10 @@ connection does not prove that a mutation failed; inspect the matching pending
 endpoint and current state before retrying. Never automatically retry a
 mutation whose outcome is unknown.
 
-Low-level DHCP, Wi-Fi and VPN endpoints apply immediately. Their successful
-responses do not require a commit. The endpoint tables identify provisioning
-operations that use tentative changes.
+DHCP and VPN controls, Wi-Fi deactivation, passphrase updates, and runtime
+controls such as reconnect and reload still apply immediately. Their successful
+responses do not require a commit. Wi-Fi configuration and profile activation
+require confirmation even when called through the non-provisioning endpoints.
 
 ## Secrets and operational safety
 

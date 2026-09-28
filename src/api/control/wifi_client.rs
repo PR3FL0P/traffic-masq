@@ -24,6 +24,45 @@ pub(super) fn validate_wifi_client_interface(
     Ok(())
 }
 
+/// Shared target construction for operator activation and internal autoconnect.
+fn profile_activation_target(
+    interface: &str,
+    previous: &InterfaceConfig,
+    profile: &crate::wifi::WifiClientProfileSummary,
+    dhcp_available: bool,
+) -> Result<(InterfaceConfig, bool), WifiClientProfileErrorDetail> {
+    let mut target = previous.clone();
+    let auto_dhcp = target.ipv4.is_none()
+        && !target
+            .dhcp_client
+            .as_ref()
+            .is_some_and(|policy| policy.enabled);
+    if auto_dhcp {
+        if !dhcp_available {
+            return Err(WifiClientProfileErrorDetail::ActivationFailed {
+                message: "profile activation requires the DHCP client service because the interface has no static IPv4 address".into(),
+            });
+        }
+        let policy = target.dhcp_client.get_or_insert_with(Default::default);
+        policy.enabled = true;
+        policy.wifi_owned = true;
+    }
+    validate_wifi_client_interface(interface, &target)
+        .map_err(|message| WifiClientProfileErrorDetail::InvalidProfile { message })?;
+    target.wifi_client = Some(WifiClientConfig {
+        ssid: profile.ssid.clone(),
+        country_code: profile.country_code.clone(),
+        security: profile.security,
+        passphrase_file: None,
+    });
+    target
+        .validate(interface)
+        .map_err(|error| WifiClientProfileErrorDetail::InvalidProfile {
+            message: error.to_string(),
+        })?;
+    Ok((target, auto_dhcp))
+}
+
 impl ControlService {
     pub(super) async fn provision_wifi_client(
         &self,
@@ -207,53 +246,30 @@ impl ControlService {
             }
         };
 
-        let _mutation = self.wifi_client_mutations.lock().await;
-        let previous = wifi_client
-            .status(&interface)
-            .await
-            .map(|status| status.spec);
-        if let Err(error) = wifi_client.configure(spec.clone()).await {
-            let restoration = match previous.clone() {
-                Some(previous) => wifi_client.configure(previous).await.map(|_| ()),
-                None => wifi_client.disable(&interface).await.map(|_| ()),
-            };
-            if let Err(rollback_error) = restoration {
-                return wifi_client_error(WifiClientErrorDetail::Other {
-                    message: format!(
-                        "failed to configure Wi-Fi client: {error}; runtime restoration failed: {rollback_error}; recovery required"
-                    ),
-                });
-            }
+        if let Err(error) = wifi_client.validate_configuration(&spec).await {
             return classify_wifi_client_error(error);
         }
-        if let Err(error) = self
-            .overrides
-            .set_interface(interface.clone(), interface_config, false)
+        let previous = effective.network.interfaces.get(&interface);
+        let update = if spec.requires_passphrase() {
+            WifiPassphraseUpdate::Keep
+        } else {
+            WifiPassphraseUpdate::Clear
+        };
+        match self
+            .transactions
+            .apply_with_passphrase_update(
+                &interface,
+                &interface_config,
+                previous,
+                previous.map(|config| config.role),
+                false,
+                update,
+            )
             .await
         {
-            if crate::atomic_file::is_indeterminate_write(&error) {
-                return super::runtime::error_response(error);
-            }
-            let restoration = match previous {
-                Some(previous) => wifi_client.configure(previous).await.map(|_| ()),
-                None => wifi_client.disable(&interface).await.map(|_| ()),
-            };
-            return wifi_client_error(WifiClientErrorDetail::Other {
-                message: compensation_message(
-                    "failed to persist Wi-Fi client override",
-                    &error,
-                    restoration,
-                ),
-            });
+            Ok(change) => Response::NetworkChangePending { change },
+            Err(error) => super::runtime::error_response(error),
         }
-        if !spec.requires_passphrase() {
-            if let Err(error) = wifi_client.clear_passphrase(&interface).await {
-                return wifi_client_error(WifiClientErrorDetail::Other {
-                    message: format!("Wi-Fi client was configured as open, but obsolete credentials could not be erased: {error}; credential cleanup required"),
-                });
-            }
-        }
-        Response::WifiClientConfigured { spec }
     }
 
     pub(super) async fn disable_wifi_client(&self, interface: String) -> Response {
@@ -608,17 +624,64 @@ impl ControlService {
         interface: String,
         profile_id: String,
     ) -> Response {
-        let _mutation = self.wifi_client_mutations.lock().await;
-        let response = self
-            .activate_wifi_client_profile_locked(interface.clone(), profile_id)
-            .await;
-        if matches!(response, Response::WifiClientProfileActivated { .. }) {
-            self.wifi_autoconnect.lock().await.resume(&interface);
+        let Some(wifi_client) = &self.wifi_client else {
+            return wifi_client_profile_error(WifiClientProfileErrorDetail::WifiClientDisabled);
+        };
+        if let Err(error) = wifi_client.preflight_binary().await {
+            return classify_wifi_client_error(error);
         }
-        response
+        let profile = match self.wifi_client_profiles.get(&profile_id) {
+            Ok(profile) => profile,
+            Err(error) => return classify_wifi_client_profile_error(error),
+        };
+        let secret = match self.wifi_client_profiles.get_passphrase(&profile_id) {
+            Ok(secret) => secret,
+            Err(error) => return classify_wifi_client_profile_error(error),
+        };
+        let effective = match self.effective_config().await {
+            Ok(config) => config,
+            Err(message) => {
+                return wifi_client_profile_error(WifiClientProfileErrorDetail::Other { message })
+            }
+        };
+        let Some(previous) = effective.network.interfaces.get(&interface) else {
+            return wifi_client_profile_error(WifiClientProfileErrorDetail::InterfaceNotFound);
+        };
+        let (target, _) = match profile_activation_target(
+            &interface,
+            previous,
+            &profile,
+            self.dhcp_client.is_some(),
+        ) {
+            Ok(target) => target,
+            Err(detail) => return wifi_client_profile_error(detail),
+        };
+        let update = secret
+            .map(WifiPassphraseUpdate::Set)
+            .unwrap_or(WifiPassphraseUpdate::Clear);
+        match self
+            .transactions
+            .apply_with_passphrase_update(
+                &interface,
+                &target,
+                Some(previous),
+                Some(previous.role),
+                false,
+                update,
+            )
+            .await
+        {
+            Ok(change) => {
+                self.wifi_autoconnect.lock().await.resume(&interface);
+                Response::NetworkChangePending { change }
+            }
+            Err(error) => super::runtime::error_response(error),
+        }
     }
 
-    pub(super) async fn activate_wifi_client_profile_locked(
+    /// Internal autoconnect only; caller holds network admission/execution and
+    /// the client mutation lock. Operator requests use commit-confirm above.
+    pub(super) async fn activate_wifi_client_profile_internal(
         &self,
         interface: String,
         profile_id: String,
@@ -636,41 +699,18 @@ impl ControlService {
                 return wifi_client_profile_error(WifiClientProfileErrorDetail::Other { message })
             }
         };
-        let Some(mut interface_config) = effective.network.interfaces.get(&interface).cloned()
-        else {
+        let Some(previous) = effective.network.interfaces.get(&interface) else {
             return wifi_client_profile_error(WifiClientProfileErrorDetail::InterfaceNotFound);
         };
-
-        let auto_enabled_dhcp = interface_config.ipv4.is_none()
-            && !interface_config
-                .dhcp_client
-                .as_ref()
-                .is_some_and(|c| c.enabled);
-        if auto_enabled_dhcp {
-            if self.dhcp_client.is_none() {
-                return wifi_client_profile_error(WifiClientProfileErrorDetail::ActivationFailed {
-                    message: "profile activation requires the DHCP client service because the interface has no static IPv4 address".to_owned(),
-                });
-            }
-            let policy = interface_config
-                .dhcp_client
-                .get_or_insert_with(Default::default);
-            policy.enabled = true;
-            policy.wifi_owned = true;
-        }
-
-        if let Err(message) = validate_wifi_client_interface(&interface, &interface_config) {
-            return wifi_client_profile_error(WifiClientProfileErrorDetail::InvalidProfile {
-                message,
-            });
-        }
-
-        interface_config.wifi_client = Some(WifiClientConfig {
-            ssid: profile.ssid.clone(),
-            country_code: profile.country_code.clone(),
-            security: profile.security,
-            passphrase_file: None,
-        });
+        let (interface_config, auto_enabled_dhcp) = match profile_activation_target(
+            &interface,
+            previous,
+            &profile,
+            self.dhcp_client.is_some(),
+        ) {
+            Ok(target) => target,
+            Err(detail) => return wifi_client_profile_error(detail),
+        };
         let spec = match WifiClientSpec::from_interface_config(&interface, &interface_config) {
             Ok(Some(spec)) => spec,
             Ok(None) => {
@@ -686,6 +726,17 @@ impl ControlService {
                 })
             }
         };
+
+        if let Err(error) = crate::wifi::policy::WifiRadioPolicy::validate_transition(
+            &effective.network,
+            &interface,
+            &interface_config,
+            |name| self.network.wireless_phy(name),
+        ) {
+            return wifi_client_profile_error(WifiClientProfileErrorDetail::InvalidProfile {
+                message: error.to_string(),
+            });
+        }
 
         let previous_status = wifi_client.status(&interface).await;
         let previous_link_ready = previous_status
@@ -917,6 +968,15 @@ impl ControlService {
             Ok(config) => config,
             Err(message) => return wifi_client_error(WifiClientErrorDetail::Other { message }),
         };
+        if let Err(error) = crate::wifi::policy::WifiRadioPolicy::validate_scan(
+            &effective.network,
+            &interface,
+            |name| self.network.wireless_phy(name),
+        ) {
+            return wifi_client_error(WifiClientErrorDetail::InvalidSpec {
+                message: error.to_string(),
+            });
+        }
         if effective
             .network
             .interfaces

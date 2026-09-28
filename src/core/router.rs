@@ -49,6 +49,7 @@ impl RouterDesired {
     /// Derive and validate router intent, including interfaces, VPN chain, routes, and forwarding.
     pub fn from_effective_config(config: &AppConfig) -> Result<Self> {
         config.validate()?;
+        crate::wifi::policy::WifiRadioPolicy::validate_system(&config.network)?;
         Self::from_validated_config(config)
     }
 

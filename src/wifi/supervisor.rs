@@ -132,7 +132,10 @@ impl HostapdSupervisor {
             inner: Arc::new(Inner {
                 hostapd_binary: config.wifi.hostapd_binary.clone(),
                 runtime_dir: config.wifi.runtime_dir.clone(),
-                passphrase_store: PassphraseStore::new(records_dir.join("psk")),
+                passphrase_store: PassphraseStore::for_role(
+                    &config.runtime.state_dir,
+                    crate::wifi::store::WifiCredentialRole::Ap,
+                ),
                 records_dir,
                 restart_backoff_seconds: config.wifi.restart_backoff_seconds.max(1),
                 ctrl_timeout: DEFAULT_CTRL_TIMEOUT,
@@ -148,6 +151,8 @@ impl HostapdSupervisor {
 
     /// Perform normal startup cleanup and apply committed access-point state.
     pub async fn reconcile_startup(&self, config: &AppConfig) -> Result<(), SupervisorError> {
+        crate::wifi::policy::WifiRadioPolicy::validate_system(&config.network)
+            .map_err(anyhow::Error::from)?;
         let specs = Self::effective_specs(config)?;
         let configured_interfaces: HashSet<String> =
             specs.iter().map(|spec| spec.interface.clone()).collect();
@@ -318,6 +323,12 @@ impl HostapdSupervisor {
     /// Validate the requested AP radio settings against the selected PHY and
     /// the kernel's currently effective regulatory constraints. This is safe to
     /// call as an API preflight; `configure` repeats it under the mutation lock.
+    pub async fn validate_configuration(&self, spec: &WifiApSpec) -> Result<(), SupervisorError> {
+        self.validate_radio(spec).await?;
+        self.render_for(spec).await?;
+        Ok(())
+    }
+
     pub async fn validate_radio(&self, spec: &WifiApSpec) -> Result<(), SupervisorError> {
         self.inner.radio.validate(spec).await?;
         Ok(())

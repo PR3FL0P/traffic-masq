@@ -11,9 +11,26 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 use crate::atomic_file::{self, PrivateDirError, PRIVATE_DIR_MODE, PRIVATE_FILE_MODE};
-use crate::config::{validate_interface_name, WifiSecurity};
+use crate::config::{validate_interface_name, InterfaceConfig, WifiSecurity};
 use crate::wifi::secret::{PassphraseError, WifiPassphrase};
 use crate::wifi::WifiApSpec;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WifiCredentialRole {
+    Ap,
+    Client,
+}
+
+impl WifiCredentialRole {
+    pub fn from_config(config: &InterfaceConfig) -> Option<Self> {
+        match (&config.wifi, &config.wifi_client) {
+            (Some(_), None) => Some(Self::Ap),
+            (None, Some(_)) => Some(Self::Client),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum PassphraseStoreError {
@@ -58,6 +75,14 @@ pub struct PassphraseStore {
 }
 
 impl PassphraseStore {
+    /// Role stores deliberately sit beside the legacy directory: Linux
+    /// interfaces named `ap` or `client` may already occupy `psk/<name>`.
+    pub fn for_role(state_dir: impl AsRef<Path>, role: WifiCredentialRole) -> Self {
+        Self::new(state_dir.as_ref().join(match role {
+            WifiCredentialRole::Ap => "wifi/psk-ap",
+            WifiCredentialRole::Client => "wifi/psk-client",
+        }))
+    }
     pub fn new(directory: impl Into<PathBuf>) -> Self {
         Self {
             directory: directory.into(),
@@ -142,6 +167,50 @@ impl PassphraseStore {
         }
         Ok(())
     }
+}
+
+/// Run after legacy transaction recovery and before starting any Wi-Fi consumer.
+/// There is intentionally no legacy fallback in role-specific stores.
+pub async fn migrate_legacy_passphrases(config: &crate::config::AppConfig) -> anyhow::Result<()> {
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let state_dir = &config.runtime.state_dir;
+        let legacy = PassphraseStore::new(state_dir.join("wifi/psk"));
+        match fs::symlink_metadata(legacy.directory()) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
+        }
+        let directory = legacy.ensure_directory()?;
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let interface = entry.file_name().into_string()
+                .map_err(|_| anyhow::anyhow!("invalid legacy Wi-Fi credential filename"))?;
+            validate_interface_name(&interface)?;
+            // Unresolved old journals must restore their legacy secret first.
+            if crate::core::recovery::check_scope(state_dir, Some(&interface)).is_err() {
+                continue;
+            }
+            let Some(secret) = legacy.get(&interface)? else { continue };
+            let role = config.network.interfaces.get(&interface)
+                .and_then(WifiCredentialRole::from_config);
+            let destination = match role {
+                Some(role) => PassphraseStore::for_role(state_dir, role),
+                None => PassphraseStore::new(state_dir.join("wifi/psk-unassigned")),
+            };
+            if let Some(existing) = destination.get(&interface)? {
+                anyhow::ensure!(existing.expose() == secret.expose(),
+                    "conflicting legacy and role-specific Wi-Fi credentials for {interface}; migration requires resolution");
+            } else {
+                destination.set(&interface, &secret)?;
+            }
+            // Copy is durable before retiring the source. A crash between the
+            // two operations is replayed by the equality check above.
+            legacy.clear(&interface)?;
+        }
+        Ok(())
+    }).await??;
+    Ok(())
 }
 
 fn read_secret_bytes(path: &Path) -> Result<Option<Zeroizing<Vec<u8>>>, PassphraseStoreError> {

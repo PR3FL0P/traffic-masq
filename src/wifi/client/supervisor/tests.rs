@@ -1141,6 +1141,38 @@ async fn scan_on_unconfigured_interface_performs_ephemeral_scan_and_cleans_up() 
 }
 
 #[tokio::test]
+async fn ephemeral_scan_cleanup_preserves_rebound_foreign_socket() {
+    let temp = tempdir().expect("tempdir");
+    let runtime = temp.path().join("run");
+    let process = fake_process();
+    let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
+    let foreign = Arc::new(std::sync::Mutex::new(None));
+    let foreign_for_hook = foreign.clone();
+    let ctrl_path = runtime.join("wlan0");
+    let scan_config = scan_config_path(&runtime, "wlan0");
+
+    process.set_after_terminate_hook(move |_| {
+        let responder = FakeSupplicantCtrl::spawn(ctrl_path.clone(), "COMPLETED", &scan_config);
+        *foreign_for_hook.lock().expect("foreign responder lock") = Some(responder);
+    });
+
+    assert!(matches!(
+        supervisor.scan("wlan0").await,
+        Err(ClientSupervisorError::NotOwned { .. })
+    ));
+
+    assert!(runtime.join("wlan0").exists());
+    assert!(!runtime.join("wlan0-scan.conf").exists());
+    assert!(WifiRecordStore::for_scan(temp.path().join("wifi"), "wlan0")
+        .load()
+        .await
+        .expect("load scan record")
+        .is_none());
+
+    drop(foreign.lock().expect("foreign responder lock").take());
+}
+
+#[tokio::test]
 async fn startup_recovers_an_interrupted_ephemeral_scan() {
     let temp = tempdir().expect("tempdir");
     let runtime = temp.path().join("run");
@@ -1202,6 +1234,128 @@ async fn scan_on_configured_interface_reuses_running_supplicant() {
         .filter(|c| matches!(c, FakeCall::Terminate(_)))
         .count();
     assert_eq!(terminate_count, 0);
+}
+
+#[tokio::test]
+async fn reconnect_rechecks_socket_ownership_after_connect() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("run");
+    let process = fake_process();
+    let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
+    supervisor
+        .configure(spec("wlan0", "upstream"))
+        .await
+        .unwrap();
+
+    // First proof succeeds, post-connect proof fails.
+    process.fail_ownership_after_checks(2);
+    assert!(matches!(
+        supervisor.reconnect("wlan0").await,
+        Err(ClientSupervisorError::NotOwned { .. })
+    ));
+}
+
+#[tokio::test]
+async fn configured_scan_rechecks_ownership_before_attach() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("run");
+    let process = fake_process();
+    let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
+    supervisor
+        .configure(spec("wlan0", "upstream"))
+        .await
+        .unwrap();
+
+    // Command session pre/post proofs succeed; event-session post-connect
+    // proof fails, so ATTACH/SCAN must not proceed through an unbound path.
+    process.fail_ownership_after_checks(4);
+    assert!(matches!(
+        supervisor.scan("wlan0").await,
+        Err(ClientSupervisorError::NotOwned { .. })
+    ));
+}
+
+#[tokio::test]
+async fn association_monitor_rechecks_ownership_before_attach() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("run");
+    let process = fake_process();
+    let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
+    supervisor
+        .configure(spec("wlan0", "upstream"))
+        .await
+        .unwrap();
+
+    supervisor.inner.association_monitors.lock().await.clear();
+    process.fail_ownership_after_checks(4);
+    supervisor.monitor_association("wlan0", 2000).await;
+
+    assert!(!supervisor
+        .inner
+        .association_monitors
+        .lock()
+        .await
+        .contains_key("wlan0"));
+}
+
+#[tokio::test]
+async fn silent_foreign_ctrl_path_is_not_treated_as_absent() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("run");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let process = fake_process();
+    let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
+    let _foreign = FakeSupplicantCtrl::spawn_silent(runtime.join("wlan0"));
+
+    assert!(matches!(
+        supervisor.configure(spec("wlan0", "upstream")).await,
+        Err(ClientSupervisorError::NotOwned { .. })
+    ));
+    assert_eq!(process.spawn_count(), 0);
+}
+
+#[tokio::test]
+async fn startup_readiness_refuses_a_foreign_responder() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("run");
+    std::fs::create_dir_all(&runtime).unwrap();
+    let process = fake_process();
+    let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
+    let config = config_path(&runtime, "wlan0");
+
+    seed_process(&process, 4242, config.clone(), "COMPLETED");
+    process.detach_ctrl_socket(4242);
+    let _foreign = FakeSupplicantCtrl::spawn(runtime.join("wlan0"), "COMPLETED", &config);
+
+    let record = PersistedWifiRecord {
+        pid: 4242,
+        started_at_unix: 1,
+        binary_path: Some(PathBuf::from("/usr/sbin/wpa_supplicant")),
+        ctrl_path: runtime.join("wlan0"),
+        config_path: config,
+        config_digest: WifiDigest::from_bytes([1; 32]),
+        key_digest: WifiDigest::from_bytes([2; 32]),
+        ssid: "upstream".to_string(),
+    };
+    WifiRecordStore::for_client(temp.path().join("wifi"), "wlan0")
+        .save(&record)
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        supervisor
+            .wait_for_ready(
+                OwnedWpaCtrlIdentity {
+                    interface: "wlan0".to_string(),
+                    kind: WifiProcessKind::Client,
+                    record,
+                    require_current_record: true,
+                },
+                Duration::from_millis(20),
+            )
+            .await,
+        Err(ClientSupervisorError::NotOwned { .. })
+    ));
 }
 
 #[tokio::test]
@@ -1316,4 +1470,150 @@ async fn association_events_identify_the_current_supplicant_and_stop_on_disable(
         .lock()
         .await
         .is_empty());
+}
+
+#[tokio::test]
+async fn reconfigure_preserves_silent_foreign_socket_rebound_after_stop() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("run");
+    let process = fake_process();
+    let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
+    supervisor
+        .configure(spec("wlan0", "upstream"))
+        .await
+        .unwrap();
+    let foreign = Arc::new(std::sync::Mutex::new(None));
+    let foreign_for_hook = foreign.clone();
+    let ctrl_path = runtime.join("wlan0");
+    process.set_after_terminate_hook(move |_| {
+        *foreign_for_hook.lock().unwrap() =
+            Some(FakeSupplicantCtrl::spawn_silent(ctrl_path.clone()));
+    });
+
+    assert!(matches!(
+        supervisor.configure(spec("wlan0", "another-network")).await,
+        Err(ClientSupervisorError::NotOwned { .. })
+    ));
+    assert_eq!(process.spawn_count(), 1);
+    assert!(runtime.join("wlan0").exists());
+}
+
+#[tokio::test]
+async fn status_waits_for_the_operation_lock() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("run");
+    let supervisor = supervisor(temp.path(), &runtime, fake_process()).await;
+    supervisor
+        .configure(spec("wlan0", "upstream"))
+        .await
+        .unwrap();
+    let operation = supervisor.inner.operation_lock.lock().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), supervisor.status("wlan0"))
+            .await
+            .is_err()
+    );
+    drop(operation);
+    assert!(supervisor
+        .status("wlan0")
+        .await
+        .unwrap()
+        .wpa_state
+        .is_connected());
+}
+
+#[tokio::test]
+async fn socket_replacement_before_connect_sends_no_commands_to_foreign_endpoint() {
+    for operation in ["reconnect", "scan", "monitor"] {
+        let temp = tempdir().unwrap();
+        let runtime = temp.path().join("run");
+        let process = fake_process();
+        let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
+        supervisor
+            .configure(spec("wlan0", "upstream"))
+            .await
+            .unwrap();
+        supervisor.inner.association_monitors.lock().await.clear();
+        let foreign = Arc::new(std::sync::Mutex::new(None));
+        let foreign_for_hook = foreign.clone();
+        let weak_process = Arc::downgrade(&process);
+        let ctrl_path = runtime.join("wlan0");
+        let checks = std::sync::atomic::AtomicU32::new(0);
+        let replace_after = if operation == "reconnect" { 1 } else { 3 };
+        process.set_after_socket_proof_hook(move |pid| {
+            if checks.fetch_add(1, Ordering::Relaxed) + 1 == replace_after {
+                weak_process.upgrade().unwrap().detach_ctrl_socket(pid);
+                let socket = StdUnixDatagram::bind(&ctrl_path).unwrap();
+                socket.set_nonblocking(true).unwrap();
+                *foreign_for_hook.lock().unwrap() = Some(socket);
+            }
+        });
+
+        match operation {
+            "reconnect" => assert!(matches!(
+                supervisor.reconnect("wlan0").await,
+                Err(ClientSupervisorError::NotOwned { .. })
+            )),
+            "scan" => assert!(matches!(
+                supervisor.scan("wlan0").await,
+                Err(ClientSupervisorError::NotOwned { .. })
+            )),
+            _ => {
+                supervisor.monitor_association("wlan0", 2000).await;
+                assert!(supervisor
+                    .inner
+                    .association_monitors
+                    .lock()
+                    .await
+                    .is_empty());
+            }
+        }
+        let guard = foreign.lock().unwrap();
+        let mut buffer = [0; 128];
+        assert_eq!(
+            guard
+                .as_ref()
+                .unwrap()
+                .recv(&mut buffer)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::WouldBlock,
+            "unexpected command during {operation}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn ap_and_client_supervisors_keep_interface_credentials_separate() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("run");
+    let config = app_config(temp.path(), &runtime);
+    let client = WifiClientSupervisor::open_with_process_for_recovery(&config, fake_process());
+    let ap = crate::wifi::HostapdSupervisor::open_for_recovery(&config);
+    client
+        .set_passphrase("wlan0", &WifiPassphrase::new("station-password").unwrap())
+        .await
+        .unwrap();
+    assert!(ap.stored_passphrase("wlan0").await.unwrap().is_none());
+    ap.set_passphrase("wlan0", &WifiPassphrase::new("ap-password").unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .stored_passphrase("wlan0")
+            .await
+            .unwrap()
+            .unwrap()
+            .expose(),
+        "station-password"
+    );
+    client.clear_passphrase("wlan0").await.unwrap();
+    assert_eq!(
+        ap.stored_passphrase("wlan0")
+            .await
+            .unwrap()
+            .unwrap()
+            .expose(),
+        "ap-password"
+    );
 }

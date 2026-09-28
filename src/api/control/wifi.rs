@@ -94,57 +94,30 @@ impl ControlService {
             }
         };
 
-        let _mutation = self.wifi_mutations.lock().await;
-        let previous = wifi.status(&interface).await.map(|status| status.spec);
-        if let Err(error) = wifi.configure(spec.clone()).await {
-            let restoration = match previous.clone() {
-                Some(previous) => wifi.configure(previous).await.map(|_| ()),
-                None => wifi.disable(&interface).await.map(|_| ()),
-            };
-            if let Err(rollback_error) = restoration {
-                return wifi_error(WifiErrorDetail::Other {
-                    message: format!(
-                        "failed to configure Wi-Fi: {error}; runtime restoration failed: {rollback_error}; recovery required"
-                    ),
-                });
-            }
+        if let Err(error) = wifi.validate_configuration(&spec).await {
             return classify_wifi_error(error);
         }
-        if let Err(error) = self
-            .overrides
-            .set_interface(interface.clone(), interface_config, false)
+        let previous = effective.network.interfaces.get(&interface);
+        let update = if clear_stored_passphrase {
+            WifiPassphraseUpdate::Clear
+        } else {
+            WifiPassphraseUpdate::Keep
+        };
+        match self
+            .transactions
+            .apply_with_passphrase_update(
+                &interface,
+                &interface_config,
+                previous,
+                previous.map(|config| config.role),
+                false,
+                update,
+            )
             .await
         {
-            if crate::atomic_file::is_indeterminate_write(&error) {
-                return wifi_error(WifiErrorDetail::Other {
-                    message: format!("{error:#}"),
-                });
-            }
-            let restoration = match previous {
-                Some(previous) => wifi.configure(previous).await.map(|_| ()),
-                None => wifi.disable(&interface).await.map(|_| ()),
-            };
-            return wifi_error(WifiErrorDetail::Other {
-                message: compensation_message(
-                    "failed to persist Wi-Fi override",
-                    &error,
-                    restoration,
-                ),
-            });
+            Ok(change) => Response::NetworkChangePending { change },
+            Err(error) => super::runtime::error_response(error),
         }
-        // Persist Open mode before removing the credential. If the process dies
-        // between these operations, the leftover secret is inert because Open
-        // AP rendering never resolves credentials from the secret store.
-        if clear_stored_passphrase {
-            if let Err(error) = wifi.clear_passphrase(&interface).await {
-                return wifi_error(WifiErrorDetail::Other {
-                    message: format!(
-                        "Wi-Fi was configured as open, but the obsolete stored passphrase could not be erased: {error}; credential cleanup required"
-                    ),
-                });
-            }
-        }
-        Response::WifiConfigured { spec }
     }
 
     #[allow(clippy::too_many_arguments)] // Mirrors the API request's independent provisioning options.

@@ -34,10 +34,12 @@ secret I/O or runtime failures keep the transaction in rollback recovery and
 prevent confirmation. This ordering also applies to timeout, shutdown and
 failed-apply compensation.
 
-Standalone DHCP, Wi-Fi and VPN operations are immediate rather than
-commit-confirm transactions. Because some of their effects survive a daemon
-crash, they establish durable ownership proof before persistent runtime state is
-created: DHCP lease records include the applied route policy, Wi-Fi launches use
+Operator AP/client configuration and saved profile activation use the same
+commit-confirm interface transactions as provisioning. Internal autoconnect
+activation remains immediate. DHCP and VPN controls, Wi-Fi deactivation,
+passphrase updates and runtime controls also remain immediate. Since runtime
+effects can survive a daemon crash, subsystems establish durable ownership
+proof before persistent runtime state is created: DHCP lease records include the applied route policy, Wi-Fi launches use
 write-ahead process records, and WireGuard activation uses a durable intent plus
 an interface launch marker. Startup recovery compares those proofs with
 committed intent and only removes state whose ownership can still be verified.
@@ -51,6 +53,14 @@ operations keep running if the HTTP client disconnects. The executor
 limits queued work and waits for accepted operations during shutdown. If a
 request times out, the client must check the current state before retrying: the
 change may already have taken effect.
+
+Wi-Fi radio admission uses a shared policy: managed AP and STA interfaces may
+not share a known physical PHY, including a temporary STA used for scanning.
+The rule applies to interface transactions, router provisioning, profile
+activation, autoconnect, startup and runtime reconciliation. Router provisioning
+also checks allocations outside the selected interface pair. Unknown PHYs are
+skipped and checked again during reconciliation when devices appear; this is
+not capability-based support for concurrent AP/STA VIFs.
 
 ## Terminal client
 
@@ -80,3 +90,28 @@ already admitted operations and may need retries. An already admitted confirmati
 can finish after the displayed expiry. `expires_at_unix` is an advisory wall-clock
 display value; scheduling uses a monotonic timer. Clients should inspect pending
 state after expiry or a request timeout, rather than infer a transaction outcome.
+
+## Wi-Fi credential roles
+
+AP and station credentials have separate interface-keyed stores:
+`wifi/psk-ap/<interface>` and `wifi/psk-client/<interface>` under the state
+directory. Supervisors never fall back to the legacy `wifi/psk/<interface>`
+namespace. Updating or clearing one role does not change the other role's secret.
+A protected AP/STA role transition cannot use `Keep`: it needs an explicit
+passphrase or an explicit `passphrase_file`. Selecting a file on a role transition
+clears any older stored credential for the target role so it cannot shadow that
+file. Same-role edits can retain their existing credential.
+
+Interface secret journals (version 3) and router provisioning secret journals
+(version 2) record the credential role. Rollback and crash recovery restore only
+that namespace. Older journals are still recovered into the legacy namespace
+before migration; their role is not guessed from the proposed configuration.
+
+After legacy journal recovery, startup migrates credentials according to the
+committed interface configuration. The role-specific copy is persisted before
+the old file is removed, so an interrupted migration can be repeated. Conflicting
+source and destination values stop migration without overwriting either secret.
+Entries without an unambiguous configured role move to `wifi/psk-unassigned/`,
+which neither supervisor reads. Recovery-blocked interfaces are deferred until
+recovery succeeds. Profile stores and explicitly configured external secret
+files retain their existing paths.

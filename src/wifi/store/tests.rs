@@ -310,3 +310,146 @@ fn resolve_rejects_a_passphrase_file_whose_first_line_fails_wpa_validation() {
     let error = resolve_passphrase(&spec, &store).unwrap_err();
     assert!(matches!(error, ResolvePassphraseError::Passphrase(_)));
 }
+
+#[test]
+fn role_stores_never_resolve_or_clear_another_roles_secret() {
+    let dir = tempdir().unwrap();
+    let ap = PassphraseStore::for_role(dir.path(), WifiCredentialRole::Ap);
+    let client = PassphraseStore::for_role(dir.path(), WifiCredentialRole::Client);
+    let legacy = PassphraseStore::new(dir.path().join("wifi/psk"));
+    legacy.set("wlan0", &passphrase("legacy-password")).unwrap();
+    assert!(ap.get("wlan0").unwrap().is_none());
+    assert!(client.get("wlan0").unwrap().is_none());
+    ap.set("wlan0", &passphrase("ap-password")).unwrap();
+    assert!(client.get("wlan0").unwrap().is_none());
+    client.set("wlan0", &passphrase("client-password")).unwrap();
+    ap.clear("wlan0").unwrap();
+    assert_eq!(
+        client.get("wlan0").unwrap().unwrap().expose(),
+        "client-password"
+    );
+    assert_eq!(
+        legacy.get("wlan0").unwrap().unwrap().expose(),
+        "legacy-password"
+    );
+}
+
+fn migration_config(root: &Path) -> crate::config::AppConfig {
+    let mut config = crate::config::AppConfig::default();
+    config.runtime.state_dir = root.to_owned();
+    config.network.interfaces.insert(
+        "ap".into(),
+        serde_json::from_value(serde_json::json!({
+            "managed": true, "role": "output", "ipv4": "192.168.50.1/24",
+            "wifi": {"ssid": "ap", "channel": 6, "security": "wpa2"}
+        }))
+        .unwrap(),
+    );
+    config.network.interfaces.insert(
+        "client".into(),
+        serde_json::from_value(serde_json::json!({
+            "managed": true, "role": "input", "ipv4": "192.168.60.1/24",
+            "wifi_client": {"ssid": "upstream", "security": "wpa2"}
+        }))
+        .unwrap(),
+    );
+    config
+}
+
+#[tokio::test]
+async fn legacy_migration_uses_committed_role_and_quarantines_unassigned_secrets() {
+    let dir = tempdir().unwrap();
+    let mut config = migration_config(dir.path());
+    let legacy = PassphraseStore::new(dir.path().join("wifi/psk"));
+    for name in ["ap", "client", "orphan"] {
+        legacy
+            .set(name, &passphrase(&format!("{name}-password")))
+            .unwrap();
+    }
+    // Simulate a crash after the durable copy but before legacy unlink.
+    PassphraseStore::for_role(dir.path(), WifiCredentialRole::Ap)
+        .set("ap", &passphrase("ap-password"))
+        .unwrap();
+    migrate_legacy_passphrases(&config).await.unwrap();
+    migrate_legacy_passphrases(&config).await.unwrap();
+    for (name, role) in [
+        ("ap", WifiCredentialRole::Ap),
+        ("client", WifiCredentialRole::Client),
+    ] {
+        assert!(legacy.get(name).unwrap().is_none());
+        assert_eq!(
+            PassphraseStore::for_role(dir.path(), role)
+                .get(name)
+                .unwrap()
+                .unwrap()
+                .expose(),
+            format!("{name}-password")
+        );
+    }
+    assert_eq!(
+        PassphraseStore::new(dir.path().join("wifi/psk-unassigned"))
+            .get("orphan")
+            .unwrap()
+            .unwrap()
+            .expose(),
+        "orphan-password"
+    );
+    config
+        .network
+        .interfaces
+        .insert("orphan".into(), config.network.interfaces["ap"].clone());
+    migrate_legacy_passphrases(&config).await.unwrap();
+    assert!(
+        PassphraseStore::for_role(dir.path(), WifiCredentialRole::Ap)
+            .get("orphan")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        PassphraseStore::for_role(dir.path(), WifiCredentialRole::Client)
+            .get("ap")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn migration_preserves_both_files_on_conflict_and_rejects_symlinks() {
+    let dir = tempdir().unwrap();
+    let config = migration_config(dir.path());
+    let legacy = PassphraseStore::new(dir.path().join("wifi/psk"));
+    let ap = PassphraseStore::for_role(dir.path(), WifiCredentialRole::Ap);
+    legacy.set("ap", &passphrase("old-password")).unwrap();
+    ap.set("ap", &passphrase("new-password")).unwrap();
+    assert!(migrate_legacy_passphrases(&config).await.is_err());
+    assert_eq!(legacy.get("ap").unwrap().unwrap().expose(), "old-password");
+    assert_eq!(ap.get("ap").unwrap().unwrap().expose(), "new-password");
+    ap.clear("ap").unwrap();
+    let outside = dir.path().join("outside");
+    fs::write(&outside, "outside-password").unwrap();
+    symlink(&outside, ap.directory().join("ap")).unwrap();
+    assert!(migrate_legacy_passphrases(&config).await.is_err());
+    assert_eq!(fs::read_to_string(outside).unwrap(), "outside-password");
+    assert!(legacy.get("ap").unwrap().is_some());
+}
+
+#[tokio::test]
+async fn migration_defers_recovery_blocked_interfaces_until_legacy_rollback_finishes() {
+    let dir = tempdir().unwrap();
+    let config = migration_config(dir.path());
+    let legacy = PassphraseStore::new(dir.path().join("wifi/psk"));
+    let ap = PassphraseStore::for_role(dir.path(), WifiCredentialRole::Ap);
+    legacy.set("ap", &passphrase("tentative-password")).unwrap();
+    crate::core::recovery::block_interface(dir.path(), "ap", "pending old journal".into());
+    migrate_legacy_passphrases(&config).await.unwrap();
+    assert!(ap.get("ap").unwrap().is_none());
+    assert_eq!(
+        legacy.get("ap").unwrap().unwrap().expose(),
+        "tentative-password"
+    );
+    legacy.set("ap", &passphrase("restored-password")).unwrap();
+    crate::core::recovery::unblock_interface(dir.path(), "ap");
+    migrate_legacy_passphrases(&config).await.unwrap();
+    assert_eq!(ap.get("ap").unwrap().unwrap().expose(), "restored-password");
+    assert!(legacy.get("ap").unwrap().is_none());
+}

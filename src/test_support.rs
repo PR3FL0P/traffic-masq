@@ -25,6 +25,7 @@ pub(crate) enum FakeProcessCall {
 }
 
 type ResponderFactory<R> = dyn Fn(&str, &Path, &str) -> R + Send + Sync;
+type ProcessHook = dyn Fn(u32) + Send + Sync;
 
 /// Process fake shared by Wi-Fi AP/client supervisor tests. The responder
 /// factory is the only daemon-specific piece: hostapd and wpa_supplicant use
@@ -38,9 +39,12 @@ pub(crate) struct FakeSupervisedProcess<R: Send + 'static> {
     binary_name: &'static str,
     spawn_profile: StdMutex<String>,
     responder_factory: Box<ResponderFactory<R>>,
+    after_terminate: StdMutex<Option<Box<ProcessHook>>>,
+    after_socket_proof: StdMutex<Option<Box<ProcessHook>>>,
     pub(crate) fail_spawn: AtomicBool,
     pub(crate) suppress_spawn_responder: AtomicBool,
     pub(crate) persistent_responder: AtomicBool,
+    ownership_failure_countdown: AtomicU32,
 }
 
 impl<R: Send + 'static> FakeSupervisedProcess<R> {
@@ -59,9 +63,12 @@ impl<R: Send + 'static> FakeSupervisedProcess<R> {
             binary_name,
             spawn_profile: StdMutex::new(spawn_profile.to_string()),
             responder_factory: Box::new(responder_factory),
+            after_terminate: StdMutex::new(None),
+            after_socket_proof: StdMutex::new(None),
             fail_spawn: AtomicBool::new(false),
             suppress_spawn_responder: AtomicBool::new(false),
             persistent_responder: AtomicBool::new(false),
+            ownership_failure_countdown: AtomicU32::new(0),
         })
     }
 
@@ -80,6 +87,22 @@ impl<R: Send + 'static> FakeSupervisedProcess<R> {
 
     pub(crate) fn set_spawn_profile(&self, profile: &str) {
         *self.spawn_profile.lock().unwrap() = profile.to_string();
+    }
+
+    pub(crate) fn set_after_terminate_hook(&self, hook: impl Fn(u32) + Send + Sync + 'static) {
+        *self.after_terminate.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    /// Make the Nth subsequent Unix-socket ownership proof fail once. This is
+    /// used to model pathname replacement between pre- and post-connect proof.
+    pub(crate) fn fail_ownership_after_checks(&self, checks: u32) {
+        assert!(checks > 0);
+        self.ownership_failure_countdown
+            .store(checks, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_after_socket_proof_hook(&self, hook: impl Fn(u32) + Send + Sync + 'static) {
+        *self.after_socket_proof.lock().unwrap() = Some(Box::new(hook));
     }
 
     pub(crate) fn seed(&self, pid: u32, config_path: PathBuf, responder: R) {
@@ -204,12 +227,25 @@ impl<R: Send + 'static> SupervisedProcess for FakeSupervisedProcess<R> {
     }
 
     async fn owns_unix_socket(&self, pid: u32, socket_path: &Path) -> Result<bool, ProcessError> {
-        Ok(self
+        if self
+            .ownership_failure_countdown
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok_and(|remaining| remaining == 1)
+        {
+            return Ok(false);
+        }
+        let owned = self
             .ctrl_sockets
             .lock()
             .unwrap()
             .get(&pid)
-            .is_some_and(|owned| owned == socket_path))
+            .is_some_and(|owned| owned == socket_path);
+        if let Some(hook) = self.after_socket_proof.lock().unwrap().as_ref() {
+            hook(pid);
+        }
+        Ok(owned)
     }
 
     async fn terminate(&self, pid: u32) -> Result<(), ProcessError> {
@@ -221,6 +257,9 @@ impl<R: Send + 'static> SupervisedProcess for FakeSupervisedProcess<R> {
             self.responders.lock().unwrap().remove(&pid);
             self.ctrl_sockets.lock().unwrap().remove(&pid);
             self.configs.lock().unwrap().remove(&pid);
+        }
+        if let Some(hook) = self.after_terminate.lock().unwrap().as_ref() {
+            hook(pid);
         }
         Ok(())
     }
@@ -238,6 +277,7 @@ impl<R: Send + 'static> SupervisedProcess for FakeSupervisedProcess<R> {
 /// and policy reconciliation together.
 #[derive(Debug)]
 pub(crate) struct FakeNetworkProvider {
+    pub(crate) wireless_phys: StdMutex<HashMap<String, String>>,
     pub(crate) interfaces: Mutex<HashMap<String, NetworkInterface>>,
     pub(crate) addresses: Mutex<HashMap<String, Vec<Ipv4AddressInfo>>>,
     pub(crate) routes: Mutex<Vec<Ipv4RouteInfo>>,
@@ -250,6 +290,7 @@ pub(crate) struct FakeNetworkProvider {
 impl Default for FakeNetworkProvider {
     fn default() -> Self {
         Self {
+            wireless_phys: StdMutex::new(HashMap::new()),
             interfaces: Mutex::new(HashMap::new()),
             addresses: Mutex::new(HashMap::new()),
             routes: Mutex::new(Vec::new()),
@@ -302,6 +343,9 @@ impl FakeNetworkProvider {
 
 #[async_trait]
 impl NetworkProvider for FakeNetworkProvider {
+    fn wireless_phy(&self, interface: &str) -> Option<String> {
+        self.wireless_phys.lock().unwrap().get(interface).cloned()
+    }
     async fn list_interfaces(&self) -> Result<Vec<NetworkInterface>> {
         Ok(self.interfaces.lock().await.values().cloned().collect())
     }

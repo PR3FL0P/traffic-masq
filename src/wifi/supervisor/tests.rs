@@ -240,7 +240,7 @@ async fn test_supervisor(
     let inner = Inner {
         hostapd_binary: PathBuf::from("/usr/sbin/hostapd"),
         runtime_dir: runtime_dir.to_path_buf(),
-        passphrase_store: PassphraseStore::new(state_dir.join("wifi/psk")),
+        passphrase_store: PassphraseStore::new(state_dir.join("wifi/psk-ap")),
         records_dir: state_dir.join("wifi"),
         restart_backoff_seconds: 1,
         ctrl_timeout: Duration::from_millis(500),

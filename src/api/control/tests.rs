@@ -2213,9 +2213,8 @@ async fn wifi_enabled_fixture() -> WifiFixture {
     let dhcp = DhcpSupervisor::start(&config)
         .await
         .expect("dhcp supervisor");
-    let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
-        addresses: Vec::new(),
-    });
+    let network = Arc::new(crate::test_support::FakeNetworkProvider::default());
+    network.add_interface("wlan0", 1).await;
     let process = FakeWifiProcess::new();
     let wifi = WifiSupervisor::start_with_process_and_radio(
         &config,
@@ -2408,7 +2407,7 @@ async fn get_wifi_config_reports_unknown_interface_as_none_too() {
 }
 
 #[tokio::test]
-async fn configure_wifi_reconfigures_and_persists_the_new_ssid() {
+async fn configure_wifi_keeps_the_new_ssid_tentative_until_commit() {
     let fixture = wifi_enabled_fixture().await;
     let response = fixture
         .service
@@ -2427,10 +2426,32 @@ async fn configure_wifi_reconfigures_and_persists_the_new_ssid() {
             },
         })
         .await;
-    match response {
-        Response::WifiConfigured { spec } => assert_eq!(spec.ssid, "net-b"),
-        other => panic!("unexpected response: {other:?}"),
-    }
+    let Response::NetworkChangePending { change } = response else {
+        panic!("{response:?}")
+    };
+    assert_eq!(
+        fixture
+            .service
+            .effective_config()
+            .await
+            .unwrap()
+            .network
+            .interfaces["wlan0"]
+            .wifi
+            .as_ref()
+            .unwrap()
+            .ssid,
+        "net-a"
+    );
+    assert!(matches!(
+        fixture
+            .service
+            .dispatch(Request::CommitNetworkChange {
+                token: change.token
+            })
+            .await,
+        Response::NetworkChangeCommitted { .. }
+    ));
 
     match fixture
         .service
@@ -2703,7 +2724,7 @@ async fn configure_wifi_wpa2_to_open_clears_the_stored_passphrase() {
     let mut config = wifi_base_config(directory.path());
     config.network.interfaces.get_mut("wlan0").unwrap().wifi =
         Some(wifi_ap_config("net-a", WifiSecurity::Wpa2));
-    let store = crate::wifi::PassphraseStore::new(directory.path().join("wifi/psk"));
+    let store = crate::wifi::PassphraseStore::new(directory.path().join("wifi/psk-ap"));
     store
         .set(
             "wlan0",
@@ -2716,9 +2737,8 @@ async fn configure_wifi_wpa2_to_open_clears_the_stored_passphrase() {
     let dhcp = DhcpSupervisor::start(&config)
         .await
         .expect("dhcp supervisor");
-    let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
-        addresses: Vec::new(),
-    });
+    let network = Arc::new(crate::test_support::FakeNetworkProvider::default());
+    network.add_interface("wlan0", 1).await;
     let wifi = WifiSupervisor::start_with_process_and_radio(
         &config,
         FakeWifiProcess::new(),
@@ -2746,7 +2766,7 @@ async fn configure_wifi_wpa2_to_open_clears_the_stored_passphrase() {
         })
         .await;
     assert!(
-        matches!(response, Response::WifiConfigured { .. }),
+        matches!(response, Response::NetworkChangePending { .. }),
         "{response:?}"
     );
     assert!(store.get("wlan0").unwrap().is_none());
@@ -2755,7 +2775,7 @@ async fn configure_wifi_wpa2_to_open_clears_the_stored_passphrase() {
 #[tokio::test]
 async fn disable_wifi_clears_stale_secret_and_open_recreate_stays_clean() {
     let fixture = wifi_enabled_fixture().await;
-    let store = crate::wifi::PassphraseStore::new(fixture._directory.path().join("wifi/psk"));
+    let store = crate::wifi::PassphraseStore::new(fixture._directory.path().join("wifi/psk-ap"));
     store
         .set(
             "wlan0",
@@ -2793,7 +2813,7 @@ async fn disable_wifi_clears_stale_secret_and_open_recreate_stays_clean() {
         })
         .await;
     assert!(
-        matches!(recreated, Response::WifiConfigured { .. }),
+        matches!(recreated, Response::NetworkChangePending { .. }),
         "{recreated:?}"
     );
     assert!(store.get("wlan0").unwrap().is_none());
@@ -2878,7 +2898,7 @@ async fn wifi_set_passphrase_applies_live_via_reload() {
     .await
     .expect("wifi supervisor");
 
-    let passphrase_store = crate::wifi::PassphraseStore::new(directory.path().join("wifi/psk"));
+    let passphrase_store = crate::wifi::PassphraseStore::new(directory.path().join("wifi/psk-ap"));
     passphrase_store
         .set(
             "wlan0",
@@ -2948,7 +2968,7 @@ async fn wifi_configured_response_never_serializes_the_passphrase_that_was_just_
     });
     let process = FakeWifiProcess::new();
 
-    let passphrase_store = crate::wifi::PassphraseStore::new(directory.path().join("wifi/psk"));
+    let passphrase_store = crate::wifi::PassphraseStore::new(directory.path().join("wifi/psk-ap"));
     passphrase_store
         .set(
             "wlan0",
@@ -3494,10 +3514,7 @@ async fn saved_wifi_client_profile_crud_activation_and_active_delete_guard() {
 
     let activated = fixture
         .service
-        .dispatch(Request::ActivateWifiClientProfile {
-            interface: "wlan1".to_string(),
-            profile_id: "office".to_string(),
-        })
+        .activate_wifi_client_profile_internal("wlan1".to_string(), "office".to_string())
         .await;
     let Response::WifiClientProfileActivated { status, .. } = activated else {
         panic!("expected activation response, got {activated:?}");
@@ -3574,10 +3591,7 @@ async fn wifi_client_deactivate_preserves_managed_and_allows_subsequent_reactiva
 
     let activated = fixture
         .service
-        .dispatch(Request::ActivateWifiClientProfile {
-            interface: "wlan1".to_string(),
-            profile_id: "home".to_string(),
-        })
+        .activate_wifi_client_profile_internal("wlan1".to_string(), "home".to_string())
         .await;
     assert!(matches!(
         activated,
@@ -3694,7 +3708,10 @@ async fn autoconnect_does_not_launch_a_scan_during_secret_recovery() {
         &fixture.service.config.runtime.state_dir,
     );
     secrets
-        .stage(std::collections::BTreeMap::from([("wlan1".into(), None)]))
+        .stage(std::collections::BTreeMap::from([(
+            "wlan1".into(),
+            (crate::wifi::store::WifiCredentialRole::Client, None),
+        )]))
         .await
         .unwrap();
 
@@ -3795,10 +3812,7 @@ async fn autoconnect_timeout_clears_stalled_profile_without_deadlock() {
 
     let activated = fixture
         .service
-        .dispatch(Request::ActivateWifiClientProfile {
-            interface: "wlan1".to_string(),
-            profile_id: "saved".to_string(),
-        })
+        .activate_wifi_client_profile_internal("wlan1".to_string(), "saved".to_string())
         .await;
     assert!(matches!(
         activated,
@@ -3859,7 +3873,7 @@ async fn wifi_client_status_reports_the_live_association() {
 }
 
 #[tokio::test]
-async fn configure_wifi_client_applies_and_persists_the_new_network() {
+async fn configure_wifi_client_keeps_the_new_network_tentative_until_commit() {
     let fixture = wifi_client_enabled_fixture().await;
     let response = fixture
         .service
@@ -3872,10 +3886,32 @@ async fn configure_wifi_client_applies_and_persists_the_new_network() {
             },
         })
         .await;
-    let Response::WifiClientConfigured { spec } = response else {
-        panic!("expected a configured response, got {response:?}");
+    let Response::NetworkChangePending { change } = response else {
+        panic!("{response:?}")
     };
-    assert_eq!(spec.ssid, "somewhere-else");
+    assert_eq!(
+        fixture
+            .service
+            .effective_config()
+            .await
+            .unwrap()
+            .network
+            .interfaces["wlan1"]
+            .wifi_client
+            .as_ref()
+            .unwrap()
+            .ssid,
+        "upstream"
+    );
+    assert!(matches!(
+        fixture
+            .service
+            .dispatch(Request::CommitNetworkChange {
+                token: change.token
+            })
+            .await,
+        Response::NetworkChangeCommitted { .. }
+    ));
 
     let Response::WifiClientConfig { spec, .. } = fixture
         .service
@@ -4563,10 +4599,7 @@ async fn disabling_wifi_client_also_cleans_up_and_disables_active_dhcp_client() 
     assert!(matches!(created, Response::WifiClientProfile { .. }));
 
     let activated = service
-        .dispatch(Request::ActivateWifiClientProfile {
-            interface: "wlan1".to_string(),
-            profile_id: "reactivate".to_string(),
-        })
+        .activate_wifi_client_profile_internal("wlan1".to_string(), "reactivate".to_string())
         .await;
     assert!(matches!(
         activated,
@@ -6217,7 +6250,7 @@ async fn configure_client_open_erases_obsolete_stored_credentials() {
         })
         .await;
     assert!(
-        matches!(response, Response::WifiClientConfigured { .. }),
+        matches!(response, Response::NetworkChangePending { .. }),
         "{response:?}"
     );
     assert!(wifi.stored_passphrase("wlan1").await.unwrap().is_none());
@@ -6525,4 +6558,315 @@ async fn settings_writes_wait_for_network_execution_and_observe_commit_fence() {
         );
         assert_eq!(fixture.overrides.committed_revision().await, revision);
     }
+}
+
+async fn shared_phy_wifi_service() -> (ControlService, tempfile::TempDir) {
+    let directory = tempdir().unwrap();
+    let mut config = wifi_client_base_config(directory.path());
+    let ap_config = wifi_base_config(directory.path());
+    config.wifi = ap_config.wifi;
+    config.wifi.hostapd_binary = PathBuf::from("/bin/true");
+    config.wifi_client.wpa_supplicant_binary = PathBuf::from("/bin/true");
+    config.network.interfaces.insert(
+        "wlan0".into(),
+        ap_config.network.interfaces["wlan0"].clone(),
+    );
+    let network = Arc::new(crate::test_support::FakeNetworkProvider::default());
+    for (name, index) in [("wlan0", 1), ("wlan1", 2)] {
+        network.add_interface(name, index).await;
+        network
+            .interfaces
+            .lock()
+            .await
+            .get_mut(name)
+            .unwrap()
+            .is_wireless = true;
+        network
+            .wireless_phys
+            .lock()
+            .unwrap()
+            .insert(name.into(), "shared-radio".into());
+    }
+    let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+        .await
+        .unwrap();
+    let dhcp = DhcpSupervisor::start(&config).await.unwrap();
+    let wifi = WifiSupervisor::start_with_process_and_radio(
+        &config,
+        FakeWifiProcess::new(),
+        Arc::new(crate::wifi::radio::AllowAllRadioValidator),
+    )
+    .await
+    .unwrap();
+    let client = ClientSupervisor::start_with_process(&config, FakeSupplicantProcess::new())
+        .await
+        .unwrap();
+    let service = ControlService::new(config, network, dhcp, overrides)
+        .with_wifi_supervisor(wifi)
+        .with_wifi_client_supervisor(client);
+    let response = service
+        .dispatch(Request::CreateWifiClientProfile {
+            profile: WifiClientProfileWriteRequest {
+                id: "radio-test".into(),
+                ssid: "upstream".into(),
+                country_code: Some("PL".into()),
+                security: WifiClientSecurity::Open,
+                priority: 0,
+                autoconnect: true,
+                passphrase: None,
+                clear_passphrase: false,
+            },
+        })
+        .await;
+    assert!(
+        matches!(response, Response::WifiClientProfile { .. }),
+        "{response:?}"
+    );
+    (service, directory)
+}
+
+#[tokio::test]
+async fn every_wifi_admission_path_rejects_mixed_roles_on_one_phy_before_mutation() {
+    let (service, _directory) = shared_phy_wifi_service().await;
+    let ap = WifiEditRequest {
+        ssid: "changed-ap".into(),
+        country_code: Some("PL".into()),
+        band: WifiBand::Ghz2,
+        channel: 6,
+        channel_width: WifiChannelWidth::Ht20,
+        security: WifiSecurity::Open,
+        hidden: false,
+        client_isolation: false,
+        max_stations: 32,
+    };
+    for request in [
+        Request::ConfigureWifi {
+            interface: "wlan0".into(),
+            settings: ap.clone(),
+        },
+        Request::ProvisionWifiAccessPoint {
+            interface: "wlan0".into(),
+            settings: ap,
+            passphrase: None,
+            clear_passphrase: true,
+            configure_dhcp: false,
+            subnet: None,
+            disable_dhcp: false,
+        },
+        Request::ConfigureWifiClient {
+            interface: "wlan1".into(),
+            settings: WifiClientEditRequest {
+                ssid: "changed-sta".into(),
+                country_code: Some("PL".into()),
+                security: WifiClientSecurity::Open,
+            },
+        },
+        Request::ProvisionWifiClient {
+            interface: "wlan1".into(),
+            settings: crate::api::model::ProvisionWifiClientRequest {
+                profile_id: "radio-test".into(),
+                ip_policy: crate::api::model::WifiClientIpPolicy::Preserve,
+            },
+        },
+        Request::ActivateWifiClientProfile {
+            interface: "wlan1".into(),
+            profile_id: "radio-test".into(),
+        },
+        Request::WifiClientScan {
+            interface: "wlan1".into(),
+        },
+    ] {
+        let response = service.dispatch(request).await;
+        assert!(
+            serde_json::to_string(&response)
+                .unwrap()
+                .contains("shared-radio"),
+            "{response:?}"
+        );
+        assert!(service.transactions.pending().await.is_empty());
+        assert!(service.overrides.snapshot().await.interfaces.is_empty());
+    }
+    let response = service
+        .activate_wifi_client_profile_internal("wlan1".into(), "radio-test".into())
+        .await;
+    assert!(
+        serde_json::to_string(&response)
+            .unwrap()
+            .contains("shared-radio"),
+        "{response:?}"
+    );
+    service.autoconnect_wifi_once().await.unwrap();
+    assert!(service.overrides.snapshot().await.interfaces.is_empty());
+    assert!(service
+        .wifi
+        .as_ref()
+        .unwrap()
+        .status("wlan0")
+        .await
+        .is_none());
+    assert!(service
+        .wifi_client
+        .as_ref()
+        .unwrap()
+        .status("wlan1")
+        .await
+        .is_none());
+}
+
+#[tokio::test]
+async fn operator_profile_activation_is_tentative_and_rollback_restores_committed_config() {
+    let fixture = wifi_client_enabled_fixture().await;
+    let original = fixture
+        .service
+        .effective_config()
+        .await
+        .unwrap()
+        .network
+        .interfaces["wlan1"]
+        .clone();
+    fixture
+        .service
+        .dispatch(Request::CreateWifiClientProfile {
+            profile: WifiClientProfileWriteRequest {
+                id: "tentative".into(),
+                ssid: "tentative-network".into(),
+                country_code: Some("PL".into()),
+                security: WifiClientSecurity::Open,
+                priority: 0,
+                autoconnect: false,
+                passphrase: None,
+                clear_passphrase: false,
+            },
+        })
+        .await;
+    let response = fixture
+        .service
+        .dispatch(Request::ActivateWifiClientProfile {
+            interface: "wlan1".into(),
+            profile_id: "tentative".into(),
+        })
+        .await;
+    let Response::NetworkChangePending { change } = response else {
+        panic!("{response:?}")
+    };
+    assert_eq!(
+        fixture
+            .service
+            .effective_config()
+            .await
+            .unwrap()
+            .network
+            .interfaces["wlan1"],
+        original
+    );
+    assert!(fixture
+        .service
+        .overrides
+        .snapshot()
+        .await
+        .interfaces
+        .is_empty());
+    let response = fixture
+        .service
+        .dispatch(Request::RollbackNetworkChange {
+            token: change.token,
+        })
+        .await;
+    assert!(
+        matches!(response, Response::NetworkChangeRolledBack { .. }),
+        "{response:?}"
+    );
+    assert_eq!(
+        fixture
+            .service
+            .effective_config()
+            .await
+            .unwrap()
+            .network
+            .interfaces["wlan1"],
+        original
+    );
+    assert!(fixture.service.transactions.pending().await.is_empty());
+}
+
+#[tokio::test]
+async fn client_configuration_converges_before_reply_and_rollback_restores_runtime_without_deadlock(
+) {
+    let fixture = wifi_client_enabled_fixture().await;
+    let desired = DesiredNetworkState::new(
+        fixture.service.base_config.clone(),
+        fixture.service.overrides.clone(),
+    );
+    desired.attach_converger();
+    let service = fixture.service.with_desired_state(desired.clone());
+    let runtime = service.wifi_client.as_ref().unwrap().clone();
+    let gate = service.network_mutations.clone();
+    let worker_desired = desired.clone();
+    let worker_runtime = runtime.clone();
+    let worker = tokio::spawn(async move {
+        loop {
+            let version = worker_desired.version();
+            {
+                // Same gate as the daemon's convergence pass: dispatch must
+                // release exclusive execution while retaining API admission.
+                let _execution = gate.read().await;
+                let config = worker_desired.effective().await.unwrap();
+                let spec = WifiClientSpec::from_interface_config(
+                    "wlan1",
+                    &config.network.interfaces["wlan1"],
+                )
+                .unwrap()
+                .unwrap();
+                let result = worker_runtime
+                    .configure(spec)
+                    .await
+                    .map_err(anyhow::Error::from);
+                worker_desired.report_result(version, result.map(|_| BTreeMap::new()));
+            }
+            worker_desired.changed().await;
+        }
+    });
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        service.dispatch(Request::ConfigureWifiClient {
+            interface: "wlan1".into(),
+            settings: WifiClientEditRequest {
+                ssid: "tentative-runtime".into(),
+                country_code: Some("PL".into()),
+                security: WifiClientSecurity::Open,
+            },
+        }),
+    )
+    .await
+    .expect("dispatch must not hold convergence's execution lock");
+    let Response::NetworkChangePending { change } = response else {
+        worker.abort();
+        panic!("{response:?}")
+    };
+    assert_eq!(
+        runtime.status("wlan1").await.unwrap().spec.ssid,
+        "tentative-runtime"
+    );
+    assert_eq!(
+        service.effective_config().await.unwrap().network.interfaces["wlan1"]
+            .wifi_client
+            .as_ref()
+            .unwrap()
+            .ssid,
+        "upstream"
+    );
+    let rollback = tokio::time::timeout(
+        Duration::from_secs(5),
+        service.dispatch(Request::RollbackNetworkChange {
+            token: change.token,
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(rollback, Response::NetworkChangeRolledBack { .. }),
+        "{rollback:?}"
+    );
+    assert_eq!(runtime.status("wlan1").await.unwrap().spec.ssid, "upstream");
+    worker.abort();
 }

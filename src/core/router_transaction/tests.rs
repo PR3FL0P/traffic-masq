@@ -215,7 +215,7 @@ impl RouterSubsystems for FakeSubsystems {
     }
     async fn rollback_interfaces(&self, _: &[InterfaceSnapshot]) -> Result<()> {
         if let Some(root) = self.rollback_secret.lock().unwrap().as_ref() {
-            let store = crate::wifi::store::PassphraseStore::new(root.join("wifi/psk"));
+            let store = crate::wifi::store::PassphraseStore::new(root.join("wifi/psk-ap"));
             anyhow::ensure!(
                 store
                     .get("wlan0")?
@@ -841,11 +841,14 @@ async fn stage_test_secret(
     secrets
         .stage(std::collections::BTreeMap::from([(
             "wlan0".into(),
-            Some(WifiPassphrase::new("old-password").unwrap()),
+            (
+                crate::wifi::store::WifiCredentialRole::Ap,
+                Some(WifiPassphrase::new("old-password").unwrap()),
+            ),
         )]))
         .await
         .unwrap();
-    PassphraseStore::new(directory.join("wifi/psk"))
+    PassphraseStore::new(directory.join("wifi/psk-ap"))
         .set("wlan0", &WifiPassphrase::new("new-password").unwrap())
         .unwrap();
     secrets
@@ -932,7 +935,7 @@ async fn provisioning_secret_restore_failure_blocks_commit_and_can_be_retried() 
         .unwrap();
     let token = coordinator.apply(plan).await.unwrap();
     secrets.bind_token(&token).await.unwrap();
-    let secret_path = directory.path().join("wifi/psk/wlan0");
+    let secret_path = directory.path().join("wifi/psk-ap/wlan0");
     std::fs::remove_file(&secret_path).unwrap();
     std::fs::create_dir(&secret_path).unwrap();
 

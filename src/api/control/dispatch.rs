@@ -656,7 +656,10 @@ fn is_network_mutation(request: &Request) -> bool {
 fn is_converged_network_transaction_request(request: &Request) -> bool {
     matches!(
         request,
-        Request::ProvisionWifiClient { .. }
+        Request::ConfigureWifi { .. }
+            | Request::ConfigureWifiClient { .. }
+            | Request::ActivateWifiClientProfile { .. }
+            | Request::ProvisionWifiClient { .. }
             | Request::ProvisionWifiAccessPoint { .. }
             | Request::ActivateWifiApProfile { .. }
             | Request::ApplyInterface { .. }

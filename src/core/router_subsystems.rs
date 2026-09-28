@@ -934,6 +934,14 @@ where
     }
 
     async fn plan_interfaces(&self, desired: &RouterDesired) -> Result<Vec<InterfaceChangePlan>> {
+        let network = crate::config::NetworkConfig {
+            interfaces: desired
+                .interfaces
+                .iter()
+                .map(|entry| (entry.name.clone(), entry.config.clone()))
+                .collect(),
+        };
+        self.interfaces.validate_wifi_radio_policy(&network)?;
         let mut plans = Vec::with_capacity(desired.interfaces.len());
         for entry in &desired.interfaces {
             let plan = self

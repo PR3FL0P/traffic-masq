@@ -4,7 +4,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-use crate::wifi::ctrl_transport::{self, CtrlSocket, EventClient};
+use crate::wifi::ctrl_transport::{self, CtrlSocket, EventClient, EventConnection};
 
 pub use crate::wifi::ctrl_transport::{CtrlError, MacAddr, MacAddrParseError};
 
@@ -324,16 +324,45 @@ fn whitespace_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
         .find_map(|token| token.strip_prefix(key)?.strip_prefix('='))
 }
 
+pub(crate) struct WpaSupplicantEventConnection(
+    EventConnection<WpaSupplicantEvent, fn(&str) -> WpaSupplicantEvent>,
+);
+
+impl WpaSupplicantEventConnection {
+    pub(crate) async fn attach(
+        self,
+    ) -> Result<
+        (
+            WpaSupplicantEventClient,
+            broadcast::Receiver<WpaSupplicantEvent>,
+        ),
+        CtrlError,
+    > {
+        let (inner, receiver) = self.0.attach().await?;
+        Ok((WpaSupplicantEventClient(inner), receiver))
+    }
+}
+
 pub struct WpaSupplicantEventClient(EventClient<WpaSupplicantEvent>);
 
 impl WpaSupplicantEventClient {
+    /// Connect without sending ATTACH. Supervisors can prove ownership of the
+    /// connected endpoint before any control command is sent.
+    pub(crate) async fn connect(
+        ctrl_path: &Path,
+        timeout: Duration,
+    ) -> Result<WpaSupplicantEventConnection, CtrlError> {
+        let parse: fn(&str) -> WpaSupplicantEvent = WpaSupplicantEvent::parse;
+        Ok(WpaSupplicantEventConnection(
+            EventClient::connect(ctrl_path, timeout, parse).await?,
+        ))
+    }
+
     pub async fn attach(
         ctrl_path: &Path,
         timeout: Duration,
     ) -> Result<(Self, broadcast::Receiver<WpaSupplicantEvent>), CtrlError> {
-        let (inner, receiver) =
-            EventClient::attach(ctrl_path, timeout, WpaSupplicantEvent::parse).await?;
-        Ok((Self(inner), receiver))
+        Self::connect(ctrl_path, timeout).await?.attach().await
     }
 
     pub async fn close(self) {

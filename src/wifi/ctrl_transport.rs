@@ -204,6 +204,42 @@ pub(crate) fn strip_priority_prefix(line: &str) -> &str {
     }
 }
 
+pub(crate) struct EventConnection<E, F> {
+    socket: UnixDatagram,
+    timeout: Duration,
+    parse: F,
+    _event: std::marker::PhantomData<E>,
+}
+
+impl<E, F> EventConnection<E, F>
+where
+    F: Fn(&str) -> E + Send + 'static,
+    E: Clone + Send + 'static,
+{
+    /// Finish event subscription on an already-connected control socket.
+    /// Splitting connect from ATTACH lets supervisors prove ownership after
+    /// connect and before sending any command to the endpoint.
+    pub(crate) async fn attach(
+        self,
+    ) -> Result<(EventClient<E>, broadcast::Receiver<E>), CtrlError> {
+        let reply = control_request(&self.socket, self.timeout, "ATTACH").await?;
+        expect_ok("ATTACH", &reply)?;
+
+        let (sender, receiver) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let task = tokio::spawn(event_loop(self.socket, sender, cancel_rx, self.parse));
+
+        Ok((
+            EventClient {
+                cancel: Some(cancel_tx),
+                task: Some(task),
+                _event: std::marker::PhantomData,
+            },
+            receiver,
+        ))
+    }
+}
+
 pub(crate) struct EventClient<E> {
     cancel: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
@@ -211,6 +247,23 @@ pub(crate) struct EventClient<E> {
 }
 
 impl<E> EventClient<E> {
+    pub(crate) async fn connect<F>(
+        ctrl_path: &Path,
+        timeout: Duration,
+        parse: F,
+    ) -> Result<EventConnection<E, F>, CtrlError>
+    where
+        F: Fn(&str) -> E + Send + 'static,
+        E: Clone + Send + 'static,
+    {
+        Ok(EventConnection {
+            socket: bind_and_connect(ctrl_path)?,
+            timeout,
+            parse,
+            _event: std::marker::PhantomData,
+        })
+    }
+
     pub(crate) async fn attach<F>(
         ctrl_path: &Path,
         timeout: Duration,
@@ -220,22 +273,10 @@ impl<E> EventClient<E> {
         F: Fn(&str) -> E + Send + 'static,
         E: Clone + Send + 'static,
     {
-        let socket = bind_and_connect(ctrl_path)?;
-        let reply = control_request(&socket, timeout, "ATTACH").await?;
-        expect_ok("ATTACH", &reply)?;
-
-        let (sender, receiver) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        let (cancel_tx, cancel_rx) = oneshot::channel();
-        let task = tokio::spawn(event_loop(socket, sender, cancel_rx, parse));
-
-        Ok((
-            Self {
-                cancel: Some(cancel_tx),
-                task: Some(task),
-                _event: std::marker::PhantomData,
-            },
-            receiver,
-        ))
+        Self::connect(ctrl_path, timeout, parse)
+            .await?
+            .attach()
+            .await
     }
 
     pub(crate) async fn close(mut self) {

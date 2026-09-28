@@ -140,6 +140,15 @@ impl ControlService {
             if !config.managed || config.role != InterfaceRole::Input {
                 continue;
             }
+            if crate::wifi::policy::WifiRadioPolicy::validate_scan(
+                &effective.network,
+                name,
+                |name| self.network.wireless_phy(name),
+            )
+            .is_err()
+            {
+                continue;
+            }
             let now = Instant::now();
             if let Some(status) = wifi.status(name).await {
                 if status.wpa_state == WpaState::Completed {
@@ -228,7 +237,7 @@ impl ControlService {
             }
 
             match self
-                .activate_wifi_client_profile_locked(name.clone(), id.clone())
+                .activate_wifi_client_profile_internal(name.clone(), id.clone())
                 .await
             {
                 Response::WifiClientProfileActivated { .. } => {

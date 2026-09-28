@@ -184,18 +184,25 @@ pub fn derive_router_provisioning(
     let uplink_observation = require_interface(&desired.uplink.interface, context)?;
     let output_observation = require_interface(&desired.output.interface, context)?;
 
-    if let (Some(uplink_phy), Some(output_phy)) = (
-        uplink_observation.wireless_phy.as_deref(),
-        output_observation.wireless_phy.as_deref(),
-    ) {
-        if uplink_phy == output_phy {
-            return Err(RouterProvisioningError::RadioReused {
-                phy: uplink_phy.to_owned(),
-                uplink: desired.uplink.interface.clone(),
-                output: desired.output.interface.clone(),
-            });
-        }
-    }
+    crate::wifi::policy::WifiRadioPolicy::validate_roles(
+        [
+            (
+                desired.uplink.interface.as_str(),
+                crate::wifi::policy::WifiRadioRole::Client,
+            ),
+            (
+                desired.output.interface.as_str(),
+                crate::wifi::policy::WifiRadioRole::Ap,
+            ),
+        ],
+        |name| {
+            context
+                .interfaces
+                .get(name)
+                .and_then(|interface| interface.wireless_phy.clone())
+        },
+    )
+    .map_err(radio_conflict)?;
 
     for (name, observation) in [
         (&desired.uplink.interface, uplink_observation),
@@ -350,6 +357,14 @@ pub fn derive_router_provisioning(
         .interfaces
         .insert(desired.output.interface.clone(), output_interface.clone());
     effective_config.router = router.clone();
+    crate::wifi::policy::WifiRadioPolicy::validate(&effective_config.network, |name| {
+        context
+            .interfaces
+            .get(name)
+            .and_then(|interface| interface.wireless_phy.clone())
+    })
+    .map_err(radio_conflict)?;
+
     effective_config
         .validate()
         .map_err(|error| RouterProvisioningError::InvalidEffectiveConfig(error.to_string()))?;
@@ -364,6 +379,14 @@ pub fn derive_router_provisioning(
         uplink_name: desired.uplink.interface.clone(),
         output_name: desired.output.interface.clone(),
     })
+}
+
+fn radio_conflict(error: crate::wifi::policy::WifiRadioConflict) -> RouterProvisioningError {
+    RouterProvisioningError::RadioReused {
+        phy: error.phy,
+        uplink: error.client_interface,
+        output: error.ap_interface,
+    }
 }
 
 fn require_interface<'a>(

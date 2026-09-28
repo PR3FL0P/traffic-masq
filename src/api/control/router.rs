@@ -455,7 +455,10 @@ impl ControlService {
         if let Some(supervisor) = output_supervisor {
             match supervisor.stored_passphrase(&output_interface).await {
                 Ok(secret) => {
-                    previous.insert(output_interface.clone(), secret);
+                    previous.insert(
+                        output_interface.clone(),
+                        (crate::wifi::store::WifiCredentialRole::Ap, secret),
+                    );
                 }
                 Err(error) => {
                     return provisioning_error(RouterProvisioningErrorDetail::Other {
@@ -467,7 +470,10 @@ impl ControlService {
         if let Some(supervisor) = uplink_supervisor {
             match supervisor.stored_passphrase(&uplink_interface).await {
                 Ok(secret) => {
-                    previous.insert(uplink_interface.clone(), secret);
+                    previous.insert(
+                        uplink_interface.clone(),
+                        (crate::wifi::store::WifiCredentialRole::Client, secret),
+                    );
                 }
                 Err(error) => {
                     return provisioning_error(RouterProvisioningErrorDetail::Other {
@@ -764,7 +770,7 @@ impl ControlService {
                         .get(&interface.name)
                         .map(|config| config.role),
                     wireless_phy: if interface.is_wireless {
-                        crate::netlink::wireless_phy(&interface.name)
+                        self.network.wireless_phy(&interface.name)
                     } else {
                         None
                     },

@@ -220,6 +220,16 @@ impl DesiredNetworkState {
         self.overrides.snapshot().await
     }
 
+    pub(crate) async fn committed_config(&self) -> Result<AppConfig> {
+        let mut config = self
+            .overrides
+            .snapshot()
+            .await
+            .effective_config(&self.base)?;
+        config.runtime.state_dir = self.state_dir().to_path_buf();
+        Ok(config)
+    }
+
     /// Merge base configuration, committed overrides, and tentative interface changes.
     /// Tentative entries take precedence; invalid committed configuration is an error.
     pub async fn effective(&self) -> Result<AppConfig> {

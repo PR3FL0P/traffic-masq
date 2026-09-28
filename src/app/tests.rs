@@ -1820,3 +1820,60 @@ fn explicit_router_recovery_states_may_keep_control_plane_available() {
         false,
     ));
 }
+
+#[tokio::test]
+async fn hotplug_phy_conflict_blocks_reconciliation_before_interface_mutation() {
+    let mut config = hotplug_reconcile_config();
+    config.network.interfaces.get_mut("lan0").unwrap().wifi = Some(
+        serde_json::from_value(serde_json::json!({
+            "ssid": "ap", "channel": 6, "security": "open"
+        }))
+        .unwrap(),
+    );
+    let mut client = config.network.interfaces["lan0"].clone();
+    client.role = InterfaceRole::Input;
+    client.wifi = None;
+    client.wifi_client = Some(crate::config::WifiClientConfig {
+        ssid: "sta".into(),
+        country_code: None,
+        security: crate::config::WifiClientSecurity::Open,
+        passphrase_file: None,
+    });
+    client.dhcp = None;
+    client.ipv4 = Some("192.168.78.1/24".parse().unwrap());
+    config.network.interfaces.insert("wan0".into(), client);
+    let directory = tempdir().unwrap();
+    let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+        .await
+        .unwrap();
+    let network = Arc::new(FakeNetworkProvider::default());
+    network
+        .add_interface_with_state("lan0", 7, false, Vec::new())
+        .await;
+    network
+        .add_interface_with_state("wan0", 8, false, Vec::new())
+        .await;
+    {
+        let mut phys = network.wireless_phys.lock().unwrap();
+        phys.insert("lan0".into(), "hotplug-radio".into());
+        phys.insert("wan0".into(), "hotplug-radio".into());
+    }
+    let error = reconcile_network_runtime_once(
+        &DesiredNetworkState::new(config, overrides),
+        &AddressOwnershipJournal::in_memory(),
+        network.clone(),
+        &FakeDhcpReconciler::default(),
+        None::<&FakeWifiReconciler>,
+        None::<&FakeWifiReconciler>,
+        None::<&FakeDhcpClientReconciler>,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("hotplug-radio"));
+    assert!(network
+        .list_interfaces()
+        .await
+        .unwrap()
+        .iter()
+        .all(|interface| !interface.is_up));
+}

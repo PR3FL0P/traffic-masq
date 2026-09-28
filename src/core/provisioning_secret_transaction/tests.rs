@@ -4,12 +4,15 @@ use super::*;
 async fn uncommitted_journal_restores_prior_secret() {
     let temp = tempfile::tempdir().expect("tempdir");
     let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
-    let passphrases = PassphraseStore::new(temp.path().join("wifi/psk"));
+    let passphrases = PassphraseStore::new(temp.path().join("wifi/psk-ap"));
     let old = WifiPassphrase::new("old-password").expect("old");
     let new = WifiPassphrase::new("new-password").expect("new");
     passphrases.set("wlan0", &old).expect("old write");
     store
-        .stage(BTreeMap::from([("wlan0".to_owned(), Some(old))]))
+        .stage(BTreeMap::from([(
+            "wlan0".to_owned(),
+            (WifiCredentialRole::Ap, Some(old)),
+        )]))
         .await
         .expect("stage");
     passphrases.set("wlan0", &new).expect("new write");
@@ -33,11 +36,14 @@ async fn uncommitted_journal_restores_prior_secret() {
 async fn committed_journal_keeps_new_secret() {
     let temp = tempfile::tempdir().expect("tempdir");
     let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
-    let passphrases = PassphraseStore::new(temp.path().join("wifi/psk"));
+    let passphrases = PassphraseStore::new(temp.path().join("wifi/psk-ap"));
     let old = WifiPassphrase::new("old-password").expect("old");
     let new = WifiPassphrase::new("new-password").expect("new");
     store
-        .stage(BTreeMap::from([("wlan0".to_owned(), Some(old))]))
+        .stage(BTreeMap::from([(
+            "wlan0".to_owned(),
+            (WifiCredentialRole::Ap, Some(old)),
+        )]))
         .await
         .expect("stage");
     passphrases.set("wlan0", &new).expect("new write");
@@ -58,11 +64,14 @@ async fn committed_journal_keeps_new_secret() {
 async fn reconvergence_restore_keeps_journal_until_explicit_completion() {
     let temp = tempfile::tempdir().expect("tempdir");
     let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
-    let passphrases = PassphraseStore::new(temp.path().join("wifi/psk"));
+    let passphrases = PassphraseStore::new(temp.path().join("wifi/psk-ap"));
     let old = WifiPassphrase::new("old-password").expect("old");
     let new = WifiPassphrase::new("new-password").expect("new");
     store
-        .stage(BTreeMap::from([("wlan0".to_owned(), Some(old))]))
+        .stage(BTreeMap::from([(
+            "wlan0".to_owned(),
+            (WifiCredentialRole::Ap, Some(old)),
+        )]))
         .await
         .expect("stage");
     passphrases.set("wlan0", &new).expect("new write");
@@ -98,7 +107,7 @@ async fn reconvergence_restore_keeps_journal_until_explicit_completion() {
 async fn committed_unknown_schema_is_retired_before_full_decode() {
     let temp = tempfile::tempdir().expect("tempdir");
     let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
-    let passphrases = PassphraseStore::new(temp.path().join("wifi/psk"));
+    let passphrases = PassphraseStore::new(temp.path().join("wifi/psk-ap"));
     let current = WifiPassphrase::new("current-password").expect("current");
     passphrases.set("wlan0", &current).expect("current write");
     tokio::fs::create_dir_all(temp.path().join("wifi"))
@@ -200,4 +209,89 @@ async fn malformed_json_never_infers_commit_from_token_text() {
     assert!(diagnostic.contains("do_not_edit_journal=true"));
     assert!(diagnostic.contains("operator_action=restore_coherent_backup"));
     assert!(journal.exists());
+}
+
+#[tokio::test]
+async fn router_secret_recovery_restores_each_role_without_touching_the_other() {
+    let temp = tempfile::tempdir().unwrap();
+    let journal = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
+    let ap = PassphraseStore::for_role(temp.path(), WifiCredentialRole::Ap);
+    let client = PassphraseStore::for_role(temp.path(), WifiCredentialRole::Client);
+    ap.set("wlan0", &WifiPassphrase::new("ap-new-password").unwrap())
+        .unwrap();
+    client
+        .set("wlan0", &WifiPassphrase::new("client-preserved").unwrap())
+        .unwrap();
+    client
+        .set(
+            "wlan1",
+            &WifiPassphrase::new("client-new-password").unwrap(),
+        )
+        .unwrap();
+    ap.set("wlan1", &WifiPassphrase::new("ap-preserved").unwrap())
+        .unwrap();
+    journal
+        .stage(BTreeMap::from([
+            (
+                "wlan0".into(),
+                (
+                    WifiCredentialRole::Ap,
+                    Some(WifiPassphrase::new("ap-old-password").unwrap()),
+                ),
+            ),
+            ("wlan1".into(), (WifiCredentialRole::Client, None)),
+        ]))
+        .await
+        .unwrap();
+    journal.recover(None).await.unwrap();
+    assert_eq!(
+        ap.get("wlan0").unwrap().unwrap().expose(),
+        "ap-old-password"
+    );
+    assert!(client.get("wlan1").unwrap().is_none());
+    assert_eq!(
+        client.get("wlan0").unwrap().unwrap().expose(),
+        "client-preserved"
+    );
+    assert_eq!(ap.get("wlan1").unwrap().unwrap().expose(), "ap-preserved");
+}
+
+#[tokio::test]
+async fn legacy_router_secret_journal_restores_legacy_namespace_only() {
+    let temp = tempfile::tempdir().unwrap();
+    let journal = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
+    std::fs::create_dir_all(temp.path().join("wifi")).unwrap();
+    std::fs::write(
+        &journal.journal,
+        br#"{"version":1,"previous":{"wlan0":"old-password"}}"#,
+    )
+    .unwrap();
+    let ap = PassphraseStore::for_role(temp.path(), WifiCredentialRole::Ap);
+    ap.set("wlan0", &WifiPassphrase::new("ap-password").unwrap())
+        .unwrap();
+    journal.recover(None).await.unwrap();
+    assert_eq!(
+        PassphraseStore::new(temp.path().join("wifi/psk"))
+            .get("wlan0")
+            .unwrap()
+            .unwrap()
+            .expose(),
+        "old-password"
+    );
+    assert_eq!(ap.get("wlan0").unwrap().unwrap().expose(), "ap-password");
+}
+
+#[tokio::test]
+async fn new_router_secret_journal_without_roles_is_rejected_and_retained() {
+    let temp = tempfile::tempdir().unwrap();
+    let journal = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
+    std::fs::create_dir_all(temp.path().join("wifi")).unwrap();
+    std::fs::write(
+        &journal.journal,
+        br#"{"version":2,"previous":{"wlan0":"old-password"}}"#,
+    )
+    .unwrap();
+    assert!(journal.recover(None).await.is_err());
+    assert!(journal.journal.exists());
+    assert!(!temp.path().join("wifi/psk/wlan0").exists());
 }

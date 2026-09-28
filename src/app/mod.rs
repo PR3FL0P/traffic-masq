@@ -742,6 +742,9 @@ async fn reconcile_network_runtime_once<
 ) -> Result<BTreeMap<String, String>> {
     crate::core::recovery::check_commit(desired.state_dir())?;
     let effective = desired.effective().await?;
+    crate::wifi::policy::WifiRadioPolicy::validate(&effective.network, |name| {
+        network.wireless_phy(name)
+    })?;
     let management_allowlist = desired.management_allowlist().await;
     let mut failures: BTreeMap<String, String> = BTreeMap::new();
     let interface_manager = InterfaceManager::new(network.clone(), journal.clone());
@@ -751,6 +754,11 @@ async fn reconcile_network_runtime_once<
         &desired.committed_overrides().await,
     )
     .await?;
+    // An old journal may just have restored a legacy secret. Use committed
+    // intent, never a tentative role switch, before allowing its consumer.
+    // Retry migration failures on later passes even after journal recovery
+    // itself has succeeded and removed the interface's recovery fence.
+    crate::wifi::store::migrate_legacy_passphrases(&desired.committed_config().await?).await?;
     let observed_interfaces: HashMap<_, _> = network
         .list_interfaces()
         .await?
@@ -1155,6 +1163,7 @@ fn spawn_wifi_autoconnect(
 /// Monitor supervised network processes and retry recoverable failures until shutdown.
 #[allow(clippy::too_many_arguments)]
 fn spawn_process_liveness_checks(
+    desired: DesiredNetworkState,
     state_dir: std::path::PathBuf,
     dhcp: DhcpSupervisor,
     wifi: Option<HostapdSupervisor>,
@@ -1219,10 +1228,20 @@ fn spawn_process_liveness_checks(
                         tracing::debug!("process liveness mutations suspended while a router transaction is pending recovery/confirmation");
                         continue;
                     }
+                    let wifi_admitted = match desired.effective().await {
+                        Ok(config) => match crate::wifi::policy::WifiRadioPolicy::validate_system(&config.network) {
+                            Ok(()) => true,
+                            Err(error) => {
+                                tracing::warn!(%error, "Wi-Fi process restart blocked by radio policy");
+                                false
+                            }
+                        },
+                        Err(error) => { tracing::warn!(%error, "process restart blocked by invalid desired state"); continue; }
+                    };
                     check_process_liveness(
                         &dhcp,
-                        wifi.as_ref(),
-                        wifi_client.as_ref(),
+                        wifi.as_ref().filter(|_| wifi_admitted),
+                        wifi_client.as_ref().filter(|_| wifi_admitted),
                         Some(&dhcp_client),
                     )
                     .await;
@@ -1684,6 +1703,7 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         config.validate()?;
         (overrides.hydrate_strict().await?, true)
     };
+    crate::wifi::store::migrate_legacy_passphrases(&effective_config).await?;
     let override_snapshot = overrides.snapshot().await;
     let management_allowlist = management_allowlist(&override_snapshot);
 
@@ -2190,6 +2210,7 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
 
     let (liveness_stop, liveness_shutdown) = watch::channel(false);
     let liveness_task = spawn_process_liveness_checks(
+        desired_state.clone(),
         effective_config.runtime.state_dir.clone(),
         dhcp.clone(),
         wifi_supervisor.clone(),

@@ -673,7 +673,7 @@ async fn clear_passphrase_is_journaled_and_restored_on_rollback() {
         Duration::from_secs(60),
         desired,
     );
-    let store = PassphraseStore::new(directory.path().join("wifi/psk"));
+    let store = PassphraseStore::new(directory.path().join("wifi/psk-ap"));
     store
         .set(
             "test0",
@@ -682,7 +682,7 @@ async fn clear_passphrase_is_journaled_and_restored_on_rollback() {
         .expect("seed passphrase");
 
     let previous = interface_config(COMMITTED);
-    let proposed = interface_config(PROPOSED);
+    let proposed = credential_config(WifiCredentialRole::Ap);
     let pending = manager
         .apply_with_passphrase_update(
             "test0",
@@ -719,7 +719,7 @@ async fn rollback_publishes_restore_intent_even_when_secret_restore_fails() {
         Duration::from_secs(60),
         desired.clone(),
     );
-    let proposed = interface_config(PROPOSED);
+    let proposed = credential_config(WifiCredentialRole::Ap);
     let pending = manager
         .apply_with_passphrase(
             "test0",
@@ -733,7 +733,7 @@ async fn rollback_publishes_restore_intent_even_when_secret_restore_fails() {
         .expect("apply");
     assert!(desired.is_tentative("test0").await);
 
-    let psk_dir = directory.path().join("wifi/psk");
+    let psk_dir = directory.path().join("wifi/psk-ap");
     std::fs::remove_dir_all(&psk_dir).expect("remove passphrase directory");
     std::os::unix::fs::symlink(directory.path(), &psk_dir)
         .expect("replace passphrase directory with a rejected symlink");
@@ -924,7 +924,7 @@ async fn rejected_wifi_candidate_restores_credentials_and_both_ip_policy_transit
             Duration::from_secs(60),
             desired.clone(),
         );
-        let store = PassphraseStore::new(directory.path().join("wifi/psk"));
+        let store = PassphraseStore::new(directory.path().join("wifi/psk-client"));
         store
             .set("test0", &WifiPassphrase::new("original-password").unwrap())
             .unwrap();
@@ -1106,4 +1106,245 @@ fn old_pending_response_defaults_to_awaiting_confirmation() {
     assert!(info.can_commit());
     assert!(info.can_rollback());
     assert_eq!(info.last_error, None);
+}
+
+fn credential_config(role: WifiCredentialRole) -> InterfaceConfig {
+    let mut config = interface_config(PROPOSED);
+    match role {
+        WifiCredentialRole::Ap => {
+            config.wifi = Some(
+                serde_json::from_value(serde_json::json!({
+                    "ssid": "test-ap", "channel": 6, "security": "wpa2"
+                }))
+                .unwrap(),
+            );
+        }
+        WifiCredentialRole::Client => {
+            config.role = InterfaceRole::Input;
+            config.nat = false;
+            config.wifi_client = Some(
+                serde_json::from_value(serde_json::json!({
+                    "ssid": "test-sta", "security": "wpa2"
+                }))
+                .unwrap(),
+            );
+        }
+    }
+    config
+}
+
+#[tokio::test]
+async fn keep_cannot_reuse_credentials_across_wifi_roles_in_either_direction() {
+    for (old_role, new_role) in [
+        (WifiCredentialRole::Client, WifiCredentialRole::Ap),
+        (WifiCredentialRole::Ap, WifiCredentialRole::Client),
+    ] {
+        let directory = tempdir().unwrap();
+        let previous = credential_config(old_role);
+        let candidate = credential_config(new_role);
+        let mut base = AppConfig::default();
+        base.network
+            .interfaces
+            .insert("test0".into(), previous.clone());
+        let overrides = RuntimeOverrideManager::load(directory.path(), &base)
+            .await
+            .unwrap();
+        let desired = DesiredNetworkState::new(base, overrides);
+        let manager = NetworkTransactionManager::new(
+            InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory()),
+            Duration::from_secs(60),
+            desired.clone(),
+        );
+        let old = PassphraseStore::for_role(directory.path(), old_role);
+        let target = PassphraseStore::for_role(directory.path(), new_role);
+        old.set("test0", &WifiPassphrase::new("source-password").unwrap())
+            .unwrap();
+        // Even a stale credential from an earlier use of the target role is
+        // not authorization to reuse it on this transition.
+        target
+            .set(
+                "test0",
+                &WifiPassphrase::new("stale-target-password").unwrap(),
+            )
+            .unwrap();
+        let error = manager
+            .apply_with_passphrase_update(
+                "test0",
+                &candidate,
+                Some(&previous),
+                Some(previous.role),
+                true,
+                WifiPassphraseUpdate::Keep,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("explicit passphrase"),
+            "{error:#}"
+        );
+        assert_eq!(desired.version(), 0);
+        assert!(manager.pending().await.is_empty());
+        assert_eq!(
+            old.get("test0").unwrap().unwrap().expose(),
+            "source-password"
+        );
+        assert_eq!(
+            target.get("test0").unwrap().unwrap().expose(),
+            "stale-target-password"
+        );
+    }
+}
+
+#[tokio::test]
+async fn role_switch_rollback_and_crash_recovery_restore_only_the_target_namespace() {
+    for (old_role, new_role) in [
+        (WifiCredentialRole::Client, WifiCredentialRole::Ap),
+        (WifiCredentialRole::Ap, WifiCredentialRole::Client),
+    ] {
+        for crash in [false, true] {
+            let directory = tempdir().unwrap();
+            let previous = credential_config(old_role);
+            let candidate = credential_config(new_role);
+            let mut base = AppConfig::default();
+            base.network
+                .interfaces
+                .insert("test0".into(), previous.clone());
+            let overrides = RuntimeOverrideManager::load(directory.path(), &base)
+                .await
+                .unwrap();
+            let desired = DesiredNetworkState::new(base, overrides);
+            let interfaces =
+                InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory());
+            let manager = NetworkTransactionManager::new(
+                interfaces.clone(),
+                Duration::from_secs(60),
+                desired,
+            );
+            let source = PassphraseStore::for_role(directory.path(), old_role);
+            let target = PassphraseStore::for_role(directory.path(), new_role);
+            source
+                .set("test0", &WifiPassphrase::new("source-password").unwrap())
+                .unwrap();
+            target
+                .set(
+                    "test0",
+                    &WifiPassphrase::new("previous-target-password").unwrap(),
+                )
+                .unwrap();
+            let pending = manager
+                .apply_with_passphrase_update(
+                    "test0",
+                    &candidate,
+                    Some(&previous),
+                    Some(previous.role),
+                    true,
+                    WifiPassphraseUpdate::Set(WifiPassphrase::new("new-target-password").unwrap()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                target.get("test0").unwrap().unwrap().expose(),
+                "new-target-password"
+            );
+            if crash {
+                recover_interface_transactions(directory.path(), &interfaces, &Default::default())
+                    .await
+                    .unwrap();
+            } else {
+                manager.rollback(&pending.token).await.unwrap();
+            }
+            assert_eq!(
+                source.get("test0").unwrap().unwrap().expose(),
+                "source-password"
+            );
+            assert_eq!(
+                target.get("test0").unwrap().unwrap().expose(),
+                "previous-target-password"
+            );
+            assert!(!directory
+                .path()
+                .join("interface-transactions/test0.json")
+                .exists());
+        }
+    }
+}
+
+#[tokio::test]
+async fn legacy_interface_secret_journal_restores_legacy_namespace_only() {
+    let directory = tempdir().unwrap();
+    let interfaces = InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory());
+    let snapshot = interfaces.snapshot("test0").await.unwrap();
+    let journals = crate::state::private_store::PrivateJsonDirectory::open(
+        directory.path(),
+        "interface-transactions",
+    )
+    .unwrap();
+    journals
+        .write(
+            "test0",
+            &serde_json::to_vec(&serde_json::json!({
+                "version": 2, "token": "old-daemon", "snapshot": snapshot,
+                "secret": {"previous": "legacy-password"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    let ap = PassphraseStore::for_role(directory.path(), WifiCredentialRole::Ap);
+    ap.set("test0", &WifiPassphrase::new("ap-password").unwrap())
+        .unwrap();
+    recover_interface_transactions(directory.path(), &interfaces, &Default::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        PassphraseStore::new(directory.path().join("wifi/psk"))
+            .get("test0")
+            .unwrap()
+            .unwrap()
+            .expose(),
+        "legacy-password"
+    );
+    assert_eq!(ap.get("test0").unwrap().unwrap().expose(), "ap-password");
+}
+
+#[tokio::test]
+async fn explicit_file_on_role_switch_cannot_be_shadowed_by_stale_target_secret() {
+    let directory = tempdir().unwrap();
+    let previous = credential_config(WifiCredentialRole::Client);
+    let mut candidate = credential_config(WifiCredentialRole::Ap);
+    candidate.wifi.as_mut().unwrap().passphrase_file =
+        Some(directory.path().join("explicit-secret"));
+    let mut base = AppConfig::default();
+    base.network
+        .interfaces
+        .insert("test0".into(), previous.clone());
+    let overrides = RuntimeOverrideManager::load(directory.path(), &base)
+        .await
+        .unwrap();
+    let desired = DesiredNetworkState::new(base, overrides);
+    let manager = NetworkTransactionManager::new(
+        InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory()),
+        Duration::from_secs(60),
+        desired,
+    );
+    let target = PassphraseStore::for_role(directory.path(), WifiCredentialRole::Ap);
+    target
+        .set("test0", &WifiPassphrase::new("stale-password").unwrap())
+        .unwrap();
+    let pending = manager
+        .apply_with_passphrase_update(
+            "test0",
+            &candidate,
+            Some(&previous),
+            Some(previous.role),
+            true,
+            WifiPassphraseUpdate::Keep,
+        )
+        .await
+        .unwrap();
+    assert!(target.get("test0").unwrap().is_none());
+    manager.rollback(&pending.token).await.unwrap();
+    assert_eq!(
+        target.get("test0").unwrap().unwrap().expose(),
+        "stale-password"
+    );
 }

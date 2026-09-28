@@ -8,6 +8,7 @@ pub mod client;
 pub mod ctrl;
 mod ctrl_transport;
 pub(crate) mod lifecycle;
+pub mod policy;
 pub mod process;
 pub(crate) mod radio;
 pub mod record;

@@ -9,15 +9,15 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::atomic_file::{self, PRIVATE_DIR_MODE, PRIVATE_FILE_MODE};
 use crate::wifi::secret::WifiPassphrase;
-use crate::wifi::store::PassphraseStore;
+use crate::wifi::store::{PassphraseStore, WifiCredentialRole};
 
-const JOURNAL_VERSION: u32 = 1;
+const JOURNAL_VERSION: u32 = 2;
 const JOURNAL_FILE: &str = "router-provisioning-secrets.json";
 
 #[derive(Clone)]
 pub struct ProvisioningSecretTransactionStore {
     journal: PathBuf,
-    passphrases: PassphraseStore,
+    state_dir: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -33,6 +33,8 @@ struct ProvisioningSecretJournal {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     token: Option<String>,
     previous: BTreeMap<String, Option<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    roles: BTreeMap<String, WifiCredentialRole>,
 }
 
 impl Drop for ProvisioningSecretJournal {
@@ -48,11 +50,14 @@ impl ProvisioningSecretTransactionStore {
         let wifi_dir = state_dir.as_ref().join("wifi");
         Self {
             journal: wifi_dir.join(JOURNAL_FILE),
-            passphrases: PassphraseStore::new(wifi_dir.join("psk")),
+            state_dir: state_dir.as_ref().to_path_buf(),
         }
     }
 
-    pub async fn stage(&self, previous: BTreeMap<String, Option<WifiPassphrase>>) -> Result<()> {
+    pub async fn stage(
+        &self,
+        previous: BTreeMap<String, (WifiCredentialRole, Option<WifiPassphrase>)>,
+    ) -> Result<()> {
         if previous.is_empty() {
             return Ok(());
         }
@@ -60,14 +65,21 @@ impl ProvisioningSecretTransactionStore {
             bail!("an unresolved router provisioning secret transaction already exists");
         }
 
+        let roles = previous
+            .iter()
+            .map(|(interface, (role, _))| (interface.clone(), *role))
+            .collect();
         let previous = previous
             .into_iter()
-            .map(|(interface, secret)| (interface, secret.map(|secret| secret.expose().to_owned())))
+            .map(|(interface, (_, secret))| {
+                (interface, secret.map(|secret| secret.expose().to_owned()))
+            })
             .collect();
         self.save(&ProvisioningSecretJournal {
             version: JOURNAL_VERSION,
             token: None,
             previous,
+            roles,
         })
         .await
     }
@@ -218,9 +230,13 @@ impl ProvisioningSecretTransactionStore {
     async fn restore_only(&self, journal: &ProvisioningSecretJournal) -> Result<()> {
         let mut failures = Vec::new();
         for (interface, previous) in &journal.previous {
+            let passphrases = match journal.roles.get(interface) {
+                Some(role) => PassphraseStore::for_role(&self.state_dir, *role),
+                None => PassphraseStore::new(self.state_dir.join("wifi/psk")),
+            };
             let result = match previous {
                 Some(raw) => match WifiPassphrase::new(raw.clone()) {
-                    Ok(secret) => self.passphrases.set(interface, &secret),
+                    Ok(secret) => passphrases.set(interface, &secret),
                     Err(error) => {
                         failures.push(format!(
                             "{interface}: invalid journaled passphrase: {error}"
@@ -228,7 +244,7 @@ impl ProvisioningSecretTransactionStore {
                         continue;
                     }
                 },
-                None => self.passphrases.clear(interface),
+                None => passphrases.clear(interface),
             };
             if let Err(error) = result {
                 failures.push(format!("{interface}: {error}"));
@@ -348,7 +364,7 @@ impl ProvisioningSecretTransactionStore {
         };
         let journal: ProvisioningSecretJournal =
             serde_json::from_slice(bytes).with_context(diagnostic)?;
-        if journal.version != JOURNAL_VERSION {
+        if !matches!(journal.version, 1 | JOURNAL_VERSION) {
             let diagnostic = crate::core::recovery::RecoveryDiagnostic::fatal(
                 crate::core::recovery::StartupRecoveryCode::SupportedProvisioningSecretSchema,
                 "decode",
@@ -357,13 +373,22 @@ impl ProvisioningSecretTransactionStore {
             .journal(self.journal.clone())
             .object("router-provisioning-secrets")
             .detail("journal_schema", journal.version)
-            .detail("supported_schemas", JOURNAL_VERSION)
+            .detail("supported_schemas", "1, 2")
             .detail("fallback_action", "restore_coherent_backup");
             return Err(anyhow::anyhow!(
                 "unsupported provisioning secret journal version {}",
                 journal.version
             )
             .context(diagnostic));
+        }
+        if !((journal.version == 1 && journal.roles.is_empty())
+            || (journal.version == JOURNAL_VERSION
+                && journal.previous.keys().eq(journal.roles.keys())))
+        {
+            return Err(
+                anyhow::anyhow!("invalid role provenance in provisioning secret journal")
+                    .context(diagnostic()),
+            );
         }
         Ok(journal)
     }

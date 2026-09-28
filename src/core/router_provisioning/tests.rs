@@ -196,3 +196,33 @@ fn management_role_requires_explicit_confirmation() {
         }
     );
 }
+
+#[test]
+fn provisioning_checks_existing_allocations_beyond_the_selected_pair() {
+    let mut context = context();
+    let existing: InterfaceConfig = serde_json::from_value(serde_json::json!({
+        "managed": true, "role": "output", "ipv4": "192.168.90.1/24",
+        "wifi": {"ssid": "existing-ap", "channel": 6, "security": "open"}
+    }))
+    .unwrap();
+    context
+        .effective_config
+        .network
+        .interfaces
+        .insert("existing-ap".into(), existing);
+    context.interfaces.insert(
+        "existing-ap".into(),
+        ProvisioningInterfaceObservation {
+            role: Some(InterfaceRole::Output),
+            wireless_phy: Some("phy1".into()),
+        },
+    );
+    assert_eq!(
+        derive_router_provisioning(&desired(), &context).unwrap_err(),
+        RouterProvisioningError::RadioReused {
+            phy: "phy1".into(),
+            uplink: "wlan-up".into(),
+            output: "existing-ap".into(),
+        }
+    );
+}
