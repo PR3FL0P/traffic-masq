@@ -461,11 +461,11 @@ impl WifiProfileEditor {
     }
 
     fn from_profile(interface: String, profile: &WifiClientProfileSummary) -> Self {
-        let cursor = super::input::grapheme_count(&profile.id);
+        let cursor = super::input::grapheme_count(&profile.ssid);
         Self {
             interface,
             original_id: Some(profile.id.clone()),
-            field: ProfileField::Id,
+            field: ProfileField::Ssid,
             id: profile.id.clone(),
             ssid: profile.ssid.clone(),
             security: profile.security,
@@ -480,7 +480,7 @@ impl WifiProfileEditor {
 
     pub(crate) fn active_value(&self) -> Option<&str> {
         match self.field {
-            ProfileField::Id => Some(&self.id),
+            ProfileField::Id if self.original_id.is_none() => Some(&self.id),
             ProfileField::Ssid => Some(&self.ssid),
             ProfileField::Country => Some(&self.country),
             ProfileField::Priority => Some(&self.priority),
@@ -496,7 +496,9 @@ impl WifiProfileEditor {
     pub(crate) fn active_editor(&mut self) -> Option<super::input::TextEditor<'_>> {
         let cursor = &mut self.cursor;
         match self.field {
-            ProfileField::Id => Some(super::input::TextEditor::new(&mut self.id, cursor)),
+            ProfileField::Id if self.original_id.is_none() => {
+                Some(super::input::TextEditor::new(&mut self.id, cursor))
+            }
             ProfileField::Ssid => Some(super::input::TextEditor::new(&mut self.ssid, cursor)),
             ProfileField::Country => Some(super::input::TextEditor::new(&mut self.country, cursor)),
             ProfileField::Priority => {
@@ -1060,10 +1062,12 @@ pub(crate) async fn load_wifi_data(app: &mut TuiApp, client: &ApiClient) {
         Ok(Response::Interfaces { interfaces }) => interfaces,
         Ok(response) => {
             report_unexpected(app, response);
+            app.wifi.replace_rows(Vec::new());
             return;
         }
         Err(error) => {
             app.wifi.error = Some(error.to_string());
+            app.wifi.replace_rows(Vec::new());
             return;
         }
     };
@@ -1125,6 +1129,7 @@ pub(crate) async fn load_wifi_data(app: &mut TuiApp, client: &ApiClient) {
                     "Could not refresh {} configuration: {result:?}",
                     row.interface
                 ));
+                app.wifi.replace_rows(Vec::new());
                 return;
             }
         };

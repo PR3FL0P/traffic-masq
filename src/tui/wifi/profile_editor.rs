@@ -124,10 +124,16 @@ pub(crate) async fn handle_wifi_profile_editor_key(
         }
         KeyCode::Up => {
             editor.field = move_field(&PROFILE_FIELDS, editor.field, false);
+            if editor.original_id.is_some() && editor.field == ProfileField::Id {
+                editor.field = ProfileField::Save;
+            }
             editor.reset_cursor();
         }
         KeyCode::Down => {
             editor.field = move_field(&PROFILE_FIELDS, editor.field, true);
+            if editor.original_id.is_some() && editor.field == ProfileField::Id {
+                editor.field = ProfileField::Ssid;
+            }
             editor.reset_cursor();
         }
         KeyCode::Enter | KeyCode::Char(' ') if editor.field == ProfileField::Autoconnect => {
@@ -142,6 +148,9 @@ pub(crate) async fn handle_wifi_profile_editor_key(
         KeyCode::Enter if editor.field == ProfileField::Save => save_profile(app, client).await,
         KeyCode::Enter => {
             editor.field = move_field(&PROFILE_FIELDS, editor.field, true);
+            if editor.original_id.is_some() && editor.field == ProfileField::Id {
+                editor.field = ProfileField::Ssid;
+            }
             editor.reset_cursor();
         }
         other => {
