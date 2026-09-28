@@ -418,7 +418,23 @@ fn parse_phy_info(phy: &str, text: &str) -> Result<WifiPhyCapabilities, RadioErr
 
 fn parse_frequency_line(line: &str) -> Option<WifiChannel> {
     let rest = line.strip_prefix('*')?.trim_start();
-    let frequency = rest.split_whitespace().next()?.parse::<u32>().ok()?;
+    let mut fields = rest.split_whitespace();
+    let value = fields.next()?;
+    if fields.next()? != "MHz" {
+        return None;
+    }
+    // iw also prints whole-MHz channels with decimal precision (2412.0).
+    // Reject fractional MHz instead of silently rounding to another frequency.
+    let whole = match value.split_once('.') {
+        Some((whole, fraction))
+            if !fraction.is_empty() && fraction.bytes().all(|byte| byte == b'0') =>
+        {
+            whole
+        }
+        Some(_) => return None,
+        None => value,
+    };
+    let frequency = whole.parse::<u32>().ok()?;
     let open = rest.find('[')?;
     let close = rest[open + 1..].find(']')? + open + 1;
     let channel = rest[open + 1..close].parse::<u8>().ok()?;
@@ -461,7 +477,7 @@ fn parse_reg_domains(text: &str) -> RegulatoryDomain {
         let Some(code) = country.get(..2) else {
             continue;
         };
-        if !code.bytes().all(|byte| byte.is_ascii_uppercase()) {
+        if code != "00" && !code.bytes().all(|byte| byte.is_ascii_uppercase()) {
             continue;
         }
         match scope {
@@ -540,6 +556,67 @@ Wiphy phy0
             parse_phy_info("phy0", PHY).expect("parse phy"),
             parse_reg_domains("global\ncountry PL: DFS-ETSI\n"),
         )
+    }
+
+    #[test]
+    fn parses_actual_decimal_iw_output() {
+        let caps = parse_phy_info("phy0", include_str!("fixtures/iw-phy-decimal.txt"))
+            .expect("decimal MHz output from iw must be accepted");
+        assert!(caps.supports_ap);
+        let band = &caps.bands[&WifiBand::Ghz2];
+        assert_eq!(band.channels.len(), 14);
+        assert_eq!(band.channels[&1].frequency_mhz, 2412);
+        assert!(band.channels[&14].disabled);
+        assert!(caps.bands[&WifiBand::Ghz5].channels[&52].no_ir);
+        assert!(caps.bands[&WifiBand::Ghz5].channels[&52].radar);
+        let reg = parse_reg_domains(
+            "global\ncountry 00: DFS-UNSET\nphy#0 (self-managed)\ncountry 00: DFS-UNSET\n",
+        );
+        caps.validate(&spec(WifiBand::Ghz2, 1, WifiChannelWidth::Ht20), &reg)
+            .expect("usable 2.4 GHz AP channel");
+        assert!(caps
+            .validate(&spec(WifiBand::Ghz5, 36, WifiChannelWidth::Ht20), &reg)
+            .expect_err("self-managed world-domain no-IR must be respected")
+            .to_string()
+            .contains("no-IR"));
+    }
+
+    #[test]
+    fn frequency_formats_preserve_restrictions() {
+        for frequency in ["2412", "2412.0", "2412.000"] {
+            let line = format!("* {frequency} MHz [1] (no IR) (no HT40+) (no HT40-) (no 80MHz)");
+            let channel = parse_frequency_line(&line).expect("valid frequency");
+            assert_eq!(channel.frequency_mhz, 2412);
+            assert!(
+                channel.no_ir && channel.no_ht40_plus && channel.no_ht40_minus && channel.no_80mhz
+            );
+        }
+        for line in [
+            "* 2412.5 MHz [1]",
+            "* NaN MHz [1]",
+            "* 2412. MHz [1]",
+            "* 2412 kHz [1]",
+        ] {
+            assert!(parse_frequency_line(line).is_none(), "{line}");
+        }
+    }
+
+    #[test]
+    fn preserves_self_managed_world_regdomain() {
+        let reg = parse_reg_domains(
+            "global\ncountry PL: DFS-ETSI\nphy#0 (self-managed)\ncountry 00: DFS-UNSET\n",
+        );
+        assert_eq!(reg.per_phy.get(&0), Some(&("00".to_string(), true)));
+        let (caps, _) = capabilities();
+        assert!(caps
+            .validate(&spec(WifiBand::Ghz2, 13, WifiChannelWidth::Ht20), &reg)
+            .is_err());
+        assert_eq!(
+            parse_reg_domains("country 00: DFS-UNSET")
+                .global_country
+                .as_deref(),
+            Some("00")
+        );
     }
 
     #[test]
