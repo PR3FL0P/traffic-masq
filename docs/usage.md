@@ -401,6 +401,9 @@ policy explicitly selects preserve, enable/configure, or disable. **Apply** is
 tentative: verify connectivity and commit before the rollback timer expires.
 Saving a reusable AP profile is separate from applying the saved profile.
 
+Scanning is unavailable on interfaces configured as access points, including
+when hostapd is stopped or has failed to start.
+
 ## Daemon commands
 
 ```text

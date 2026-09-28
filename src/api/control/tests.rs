@@ -4068,6 +4068,44 @@ async fn reconnecting_an_unmanaged_interface_reports_it_as_not_found() {
 }
 
 #[tokio::test]
+async fn wifi_client_scan_rejects_configured_ap_without_hostapd_task() {
+    let directory = tempdir().unwrap();
+    let mut config = wifi_client_base_config(directory.path());
+    let mut ap = config.network.interfaces["wlan1"].clone();
+    ap.role = InterfaceRole::Output;
+    ap.wifi_client = None;
+    ap.dhcp_client = None;
+    ap.wifi = Some(wifi_ap_config("hotspot", WifiSecurity::Open));
+    config.network.interfaces.insert("wlan0".into(), ap);
+    let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+        .await
+        .unwrap();
+    let dhcp = DhcpSupervisor::start(&config).await.unwrap();
+    let process = FakeSupplicantProcess::new();
+    let wifi_client = ClientSupervisor::start_with_process(&config, process.clone())
+        .await
+        .unwrap();
+    let before = process.configs.lock().unwrap().len();
+    let network: Arc<dyn NetworkProvider> =
+        Arc::new(ProvisioningNetwork::with_wireless(&["wlan0", "wlan1"]));
+    // No AP supervisor: configured APs must still never spawn a scan supplicant.
+    let service = ControlService::new(config, network, dhcp, overrides)
+        .with_wifi_client_supervisor(wifi_client);
+    let response = service
+        .dispatch(Request::WifiClientScan {
+            interface: "wlan0".into(),
+        })
+        .await;
+    assert!(
+        matches!(response, Response::WifiClientError {
+        detail: WifiClientErrorDetail::InvalidSpec { ref message }
+    } if message.contains("access point")),
+        "{response:?}"
+    );
+    assert_eq!(process.configs.lock().unwrap().len(), before);
+}
+
+#[tokio::test]
 async fn wifi_client_scan_on_configured_interface_returns_scan_results() {
     let fixture = wifi_client_enabled_fixture().await;
     let response = fixture

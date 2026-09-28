@@ -1507,3 +1507,22 @@ fn ap_warnings_and_focused_action_fit_minimum_terminal() {
     assert!(text.contains("DNS is not advertised"));
     assert!(text.contains("confirm before the rollback timer expires"));
 }
+
+#[tokio::test]
+async fn ap_scan_is_unavailable_even_without_running_status() {
+    let mut app = TuiApp::default();
+    let mut row = radio("wlan0");
+    row.role = WifiRole::AccessPoint;
+    app.wifi.rows.push(row);
+    assert!(!actions(WifiRole::AccessPoint)
+        .iter()
+        .any(|(action, _)| matches!(action, PrimaryAction::Scan)));
+    start_scan(
+        &mut app,
+        &ApiClient::new("/nonexistent.sock"),
+        "wlan0".into(),
+    )
+    .await;
+    assert!(app.wifi_scan.is_none());
+    assert!(app.logs.back().unwrap().message.contains("unavailable"));
+}

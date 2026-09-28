@@ -994,6 +994,18 @@ async fn request_simple(app: &mut TuiApp, client: &ApiClient, request: Request, 
 }
 
 async fn start_scan(app: &mut TuiApp, client: &ApiClient, interface: String) {
+    if app
+        .wifi
+        .rows
+        .iter()
+        .any(|row| row.interface == interface && row.role == WifiRole::AccessPoint)
+    {
+        app.push_message(
+            LogLevel::Warn,
+            "Scanning is unavailable in access point mode",
+        );
+        return;
+    }
     match client
         .request(&Request::WifiClientScan {
             interface: interface.clone(),

@@ -913,6 +913,20 @@ impl ControlService {
     }
 
     pub(super) async fn wifi_client_scan(&self, interface: String) -> Response {
+        let effective = match self.effective_config().await {
+            Ok(config) => config,
+            Err(message) => return wifi_client_error(WifiClientErrorDetail::Other { message }),
+        };
+        if effective
+            .network
+            .interfaces
+            .get(&interface)
+            .is_some_and(|config| config.wifi.is_some())
+        {
+            return wifi_client_error(WifiClientErrorDetail::InvalidSpec {
+                message: format!("scanning is unavailable while interface {interface} is configured as an access point"),
+            });
+        }
         let Some(wifi_client) = &self.wifi_client else {
             return wifi_client_disabled();
         };
