@@ -1374,53 +1374,23 @@ fn unicode_ssids_have_nonempty_stable_distinct_profile_ids() {
     assert_ne!(home, profile_id_for_ssid("Гості"));
 }
 
-#[tokio::test]
-async fn ap_profile_load_restores_radio_options_without_exposing_password() {
-    let mut editor = WifiEditor::from_row(&radio("wlan0"));
-    let mut settings = ap_settings(&editor);
-    settings.ssid = "Guests".into();
-    settings.hidden = true;
-    settings.client_isolation = true;
-    settings.channel = 11;
-    editor
-        .profiles
-        .push(crate::api::model::WifiApProfileSummary {
-            id: "guest".into(),
-            settings,
-            configure_dhcp: false,
-            subnet: None,
-            disable_dhcp: false,
-            has_passphrase: true,
-        });
-    editor.field = WifiField::SavedProfile;
-    editor.passphrase = "unsaved-secret".into();
-    let mut app = TuiApp {
-        screen: Screen::WifiEditor,
-        wifi_editor: Some(editor),
-        ..Default::default()
-    };
-    handle_wifi_editor_key(
-        &mut app,
-        KeyCode::Enter,
-        &ApiClient::new("/nonexistent.sock"),
-    )
-    .await;
-    assert_eq!(app.wifi_editor.as_ref().unwrap().profile_picker, Some(0));
-    handle_wifi_editor_key(
-        &mut app,
-        KeyCode::Enter,
-        &ApiClient::new("/nonexistent.sock"),
-    )
-    .await;
+#[test]
+fn ap_profile_edit_restores_settings_without_exposing_password() {
+    let profile = ap_test_profile();
+    let mut app = TuiApp::default();
+    ap_profiles::open_ap_profile_editor(&mut app, "wlan0".into(), Some(&profile));
     let loaded = app.wifi_editor.as_ref().unwrap();
     assert_eq!(loaded.ssid, "Guests");
     assert_eq!(loaded.profile_id, "guest");
     assert!(loaded.passphrase.is_empty());
-    assert!(loaded.loaded_profile);
+    assert!(loaded.profile_mode);
     assert!(loaded.existing);
     assert!(!loaded.configure_dhcp);
     assert_eq!(ap_settings(loaded).channel, 11);
     assert!(ap_settings(loaded).hidden);
+    assert!(!loaded.fields().contains(&WifiField::ProfileId));
+    assert!(!loaded.fields().contains(&WifiField::Apply));
+    assert!(loaded.fields().contains(&WifiField::SaveProfile));
 }
 
 #[tokio::test]
@@ -1474,9 +1444,6 @@ async fn ap_unsaved_edits_require_explicit_discard() {
     handle_wifi_editor_key(&mut app, KeyCode::Esc, &client).await;
     assert!(!app.wifi_editor.as_ref().unwrap().discard_requested);
     assert!(app.wifi_editor.as_ref().unwrap().ssid.ends_with('x'));
-    app.wifi_editor.as_mut().unwrap().field = WifiField::SavedProfile;
-    handle_wifi_editor_key(&mut app, KeyCode::Enter, &client).await;
-    assert!(app.wifi_editor.as_ref().unwrap().profile_picker.is_none());
     handle_wifi_editor_key(&mut app, KeyCode::Esc, &client).await;
     handle_wifi_editor_key(&mut app, KeyCode::Enter, &client).await;
     assert!(app.wifi_editor.is_none());
@@ -1508,6 +1475,163 @@ fn ap_warnings_and_focused_action_fit_minimum_terminal() {
     assert!(text.contains("confirm before the rollback timer expires"));
 }
 
+fn ap_test_profile() -> crate::api::model::WifiApProfileSummary {
+    let mut settings = ap_settings(&WifiEditor::from_row(&radio("wlan0")));
+    settings.ssid = "Guests".into();
+    settings.channel = 11;
+    settings.hidden = true;
+    settings.client_isolation = true;
+    crate::api::model::WifiApProfileSummary {
+        id: "guest".into(),
+        settings,
+        configure_dhcp: false,
+        disable_dhcp: false,
+        subnet: None,
+        has_passphrase: true,
+    }
+}
+
+fn ap_profiles_app(mode: WifiProfilesMode) -> TuiApp {
+    TuiApp {
+        screen: Screen::WifiApProfiles,
+        wifi_ap_profiles: Some(WifiApProfilesView {
+            interface: "wlan0".into(),
+            profiles: vec![ap_test_profile()],
+            mode,
+            selected: 0,
+            selected_profile: 0,
+            delete_confirmation: None,
+        }),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn ap_profiles_menu_create_edit_and_back_match_client_flow() {
+    let mut app = ap_profiles_app(WifiProfilesMode::Menu);
+    let client = ApiClient::new("/nonexistent.sock");
+    handle_wifi_ap_profiles_key(&mut app, KeyCode::Down, &client).await;
+    handle_wifi_ap_profiles_key(&mut app, KeyCode::Enter, &client).await;
+    assert_eq!(app.screen, Screen::WifiEditor);
+    let editor = app.wifi_editor.as_ref().unwrap();
+    assert!(editor.profile_mode && !editor.existing);
+    assert!(editor.profile_id.is_empty() && editor.passphrase.is_empty());
+    assert!(editor.fields().contains(&WifiField::ProfileId));
+    handle_wifi_editor_key(&mut app, KeyCode::Enter, &client).await;
+    assert_eq!(app.wifi_editor.as_ref().unwrap().field, WifiField::Ssid);
+    handle_wifi_editor_key(&mut app, KeyCode::Esc, &client).await;
+    assert_eq!(app.screen, Screen::WifiApProfiles);
+    handle_wifi_ap_profiles_key(&mut app, KeyCode::Up, &client).await;
+    handle_wifi_ap_profiles_key(&mut app, KeyCode::Enter, &client).await;
+    assert_eq!(
+        app.wifi_ap_profiles.as_ref().unwrap().mode,
+        WifiProfilesMode::Management
+    );
+    handle_wifi_ap_profiles_key(&mut app, KeyCode::Enter, &client).await;
+    assert_eq!(
+        app.wifi_ap_profiles.as_ref().unwrap().mode,
+        WifiProfilesMode::ProfileActions
+    );
+    handle_wifi_ap_profiles_key(&mut app, KeyCode::Down, &client).await;
+    handle_wifi_ap_profiles_key(&mut app, KeyCode::Enter, &client).await;
+    assert_eq!(app.wifi_editor.as_ref().unwrap().profile_id, "guest");
+    handle_wifi_editor_key(&mut app, KeyCode::Esc, &client).await;
+    handle_wifi_ap_profiles_key(&mut app, KeyCode::Esc, &client).await;
+    assert_eq!(
+        app.wifi_ap_profiles.as_ref().unwrap().mode,
+        WifiProfilesMode::Management
+    );
+    handle_wifi_ap_profiles_key(&mut app, KeyCode::Esc, &client).await;
+    assert_eq!(
+        app.wifi_ap_profiles.as_ref().unwrap().mode,
+        WifiProfilesMode::Menu
+    );
+    handle_wifi_ap_profiles_key(&mut app, KeyCode::Esc, &client).await;
+    assert_eq!(app.screen, Screen::Wifi);
+}
+
+#[tokio::test]
+async fn ap_profile_save_does_not_activate_and_returns_to_selected_profile() {
+    let mut app = ap_profiles_app(WifiProfilesMode::ProfileActions);
+    ap_profiles::open_ap_profile_editor(&mut app, "wlan0".into(), Some(&ap_test_profile()));
+    app.wifi_editor.as_mut().unwrap().field = WifiField::SaveProfile;
+    let (_dir, client, server) = mock_api(vec![Response::WifiApProfileSaved {
+        profile: ap_test_profile(),
+    }])
+    .await;
+    handle_wifi_editor_key(&mut app, KeyCode::Enter, &client).await;
+    let paths = server.await.unwrap();
+    assert_eq!(paths.len(), 1);
+    assert_eq!(paths, vec!["PUT /api/v1/wifi-ap-profiles"]);
+    assert!(app.wifi_editor.is_none());
+    assert!(app.pending.is_none());
+    assert_eq!(app.screen, Screen::WifiApProfiles);
+    let view = app.wifi_ap_profiles.as_ref().unwrap();
+    assert_eq!(view.mode, WifiProfilesMode::Management);
+    assert_eq!(view.profiles[view.selected].id, "guest");
+}
+
+#[tokio::test]
+async fn ap_profile_apply_uses_saved_profile_and_commit_confirmation() {
+    let mut app = ap_profiles_app(WifiProfilesMode::ProfileActions);
+    let change = crate::core::transaction::PendingNetworkChange {
+        phase: Default::default(),
+        last_error: None,
+        token: "ap-profile-token".into(),
+        interface: "wlan0".into(),
+        rollback_timeout_seconds: 60,
+        expires_at_unix: super::super::current_unix_time() + 60,
+    };
+    let (_dir, client, server) = mock_api(vec![Response::NetworkChangePending {
+        change: change.clone(),
+    }])
+    .await;
+    handle_wifi_ap_profiles_key(&mut app, KeyCode::Enter, &client).await;
+    let paths = server.await.unwrap();
+    assert_eq!(paths.len(), 1);
+    assert_eq!(paths, vec!["PUT /api/v1/wifi/wlan0/profile"]);
+    assert_eq!(app.pending, Some(change));
+    assert_eq!(app.screen, Screen::PendingChange);
+    assert_eq!(app.pending_return_screen, Screen::WifiApProfiles);
+}
+
+#[tokio::test]
+async fn ap_profile_delete_requires_confirmation_and_keeps_network_unchanged() {
+    let mut app = ap_profiles_app(WifiProfilesMode::ProfileActions);
+    app.wifi_ap_profiles.as_mut().unwrap().selected = 2;
+    let offline = ApiClient::new("/nonexistent.sock");
+    handle_wifi_ap_profiles_key(&mut app, KeyCode::Enter, &offline).await;
+    assert_eq!(
+        app.wifi_ap_profiles
+            .as_ref()
+            .unwrap()
+            .delete_confirmation
+            .as_deref(),
+        Some("guest")
+    );
+    handle_wifi_ap_profiles_key(&mut app, KeyCode::Esc, &offline).await;
+    assert!(app
+        .wifi_ap_profiles
+        .as_ref()
+        .unwrap()
+        .delete_confirmation
+        .is_none());
+    assert_eq!(app.wifi_ap_profiles.as_ref().unwrap().profiles.len(), 1);
+    handle_wifi_ap_profiles_key(&mut app, KeyCode::Enter, &offline).await;
+    let (_dir, client, server) = mock_api(vec![
+        Response::WifiApProfileDeleted { id: "guest".into() },
+        Response::WifiApProfiles { profiles: vec![] },
+    ])
+    .await;
+    handle_wifi_ap_profiles_key(&mut app, KeyCode::Char('y'), &client).await;
+    let paths = server.await.unwrap();
+    assert_eq!(paths.len(), 2);
+    assert!(paths[0].starts_with("DELETE "));
+    assert!(paths[1].starts_with("GET "));
+    assert!(app.wifi_ap_profiles.as_ref().unwrap().profiles.is_empty());
+    assert!(app.pending.is_none());
+}
+
 #[tokio::test]
 async fn ap_scan_is_unavailable_even_without_running_status() {
     let mut app = TuiApp::default();
@@ -1525,4 +1649,43 @@ async fn ap_scan_is_unavailable_even_without_running_status() {
     .await;
     assert!(app.wifi_scan.is_none());
     assert!(app.logs.back().unwrap().message.contains("unavailable"));
+}
+
+#[tokio::test]
+async fn ap_profile_rejects_invalid_subnet_and_duplicate_id_without_saving() {
+    let mut app = ap_profiles_app(WifiProfilesMode::Menu);
+    ap_profiles::open_ap_profile_editor(&mut app, "wlan0".into(), None);
+    let editor = app.wifi_editor.as_mut().unwrap();
+    editor.profile_id = "guest".into();
+    editor.subnet = "invalid subnet".into();
+    editor.field = WifiField::SaveProfile;
+    let client = ApiClient::new("/nonexistent.sock");
+    handle_wifi_editor_key(&mut app, KeyCode::Enter, &client).await;
+    assert!(app.logs.back().unwrap().message.contains("Invalid IPv4"));
+    app.wifi_editor.as_mut().unwrap().subnet.clear();
+    handle_wifi_editor_key(&mut app, KeyCode::Enter, &client).await;
+    assert!(app.logs.back().unwrap().message.contains("already exists"));
+    assert!(app.wifi_editor.is_some());
+}
+
+#[test]
+fn ap_profile_actions_fit_small_terminal_and_mouse_skips_header() {
+    let mut app = ap_profiles_app(WifiProfilesMode::ProfileActions);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| render_wifi_ap_profiles(frame, frame.area(), &mut app))
+        .unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(text.contains("Apply profile"));
+    assert!(text.contains("Edit profile"));
+    assert!(text.contains("Delete profile"));
+    assert!(!text.contains("Scan"));
+    assert_eq!(app.ui.list_area.unwrap().y, 3);
+    assert_eq!(app.ui.list_count, 4);
 }

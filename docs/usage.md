@@ -399,7 +399,13 @@ The Wi-Fi screen includes unconfigured radios. **Create hotspot** accepts an IPv
 subnet and prepares a managed output interface in one backend transaction. DHCP
 policy explicitly selects preserve, enable/configure, or disable. **Apply** is
 tentative: verify connectivity and commit before the rollback timer expires.
-Saving a reusable AP profile is separate from applying the saved profile.
+**Saved AP profiles** uses the same navigation as client profiles: choose
+**Management** to select an existing profile, or **Create new profile**. Each
+profile offers **Apply profile**, **Edit profile**, and **Delete profile**.
+Saving returns to the profile list without changing the running access point;
+applying starts a tentative network change that must be confirmed. Deletion
+requires confirmation and leaves the running AP unchanged. When editing, a blank
+passphrase retains that profile's saved password. Existing profile IDs are fixed.
 
 Scanning is unavailable on interfaces configured as access points, including
 when hostapd is stopped or has failed to start.

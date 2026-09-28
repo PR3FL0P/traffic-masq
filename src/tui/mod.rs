@@ -93,6 +93,7 @@ enum Screen {
     WifiEditor,
     WifiScan,
     WifiProfiles,
+    WifiApProfiles,
     WifiProfileEditor,
     WifiConnectPrompt,
     Settings,
@@ -176,6 +177,7 @@ fn section_of(screen: Screen) -> Section {
         | Screen::WifiEditor
         | Screen::WifiScan
         | Screen::WifiProfiles
+        | Screen::WifiApProfiles
         | Screen::WifiProfileEditor
         | Screen::WifiConnectPrompt => Section::Wifi,
         Screen::Settings | Screen::SettingsPassword | Screen::Access => Section::Settings,
@@ -233,6 +235,7 @@ struct ViewIdentity {
     topology_open: bool,
     wifi_actions_open: bool,
     wifi_profiles_mode: Option<wifi::WifiProfilesMode>,
+    wifi_ap_profiles_mode: Option<wifi::WifiProfilesMode>,
 }
 
 struct TuiApp {
@@ -267,6 +270,7 @@ struct TuiApp {
     wifi_editor: Option<wifi::WifiEditor>,
     wifi_scan: Option<wifi::WifiScanPicker>,
     wifi_profiles: Option<wifi::WifiProfilesView>,
+    wifi_ap_profiles: Option<wifi::WifiApProfilesView>,
     wifi_profile_editor: Option<wifi::WifiProfileEditor>,
     wifi_connect: Option<wifi::WifiConnectPrompt>,
     settings: Option<SecurityEditor>,
@@ -318,6 +322,7 @@ impl Default for TuiApp {
             wifi_editor: None,
             wifi_scan: None,
             wifi_profiles: None,
+            wifi_ap_profiles: None,
             wifi_profile_editor: None,
             wifi_connect: None,
             settings: None,
@@ -1120,6 +1125,11 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                                     scan.selected = index;
                                 }
                             }
+                            Screen::WifiApProfiles => {
+                                if let Some(view) = app.wifi_ap_profiles.as_mut() {
+                                    view.select(index);
+                                }
+                            }
                             Screen::WifiProfiles => {
                                 if let Some(view) = app.wifi_profiles.as_mut() {
                                     match view.mode {
@@ -1153,6 +1163,9 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
             Screen::Wifi => wifi::handle_wifi_key(app, KeyCode::Up, client).await,
             Screen::WifiScan => wifi::handle_wifi_scan_key(app, KeyCode::Up, client).await,
             Screen::WifiProfiles => wifi::handle_wifi_profiles_key(app, KeyCode::Up, client).await,
+            Screen::WifiApProfiles => {
+                wifi::handle_wifi_ap_profiles_key(app, KeyCode::Up, client).await
+            }
             Screen::Dashboard => {
                 dashboard::handle_dashboard_key(app, KeyCode::Up, client, direct).await;
             }
@@ -1182,6 +1195,9 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
             Screen::Preview => interfaces::handle_preview_key(app, KeyCode::Down, client).await,
             Screen::Wifi => wifi::handle_wifi_key(app, KeyCode::Down, client).await,
             Screen::WifiScan => wifi::handle_wifi_scan_key(app, KeyCode::Down, client).await,
+            Screen::WifiApProfiles => {
+                wifi::handle_wifi_ap_profiles_key(app, KeyCode::Down, client).await
+            }
             Screen::WifiProfiles => {
                 wifi::handle_wifi_profiles_key(app, KeyCode::Down, client).await
             }
@@ -1261,6 +1277,7 @@ fn draw_app<'a, B: ratatui::backend::Backend>(
         topology_open: app.router.topology.open,
         wifi_actions_open: app.wifi.actions_open,
         wifi_profiles_mode: app.wifi_profiles.as_ref().map(|view| view.mode),
+        wifi_ap_profiles_mode: app.wifi_ap_profiles.as_ref().map(|view| view.mode),
     };
     if app.last_drawn_view != Some(view) {
         terminal.clear()?;
@@ -1420,6 +1437,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp, direct: bool) {
         Screen::WifiEditor => wifi::render_wifi_editor(frame, chunks[1], app),
         Screen::WifiScan => wifi::render_wifi_scan(frame, chunks[1], app),
         Screen::WifiProfiles => wifi::render_wifi_profiles(frame, chunks[1], app),
+        Screen::WifiApProfiles => wifi::render_wifi_ap_profiles(frame, chunks[1], app),
         Screen::WifiProfileEditor => wifi::render_wifi_profile_editor(frame, chunks[1], app),
         Screen::WifiConnectPrompt => wifi::render_wifi_connect_prompt(frame, chunks[1], app),
         Screen::Settings => settings::render_settings(frame, chunks[1], app),
@@ -1593,6 +1611,7 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
         Screen::WifiEditor => wifi::handle_wifi_editor_key(app, key, client).await,
         Screen::WifiScan => wifi::handle_wifi_scan_key(app, key, client).await,
         Screen::WifiProfiles => wifi::handle_wifi_profiles_key(app, key, client).await,
+        Screen::WifiApProfiles => wifi::handle_wifi_ap_profiles_key(app, key, client).await,
         Screen::WifiProfileEditor => wifi::handle_wifi_profile_editor_key(app, key, client).await,
         Screen::WifiConnectPrompt => wifi::handle_wifi_connect_prompt_key(app, key, client).await,
         Screen::Settings => settings::handle_settings_key(app, key, client).await,

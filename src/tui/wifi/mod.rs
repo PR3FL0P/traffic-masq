@@ -22,6 +22,10 @@ use super::logs::LogLevel;
 use super::{theme, Screen, TuiApp};
 
 mod ap_editor;
+mod ap_profiles;
+pub(crate) use ap_profiles::{
+    handle_wifi_ap_profiles_key, render_wifi_ap_profiles, WifiApProfilesView,
+};
 mod connect;
 mod profile_editor;
 mod profiles;
@@ -135,13 +139,12 @@ pub(crate) enum WifiField {
     Dhcp,
     Subnet,
     ProfileId,
-    SavedProfile,
     SaveProfile,
-    DeleteProfile,
     Apply,
 }
 
-const WIFI_FIELDS: [WifiField; 17] = [
+const WIFI_FIELDS: [WifiField; 15] = [
+    WifiField::ProfileId,
     WifiField::Ssid,
     WifiField::Security,
     WifiField::Passphrase,
@@ -154,10 +157,7 @@ const WIFI_FIELDS: [WifiField; 17] = [
     WifiField::MaxStations,
     WifiField::Dhcp,
     WifiField::Subnet,
-    WifiField::ProfileId,
-    WifiField::SavedProfile,
     WifiField::SaveProfile,
-    WifiField::DeleteProfile,
     WifiField::Apply,
 ];
 
@@ -178,11 +178,10 @@ pub(crate) struct WifiEditor {
     disable_dhcp: bool,
     subnet: String,
     profile_id: String,
-    loaded_profile: bool,
+    profile_mode: bool,
+    original_profile_id: Option<String>,
     dirty: bool,
     discard_requested: bool,
-    profile_picker: Option<usize>,
-    profiles: Vec<crate::api::model::WifiApProfileSummary>,
     original_spec: Option<crate::wifi::WifiApSpec>,
     radio_settings: Option<WifiEditRequest>,
     pub(crate) cursor: usize,
@@ -229,19 +228,32 @@ impl WifiEditor {
             disable_dhcp: false,
             subnet: String::new(),
             profile_id: String::new(),
-            loaded_profile: false,
+            profile_mode: false,
+            original_profile_id: None,
             dirty: false,
             discard_requested: false,
-            profile_picker: None,
-            profiles: Vec::new(),
             original_spec: row.ap.as_ref().map(|status| status.spec.clone()),
             radio_settings: None,
             cursor,
         }
     }
 
+    fn fields(&self) -> Vec<WifiField> {
+        WIFI_FIELDS
+            .iter()
+            .copied()
+            .filter(|field| match field {
+                WifiField::ProfileId => self.profile_mode && self.original_profile_id.is_none(),
+                WifiField::SaveProfile => self.profile_mode,
+                WifiField::Apply => !self.profile_mode,
+                _ => true,
+            })
+            .collect()
+    }
+
     pub(crate) fn active_value(&self) -> Option<&str> {
         match self.field {
+            WifiField::ProfileId if self.original_profile_id.is_some() => None,
             WifiField::Subnet => Some(&self.subnet),
             WifiField::ProfileId => Some(&self.profile_id),
             WifiField::Ssid => Some(&self.ssid),
@@ -259,6 +271,7 @@ impl WifiEditor {
         let cursor = &mut self.cursor;
         match self.field {
             WifiField::Subnet => Some(super::input::TextEditor::new(&mut self.subnet, cursor)),
+            WifiField::ProfileId if self.original_profile_id.is_some() => None,
             WifiField::ProfileId => {
                 Some(super::input::TextEditor::new(&mut self.profile_id, cursor))
             }
@@ -602,6 +615,7 @@ impl WifiConnectPrompt {
 #[derive(Clone, Copy)]
 enum PrimaryAction {
     ConfigureAp,
+    ApProfiles,
     Scan,
     Profiles,
     Reconnect,
@@ -614,6 +628,7 @@ fn actions(role: WifiRole) -> &'static [(PrimaryAction, &'static str)] {
     match role {
         WifiRole::AccessPoint => &[
             (PrimaryAction::ConfigureAp, "Configure access point"),
+            (PrimaryAction::ApProfiles, "Saved AP profiles"),
             (PrimaryAction::Profiles, "Use as client (saved profile)"),
             (PrimaryAction::Reload, "Reload access point"),
             (PrimaryAction::Deactivate, "Deactivate access point"),
@@ -623,6 +638,7 @@ fn actions(role: WifiRole) -> &'static [(PrimaryAction, &'static str)] {
             (PrimaryAction::Scan, "Scan networks"),
             (PrimaryAction::Profiles, "Saved profiles"),
             (PrimaryAction::ConfigureAp, "Use as access point"),
+            (PrimaryAction::ApProfiles, "Saved AP profiles"),
             (PrimaryAction::Reconnect, "Reconnect"),
             (PrimaryAction::Deactivate, "Deactivate"),
             (PrimaryAction::Refresh, "Refresh"),
@@ -631,6 +647,7 @@ fn actions(role: WifiRole) -> &'static [(PrimaryAction, &'static str)] {
             (PrimaryAction::Scan, "Scan / connect"),
             (PrimaryAction::Profiles, "Saved profiles"),
             (PrimaryAction::ConfigureAp, "Create hotspot"),
+            (PrimaryAction::ApProfiles, "Saved AP profiles"),
             (PrimaryAction::Refresh, "Refresh"),
         ],
     }
@@ -898,11 +915,6 @@ async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
                         }
                         editor.subnet = config.ipv4.map(|ip| ip.to_string()).unwrap_or_default();
                         editor.original_spec = spec;
-                        match client.request(&Request::ListWifiApProfiles).await {
-                            Ok(Response::WifiApProfiles { profiles }) => editor.profiles = profiles,
-                            Ok(response) => report_unexpected(app, response),
-                            Err(error) => app.push_message(LogLevel::Error, error.to_string()),
-                        }
                         editor.reset_cursor();
                         app.wifi_editor = Some(editor);
                         app.screen = Screen::WifiEditor;
@@ -915,6 +927,9 @@ async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
                     Err(error) => app.push_message(LogLevel::Error, error.to_string()),
                 }
             }
+        }
+        PrimaryAction::ApProfiles => {
+            ap_profiles::open_ap_profiles(app, client, row.interface, WifiProfilesMode::Menu).await;
         }
         PrimaryAction::Scan => start_scan(app, client, row.interface).await,
         PrimaryAction::Profiles => {
