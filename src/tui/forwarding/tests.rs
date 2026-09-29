@@ -25,6 +25,62 @@ fn editor() -> ForwardingEditor {
     }
 }
 
+fn interface_status(name: &str, has_default_route: bool) -> crate::api::model::InterfaceStatus {
+    crate::api::model::InterfaceStatus {
+        owned_ipv4_addresses: None,
+        interface: crate::netlink::NetworkInterface {
+            index: 1,
+            name: name.into(),
+            is_up: true,
+            rx_bytes: 0,
+            tx_bytes: 0,
+            is_wireless: true,
+        },
+        ipv4_addresses: vec![],
+        has_default_route,
+    }
+}
+
+#[tokio::test]
+async fn new_sharing_prefills_managed_lan_to_observed_default_route() {
+    let mut app = TuiApp::default();
+    app.router.staged = true; // Avoid API calls while opening the local draft.
+    app.router.proposed_router_config.forwarding = Some(vec![]);
+    app.dashboard.interfaces = vec![
+        interface_status("wlp5s0f3u2", true),
+        interface_status("wlp1s0", false),
+    ];
+    app.dashboard.managed.insert("wlp1s0".into(), true);
+    app.dashboard
+        .roles
+        .insert("wlp1s0".into(), InterfaceRole::Output);
+    app.dashboard.routes = Some(vec![crate::api::model::RouteStatus {
+        destination: "0.0.0.0/0".parse().unwrap(),
+        gateway: Some("192.168.1.1".parse().unwrap()),
+        output_interface: Some("wlp5s0f3u2".into()),
+        output_interface_index: None,
+        table: 254,
+        metric: Some(600),
+        protocol: 16,
+        scope: 0,
+        owner: crate::netlink::RouteOwner::Dhcp,
+    }]);
+
+    open(
+        &mut app,
+        &ApiClient::new("/must-not-be-used.sock"),
+        false,
+        None,
+    )
+    .await;
+
+    let form = app.forwarding.as_ref().unwrap();
+    assert_eq!(form.interfaces[form.from], "wlp1s0");
+    assert_eq!(form.interfaces[form.to], "wlp5s0f3u2");
+    let rules = form.save().unwrap();
+    assert_eq!(rules, vec![connection("wlp1s0", "wlp5s0f3u2")]);
+}
+
 #[tokio::test]
 async fn editing_replaces_the_selected_connection_and_preserves_route_intent() {
     let mut app = TuiApp::default();

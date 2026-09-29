@@ -9,7 +9,7 @@ use crate::api::{
     client::ApiClient,
     model::{Request, Response, RouterProposalRequest},
 };
-use crate::config::{validate_forwarding, ForwardingConfig};
+use crate::config::{validate_forwarding, ForwardingConfig, InterfaceRole};
 use crate::firewall::RouterDataplaneTarget;
 use crossterm::event::KeyCode;
 use ratatui::{
@@ -222,13 +222,14 @@ async fn open(app: &mut TuiApp, client: &ApiClient, edit: bool, egress: Option<S
         return;
     }
     let rule = editing.map(|index| &rules[index]);
-    let to = interfaces
-        .iter()
-        .position(|name| Some(name) == rule.map(|rule| &rule.to).or(egress.as_ref()))
-        .unwrap_or(1);
+    let (default_from, default_to) =
+        preferred_new_connection_endpoints(app, &interfaces, egress.as_deref());
+    let to = rule
+        .and_then(|rule| interfaces.iter().position(|name| name == &rule.to))
+        .unwrap_or(default_to);
     let from = rule
         .and_then(|rule| interfaces.iter().position(|name| name == &rule.from))
-        .unwrap_or_else(|| usize::from(to == 0));
+        .unwrap_or(default_from);
     let source = rule
         .and_then(|rule| rule.source_subnet)
         .map_or(String::new(), |subnet| subnet.to_string());
@@ -247,6 +248,67 @@ async fn open(app: &mut TuiApp, client: &ApiClient, edit: bool, egress: Option<S
     };
     app.forwarding = Some(editor);
     app.screen = Screen::Forwarding;
+}
+
+fn preferred_new_connection_endpoints(
+    app: &TuiApp,
+    interfaces: &[String],
+    explicit_egress: Option<&str>,
+) -> (usize, usize) {
+    let fallback_to = usize::from(interfaces.len() > 1);
+    let to = explicit_egress
+        .and_then(|egress| interfaces.iter().position(|name| name == egress))
+        .or_else(|| {
+            app.dashboard
+                .routes
+                .as_ref()
+                .and_then(|routes| {
+                    routes
+                        .iter()
+                        .filter(|route| route.destination.prefix_len() == 0)
+                        .filter_map(|route| {
+                            let name = route.output_interface.as_ref()?;
+                            let index = interfaces.iter().position(|candidate| candidate == name)?;
+                            Some((route.table != 254, route.metric.unwrap_or(u32::MAX), index))
+                        })
+                        .min()
+                        .map(|(_, _, index)| index)
+                })
+        })
+        .or_else(|| {
+            app.dashboard.interfaces.iter().find_map(|status| {
+                status.has_default_route.then(|| {
+                    interfaces
+                        .iter()
+                        .position(|name| name == &status.interface.name)
+                })?
+            })
+        })
+        .unwrap_or(fallback_to);
+
+    let from = interfaces
+        .iter()
+        .enumerate()
+        .find(|(index, name)| {
+            *index != to
+                && app.dashboard.managed.get(*name).copied().unwrap_or(false)
+                && app.dashboard.roles.get(*name) == Some(&InterfaceRole::Output)
+        })
+        .map(|(index, _)| index)
+        .or_else(|| {
+            app.dashboard.interfaces.iter().find_map(|status| {
+                if status.has_default_route {
+                    return None;
+                }
+                interfaces
+                    .iter()
+                    .position(|name| name == &status.interface.name)
+                    .filter(|index| *index != to)
+            })
+        })
+        .unwrap_or_else(|| usize::from(to == 0));
+
+    (from, to)
 }
 
 fn stage(app: &mut TuiApp, rules: Vec<ForwardingConfig>) {
