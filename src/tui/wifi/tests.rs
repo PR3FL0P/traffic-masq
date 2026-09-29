@@ -1885,3 +1885,41 @@ async fn saving_standalone_client_profile_returns_to_library_without_connecting(
     assert_eq!(app.wifi_profiles.as_ref().unwrap().profiles.len(), 1);
     assert_eq!(server.await.unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn control_o_submits_wifi_connection_from_any_field() {
+    let (_dir, client, server) = mock_api(vec![Response::WifiClientError {
+        detail: crate::api::model::WifiClientErrorDetail::Other {
+            message: "test rejection".into(),
+        },
+    }])
+    .await;
+    let mut app = TuiApp {
+        screen: Screen::WifiConnectPrompt,
+        wifi_connect: Some(WifiConnectPrompt::new(
+            "wlan0".into(),
+            "home".into(),
+            "Home".into(),
+            None,
+        )),
+        ..Default::default()
+    };
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| super::super::render(frame, &mut app, false))
+        .unwrap();
+    super::super::handle_key_event(
+        &mut app,
+        crossterm::event::KeyEvent::new(
+            KeyCode::Char('o'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ),
+        &client,
+        false,
+    )
+    .await;
+    assert_eq!(
+        server.await.unwrap(),
+        vec!["PUT /api/v1/wifi-client/wlan0/provision"]
+    );
+}

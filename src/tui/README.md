@@ -45,7 +45,7 @@ The TUI serves as the primary operational console for the `traffic-masq` network
 | [`vpn_policy.rs`](vpn_policy.rs) | Policy routing rules for WireGuard (routing marks, table IDs, client bypass policies). | `VpnPolicyData`, `VpnPolicyEditor` |
 | [`settings.rs`](settings.rs) | Daemon configuration, rollback timeout settings, session preferences, device password update wizard, security override reset. | `SecurityEditor`, `SettingsField`, `PasswordChangeEditor` |
 | [`access.rs`](access.rs) | Remote HTTPS access configuration (TLS listen socket, certificate and private key file paths). | `AccessEditor`, `AccessField` |
-| [`logs.rs`](logs.rs) | In-memory circular log buffer (`LOG_HISTORY_LEN = 500`), severity levels (`Info`, `Warn`, `Error`), F1 popup viewer, log export. | `LogEntry`, `LogLevel`, `LogFocus`, `render_log` |
+| [`logs.rs`](logs.rs) | In-memory circular log buffer (`LOG_HISTORY_LEN = 500`), severity levels (`Info`, `Warn`, `Error`), Ctrl+G popup viewer, log export. | `LogEntry`, `LogLevel`, `LogFocus`, `render_log` |
 
 ---
 
@@ -302,7 +302,7 @@ async fn resize_clears_hit_regions() {
 
 ### UX safeguards
 
-- F4 opens modal context help, including a first-setup checklist. F1 remains the operation-message viewer.
+- Ctrl+K opens modal context help, including a first-setup checklist. Ctrl+G remains the operation-message viewer.
 - Below 80x24, an active confirmation deadline is shown with Enter to commit and Esc to roll back. Other editing remains disabled.
 - AP editor consequences stay pinned below the scrolling fields. A `*` marks edited settings; Esc asks before discarding them.
 - Load profile opens a selectable list. Save edited settings before loading another profile or applying a loaded profile.

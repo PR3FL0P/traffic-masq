@@ -98,5 +98,5 @@ fn narrow_footer_keeps_action_meanings() {
         .collect();
     assert!(text.contains("Enter:activate"));
     assert!(text.contains("Esc:back"));
-    assert!(text.contains("F4:all keys"));
+    assert!(text.contains("Ctrl+K:all keys"));
 }

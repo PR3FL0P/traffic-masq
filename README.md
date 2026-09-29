@@ -194,9 +194,9 @@ and commit it to save the routing change, using the normal rollback timer.
 In the Router tab, **1 / 2 / 3** selects Routes, Internet sharing or Topology.
 Use arrows to select items and Tab/Shift+Tab to move focus forward/backward
 between fields, lists and actions. Enter activates the focused control; Esc
-returns to the list or leaves the editor. F2/F3 selects the previous/next main
+returns to the list or leaves the editor. Ctrl+P/Ctrl+N selects the previous/next main
 tab; Left/Right also switches tabs when no field or action uses those arrows.
-F4 opens context help and the first-setup checklist. F1 opens the full operation message; Ctrl+C exits (an in-flight action finishes first). Topology shows configuration and observed routes, not a
+Ctrl+K opens context help and the first-setup checklist. Ctrl+G opens the full operation message; Ctrl+C exits (an in-flight action finishes first). Topology shows configuration and observed routes, not a
 connectivity test.
 
 ### Applying and confirming changes

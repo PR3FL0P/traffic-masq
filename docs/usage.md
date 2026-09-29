@@ -274,9 +274,9 @@ configured idle/absolute limits can require a password sooner.
 
 ### Navigation
 
-The TUI keeps operation messages visible; press F1 to read a full message and
+The TUI keeps operation messages visible; press Ctrl+G to read a full message and
 use Up/Down to scroll it. Tab/Shift+Tab moves focus forward/backward;
-F2/F3 selects the previous/next main tab. Ctrl+C exits after any in-flight
+Ctrl+P/Ctrl+N selects the previous/next main tab. Ctrl+C exits after any in-flight
 action completes. Finish a form or leave it with Esc before changing
 tabs. Long Wi-Fi lists scroll with the selection; deleting a profile requires
 an explicit Y confirmation naming the profile.
@@ -383,7 +383,7 @@ profiles there; select a compatible interface to connect or apply a profile.
 Tab switches between wireless interfaces and their actions; Esc returns to the
 same interface. Lists and connection forms scroll to keep the selection visible.
 In the connection form, arrows move focus and Enter/Space selects an IP option.
-Use **Connect** or F10 to submit. This provisions the profile, credentials and
+Use **Connect** or Ctrl+O to submit. This provisions the profile, credentials and
 IPv4 policy together as a tentative change. Verify connectivity, then commit
 before the deadline. On failure, inspect the reported pending/recovery state
 before retrying. **Keep current static IP** uses the configured address, never a

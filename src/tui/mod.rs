@@ -1309,6 +1309,34 @@ async fn handle_key_event(app: &mut TuiApp, key: KeyEvent, client: &ApiClient, d
         app.should_quit = true;
         return;
     }
+    if key.modifiers == KeyModifiers::CONTROL && app.ui.input_enabled {
+        match key.code {
+            KeyCode::Char('k') => app.help_open = !app.help_open,
+            _ if app.help_open => {}
+            KeyCode::Char('g') => {
+                app.message_open = !app.message_open;
+                app.message_scroll = 0;
+            }
+            _ if app.message_open => {}
+            KeyCode::Char('p' | 'n') => {
+                let target = adjacent_section(
+                    section_of_app(app),
+                    key.code == KeyCode::Char('n'),
+                    app.show_dhcp_client,
+                    direct,
+                );
+                navigate_to_section(app, target, client, direct).await;
+            }
+            KeyCode::Char('o') if app.screen == Screen::WifiConnectPrompt => {
+                if let Some(prompt) = app.wifi_connect.as_mut() {
+                    prompt.field = wifi::WifiConnectField::Submit;
+                }
+                handle_key(app, KeyCode::Enter, client, direct).await;
+            }
+            _ => {}
+        }
+        return;
+    }
     // Modified letters must never be inserted into a text field as plain text.
     if key
         .modifiers
@@ -1366,8 +1394,8 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp, direct: bool) {
     app.ui.input_enabled = true;
     if app.help_open {
         let mut lines = vec![
-            Line::from("F2/F3: previous/next section | Ctrl+C: quit"),
-            Line::from("Tab/Shift+Tab: focus | F1: full operation message"),
+            Line::from("Ctrl+P/Ctrl+N: previous/next section | Ctrl+C: quit"),
+            Line::from("Tab/Shift+Tab: focus | Ctrl+G: full operation message"),
             Line::from(""),
         ];
         lines.extend(
@@ -1384,7 +1412,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp, direct: bool) {
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(ratatui::widgets::Wrap { trim: false })
-                .block(layout::panel("Help — Esc/F4: close")),
+                .block(layout::panel("Help — Esc/Ctrl+K: close")),
             area,
         );
         return;
@@ -1400,7 +1428,9 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp, direct: bool) {
             Paragraph::new(format_message_lines(text))
                 .wrap(ratatui::widgets::Wrap { trim: false })
                 .scroll((app.message_scroll, 0))
-                .block(layout::panel("Message — Up/Down: scroll; Esc/F1: close")),
+                .block(layout::panel(
+                    "Message — Up/Down: scroll; Esc/Ctrl+G: close",
+                )),
             area,
         );
         return;
@@ -1500,19 +1530,10 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
         }
         return;
     }
-    if key == KeyCode::F(4) {
-        app.help_open = !app.help_open;
-        return;
-    }
     if app.help_open {
         if key == KeyCode::Esc {
             app.help_open = false;
         }
-        return;
-    }
-    if key == KeyCode::F(1) {
-        app.message_open = !app.message_open;
-        app.message_scroll = 0;
         return;
     }
     if app.message_open {
@@ -1522,17 +1543,6 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
             KeyCode::Down => app.message_scroll = app.message_scroll.saturating_add(1),
             _ => {}
         }
-        return;
-    }
-
-    if matches!(key, KeyCode::F(2) | KeyCode::F(3)) {
-        let target = adjacent_section(
-            section_of_app(app),
-            key == KeyCode::F(3),
-            app.show_dhcp_client,
-            direct,
-        );
-        navigate_to_section(app, target, client, direct).await;
         return;
     }
 

@@ -197,7 +197,13 @@ async fn tab_focus_and_modified_keys_are_consistent() {
         app.vpn_import.as_ref().unwrap().field,
         vpn::VpnImportField::Name
     );
-    handle_key(&mut app, KeyCode::F(3), &client, false).await;
+    handle_key_event(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        &client,
+        false,
+    )
+    .await;
     assert_eq!(app.screen, Screen::VpnImport);
     handle_key_event(
         &mut app,
@@ -924,7 +930,13 @@ async fn help_is_modal_and_does_not_activate_underlying_screen() {
     let client = ApiClient::new("/nonexistent.sock");
     let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
     terminal.draw(|f| render(f, &mut app, false)).unwrap();
-    handle_key(&mut app, KeyCode::F(4), &client, false).await;
+    handle_key_event(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        &client,
+        false,
+    )
+    .await;
     terminal.draw(|f| render(f, &mut app, false)).unwrap();
     assert!(app.help_open);
     handle_key(&mut app, KeyCode::Enter, &client, false).await;
@@ -1031,4 +1043,85 @@ fn pending_refresh_exposes_recovery_and_removes_confirmation_controls() {
         assert!(text.contains("storage unavailable"));
         assert!(!text.contains("[Commit]"));
     }
+}
+
+#[tokio::test]
+async fn control_shortcuts_preserve_text_and_modal_focus() {
+    let client = ApiClient::new("/nonexistent.sock");
+    let mut app = TuiApp {
+        screen: Screen::VpnImport,
+        vpn_import: Some(VpnImportEditor {
+            field: vpn::VpnImportField::Name,
+            name: "draft".into(),
+            path: String::new(),
+            cursor: 5,
+        }),
+        ..Default::default()
+    };
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| render(frame, &mut app, false))
+        .unwrap();
+    for key in ['g', 'n', 'p', 'o'] {
+        handle_key_event(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL),
+            &client,
+            false,
+        )
+        .await;
+    }
+    assert!(app.message_open);
+    assert_eq!(app.screen, Screen::VpnImport);
+    handle_key_event(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+        &client,
+        false,
+    )
+    .await;
+    assert!(!app.message_open);
+    handle_key_event(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        &client,
+        false,
+    )
+    .await;
+    handle_key_event(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+        &client,
+        false,
+    )
+    .await;
+    assert!(app.help_open);
+    assert!(!app.message_open);
+    handle_key_event(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        &client,
+        false,
+    )
+    .await;
+    assert!(!app.help_open);
+    assert_eq!(app.vpn_import.as_ref().unwrap().name, "draft");
+
+    app.screen = Screen::Dashboard;
+    handle_key_event(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        &client,
+        true,
+    )
+    .await;
+    assert_eq!(app.screen, Screen::InterfaceList);
+    handle_key_event(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        &client,
+        true,
+    )
+    .await;
+    assert_eq!(app.screen, Screen::Dashboard);
 }

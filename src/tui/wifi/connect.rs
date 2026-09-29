@@ -59,9 +59,6 @@ pub(crate) async fn handle_wifi_connect_prompt_key(
                 Screen::Wifi
             };
         }
-        KeyCode::F(10) => {
-            submit_wifi_connect(app, client).await;
-        }
         KeyCode::Up => {
             let focusable = prompt.focusable_fields();
             if let Some(pos) = focusable.iter().position(|f| *f == prompt.field) {
@@ -298,7 +295,7 @@ pub(crate) fn render_wifi_connect_prompt(
 
     lines.push(Line::from(""));
     lines.push(Line::styled(
-        "↑/↓: focus • Enter: select • F10: connect • Esc: cancel",
+        "↑/↓: focus • Enter: select • Ctrl+O: connect • Esc: cancel",
         Style::default().fg(theme::MUTED),
     ));
 

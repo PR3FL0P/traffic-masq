@@ -193,7 +193,7 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Tu
             .copied()
             .filter(|(key, _)| matches!(*key, "Enter" | "Esc" | "↑/↓"))
             .collect();
-        compact.push(("F4", "all keys"));
+        compact.push(("Ctrl+K", "all keys"));
         compact
     } else {
         help
@@ -234,7 +234,7 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Tu
 
     frame.render_widget(
         Paragraph::new(vec![Line::from(spans), message_line])
-            .block(panel("F1:msg F4:help F2/3:tabs Tab:focus ^C:quit")),
+            .block(panel("^G:msg ^K:help ^P/^N:tabs Tab:focus ^C:quit")),
         area,
     );
 }
