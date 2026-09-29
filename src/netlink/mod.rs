@@ -9,7 +9,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
 use netlink_packet_route::{
@@ -22,7 +22,7 @@ use netlink_packet_route::{
 use netlink_packet_utils::nla::{DefaultNla, Nla};
 use rtnetlink::{new_connection, Handle, IpVersion};
 use serde::{Deserialize, Serialize};
-use tokio::task::JoinHandle;
+use tokio::{sync::Mutex, task::JoinHandle};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkInterface {
@@ -525,6 +525,10 @@ const ADDRESS_PROTOCOL_UNSUPPORTED: u8 = 2;
 pub struct RtnetlinkNetworkProvider {
     handle: Handle,
     _connection_task: JoinHandle<()>,
+    /// `rtnetlink::Handle` instances backed by one netlink socket must not
+    /// execute overlapping dump/request sequences. Concurrent API clients can
+    /// otherwise make the kernel reject a second dump with `EBUSY`.
+    request_lock: Mutex<()>,
     /// Observed `IFA_PROTO` support, resolved by reading back the first
     /// address we tag. `IFA_PROTO` needs Linux 5.18; older kernels parse
     /// `RTM_NEWADDR` liberally and ignore the attribute without an error, so
@@ -539,6 +543,7 @@ impl RtnetlinkNetworkProvider {
         Ok(Self {
             handle,
             _connection_task: connection_task,
+            request_lock: Mutex::new(()),
             address_protocol_support: AtomicU8::new(ADDRESS_PROTOCOL_UNKNOWN),
         })
     }
@@ -549,7 +554,11 @@ impl RtnetlinkNetworkProvider {
     /// link and healthy, only ownership tracking is degraded. Recording that
     /// keeps `supports_ipv4_address_protocol` honest, which is what the
     /// unmanage guard relies on.
-    async fn confirm_address_protocol(
+    ///
+    /// Caller must hold `request_lock`; keeping the write and read-back in one
+    /// serialized netlink sequence also prevents another client from starting
+    /// a dump between them.
+    async fn confirm_address_protocol_unlocked(
         &self,
         interface: &str,
         address: Ipv4Addr,
@@ -561,7 +570,7 @@ impl RtnetlinkNetworkProvider {
         }
 
         let observed = self
-            .list_ipv4_addresses(interface)
+            .list_ipv4_addresses_unlocked(interface)
             .await?
             .into_iter()
             .find(|item| item.address == address && item.prefix_len == prefix_len)
@@ -594,7 +603,8 @@ impl RtnetlinkNetworkProvider {
             .map(|protocol| AddressAttribute::Other(DefaultNla::new(IFA_PROTO, vec![protocol])))
     }
 
-    async fn link_index(&self, name: &str) -> Result<u32> {
+    /// Resolve an interface index while the caller holds `request_lock`.
+    async fn link_index_unlocked(&self, name: &str) -> Result<u32> {
         let mut links = self
             .handle
             .link()
@@ -603,18 +613,66 @@ impl RtnetlinkNetworkProvider {
             .execute();
         let link = links
             .try_next()
-            .await?
+            .await
+            .with_context(|| format!("RTM_GETLINK while resolving interface {name}"))?
             .ok_or_else(|| anyhow::anyhow!("interface not found: {name}"))?;
         Ok(link.header.index)
     }
 
-    async fn address_message(
+    /// Read IPv4 addresses while the caller holds `request_lock`.
+    async fn list_ipv4_addresses_unlocked(&self, interface: &str) -> Result<Vec<Ipv4AddressInfo>> {
+        let index = self.link_index_unlocked(interface).await?;
+        let mut addresses = self
+            .handle
+            .address()
+            .get()
+            .set_link_index_filter(index)
+            .execute();
+
+        let mut result = Vec::new();
+        while let Some(message) = addresses
+            .try_next()
+            .await
+            .with_context(|| format!("RTM_GETADDR while listing IPv4 addresses on {interface}"))?
+        {
+            let mut ipv4 = None;
+            let mut protocol = None;
+            for attr in &message.attributes {
+                match attr {
+                    AddressAttribute::Local(IpAddr::V4(address))
+                    | AddressAttribute::Address(IpAddr::V4(address)) => {
+                        ipv4.get_or_insert(*address);
+                    }
+                    AddressAttribute::Other(other)
+                        if other.kind() == IFA_PROTO && other.value_len() == 1 =>
+                    {
+                        let mut value = [0u8; 1];
+                        other.emit_value(&mut value);
+                        protocol = Some(value[0]);
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Some(address) = ipv4 {
+                result.push(Ipv4AddressInfo {
+                    interface_index: message.header.index,
+                    address,
+                    prefix_len: message.header.prefix_len,
+                    protocol,
+                });
+            }
+        }
+        Ok(result)
+    }
+
+    async fn address_message_unlocked(
         &self,
         interface: &str,
         address: Ipv4Addr,
         prefix_len: u8,
     ) -> Result<AddressMessage> {
-        let index = self.link_index(interface).await?;
+        let index = self.link_index_unlocked(interface).await?;
         let mut addresses = self
             .handle
             .address()
@@ -624,9 +682,15 @@ impl RtnetlinkNetworkProvider {
             .set_prefix_length_filter(prefix_len)
             .execute();
 
-        addresses.try_next().await?.ok_or_else(|| {
-            anyhow::anyhow!("address {address}/{prefix_len} not found on {interface}")
-        })
+        addresses
+            .try_next()
+            .await
+            .with_context(|| {
+                format!("RTM_GETADDR while resolving {address}/{prefix_len} on {interface}")
+            })?
+            .ok_or_else(|| {
+                anyhow::anyhow!("address {address}/{prefix_len} not found on {interface}")
+            })
     }
 }
 
@@ -764,6 +828,7 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
     }
 
     async fn hardware_address(&self, interface: &str) -> Result<Vec<u8>> {
+        let _request = self.request_lock.lock().await;
         let mut links = self
             .handle
             .link()
@@ -772,7 +837,8 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
             .execute();
         let link = links
             .try_next()
-            .await?
+            .await
+            .with_context(|| format!("RTM_GETLINK while reading hardware address for {interface}"))?
             .ok_or_else(|| anyhow::anyhow!("interface not found: {interface}"))?;
         link.attributes
             .into_iter()
@@ -784,10 +850,15 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
     }
 
     async fn list_interfaces(&self) -> Result<Vec<NetworkInterface>> {
+        let _request = self.request_lock.lock().await;
         let mut links = self.handle.link().get().execute();
         let mut interfaces = Vec::new();
 
-        while let Some(link) = links.try_next().await? {
+        while let Some(link) = links
+            .try_next()
+            .await
+            .context("RTM_GETLINK while listing interfaces")?
+        {
             let mut name = None;
             let mut rx_bytes = 0u64;
             let mut tx_bytes = 0u64;
@@ -798,7 +869,6 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
                         rx_bytes = stats.rx_bytes;
                         tx_bytes = stats.tx_bytes;
                     }
-
                     LinkAttribute::Stats(stats) if rx_bytes == 0 && tx_bytes == 0 => {
                         rx_bytes = u64::from(stats.rx_bytes);
                         tx_bytes = u64::from(stats.tx_bytes);
@@ -824,58 +894,33 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
     }
 
     async fn list_ipv4_addresses(&self, interface: &str) -> Result<Vec<Ipv4AddressInfo>> {
-        let index = self.link_index(interface).await?;
-        let mut addresses = self
-            .handle
-            .address()
-            .get()
-            .set_link_index_filter(index)
-            .execute();
-
-        let mut result = Vec::new();
-
-        while let Some(message) = addresses.try_next().await? {
-            let mut ipv4 = None;
-            let mut protocol = None;
-            for attr in &message.attributes {
-                match attr {
-                    AddressAttribute::Local(IpAddr::V4(address))
-                    | AddressAttribute::Address(IpAddr::V4(address)) => {
-                        ipv4.get_or_insert(*address);
-                    }
-                    AddressAttribute::Other(other)
-                        if other.kind() == IFA_PROTO && other.value_len() == 1 =>
-                    {
-                        let mut value = [0u8; 1];
-                        other.emit_value(&mut value);
-                        protocol = Some(value[0]);
-                    }
-                    _ => {}
-                }
-            }
-
-            if let Some(address) = ipv4 {
-                result.push(Ipv4AddressInfo {
-                    interface_index: message.header.index,
-                    address,
-                    prefix_len: message.header.prefix_len,
-                    protocol,
-                });
-            }
-        }
-
-        Ok(result)
+        let _request = self.request_lock.lock().await;
+        self.list_ipv4_addresses_unlocked(interface).await
     }
 
     async fn set_link_up(&self, name: &str) -> Result<()> {
-        let index = self.link_index(name).await?;
-        self.handle.link().set(index).up().execute().await?;
+        let _request = self.request_lock.lock().await;
+        let index = self.link_index_unlocked(name).await?;
+        self.handle
+            .link()
+            .set(index)
+            .up()
+            .execute()
+            .await
+            .with_context(|| format!("RTM_NEWLINK while setting {name} up"))?;
         Ok(())
     }
 
     async fn set_link_down(&self, name: &str) -> Result<()> {
-        let index = self.link_index(name).await?;
-        self.handle.link().set(index).down().execute().await?;
+        let _request = self.request_lock.lock().await;
+        let index = self.link_index_unlocked(name).await?;
+        self.handle
+            .link()
+            .set(index)
+            .down()
+            .execute()
+            .await
+            .with_context(|| format!("RTM_NEWLINK while setting {name} down"))?;
         Ok(())
     }
 
@@ -886,7 +931,8 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
         prefix_len: u8,
         ownership: AddressOwnership,
     ) -> Result<()> {
-        let index = self.link_index(interface).await?;
+        let _request = self.request_lock.lock().await;
+        let index = self.link_index_unlocked(interface).await?;
         let mut request = self
             .handle
             .address()
@@ -903,10 +949,15 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
         if let Some(attribute) = Self::ownership_attribute(ownership) {
             request.message_mut().attributes.push(attribute);
         }
-        request.execute().await?;
+        request
+            .execute()
+            .await
+            .with_context(|| {
+                format!("RTM_NEWADDR while adding {address}/{prefix_len} to {interface}")
+            })?;
 
         if let Some(protocol) = ownership.protocol() {
-            self.confirm_address_protocol(interface, address, prefix_len, protocol)
+            self.confirm_address_protocol_unlocked(interface, address, prefix_len, protocol)
                 .await?;
         }
         Ok(())
@@ -919,7 +970,10 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
         prefix_len: u8,
         ownership: AddressOwnership,
     ) -> Result<()> {
-        let existing = self.address_message(interface, address, prefix_len).await?;
+        let _request = self.request_lock.lock().await;
+        let existing = self
+            .address_message_unlocked(interface, address, prefix_len)
+            .await?;
         let mut request = self
             .handle
             .address()
@@ -952,10 +1006,12 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
             }
         }
 
-        request.execute().await?;
+        request.execute().await.with_context(|| {
+            format!("RTM_NEWADDR while updating ownership of {address}/{prefix_len} on {interface}")
+        })?;
 
         if let Some(protocol) = ownership.protocol() {
-            self.confirm_address_protocol(interface, address, prefix_len, protocol)
+            self.confirm_address_protocol_unlocked(interface, address, prefix_len, protocol)
                 .await?;
         }
         Ok(())
@@ -967,15 +1023,30 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
         address: Ipv4Addr,
         prefix_len: u8,
     ) -> Result<()> {
-        let message = self.address_message(interface, address, prefix_len).await?;
-        self.handle.address().del(message).execute().await?;
+        let _request = self.request_lock.lock().await;
+        let message = self
+            .address_message_unlocked(interface, address, prefix_len)
+            .await?;
+        self.handle
+            .address()
+            .del(message)
+            .execute()
+            .await
+            .with_context(|| {
+                format!("RTM_DELADDR while deleting {address}/{prefix_len} from {interface}")
+            })?;
         Ok(())
     }
 
     async fn list_ipv4_routes(&self) -> Result<Vec<Ipv4RouteInfo>> {
+        let _request = self.request_lock.lock().await;
         let mut messages = self.handle.route().get(IpVersion::V4).execute();
         let mut routes = Vec::new();
-        while let Some(message) = messages.try_next().await? {
+        while let Some(message) = messages
+            .try_next()
+            .await
+            .context("RTM_GETROUTE while listing IPv4 routes")?
+        {
             if let Some(route) = parse_ipv4_route(&message)? {
                 routes.push(route);
             }
@@ -997,6 +1068,7 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
 
     async fn add_ipv4_route(&self, route: &Ipv4RouteSpec) -> Result<()> {
         route.validate()?;
+        let _request = self.request_lock.lock().await;
         let mut request = self
             .handle
             .route()
@@ -1016,30 +1088,64 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
         if let Some(metric) = route.metric {
             request = request.priority(metric);
         }
-        request.execute().await?;
+        request.execute().await.with_context(|| {
+            format!(
+                "RTM_NEWROUTE while adding {}/{} in table {}",
+                route.destination.network(),
+                route.destination.prefix_len(),
+                route.table
+            )
+        })?;
         Ok(())
     }
 
     async fn delete_ipv4_route(&self, route: &Ipv4RouteInfo) -> Result<()> {
+        let _request = self.request_lock.lock().await;
         let mut messages = self.handle.route().get(IpVersion::V4).execute();
-        while let Some(message) = messages.try_next().await? {
-            if parse_ipv4_route(&message)?.as_ref() == Some(route) {
-                self.handle.route().del(message).execute().await?;
-                return Ok(());
+        let mut matched = None;
+        while let Some(message) = messages
+            .try_next()
+            .await
+            .context("RTM_GETROUTE while locating IPv4 route for deletion")?
+        {
+            if matched.is_none() && parse_ipv4_route(&message)?.as_ref() == Some(route) {
+                matched = Some(message);
             }
         }
-        anyhow::bail!(
-            "IPv4 route {}/{} in table {} was not found",
-            route.destination.network(),
-            route.destination.prefix_len(),
-            route.table
-        )
+        let Some(message) = matched else {
+            anyhow::bail!(
+                "IPv4 route {}/{} in table {} was not found",
+                route.destination.network(),
+                route.destination.prefix_len(),
+                route.table
+            );
+        };
+        drop(messages);
+        self.handle
+            .route()
+            .del(message)
+            .execute()
+            .await
+            .with_context(|| {
+                format!(
+                    "RTM_DELROUTE while deleting {}/{} from table {}",
+                    route.destination.network(),
+                    route.destination.prefix_len(),
+                    route.table
+                )
+            })?;
+        Ok(())
     }
 
     async fn list_ipv4_rules(&self) -> Result<Vec<Ipv4RuleInfo>> {
+        let _request = self.request_lock.lock().await;
         let mut messages = self.handle.rule().get(IpVersion::V4).execute();
         let mut rules = Vec::new();
-        while let Some(message) = messages.try_next().await? {
+        while let Some(message) = messages
+            .try_next()
+            .await
+            .context("RTM_GETRULE while listing IPv4 rules")?
+        {
             if let Some(rule) = parse_ipv4_rule(&message)? {
                 rules.push(rule);
             }
@@ -1061,6 +1167,7 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
 
     async fn add_ipv4_rule(&self, rule: &Ipv4RuleSpec) -> Result<()> {
         rule.validate()?;
+        let _request = self.request_lock.lock().await;
         let mut request = self
             .handle
             .rule()
@@ -1092,19 +1199,41 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
                 .attributes
                 .push(RuleAttribute::FwMask(fw_mask));
         }
-        request.execute().await?;
+        request
+            .execute()
+            .await
+            .with_context(|| {
+                format!("RTM_NEWRULE while adding IPv4 rule for table {}", rule.table)
+            })?;
         Ok(())
     }
 
     async fn delete_ipv4_rule(&self, rule: &Ipv4RuleInfo) -> Result<()> {
+        let _request = self.request_lock.lock().await;
         let mut messages = self.handle.rule().get(IpVersion::V4).execute();
-        while let Some(message) = messages.try_next().await? {
-            if parse_ipv4_rule(&message)?.as_ref() == Some(rule) {
-                self.handle.rule().del(message).execute().await?;
-                return Ok(());
+        let mut matched = None;
+        while let Some(message) = messages
+            .try_next()
+            .await
+            .context("RTM_GETRULE while locating IPv4 rule for deletion")?
+        {
+            if matched.is_none() && parse_ipv4_rule(&message)?.as_ref() == Some(rule) {
+                matched = Some(message);
             }
         }
-        anyhow::bail!("IPv4 rule for table {} was not found", rule.table)
+        let Some(message) = matched else {
+            anyhow::bail!("IPv4 rule for table {} was not found", rule.table);
+        };
+        drop(messages);
+        self.handle
+            .rule()
+            .del(message)
+            .execute()
+            .await
+            .with_context(|| {
+                format!("RTM_DELRULE while deleting IPv4 rule for table {}", rule.table)
+            })?;
+        Ok(())
     }
 }
 

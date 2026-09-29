@@ -346,3 +346,56 @@ fn ipv4_route_spec_validates_gateway_and_table() {
     invalid_table.table = 255;
     assert!(invalid_table.validate().is_err());
 }
+
+#[tokio::test]
+async fn rtnetlink_provider_serializes_shared_handle_requests() {
+    let provider = Arc::new(RtnetlinkNetworkProvider::connect().expect("rtnetlink provider"));
+    let guard = provider.request_lock.lock().await;
+
+    let mut request = tokio::spawn({
+        let provider = provider.clone();
+        async move { provider.list_interfaces().await }
+    });
+
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut request)
+            .await
+            .is_err(),
+        "request unexpectedly bypassed the shared rtnetlink serialization lock"
+    );
+
+    drop(guard);
+    tokio::time::timeout(std::time::Duration::from_secs(5), request)
+        .await
+        .expect("serialized request timed out")
+        .expect("request task panicked")
+        .expect("RTM_GETLINK failed after serialization lock was released");
+}
+
+#[tokio::test]
+async fn concurrent_rtnetlink_reads_share_one_provider_without_overlap_errors() {
+    let provider = Arc::new(RtnetlinkNetworkProvider::connect().expect("rtnetlink provider"));
+
+    let (interfaces, routes, rules) = tokio::join!(
+        provider.list_interfaces(),
+        provider.list_ipv4_routes(),
+        provider.list_ipv4_rules(),
+    );
+
+    interfaces.expect("interfaces");
+    routes.expect("routes");
+    rules.expect("rules");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn ipv4_address_read_uses_single_serialized_netlink_sequence() {
+    let provider = RtnetlinkNetworkProvider::connect().expect("rtnetlink provider");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        provider.list_ipv4_addresses("lo"),
+    )
+    .await
+    .expect("nested RTM_GETLINK/RTM_GETADDR sequence deadlocked")
+    .expect("IPv4 address read failed");
+}
