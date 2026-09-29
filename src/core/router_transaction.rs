@@ -638,16 +638,14 @@ impl RouterTransactionCoordinator {
         // Runtime restoration can need the old credentials to start a station
         // or AP. Restore them before the snapshot, including apply compensation
         // where the provisioning journal has not been bound to a token yet.
-        let restored = secrets
-            .restore_for_token_or_unbound_for_reconvergence(token)
-            .await;
+        let restored = secrets.restore(Some(token)).await;
         let mut failures = self.inner.manager.rollback_to(snapshot).await;
         match restored {
             Err(error) => {
                 failures.push(format!("failed to restore provisioning secrets: {error:#}"))
             }
             Ok(true) if failures.is_empty() => {
-                if let Err(error) = secrets.complete_reconvergence().await {
+                if let Err(error) = secrets.finish(Some(token)).await {
                     failures.push(format!(
                         "failed to clear provisioning secret journal: {error:#}"
                     ));

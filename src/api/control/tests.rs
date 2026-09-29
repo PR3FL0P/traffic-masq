@@ -1,3 +1,4 @@
+use crate::core::transaction::InterfaceChange;
 use crate::netlink::AddressOwnership;
 use std::net::Ipv4Addr;
 
@@ -3806,7 +3807,16 @@ async fn autoconnect_is_blocked_by_pending_transaction_on_another_interface() {
     let pending = fixture
         .service
         .transactions
-        .apply_transition("wlan2", &target, None, None, true)
+        .apply(
+            "wlan2",
+            InterfaceChange {
+                config: &target,
+                previous: None,
+                current_role: None,
+                allow_management_change: true,
+                passphrase: crate::wifi::WifiPassphraseUpdate::Keep,
+            },
+        )
         .await
         .expect("create pending transaction on wlan2");
 

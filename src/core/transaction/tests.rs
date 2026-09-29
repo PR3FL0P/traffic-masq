@@ -388,7 +388,16 @@ async fn direct_commit_persists_the_configuration_and_recovery_token() {
         desired.clone(),
     );
     let pending = manager
-        .apply("test0", &interface_config(PROPOSED), None, false)
+        .apply(
+            "test0",
+            InterfaceChange {
+                config: &interface_config(PROPOSED),
+                previous: None,
+                current_role: None,
+                allow_management_change: false,
+                passphrase: WifiPassphraseUpdate::Keep,
+            },
+        )
         .await
         .unwrap();
     manager.commit(&pending.token).await.unwrap();
@@ -423,7 +432,16 @@ async fn confirmation_waits_for_an_active_convergence_pass() {
     let gate = Arc::new(NetworkMutationGate::default());
     manager.set_runtime_gate(gate.clone());
     let pending = manager
-        .apply("test0", &interface_config(PROPOSED), None, false)
+        .apply(
+            "test0",
+            InterfaceChange {
+                config: &interface_config(PROPOSED),
+                previous: None,
+                current_role: None,
+                allow_management_change: false,
+                passphrase: WifiPassphraseUpdate::Keep,
+            },
+        )
         .await
         .unwrap();
     let pass = gate.read().await;
@@ -467,9 +485,13 @@ async fn failed_commit_persistence_keeps_change_pending_for_rollback() {
     let change = manager
         .apply(
             "test0",
-            &interface_config(PROPOSED),
-            Some(InterfaceRole::Output),
-            false,
+            InterfaceChange {
+                config: &interface_config(PROPOSED),
+                previous: None,
+                current_role: Some(InterfaceRole::Output),
+                allow_management_change: false,
+                passphrase: WifiPassphraseUpdate::Keep,
+            },
         )
         .await
         .expect("apply");
@@ -521,7 +543,16 @@ async fn timeout_waits_for_admitted_confirmation() {
     let gate = Arc::new(NetworkMutationGate::default());
     manager.set_runtime_gate(gate.clone());
     let pending = manager
-        .apply("test0", &interface_config(PROPOSED), None, false)
+        .apply(
+            "test0",
+            InterfaceChange {
+                config: &interface_config(PROPOSED),
+                previous: None,
+                current_role: None,
+                allow_management_change: false,
+                passphrase: WifiPassphraseUpdate::Keep,
+            },
+        )
         .await
         .unwrap();
 
@@ -554,9 +585,13 @@ async fn uncommitted_change_is_automatically_rolled_back() {
     manager
         .apply(
             "test0",
-            &interface_config(PROPOSED),
-            Some(InterfaceRole::Output),
-            false,
+            InterfaceChange {
+                config: &interface_config(PROPOSED),
+                previous: None,
+                current_role: Some(InterfaceRole::Output),
+                allow_management_change: false,
+                passphrase: WifiPassphraseUpdate::Keep,
+            },
         )
         .await
         .expect("apply");
@@ -595,9 +630,13 @@ async fn an_apply_writes_desired_state_rather_than_the_kernel() {
     manager
         .apply(
             "test0",
-            &interface_config(PROPOSED),
-            Some(InterfaceRole::Output),
-            false,
+            InterfaceChange {
+                config: &interface_config(PROPOSED),
+                previous: None,
+                current_role: Some(InterfaceRole::Output),
+                allow_management_change: false,
+                passphrase: WifiPassphraseUpdate::Keep,
+            },
         )
         .await
         .expect("apply");
@@ -636,9 +675,13 @@ async fn failed_apply_with_failed_compensation_stays_pending_and_rollback_only()
         apply_manager
             .apply(
                 "test0",
-                &interface_config(PROPOSED),
-                Some(InterfaceRole::Output),
-                false,
+                InterfaceChange {
+                    config: &interface_config(PROPOSED),
+                    previous: None,
+                    current_role: Some(InterfaceRole::Output),
+                    allow_management_change: false,
+                    passphrase: WifiPassphraseUpdate::Keep,
+                },
             )
             .await
     });
@@ -707,13 +750,15 @@ async fn clear_passphrase_is_journaled_and_restored_on_rollback() {
     let previous = interface_config(COMMITTED);
     let proposed = credential_config(WifiCredentialRole::Ap);
     let pending = manager
-        .apply_with_passphrase_update(
+        .apply(
             "test0",
-            &proposed,
-            Some(&previous),
-            Some(InterfaceRole::Output),
-            false,
-            WifiPassphraseUpdate::Clear,
+            InterfaceChange {
+                config: &proposed,
+                previous: Some(&previous),
+                current_role: Some(InterfaceRole::Output),
+                allow_management_change: false,
+                passphrase: WifiPassphraseUpdate::Clear,
+            },
         )
         .await
         .expect("apply clear");
@@ -762,13 +807,15 @@ async fn clearing_a_removed_wifi_role_uses_the_previous_role_store_and_rolls_bac
     let mut target = previous.clone();
     target.wifi = None;
     let pending = manager
-        .apply_with_passphrase_update(
+        .apply(
             "test0",
-            &target,
-            Some(&previous),
-            Some(InterfaceRole::Output),
-            true,
-            WifiPassphraseUpdate::Clear,
+            InterfaceChange {
+                config: &target,
+                previous: Some(&previous),
+                current_role: Some(InterfaceRole::Output),
+                allow_management_change: true,
+                passphrase: WifiPassphraseUpdate::Clear,
+            },
         )
         .await
         .expect("apply AP removal");
@@ -799,13 +846,17 @@ async fn rollback_publishes_restore_intent_even_when_secret_restore_fails() {
     );
     let proposed = credential_config(WifiCredentialRole::Ap);
     let pending = manager
-        .apply_with_passphrase(
+        .apply(
             "test0",
-            &proposed,
-            None,
-            Some(InterfaceRole::Output),
-            false,
-            Some(WifiPassphrase::new("new-password").expect("passphrase")),
+            InterfaceChange {
+                config: &proposed,
+                previous: None,
+                current_role: Some(InterfaceRole::Output),
+                allow_management_change: false,
+                passphrase: Some(WifiPassphrase::new("new-password").expect("passphrase"))
+                    .map(WifiPassphraseUpdate::Set)
+                    .unwrap_or(WifiPassphraseUpdate::Keep),
+            },
         )
         .await
         .expect("apply");
@@ -865,9 +916,13 @@ async fn a_refused_change_is_reported_to_the_caller_and_not_proposed() {
     let error = manager
         .apply(
             "test0",
-            &interface_config(PROPOSED),
-            Some(InterfaceRole::None),
-            false,
+            InterfaceChange {
+                config: &interface_config(PROPOSED),
+                previous: None,
+                current_role: Some(InterfaceRole::None),
+                allow_management_change: false,
+                passphrase: WifiPassphraseUpdate::Keep,
+            },
         )
         .await
         .expect_err("a management change without confirmation must be refused");
@@ -1024,13 +1079,17 @@ async fn rejected_wifi_candidate_restores_credentials_and_both_ip_policy_transit
         let old = previous.clone();
         let apply = tokio::spawn(async move {
             apply_manager
-                .apply_with_passphrase_update(
+                .apply(
                     "test0",
-                    &candidate,
-                    Some(&old),
-                    Some(InterfaceRole::Input),
-                    true,
-                    WifiPassphraseUpdate::Set(WifiPassphrase::new("wrong-password").unwrap()),
+                    InterfaceChange {
+                        config: &candidate,
+                        previous: Some(&old),
+                        current_role: Some(InterfaceRole::Input),
+                        allow_management_change: true,
+                        passphrase: WifiPassphraseUpdate::Set(
+                            WifiPassphrase::new("wrong-password").unwrap(),
+                        ),
+                    },
                 )
                 .await
         });
@@ -1083,7 +1142,16 @@ async fn automatic_rollback_retries_after_converger_recovers() {
     let gate = Arc::new(NetworkMutationGate::default());
     manager.set_runtime_gate(gate.clone());
     let pending = manager
-        .apply("test0", &interface_config(PROPOSED), None, false)
+        .apply(
+            "test0",
+            InterfaceChange {
+                config: &interface_config(PROPOSED),
+                previous: None,
+                current_role: None,
+                allow_management_change: false,
+                passphrase: WifiPassphraseUpdate::Keep,
+            },
+        )
         .await
         .unwrap();
     desired.fail_converger("temporary failure");
@@ -1141,7 +1209,16 @@ async fn indeterminate_commit_blocks_manual_timer_and_shutdown_rollback() {
         desired.clone(),
     );
     let pending = manager
-        .apply("test0", &interface_config(PROPOSED), None, false)
+        .apply(
+            "test0",
+            InterfaceChange {
+                config: &interface_config(PROPOSED),
+                previous: None,
+                current_role: None,
+                allow_management_change: false,
+                passphrase: WifiPassphraseUpdate::Keep,
+            },
+        )
         .await
         .unwrap();
     let applied = addresses(&provider).await;
@@ -1256,13 +1333,15 @@ async fn keep_cannot_reuse_credentials_across_wifi_roles_in_either_direction() {
             )
             .unwrap();
         let error = manager
-            .apply_with_passphrase_update(
+            .apply(
                 "test0",
-                &candidate,
-                Some(&previous),
-                Some(previous.role),
-                true,
-                WifiPassphraseUpdate::Keep,
+                InterfaceChange {
+                    config: &candidate,
+                    previous: Some(&previous),
+                    current_role: Some(previous.role),
+                    allow_management_change: true,
+                    passphrase: WifiPassphraseUpdate::Keep,
+                },
             )
             .await
             .unwrap_err();
@@ -1320,13 +1399,17 @@ async fn role_switch_rollback_and_crash_recovery_restore_only_the_target_namespa
                 )
                 .unwrap();
             let pending = manager
-                .apply_with_passphrase_update(
+                .apply(
                     "test0",
-                    &candidate,
-                    Some(&previous),
-                    Some(previous.role),
-                    true,
-                    WifiPassphraseUpdate::Set(WifiPassphrase::new("new-target-password").unwrap()),
+                    InterfaceChange {
+                        config: &candidate,
+                        previous: Some(&previous),
+                        current_role: Some(previous.role),
+                        allow_management_change: true,
+                        passphrase: WifiPassphraseUpdate::Set(
+                            WifiPassphrase::new("new-target-password").unwrap(),
+                        ),
+                    },
                 )
                 .await
                 .unwrap();
@@ -1429,13 +1512,15 @@ async fn explicit_file_on_role_switch_cannot_be_shadowed_by_stale_target_secret(
         .set("test0", &WifiPassphrase::new("stale-password").unwrap())
         .unwrap();
     let pending = manager
-        .apply_with_passphrase_update(
+        .apply(
             "test0",
-            &candidate,
-            Some(&previous),
-            Some(previous.role),
-            true,
-            WifiPassphraseUpdate::Keep,
+            InterfaceChange {
+                config: &candidate,
+                previous: Some(&previous),
+                current_role: Some(previous.role),
+                allow_management_change: true,
+                passphrase: WifiPassphraseUpdate::Keep,
+            },
         )
         .await
         .unwrap();

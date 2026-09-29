@@ -115,100 +115,40 @@ impl ProvisioningSecretTransactionStore {
         self.save(&journal).await
     }
 
-    pub async fn restore_staged(&self) -> Result<bool> {
+    /// Restore the prior credentials while retaining the journal. `None` is
+    /// valid only for a staged journal; a token also accepts an unbound journal
+    /// when binding failed after the router transaction began.
+    pub async fn restore(&self, token: Option<&str>) -> Result<bool> {
         let Some(journal) = self.load().await? else {
             return Ok(false);
         };
-        if journal.token.is_some() {
-            bail!(
-                "refusing to restore a token-bound provisioning secret journal without its token"
-            );
-        }
-        self.restore_and_clear(journal).await?;
-        Ok(true)
-    }
-
-    /// Restore staged secrets but retain the journal until the caller has
-    /// re-converged every runtime consumer of those secrets.  This keeps new
-    /// network mutations fail-closed if hostapd/wpa_supplicant restoration
-    /// fails after the files themselves were restored.
-    pub async fn restore_staged_for_reconvergence(&self) -> Result<bool> {
-        let Some(journal) = self.load().await? else {
-            return Ok(false);
-        };
-        if journal.token.is_some() {
-            bail!(
-                "refusing to restore a token-bound provisioning secret journal without its token"
-            );
-        }
+        Self::check_token(&journal, token)?;
         self.restore_only(&journal).await?;
         Ok(true)
     }
 
-    pub async fn restore_for_token(&self, token: &str) -> Result<bool> {
+    /// Retire a journal only after every runtime consumer has been restored,
+    /// or after the router commit has durably recorded its token.
+    pub async fn finish(&self, token: Option<&str>) -> Result<bool> {
         let Some(journal) = self.load().await? else {
             return Ok(false);
         };
-        if journal.token.as_deref() != Some(token) {
-            bail!("provisioning secret journal does not belong to transaction {token}");
-        }
-        self.restore_and_clear(journal).await?;
-        Ok(true)
-    }
-
-    /// Restore an uncommitted journal after the router coordinator has
-    /// successfully rolled back. `None` is accepted because an apply failure
-    /// can enter RollbackFailed before the provisioning journal is bound to the
-    /// router token; the coordinator token still serializes that recovery.
-    pub async fn restore_for_token_or_unbound(&self, token: &str) -> Result<bool> {
-        let Some(journal) = self.load().await? else {
-            return Ok(false);
-        };
-        if journal
-            .token
-            .as_deref()
-            .is_some_and(|existing| existing != token)
-        {
-            bail!("provisioning secret journal does not belong to transaction {token}");
-        }
-        self.restore_and_clear(journal).await?;
-        Ok(true)
-    }
-
-    /// Token-aware variant used after router rollback when runtime consumers
-    /// still need a second convergence pass before recovery can be declared
-    /// complete.
-    pub async fn restore_for_token_or_unbound_for_reconvergence(
-        &self,
-        token: &str,
-    ) -> Result<bool> {
-        let Some(journal) = self.load().await? else {
-            return Ok(false);
-        };
-        if journal
-            .token
-            .as_deref()
-            .is_some_and(|existing| existing != token)
-        {
-            bail!("provisioning secret journal does not belong to transaction {token}");
-        }
-        self.restore_only(&journal).await?;
-        Ok(true)
-    }
-
-    pub async fn complete_reconvergence(&self) -> Result<()> {
-        self.clear().await
-    }
-
-    pub async fn discard_for_token(&self, token: &str) -> Result<bool> {
-        let Some(journal) = self.load().await? else {
-            return Ok(false);
-        };
-        if journal.token.as_deref() != Some(token) {
-            bail!("provisioning secret journal does not belong to transaction {token}");
-        }
+        Self::check_token(&journal, token)?;
         self.clear().await?;
         Ok(true)
+    }
+
+    fn check_token(journal: &ProvisioningSecretJournal, token: Option<&str>) -> Result<()> {
+        match (journal.token.as_deref(), token) {
+            (Some(existing), Some(token)) if existing == token => Ok(()),
+            (None, _) => Ok(()),
+            (Some(_), Some(token)) => {
+                bail!("provisioning secret journal does not belong to transaction {token}")
+            }
+            (Some(_), None) => {
+                bail!("refusing to access a token-bound provisioning secret journal without its token")
+            }
+        }
     }
 
     /// Resolve a journal left by a process crash before Wi-Fi supervisors start.

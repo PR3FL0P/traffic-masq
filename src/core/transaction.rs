@@ -406,6 +406,16 @@ pub struct NetworkTransactionManager {
     inner: Arc<Inner>,
 }
 
+/// One tentative interface change, including the previous configuration used
+/// to plan transitions and the explicit credential operation.
+pub struct InterfaceChange<'a> {
+    pub config: &'a InterfaceConfig,
+    pub previous: Option<&'a InterfaceConfig>,
+    pub current_role: Option<InterfaceRole>,
+    pub passphrase: WifiPassphraseUpdate,
+    pub allow_management_change: bool,
+}
+
 struct Inner {
     interface_manager: InterfaceManager,
     rollback_timeout: Duration,
@@ -638,81 +648,21 @@ impl NetworkTransactionManager {
         Ok(plan)
     }
 
-    /// Propose an interface change and wait for convergence before returning its confirmation token.
-    pub async fn apply(
-        &self,
-        interface: &str,
-        config: &InterfaceConfig,
-        current_role: Option<InterfaceRole>,
-        allow_management_change: bool,
-    ) -> Result<PendingNetworkChange> {
-        self.apply_transition(
-            interface,
-            config,
-            None,
-            current_role,
-            allow_management_change,
-        )
-        .await
-    }
-
-    /// Apply a tentative transition while retaining the previous configuration for rollback.
-    pub async fn apply_transition(
-        &self,
-        interface: &str,
-        config: &InterfaceConfig,
-        previous_config: Option<&InterfaceConfig>,
-        current_role: Option<InterfaceRole>,
-        allow_management_change: bool,
-    ) -> Result<PendingNetworkChange> {
-        self.apply_with_passphrase(
-            interface,
-            config,
-            previous_config,
-            current_role,
-            allow_management_change,
-            None,
-        )
-        .await
-    }
-
-    /// Backwards-compatible secret staging: `None` keeps the stored credential and
-    /// `Some` replaces it. Use `apply_with_passphrase_update` when an explicit clear is needed.
-    pub async fn apply_with_passphrase(
-        &self,
-        interface: &str,
-        config: &InterfaceConfig,
-        previous_config: Option<&InterfaceConfig>,
-        current_role: Option<InterfaceRole>,
-        allow_management_change: bool,
-        passphrase: Option<WifiPassphrase>,
-    ) -> Result<PendingNetworkChange> {
-        let update = passphrase
-            .map(WifiPassphraseUpdate::Set)
-            .unwrap_or(WifiPassphraseUpdate::Keep);
-        self.apply_with_passphrase_update(
-            interface,
-            config,
-            previous_config,
-            current_role,
-            allow_management_change,
-            update,
-        )
-        .await
-    }
-
     /// Journal the original interface and explicit secret operation before proposing a change.
     /// Wait for convergence and require confirmation before the deadline; failed rollback
     /// remains visible and journaled so recovery can be retried.
-    pub async fn apply_with_passphrase_update(
+    pub async fn apply(
         &self,
         interface: &str,
-        config: &InterfaceConfig,
-        previous_config: Option<&InterfaceConfig>,
-        current_role: Option<InterfaceRole>,
-        allow_management_change: bool,
-        passphrase_update: WifiPassphraseUpdate,
+        change: InterfaceChange<'_>,
     ) -> Result<PendingNetworkChange> {
+        let InterfaceChange {
+            config,
+            previous: previous_config,
+            current_role,
+            passphrase: passphrase_update,
+            allow_management_change,
+        } = change;
         let _operation = self.inner.operation_lock.lock().await;
         let gate = self.runtime_gate();
         let execution = match &gate {

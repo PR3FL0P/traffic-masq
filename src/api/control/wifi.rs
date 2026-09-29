@@ -1,5 +1,6 @@
 use super::dhcp::{default_dhcp_settings, dhcp_edit_request_to_config};
 use super::*;
+use crate::core::transaction::InterfaceChange;
 
 impl ControlService {
     pub(super) async fn wifi_status(&self) -> Response {
@@ -104,13 +105,15 @@ impl ControlService {
         };
         match self
             .transactions
-            .apply_with_passphrase_update(
+            .apply(
                 &interface,
-                &interface_config,
-                previous,
-                previous.map(|config| config.role),
-                false,
-                update,
+                InterfaceChange {
+                    config: &interface_config,
+                    previous,
+                    current_role: previous.map(|config| config.role),
+                    allow_management_change: false,
+                    passphrase: update,
+                },
             )
             .await
         {
@@ -227,13 +230,15 @@ impl ControlService {
         // rollback restores both network state and the previous secret.
         let pending = match self
             .transactions
-            .apply_with_passphrase_update(
+            .apply(
                 &interface,
-                &target,
-                previous_interface.as_ref(),
-                previous_interface.as_ref().map(|config| config.role),
-                true,
-                passphrase_update,
+                InterfaceChange {
+                    config: &target,
+                    previous: previous_interface.as_ref(),
+                    current_role: previous_interface.as_ref().map(|config| config.role),
+                    allow_management_change: true,
+                    passphrase: passphrase_update,
+                },
             )
             .await
         {
@@ -261,16 +266,17 @@ impl ControlService {
         target.wifi = None;
         match self
             .transactions
-            .apply_with_passphrase_update(
+            .apply(
                 &interface,
-                &target,
-                Some(previous),
-                Some(previous.role),
-                true,
-                // Removing an AP is the point at which its stored credential
-                // becomes obsolete. The transaction journals it first, clears
-                // it while tentative, and restores it automatically on rollback.
-                WifiPassphraseUpdate::Clear,
+                InterfaceChange {
+                    config: &target,
+                    previous: Some(previous),
+                    current_role: Some(previous.role),
+                    allow_management_change: true,
+                    // Removing an AP makes its stored credential obsolete.
+                    // The transaction restores it if the change rolls back.
+                    passphrase: WifiPassphraseUpdate::Clear,
+                },
             )
             .await
         {

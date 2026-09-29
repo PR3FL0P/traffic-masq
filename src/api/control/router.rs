@@ -195,7 +195,7 @@ impl ControlService {
                 let secrets = ProvisioningSecretTransactionStore::in_state_dir(
                     &self.config.runtime.state_dir,
                 );
-                if let Err(error) = secrets.discard_for_token(&token).await {
+                if let Err(error) = secrets.finish(Some(&token)).await {
                     tracing::warn!(%error, %token, "failed to clean committed provisioning secret journal");
                 }
                 Response::RouterCommitted { revision }
@@ -214,7 +214,7 @@ impl ControlService {
                     &self.config.runtime.state_dir,
                 );
                 match secrets
-                    .restore_for_token_or_unbound_for_reconvergence(&token)
+                    .restore(Some(&token))
                     .await
                 {
                     Ok(true) => {
@@ -230,7 +230,7 @@ impl ControlService {
                                 "router state restored but Wi-Fi secret re-convergence failed; recovery journal retained",
                             ));
                         }
-                        if let Err(error) = secrets.complete_reconvergence().await {
+                        if let Err(error) = secrets.finish(Some(&token)).await {
                             return classify_router_error(error.context(
                                 "router state and Wi-Fi secrets were restored but recovery journal cleanup failed",
                             ));
@@ -257,10 +257,7 @@ impl ControlService {
                         let secrets = ProvisioningSecretTransactionStore::in_state_dir(
                             &self.config.runtime.state_dir,
                         );
-                        match secrets
-                            .restore_for_token_or_unbound_for_reconvergence(&token)
-                            .await
-                        {
+                        match secrets.restore(Some(&token)).await {
                             Ok(true) => {
                                 let desired = match self.current_router_desired().await {
                                     Ok(desired) => desired,
@@ -271,7 +268,7 @@ impl ControlService {
                                         "router rollback completed but Wi-Fi secret re-convergence failed; recovery journal retained",
                                     ));
                                 }
-                                if let Err(cleanup_error) = secrets.complete_reconvergence().await {
+                                if let Err(cleanup_error) = secrets.finish(Some(&token)).await {
                                     return classify_router_error(cleanup_error.context(
                                         "router rollback and Wi-Fi secret re-convergence completed but recovery journal cleanup failed",
                                     ));
@@ -498,7 +495,7 @@ impl ControlService {
                 .set_passphrase(&output_interface, passphrase)
                 .await
             {
-                let restore = secret_tx.restore_staged().await;
+                let restore = restore_staged_and_finish(&secret_tx).await;
                 return provisioning_error(RouterProvisioningErrorDetail::InvalidSecret {
                     message: match restore {
                         Ok(_) => error.to_string(),
@@ -516,7 +513,7 @@ impl ControlService {
                 .set_passphrase(&uplink_interface, passphrase)
                 .await
             {
-                let restore = secret_tx.restore_staged().await;
+                let restore = restore_staged_and_finish(&secret_tx).await;
                 return provisioning_error(RouterProvisioningErrorDetail::InvalidSecret {
                     message: match restore {
                         Ok(_) => error.to_string(),
@@ -532,7 +529,7 @@ impl ControlService {
         let candidate = match self.overrides.build_candidate(&proposal).await {
             Ok(candidate) => candidate,
             Err(error) => {
-                let restore = secret_tx.restore_staged().await;
+                let restore = restore_staged_and_finish(&secret_tx).await;
                 if let Err(restore_error) = restore {
                     return provisioning_error(RouterProvisioningErrorDetail::Other {
                         message: format!(
@@ -546,7 +543,7 @@ impl ControlService {
         let transaction_plan = match router.plan(candidate).await {
             Ok(plan) => plan,
             Err(error) => {
-                let restore = secret_tx.restore_staged().await;
+                let restore = restore_staged_and_finish(&secret_tx).await;
                 if let Err(restore_error) = restore {
                     return provisioning_error(RouterProvisioningErrorDetail::Other {
                         message: format!(
@@ -567,7 +564,7 @@ impl ControlService {
                 // so reconcile once more after restoring it to ensure running
                 // Wi-Fi daemons also use the committed secret.
                 if router.status().await != CoordinatorStatus::RollbackFailed {
-                    match secret_tx.restore_staged_for_reconvergence().await {
+                    match secret_tx.restore(None).await {
                         Ok(true) => {
                             let committed = match self.current_router_desired().await {
                                 Ok(desired) => desired,
@@ -580,7 +577,7 @@ impl ControlService {
                                     ),
                                 });
                             }
-                            if let Err(cleanup_error) = secret_tx.complete_reconvergence().await {
+                            if let Err(cleanup_error) = secret_tx.finish(None).await {
                                 return provisioning_error(RouterProvisioningErrorDetail::Other {
                                     message: format!(
                                         "{error:#}; prior secrets and runtime were restored but recovery journal cleanup failed: {cleanup_error:#}; recovery required"
@@ -606,7 +603,7 @@ impl ControlService {
             match router.rollback_with_token(&token).await {
                 Ok(()) => {
                     let message = match secret_tx
-                        .restore_for_token_or_unbound_for_reconvergence(&token)
+                        .restore(Some(&token))
                         .await
                     {
                         Ok(true) => {
@@ -615,8 +612,8 @@ impl ControlService {
                                 Err(response) => return response,
                             };
                             match router.repair(committed).await {
-                                Ok(()) => match secret_tx.complete_reconvergence().await {
-                                    Ok(()) => format!(
+                                Ok(()) => match secret_tx.finish(Some(&token)).await {
+                                    Ok(_) => format!(
                                         "failed to bind provisioning secrets to router transaction {token}: {error:#}; router state and prior secrets were restored"
                                     ),
                                     Err(cleanup_error) => format!(
@@ -887,7 +884,7 @@ impl ControlService {
                 == Some(token.as_str());
             let secrets = ProvisioningSecretTransactionStore::in_state_dir(&state_dir);
             if committed {
-                if let Err(error) = secrets.discard_for_token(&token).await {
+                if let Err(error) = secrets.finish(Some(&token)).await {
                     tracing::warn!(%error, %token, "failed to clean committed provisioning secret journal");
                 }
                 return;
@@ -910,16 +907,13 @@ impl ControlService {
                 .as_deref()
                 == Some(token.as_str());
             if committed {
-                if let Err(error) = secrets.discard_for_token(&token).await {
+                if let Err(error) = secrets.finish(Some(&token)).await {
                     tracing::warn!(%error, %token, "failed to clean committed provisioning secret journal");
                 }
                 return;
             }
 
-            match secrets
-                .restore_for_token_or_unbound_for_reconvergence(&token)
-                .await
-            {
+            match secrets.restore(Some(&token)).await {
                 Ok(true) => {
                     let snapshot = overrides.snapshot().await;
                     match snapshot
@@ -928,7 +922,7 @@ impl ControlService {
                     {
                         Ok(desired) => match router.repair(desired).await {
                             Ok(()) => {
-                                if let Err(error) = secrets.complete_reconvergence().await {
+                                if let Err(error) = secrets.finish(Some(&token)).await {
                                     tracing::error!(%error, %token, "provisioning timeout recovery converged but journal cleanup failed; recovery remains blocked");
                                 }
                             }
@@ -1074,4 +1068,14 @@ mod recovery_notice_tests {
         assert!(router_recovery_notice(CoordinatorStatus::Idle, Vec::new()).is_none());
         assert!(router_recovery_notice(CoordinatorStatus::Pending, Vec::new()).is_none());
     }
+}
+
+async fn restore_staged_and_finish(
+    secrets: &ProvisioningSecretTransactionStore,
+) -> anyhow::Result<bool> {
+    let restored = secrets.restore(None).await?;
+    if restored {
+        secrets.finish(None).await?;
+    }
+    Ok(restored)
 }

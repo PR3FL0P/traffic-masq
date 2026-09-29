@@ -5,6 +5,7 @@ use super::dhcp::{
 use super::interfaces::{interface_edit_request_to_config, interface_statuses};
 use super::runtime::error_response;
 use super::*;
+use crate::core::transaction::InterfaceChange;
 
 impl ControlService {
     /// Route a typed request to its handler while enforcing mutation and recovery gates.
@@ -394,12 +395,15 @@ impl ControlService {
                 }
                 match self
                     .transactions
-                    .apply_transition(
+                    .apply(
                         &interface,
-                        &config,
-                        current.as_ref(),
-                        current_role,
-                        allow_management_change,
+                        InterfaceChange {
+                            config: &config,
+                            previous: current.as_ref(),
+                            current_role: current_role,
+                            allow_management_change: allow_management_change,
+                            passphrase: crate::wifi::WifiPassphraseUpdate::Keep,
+                        },
                     )
                     .await
                 {
@@ -444,12 +448,15 @@ impl ControlService {
                         }
                         match self
                             .transactions
-                            .apply_transition(
+                            .apply(
                                 &interface,
-                                &config,
-                                current.as_ref(),
-                                current_role,
-                                allow_management_change,
+                                InterfaceChange {
+                                    config: &config,
+                                    previous: current.as_ref(),
+                                    current_role: current_role,
+                                    allow_management_change: allow_management_change,
+                                    passphrase: crate::wifi::WifiPassphraseUpdate::Keep,
+                                },
                             )
                             .await
                         {

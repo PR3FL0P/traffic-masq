@@ -76,10 +76,7 @@ async fn reconvergence_restore_keeps_journal_until_explicit_completion() {
         .expect("stage");
     passphrases.set("wlan0", &new).expect("new write");
 
-    assert!(store
-        .restore_staged_for_reconvergence()
-        .await
-        .expect("restore"));
+    assert!(store.restore(None).await.expect("restore"));
     assert_eq!(
         passphrases
             .get("wlan0")
@@ -93,10 +90,48 @@ async fn reconvergence_restore_keeps_journal_until_explicit_completion() {
         .await
         .expect("journal must remain"));
 
-    store
-        .complete_reconvergence()
+    store.finish(None).await.expect("complete recovery");
+    assert!(!store
+        .unresolved_after_committed_cleanup(None)
         .await
-        .expect("complete recovery");
+        .expect("journal cleared"));
+}
+
+#[tokio::test]
+async fn restore_rejects_wrong_token_and_retains_journal_until_finish() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
+    let passphrases = PassphraseStore::new(temp.path().join("wifi/psk-ap"));
+    let old = WifiPassphrase::new("old-password").expect("old");
+    let new = WifiPassphrase::new("new-password").expect("new");
+    store
+        .stage(BTreeMap::from([(
+            "wlan0".to_owned(),
+            (WifiCredentialRole::Ap, Some(old)),
+        )]))
+        .await
+        .expect("stage");
+    passphrases.set("wlan0", &new).expect("new write");
+    store.bind_token("expected").await.expect("bind");
+
+    assert!(store.restore(Some("other")).await.is_err());
+    assert!(store.finish(Some("other")).await.is_err());
+    assert!(store.restore(None).await.is_err());
+    assert_eq!(
+        passphrases
+            .get("wlan0")
+            .expect("read")
+            .expect("secret")
+            .expose(),
+        "new-password"
+    );
+
+    assert!(store.restore(Some("expected")).await.expect("restore"));
+    assert!(store
+        .unresolved_after_committed_cleanup(None)
+        .await
+        .expect("journal remains"));
+    assert!(store.finish(Some("expected")).await.expect("finish"));
     assert!(!store
         .unresolved_after_committed_cleanup(None)
         .await
