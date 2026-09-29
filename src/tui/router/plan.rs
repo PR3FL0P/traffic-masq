@@ -277,6 +277,7 @@ pub(crate) async fn open_router_plan(app: &mut TuiApp, client: &ApiClient) {
             app.router.error = Some(detail.clone());
             app.push_message(LogLevel::Error, describe_router_error(&detail));
         }
+        Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
         Ok(response) => {
             app.push_message(
                 LogLevel::Error,
@@ -344,6 +345,7 @@ async fn router_apply_current_plan(app: &mut TuiApp, client: &ApiClient) {
         Ok(Response::RouterError { detail }) => {
             app.push_message(LogLevel::Error, describe_router_error(&detail));
         }
+        Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
         Ok(response) => app.push_message(
             LogLevel::Error,
             format!("Unexpected response: {response:?}"),

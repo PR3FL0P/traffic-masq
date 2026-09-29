@@ -312,6 +312,7 @@ async fn finish_router_pending(app: &mut TuiApp, client: &ApiClient, commit: boo
                 view.recovery = recovery;
             }
         }
+        Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
         Ok(response) => {
             app.push_message(
                 LogLevel::Error,

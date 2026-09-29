@@ -272,6 +272,16 @@ pub(crate) async fn refresh_router_data(app: &mut TuiApp, client: &ApiClient) {
     load_router_data(app, client).await;
 }
 
+/// Refresh only volatile router status.
+///
+/// This is intentionally cheaper than `load_router_data`: the TUI calls it from
+/// its periodic refresh loop, so it must not request a dry-run router plan or
+/// reload editor configuration/routes. Full router data is loaded explicitly on
+/// screen entry, user refresh, and after router mutations.
+pub(crate) async fn refresh_router_status(app: &mut TuiApp, client: &ApiClient) {
+    let _ = load_router_status(app, client).await;
+}
+
 /// Report whether current editor state requires a new router preview.
 pub(super) fn router_plan_needed(router: &RouterData) -> bool {
     router.enabled
@@ -285,10 +295,7 @@ pub(super) fn router_plan_needed(router: &RouterData) -> bool {
             .is_some_and(|rules| !rules.is_empty())
 }
 
-/// Refresh router configuration, status, and pending transaction state from the daemon.
-pub(crate) async fn load_router_data(app: &mut TuiApp, client: &ApiClient) {
-    app.router.error = None;
-
+async fn load_router_status(app: &mut TuiApp, client: &ApiClient) -> bool {
     match client.request(&Request::RouterStatus).await {
         Ok(Response::RouterStatus {
             enabled,
@@ -302,12 +309,19 @@ pub(crate) async fn load_router_data(app: &mut TuiApp, client: &ApiClient) {
             app.router.coordinator_status = Some(coordinator_status);
             app.router.recovery = recovery;
             app.router.health = health;
+            true
         }
         Ok(Response::RouterError { detail }) => {
             app.router.error = Some(detail);
             app.router.topology.loaded = false;
             app.router.plan = None;
-            return;
+            false
+        }
+        Ok(Response::Error { message }) => {
+            app.push_message(LogLevel::Error, message);
+            app.router.topology.loaded = false;
+            app.router.plan = None;
+            false
         }
         Ok(response) => {
             app.push_message(
@@ -316,14 +330,22 @@ pub(crate) async fn load_router_data(app: &mut TuiApp, client: &ApiClient) {
             );
             app.router.topology.loaded = false;
             app.router.plan = None;
-            return;
+            false
         }
         Err(error) => {
             app.push_message(LogLevel::Error, error.to_string());
             app.router.topology.loaded = false;
             app.router.plan = None;
-            return;
+            false
         }
+    }
+}
+
+/// Refresh router configuration, status, and pending transaction state from the daemon.
+pub(crate) async fn load_router_data(app: &mut TuiApp, client: &ApiClient) {
+    app.router.error = None;
+    if !load_router_status(app, client).await {
+        return;
     }
 
     let mut topology_loaded = true;
@@ -367,6 +389,10 @@ pub(crate) async fn load_router_data(app: &mut TuiApp, client: &ApiClient) {
         }
         Ok(Response::RouterError { detail }) => {
             app.router.error = Some(detail);
+            app.router.plan = None;
+        }
+        Ok(Response::Error { message }) => {
+            app.push_message(LogLevel::Error, message);
             app.router.plan = None;
         }
         Ok(response) => {

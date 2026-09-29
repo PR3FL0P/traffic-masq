@@ -705,6 +705,61 @@ fn degraded_recovery_marks_router_mutations_as_blocked() {
 }
 
 #[tokio::test]
+async fn periodic_router_status_refresh_does_not_request_a_plan() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("api.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut bytes = [0; 1024];
+        while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+            let count = stream.read(&mut bytes).await.unwrap();
+            assert!(count > 0);
+            request.extend_from_slice(&bytes[..count]);
+        }
+
+        let body = serde_json::to_vec(&Response::RouterStatus {
+            enabled: true,
+            ready: true,
+            coordinator_status: CoordinatorStatus::Idle,
+            health: RouterHealthReport::default(),
+            recovery: None,
+        })
+        .unwrap();
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        stream.write_all(&body).await.unwrap();
+        drop(stream);
+
+        tokio::time::timeout(std::time::Duration::from_millis(200), listener.accept())
+            .await
+            .is_err()
+    });
+
+    let mut app = TuiApp::default();
+    app.router.proposed_router_config.enabled = true;
+    app.router.error = Some(RouterErrorDetail::StalePlan);
+    super::controller::refresh_router_status(&mut app, &ApiClient::new(socket)).await;
+
+    assert!(app.router.enabled);
+    assert!(app.router.ready);
+    assert!(app.router.proposed_router_config.enabled);
+    assert!(matches!(app.router.error, Some(RouterErrorDetail::StalePlan)));
+    assert!(server.await.unwrap(), "periodic refresh made a second API request");
+}
+
+#[tokio::test]
 async fn failed_status_refresh_preserves_last_known_recovery() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

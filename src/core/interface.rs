@@ -290,9 +290,10 @@ impl InterfaceManager {
 
     /// Plan a change and record the decision.
     ///
-    /// Every outcome is logged, including refusals, because "nothing happened"
-    /// and "the plan was empty" and "planning was rejected" look identical from
-    /// the outside and have completely different causes.
+    /// Successful planning is observational and can run frequently (for example,
+    /// from TUI dry-run previews), so it is DEBUG telemetry. Refusals remain WARN
+    /// because they explain why a requested change cannot proceed. Actual mutations
+    /// are logged by `apply_plan` at INFO.
     pub async fn plan_interface_transition(
         &self,
         name: &str,
@@ -313,7 +314,7 @@ impl InterfaceManager {
             .await;
 
         match &result {
-            Ok(plan) => tracing::info!(
+            Ok(plan) => tracing::debug!(
                 interface = %name,
                 managed = config.managed,
                 ?previous_managed,
@@ -375,7 +376,7 @@ impl InterfaceManager {
             let delete_ipv4 = {
                 let previous_ipv4 = previous_config.and_then(|previous| previous.ipv4);
                 let observed = self.provider.list_ipv4_addresses(name).await?;
-                tracing::info!(
+                tracing::debug!(
                     interface = %name,
                     observed = %describe_addresses(&observed),
                     ?previous_ipv4,
@@ -457,7 +458,7 @@ impl InterfaceManager {
             .ipv4
             .map(|network| (network.addr(), network.prefix_len()));
         let can_tag = self.provider.supports_ipv4_address_protocol();
-        tracing::info!(
+        tracing::debug!(
             interface = %name,
             observed = %describe_addresses(&current),
             ?desired,

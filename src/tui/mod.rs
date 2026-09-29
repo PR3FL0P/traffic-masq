@@ -582,7 +582,7 @@ async fn run_loop(
                 dashboard::record_traffic_samples(&mut app);
 
                 if !direct && matches!(app.screen, Screen::Router | Screen::RouterPlan) {
-                    router::load_router_data(&mut app, client).await;
+                    router::refresh_router_status(&mut app, client).await;
                 }
                 if !direct {
                     router::refresh_router_pending_screen(&mut app, client).await;

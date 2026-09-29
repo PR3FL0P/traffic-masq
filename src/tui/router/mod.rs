@@ -33,7 +33,7 @@ mod view;
 
 // Keep router's external surface stable while implementation is split by responsibility.
 pub(crate) use controller::{
-    focus_action, handle_router_key, load_router_data, refresh_router_data,
+    focus_action, handle_router_key, load_router_data, refresh_router_data, refresh_router_status,
 };
 pub(crate) use editor::{focus_route_editor_action, handle_route_editor_key, render_route_editor};
 pub(crate) use pending::{
