@@ -367,16 +367,18 @@ impl HostapdSupervisor {
 
         let existing = self.inner.tasks.lock().await.get(&interface).cloned();
         let task = match existing {
-            Some(mut task)
+            Some(task)
                 if task.record.config_digest == rendered.config_digest
                     && task.record.key_digest == rendered.key_digest =>
             {
-                if self.task_process_matches(&task).await? {
+                if task.retry.is_waiting() || self.task_process_matches(&task).await? {
                     task
                 } else {
-                    self.restart_task(&mut task, &spec, &rendered, &ctrl_path)
-                        .await?;
-                    task
+                    // The convergence loop also reapplies unchanged intent.
+                    // Route repair through the same retry policy as liveness
+                    // checks, otherwise it bypasses the restart backoff.
+                    self.ensure_interface_alive(&interface).await?;
+                    return Ok(());
                 }
             }
             Some(mut task) => {
@@ -858,7 +860,11 @@ impl HostapdSupervisor {
             WifiHealth::Healthy
         } else if hostapd_state == HostapdState::Disabled {
             retry_health(
-                "hostapd reports DISABLED",
+                if task.spec.channel == 0 {
+                    "hostapd reports DISABLED with automatic channel selection; if ACS cannot collect survey data, select a fixed channel supported by the radio and country"
+                } else {
+                    "hostapd reports DISABLED; check the channel, country and driver diagnostics"
+                },
                 task.retry.consecutive_failures.max(1),
                 task.retry.next_restart_earliest,
                 interface,
@@ -1112,15 +1118,26 @@ impl HostapdSupervisor {
             }
         }
 
-        task.retry.consecutive_failures += 1;
+        task.retry.consecutive_failures = task.retry.consecutive_failures.saturating_add(1);
         match self
             .spawn_and_record(&task.spec, &rendered, &ctrl_path)
             .await
         {
             Ok(record) => {
                 task.record = record;
-                task.retry.next_restart_earliest = None;
+                // A responsive control socket proves startup, not a working AP.
+                // ACS can fail after PING succeeds. Keep exponential backoff
+                // until a later health check actually observes ENABLED.
+                task.retry.next_restart_earliest = Some(
+                    Instant::now()
+                        + crate::wifi::lifecycle::backoff_duration(
+                            self.inner.restart_backoff_seconds,
+                            task.retry.consecutive_failures,
+                        ),
+                );
                 task.retry.last_failure = None;
+                task.last_hostapd_state = None;
+                task.last_state_change_at = Instant::now();
             }
             Err(error) => {
                 tracing::error!(%interface, %error, "failed to respawn hostapd");

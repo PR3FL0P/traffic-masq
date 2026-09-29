@@ -47,6 +47,11 @@ struct FakeHostapdCtrl {
 
 impl FakeHostapdCtrl {
     fn spawn(ctrl_path: PathBuf, source: SsidSource) -> Self {
+        Self::spawn_with_state(ctrl_path, source, "ENABLED")
+    }
+
+    fn spawn_with_state(ctrl_path: PathBuf, source: SsidSource, state: &str) -> Self {
+        let state = state.to_string();
         let socket = StdUnixDatagram::bind(&ctrl_path).expect("bind fake ctrl socket");
         socket
             .set_read_timeout(Some(Duration::from_millis(20)))
@@ -75,7 +80,7 @@ impl FakeHostapdCtrl {
                     "PONG\n".to_string()
                 } else if command == "STATUS" {
                     format!(
-                        "state=ENABLED\nssid[0]={ssid}\nbssid[0]=02:00:00:00:00:00\nnum_sta[0]=0\n"
+                        "state={state}\nssid[0]={ssid}\nbssid[0]=02:00:00:00:00:00\nnum_sta[0]=0\n"
                     )
                 } else if command == "RELOAD" {
                     ssid = source.current();
@@ -1288,4 +1293,94 @@ async fn disabling_ap_never_signals_a_pid_with_mismatched_identity() {
         .calls()
         .iter()
         .any(|c| matches!(c, FakeCall::Terminate(_) | FakeCall::Kill(_))));
+}
+
+#[tokio::test]
+async fn disabled_acs_ap_keeps_backoff_after_a_successful_spawn() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("hostapd");
+    let process = FakeProcess::new("hostapd", 1000, "DISABLED", |_, path, state| {
+        FakeHostapdCtrl::spawn_with_state(
+            path.with_extension(""),
+            SsidSource::ConfigFile(path.to_path_buf()),
+            state,
+        )
+    });
+    let supervisor = test_supervisor(temp.path(), &runtime, process.clone()).await;
+    let mut ap = spec("wlan0", "acs-test");
+    ap.channel = 0;
+    supervisor.configure(ap.clone()).await.unwrap();
+
+    for attempt in 1..=3 {
+        assert!(supervisor.ensure_alive().await.unwrap());
+        let count = process.spawn_count();
+        assert!(!supervisor.ensure_alive().await.unwrap());
+        assert_eq!(process.spawn_count(), count);
+        supervisor.configure(ap.clone()).await.unwrap();
+        assert_eq!(
+            process.spawn_count(),
+            count,
+            "convergence must respect backoff"
+        );
+        let status = supervisor.status("wlan0").await.unwrap();
+        let WifiHealth::Retrying { error, .. } = status.health else {
+            panic!("a disabled AP must report failure");
+        };
+        assert!(error.contains("fixed channel"));
+        let mut tasks = supervisor.inner.tasks.lock().await;
+        let task = tasks.get_mut("wlan0").unwrap();
+        assert_eq!(task.retry.consecutive_failures, attempt);
+        assert!(task.retry.next_restart_earliest.unwrap() > Instant::now());
+        // Advance the supervisor's retry deadline without a wall-clock sleep.
+        task.retry.next_restart_earliest = Some(Instant::now());
+    }
+    let pid = supervisor.status("wlan0").await.unwrap().pid;
+    process.kill_externally(pid);
+    supervisor
+        .inner
+        .tasks
+        .lock()
+        .await
+        .get_mut("wlan0")
+        .unwrap()
+        .retry
+        .next_restart_earliest = Some(Instant::now() + Duration::from_secs(60));
+    let count = process.spawn_count();
+    supervisor.configure(ap).await.unwrap();
+    assert_eq!(
+        process.spawn_count(),
+        count,
+        "unchanged intent must not restart a dead process during backoff"
+    );
+    supervisor
+        .inner
+        .tasks
+        .lock()
+        .await
+        .get_mut("wlan0")
+        .unwrap()
+        .retry
+        .next_restart_earliest = Some(Instant::now());
+    process.set_spawn_profile("ENABLED");
+    assert!(supervisor.ensure_alive().await.unwrap());
+    supervisor
+        .inner
+        .tasks
+        .lock()
+        .await
+        .get_mut("wlan0")
+        .unwrap()
+        .retry
+        .next_restart_earliest = Some(Instant::now());
+    assert!(!supervisor.ensure_alive().await.unwrap());
+    assert_eq!(
+        supervisor.inner.tasks.lock().await["wlan0"]
+            .retry
+            .consecutive_failures,
+        0
+    );
+    assert!(matches!(
+        supervisor.status("wlan0").await.unwrap().health,
+        WifiHealth::Healthy
+    ));
 }

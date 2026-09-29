@@ -415,6 +415,14 @@ point or an active Wi-Fi client from the TUI is tentative as well: the pending
 screen must be committed to keep the deactivation, otherwise rollback restores
 the previous interface state (and the AP credential when applicable).
 
+If hostapd repeatedly reports `ACS: Unable to collect survey data`, automatic
+channel selection (`channel = 0`) cannot obtain the measurements it needs from
+the radio/driver. Edit the AP profile to use a fixed channel permitted by the
+radio and country, then apply and confirm the change. Saving a profile alone
+does not update the running AP. Repeated unsuccessful AP starts use exponential
+restart backoff (up to five minutes); answering control-socket PING does not
+reset that backoff until hostapd reports `ENABLED`.
+
 ## Daemon commands
 
 ```text
