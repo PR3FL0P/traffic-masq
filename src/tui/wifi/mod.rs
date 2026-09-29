@@ -90,6 +90,8 @@ impl WifiData {
     }
 
     fn replace_rows(&mut self, rows: Vec<WifiRow>) {
+        let library = (!self.actions_open && self.selected >= self.rows.len())
+            .then(|| self.selected - self.rows.len());
         let previous = self
             .focused_radio()
             .map(|row| (row.interface.clone(), row.role));
@@ -105,6 +107,8 @@ impl WifiData {
         self.actions_open = self.actions_open && retained.is_some();
         self.selected = if self.actions_open {
             self.rows.len() + action.unwrap_or(0)
+        } else if let Some(slot) = library {
+            self.rows.len() + slot
         } else {
             self.selected_radio
         }
@@ -112,8 +116,11 @@ impl WifiData {
     }
 
     fn cursor_limit(&self) -> usize {
+        if !self.actions_open {
+            return self.rows.len() + 1;
+        }
         let Some(row) = self.focused_radio() else {
-            return 0;
+            return self.rows.len() + 1;
         };
         if self.actions_open {
             self.rows.len() + actions(row.role).len() - 1
@@ -352,6 +359,15 @@ impl WifiProfileAction {
         Self::Back,
     ];
 
+    pub(crate) fn for_interface(interface: &str) -> &'static [Self] {
+        if interface.is_empty() {
+            &[Self::Edit, Self::Delete, Self::Back]
+        } else {
+            &Self::ALL
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn from_index(index: usize) -> Option<Self> {
         Self::ALL.get(index).copied()
     }
@@ -631,7 +647,6 @@ fn actions(role: WifiRole) -> &'static [(PrimaryAction, &'static str)] {
         WifiRole::AccessPoint => &[
             (PrimaryAction::ConfigureAp, "Configure access point"),
             (PrimaryAction::ApProfiles, "Saved AP profiles"),
-            (PrimaryAction::Profiles, "Use as client (saved profile)"),
             (PrimaryAction::Reload, "Reload access point"),
             (PrimaryAction::Deactivate, "Deactivate access point"),
             (PrimaryAction::Refresh, "Refresh"),
@@ -639,19 +654,11 @@ fn actions(role: WifiRole) -> &'static [(PrimaryAction, &'static str)] {
         WifiRole::Client => &[
             (PrimaryAction::Scan, "Scan networks"),
             (PrimaryAction::Profiles, "Saved profiles"),
-            (PrimaryAction::ConfigureAp, "Use as access point"),
-            (PrimaryAction::ApProfiles, "Saved AP profiles"),
             (PrimaryAction::Reconnect, "Reconnect"),
             (PrimaryAction::Deactivate, "Deactivate"),
             (PrimaryAction::Refresh, "Refresh"),
         ],
-        WifiRole::Unknown => &[
-            (PrimaryAction::Scan, "Scan / connect"),
-            (PrimaryAction::Profiles, "Saved profiles"),
-            (PrimaryAction::ConfigureAp, "Create hotspot"),
-            (PrimaryAction::ApProfiles, "Saved AP profiles"),
-            (PrimaryAction::Refresh, "Refresh"),
-        ],
+        WifiRole::Unknown => &[(PrimaryAction::Refresh, "Refresh")],
     }
 }
 
@@ -701,6 +708,19 @@ pub(crate) fn render_wifi(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
     }
     let radio_start = usize::from(app.wifi.error.is_some());
     let mut button_rows = Vec::new();
+    if !app.wifi.actions_open {
+        for (slot, label) in ["Saved client profiles", "Saved AP profiles"]
+            .iter()
+            .enumerate()
+        {
+            let selected = app.wifi.selected == app.wifi.rows.len() + slot;
+            button_rows.push((lines.len(), slot));
+            lines.push(Line::styled(
+                format!("{}{}", if selected { "▶ " } else { "  " }, label),
+                selected_style(selected),
+            ));
+        }
+    }
     if app.wifi.actions_open {
         if let Some(row) = app.wifi.focused_radio() {
             lines.push(Line::from(format!("Actions for {}", row.interface)));
@@ -723,7 +743,7 @@ pub(crate) fn render_wifi(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
             }
             if row.role == WifiRole::Unknown {
                 lines.push(Line::styled(
-                    "Not configured: scan and connect, or create a hotspot.",
+                    "Assign input (client) or output (AP) in Interfaces first.",
                     Style::default().fg(theme::WARN),
                 ));
             }
@@ -775,7 +795,9 @@ pub(crate) fn render_wifi(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
             }
         }
     }
-    let selected_line = radio_start + app.wifi.selected + usize::from(app.wifi.actions_open);
+    let selected_line = radio_start
+        + app.wifi.selected
+        + usize::from(app.wifi.actions_open || app.wifi.rows.is_empty());
     let offset = selected_line.saturating_sub(inner.height.saturating_sub(1) as usize);
     let visible_start = offset.max(radio_start);
     let visible_end = (offset + inner.height as usize).min(radio_start + app.wifi.rows.len());
@@ -844,7 +866,8 @@ pub(crate) async fn handle_wifi_key(app: &mut TuiApp, key: KeyCode, client: &Api
         KeyCode::End => {
             app.wifi.selected = app.wifi.cursor_limit();
             if !app.wifi.actions_open {
-                app.wifi.selected_radio = app.wifi.selected;
+                app.wifi.selected_radio =
+                    app.wifi.selected.min(app.wifi.rows.len().saturating_sub(1));
             }
         }
         KeyCode::Up | KeyCode::Left => {
@@ -855,14 +878,16 @@ pub(crate) async fn handle_wifi_key(app: &mut TuiApp, key: KeyCode, client: &Api
             }
             app.wifi.selected = app.wifi.selected.saturating_sub(1);
             if app.wifi.selected < app.wifi.rows.len() {
-                app.wifi.selected_radio = app.wifi.selected;
+                app.wifi.selected_radio =
+                    app.wifi.selected.min(app.wifi.rows.len().saturating_sub(1));
                 app.wifi.actions_open = false;
             }
         }
         KeyCode::Down | KeyCode::Right => {
             app.wifi.selected = (app.wifi.selected + 1).min(app.wifi.cursor_limit());
             if app.wifi.selected < app.wifi.rows.len() {
-                app.wifi.selected_radio = app.wifi.selected;
+                app.wifi.selected_radio =
+                    app.wifi.selected.min(app.wifi.rows.len().saturating_sub(1));
                 app.wifi.actions_open = false;
             }
         }
@@ -872,6 +897,14 @@ pub(crate) async fn handle_wifi_key(app: &mut TuiApp, key: KeyCode, client: &Api
 }
 
 async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
+    if !app.wifi.actions_open && app.wifi.selected >= app.wifi.rows.len() {
+        if app.wifi.selected == app.wifi.rows.len() {
+            open_profiles(app, client, String::new(), WifiProfilesMode::Menu).await;
+        } else {
+            ap_profiles::open_ap_profiles(app, client, String::new(), WifiProfilesMode::Menu).await;
+        }
+        return;
+    }
     let Some(row) = app.wifi.focused_radio().cloned() else {
         return;
     };
@@ -1133,19 +1166,21 @@ pub(crate) async fn load_wifi_data(app: &mut TuiApp, client: &ApiClient) {
                 return;
             }
         };
-        if row.role == WifiRole::Unknown {
-            if let Some(config) = &config {
-                row.role = if config.wifi.is_some() {
-                    WifiRole::AccessPoint
-                } else if config.wifi_client.is_some() {
-                    WifiRole::Client
-                } else {
-                    WifiRole::Unknown
-                };
-            }
-        }
+        row.role = configured_role(config.as_ref());
     }
     app.wifi.replace_rows(rows);
+}
+
+fn configured_role(config: Option<&crate::config::InterfaceConfig>) -> WifiRole {
+    use crate::config::InterfaceRole;
+    match config
+        .filter(|config| config.managed)
+        .map(|config| config.role)
+    {
+        Some(InterfaceRole::Input) => WifiRole::Client,
+        Some(InterfaceRole::Output) => WifiRole::AccessPoint,
+        _ => WifiRole::Unknown,
+    }
 }
 
 pub(crate) fn build_rows(
@@ -1163,13 +1198,7 @@ pub(crate) fn build_rows(
                 .iter()
                 .find(|item| item.interface == interface)
                 .cloned();
-            let role = if ap_status.is_some() {
-                WifiRole::AccessPoint
-            } else if client.is_some() {
-                WifiRole::Client
-            } else {
-                WifiRole::Unknown
-            };
+            let role = WifiRole::Unknown;
             WifiRow {
                 interface,
                 role,

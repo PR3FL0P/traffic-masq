@@ -268,6 +268,7 @@ async fn ap_options_open_only_on_activation_and_radio_edits_reach_request() {
     let client = ApiClient::new("/nonexistent.sock");
     handle_wifi_key(&mut app, KeyCode::Down, &client).await;
     assert!(!app.wifi.actions_open);
+    handle_wifi_key(&mut app, KeyCode::Up, &client).await;
     handle_wifi_key(&mut app, KeyCode::Enter, &client).await;
     terminal
         .draw(|frame| render_wifi(frame, frame.area(), &mut app))
@@ -735,10 +736,16 @@ fn unconfigured_radio_never_defaults_to_ap_and_role_mapping_is_strict() {
     assert_eq!(build_rows(&[status], &[], &[])[0].role, WifiRole::Unknown);
     assert!(actions(WifiRole::Unknown)
         .iter()
-        .any(|(action, _)| matches!(action, PrimaryAction::Scan)));
-    assert!(actions(WifiRole::Unknown)
+        .all(|(action, _)| matches!(action, PrimaryAction::Refresh)));
+    assert!(!actions(WifiRole::AccessPoint)
         .iter()
-        .any(|(action, _)| matches!(action, PrimaryAction::ConfigureAp)));
+        .any(|(action, _)| matches!(action, PrimaryAction::Scan | PrimaryAction::Profiles)));
+    assert!(
+        !actions(WifiRole::Client).iter().any(|(action, _)| matches!(
+            action,
+            PrimaryAction::ConfigureAp | PrimaryAction::ApProfiles
+        ))
+    );
 }
 
 #[test]
@@ -1769,4 +1776,112 @@ fn ap_profile_actions_fit_small_terminal_and_mouse_skips_header() {
     assert!(!text.contains("Scan"));
     assert_eq!(app.ui.list_area.unwrap().y, 3);
     assert_eq!(app.ui.list_count, 4);
+}
+
+#[test]
+fn configured_network_role_determines_wifi_role_before_activation() {
+    use crate::config::{InterfaceConfig, InterfaceRole};
+    let mut config = InterfaceConfig {
+        role: InterfaceRole::Input,
+        managed: true,
+        ipv4: None,
+        dhcp: None,
+        dhcp_client: None,
+        wifi: None,
+        wifi_client: None,
+        nat: false,
+    };
+    assert_eq!(configured_role(Some(&config)), WifiRole::Client);
+    config.role = InterfaceRole::Output;
+    assert_eq!(configured_role(Some(&config)), WifiRole::AccessPoint);
+    config.managed = false;
+    assert_eq!(configured_role(Some(&config)), WifiRole::Unknown);
+    assert_eq!(configured_role(None), WifiRole::Unknown);
+}
+
+#[test]
+fn profile_libraries_are_navigable_without_radios() {
+    let data = WifiData::default();
+    assert_eq!(data.cursor_limit(), 1);
+    let mut app = TuiApp::default();
+    focus_action(&mut app, 1);
+    assert_eq!(app.wifi.selected, 1);
+    assert!(!app.wifi.actions_open);
+}
+
+#[tokio::test]
+async fn standalone_profile_libraries_open_without_interfaces() {
+    let (_dir, client, server) = mock_api(vec![
+        Response::WifiClientProfiles { profiles: vec![] },
+        Response::WifiApProfiles { profiles: vec![] },
+    ])
+    .await;
+    let mut app = TuiApp {
+        screen: Screen::Wifi,
+        ..Default::default()
+    };
+    handle_wifi_key(&mut app, KeyCode::Enter, &client).await;
+    assert_eq!(app.screen, Screen::WifiProfiles);
+    handle_wifi_profiles_key(&mut app, KeyCode::Down, &client).await;
+    handle_wifi_profiles_key(&mut app, KeyCode::Enter, &client).await;
+    assert_eq!(app.screen, Screen::WifiProfileEditor);
+    assert!(app
+        .wifi_profile_editor
+        .as_ref()
+        .unwrap()
+        .interface
+        .is_empty());
+    app.screen = Screen::Wifi;
+    handle_wifi_key(&mut app, KeyCode::End, &client).await;
+    handle_wifi_key(&mut app, KeyCode::Enter, &client).await;
+    assert_eq!(app.screen, Screen::WifiApProfiles);
+    handle_wifi_ap_profiles_key(&mut app, KeyCode::Down, &client).await;
+    handle_wifi_ap_profiles_key(&mut app, KeyCode::Enter, &client).await;
+    assert_eq!(app.screen, Screen::WifiEditor);
+    assert!(app.wifi_editor.as_ref().unwrap().profile_mode);
+    assert_eq!(server.await.unwrap().len(), 2);
+    assert_eq!(
+        WifiProfileAction::for_interface(""),
+        &[
+            WifiProfileAction::Edit,
+            WifiProfileAction::Delete,
+            WifiProfileAction::Back,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn saving_standalone_client_profile_returns_to_library_without_connecting() {
+    let profile = WifiClientProfileSummary {
+        id: "home".into(),
+        ssid: "Home".into(),
+        country_code: None,
+        security: WifiClientSecurity::Open,
+        priority: 0,
+        autoconnect: false,
+        created_at: 0,
+        modified_at: 0,
+        has_passphrase: false,
+    };
+    let (_dir, client, server) = mock_api(vec![
+        Response::WifiClientProfile {
+            profile: profile.clone(),
+        },
+        Response::WifiClientProfiles {
+            profiles: vec![profile],
+        },
+    ])
+    .await;
+    let mut app = TuiApp::default();
+    profiles::open_create_profile(&mut app, String::new());
+    let editor = app.wifi_profile_editor.as_mut().unwrap();
+    editor.id = "home".into();
+    editor.ssid = "Home".into();
+    editor.security = WifiClientSecurity::Open;
+    editor.field = ProfileField::Save;
+    handle_wifi_profile_editor_key(&mut app, KeyCode::Enter, &client).await;
+    assert_eq!(app.screen, Screen::WifiProfiles);
+    assert!(app.wifi_connect.is_none());
+    assert_eq!(app.wifi_profiles.as_ref().unwrap().profiles.len(), 1);
+    assert_eq!(server.await.unwrap().len(), 2);
 }

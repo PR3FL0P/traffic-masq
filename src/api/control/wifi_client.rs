@@ -74,6 +74,16 @@ impl ControlService {
         let Some(wifi_client) = &self.wifi_client else {
             return wifi_client_disabled();
         };
+        let effective = match self.effective_config().await {
+            Ok(config) => config,
+            Err(message) => return wifi_client_error(WifiClientErrorDetail::Other { message }),
+        };
+        let previous = effective.network.interfaces.get(&interface);
+        if !previous.is_some_and(|config| config.managed && config.role == InterfaceRole::Input) {
+            return wifi_client_error(WifiClientErrorDetail::InvalidSpec {
+                message: "Wi-Fi client provisioning requires a managed input interface; assign its role first".into(),
+            });
+        }
         if let Err(error) = wifi_client.preflight_binary().await {
             return classify_wifi_client_error(error);
         }
@@ -88,23 +98,8 @@ impl ControlService {
             Ok(secret) => secret,
             Err(error) => return classify_wifi_client_profile_error(error),
         };
-        let effective = match self.effective_config().await {
-            Ok(config) => config,
-            Err(message) => return wifi_client_error(WifiClientErrorDetail::Other { message }),
-        };
-        let previous = effective.network.interfaces.get(&interface);
-        let mut target = previous.cloned().unwrap_or(InterfaceConfig {
-            role: InterfaceRole::Input,
-            managed: true,
-            ipv4: None,
-            dhcp: None,
-            dhcp_client: None,
-            wifi: None,
-            wifi_client: None,
-            nat: false,
-        });
+        let mut target = previous.cloned().expect("validated input interface");
         target.managed = true;
-        target.role = InterfaceRole::Input;
         target.wifi = None;
         target.dhcp = None;
         match settings.ip_policy {

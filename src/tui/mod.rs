@@ -1145,7 +1145,12 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                                             }
                                         }
                                         wifi::WifiProfilesMode::ProfileActions => {
-                                            if index < wifi::WifiProfileAction::ALL.len() {
+                                            if index
+                                                < wifi::WifiProfileAction::for_interface(
+                                                    &view.interface,
+                                                )
+                                                .len()
+                                            {
                                                 view.selected = index;
                                             }
                                         }

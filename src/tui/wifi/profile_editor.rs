@@ -189,7 +189,7 @@ async fn save_profile(app: &mut TuiApp, client: &ApiClient) {
             let ssid = saved_profile.ssid.clone();
             app.wifi_profile_editor = None;
             app.screen = Screen::Wifi;
-            if is_new {
+            if is_new && !interface.is_empty() {
                 open_wifi_connect_prompt(app, client, interface, profile_id, ssid).await;
             } else {
                 open_profiles(app, client, interface, WifiProfilesMode::Management).await;

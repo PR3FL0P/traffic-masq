@@ -148,16 +148,19 @@ impl ControlService {
             });
         }
         let previous_interface = effective.network.interfaces.get(&interface).cloned();
-        let mut target = previous_interface.clone().unwrap_or(InterfaceConfig {
-            role: InterfaceRole::Output,
-            managed: true,
-            ipv4: None,
-            dhcp: None,
-            dhcp_client: None,
-            wifi: None,
-            wifi_client: None,
-            nat: true,
-        });
+        if !previous_interface
+            .as_ref()
+            .is_some_and(|config| config.managed && config.role == InterfaceRole::Output)
+        {
+            return wifi_error(WifiErrorDetail::InvalidSpec {
+                message:
+                    "AP provisioning requires a managed output interface; assign its role first"
+                        .into(),
+            });
+        }
+        let mut target = previous_interface
+            .clone()
+            .expect("validated output interface");
         let Some(cidr) = subnet.or(target.ipv4) else {
             return wifi_error(WifiErrorDetail::InvalidSpec {
                 message: "AP provisioning requires an IPv4 subnet".into(),
@@ -167,7 +170,6 @@ impl ControlService {
             return classify_wifi_error(error);
         }
         target.managed = true;
-        target.role = InterfaceRole::Output;
         target.ipv4 = Some(cidr);
         target.wifi_client = None;
         if let Some(policy) = target.dhcp_client.as_mut() {

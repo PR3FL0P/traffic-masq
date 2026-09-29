@@ -83,7 +83,14 @@ fn render_profiles_menu(
     ui: &mut UiLayout,
     view: &WifiProfilesView,
 ) {
-    let block = panel(&format!("Saved profiles — {}", view.interface));
+    let block = panel(&format!(
+        "Saved profiles — {}",
+        if view.interface.is_empty() {
+            "library"
+        } else {
+            &view.interface
+        }
+    ));
     let inner = block.inner(area);
 
     ui.list_area = Some(inner);
@@ -232,7 +239,7 @@ fn render_profile_actions(
         .saturating_sub(list_area.height.saturating_sub(1) as usize);
 
     ui.list_area = Some(list_area);
-    ui.list_count = WifiProfileAction::ALL.len();
+    ui.list_count = WifiProfileAction::for_interface(&view.interface).len();
     ui.list_row_height = 1;
     ui.list_scroll_offset = offset;
 
@@ -252,7 +259,11 @@ fn render_profile_actions(
         lines.push(Line::from(""));
     }
 
-    for (slot, action) in WifiProfileAction::ALL.iter().enumerate().skip(offset) {
+    for (slot, action) in WifiProfileAction::for_interface(&view.interface)
+        .iter()
+        .enumerate()
+        .skip(offset)
+    {
         let is_selected = view.selected == slot;
         lines.push(Line::styled(
             format!(
@@ -358,14 +369,18 @@ pub(crate) async fn handle_wifi_profiles_key(app: &mut TuiApp, key: KeyCode, cli
                 view.selected = view.selected.saturating_sub(1);
             }
             KeyCode::Down => {
-                let max_index = WifiProfileAction::ALL.len().saturating_sub(1);
+                let max_index = WifiProfileAction::for_interface(&view.interface)
+                    .len()
+                    .saturating_sub(1);
                 view.selected = (view.selected + 1).min(max_index);
             }
             KeyCode::Home => {
                 view.selected = 0;
             }
             KeyCode::End => {
-                view.selected = WifiProfileAction::ALL.len().saturating_sub(1);
+                view.selected = WifiProfileAction::for_interface(&view.interface)
+                    .len()
+                    .saturating_sub(1);
             }
             KeyCode::Enter => activate_profile_row(app, client).await,
             _ => {}
@@ -374,6 +389,20 @@ pub(crate) async fn handle_wifi_profiles_key(app: &mut TuiApp, key: KeyCode, cli
 }
 
 async fn activate_profile_action(app: &mut TuiApp, client: &ApiClient, action: WifiProfileAction) {
+    if matches!(
+        action,
+        WifiProfileAction::Activate | WifiProfileAction::Deactivate
+    ) && app
+        .wifi_profiles
+        .as_ref()
+        .is_none_or(|view| view.interface.is_empty())
+    {
+        app.push_message(
+            LogLevel::Warn,
+            "Select an input interface in Wi-Fi to connect a profile",
+        );
+        return;
+    }
     match action {
         WifiProfileAction::Back => {
             if let Some(current) = app.wifi_profiles.as_mut() {
@@ -470,7 +499,10 @@ async fn activate_profile_row(app: &mut TuiApp, client: &ApiClient) {
             }
         }
         WifiProfilesMode::ProfileActions => {
-            if let Some(action) = WifiProfileAction::from_index(selected) {
+            if let Some(action) = WifiProfileAction::for_interface(&interface)
+                .get(selected)
+                .copied()
+            {
                 activate_profile_action(app, client, action).await;
             }
         }

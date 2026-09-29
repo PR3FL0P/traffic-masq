@@ -373,6 +373,13 @@ states show their available recovery actions instead.
 
 ### Wi-Fi client connections
 
+Assign each wireless interface a managed role in **Interfaces** first:
+**input** permits Wi-Fi client actions, and **output** permits access point actions.
+Wi-Fi provisioning preserves that role and rejects missing or incompatible roles.
+The Wi-Fi screen also offers standalone **Saved client profiles** and
+**Saved AP profiles** libraries, even with no interfaces. Create, edit, and delete
+profiles there; select a compatible interface to connect or apply a profile.
+
 Tab switches between wireless interfaces and their actions; Esc returns to the
 same interface. Lists and connection forms scroll to keep the selection visible.
 In the connection form, arrows move focus and Enter/Space selects an IP option.
@@ -397,13 +404,15 @@ must change together with the profile.
 
 ### Wi-Fi access points
 
-The Wi-Fi screen includes unconfigured radios. **Create hotspot** accepts an IPv4
-subnet and prepares a managed output interface in one backend transaction. DHCP
+The Wi-Fi screen includes unconfigured radios. Assign a managed **output** role
+first, then **Configure access point** accepts an IPv4 subnet and configures the
+AP in one backend transaction. DHCP
 policy explicitly selects preserve, enable/configure, or disable. **Apply** is
 tentative: verify connectivity and commit before the rollback timer expires.
 **Saved AP profiles** uses the same navigation as client profiles: choose
 **Management** to select an existing profile, or **Create new profile**. Each
-profile offers **Apply profile**, **Edit profile**, and **Delete profile**.
+profile offers **Edit profile** and **Delete profile**; **Apply profile** is also
+available when opened from an output interface.
 Saving returns to the profile list without changing the running access point;
 applying starts a tentative network change that must be confirmed. Deletion
 requires confirmation and leaves the running AP unchanged. When editing, a blank

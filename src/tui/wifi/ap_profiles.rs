@@ -19,11 +19,19 @@ const ACTIONS: [WifiProfileAction; 4] = [
 ];
 
 impl WifiApProfilesView {
+    fn actions(&self) -> &'static [WifiProfileAction] {
+        if self.interface.is_empty() {
+            &ACTIONS[1..]
+        } else {
+            &ACTIONS
+        }
+    }
+
     pub(crate) fn select(&mut self, index: usize) {
         let count = match self.mode {
             WifiProfilesMode::Menu => 2,
             WifiProfilesMode::Management => self.profiles.len(),
-            WifiProfilesMode::ProfileActions => ACTIONS.len(),
+            WifiProfilesMode::ProfileActions => self.actions().len(),
         };
         self.selected = index.min(count.saturating_sub(1));
         if self.mode == WifiProfilesMode::Management {
@@ -124,7 +132,14 @@ pub(crate) fn render_wifi_ap_profiles(
     let title = if let Some(id) = &view.delete_confirmation {
         format!("Delete {id}? Y: confirm, any other key: cancel")
     } else {
-        format!("Saved AP profiles — {}", view.interface)
+        format!(
+            "Saved AP profiles — {}",
+            if view.interface.is_empty() {
+                "library"
+            } else {
+                &view.interface
+            }
+        )
     };
     let block = panel(&title);
     let inner = block.inner(area);
@@ -172,7 +187,7 @@ pub(crate) fn render_wifi_ap_profiles(
                 list_area.y += header_height;
                 list_area.height = list_area.height.saturating_sub(header_height);
             }
-            ACTIONS
+            view.actions()
                 .iter()
                 .map(|action| {
                     if *action == WifiProfileAction::Activate {
@@ -274,7 +289,7 @@ pub(crate) async fn handle_wifi_ap_profiles_key(
                 }
             }
             WifiProfilesMode::ProfileActions => {
-                let Some(action) = ACTIONS.get(view.selected).copied() else {
+                let Some(action) = view.actions().get(view.selected).copied() else {
                     return;
                 };
                 if action == WifiProfileAction::Back {
@@ -292,6 +307,13 @@ pub(crate) async fn handle_wifi_ap_profiles_key(
                     }
                     WifiProfileAction::Delete => view.delete_confirmation = Some(profile.id),
                     WifiProfileAction::Activate => {
+                        if interface.is_empty() {
+                            app.push_message(
+                                LogLevel::Warn,
+                                "Select an output interface in Wi-Fi to apply an AP profile",
+                            );
+                            return;
+                        }
                         match client
                             .request(&Request::ActivateWifiApProfile {
                                 interface,

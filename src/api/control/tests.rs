@@ -6727,11 +6727,11 @@ async fn wifi_deactivate_preserves_independent_dhcp_intent() {
 }
 
 #[tokio::test]
-async fn hotspot_provision_manages_an_unconfigured_radio_and_subnet_atomically() {
+async fn hotspot_provision_uses_preassigned_output_role_and_subnet_atomically() {
     let directory = tempdir().unwrap();
     let mut config = wifi_base_config(directory.path());
     config.wifi.hostapd_binary = PathBuf::from("/bin/true");
-    config.network.interfaces.remove("wlan0");
+    config.network.interfaces.get_mut("wlan0").unwrap().wifi = None;
     let overrides = RuntimeOverrideManager::load(directory.path(), &config)
         .await
         .unwrap();
@@ -6782,6 +6782,8 @@ async fn hotspot_provision_manages_an_unconfigured_radio_and_subnet_atomically()
         .effective_interface("wlan0")
         .await
         .unwrap()
+        .unwrap()
+        .wifi
         .is_none());
     assert!(matches!(
         service
@@ -7232,4 +7234,73 @@ async fn client_configuration_converges_before_reply_and_rollback_restores_runti
     );
     assert_eq!(runtime.status("wlan1").await.unwrap().spec.ssid, "upstream");
     worker.abort();
+}
+
+#[tokio::test]
+async fn wifi_provisioning_rejects_interfaces_without_the_required_role() {
+    let ap = wifi_enabled_fixture().await;
+    let client = wifi_client_enabled_fixture().await;
+    let mut input = client.service.base_config.network.interfaces["wlan1"].clone();
+    input.wifi_client = None;
+    ap.service
+        .overrides
+        .set_interface("input".into(), input, false)
+        .await
+        .unwrap();
+    let mut output = ap.service.base_config.network.interfaces["wlan0"].clone();
+    output.wifi = None;
+    client
+        .service
+        .overrides
+        .set_interface("output".into(), output, false)
+        .await
+        .unwrap();
+    for interface in ["missing", "input"] {
+        let response = ap
+            .service
+            .dispatch(Request::ProvisionWifiAccessPoint {
+                interface: interface.into(),
+                settings: WifiEditRequest {
+                    ssid: "test".into(),
+                    country_code: None,
+                    band: WifiBand::Ghz2,
+                    channel: 0,
+                    channel_width: WifiChannelWidth::Ht20,
+                    security: WifiSecurity::Open,
+                    hidden: false,
+                    client_isolation: false,
+                    max_stations: 32,
+                },
+                passphrase: None,
+                clear_passphrase: true,
+                configure_dhcp: true,
+                subnet: Some("192.168.50.1/24".parse().unwrap()),
+                disable_dhcp: false,
+            })
+            .await;
+        assert!(
+            matches!(response, Response::WifiError {
+            detail: WifiErrorDetail::InvalidSpec { ref message }
+        } if message.contains("managed output")),
+            "{response:?}"
+        );
+    }
+    for interface in ["missing", "output"] {
+        let response = client
+            .service
+            .dispatch(Request::ProvisionWifiClient {
+                interface: interface.into(),
+                settings: crate::api::model::ProvisionWifiClientRequest {
+                    profile_id: "unused".into(),
+                    ip_policy: crate::api::model::WifiClientIpPolicy::Dhcp,
+                },
+            })
+            .await;
+        assert!(
+            matches!(response, Response::WifiClientError {
+            detail: WifiClientErrorDetail::InvalidSpec { ref message }
+        } if message.contains("managed input")),
+            "{response:?}"
+        );
+    }
 }
