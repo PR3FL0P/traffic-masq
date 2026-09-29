@@ -949,12 +949,9 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
         if let Some(attribute) = Self::ownership_attribute(ownership) {
             request.message_mut().attributes.push(attribute);
         }
-        request
-            .execute()
-            .await
-            .with_context(|| {
-                format!("RTM_NEWADDR while adding {address}/{prefix_len} to {interface}")
-            })?;
+        request.execute().await.with_context(|| {
+            format!("RTM_NEWADDR while adding {address}/{prefix_len} to {interface}")
+        })?;
 
         if let Some(protocol) = ownership.protocol() {
             self.confirm_address_protocol_unlocked(interface, address, prefix_len, protocol)
@@ -1199,12 +1196,12 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
                 .attributes
                 .push(RuleAttribute::FwMask(fw_mask));
         }
-        request
-            .execute()
-            .await
-            .with_context(|| {
-                format!("RTM_NEWRULE while adding IPv4 rule for table {}", rule.table)
-            })?;
+        request.execute().await.with_context(|| {
+            format!(
+                "RTM_NEWRULE while adding IPv4 rule for table {}",
+                rule.table
+            )
+        })?;
         Ok(())
     }
 
@@ -1231,7 +1228,10 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
             .execute()
             .await
             .with_context(|| {
-                format!("RTM_DELRULE while deleting IPv4 rule for table {}", rule.table)
+                format!(
+                    "RTM_DELRULE while deleting IPv4 rule for table {}",
+                    rule.table
+                )
             })?;
         Ok(())
     }

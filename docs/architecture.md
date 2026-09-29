@@ -8,11 +8,16 @@ interface state itself and cannot make changes.
 | --- | --- |
 | `api` | HTTP, authorization and control-operation limits |
 | `core` | Configuration, ownership, plans, transactions and reconciliation |
-| `netlink`, `firewall` | Kernel interfaces, routes and nftables |
+| `crates/netlink` (`traffic-masq-netlink`) | Kernel interfaces, IPv4 addresses, routes, rules and change events |
+| `firewall` | nftables and IPv4 forwarding |
 | `dhcp`, `wifi`, `vpn` | DHCP and VPN runtimes; Wi-Fi service supervision |
 | `state`, `atomic_file` | Persistent state and atomic file writes |
 | `app` | Startup, shutdown, installation and init integration |
 | `tui` | Input, screen state and rendering |
+
+The root library re-exports `traffic-masq-netlink` as `traffic_masq::netlink`
+for existing callers. The netlink crate depends only on kernel protocol and
+runtime libraries; application orchestration depends on it, never the reverse.
 
 ## Applying changes
 

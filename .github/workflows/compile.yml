@@ -68,13 +68,13 @@ jobs:
           # Always compile and run tests in fast debug mode (no release optimizations)
           if [ -n "${{ inputs.test_filter }}" ] && [ "${{ inputs.test_filter }}" != "all" ]; then
             echo "==> Running targeted tests (debug) matching: ${{ inputs.test_filter }}"
-            cargo test -- ${{ inputs.test_filter }}
+            cargo test --workspace -- ${{ inputs.test_filter }}
           elif [ "${{ inputs.test_filter }}" = "all" ]; then
             echo "==> Running complete test suite (debug)"
-            cargo test
+            cargo test --workspace
           else
             echo "==> Running library unit test suite (debug)"
-            cargo test --lib
+            cargo test --workspace --lib
           fi
 
       - name: Build binaries

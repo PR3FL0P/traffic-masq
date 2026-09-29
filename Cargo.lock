@@ -2930,13 +2930,10 @@ dependencies = [
  "hyper",
  "hyper-util",
  "ipnet",
- "netlink-packet-core 0.7.0",
  "netlink-packet-core 0.8.1",
  "netlink-packet-generic",
  "netlink-packet-route",
- "netlink-packet-utils",
  "netlink-packet-wireguard",
- "netlink-sys",
  "nix 0.29.0",
  "pbkdf2",
  "rand",
@@ -2961,9 +2958,28 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "traffic-masq-netlink",
  "unicode-segmentation",
  "unicode-width",
  "zeroize",
+]
+
+[[package]]
+name = "traffic-masq-netlink"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures-util",
+ "ipnet",
+ "netlink-packet-core 0.7.0",
+ "netlink-packet-route",
+ "netlink-packet-utils",
+ "netlink-sys",
+ "rtnetlink",
+ "serde",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

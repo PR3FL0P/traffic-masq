@@ -1,4 +1,8 @@
 
+[workspace]
+members = ["crates/netlink"]
+resolver = "2"
+
 [package]
 name = "traffic-masq"
 version = "0.1.0"
@@ -36,14 +40,8 @@ hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "server", "service", "tokio"] }
 ipnet = { version = "2", features = ["serde"] }
 netlink-packet-core = "0.8"
-# rtnetlink 0.14 speaks netlink-packet-core 0.7, while the genetlink stack used by
-# the WireGuard provider speaks 0.8. Both are genuinely in use, so the rtnetlink
-# one is aliased rather than one of them being forced onto the wrong version.
-netlink-packet-core-rtnetlink = { package = "netlink-packet-core", version = "0.7" }
-netlink-sys = "0.8"
 netlink-packet-generic = "0.4"
 netlink-packet-route = "0.19"
-netlink-packet-utils = "0.5"
 netlink-packet-wireguard = "0.4.2"
 nix = { version = "0.29", features = ["fs", "net", "process", "signal", "socket", "uio", "user"] }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
@@ -69,6 +67,7 @@ unicode-width = "0.2"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+traffic-masq-netlink = { path = "crates/netlink" }
 zeroize = { version = "1", features = ["serde"] }
 
 [dev-dependencies]

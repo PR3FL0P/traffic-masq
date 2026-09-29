@@ -33,7 +33,7 @@ To obtain binaries from CI instead, run `Compile Binaries` manually with the
 release profile. Download its `traffic-masq-binaries` artifact, which contains
 the two binaries and `traffic-masq-linux-x86_64.tar.gz`. Generate a checksum
 separately if publishing that archive. The workflow's optional tests run with
-`cargo test --lib` by default; `test_filter=all` runs `cargo test`.
+`cargo test --workspace --lib` by default; `test_filter=all` runs `cargo test --workspace`.
 
 Use `BINARY_DIR`, `OUTPUT_DIR` and `TARGET` to package binaries built elsewhere.
 When cross-compiling, set both `BINARY_DIR` and the actual `TARGET` explicitly.

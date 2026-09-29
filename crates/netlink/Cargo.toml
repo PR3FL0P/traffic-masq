@@ -1,0 +1,21 @@
+[package]
+name = "traffic-masq-netlink"
+version = "0.1.0"
+edition = "2021"
+license-file = "../../LICENSE"
+rust-version = "1.95"
+description = "Linux netlink adapter for traffic-masq"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+futures-util = "0.3"
+ipnet = { version = "2", features = ["serde"] }
+netlink-packet-core-rtnetlink = { package = "netlink-packet-core", version = "0.7" }
+netlink-packet-route = "0.19"
+netlink-packet-utils = "0.5"
+netlink-sys = "0.8"
+rtnetlink = "0.14"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"

@@ -27,7 +27,7 @@ pub mod dhcp;
 pub mod firewall;
 pub mod logging;
 
-pub mod netlink;
+pub use traffic_masq_netlink as netlink;
 pub mod state;
 #[cfg(test)]
 pub(crate) mod test_support;
