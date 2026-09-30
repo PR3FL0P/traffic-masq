@@ -31,6 +31,5 @@ pub use traffic_masq_netlink as netlink;
 pub mod state;
 #[cfg(test)]
 pub(crate) mod test_support;
-pub mod tui;
 pub mod vpn;
 pub mod wifi;

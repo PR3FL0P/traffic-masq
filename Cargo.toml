@@ -1,6 +1,6 @@
 
 [workspace]
-members = ["crates/netlink", "crates/protocol", "crates/api-client", "crates/atomic-file"]
+members = ["crates/netlink", "crates/protocol", "crates/api-client", "crates/atomic-file", "crates/tui"]
 resolver = "2"
 
 [package]
@@ -20,10 +20,6 @@ path = "src/lib.rs"
 name = "traffic-masqd"
 path = "src/bin/traffic-masqd.rs"
 
-[[bin]]
-name = "traffic-masq"
-path = "src/bin/traffic-masq.rs"
-
 [dependencies]
 anyhow = "1"
 argon2 = "0.5"
@@ -31,7 +27,6 @@ async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
-crossterm = "0.28"
 fs2 = "0.4"
 futures-util = "0.3"
 genetlink = "0.2.7"
@@ -46,7 +41,6 @@ netlink-packet-wireguard = "0.4.2"
 nix = { version = "0.29", features = ["fs", "net", "process", "signal", "socket", "uio", "user"] }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 rand = "0.8"
-ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_28", "layout-cache"] }
 rpassword = "7"
 rtnetlink = "0.14"
 rustls = "0.23"
@@ -62,8 +56,6 @@ tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
 toml = "0.8"
 tower = "0.5"
-unicode-segmentation = "1.13"
-unicode-width = "0.2"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

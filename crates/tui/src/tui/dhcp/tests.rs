@@ -23,9 +23,10 @@ async fn editor_uses_saved_address_even_when_dashboard_is_empty() {
         }
     });
     let mut app = TuiApp::default();
-    app.dashboard.interfaces.push(
-        crate::api::model::InterfaceStatus {
-            interface: crate::netlink::NetworkInterface {
+    app.dashboard
+        .interfaces
+        .push(traffic_masq_protocol::InterfaceStatusView {
+            interface: traffic_masq_protocol::NetworkInterfaceView {
                 index: 1,
                 name: "lan0".into(),
                 is_up: true,
@@ -36,9 +37,7 @@ async fn editor_uses_saved_address_even_when_dashboard_is_empty() {
             ipv4_addresses: vec![],
             owned_ipv4_addresses: None,
             has_default_route: false,
-        }
-        .into(),
-    );
+        });
     let client = ApiClient::new(socket);
     open_dhcp_editor(&mut app, &client).await;
     server.await.unwrap();
@@ -75,9 +74,10 @@ async fn editor_falls_back_to_status_address_ignoring_link_local() {
         }
     });
     let mut app = TuiApp::default();
-    app.dashboard.interfaces.push(
-        crate::api::model::InterfaceStatus {
-            interface: crate::netlink::NetworkInterface {
+    app.dashboard
+        .interfaces
+        .push(traffic_masq_protocol::InterfaceStatusView {
+            interface: traffic_masq_protocol::NetworkInterfaceView {
                 index: 1,
                 name: "lan0".into(),
                 is_up: true,
@@ -86,13 +86,13 @@ async fn editor_falls_back_to_status_address_ignoring_link_local() {
                 is_wireless: false,
             },
             ipv4_addresses: vec![
-                crate::netlink::Ipv4AddressInfo {
+                traffic_masq_protocol::Ipv4AddressInfoView {
                     interface_index: 1,
                     address: "169.254.10.20".parse().unwrap(),
                     prefix_len: 16,
                     protocol: None,
                 },
-                crate::netlink::Ipv4AddressInfo {
+                traffic_masq_protocol::Ipv4AddressInfoView {
                     interface_index: 1,
                     address: "192.168.1.1".parse().unwrap(),
                     prefix_len: 24,
@@ -101,9 +101,7 @@ async fn editor_falls_back_to_status_address_ignoring_link_local() {
             ],
             owned_ipv4_addresses: None,
             has_default_route: false,
-        }
-        .into(),
-    );
+        });
     let client = ApiClient::new(socket);
     open_dhcp_editor(&mut app, &client).await;
     server.await.unwrap();
@@ -136,9 +134,10 @@ async fn editor_leaves_fields_empty_if_only_link_local_address_present() {
         }
     });
     let mut app = TuiApp::default();
-    app.dashboard.interfaces.push(
-        crate::api::model::InterfaceStatus {
-            interface: crate::netlink::NetworkInterface {
+    app.dashboard
+        .interfaces
+        .push(traffic_masq_protocol::InterfaceStatusView {
+            interface: traffic_masq_protocol::NetworkInterfaceView {
                 index: 1,
                 name: "lan0".into(),
                 is_up: true,
@@ -146,7 +145,7 @@ async fn editor_leaves_fields_empty_if_only_link_local_address_present() {
                 tx_bytes: 0,
                 is_wireless: false,
             },
-            ipv4_addresses: vec![crate::netlink::Ipv4AddressInfo {
+            ipv4_addresses: vec![traffic_masq_protocol::Ipv4AddressInfoView {
                 interface_index: 1,
                 address: "169.254.10.20".parse().unwrap(),
                 prefix_len: 16,
@@ -154,9 +153,7 @@ async fn editor_leaves_fields_empty_if_only_link_local_address_present() {
             }],
             owned_ipv4_addresses: None,
             has_default_route: false,
-        }
-        .into(),
-    );
+        });
     let client = ApiClient::new(socket);
     open_dhcp_editor(&mut app, &client).await;
     server.await.unwrap();

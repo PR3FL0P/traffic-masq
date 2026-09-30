@@ -10,15 +10,15 @@ use super::view::{
     summarize_uplink,
 };
 use super::*;
-use crate::config::InterfaceConfig;
-use crate::core::router::RouterInterfaceDesired;
-use crate::firewall::{
-    RouterDataplaneDesired, RouterDataplanePlan, RouterDataplaneSnapshot, RouterDataplaneTarget,
-};
 use std::net::Ipv4Addr;
+use traffic_masq_protocol::{
+    ForwardingConfigView, InterfaceConfigView, OwnedFirewallIntegrityView,
+    RouterDataplaneDesiredView, RouterDataplanePlanView, RouterDataplaneSnapshotView,
+    RouterInterfaceDesiredView,
+};
 
-fn dhcp_spec(interface: &str) -> DhcpServiceSpec {
-    DhcpServiceSpec {
+fn dhcp_spec(interface: &str) -> DhcpServiceView {
+    DhcpServiceView {
         interface: interface.to_string(),
         server_ip: Ipv4Addr::new(192, 168, 10, 1),
         prefix_len: 24,
@@ -410,36 +410,26 @@ fn route_status(route: &OwnedIpv4RouteConfig, owner: RouteOwner) -> RouteStatus 
 }
 
 #[test]
-fn deleting_last_default_route_preserves_permission_in_candidate() {
-    use crate::core::router_candidate::{RouterCandidate, RouterIntentProposal};
-
+fn deleting_last_default_route_preserves_permission_in_proposal() {
     let original = route_config("0.0.0.0/0");
-    let config = crate::config::AppConfig {
-        router: RouterConfig {
-            enabled: true,
-            allow_default_route_change: true,
-            owned_routes: vec![original.clone()],
-            ..Default::default()
-        }
-        .into(),
+    let config = RouterConfig {
+        enabled: true,
+        allow_default_route_change: true,
+        owned_routes: vec![original.clone()],
         ..Default::default()
     };
     let mut app = TuiApp::default();
-    app.router.proposed_router_config = config.router.clone().into();
+    app.router.proposed_router_config = config;
     app.router.routes = vec![route_status(&original, RouteOwner::TrafficMasqStatic)];
 
     delete_selected_route(&mut app);
 
     assert!(app.router.staged);
     assert!(app.router.routes.is_empty());
-    let candidate = RouterCandidate::build(
-        &config,
-        &crate::state::overrides::RuntimeOverrides::default(),
-        &RouterIntentProposal::new().set_router(app.router.proposed_router_config.into()),
-    )
-    .expect("deleting the last standalone route builds a valid candidate");
-    assert!(candidate.desired().routes.is_empty());
-    assert!(candidate.desired().allow_default_route_change);
+    let proposal = super::plan::current_router_proposal(&app);
+    let router = proposal.set_router.expect("staged router config");
+    assert!(router.owned_routes.is_empty());
+    assert!(router.allow_default_route_change);
 }
 
 #[test]
@@ -467,7 +457,7 @@ fn delete_selected_route_shows_manual_command_for_external_and_stages_owned() {
         output_interface_index: None,
         table: 254,
         metric: Some(50),
-        protocol: crate::netlink::TRAFFIC_MASQ_ROUTE_PROTOCOL,
+        protocol: traffic_masq_netlink::TRAFFIC_MASQ_ROUTE_PROTOCOL,
         scope: 0,
         owner: RouteOwner::TrafficMasqStatic,
     };
@@ -892,9 +882,9 @@ fn describes_each_router_error_detail_distinctly() {
 #[test]
 fn summarizes_only_output_interfaces_with_subnet() {
     let interfaces = vec![
-        RouterInterfaceDesired {
+        RouterInterfaceDesiredView {
             name: "wan0".to_string(),
-            config: InterfaceConfig {
+            config: InterfaceConfigView {
                 role: InterfaceRole::Input,
                 managed: false,
                 ipv4: None,
@@ -905,9 +895,9 @@ fn summarizes_only_output_interfaces_with_subnet() {
                 nat: true,
             },
         },
-        RouterInterfaceDesired {
+        RouterInterfaceDesiredView {
             name: "lan0".to_string(),
-            config: InterfaceConfig {
+            config: InterfaceConfigView {
                 role: InterfaceRole::Output,
                 managed: true,
                 ipv4: Some("192.168.10.1/24".parse().unwrap()),
@@ -920,8 +910,6 @@ fn summarizes_only_output_interfaces_with_subnet() {
         },
     ];
 
-    let interfaces: Vec<RouterInterfaceDesiredView> =
-        interfaces.into_iter().map(Into::into).collect();
     let summary = summarize_output_interfaces(&interfaces);
 
     assert_eq!(summary, vec!["lan0 (192.168.10.1/24)"]);
@@ -932,8 +920,6 @@ fn summarizes_dhcp_with_known_and_missing_lease_counts() {
     let dhcp = vec![dhcp_spec("lan0"), dhcp_spec("lan1")];
     let lease_counts = vec![("lan0".to_string(), 3usize)];
 
-    let dhcp: Vec<traffic_masq_protocol::DhcpServiceView> =
-        dhcp.into_iter().map(Into::into).collect();
     let summary = summarize_dhcp(&dhcp, &lease_counts);
 
     assert_eq!(
@@ -947,12 +933,12 @@ fn summarizes_dhcp_with_known_and_missing_lease_counts() {
 
 #[test]
 fn summarizes_uplink_for_enabled_and_disabled_dataplane() {
-    let enabled = RouterDataplaneTarget::Enabled(RouterDataplaneDesired {
+    let enabled = RouterDataplaneTargetView::Enabled(RouterDataplaneDesiredView {
         forwarding: None,
         uplink: "wan0".to_string(),
         outputs: Vec::new(),
     });
-    assert_eq!(summarize_uplink(&enabled.into()), "wan0");
+    assert_eq!(summarize_uplink(&enabled), "wan0");
     assert_eq!(
         summarize_uplink(&RouterDataplaneTargetView::Disabled),
         "none (dataplane disabled)"
@@ -961,13 +947,13 @@ fn summarizes_uplink_for_enabled_and_disabled_dataplane() {
 
 #[test]
 fn formats_forwarding_status_reflects_snapshot_target_and_drift() {
-    let plan = RouterDataplanePlan {
-        snapshot: RouterDataplaneSnapshot {
+    let plan = RouterDataplanePlanView {
+        snapshot: RouterDataplaneSnapshotView {
             ipv4_forwarding: true,
             owned: None,
-            owned_firewall_integrity: crate::firewall::OwnedFirewallIntegrity::Intact,
+            owned_firewall_integrity: OwnedFirewallIntegrityView::Intact,
         },
-        target: RouterDataplaneTarget::Enabled(RouterDataplaneDesired {
+        target: RouterDataplaneTargetView::Enabled(RouterDataplaneDesiredView {
             forwarding: None,
             uplink: "wan0".to_string(),
             outputs: Vec::new(),
@@ -976,21 +962,21 @@ fn formats_forwarding_status_reflects_snapshot_target_and_drift() {
     };
 
     assert_eq!(
-        format_forwarding_status(&plan.into()),
+        format_forwarding_status(&plan),
         "forwarding on, NAT desired, drift: requires apply"
     );
 }
 
 #[test]
 fn forwarding_status_does_not_claim_nat_for_non_masqueraded_rules() {
-    let plan = RouterDataplanePlan {
-        snapshot: RouterDataplaneSnapshot {
+    let plan = RouterDataplanePlanView {
+        snapshot: RouterDataplaneSnapshotView {
             ipv4_forwarding: true,
             owned: None,
-            owned_firewall_integrity: crate::firewall::OwnedFirewallIntegrity::Intact,
+            owned_firewall_integrity: OwnedFirewallIntegrityView::Intact,
         },
-        target: RouterDataplaneTarget::Enabled(RouterDataplaneDesired {
-            forwarding: Some(vec![crate::config::ForwardingConfig {
+        target: RouterDataplaneTargetView::Enabled(RouterDataplaneDesiredView {
+            forwarding: Some(vec![ForwardingConfigView {
                 source_subnet: None,
                 from: "lan0".to_string(),
                 to: "wg0".to_string(),
@@ -1003,7 +989,7 @@ fn forwarding_status_does_not_claim_nat_for_non_masqueraded_rules() {
     };
 
     assert_eq!(
-        format_forwarding_status(&plan.into()),
+        format_forwarding_status(&plan),
         "forwarding on, NAT disabled, in sync"
     );
 }

@@ -20,7 +20,7 @@ async fn rollback_click_sends_rollback_request() {
     });
     let mut app = TuiApp {
         screen: Screen::PendingChange,
-        pending: Some(crate::core::transaction::PendingNetworkChange {
+        pending: Some(PendingNetworkChange {
             phase: Default::default(),
             last_error: None,
             token: "test-token".into(),
@@ -584,7 +584,7 @@ async fn settings_tab_switching_and_editing_arrow_isolation() {
         },
         settings: Some(SecurityEditor {
             field: settings::SettingsField::RollbackTimeout,
-            active: crate::api::model::SecuritySettings {
+            active: traffic_masq_protocol::SecuritySettings {
                 rollback_timeout_seconds: 60,
             },
             rollback_timeout_input: "60".into(),
@@ -893,7 +893,7 @@ async fn small_terminal_escape_sends_rollback_request() {
     });
     let mut app = TuiApp {
         screen: Screen::PendingChange,
-        pending: Some(crate::core::transaction::PendingNetworkChange {
+        pending: Some(PendingNetworkChange {
             phase: Default::default(),
             last_error: None,
             token: "test-token".into(),
@@ -967,7 +967,7 @@ async fn small_terminal_enter_sends_commit_request() {
     });
     let mut app = TuiApp {
         screen: Screen::PendingChange,
-        pending: Some(crate::core::transaction::PendingNetworkChange {
+        pending: Some(PendingNetworkChange {
             phase: Default::default(),
             last_error: None,
             token: "test-token".into(),
@@ -1000,7 +1000,7 @@ async fn small_terminal_enter_sends_commit_request() {
 
 #[test]
 fn pending_refresh_exposes_recovery_and_removes_confirmation_controls() {
-    use crate::core::transaction::{NetworkChangePhase, PendingNetworkChange};
+    use traffic_masq_protocol::NetworkChangePhase;
     let initial = PendingNetworkChange {
         token: "recovering".into(),
         interface: "eth0".into(),

@@ -7,10 +7,10 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Gauge, Paragraph, Row, Table};
 
-#[cfg(test)]
-use crate::dhcp::supervisor::DhcpServiceSpec;
 use crate::tui::api::client::ApiClient;
 use crate::tui::api::model::{Request, Response, RouterErrorDetail, RouterRecoveryNotice};
+#[cfg(test)]
+use traffic_masq_protocol::DhcpServiceView;
 use traffic_masq_protocol::RecoveryAction;
 use traffic_masq_protocol::{CoordinatorStatus, RouterHealthReport};
 use traffic_masq_protocol::{

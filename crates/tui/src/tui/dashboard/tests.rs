@@ -367,7 +367,7 @@ fn overview_shows_pending_count_and_vpn_configuration_without_dhcp() {
 
 #[tokio::test]
 async fn partial_api_failure_does_not_clear_other_status_or_fetch_dhcp() {
-    use crate::api::model::Response;
+    use crate::tui::api::model::Response;
     use http_body_util::Full;
     use hyper::{body::Bytes, server::conn::http1, service::service_fn};
     use hyper_util::rt::TokioIo;

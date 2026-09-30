@@ -25,10 +25,13 @@ fn editor() -> ForwardingEditor {
     }
 }
 
-fn interface_status(name: &str, has_default_route: bool) -> crate::api::model::InterfaceStatus {
-    crate::api::model::InterfaceStatus {
+fn interface_status(
+    name: &str,
+    has_default_route: bool,
+) -> traffic_masq_protocol::InterfaceStatusView {
+    traffic_masq_protocol::InterfaceStatusView {
         owned_ipv4_addresses: None,
-        interface: crate::netlink::NetworkInterface {
+        interface: traffic_masq_protocol::NetworkInterfaceView {
             index: 1,
             name: name.into(),
             is_up: true,
@@ -47,14 +50,14 @@ async fn new_sharing_prefills_managed_lan_to_observed_default_route() {
     app.router.staged = true; // Avoid API calls while opening the local draft.
     app.router.proposed_router_config.forwarding = Some(vec![]);
     app.dashboard.interfaces = vec![
-        interface_status("wlp5s0f3u2", true).into(),
-        interface_status("wlp1s0", false).into(),
+        interface_status("wlp5s0f3u2", true),
+        interface_status("wlp1s0", false),
     ];
     app.dashboard.managed.insert("wlp1s0".into(), true);
     app.dashboard
         .roles
         .insert("wlp1s0".into(), InterfaceRole::Output);
-    app.dashboard.routes = Some(vec![crate::api::model::RouteStatus {
+    app.dashboard.routes = Some(vec![traffic_masq_protocol::RouteStatusView {
         destination: "0.0.0.0/0".parse().unwrap(),
         gateway: Some("192.168.1.1".parse().unwrap()),
         output_interface: Some("wlp5s0f3u2".into()),
@@ -63,9 +66,8 @@ async fn new_sharing_prefills_managed_lan_to_observed_default_route() {
         metric: Some(600),
         protocol: 16,
         scope: 0,
-        owner: crate::netlink::RouteOwner::Dhcp,
-    }
-    .into()]);
+        owner: traffic_masq_protocol::RouteOwnerView::Dhcp,
+    }]);
 
     open(
         &mut app,
@@ -159,7 +161,7 @@ async fn route_shortcut_prefills_egress_without_changing_routes_or_staging() {
     let mut app = TuiApp::default();
     app.router.staged = true; // A local draft avoids any API request.
     app.router.proposed_router_config.forwarding = Some(vec![connection("lan0", "wan0").into()]);
-    let route = crate::api::model::RouteStatus {
+    let route = traffic_masq_protocol::RouteStatusView {
         destination: "10.0.0.0/8".parse().unwrap(),
         gateway: None,
         output_interface: Some("wg0".into()),
@@ -168,9 +170,9 @@ async fn route_shortcut_prefills_egress_without_changing_routes_or_staging() {
         metric: None,
         protocol: 4,
         scope: 0,
-        owner: crate::netlink::RouteOwner::Static,
+        owner: traffic_masq_protocol::RouteOwnerView::Static,
     };
-    app.router.routes.push(route.into());
+    app.router.routes.push(route);
     let before = app.router.proposed_router_config.clone();
     open_from_route(&mut app, &ApiClient::new("/must-not-be-used.sock")).await;
     let form = app.forwarding.as_ref().unwrap();

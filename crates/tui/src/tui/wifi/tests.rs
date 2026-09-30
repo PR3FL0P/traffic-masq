@@ -198,7 +198,7 @@ async fn connect_failure_uses_one_backend_operation() {
 
 #[tokio::test]
 async fn static_connect_retains_pending_transaction_without_auto_commit() {
-    let change = crate::core::transaction::PendingNetworkChange {
+    let change = traffic_masq_protocol::PendingNetworkChange {
         phase: Default::default(),
         last_error: None,
         token: "pending-token".into(),
@@ -410,7 +410,7 @@ fn ap_request_is_atomic_and_enables_derived_dhcp_by_default() {
 
 #[tokio::test]
 async fn ap_apply_enters_shared_commit_confirm_screen() {
-    let change = crate::core::transaction::PendingNetworkChange {
+    let change = traffic_masq_protocol::PendingNetworkChange {
         phase: Default::default(),
         last_error: None,
         token: "ap-token".into(),
@@ -1017,10 +1017,10 @@ fn render_wifi_displays_conflict_advice_when_competing_managers_present() {
                         interface: "wlp1s0".to_string(),
                         ssid: "TestAP".to_string(),
                         country_code: Some("US".to_string()),
-                        band: crate::config::WifiBand::Ghz2,
+                        band: WifiBand::Ghz2,
                         channel: 6,
-                        channel_width: crate::config::WifiChannelWidth::Ht20,
-                        security: crate::config::WifiSecurity::Open,
+                        channel_width: WifiChannelWidth::Ht20,
+                        security: WifiSecurity::Open,
                         hidden: false,
                         client_isolation: false,
                         max_stations: 32,
@@ -1304,7 +1304,7 @@ fn scan_security_label_distinguishes_transition_mode() {
 
 #[tokio::test]
 async fn request_simple_surfaces_wifi_error_and_client_error() {
-    use crate::api::model::WifiClientErrorDetail;
+    use traffic_masq_protocol::WifiClientErrorDetail;
 
     let (_directory, client, server) = mock_api(vec![
         Response::WifiClientError {
@@ -1350,7 +1350,7 @@ async fn request_simple_surfaces_wifi_error_and_client_error() {
 
 #[tokio::test]
 async fn request_simple_enters_pending_change_for_transactional_deactivation() {
-    let change = crate::core::transaction::PendingNetworkChange {
+    let change = traffic_masq_protocol::PendingNetworkChange {
         phase: Default::default(),
         last_error: None,
         token: "wifi-disable-token".into(),
@@ -1382,7 +1382,7 @@ async fn request_simple_enters_pending_change_for_transactional_deactivation() {
 
 #[tokio::test]
 async fn profile_deactivation_enters_pending_change_and_returns_to_profiles() {
-    let change = crate::core::transaction::PendingNetworkChange {
+    let change = traffic_masq_protocol::PendingNetworkChange {
         phase: Default::default(),
         last_error: None,
         token: "wifi-profile-disable-token".into(),
@@ -1563,13 +1563,13 @@ fn ap_warnings_and_focused_action_fit_minimum_terminal() {
     assert!(text.contains("confirm before the rollback timer expires"));
 }
 
-fn ap_test_profile() -> crate::api::model::WifiApProfileSummary {
+fn ap_test_profile() -> traffic_masq_protocol::WifiApProfileSummary {
     let mut settings = ap_settings(&WifiEditor::from_row(&radio("wlan0")));
     settings.ssid = "Guests".into();
     settings.channel = 11;
     settings.hidden = true;
     settings.client_isolation = true;
-    crate::api::model::WifiApProfileSummary {
+    traffic_masq_protocol::WifiApProfileSummary {
         id: "guest".into(),
         settings,
         configure_dhcp: false,
@@ -1662,7 +1662,7 @@ async fn ap_profile_save_does_not_activate_and_returns_to_selected_profile() {
 #[tokio::test]
 async fn ap_profile_apply_uses_saved_profile_and_commit_confirmation() {
     let mut app = ap_profiles_app(WifiProfilesMode::ProfileActions);
-    let change = crate::core::transaction::PendingNetworkChange {
+    let change = traffic_masq_protocol::PendingNetworkChange {
         phase: Default::default(),
         last_error: None,
         token: "ap-profile-token".into(),
@@ -1889,7 +1889,7 @@ async fn saving_standalone_client_profile_returns_to_library_without_connecting(
 #[tokio::test]
 async fn control_o_submits_wifi_connection_from_any_field() {
     let (_dir, client, server) = mock_api(vec![Response::WifiClientError {
-        detail: crate::api::model::WifiClientErrorDetail::Other {
+        detail: traffic_masq_protocol::WifiClientErrorDetail::Other {
             message: "test rejection".into(),
         },
     }])

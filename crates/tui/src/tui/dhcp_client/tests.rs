@@ -4,7 +4,7 @@ use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
 use super::*;
-use crate::api::model::DhcpClientStatusView;
+use traffic_masq_protocol::DhcpClientStatusView;
 
 fn status_named(interface: &str, state: DhcpClientOperationalState) -> DhcpClientStatusView {
     DhcpClientStatusView {

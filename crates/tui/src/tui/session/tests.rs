@@ -143,36 +143,25 @@ fn rejects_public_files_and_symlinks() {
 }
 
 #[tokio::test]
-async fn restored_token_is_checked_by_daemon_and_revoked_token_is_discarded() {
+async fn restored_token_is_checked_by_api_and_revoked_token_is_discarded() {
     use http_body_util::Full;
     use hyper::{body::Bytes, service::service_fn};
     use hyper_util::rt::TokioIo;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     let dir = tempfile::tempdir().unwrap();
     let store = store(dir.path());
-    let config = crate::config::AuthConfig {
-        database_path: dir.path().join("auth.sqlite3"),
-        argon2_memory_kib: 1024,
-        argon2_iterations: 1,
-        ..Default::default()
-    };
-    let auth = crate::auth::AuthService::open(&config).await.unwrap();
-    auth.initialize_device_password("test device password")
-        .await
-        .unwrap();
-    let login = auth
-        .login_device("test device password", None, None)
-        .await
-        .unwrap();
     let socket = dir.path().join("api.sock");
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-    let server_auth = auth.clone();
+    let token_revoked = Arc::new(AtomicBool::new(false));
+    let server_revoked = Arc::clone(&token_revoked);
     let task = tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
-            let auth = server_auth.clone();
+            let token_revoked = Arc::clone(&server_revoked);
             tokio::spawn(async move {
                 let handler = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
-                    let auth = auth.clone();
+                    let token_revoked = Arc::clone(&token_revoked);
                     async move {
                         assert_eq!(request.uri().path(), "/api/v1/security/settings");
                         let token = request
@@ -183,13 +172,14 @@ async fn restored_token_is_checked_by_daemon_and_revoked_token_is_discarded() {
                             .unwrap()
                             .strip_prefix("Bearer ")
                             .unwrap();
-                        let valid = auth.authenticate(token).await.is_ok();
+                        let valid =
+                            token == "secret-token" && !token_revoked.load(Ordering::SeqCst);
                         let body = if valid {
                             serde_json::to_vec(&Response::SecurityConfig {
-                                active: crate::api::model::SecuritySettings {
+                                active: traffic_masq_protocol::SecuritySettings {
                                     rollback_timeout_seconds: 30,
                                 },
-                                desired: crate::api::model::SecuritySettings {
+                                desired: traffic_masq_protocol::SecuritySettings {
                                     rollback_timeout_seconds: 30,
                                 },
                                 override_active: false,
@@ -215,16 +205,13 @@ async fn restored_token_is_checked_by_daemon_and_revoked_token_is_discarded() {
         }
     });
     let client = ApiClient::new(&socket);
-    let mut session = credential(super::super::current_unix_time());
-    session.token = Zeroizing::new(login.token.clone());
-    session.absolute_expires_at = login.absolute_expires_at;
-    client.restore_authentication(session).await;
+    client
+        .restore_authentication(credential(super::super::current_unix_time()))
+        .await;
     store.remember(&client).await.unwrap();
     let next = ApiClient::new(&socket);
     assert!(store.restore(&next).await.unwrap());
-    auth.reset_device_password("new test device password")
-        .await
-        .unwrap();
+    token_revoked.store(true, Ordering::SeqCst);
     let revoked = ApiClient::new(&socket);
     assert!(!store.restore(&revoked).await.unwrap());
     assert!(!revoked.is_authenticated().await);

@@ -9,13 +9,13 @@ interface state itself and cannot make changes.
 | `api` | HTTP, authorization and control-operation limits |
 | `crates/protocol` (`traffic-masq-protocol`) | API wire DTOs independent of daemon internals |
 | `crates/api-client` (`traffic-masq-api-client`) | Unix-socket HTTP transport, auth/session, request mapping and response decoding |
+| `crates/tui` (`traffic-masq-tui`) | Standalone terminal client and read-only direct-mode observation |
 | `core` | Configuration, ownership, plans, transactions and reconciliation |
 | `crates/netlink` (`traffic-masq-netlink`) | Kernel interfaces, IPv4 addresses, routes, rules and change events |
 | `firewall` | nftables and IPv4 forwarding |
 | `dhcp`, `wifi`, `vpn` | DHCP and VPN runtimes; Wi-Fi service supervision |
-| `state`, `atomic_file` | Persistent state and atomic file writes |
+| `state`, `crates/atomic-file` | Persistent state and atomic file writes |
 | `app` | Startup, shutdown, installation and init integration |
-| `tui` | Input, screen state and rendering |
 
 The root library re-exports `traffic-masq-netlink` as `traffic_masq::netlink`
 for existing callers. The netlink crate depends only on kernel protocol and
@@ -29,8 +29,8 @@ The response envelope also lives in protocol. VPN views, router health,
 coordinator and pending-change status, DHCP lease views, interface status and
 plans, routes, Wi-Fi status, and the complete router plan are protocol DTOs.
 The response alias `ControlResponse` contains no daemon model types. The TUI
-still imports daemon configuration and runtime modules directly; those imports
-must be removed before the TUI can become a client-only crate.
+crate depends on protocol, API client, netlink and atomic file storage without
+depending on the daemon crate. Its binary provides the operator interface.
 `config` re-exports shared interface, Wi-Fi and VPN enum values from protocol;
 `core::router_provisioning` similarly re-exports downstream overrides.
 The root `api::client::ApiClient` aliases the standalone `ControlApiClient`.
