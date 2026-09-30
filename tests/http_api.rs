@@ -34,8 +34,8 @@ use traffic_masq::core::interface::{DhcpChangeAction, InterfaceChangePlan, Inter
 use traffic_masq::core::override_manager::RuntimeOverrideManager;
 use traffic_masq::core::route::{RoutePlan, RouteSnapshot};
 use traffic_masq::core::router::{
-    DhcpPlan, RouterDesired, RouterManager, RouterSnapshot, RouterSubsystems, VpnChainSnapshot,
-    WifiPlan, WifiSnapshot,
+    DhcpPlan, RouterDesired, RouterManager, RouterSnapshot, RouterSubsystemPlan, RouterSubsystems,
+    VpnChainSnapshot, WifiPlan, WifiSnapshot,
 };
 use traffic_masq::core::router_transaction::{CoordinatorStatus, RouterTransactionCoordinator};
 use traffic_masq::dhcp::supervisor::{DhcpServiceSpec, DhcpSupervisor};
@@ -606,8 +606,8 @@ fn fake_dataplane_snapshot() -> RouterDataplaneSnapshot {
 
 #[async_trait]
 impl RouterSubsystems for FakeRouterSubsystems {
-    async fn plan_interfaces(&self, _: &RouterDesired) -> Result<Vec<InterfaceChangePlan>> {
-        Ok(vec![InterfaceChangePlan {
+    async fn plan_for(&self, desired: &RouterDesired) -> Result<RouterSubsystemPlan> {
+        let interfaces = vec![InterfaceChangePlan {
             interface: "lan0".into(),
             delete_ipv4: Vec::new(),
             retag_ipv4: None,
@@ -616,29 +616,33 @@ impl RouterSubsystems for FakeRouterSubsystems {
             management_change: false,
             dhcp_action: DhcpChangeAction::Unchanged,
             releasing_management: false,
-        }])
-    }
-
-    async fn plan_uplink_wifi(
-        &self,
-        desired: &RouterDesired,
-    ) -> Result<Vec<WifiPlan<WifiClientSpec>>> {
-        Ok(desired
+        }];
+        let uplink_wifi = desired
             .uplink_wifi
             .iter()
             .map(|spec| WifiPlan::Start {
                 desired: spec.clone(),
             })
-            .collect())
-    }
-    async fn plan_output_wifi(&self, desired: &RouterDesired) -> Result<Vec<WifiPlan<WifiApSpec>>> {
-        Ok(desired
+            .collect();
+        let output_wifi = desired
             .output_wifi
             .iter()
             .map(|spec| WifiPlan::Start {
                 desired: spec.clone(),
             })
-            .collect())
+            .collect();
+        let routes = self.plan_routes(desired).await?;
+        let vpn_chain = self.plan_vpn_chain(desired).await?;
+        let dataplane = self.plan_dataplane(desired).await?;
+        Ok(RouterSubsystemPlan {
+            interfaces,
+            uplink_wifi,
+            output_wifi,
+            routes,
+            dhcp: Vec::new(),
+            vpn_chain,
+            dataplane,
+        })
     }
     async fn apply_uplink_wifi(&self, _: &[WifiPlan<WifiClientSpec>]) -> Result<()> {
         Ok(())
@@ -663,9 +667,6 @@ impl RouterSubsystems for FakeRouterSubsystems {
             add: Vec::new(),
             delete: Vec::new(),
         })
-    }
-    async fn plan_dhcp(&self, _: &RouterDesired) -> Result<Vec<DhcpPlan>> {
-        Ok(Vec::new())
     }
     async fn plan_dataplane(&self, desired: &RouterDesired) -> Result<RouterDataplanePlan> {
         Ok(RouterDataplanePlan {

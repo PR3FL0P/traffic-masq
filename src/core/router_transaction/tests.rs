@@ -144,12 +144,12 @@ impl RouterSubsystems for FakeSubsystems {
         Ok(())
     }
 
-    async fn plan_interfaces(
+    async fn plan_for(
         &self,
-        _: &crate::core::router::RouterDesired,
-    ) -> Result<Vec<InterfaceChangePlan>> {
+        desired: &RouterDesired,
+    ) -> Result<crate::core::router::RouterSubsystemPlan> {
         self.record("plan_interfaces")?;
-        Ok(vec![InterfaceChangePlan {
+        let interfaces = vec![InterfaceChangePlan {
             interface: "lan0".into(),
             delete_ipv4: Vec::new(),
             retag_ipv4: None,
@@ -158,7 +158,26 @@ impl RouterSubsystems for FakeSubsystems {
             management_change: false,
             dhcp_action: DhcpChangeAction::Unchanged,
             releasing_management: false,
-        }])
+        }];
+        if desired.uplink_wifi.is_some() {
+            anyhow::bail!("uplink Wi-Fi runtime is unavailable");
+        }
+        if !desired.output_wifi.is_empty() {
+            anyhow::bail!("output Wi-Fi runtime is unavailable");
+        }
+        let routes = self.plan_routes(desired).await?;
+        self.record("plan_dhcp")?;
+        let vpn_chain = self.plan_vpn_chain(desired).await?;
+        let dataplane = self.plan_dataplane(desired).await?;
+        Ok(crate::core::router::RouterSubsystemPlan {
+            interfaces,
+            uplink_wifi: Vec::new(),
+            output_wifi: Vec::new(),
+            routes,
+            dhcp: Vec::new(),
+            vpn_chain,
+            dataplane,
+        })
     }
     async fn plan_routes(&self, _: &crate::core::router::RouterDesired) -> Result<RoutePlan> {
         self.record("plan_routes")?;
@@ -166,10 +185,6 @@ impl RouterSubsystems for FakeSubsystems {
             add: Vec::new(),
             delete: Vec::new(),
         })
-    }
-    async fn plan_dhcp(&self, _: &crate::core::router::RouterDesired) -> Result<Vec<DhcpPlan>> {
-        self.record("plan_dhcp")?;
-        Ok(Vec::new())
     }
     async fn plan_dataplane(
         &self,
@@ -564,6 +579,10 @@ async fn full_lifecycle_applies_and_commits() {
     let plan = coordinator.plan(candidate).await.expect("plan");
     coordinator.apply(plan).await.expect("apply");
     assert_eq!(coordinator.status().await, CoordinatorStatus::Pending);
+    let pending = coordinator.view().await;
+    assert_eq!(pending.phase, RouterPhase::Pending);
+    assert!(pending.commit_uncertainty.is_none());
+    assert!(!pending.cleanup_pending);
 
     let revision = coordinator
         .commit(&coordinator.pending_token().await.unwrap_or_default())
@@ -1123,7 +1142,9 @@ async fn incomplete_rollback_enters_recovery_state_and_can_be_retried() {
     assert!(failure.failures.iter().any(|f| f.contains("rollback_dhcp")));
 
     let view = coordinator.view().await;
-    assert_eq!(view.status, CoordinatorStatus::RollbackFailed);
+    assert_eq!(view.phase, RouterPhase::RollbackRequired);
+    assert!(view.commit_uncertainty.is_none());
+    assert_eq!(view.status(), CoordinatorStatus::RollbackFailed);
     assert_eq!(view.token.as_deref(), Some(failure.token.as_str()));
     assert_eq!(view.rollback_failures, failure.failures);
 
@@ -1231,8 +1252,12 @@ async fn restored_router_reports_cleanup_pending_and_never_rolls_back_twice() {
     let receipt = coordinator.inner.journal.with_extension("json.recovered");
     tokio::fs::create_dir(&receipt).await.unwrap();
     coordinator.rollback().await.unwrap();
+    let view = coordinator.view().await;
+    assert_eq!(view.phase, RouterPhase::Idle);
+    assert!(view.commit_uncertainty.is_none());
+    assert!(view.cleanup_pending);
     assert_eq!(
-        coordinator.status().await,
+        view.status(),
         CoordinatorStatus::RecoveredButJournalCleanupPending
     );
     let after = fake.events();
@@ -1241,6 +1266,7 @@ async fn restored_router_reports_cleanup_pending_and_never_rolls_back_twice() {
         .await
         .unwrap();
     assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
+    assert!(!coordinator.view().await.cleanup_pending);
     assert_eq!(fake.events(), after);
 }
 
@@ -1402,11 +1428,12 @@ async fn indeterminate_commit_fences_router_and_retains_recovery_evidence() {
         coordinator.status().await,
         CoordinatorStatus::CommitIndeterminate
     );
-    assert_eq!(
-        coordinator.view().await.token.as_deref(),
-        Some(token.as_str())
-    );
-    assert!(!coordinator.view().await.rollback_failures.is_empty());
+    let view = coordinator.view().await;
+    assert_eq!(view.phase, RouterPhase::Pending);
+    assert!(view.commit_uncertainty.is_some());
+    assert_eq!(view.token.as_deref(), Some(token.as_str()));
+    assert!(view.rollback_failures.is_empty());
+    assert!(!view.failures().is_empty());
     assert!(coordinator.commit(&token).await.is_err());
     assert!(coordinator.rollback_with_token(&token).await.is_err());
     assert!(coordinator.rollback().await.is_err());

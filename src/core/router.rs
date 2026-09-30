@@ -338,6 +338,19 @@ pub struct RouterPlan {
     pub risk: RouterRisk,
 }
 
+/// Observations and operations collected for a full router plan. The manager
+/// attaches the desired intent and derives the risk shown to callers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouterSubsystemPlan {
+    pub interfaces: Vec<InterfaceChangePlan>,
+    pub uplink_wifi: Vec<WifiPlan<WifiClientSpec>>,
+    pub output_wifi: Vec<WifiPlan<WifiApSpec>>,
+    pub routes: RoutePlan,
+    pub dhcp: Vec<DhcpPlan>,
+    pub vpn_chain: VpnChainPlan,
+    pub dataplane: RouterDataplanePlan,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WifiSnapshot<T> {
     pub interface: String,
@@ -412,30 +425,15 @@ pub trait RouterSubsystems: Send + Sync {
         Ok(())
     }
 
-    async fn plan_interfaces(&self, desired: &RouterDesired) -> Result<Vec<InterfaceChangePlan>>;
-    async fn plan_uplink_wifi(
-        &self,
-        desired: &RouterDesired,
-    ) -> Result<Vec<WifiPlan<WifiClientSpec>>> {
-        if desired.uplink_wifi.is_some() {
-            anyhow::bail!("uplink Wi-Fi runtime is unavailable")
-        }
-        Ok(Vec::new())
-    }
-    async fn plan_output_wifi(&self, desired: &RouterDesired) -> Result<Vec<WifiPlan<WifiApSpec>>> {
-        if !desired.output_wifi.is_empty() {
-            anyhow::bail!("output Wi-Fi runtime is unavailable")
-        }
-        Ok(Vec::new())
-    }
+    /// Collect the complete plan in dependency order. Keep narrow route, VPN,
+    /// and dataplane planners for drift repair without replanning the router.
+    async fn plan_for(&self, desired: &RouterDesired) -> Result<RouterSubsystemPlan>;
     async fn plan_routes(&self, desired: &RouterDesired) -> Result<RoutePlan>;
-    async fn plan_dhcp(&self, desired: &RouterDesired) -> Result<Vec<DhcpPlan>>;
     async fn plan_dataplane(&self, desired: &RouterDesired) -> Result<RouterDataplanePlan>;
 
-    /// Plan the VPN hop chain. Mirrors the `uplink_wifi`/`output_wifi`
-    /// default pattern: a subsystem implementor that doesn't support
-    /// chaining safely no-ops when there is nothing to chain, and errors
-    /// only if the desired state actually wants one.
+    /// Plan the VPN hop chain for narrow drift repair as well as full plans.
+    /// An implementation without VPN support safely no-ops for an empty
+    /// chain and errors when the desired state needs one.
     async fn plan_vpn_chain(&self, desired: &RouterDesired) -> Result<VpnChainPlan> {
         if !desired.vpn_chain.is_empty() {
             anyhow::bail!("VPN chain runtime is unavailable")
@@ -618,13 +616,15 @@ impl RouterManager {
 
     /// Inspect router subsystems and prepare the ordered operations required by desired intent.
     pub async fn plan(&self, desired: RouterDesired) -> Result<RouterPlan> {
-        let interfaces = self.subsystems.plan_interfaces(&desired).await?;
-        let uplink_wifi = self.subsystems.plan_uplink_wifi(&desired).await?;
-        let output_wifi = self.subsystems.plan_output_wifi(&desired).await?;
-        let routes = self.subsystems.plan_routes(&desired).await?;
-        let dhcp = self.subsystems.plan_dhcp(&desired).await?;
-        let vpn_chain = self.subsystems.plan_vpn_chain(&desired).await?;
-        let dataplane = self.subsystems.plan_dataplane(&desired).await?;
+        let RouterSubsystemPlan {
+            interfaces,
+            uplink_wifi,
+            output_wifi,
+            routes,
+            dhcp,
+            vpn_chain,
+            dataplane,
+        } = self.subsystems.plan_for(&desired).await?;
         let risk = RouterRisk {
             changes_default_route: routes.changes_default_route(),
             requires_management_confirmation: interfaces

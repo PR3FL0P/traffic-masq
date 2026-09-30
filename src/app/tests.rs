@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 
 use crate::config::{
     DhcpInterfaceConfig, InterfaceConfig, InterfaceRole, RouterConfig, UplinkConfig, UplinkMode,
-    VpnConfig,
+    VpnConfig, VpnPolicyMode,
 };
 #[cfg(target_os = "linux")]
 use crate::dhcp::client::supervisor::LinuxDhcpClientLauncher;
@@ -21,7 +21,7 @@ use crate::vpn::active_profile::ActiveProfileStore;
 use crate::vpn::manager::OWNED_INTERFACE_NAME;
 use crate::vpn::store::WireGuardProfileStore;
 use crate::vpn::wireguard::WireGuardVpnDriver;
-use crate::vpn::VpnProvider;
+use crate::vpn::{VpnManager, VpnProvider};
 
 use super::*;
 use crate::test_support::{FakeNetworkProvider, StaticKeyVpnProvider};

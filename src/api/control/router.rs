@@ -62,12 +62,12 @@ impl ControlService {
         };
         let health = router.manager().health(&desired).await;
         let coordinator = router.view().await;
-        let recovery =
-            router_recovery_notice(coordinator.status, coordinator.rollback_failures.clone());
+        let status = coordinator.status();
+        let recovery = router_recovery_notice(status, coordinator.failures());
         Response::RouterStatus {
             enabled: desired.enabled,
             ready: desired.enabled && health.ready(),
-            coordinator_status: coordinator.status,
+            coordinator_status: status,
             health,
             recovery,
         }
@@ -289,7 +289,7 @@ impl ControlService {
                     }
                 }
                 let coordinator = router.view().await;
-                if coordinator.status == CoordinatorStatus::RollbackFailed {
+                if coordinator.status() == CoordinatorStatus::RollbackFailed {
                     Response::RouterError {
                         detail: RouterErrorDetail::RollbackFailed {
                             failures: coordinator.rollback_failures,
@@ -307,12 +307,11 @@ impl ControlService {
             return router_disabled();
         };
         let coordinator = router.view().await;
-        let status = coordinator.status;
+        let status = coordinator.status();
+        let rollback_failure = (status == CoordinatorStatus::RollbackFailed)
+            .then(|| coordinator.rollback_failures.clone());
+        let recovery = router_recovery_notice(status, coordinator.failures());
         let token = coordinator.token;
-        let rollback_failures = coordinator.rollback_failures;
-        let rollback_failure =
-            (status == CoordinatorStatus::RollbackFailed).then(|| rollback_failures.clone());
-        let recovery = router_recovery_notice(status, rollback_failures);
         Response::RouterPendingTransaction {
             token,
             status,
@@ -673,8 +672,8 @@ impl ControlService {
 
         let readiness = router.manager().health(&desired).await;
         let coordinator = router.view().await;
-        let status = coordinator.status;
-        let failures = coordinator.rollback_failures;
+        let status = coordinator.status();
+        let failures = coordinator.failures();
         let ready = desired.enabled && readiness.ready() && !unconfigured;
         let stage = match status {
             CoordinatorStatus::RollbackFailed => ProvisioningStage::RollbackFailed,

@@ -65,9 +65,45 @@ pub struct NoPendingTransactionError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoordinatorView {
-    pub status: CoordinatorStatus,
+    pub phase: RouterPhase,
+    /// A failed commit write whose durable outcome cannot yet be proved.
+    pub commit_uncertainty: Option<String>,
+    /// Recovery completed, but its durable journal receipt still needs removal.
+    pub cleanup_pending: bool,
     pub token: Option<String>,
     pub rollback_failures: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouterPhase {
+    Idle,
+    Pending,
+    RollbackRequired,
+}
+
+impl CoordinatorView {
+    /// Preserve the wire status while keeping transaction and recovery state separate.
+    pub fn status(&self) -> CoordinatorStatus {
+        if self.commit_uncertainty.is_some() {
+            return CoordinatorStatus::CommitIndeterminate;
+        }
+        match self.phase {
+            RouterPhase::Idle if self.cleanup_pending => {
+                CoordinatorStatus::RecoveredButJournalCleanupPending
+            }
+            RouterPhase::Idle => CoordinatorStatus::Idle,
+            RouterPhase::Pending => CoordinatorStatus::Pending,
+            RouterPhase::RollbackRequired => CoordinatorStatus::RollbackFailed,
+        }
+    }
+
+    /// Include the commit diagnostic in the legacy API failure list.
+    pub fn failures(&self) -> Vec<String> {
+        self.commit_uncertainty
+            .as_ref()
+            .map(|error| vec![error.clone()])
+            .unwrap_or_else(|| self.rollback_failures.clone())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -435,41 +471,33 @@ impl RouterTransactionCoordinator {
     /// Return an internally consistent view of coordinator state under one lock.
     pub async fn view(&self) -> CoordinatorView {
         let state = self.inner.state.lock().await;
-        if let Some(error) = crate::core::recovery::commit_uncertainty(
+        let commit_uncertainty = crate::core::recovery::commit_uncertainty(
             self.inner
                 .overrides
                 .path()
                 .parent()
                 .expect("state directory"),
-        ) {
-            let token = match &*state {
-                CoordinatorState::Pending(pending) => Some(pending.token.clone()),
-                CoordinatorState::RollbackFailed(failure) => Some(failure.token.clone()),
-                CoordinatorState::Idle => None,
-            };
-            return CoordinatorView {
-                status: CoordinatorStatus::CommitIndeterminate,
-                token,
-                rollback_failures: vec![error],
-            };
-        }
+        );
+        let cleanup_pending = crate::core::recovery::cleanup_pending(&self.inner.journal);
         match &*state {
             CoordinatorState::Idle => CoordinatorView {
-                status: if crate::core::recovery::cleanup_pending(&self.inner.journal) {
-                    CoordinatorStatus::RecoveredButJournalCleanupPending
-                } else {
-                    CoordinatorStatus::Idle
-                },
+                phase: RouterPhase::Idle,
+                commit_uncertainty,
+                cleanup_pending,
                 token: None,
                 rollback_failures: Vec::new(),
             },
             CoordinatorState::Pending(pending) => CoordinatorView {
-                status: CoordinatorStatus::Pending,
+                phase: RouterPhase::Pending,
+                commit_uncertainty,
+                cleanup_pending,
                 token: Some(pending.token.clone()),
                 rollback_failures: Vec::new(),
             },
             CoordinatorState::RollbackFailed(failure) => CoordinatorView {
-                status: CoordinatorStatus::RollbackFailed,
+                phase: RouterPhase::RollbackRequired,
+                commit_uncertainty,
+                cleanup_pending,
                 token: Some(failure.token.clone()),
                 rollback_failures: failure.failures.clone(),
             },
@@ -503,7 +531,7 @@ impl RouterTransactionCoordinator {
 
     /// Report whether the coordinator is idle, awaiting confirmation, or awaiting rollback recovery.
     pub async fn status(&self) -> CoordinatorStatus {
-        self.view().await.status
+        self.view().await.status()
     }
 
     /// Wait until a pending/recovery transaction has returned to idle.

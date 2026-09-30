@@ -332,17 +332,27 @@ fn plan() -> RouterPlan {
 
 #[async_trait]
 impl RouterSubsystems for FakeSubsystems {
-    async fn plan_interfaces(&self, _: &RouterDesired) -> Result<Vec<InterfaceChangePlan>> {
+    async fn plan_for(&self, desired: &RouterDesired) -> Result<RouterSubsystemPlan> {
         self.event("plan_interfaces")?;
-        Ok(plan().interfaces)
-    }
-    async fn plan_uplink_wifi(&self, _: &RouterDesired) -> Result<Vec<WifiPlan<WifiClientSpec>>> {
+        let interfaces = plan().interfaces;
         self.event("plan_uplink_wifi")?;
-        Ok(Vec::new())
-    }
-    async fn plan_output_wifi(&self, _: &RouterDesired) -> Result<Vec<WifiPlan<WifiApSpec>>> {
+        let uplink_wifi = Vec::new();
         self.event("plan_output_wifi")?;
-        Ok(Vec::new())
+        let output_wifi = Vec::new();
+        let routes = self.plan_routes(desired).await?;
+        self.event("plan_dhcp")?;
+        let dhcp = Vec::new();
+        let vpn_chain = self.plan_vpn_chain(desired).await?;
+        let dataplane = self.plan_dataplane(desired).await?;
+        Ok(RouterSubsystemPlan {
+            interfaces,
+            uplink_wifi,
+            output_wifi,
+            routes,
+            dhcp,
+            vpn_chain,
+            dataplane,
+        })
     }
     async fn plan_routes(&self, _: &RouterDesired) -> Result<RoutePlan> {
         self.event("plan_routes")?;
@@ -358,10 +368,6 @@ impl RouterSubsystems for FakeSubsystems {
             add: add.into_iter().collect(),
             delete: Vec::new(),
         })
-    }
-    async fn plan_dhcp(&self, _: &RouterDesired) -> Result<Vec<DhcpPlan>> {
-        self.event("plan_dhcp")?;
-        Ok(Vec::new())
     }
     async fn plan_dataplane(&self, desired: &RouterDesired) -> Result<RouterDataplanePlan> {
         self.event("plan_dataplane")?;
@@ -674,6 +680,43 @@ async fn plan_aggregates_default_route_risk() {
     let router_plan = RouterManager::new(fake).plan(desired).await.unwrap();
     assert!(router_plan.risk.changes_default_route);
     assert!(!router_plan.risk.requires_management_confirmation);
+}
+
+#[tokio::test]
+async fn full_plan_preserves_stage_order_and_first_error() {
+    let desired = RouterDesired::from_effective_config(&enabled_config()).unwrap();
+    let stages = [
+        "plan_interfaces",
+        "plan_uplink_wifi",
+        "plan_output_wifi",
+        "plan_routes",
+        "plan_dhcp",
+        "plan_dataplane",
+    ];
+
+    let fake = FakeSubsystems::new(None);
+    let planned = RouterManager::new(fake.clone())
+        .plan(desired.clone())
+        .await
+        .unwrap();
+    assert_eq!(planned.desired, desired);
+    assert_eq!(fake.events(), stages.map(str::to_string).to_vec());
+
+    for (index, stage) in stages.iter().enumerate() {
+        let fake = FakeSubsystems::new(Some(stage));
+        let error = RouterManager::new(fake.clone())
+            .plan(desired.clone())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(stage));
+        assert_eq!(
+            fake.events(),
+            stages[..=index]
+                .iter()
+                .map(|stage| stage.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
 }
 
 #[tokio::test]

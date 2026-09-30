@@ -13,8 +13,8 @@ use ipnet::Ipv4Net;
 use crate::core::interface::{InterfaceChangePlan, InterfaceManager, InterfaceSnapshot};
 use crate::core::route::{RouteManager, RoutePlan, RouteSnapshot};
 use crate::core::router::{
-    DhcpPlan, RouterDesired, RouterDhcpHealthReason, RouterSubsystems, VpnChainPlan,
-    VpnChainSnapshot, WifiPlan, WifiSnapshot,
+    DhcpPlan, RouterDesired, RouterDhcpHealthReason, RouterSubsystemPlan, RouterSubsystems,
+    VpnChainPlan, VpnChainSnapshot, WifiPlan, WifiSnapshot,
 };
 use crate::core::vpn_chain::{VpnHopDesired, VpnHopKind, VpnHopRoutingDesired};
 use crate::core::vpn_policy::VpnPolicyReservedIds;
@@ -874,65 +874,11 @@ where
     }
 }
 
-#[async_trait]
-impl<P, E> RouterSubsystems for ProductionRouterSubsystems<P, E>
+impl<P, E> ProductionRouterSubsystems<P, E>
 where
-    P: RouterDataplaneProvider + Send + Sync,
-    E: RouterDataplaneEventSink + Send + Sync,
+    P: RouterDataplaneProvider,
+    E: RouterDataplaneEventSink,
 {
-    async fn prepare_recovery(&self, current: &RouterDesired) -> Result<()> {
-        if current.vpn_chain.is_empty() {
-            return Ok(());
-        }
-        self.require_vpn_chain_deps()?;
-
-        let mut recovered = Vec::new();
-        for hop in &current.vpn_chain {
-            let manager = self.vpn_manager_for_hop(hop.hop_index).await?;
-            match manager.reconcile_on(&hop.interface).await? {
-                ReconcileOutcome::Absent => {}
-                ReconcileOutcome::Adopted(record) if record.profile_name == hop.profile_name => {
-                    recovered.push(hop.clone());
-                }
-                ReconcileOutcome::Adopted(record) => {
-                    // The link is ours, but it belongs to the pre-transaction
-                    // profile. Keep the ownership record in the manager so a
-                    // subsequent snapshot rollback can re-use it, but do not
-                    // misclassify it as partially-applied candidate state.
-                    tracing::warn!(
-                        interface = %hop.interface,
-                        expected_profile = %hop.profile_name,
-                        observed_profile = %record.profile_name,
-                        "owned VPN hop belongs to different intent during recovery"
-                    );
-                }
-                ReconcileOutcome::ForeignInterfacePresent => bail!(
-                    "cannot recover VPN hop {}: interface '{}' exists without matching durable ownership proof",
-                    hop.hop_index,
-                    hop.interface
-                ),
-            }
-        }
-        // Recovery also runs before live repairs. Preserve known resources
-        // until apply/rollback has actually removed them, including hops no
-        // longer present in the desired chain or whose links disappeared.
-        let mut active = self.vpn_active_chain.write().await;
-        for hop in recovered {
-            if !active.contains(&hop) {
-                active.push(hop);
-            }
-        }
-        Ok(())
-    }
-
-    async fn adopt_router_interfaces(&self, desired: &RouterDesired) {
-        self.adopt(desired).await;
-    }
-
-    async fn retain_router_interfaces(&self, interfaces: &[String]) {
-        self.retain(interfaces).await;
-    }
-
     async fn plan_interfaces(&self, desired: &RouterDesired) -> Result<Vec<InterfaceChangePlan>> {
         let network = crate::config::NetworkConfig {
             interfaces: desired
@@ -1019,12 +965,6 @@ where
         Ok(plans)
     }
 
-    async fn plan_routes(&self, desired: &RouterDesired) -> Result<RoutePlan> {
-        self.routes
-            .plan(&desired.routes, desired.allow_default_route_change)
-            .await
-    }
-
     async fn plan_dhcp(&self, desired: &RouterDesired) -> Result<Vec<DhcpPlan>> {
         let desired_by_interface: BTreeMap<&str, &DhcpServiceSpec> = desired
             .dhcp
@@ -1051,6 +991,91 @@ where
             plans.push(plan);
         }
         Ok(plans)
+    }
+}
+
+#[async_trait]
+impl<P, E> RouterSubsystems for ProductionRouterSubsystems<P, E>
+where
+    P: RouterDataplaneProvider + Send + Sync,
+    E: RouterDataplaneEventSink + Send + Sync,
+{
+    async fn prepare_recovery(&self, current: &RouterDesired) -> Result<()> {
+        if current.vpn_chain.is_empty() {
+            return Ok(());
+        }
+        self.require_vpn_chain_deps()?;
+
+        let mut recovered = Vec::new();
+        for hop in &current.vpn_chain {
+            let manager = self.vpn_manager_for_hop(hop.hop_index).await?;
+            match manager.reconcile_on(&hop.interface).await? {
+                ReconcileOutcome::Absent => {}
+                ReconcileOutcome::Adopted(record) if record.profile_name == hop.profile_name => {
+                    recovered.push(hop.clone());
+                }
+                ReconcileOutcome::Adopted(record) => {
+                    // The link is ours, but it belongs to the pre-transaction
+                    // profile. Keep the ownership record in the manager so a
+                    // subsequent snapshot rollback can re-use it, but do not
+                    // misclassify it as partially-applied candidate state.
+                    tracing::warn!(
+                        interface = %hop.interface,
+                        expected_profile = %hop.profile_name,
+                        observed_profile = %record.profile_name,
+                        "owned VPN hop belongs to different intent during recovery"
+                    );
+                }
+                ReconcileOutcome::ForeignInterfacePresent => bail!(
+                    "cannot recover VPN hop {}: interface '{}' exists without matching durable ownership proof",
+                    hop.hop_index,
+                    hop.interface
+                ),
+            }
+        }
+        // Recovery also runs before live repairs. Preserve known resources
+        // until apply/rollback has actually removed them, including hops no
+        // longer present in the desired chain or whose links disappeared.
+        let mut active = self.vpn_active_chain.write().await;
+        for hop in recovered {
+            if !active.contains(&hop) {
+                active.push(hop);
+            }
+        }
+        Ok(())
+    }
+
+    async fn adopt_router_interfaces(&self, desired: &RouterDesired) {
+        self.adopt(desired).await;
+    }
+
+    async fn retain_router_interfaces(&self, interfaces: &[String]) {
+        self.retain(interfaces).await;
+    }
+
+    async fn plan_for(&self, desired: &RouterDesired) -> Result<RouterSubsystemPlan> {
+        let interfaces = self.plan_interfaces(desired).await?;
+        let uplink_wifi = self.plan_uplink_wifi(desired).await?;
+        let output_wifi = self.plan_output_wifi(desired).await?;
+        let routes = self.plan_routes(desired).await?;
+        let dhcp = self.plan_dhcp(desired).await?;
+        let vpn_chain = self.plan_vpn_chain(desired).await?;
+        let dataplane = self.plan_dataplane(desired).await?;
+        Ok(RouterSubsystemPlan {
+            interfaces,
+            uplink_wifi,
+            output_wifi,
+            routes,
+            dhcp,
+            vpn_chain,
+            dataplane,
+        })
+    }
+
+    async fn plan_routes(&self, desired: &RouterDesired) -> Result<RoutePlan> {
+        self.routes
+            .plan(&desired.routes, desired.allow_default_route_change)
+            .await
     }
 
     async fn plan_dataplane(&self, desired: &RouterDesired) -> Result<RouterDataplanePlan> {

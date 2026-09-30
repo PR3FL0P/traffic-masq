@@ -392,7 +392,9 @@ async fn selects_the_live_address_that_matches_the_dhcp_router() {
 use crate::config::{RouterConfig, UplinkConfig, UplinkMode};
 use crate::core::interface::{DhcpChangeAction, InterfaceChangePlan};
 use crate::core::route::{RoutePlan, RouteSnapshot};
-use crate::core::router::{DhcpPlan, RouterSnapshot, RouterSubsystems, VpnChainSnapshot};
+use crate::core::router::{
+    DhcpPlan, RouterSnapshot, RouterSubsystemPlan, RouterSubsystems, VpnChainSnapshot,
+};
 use crate::firewall::{OwnedFirewallIntegrity, RouterDataplanePlan, RouterDataplaneSnapshot};
 use tempfile::tempdir;
 
@@ -442,8 +444,8 @@ fn fake_router_snapshot() -> RouterSnapshot {
 
 #[async_trait]
 impl RouterSubsystems for FakeRouterSubsystems {
-    async fn plan_interfaces(&self, _: &RouterDesired) -> Result<Vec<InterfaceChangePlan>> {
-        Ok(vec![InterfaceChangePlan {
+    async fn plan_for(&self, desired: &RouterDesired) -> Result<RouterSubsystemPlan> {
+        let interfaces = vec![InterfaceChangePlan {
             interface: "lan0".into(),
             delete_ipv4: Vec::new(),
             retag_ipv4: None,
@@ -452,16 +454,31 @@ impl RouterSubsystems for FakeRouterSubsystems {
             management_change: false,
             dhcp_action: DhcpChangeAction::Unchanged,
             releasing_management: false,
-        }])
+        }];
+        if desired.uplink_wifi.is_some() {
+            anyhow::bail!("uplink Wi-Fi runtime is unavailable");
+        }
+        if !desired.output_wifi.is_empty() {
+            anyhow::bail!("output Wi-Fi runtime is unavailable");
+        }
+        let routes = self.plan_routes(desired).await?;
+        let vpn_chain = self.plan_vpn_chain(desired).await?;
+        let dataplane = self.plan_dataplane(desired).await?;
+        Ok(RouterSubsystemPlan {
+            interfaces,
+            uplink_wifi: Vec::new(),
+            output_wifi: Vec::new(),
+            routes,
+            dhcp: Vec::new(),
+            vpn_chain,
+            dataplane,
+        })
     }
     async fn plan_routes(&self, _: &RouterDesired) -> Result<RoutePlan> {
         Ok(RoutePlan {
             add: Vec::new(),
             delete: Vec::new(),
         })
-    }
-    async fn plan_dhcp(&self, _: &RouterDesired) -> Result<Vec<DhcpPlan>> {
-        Ok(Vec::new())
     }
     async fn plan_dataplane(&self, desired: &RouterDesired) -> Result<RouterDataplanePlan> {
         Ok(RouterDataplanePlan {
@@ -5205,38 +5222,39 @@ struct FakeProvisioningSubsystems {
 
 #[async_trait]
 impl RouterSubsystems for FakeProvisioningSubsystems {
-    async fn plan_interfaces(&self, _: &RouterDesired) -> Result<Vec<InterfaceChangePlan>> {
-        Ok(Vec::new())
-    }
-    async fn plan_uplink_wifi(
-        &self,
-        desired: &RouterDesired,
-    ) -> Result<Vec<WifiPlan<WifiClientSpec>>> {
-        Ok(desired
+    async fn plan_for(&self, desired: &RouterDesired) -> Result<RouterSubsystemPlan> {
+        let uplink_wifi = desired
             .uplink_wifi
             .iter()
             .map(|spec| WifiPlan::Start {
                 desired: spec.clone(),
             })
-            .collect())
-    }
-    async fn plan_output_wifi(&self, desired: &RouterDesired) -> Result<Vec<WifiPlan<WifiApSpec>>> {
-        Ok(desired
+            .collect();
+        let output_wifi = desired
             .output_wifi
             .iter()
             .map(|spec| WifiPlan::Start {
                 desired: spec.clone(),
             })
-            .collect())
+            .collect();
+        let routes = self.plan_routes(desired).await?;
+        let vpn_chain = self.plan_vpn_chain(desired).await?;
+        let dataplane = self.plan_dataplane(desired).await?;
+        Ok(RouterSubsystemPlan {
+            interfaces: Vec::new(),
+            uplink_wifi,
+            output_wifi,
+            routes,
+            dhcp: Vec::new(),
+            vpn_chain,
+            dataplane,
+        })
     }
     async fn plan_routes(&self, _: &RouterDesired) -> Result<RoutePlan> {
         Ok(RoutePlan {
             add: Vec::new(),
             delete: Vec::new(),
         })
-    }
-    async fn plan_dhcp(&self, _: &RouterDesired) -> Result<Vec<DhcpPlan>> {
-        Ok(Vec::new())
     }
     async fn plan_dataplane(&self, desired: &RouterDesired) -> Result<RouterDataplanePlan> {
         Ok(RouterDataplanePlan {

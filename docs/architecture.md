@@ -33,10 +33,14 @@ keeps profile storage, activation policy, and ownership recovery.
 
 `RouterManager` orders router apply and rollback stages. Its subsystem boundary
 captures one router-scoped `RouterSnapshot` with `snapshot_for`, including
-absent DHCP services and clients needed for rollback. The app's
+absent DHCP services and clients needed for rollback. `RouterSubsystems::plan_for`
+collects a full plan; route, VPN, and dataplane planning remain available for
+targeted drift repair. The app's
 `startup_recovery` module validates durable proofs before normal admission or
-API binding; `reconcile` owns runtime network convergence and integrity
-workers.
+API binding; `router_startup` wires the production coordinator and restores
+temporary route/dataplane baselines; `vpn_startup` prepares VPN control and
+legacy policy migration; `reconcile` owns runtime network convergence and
+integrity workers.
 
 `api::model` re-exports the protocol DTOs for current callers. The request
 envelope now lives in protocol. Interface changes and router proposals use

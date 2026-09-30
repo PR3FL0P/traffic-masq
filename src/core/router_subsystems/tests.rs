@@ -378,33 +378,27 @@ async fn full_round_trip_applies_interfaces_routes_and_dataplane() {
     let (subsystems, provider) = subsystems_for(&config).await;
     let desired = RouterDesired::from_effective_config(&config).expect("desired");
 
-    let interface_plan = subsystems
-        .plan_interfaces(&desired)
-        .await
-        .expect("interface plan");
-    assert_eq!(interface_plan.len(), 2);
-    let route_plan = subsystems.plan_routes(&desired).await.expect("route plan");
-    let dhcp_plan = subsystems.plan_dhcp(&desired).await.expect("dhcp plan");
-    assert!(dhcp_plan.is_empty());
-    let dataplane_plan = subsystems
-        .plan_dataplane(&desired)
-        .await
-        .expect("dataplane plan");
+    let plan = subsystems.plan_for(&desired).await.expect("router plan");
+    assert_eq!(plan.interfaces.len(), 2);
+    assert!(plan.uplink_wifi.is_empty());
+    assert!(plan.output_wifi.is_empty());
+    assert!(plan.dhcp.is_empty());
+    assert!(plan.vpn_chain.hops.is_empty());
 
     subsystems
-        .apply_interfaces(&interface_plan)
+        .apply_interfaces(&plan.interfaces)
         .await
         .expect("apply interfaces");
     subsystems
-        .apply_routes(&route_plan)
+        .apply_routes(&plan.routes)
         .await
         .expect("apply routes");
     subsystems
-        .apply_dhcp(&dhcp_plan)
+        .apply_dhcp(&plan.dhcp)
         .await
         .expect("apply dhcp (no-op)");
     subsystems
-        .apply_dataplane(&dataplane_plan)
+        .apply_dataplane(&plan.dataplane)
         .await
         .expect("apply dataplane");
 
