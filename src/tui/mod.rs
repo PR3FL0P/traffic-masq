@@ -20,7 +20,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
 use zeroize::Zeroize;
 
-use crate::netlink::{NetworkProvider, RtnetlinkNetworkProvider};
+use traffic_masq_netlink::{NetworkProvider, RtnetlinkNetworkProvider};
 use crate::tui::api::client::ApiClient;
 use crate::tui::api::model::{DhcpClientStatusView, Request, Response};
 use traffic_masq_protocol::{InterfaceChangePlanView, PendingNetworkChange};

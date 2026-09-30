@@ -214,7 +214,7 @@ pub(super) fn save_route_editor(app: &mut TuiApp) {
         output_interface_index: None,
         table: new_route.table,
         metric: new_route.metric,
-        protocol: crate::netlink::TRAFFIC_MASQ_ROUTE_PROTOCOL,
+        protocol: traffic_masq_netlink::TRAFFIC_MASQ_ROUTE_PROTOCOL,
         scope: 0,
         owner: RouteOwner::TrafficMasqStatic,
     });
