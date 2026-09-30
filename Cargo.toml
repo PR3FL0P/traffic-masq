@@ -1,6 +1,7 @@
 
 [workspace]
 members = ["crates/netlink", "crates/protocol", "crates/api-client", "crates/atomic-file", "crates/tui"]
+default-members = [".", "crates/tui"]
 resolver = "2"
 
 [package]
