@@ -2,7 +2,7 @@ use std::net::Ipv4Addr;
 
 use anyhow::{bail, Result};
 
-use crate::dhcp::packet::{
+use crate::packet::{
     finish_options, push_option, DhcpMessageType, DhcpPacket, BOOTREPLY, BOOTREQUEST,
     DHCP_FIXED_HEADER_LEN, DHCP_MAGIC_COOKIE, ETHERNET_HLEN, ETHERNET_HTYPE,
     OPTION_CLIENT_IDENTIFIER, OPTION_DNS_SERVERS, OPTION_LEASE_TIME, OPTION_MESSAGE_TYPE,

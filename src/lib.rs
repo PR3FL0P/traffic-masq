@@ -1,8 +1,8 @@
 //! `traffic-masq` — an IPv4 router, Wi-Fi access point, and VPN gateway for Linux.
 //!
-//! The library contains the shared state model and system adapters used by two
-//! binaries: `traffic-masqd` manages the network with elevated privileges,
-//! while `traffic-masq` provides the terminal UI.
+//! This crate contains the daemon state model and system adapters used by
+//! `traffic-masqd`. The `traffic-masq` terminal client lives in the separate
+//! `traffic-masq-tui` crate.
 //!
 //! The project converges the running system toward a desired state. Interface,
 //! router, and Wi-Fi AP provisioning changes use commit-confirm transactions: if

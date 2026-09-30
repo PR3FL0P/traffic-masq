@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::dhcp::lease::{LeaseManager, LeasePoolConfig};
+use crate::lease::{LeaseManager, LeasePoolConfig};
 
 use super::*;
 

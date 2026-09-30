@@ -12,14 +12,24 @@ interface state itself and cannot make changes.
 | `crates/tui` (`traffic-masq-tui`) | Standalone terminal client and read-only direct-mode observation |
 | `core` | Configuration, ownership, plans, transactions and reconciliation |
 | `crates/netlink` (`traffic-masq-netlink`) | Kernel interfaces, IPv4 addresses, routes, rules and change events |
-| `firewall` | nftables and IPv4 forwarding |
-| `dhcp`, `wifi`, `vpn` | DHCP and VPN runtimes; Wi-Fi service supervision |
+| `crates/dataplane` (`traffic-masq-dataplane`) | nftables and IPv4 forwarding models, plans and reconciliation |
+| `crates/dhcp-core` (`traffic-masq-dhcp-core`) | DHCP packets, server leases, and client state transitions |
+| `crates/wireguard` (`traffic-masq-wireguard`) | WireGuard profile parsing and Linux netlink operations |
+| `firewall` | Daemon command adapter for the dataplane crate |
+| `dhcp`, `wifi`, `vpn` | DHCP and VPN runtimes, storage and ownership; Wi-Fi service supervision |
 | `state`, `crates/atomic-file` | Persistent state and atomic file writes |
 | `app` | Startup, shutdown, installation and init integration |
 
 The root library re-exports `traffic-masq-netlink` as `traffic_masq::netlink`
 for existing callers. The netlink crate depends only on kernel protocol and
 runtime libraries; application orchestration depends on it, never the reverse.
+The dataplane crate owns forwarding rules and depends on protocol and netlink.
+The daemon supplies its bounded `nft` command executor at the `firewall`
+boundary; the dataplane crate does not import daemon configuration or core.
+The DHCP core contains no socket, store, or supervisor code. The daemon's DHCP
+module re-exports its packet, lease, server, and client state-machine APIs.
+The WireGuard crate owns the profile parser and kernel provider; the daemon
+keeps profile storage, activation policy, and ownership recovery.
 
 `api::model` re-exports the protocol DTOs for current callers. The request
 envelope now lives in protocol. Interface changes and router proposals use

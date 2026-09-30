@@ -111,7 +111,7 @@ pub fn validate_forwarding<R: ForwardingRule>(rules: &[R]) -> Result<(), String>
     Ok(())
 }
 
-fn validate_interface_name(name: &str) -> Result<(), String> {
+pub fn validate_interface_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("interface name cannot be empty".into());
     }

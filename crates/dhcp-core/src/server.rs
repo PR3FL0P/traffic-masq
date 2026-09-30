@@ -3,8 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 
-use crate::dhcp::lease::LeaseManager;
-use crate::dhcp::packet::{DhcpMessageType, DhcpPacket, DHCP_FIXED_HEADER_LEN, DHCP_MAGIC_COOKIE};
+use crate::lease::LeaseManager;
+use crate::packet::{DhcpMessageType, DhcpPacket, DHCP_FIXED_HEADER_LEN, DHCP_MAGIC_COOKIE};
 
 fn now_unix() -> u64 {
     SystemTime::now()
@@ -32,7 +32,7 @@ impl DhcpHandler {
         Self { config, leases }
     }
 
-    pub fn lease_snapshot(&self) -> Vec<crate::dhcp::lease::DhcpLease> {
+    pub fn lease_snapshot(&self) -> Vec<crate::lease::DhcpLease> {
         self.leases.snapshot()
     }
 

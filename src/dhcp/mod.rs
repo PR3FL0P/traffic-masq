@@ -6,10 +6,16 @@
 
 pub mod client;
 pub mod defaults;
-pub mod lease;
-pub mod packet;
+pub mod lease {
+    pub use traffic_masq_dhcp_core::lease::*;
+}
+pub mod packet {
+    pub use traffic_masq_dhcp_core::packet::*;
+}
 pub mod runtime;
-pub mod server;
+pub mod server {
+    pub use traffic_masq_dhcp_core::server::*;
+}
 pub mod store;
 pub mod supervisor;
 

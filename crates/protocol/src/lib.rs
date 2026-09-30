@@ -27,9 +27,9 @@ pub use network_manager_advice::{
 pub use recovery_action::RecoveryAction;
 pub use route::{RouteOwnerView, RouteStatusView};
 pub use router::{
-    validate_forwarding, ForwardingConfigView, ForwardingRule, InterfaceOverrideRequestView,
-    OwnedIpv4RouteConfigView, RouterConfigView, RouterProposalRequestView, UplinkConfigView,
-    VpnHopConfigView,
+    validate_forwarding, validate_interface_name, ForwardingConfigView, ForwardingRule,
+    InterfaceOverrideRequestView, OwnedIpv4RouteConfigView, RouterConfigView,
+    RouterProposalRequestView, UplinkConfigView, VpnHopConfigView,
 };
 pub use router_plan::{
     hop_interface_name, DhcpClientSpecView, DhcpPlanView, Ipv4RouteInfoView, Ipv4RouteSpecView,

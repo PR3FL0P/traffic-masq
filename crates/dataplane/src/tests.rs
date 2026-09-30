@@ -1,13 +1,13 @@
-use crate::netlink::AddressOwnership;
 use std::collections::VecDeque;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use traffic_masq_netlink::AddressOwnership;
 
 use tokio::sync::Mutex;
 
 use super::*;
-use crate::netlink::{Ipv4AddressInfo, NetworkInterface};
+use traffic_masq_netlink::{Ipv4AddressInfo, NetworkInterface};
 
 #[derive(Debug, Clone)]
 struct FakeNetworkProvider {
@@ -440,13 +440,13 @@ fn nft_render_contains_owned_policy_and_scoped_masquerade() {
 fn forwarding_desired() -> RouterDataplaneDesired {
     RouterDataplaneDesired {
         forwarding: Some(vec![
-            crate::config::ForwardingConfig {
+            ForwardingConfig {
                 from: "lan0".to_string(),
                 to: "wan0".to_string(),
                 masquerade: true,
                 source_subnet: Some("192.168.10.0/24".parse().expect("subnet")),
             },
-            crate::config::ForwardingConfig {
+            ForwardingConfig {
                 from: "lan1".to_string(),
                 to: "wg0".to_string(),
                 masquerade: false,

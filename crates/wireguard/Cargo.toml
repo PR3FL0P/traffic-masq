@@ -1,0 +1,22 @@
+[package]
+name = "traffic-masq-wireguard"
+version = "0.1.0"
+edition = "2021"
+license-file = "../../LICENSE"
+rust-version = "1.95"
+description = "WireGuard profile parser and Linux netlink adapter for traffic-masq"
+
+[dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+futures-util = "0.3"
+genetlink = "0.2.7"
+ipnet = "2"
+netlink-packet-core = "0.8"
+netlink-packet-generic = "0.4"
+netlink-packet-route = "0.19"
+netlink-packet-wireguard = "0.4.2"
+rtnetlink = "0.14"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+zeroize = "1"

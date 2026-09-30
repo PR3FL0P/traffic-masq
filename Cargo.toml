@@ -1,6 +1,6 @@
 
 [workspace]
-members = ["crates/netlink", "crates/protocol", "crates/api-client", "crates/atomic-file", "crates/tui"]
+members = ["crates/netlink", "crates/protocol", "crates/api-client", "crates/atomic-file", "crates/tui", "crates/dataplane", "crates/dhcp-core", "crates/wireguard"]
 default-members = [".", "crates/tui"]
 resolver = "2"
 
@@ -29,21 +29,14 @@ axum = "0.8"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
-futures-util = "0.3"
-genetlink = "0.2.7"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "server", "service", "tokio"] }
 ipnet = { version = "2", features = ["serde"] }
-netlink-packet-core = "0.8"
-netlink-packet-generic = "0.4"
-netlink-packet-route = "0.19"
-netlink-packet-wireguard = "0.4.2"
 nix = { version = "0.29", features = ["fs", "net", "process", "signal", "socket", "uio", "user"] }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 rand = "0.8"
 rpassword = "7"
-rtnetlink = "0.14"
 rustls = "0.23"
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
@@ -62,12 +55,16 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 traffic-masq-api-client = { path = "crates/api-client" }
 traffic-masq-atomic-file = { path = "crates/atomic-file" }
+traffic-masq-dataplane = { path = "crates/dataplane" }
+traffic-masq-dhcp-core = { path = "crates/dhcp-core" }
 traffic-masq-netlink = { path = "crates/netlink" }
 traffic-masq-protocol = { path = "crates/protocol" }
+traffic-masq-wireguard = { path = "crates/wireguard" }
 zeroize = { version = "1", features = ["serde"] }
 
 [dev-dependencies]
 traffic-masq-atomic-file = { path = "crates/atomic-file", features = ["fault-injection"] }
+traffic-masq-dataplane = { path = "crates/dataplane", features = ["test-support"] }
 rcgen = "0.13"
 tempfile = "3"
 # Test-only tokio clock control (`start_paused`), so the DHCP client

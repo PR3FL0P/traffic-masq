@@ -1,8 +1,12 @@
 pub mod lease;
 pub mod ownership;
-pub mod packet;
+pub mod packet {
+    pub use traffic_masq_dhcp_core::client::packet::*;
+}
 pub mod runtime;
-pub mod state_machine;
+pub mod state_machine {
+    pub use traffic_masq_dhcp_core::client::state_machine::*;
+}
 pub mod store;
 pub mod supervisor;
 

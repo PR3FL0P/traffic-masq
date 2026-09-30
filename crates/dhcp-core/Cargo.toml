@@ -1,0 +1,11 @@
+[package]
+name = "traffic-masq-dhcp-core"
+version = "0.1.0"
+edition = "2021"
+license-file = "../../LICENSE"
+rust-version = "1.95"
+description = "Pure DHCP packet, lease, server, and client state-machine logic for traffic-masq"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }

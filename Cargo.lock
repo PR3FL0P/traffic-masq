@@ -2923,22 +2923,15 @@ dependencies = [
  "base64",
  "clap",
  "fs2",
- "futures-util",
- "genetlink",
  "http-body-util",
  "hyper",
  "hyper-util",
  "ipnet",
- "netlink-packet-core 0.8.1",
- "netlink-packet-generic",
- "netlink-packet-route",
- "netlink-packet-wireguard",
  "nix 0.29.0",
  "pbkdf2",
  "rand",
  "rcgen",
  "rpassword",
- "rtnetlink",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -2958,8 +2951,11 @@ dependencies = [
  "tracing-subscriber",
  "traffic-masq-api-client",
  "traffic-masq-atomic-file",
+ "traffic-masq-dataplane",
+ "traffic-masq-dhcp-core",
  "traffic-masq-netlink",
  "traffic-masq-protocol",
+ "traffic-masq-wireguard",
  "zeroize",
 ]
 
@@ -2989,6 +2985,29 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+]
+
+[[package]]
+name = "traffic-masq-dataplane"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "ipnet",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "traffic-masq-netlink",
+ "traffic-masq-protocol",
+]
+
+[[package]]
+name = "traffic-masq-dhcp-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
 ]
 
 [[package]]
@@ -3045,6 +3064,25 @@ dependencies = [
  "traffic-masq-protocol",
  "unicode-segmentation",
  "unicode-width",
+ "zeroize",
+]
+
+[[package]]
+name = "traffic-masq-wireguard"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "futures-util",
+ "genetlink",
+ "ipnet",
+ "netlink-packet-core 0.8.1",
+ "netlink-packet-generic",
+ "netlink-packet-route",
+ "netlink-packet-wireguard",
+ "rtnetlink",
+ "thiserror 1.0.69",
+ "tokio",
  "zeroize",
 ]
 

@@ -279,7 +279,7 @@ async fn activate_installs_rules_routes_and_firewall_when_tunnel_is_healthy() {
     assert_eq!(routes[0].output_interface_index, Some(42));
     assert_eq!(routes[0].table, 30_100);
 
-    let calls = manager.firewall.executor.calls.lock().unwrap();
+    let calls = manager.firewall.executor().calls.lock().unwrap();
     assert_eq!(calls.len(), 3);
     assert_eq!(calls[2].0, ["-f", "-"]);
 }
@@ -430,7 +430,7 @@ async fn activate_refuses_when_foreign_rule_occupies_reserved_space() {
         .contains("foreign objects occupy the reserved namespace"));
 
     assert_eq!(network.list_ipv4_rules().await.unwrap().len(), 1);
-    assert!(manager.firewall.executor.calls.lock().unwrap().is_empty());
+    assert!(manager.firewall.executor().calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -475,7 +475,7 @@ async fn activate_rolls_back_rule_when_route_installation_fails() {
     assert!(network.list_ipv4_rules().await.unwrap().is_empty());
     assert!(network.list_ipv4_routes().await.unwrap().is_empty());
 
-    assert_eq!(manager.firewall.executor.calls.lock().unwrap().len(), 2);
+    assert_eq!(manager.firewall.executor().calls.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -520,7 +520,7 @@ async fn deactivate_removes_rules_and_routes_before_firewall() {
 
     assert!(network.list_ipv4_rules().await.unwrap().is_empty());
     assert!(network.list_ipv4_routes().await.unwrap().is_empty());
-    let calls = manager.firewall.executor.calls.lock().unwrap();
+    let calls = manager.firewall.executor().calls.lock().unwrap();
 
     assert_eq!(calls.len(), 6);
     assert_eq!(calls[5].0, ["-f", "-"]);

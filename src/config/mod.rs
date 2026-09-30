@@ -14,6 +14,7 @@ use anyhow::{bail, Context, Result};
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 
+pub use traffic_masq_dataplane::ForwardingConfig;
 pub use traffic_masq_protocol::{
     InterfaceRole, UplinkMode, VpnPolicyMode, WifiBand, WifiChannelWidth, WifiClientSecurity,
     WifiSecurity,
@@ -165,32 +166,6 @@ pub struct RouterConfig {
     /// `reserved` fields of a hop are recomputed at runtime, not persisted.
     #[serde(default)]
     pub vpn_chain: Vec<VpnHopConfig>,
-}
-
-/// A directional permission to forward IPv4 traffic between existing interfaces.
-/// Routing selects the egress; this rule does not create routes or VPN tunnels.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ForwardingConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_subnet: Option<Ipv4Net>,
-    pub from: String,
-    pub to: String,
-    #[serde(default = "default_true")]
-    pub masquerade: bool,
-}
-
-impl traffic_masq_protocol::ForwardingRule for ForwardingConfig {
-    fn source_subnet(&self) -> Option<Ipv4Net> {
-        self.source_subnet
-    }
-
-    fn from_interface(&self) -> &str {
-        &self.from
-    }
-
-    fn to_interface(&self) -> &str {
-        &self.to
-    }
 }
 
 /// Reject invalid forwarding port ranges, addresses, protocols, and conflicting rules.
@@ -1102,22 +1077,7 @@ impl WifiClientConfig {
 
 /// Reject names that exceed Linux interface limits or contain unsupported characters.
 pub(crate) fn validate_interface_name(name: &str) -> Result<()> {
-    if name.is_empty() {
-        bail!("interface name cannot be empty");
-    }
-
-    if name.len() > 15 {
-        bail!("interface name exceeds Linux IFNAMSIZ limit");
-    }
-
-    if !name
-        .chars()
-        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.'))
-    {
-        bail!("interface name contains unsupported characters");
-    }
-
-    Ok(())
+    traffic_masq_protocol::validate_interface_name(name).map_err(anyhow::Error::msg)
 }
 
 pub(crate) fn networks_overlap(left: Ipv4Net, right: Ipv4Net) -> bool {

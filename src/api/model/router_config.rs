@@ -1,11 +1,9 @@
 //! Router proposal conversion at the daemon boundary.
 
 use super::{InterfaceOverrideRequest, RouterProposalRequest};
-use crate::config::{
-    ForwardingConfig, OwnedIpv4RouteConfig, RouterConfig, UplinkConfig, VpnHopConfig,
-};
+use crate::config::{OwnedIpv4RouteConfig, RouterConfig, UplinkConfig, VpnHopConfig};
 use traffic_masq_protocol::{
-    ForwardingConfigView, InterfaceOverrideRequestView, OwnedIpv4RouteConfigView, RouterConfigView,
+    InterfaceOverrideRequestView, OwnedIpv4RouteConfigView, RouterConfigView,
     RouterProposalRequestView, UplinkConfigView, VpnHopConfigView,
 };
 
@@ -25,14 +23,6 @@ macro_rules! copy_fields {
 }
 
 copy_fields!(UplinkConfig, UplinkConfigView, interface, mode);
-copy_fields!(
-    ForwardingConfig,
-    ForwardingConfigView,
-    source_subnet,
-    from,
-    to,
-    masquerade
-);
 copy_fields!(
     OwnedIpv4RouteConfig,
     OwnedIpv4RouteConfigView,

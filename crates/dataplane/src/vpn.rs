@@ -83,6 +83,11 @@ where
         Self { executor }
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn executor(&self) -> &E {
+        &self.executor
+    }
+
     pub async fn observe_async(self: &std::sync::Arc<Self>) -> Result<VpnFirewallObservation> {
         let backend = self.clone();
         tokio::task::spawn_blocking(move || backend.observe()).await?
@@ -398,21 +403,21 @@ fn vpn_firewall_structure_is_intact(entries: &[Value], desired: &VpnPolicyFirewa
     chains_ok && subnets_ok && mark_ok && masquerade_ok && killswitch_ok
 }
 
-#[cfg(test)]
-pub(crate) mod test_support {
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
     use std::collections::VecDeque;
     use std::sync::Mutex as StdMutex;
 
     use super::*;
 
     #[derive(Debug, Default)]
-    pub(crate) struct FakeNftExecutor {
+    pub struct FakeNftExecutor {
         responses: StdMutex<VecDeque<Result<Vec<u8>>>>,
-        pub(crate) calls: StdMutex<Vec<(Vec<String>, Vec<u8>)>>,
+        pub calls: StdMutex<Vec<(Vec<String>, Vec<u8>)>>,
     }
 
     impl FakeNftExecutor {
-        pub(crate) fn with_responses(responses: Vec<Result<Vec<u8>>>) -> Self {
+        pub fn with_responses(responses: Vec<Result<Vec<u8>>>) -> Self {
             Self {
                 responses: StdMutex::new(responses.into()),
                 calls: StdMutex::new(Vec::new()),
@@ -434,7 +439,7 @@ pub(crate) mod test_support {
         }
     }
 
-    pub(crate) fn vpn_rule(chain: &str, expression: Value) -> Value {
+    pub fn vpn_rule(chain: &str, expression: Value) -> Value {
         serde_json::json!({ "rule": {
             "family": NFT_FAMILY,
             "table": NFT_VPN_TABLE,
@@ -443,7 +448,7 @@ pub(crate) mod test_support {
         }})
     }
 
-    pub(crate) fn nft_ruleset(owned: Option<&VpnPolicyFirewallDesired>) -> Vec<u8> {
+    pub fn nft_ruleset(owned: Option<&VpnPolicyFirewallDesired>) -> Vec<u8> {
         let mut entries = vec![
             serde_json::json!({
                 "table": { "family": "inet", "name": "foreign", "comment": "untouched" }

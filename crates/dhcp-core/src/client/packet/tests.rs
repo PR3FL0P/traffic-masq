@@ -1,5 +1,5 @@
 use super::*;
-use crate::dhcp::packet::{OPTION_END, OPTION_MESSAGE_TYPE};
+use crate::packet::{OPTION_END, OPTION_MESSAGE_TYPE};
 
 const XID: u32 = 0x1234_5678;
 const MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 9];

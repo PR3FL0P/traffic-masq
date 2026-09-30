@@ -1,6 +1,6 @@
 use std::{fmt, net::Ipv4Addr, time::Duration};
 
-use crate::dhcp::packet::DhcpPacket;
+use crate::packet::DhcpPacket;
 
 use super::packet::{Ack, ClientPacketBuilder, Offer, ReplyContext};
 
@@ -112,7 +112,7 @@ impl DhcpClientStateMachine {
         self.xid
     }
 
-    pub(crate) fn deadline(&self) -> Option<MonotonicTime> {
+    pub fn deadline(&self) -> Option<MonotonicTime> {
         self.deadline
     }
 
