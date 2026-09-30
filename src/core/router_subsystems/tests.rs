@@ -366,12 +366,6 @@ async fn a_vanished_interface_does_not_block_router_transactions() {
         snapshot.interfaces.iter().all(|entry| entry.name != "usb0"),
         "an absent interface has nothing to restore and must be skipped"
     );
-
-    let owned = subsystems
-        .snapshot_interfaces()
-        .await
-        .expect("snapshot_interfaces must tolerate a missing interface too");
-    assert!(owned.iter().all(|entry| entry.name != "usb0"));
 }
 
 #[tokio::test]
@@ -898,6 +892,17 @@ async fn chain_subsystems() -> (
     (subsystems, vpn_provider, net_provider, dir)
 }
 
+async fn chain_snapshot(
+    subsystems: &ProductionRouterSubsystems<FakeDataplaneProvider>,
+) -> VpnChainSnapshot {
+    let desired = RouterDesired::from_effective_config(&AppConfig::default()).unwrap();
+    subsystems
+        .snapshot_for(&desired)
+        .await
+        .expect("snapshot")
+        .vpn_chain
+}
+
 #[tokio::test]
 async fn apply_vpn_chain_activates_hops_in_order() {
     let (subsystems, vpn_provider, net, _dir) = chain_subsystems().await;
@@ -991,7 +996,7 @@ async fn failed_wireguard_cleanup_remains_visible_to_outer_rollback() {
         .expect_err("activation cleanup failure must propagate");
     assert!(vpn_provider.link_exists("tm-wg-0").await.expect("link"));
 
-    let recovery = subsystems.snapshot_vpn_chain().await.expect("recovery set");
+    let recovery = chain_snapshot(&subsystems).await;
     assert!(recovery.previous_hops.contains(&hop));
     assert!(
         subsystems
@@ -1043,10 +1048,7 @@ async fn vpn_repair_keeps_obsolete_hops_until_teardown() {
     let desired = RouterDesired::from_effective_config(&AppConfig::default()).unwrap();
     assert!(subsystems.health_vpn_chain(&desired).await.is_err());
     subsystems.prepare_recovery(&desired).await.unwrap();
-    assert_eq!(
-        subsystems.snapshot_vpn_chain().await.unwrap().previous_hops,
-        vec![hop]
-    );
+    assert_eq!(chain_snapshot(&subsystems).await.previous_hops, vec![hop]);
     subsystems
         .apply_vpn_chain(&VpnChainPlan { hops: vec![] })
         .await
@@ -1071,10 +1073,7 @@ async fn vpn_repair_keeps_hops_outside_the_recovered_desired_chain() {
     let mut desired = RouterDesired::from_effective_config(&AppConfig::default()).unwrap();
     desired.vpn_chain = vec![first];
     subsystems.prepare_recovery(&desired).await.unwrap();
-    assert_eq!(
-        subsystems.snapshot_vpn_chain().await.unwrap().previous_hops,
-        hops
-    );
+    assert_eq!(chain_snapshot(&subsystems).await.previous_hops, hops);
 }
 
 #[tokio::test]
@@ -1099,14 +1098,7 @@ async fn vpn_chain_restart_readopts_owned_hops_and_apply_is_idempotent() {
         .prepare_recovery(&desired)
         .await
         .expect("re-adopt persisted ownership");
-    assert_eq!(
-        restarted
-            .snapshot_vpn_chain()
-            .await
-            .expect("snapshot")
-            .previous_hops,
-        plan.hops
-    );
+    assert_eq!(chain_snapshot(&restarted).await.previous_hops, plan.hops);
     restarted
         .apply_vpn_chain(&plan)
         .await
@@ -1136,7 +1128,7 @@ async fn vpn_chain_crash_recovery_rolls_candidate_back_to_snapshot() {
         .apply_vpn_chain(&old_plan)
         .await
         .expect("old apply");
-    let old_snapshot = subsystems.snapshot_vpn_chain().await.expect("old snapshot");
+    let old_snapshot = chain_snapshot(&subsystems).await;
 
     let store = WireGuardProfileStore::new(dir.path().join("wireguard"));
     store

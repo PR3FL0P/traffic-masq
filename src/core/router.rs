@@ -443,23 +443,6 @@ pub trait RouterSubsystems: Send + Sync {
         Ok(VpnChainPlan::empty())
     }
 
-    async fn snapshot_interfaces(&self) -> Result<Vec<InterfaceSnapshot>>;
-    async fn snapshot_uplink_wifi(&self) -> Result<Vec<WifiSnapshot<WifiClientSpec>>> {
-        Ok(Vec::new())
-    }
-    async fn snapshot_output_wifi(&self) -> Result<Vec<WifiSnapshot<WifiApSpec>>> {
-        Ok(Vec::new())
-    }
-    async fn snapshot_routes(&self) -> Result<RouteSnapshot>;
-    async fn snapshot_dhcp(&self) -> Result<Vec<DhcpServiceSpec>>;
-    async fn snapshot_dataplane(&self) -> Result<RouterDataplaneSnapshot>;
-    async fn snapshot_uplink_dhcp(&self) -> Result<Option<DhcpClientSpec>> {
-        Ok(None)
-    }
-    async fn snapshot_vpn_chain(&self) -> Result<VpnChainSnapshot> {
-        Ok(VpnChainSnapshot::empty())
-    }
-
     /// Widen volatile ownership to cover an intent that is about to mutate the
     /// machine. Planning and snapshotting must stay observational; adoption is
     /// deliberately a separate apply-time step so a plan preview cannot change
@@ -475,20 +458,7 @@ pub trait RouterSubsystems: Send + Sync {
     async fn retain_router_interfaces(&self, _interfaces: &[String]) {}
 
     /// Capture recovery state for the subsystems affected by the desired router intent.
-    async fn snapshot_for(&self, _desired: &RouterDesired) -> Result<RouterSnapshot> {
-        Ok(RouterSnapshot {
-            interfaces: self.snapshot_interfaces().await?,
-            uplink_wifi: self.snapshot_uplink_wifi().await?,
-            uplink_dhcp: self.snapshot_uplink_dhcp().await?,
-            dhcp_clients: Vec::new(),
-            output_wifi: self.snapshot_output_wifi().await?,
-            routes: self.snapshot_routes().await?,
-            dhcp: self.snapshot_dhcp().await?,
-            dhcp_absent_interfaces: Vec::new(),
-            vpn_chain: self.snapshot_vpn_chain().await?,
-            dataplane: self.snapshot_dataplane().await?,
-        })
-    }
+    async fn snapshot_for(&self, desired: &RouterDesired) -> Result<RouterSnapshot>;
 
     async fn apply_interfaces(&self, plan: &[InterfaceChangePlan]) -> Result<()>;
     async fn apply_uplink_wifi(&self, plan: &[WifiPlan<WifiClientSpec>]) -> Result<()> {
@@ -509,18 +479,11 @@ pub trait RouterSubsystems: Send + Sync {
     /// Stop DHCP clients whose ownership must disappear before interface
     /// configuration is mutated.
     async fn quiesce_uplink_dhcp(&self, _desired: Option<&DhcpClientSpec>) -> Result<()> {
-        // Conservative compatibility path for existing implementations: stop
-        // DHCP before interface mutation even if that causes a fresh acquire.
-        self.apply_uplink_dhcp(None).await
-    }
-    async fn apply_uplink_dhcp(&self, _desired: Option<&DhcpClientSpec>) -> Result<()> {
         Ok(())
     }
     /// Apply candidate DHCP intent and report whether rollback should quiesce
-    /// candidate runtime before restoring interfaces. Kept separate so older
-    /// `RouterSubsystems` implementations retain the original public method.
-    async fn apply_uplink_dhcp_candidate(&self, desired: Option<&DhcpClientSpec>) -> Result<bool> {
-        self.apply_uplink_dhcp(desired).await?;
+    /// candidate runtime before restoring interfaces.
+    async fn apply_uplink_dhcp_candidate(&self, _desired: Option<&DhcpClientSpec>) -> Result<bool> {
         Ok(true)
     }
     /// Activate hops 0..N in order. On any hop's failure, must roll back
@@ -548,21 +511,15 @@ pub trait RouterSubsystems: Send + Sync {
         Ok(())
     }
     async fn rollback_routes(&self, snapshot: &RouteSnapshot) -> Result<()>;
-    async fn rollback_dhcp(&self, snapshot: &[DhcpServiceSpec]) -> Result<()>;
     async fn rollback_dhcp_scoped(
         &self,
         snapshot: &[DhcpServiceSpec],
-        _previously_absent: &[String],
-    ) -> Result<()> {
-        self.rollback_dhcp(snapshot).await
-    }
+        previously_absent: &[String],
+    ) -> Result<()>;
     async fn rollback_dataplane(&self, snapshot: &RouterDataplaneSnapshot) -> Result<()>;
     /// Stop DHCP runtime installed by the candidate before interface rollback.
     /// Previous DHCP intent is restored by `rollback_dhcp_clients` afterwards.
     async fn rollback_candidate_uplink_dhcp(&self) -> Result<()> {
-        self.apply_uplink_dhcp(None).await
-    }
-    async fn rollback_uplink_dhcp(&self, _snapshot: Option<&DhcpClientSpec>) -> Result<()> {
         Ok(())
     }
     async fn rollback_dhcp_clients(
@@ -574,7 +531,8 @@ pub trait RouterSubsystems: Send + Sync {
             snapshots.is_empty(),
             "scoped DHCP client restoration is unavailable"
         );
-        self.rollback_uplink_dhcp(legacy).await
+        let _ = legacy;
+        Ok(())
     }
     async fn rollback_vpn_chain(&self, snapshot: &VpnChainSnapshot) -> Result<()> {
         if !snapshot.hops.is_empty() {
@@ -748,22 +706,6 @@ impl RouterManager {
             self.subsystems.health_dataplane(desired).await?;
         }
         Ok(())
-    }
-
-    /// Capture current subsystem state for later router rollback.
-    pub async fn snapshot(&self) -> Result<RouterSnapshot> {
-        Ok(RouterSnapshot {
-            interfaces: self.subsystems.snapshot_interfaces().await?,
-            uplink_wifi: self.subsystems.snapshot_uplink_wifi().await?,
-            uplink_dhcp: self.subsystems.snapshot_uplink_dhcp().await?,
-            dhcp_clients: Vec::new(),
-            output_wifi: self.subsystems.snapshot_output_wifi().await?,
-            routes: self.subsystems.snapshot_routes().await?,
-            dhcp: self.subsystems.snapshot_dhcp().await?,
-            dhcp_absent_interfaces: Vec::new(),
-            vpn_chain: self.subsystems.snapshot_vpn_chain().await?,
-            dataplane: self.subsystems.snapshot_dataplane().await?,
-        })
     }
 
     /// Capture recovery state for the subsystems affected by the desired router intent.

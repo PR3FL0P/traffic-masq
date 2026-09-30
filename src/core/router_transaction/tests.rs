@@ -10,7 +10,7 @@ use crate::config::{
 };
 use crate::core::interface::{DhcpChangeAction, InterfaceChangePlan, InterfaceSnapshot};
 use crate::core::route::{RoutePlan, RouteSnapshot};
-use crate::core::router::{DhcpPlan, RouterSubsystems};
+use crate::core::router::{DhcpPlan, RouterSnapshot, RouterSubsystems, VpnChainSnapshot};
 use crate::core::router_candidate::RouterIntentProposal;
 use crate::dhcp::supervisor::DhcpServiceSpec;
 use crate::firewall::{RouterDataplanePlan, RouterDataplaneSnapshot};
@@ -182,24 +182,23 @@ impl RouterSubsystems for FakeSubsystems {
             requires_apply: true,
         })
     }
-    async fn snapshot_interfaces(&self) -> Result<Vec<InterfaceSnapshot>> {
-        self.record("snapshot_interfaces")?;
-        Ok(Vec::new())
-    }
     async fn retain_router_interfaces(&self, interfaces: &[String]) {
         self.retained.lock().unwrap().push(interfaces.to_vec());
     }
-    async fn snapshot_routes(&self) -> Result<RouteSnapshot> {
-        self.record("snapshot_routes")?;
-        Ok(RouteSnapshot::empty())
-    }
-    async fn snapshot_dhcp(&self) -> Result<Vec<DhcpServiceSpec>> {
-        self.record("snapshot_dhcp")?;
-        Ok(Vec::new())
-    }
-    async fn snapshot_dataplane(&self) -> Result<RouterDataplaneSnapshot> {
-        self.record("snapshot_dataplane")?;
-        Ok(self.dataplane_snapshot())
+    async fn snapshot_for(&self, _: &RouterDesired) -> Result<RouterSnapshot> {
+        self.record("snapshot_for")?;
+        Ok(RouterSnapshot {
+            interfaces: Vec::new(),
+            uplink_wifi: Vec::new(),
+            uplink_dhcp: None,
+            dhcp_clients: Vec::new(),
+            output_wifi: Vec::new(),
+            dhcp: Vec::new(),
+            dhcp_absent_interfaces: Vec::new(),
+            routes: RouteSnapshot::empty(),
+            vpn_chain: VpnChainSnapshot::empty(),
+            dataplane: self.dataplane_snapshot(),
+        })
     }
     async fn apply_interfaces(&self, _: &[InterfaceChangePlan]) -> Result<()> {
         self.fail_if_matched("apply_interfaces", &self.apply_fail)
@@ -228,7 +227,7 @@ impl RouterSubsystems for FakeSubsystems {
     async fn rollback_routes(&self, _: &RouteSnapshot) -> Result<()> {
         self.fail_if_matched("rollback_routes", &self.rollback_fail)
     }
-    async fn rollback_dhcp(&self, _: &[DhcpServiceSpec]) -> Result<()> {
+    async fn rollback_dhcp_scoped(&self, _: &[DhcpServiceSpec], _: &[String]) -> Result<()> {
         self.fail_if_matched("rollback_dhcp", &self.rollback_fail)
     }
     async fn rollback_dataplane(&self, _: &RouterDataplaneSnapshot) -> Result<()> {

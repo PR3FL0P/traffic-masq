@@ -371,29 +371,20 @@ impl RouterSubsystems for FakeSubsystems {
             requires_apply: true,
         })
     }
-    async fn snapshot_interfaces(&self) -> Result<Vec<InterfaceSnapshot>> {
-        self.event("snapshot_interfaces")?;
-        Ok(Vec::new())
-    }
-    async fn snapshot_uplink_wifi(&self) -> Result<Vec<WifiSnapshot<WifiClientSpec>>> {
-        self.event("snapshot_uplink_wifi")?;
-        Ok(Vec::new())
-    }
-    async fn snapshot_output_wifi(&self) -> Result<Vec<WifiSnapshot<WifiApSpec>>> {
-        self.event("snapshot_output_wifi")?;
-        Ok(Vec::new())
-    }
-    async fn snapshot_routes(&self) -> Result<RouteSnapshot> {
-        self.event("snapshot_routes")?;
-        Ok(RouteSnapshot::empty())
-    }
-    async fn snapshot_dhcp(&self) -> Result<Vec<DhcpServiceSpec>> {
-        self.event("snapshot_dhcp")?;
-        Ok(Vec::new())
-    }
-    async fn snapshot_dataplane(&self) -> Result<RouterDataplaneSnapshot> {
-        self.event("snapshot_dataplane")?;
-        Ok(dataplane_snapshot())
+    async fn snapshot_for(&self, _: &RouterDesired) -> Result<RouterSnapshot> {
+        self.event("snapshot_for")?;
+        Ok(RouterSnapshot {
+            interfaces: Vec::new(),
+            uplink_wifi: Vec::new(),
+            uplink_dhcp: None,
+            dhcp_clients: Vec::new(),
+            output_wifi: Vec::new(),
+            dhcp: Vec::new(),
+            dhcp_absent_interfaces: Vec::new(),
+            routes: RouteSnapshot::empty(),
+            vpn_chain: VpnChainSnapshot::empty(),
+            dataplane: dataplane_snapshot(),
+        })
     }
     async fn quiesce_uplink_dhcp(&self, _: Option<&DhcpClientSpec>) -> Result<()> {
         if self.quiesce_dhcp {
@@ -452,7 +443,7 @@ impl RouterSubsystems for FakeSubsystems {
     async fn rollback_routes(&self, _: &RouteSnapshot) -> Result<()> {
         self.event("rollback_routes")
     }
-    async fn rollback_dhcp(&self, _: &[DhcpServiceSpec]) -> Result<()> {
+    async fn rollback_dhcp_scoped(&self, _: &[DhcpServiceSpec], _: &[String]) -> Result<()> {
         self.event("rollback_dhcp")
     }
     async fn rollback_dataplane(&self, _: &RouterDataplaneSnapshot) -> Result<()> {
@@ -517,12 +508,7 @@ async fn snapshots_before_first_mutation_and_exact_success_order() {
     assert_eq!(
         fake.events(),
         [
-            "snapshot_interfaces",
-            "snapshot_uplink_wifi",
-            "snapshot_output_wifi",
-            "snapshot_routes",
-            "snapshot_dhcp",
-            "snapshot_dataplane",
+            "snapshot_for",
             "apply_interfaces",
             "apply_uplink_wifi",
             "apply_output_wifi",

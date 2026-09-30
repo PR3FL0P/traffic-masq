@@ -1057,81 +1057,6 @@ where
         self.dataplane.plan_target(desired.dataplane.clone()).await
     }
 
-    async fn snapshot_interfaces(&self) -> Result<Vec<InterfaceSnapshot>> {
-        let owned = self.owned_interfaces().await;
-        let mut snapshots = Vec::with_capacity(owned.len());
-        for name in &owned {
-            match self.interfaces.snapshot_if_present(name).await? {
-                Some(snapshot) => snapshots.push(snapshot),
-                None => tracing::warn!(
-                    interface = %name,
-                    "router-owned interface is not present; snapshotting the rest"
-                ),
-            }
-        }
-        Ok(snapshots)
-    }
-
-    async fn snapshot_uplink_wifi(&self) -> Result<Vec<WifiSnapshot<WifiClientSpec>>> {
-        let Some(runtime) = &self.stations else {
-            return Ok(Vec::new());
-        };
-        let owned = self.owned_interfaces().await;
-        let mut snapshots = Vec::with_capacity(owned.len());
-        for name in &owned {
-            snapshots.push(WifiSnapshot {
-                interface: name.clone(),
-                spec: runtime.status(name).await.map(|(spec, _)| spec),
-            });
-        }
-        Ok(snapshots)
-    }
-
-    async fn snapshot_output_wifi(&self) -> Result<Vec<WifiSnapshot<WifiApSpec>>> {
-        let Some(runtime) = &self.access_points else {
-            return Ok(Vec::new());
-        };
-        let owned = self.owned_interfaces().await;
-        let mut snapshots = Vec::with_capacity(owned.len());
-        for name in &owned {
-            snapshots.push(WifiSnapshot {
-                interface: name.clone(),
-                spec: runtime.status(name).await.map(|(spec, _)| spec),
-            });
-        }
-        Ok(snapshots)
-    }
-
-    async fn snapshot_routes(&self) -> Result<RouteSnapshot> {
-        self.routes.snapshot().await
-    }
-
-    async fn snapshot_dhcp(&self) -> Result<Vec<DhcpServiceSpec>> {
-        let mut specs = Vec::new();
-        for name in &self.owned_interfaces().await {
-            if let Some(spec) = self.dhcp.spec(name).await {
-                specs.push(spec);
-            }
-        }
-        Ok(specs)
-    }
-
-    async fn snapshot_dataplane(&self) -> Result<RouterDataplaneSnapshot> {
-        self.dataplane.snapshot().await
-    }
-
-    async fn snapshot_uplink_dhcp(&self) -> Result<Option<DhcpClientSpec>> {
-        let Some(runtime) = &self.dhcp_client else {
-            return Ok(None);
-        };
-        for name in &self.owned_interfaces().await {
-            if let Some(status) = runtime.status(name).await {
-                return Ok(Some(status.spec));
-            }
-        }
-        Ok(None)
-    }
-
     async fn snapshot_for(
         &self,
         desired: &RouterDesired,
@@ -1205,7 +1130,13 @@ where
             routes: self.routes.snapshot().await?,
             dhcp,
             dhcp_absent_interfaces,
-            vpn_chain: self.snapshot_vpn_chain().await?,
+            vpn_chain: {
+                let previous = self.vpn_active_chain.read().await.clone();
+                VpnChainSnapshot {
+                    hops: previous.iter().map(|hop| hop.interface.clone()).collect(),
+                    previous_hops: previous,
+                }
+            },
             dataplane: self.dataplane.snapshot().await?,
         })
     }
@@ -1298,10 +1229,6 @@ where
             }
         }
         Ok(())
-    }
-
-    async fn apply_uplink_dhcp(&self, desired: Option<&DhcpClientSpec>) -> Result<()> {
-        self.apply_uplink_dhcp_candidate(desired).await.map(|_| ())
     }
 
     async fn apply_uplink_dhcp_candidate(&self, desired: Option<&DhcpClientSpec>) -> Result<bool> {
@@ -1443,28 +1370,6 @@ where
         self.routes.rollback(snapshot).await
     }
 
-    async fn rollback_dhcp(&self, snapshot: &[DhcpServiceSpec]) -> Result<()> {
-        let previous: BTreeMap<&str, &DhcpServiceSpec> = snapshot
-            .iter()
-            .map(|spec| (spec.interface.as_str(), spec))
-            .collect();
-        let mut errors = Vec::new();
-        for name in &self.owned_interfaces().await {
-            let result = match previous.get(name.as_str()) {
-                Some(spec) => self.dhcp.configure((*spec).clone()).await,
-                None => self.dhcp.disable(name).await.map(|_| ()),
-            };
-            if let Err(error) = result {
-                errors.push(format!("{name}: {error}"));
-            }
-        }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            bail!("DHCP rollback was incomplete: {}", errors.join("; "))
-        }
-    }
-
     async fn rollback_dhcp_scoped(
         &self,
         snapshot: &[DhcpServiceSpec],
@@ -1500,17 +1405,14 @@ where
         self.dataplane.rollback(snapshot).await
     }
 
-    async fn rollback_uplink_dhcp(&self, snapshot: Option<&DhcpClientSpec>) -> Result<()> {
-        self.apply_uplink_dhcp(snapshot).await
-    }
-
     async fn rollback_dhcp_clients(
         &self,
         snapshots: &[DhcpClientSnapshot],
         legacy: Option<&DhcpClientSpec>,
     ) -> Result<()> {
         if snapshots.is_empty() {
-            return self.rollback_uplink_dhcp(legacy).await;
+            self.apply_uplink_dhcp_candidate(legacy).await?;
+            return Ok(());
         }
         let runtime = self
             .dhcp_client
@@ -1700,14 +1602,6 @@ where
         }
         Ok(VpnChainPlan {
             hops: desired.vpn_chain.clone(),
-        })
-    }
-
-    async fn snapshot_vpn_chain(&self) -> Result<VpnChainSnapshot> {
-        let previous = self.vpn_active_chain.read().await.clone();
-        Ok(VpnChainSnapshot {
-            hops: previous.iter().map(|hop| hop.interface.clone()).collect(),
-            previous_hops: previous,
         })
     }
 

@@ -34,7 +34,8 @@ use traffic_masq::core::interface::{DhcpChangeAction, InterfaceChangePlan, Inter
 use traffic_masq::core::override_manager::RuntimeOverrideManager;
 use traffic_masq::core::route::{RoutePlan, RouteSnapshot};
 use traffic_masq::core::router::{
-    DhcpPlan, RouterDesired, RouterManager, RouterSubsystems, WifiPlan, WifiSnapshot,
+    DhcpPlan, RouterDesired, RouterManager, RouterSnapshot, RouterSubsystems, VpnChainSnapshot,
+    WifiPlan, WifiSnapshot,
 };
 use traffic_masq::core::router_transaction::{CoordinatorStatus, RouterTransactionCoordinator};
 use traffic_masq::dhcp::supervisor::{DhcpServiceSpec, DhcpSupervisor};
@@ -639,12 +640,6 @@ impl RouterSubsystems for FakeRouterSubsystems {
             })
             .collect())
     }
-    async fn snapshot_uplink_wifi(&self) -> Result<Vec<WifiSnapshot<WifiClientSpec>>> {
-        Ok(Vec::new())
-    }
-    async fn snapshot_output_wifi(&self) -> Result<Vec<WifiSnapshot<WifiApSpec>>> {
-        Ok(Vec::new())
-    }
     async fn apply_uplink_wifi(&self, _: &[WifiPlan<WifiClientSpec>]) -> Result<()> {
         Ok(())
     }
@@ -679,17 +674,19 @@ impl RouterSubsystems for FakeRouterSubsystems {
             requires_apply: true,
         })
     }
-    async fn snapshot_interfaces(&self) -> Result<Vec<InterfaceSnapshot>> {
-        Ok(Vec::new())
-    }
-    async fn snapshot_routes(&self) -> Result<RouteSnapshot> {
-        Ok(RouteSnapshot::empty())
-    }
-    async fn snapshot_dhcp(&self) -> Result<Vec<DhcpServiceSpec>> {
-        Ok(Vec::new())
-    }
-    async fn snapshot_dataplane(&self) -> Result<RouterDataplaneSnapshot> {
-        Ok(fake_dataplane_snapshot())
+    async fn snapshot_for(&self, _: &RouterDesired) -> Result<RouterSnapshot> {
+        Ok(RouterSnapshot {
+            interfaces: Vec::new(),
+            uplink_wifi: Vec::new(),
+            uplink_dhcp: None,
+            dhcp_clients: Vec::new(),
+            output_wifi: Vec::new(),
+            dhcp: Vec::new(),
+            dhcp_absent_interfaces: Vec::new(),
+            routes: RouteSnapshot::empty(),
+            vpn_chain: VpnChainSnapshot::empty(),
+            dataplane: fake_dataplane_snapshot(),
+        })
     }
     async fn apply_interfaces(&self, _: &[InterfaceChangePlan]) -> Result<()> {
         Ok(())
@@ -709,7 +706,7 @@ impl RouterSubsystems for FakeRouterSubsystems {
     async fn rollback_routes(&self, _: &RouteSnapshot) -> Result<()> {
         Ok(())
     }
-    async fn rollback_dhcp(&self, _: &[DhcpServiceSpec]) -> Result<()> {
+    async fn rollback_dhcp_scoped(&self, _: &[DhcpServiceSpec], _: &[String]) -> Result<()> {
         Ok(())
     }
     async fn rollback_dataplane(&self, _: &RouterDataplaneSnapshot) -> Result<()> {
