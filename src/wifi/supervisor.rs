@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
-use crate::config::{AppConfig, ShutdownPolicy};
+use crate::config::{AppConfig, InterfaceConfig, ShutdownPolicy};
 use crate::dhcp::supervisor::resolve_interface_index;
 use crate::wifi::ctrl::{CtrlError, HostapdCtrlClient, HostapdState, MacAddr, Station};
 pub use crate::wifi::lifecycle::WifiHealth;
@@ -225,6 +225,26 @@ impl HostapdSupervisor {
             }
         }
         Ok(())
+    }
+
+    /// Apply one interface's effective access-point intent during runtime convergence.
+    pub(crate) async fn reconcile_interface_config(
+        &self,
+        interface: &str,
+        config: &InterfaceConfig,
+    ) -> anyhow::Result<()> {
+        let desired = WifiApSpec::from_interface_config(interface, config)?;
+        match desired {
+            Some(spec) => {
+                self.configure(spec).await?;
+                Ok(())
+            }
+            None if self.status(interface).await.is_some() => {
+                self.disable(interface).await?;
+                Ok(())
+            }
+            None => Ok(()),
+        }
     }
 
     /// Start the hostapd supervisor from effective configuration using the production process adapter.

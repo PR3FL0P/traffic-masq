@@ -31,6 +31,13 @@ module re-exports its packet, lease, server, and client state-machine APIs.
 The WireGuard crate owns the profile parser and kernel provider; the daemon
 keeps profile storage, activation policy, and ownership recovery.
 
+`RouterManager` orders router apply and rollback stages. Its subsystem boundary
+captures one router-scoped `RouterSnapshot` with `snapshot_for`, including
+absent DHCP services and clients needed for rollback. The app's
+`startup_recovery` module validates durable proofs before normal admission or
+API binding; `reconcile` owns runtime network convergence and integrity
+workers.
+
 `api::model` re-exports the protocol DTOs for current callers. The request
 envelope now lives in protocol. Interface changes and router proposals use
 protocol-owned DTOs converted to daemon configuration at the control boundary.

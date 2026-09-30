@@ -523,6 +523,28 @@ impl DhcpClientSupervisor {
             .map_err(Into::into)
     }
 
+    /// Wait for a lease and verify its owned kernel resources before strict convergence succeeds.
+    pub(crate) async fn wait_until_ready(&self, interface: &str) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let status = self
+                .status(interface)
+                .await
+                .context("DHCP client disappeared")?;
+            if let Some(lease) = status.lease {
+                return self.verify_bound_lease(&lease).await;
+            }
+            if let DhcpClientRunState::Degraded { reason } = status.state {
+                bail!("DHCP client on {interface} is degraded: {reason}");
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "DHCP lease is not ready on {interface}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     pub async fn statuses(&self) -> Vec<DhcpClientStatus> {
         let interfaces: Vec<String> = self.inner.tasks.lock().await.keys().cloned().collect();
         let mut statuses = Vec::with_capacity(interfaces.len());
