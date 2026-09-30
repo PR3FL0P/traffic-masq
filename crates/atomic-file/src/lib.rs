@@ -55,7 +55,7 @@ pub fn is_indeterminate_write(error: &anyhow::Error) -> bool {
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "fault-injection"))]
 fn write_faults() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, u8>> {
     static FAULTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, u8>>> =
         std::sync::OnceLock::new();
@@ -63,8 +63,9 @@ fn write_faults() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf
 }
 
 /// Fail after publishing the next replacement, then before publishing its compensation.
-#[cfg(test)]
-pub(crate) fn fail_replacement_and_compensation(path: &Path) {
+#[cfg(any(test, feature = "fault-injection"))]
+#[doc(hidden)]
+pub fn fail_replacement_and_compensation(path: &Path) {
     write_faults().lock().unwrap().insert(path.to_owned(), 2);
 }
 
@@ -185,7 +186,7 @@ fn replace_tracking_publication(
     mode: u32,
     published: &mut bool,
 ) -> io::Result<()> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fault-injection"))]
     let fault = {
         let mut faults = write_faults().lock().unwrap();
         let fault = faults.get(path).copied().unwrap_or(0);
@@ -196,7 +197,7 @@ fn replace_tracking_publication(
         }
         fault
     };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fault-injection"))]
     if fault == 1 {
         return Err(io::Error::other("injected compensation failure"));
     }
@@ -215,13 +216,13 @@ fn replace_tracking_publication(
         // first check and the rename is exactly when a symlink would be
         // planted.
         reject_symlink(path)?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "fault-injection"))]
         if fault == 3 {
             return Err(io::Error::other("injected failure before rename"));
         }
         fs::rename(&temporary, path)?;
         *published = true;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "fault-injection"))]
         if fault == 2 {
             return Err(io::Error::other("injected directory sync failure"));
         }

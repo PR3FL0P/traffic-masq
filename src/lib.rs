@@ -18,7 +18,7 @@
 
 pub mod api;
 pub mod app;
-pub mod atomic_file;
+pub use traffic_masq_atomic_file as atomic_file;
 pub mod auth;
 mod command;
 pub mod config;

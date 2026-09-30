@@ -2958,10 +2958,41 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "traffic-masq-api-client",
+ "traffic-masq-atomic-file",
  "traffic-masq-netlink",
+ "traffic-masq-protocol",
  "unicode-segmentation",
  "unicode-width",
  "zeroize",
+]
+
+[[package]]
+name = "traffic-masq-api-client"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "ipnet",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "traffic-masq-protocol",
+ "zeroize",
+]
+
+[[package]]
+name = "traffic-masq-atomic-file"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "nix 0.29.0",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
@@ -2980,6 +3011,15 @@ dependencies = [
  "serde",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "traffic-masq-protocol"
+version = "0.1.0"
+dependencies = [
+ "ipnet",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

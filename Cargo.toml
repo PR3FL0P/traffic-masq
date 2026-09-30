@@ -1,6 +1,6 @@
 
 [workspace]
-members = ["crates/netlink"]
+members = ["crates/netlink", "crates/atomic-file"]
 resolver = "2"
 
 [package]
@@ -67,10 +67,12 @@ unicode-width = "0.2"
 tracing = "0.1"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+traffic-masq-atomic-file = { path = "crates/atomic-file" }
 traffic-masq-netlink = { path = "crates/netlink" }
 zeroize = { version = "1", features = ["serde"] }
 
 [dev-dependencies]
+traffic-masq-atomic-file = { path = "crates/atomic-file", features = ["fault-injection"] }
 rcgen = "0.13"
 tempfile = "3"
 # Test-only tokio clock control (`start_paused`), so the DHCP client
