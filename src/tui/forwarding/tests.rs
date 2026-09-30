@@ -47,8 +47,8 @@ async fn new_sharing_prefills_managed_lan_to_observed_default_route() {
     app.router.staged = true; // Avoid API calls while opening the local draft.
     app.router.proposed_router_config.forwarding = Some(vec![]);
     app.dashboard.interfaces = vec![
-        interface_status("wlp5s0f3u2", true),
-        interface_status("wlp1s0", false),
+        interface_status("wlp5s0f3u2", true).into(),
+        interface_status("wlp1s0", false).into(),
     ];
     app.dashboard.managed.insert("wlp1s0".into(), true);
     app.dashboard
@@ -64,7 +64,8 @@ async fn new_sharing_prefills_managed_lan_to_observed_default_route() {
         protocol: 16,
         scope: 0,
         owner: crate::netlink::RouteOwner::Dhcp,
-    }]);
+    }
+    .into()]);
 
     open(
         &mut app,
@@ -84,16 +85,15 @@ async fn new_sharing_prefills_managed_lan_to_observed_default_route() {
 #[tokio::test]
 async fn editing_replaces_the_selected_connection_and_preserves_route_intent() {
     let mut app = TuiApp::default();
-    app.router
-        .proposed_router_config
-        .owned_routes
-        .push(crate::config::OwnedIpv4RouteConfig {
+    app.router.proposed_router_config.owned_routes.push(
+        traffic_masq_protocol::OwnedIpv4RouteConfigView {
             destination: "10.0.0.0/8".parse().unwrap(),
             gateway: None,
             output_interface: Some("wan0".into()),
             table: 254,
             metric: None,
-        });
+        },
+    );
     let routes = app.router.proposed_router_config.owned_routes.clone();
     app.forwarding = Some(editor());
     app.screen = Screen::Forwarding;
@@ -125,7 +125,7 @@ async fn editing_replaces_the_selected_connection_and_preserves_route_intent() {
 #[tokio::test]
 async fn invalid_subnet_and_cancel_do_not_modify_the_draft() {
     let mut app = TuiApp::default();
-    app.router.proposed_router_config.forwarding = Some(vec![connection("lan0", "wan0")]);
+    app.router.proposed_router_config.forwarding = Some(vec![connection("lan0", "wan0").into()]);
     app.router.staged = true;
     let before = app.router.proposed_router_config.clone();
     let mut form = editor();
@@ -158,7 +158,7 @@ fn disjoint_source_subnets_share_a_pair_but_overlap_is_rejected() {
 async fn route_shortcut_prefills_egress_without_changing_routes_or_staging() {
     let mut app = TuiApp::default();
     app.router.staged = true; // A local draft avoids any API request.
-    app.router.proposed_router_config.forwarding = Some(vec![connection("lan0", "wan0")]);
+    app.router.proposed_router_config.forwarding = Some(vec![connection("lan0", "wan0").into()]);
     let route = crate::api::model::RouteStatus {
         destination: "10.0.0.0/8".parse().unwrap(),
         gateway: None,
@@ -170,7 +170,7 @@ async fn route_shortcut_prefills_egress_without_changing_routes_or_staging() {
         scope: 0,
         owner: crate::netlink::RouteOwner::Static,
     };
-    app.router.routes.push(route);
+    app.router.routes.push(route.into());
     let before = app.router.proposed_router_config.clone();
     open_from_route(&mut app, &ApiClient::new("/must-not-be-used.sock")).await;
     let form = app.forwarding.as_ref().unwrap();
@@ -189,7 +189,7 @@ async fn section_keys_mouse_and_action_arrows_preserve_the_shared_draft() {
     };
     app.ui.input_enabled = true;
     app.router.staged = true;
-    app.router.proposed_router_config.forwarding = Some(vec![connection("lan0", "wan0")]);
+    app.router.proposed_router_config.forwarding = Some(vec![connection("lan0", "wan0").into()]);
     let before = app.router.proposed_router_config.clone();
     let client = ApiClient::new("/must-not-be-used.sock");
     super::super::handle_key(&mut app, KeyCode::Char('2'), &client, false).await;
@@ -232,7 +232,8 @@ fn sharing_sections_and_controls_fit_small_and_large_terminals() {
             ..Default::default()
         };
         app.router.pane = RouterPane::Sharing;
-        app.router.proposed_router_config.forwarding = Some(vec![connection("lan0", "wg0"); 20]);
+        app.router.proposed_router_config.forwarding =
+            Some(vec![connection("lan0", "wg0").into(); 20]);
         app.router.selected_connection = 19;
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal

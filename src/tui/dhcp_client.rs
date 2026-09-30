@@ -4,8 +4,10 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::api::client::ApiClient;
-use crate::api::model::{DhcpClientConfigRequest, DhcpClientOperationalState, Request, Response};
+use crate::tui::api::client::ApiClient;
+use crate::tui::api::model::{
+    DhcpClientConfigRequest, DhcpClientOperationalState, Request, Response,
+};
 
 use super::layout::panel;
 use super::logs::LogLevel;

@@ -13,6 +13,8 @@ use crate::config::{
 };
 use crate::core::router_candidate::RouterIntentProposal;
 
+pub use traffic_masq_protocol::ProvisioningDownstreamOverrides;
+
 pub const DEFAULT_DOWNSTREAM_PREFIX: u8 = 24;
 pub const DEFAULT_DOWNSTREAM_THIRD_OCTET: u8 = 0;
 pub const DEFAULT_DHCP_LEASE_SECONDS: u32 = 3600;
@@ -65,17 +67,6 @@ pub struct ProvisioningOutput {
 
 fn default_max_stations() -> u16 {
     32
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProvisioningDownstreamOverrides {
-    pub interface_ipv4: Option<Ipv4Net>,
-    pub pool_start: Option<Ipv4Addr>,
-    pub pool_end: Option<Ipv4Addr>,
-
-    #[serde(default)]
-    pub dns_servers: Vec<Ipv4Addr>,
-    pub lease_seconds: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

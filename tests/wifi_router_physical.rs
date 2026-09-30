@@ -300,7 +300,8 @@ impl PhysicalWifiFixture {
                     client.request(&Request::WifiClientStatus).await
                 {
                     if let Some(status) = interfaces.iter().find(|s| {
-                        s.interface == self.uplink_interface && s.wpa_state == WpaState::Completed
+                        s.interface == self.uplink_interface
+                            && s.wpa_state == WpaState::Completed.into()
                     }) {
                         if status.spec.ssid != self.upstream_ssid {
                             bail!("STA associated to an unexpected SSID");
@@ -368,7 +369,7 @@ impl PhysicalWifiFixture {
                     if router_ready {
                         if let Some(status) = interfaces.iter().find(|s| {
                             s.interface == self.output_interface
-                                && s.hostapd_state == HostapdState::Enabled
+                                && s.hostapd_state == HostapdState::Enabled.into()
                         }) {
                             if status.spec.ssid != self.ap_ssid {
                                 bail!("AP enabled with an unexpected SSID");
@@ -731,11 +732,11 @@ impl PhysicalWifiFixture {
                             && status.expires_at_unix == Some(current.expires_at_unix)))
                     && matches!(sta, Ok(Response::WifiClientStatus { ref interfaces }) if interfaces.iter().any(|status|
                         status.interface == self.uplink_interface
-                            && status.wpa_state == WpaState::Completed
+                            && status.wpa_state == WpaState::Completed.into()
                             && status.pid == supplicant_pid))
                     && matches!(ap, Ok(Response::WifiStatus { ref interfaces }) if interfaces.iter().any(|status|
                         status.interface == self.output_interface
-                            && status.hostapd_state == HostapdState::Enabled
+                            && status.hostapd_state == HostapdState::Enabled.into()
                             && status.pid == hostapd_pid));
                 if !healthy {
                     bail!("daemon/router/AP/STA/DHCP health or retained PID proof failed while waiting for natural T1");
@@ -813,7 +814,8 @@ impl PhysicalWifiFixture {
                 proposal: RouterProposalRequest {
                     set_router: Some(router),
                     ..RouterProposalRequest::default()
-                },
+                }
+                .into(),
             })
             .await?
         {
@@ -1153,12 +1155,12 @@ impl PhysicalWifiFixture {
                 {
                     let same_sta = sta.iter().any(|status| {
                         status.interface == self.uplink_interface
-                            && status.wpa_state == WpaState::Completed
+                            && status.wpa_state == WpaState::Completed.into()
                             && status.pid == supplicant_pid
                     });
                     let same_ap = ap.iter().any(|status| {
                         status.interface == self.output_interface
-                            && status.hostapd_state == HostapdState::Enabled
+                            && status.hostapd_state == HostapdState::Enabled.into()
                             && status.pid == hostapd_pid
                     });
                     if same_sta && same_ap {
@@ -1300,7 +1302,7 @@ impl PhysicalWifiFixture {
                 {
                     let sta = sta.iter().find(|status| {
                         status.interface == self.uplink_interface
-                            && status.wpa_state == WpaState::Completed
+                            && status.wpa_state == WpaState::Completed.into()
                     });
                     let dhcp = dhcp.iter().find(|status| {
                         status.interface == self.uplink_interface
@@ -1308,7 +1310,7 @@ impl PhysicalWifiFixture {
                     });
                     let ap = ap.iter().find(|status| {
                         status.interface == self.output_interface
-                            && status.hostapd_state == HostapdState::Enabled
+                            && status.hostapd_state == HostapdState::Enabled.into()
                     });
                     if let (Some(sta), Some(_dhcp_status), Some(ap), Some(address), Some(prefix)) = (
                         sta,
@@ -2001,7 +2003,7 @@ async fn verify_output_side_operational(
         Response::WifiStatus { interfaces }
             if interfaces.iter().any(|status| {
                 status.interface == fixture.output_interface
-                    && status.hostapd_state == HostapdState::Enabled
+                    && status.hostapd_state == HostapdState::Enabled.into()
                     && status.pid == expected_hostapd_pid
             }) => {}
         _ => bail!("AP/output Wi-Fi service was not enabled with its original PID"),

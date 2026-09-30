@@ -21,6 +21,8 @@ use crate::vpn::manager::hop_interface_name;
 use crate::wifi::client::WifiClientSpec;
 use crate::wifi::WifiApSpec;
 
+pub use traffic_masq_protocol::{RouterDhcpHealthReason, RouterHealthReport};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouterInterfaceDesired {
     pub name: String,
@@ -86,21 +88,10 @@ impl RouterDesired {
         let routes = desired_owned_routes(&config.router);
         let allow_default_route_change = config.router.allow_default_route_change;
 
-        let managed_outputs: Vec<(&String, &InterfaceConfig)> = config
-            .network
-            .interfaces
-            .iter()
-            .filter(|(_, interface)| interface.role == InterfaceRole::Output && interface.managed)
-            .collect();
+        let managed_outputs = managed_output_interfaces(config);
 
         if let Some(forwarding) = &config.router.forwarding {
-            let mut interfaces: Vec<_> = managed_outputs
-                .iter()
-                .map(|(name, interface)| RouterInterfaceDesired {
-                    name: (*name).clone(),
-                    config: (*interface).clone(),
-                })
-                .collect();
+            let mut interfaces = managed_outputs.clone();
             if let Some(uplink) = &config.router.uplink {
                 let interface = config
                     .network
@@ -112,13 +103,7 @@ impl RouterDesired {
                     config: interface.clone(),
                 });
             }
-            let output_wifi = interfaces
-                .iter()
-                .filter_map(|interface| {
-                    WifiApSpec::from_interface_config(&interface.name, &interface.config)
-                        .transpose()
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let output_wifi = output_wifi(&interfaces)?;
             let dataplane = if forwarding.is_empty() {
                 RouterDataplaneTarget::Disabled
             } else {
@@ -163,21 +148,8 @@ impl RouterDesired {
         }
 
         let Some(uplink) = config.router.uplink.as_ref() else {
-            let interfaces: Vec<_> = managed_outputs
-                .into_iter()
-                .map(|(name, interface)| RouterInterfaceDesired {
-                    name: name.clone(),
-                    config: interface.clone(),
-                })
-                .collect();
-
-            let mut output_wifi = interfaces
-                .iter()
-                .filter_map(|interface| {
-                    WifiApSpec::from_interface_config(&interface.name, &interface.config)
-                        .transpose()
-                })
-                .collect::<Result<Vec<_>>>()?;
+            let interfaces = managed_outputs;
+            let mut output_wifi = output_wifi(&interfaces)?;
             output_wifi.sort_by(|left, right| left.interface.cmp(&right.interface));
 
             return Ok(Self {
@@ -201,10 +173,11 @@ impl RouterDesired {
             .expect("validated router uplink interface is configured");
         let outputs = managed_outputs
             .iter()
-            .filter(|(_, interface)| interface.nat)
-            .map(|(name, interface)| OutputNetwork {
-                interface: (*name).clone(),
+            .filter(|interface| interface.config.nat)
+            .map(|interface| OutputNetwork {
+                interface: interface.name.clone(),
                 subnet: interface
+                    .config
                     .ipv4
                     .expect("validated router output has IPv4")
                     .trunc(),
@@ -221,20 +194,10 @@ impl RouterDesired {
             name: uplink.interface.clone(),
             config: uplink_config.clone(),
         }];
-        interfaces.extend(managed_outputs.into_iter().map(|(name, interface)| {
-            RouterInterfaceDesired {
-                name: name.clone(),
-                config: interface.clone(),
-            }
-        }));
+        interfaces.extend(managed_outputs);
 
         let uplink_wifi = WifiClientSpec::from_interface_config(&uplink.interface, uplink_config)?;
-        let mut output_wifi = interfaces
-            .iter()
-            .filter_map(|interface| {
-                WifiApSpec::from_interface_config(&interface.name, &interface.config).transpose()
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut output_wifi = output_wifi(&interfaces)?;
         output_wifi.sort_by(|left, right| left.interface.cmp(&right.interface));
 
         let uplink_dhcp = if uplink.mode == UplinkMode::Dhcp {
@@ -307,6 +270,28 @@ impl RouterDesired {
     }
 }
 
+fn managed_output_interfaces(config: &AppConfig) -> Vec<RouterInterfaceDesired> {
+    config
+        .network
+        .interfaces
+        .iter()
+        .filter(|(_, interface)| interface.role == InterfaceRole::Output && interface.managed)
+        .map(|(name, interface)| RouterInterfaceDesired {
+            name: name.clone(),
+            config: interface.clone(),
+        })
+        .collect()
+}
+
+fn output_wifi(interfaces: &[RouterInterfaceDesired]) -> Result<Vec<WifiApSpec>> {
+    interfaces
+        .iter()
+        .filter_map(|interface| {
+            WifiApSpec::from_interface_config(&interface.name, &interface.config).transpose()
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RouterRisk {
     pub changes_default_route: bool,
@@ -351,39 +336,6 @@ pub struct RouterPlan {
     pub vpn_chain: VpnChainPlan,
     pub dataplane: RouterDataplanePlan,
     pub risk: RouterRisk,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct RouterHealthReport {
-    pub interfaces: Option<String>,
-    pub routes: Option<String>,
-    pub dhcp: Option<String>,
-
-    pub uplink_dhcp: Option<RouterDhcpHealthReason>,
-    pub dataplane: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "reason", rename_all = "snake_case")]
-pub enum RouterDhcpHealthReason {
-    IntentMissing { interface: String },
-    IntentMismatch { interface: String },
-    Waiting { interface: String },
-    Degraded { interface: String, detail: String },
-    LeaseMissing { interface: String },
-    LeaseNotBound { interface: String },
-    LeaseExpired { interface: String },
-    ObservationMismatch { interface: String, detail: String },
-}
-
-impl RouterHealthReport {
-    pub fn ready(&self) -> bool {
-        self.interfaces.is_none()
-            && self.routes.is_none()
-            && self.dhcp.is_none()
-            && self.uplink_dhcp.is_none()
-            && self.dataplane.is_none()
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

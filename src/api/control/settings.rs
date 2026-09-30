@@ -31,8 +31,8 @@ impl ControlService {
     pub(super) async fn security_config_response(&self) -> Result<Response> {
         let snapshot = self.overrides.snapshot().await;
         let desired = self.overrides.effective_security_config().await?;
-        let active = SecuritySettings::from(&self.config.security);
-        let desired = SecuritySettings::from(&desired);
+        let active = security_settings_from_config(&self.config.security);
+        let desired = security_settings_from_config(&desired);
         Ok(Response::SecurityConfig {
             restart_required: active != desired,
             override_active: snapshot.security.is_some(),
@@ -58,11 +58,32 @@ impl ControlService {
     }
 }
 
+fn security_settings_from_config(config: &SecurityConfig) -> SecuritySettings {
+    SecuritySettings {
+        rollback_timeout_seconds: config.rollback_timeout_seconds,
+    }
+}
+
+fn api_https_settings_from_tcp_config(config: &TcpApiConfig) -> ApiHttpsSettings {
+    ApiHttpsSettings {
+        enabled: config.enabled,
+        listen: config.listen.to_string(),
+        certificate_path: config
+            .certificate_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        private_key_path: config
+            .private_key_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+    }
+}
+
 pub(super) fn api_https_settings_from_config(config: &ApiConfig) -> ApiHttpsSettings {
     config
         .tcp
         .as_ref()
-        .map(ApiHttpsSettings::from)
+        .map(api_https_settings_from_tcp_config)
         .unwrap_or_default()
 }
 

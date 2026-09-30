@@ -117,14 +117,14 @@ impl ControlService {
         });
 
         Response::Routes {
-            routes: status_routes,
+            routes: status_routes.into_iter().map(Into::into).collect(),
         }
     }
 
     pub(super) async fn get_router_config(&self) -> Response {
         match self.effective_config().await {
             Ok(effective) => Response::RouterConfig {
-                config: effective.router,
+                config: effective.router.into(),
             },
             Err(message) => Response::Error { message },
         }
@@ -144,7 +144,7 @@ impl ControlService {
         };
         match router.plan(candidate).await {
             Ok(plan) => Response::RouterPlan {
-                plan: plan.plan().clone(),
+                plan: plan.plan().clone().into(),
             },
             Err(error) => classify_router_error(error),
         }
@@ -177,7 +177,7 @@ impl ControlService {
         match router.apply(transaction_plan).await {
             Ok(token) => Response::RouterTransactionPending {
                 token,
-                plan: plan_preview,
+                plan: plan_preview.into(),
             },
             Err(error) => classify_router_error(error),
         }
@@ -1014,10 +1014,13 @@ mod recovery_notice_tests {
         )
         .unwrap();
         assert_eq!(
-            notice.known_action(),
+            notice.operator_action.parse::<RecoveryAction>().ok(),
             Some(RecoveryAction::RepairStorageAndRestart)
         );
-        assert_eq!(notice.known_code(), Some(RecoveryCode::CommitIndeterminate));
+        assert_eq!(
+            RecoveryCode::from_code(&notice.recovery_code),
+            Some(RecoveryCode::CommitIndeterminate)
+        );
         assert!(notice.blocked_operation.contains("rollback"));
     }
 
@@ -1033,9 +1036,12 @@ mod recovery_notice_tests {
         assert_eq!(notice.blocked_operation, "new router transactions");
         assert!(!notice.summary.is_empty());
         assert_eq!(notice.operator_action, "retry_rollback");
-        assert_eq!(notice.known_action(), Some(RecoveryAction::RetryRollback));
         assert_eq!(
-            notice.known_code(),
+            notice.operator_action.parse::<RecoveryAction>().ok(),
+            Some(RecoveryAction::RetryRollback)
+        );
+        assert_eq!(
+            RecoveryCode::from_code(&notice.recovery_code),
             Some(RecoveryCode::RouterRollbackFailed)
         );
         assert_eq!(notice.runbook, "docs/recovery.md#tm-rec-207");
@@ -1054,9 +1060,12 @@ mod recovery_notice_tests {
         assert_eq!(notice.blocked_operation, "new router transactions");
         assert!(!notice.summary.is_empty());
         assert_eq!(notice.operator_action, "await_cleanup");
-        assert_eq!(notice.known_action(), Some(RecoveryAction::AwaitCleanup));
         assert_eq!(
-            notice.known_code(),
+            notice.operator_action.parse::<RecoveryAction>().ok(),
+            Some(RecoveryAction::AwaitCleanup)
+        );
+        assert_eq!(
+            RecoveryCode::from_code(&notice.recovery_code),
             Some(RecoveryCode::RouterJournalCleanupPending)
         );
         assert_eq!(notice.runbook, "docs/recovery.md#tm-rec-208");

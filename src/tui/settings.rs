@@ -5,8 +5,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use zeroize::Zeroize;
 
-use crate::api::client::ApiClient;
-use crate::api::model::{Request, Response, SecuritySettings};
+use crate::tui::api::client::ApiClient;
+use crate::tui::api::model::{Request, Response, SecuritySettings};
 
 use super::layout::panel;
 use super::logs::LogLevel;

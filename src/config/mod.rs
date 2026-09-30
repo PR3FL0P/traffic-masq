@@ -14,6 +14,11 @@ use anyhow::{bail, Context, Result};
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 
+pub use traffic_masq_protocol::{
+    InterfaceRole, UplinkMode, VpnPolicyMode, WifiBand, WifiChannelWidth, WifiClientSecurity,
+    WifiSecurity,
+};
+
 mod resolver;
 pub use resolver::{ConfigSource, ResolvedConfig, CONFIG_ENV, DEFAULT_CONFIG_PATH};
 
@@ -116,20 +121,6 @@ pub struct NetworkConfig {
     pub interfaces: BTreeMap<String, InterfaceConfig>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InterfaceRole {
-    /// Does not participate in the router. Legacy management roles retain protection.
-    #[serde(alias = "management")]
-    None,
-    Input,
-    Output,
-    /// A slot naming one of the VPN hop chain's virtual `tm-wg-<hop_index>`
-    /// interfaces. Unaddressed, WireGuard-only: never carries dhcp/wifi/ipv4.
-    Middle,
-    Disabled,
-}
-
 fn default_true() -> bool {
     true
 }
@@ -188,36 +179,23 @@ pub struct ForwardingConfig {
     pub masquerade: bool,
 }
 
+impl traffic_masq_protocol::ForwardingRule for ForwardingConfig {
+    fn source_subnet(&self) -> Option<Ipv4Net> {
+        self.source_subnet
+    }
+
+    fn from_interface(&self) -> &str {
+        &self.from
+    }
+
+    fn to_interface(&self) -> &str {
+        &self.to
+    }
+}
+
 /// Reject invalid forwarding port ranges, addresses, protocols, and conflicting rules.
 pub fn validate_forwarding(rules: &[ForwardingConfig]) -> Result<()> {
-    for (index, rule) in rules.iter().enumerate() {
-        validate_interface_name(&rule.from)?;
-        validate_interface_name(&rule.to)?;
-        if rule.from == rule.to {
-            bail!("forwarding requires different ingress and egress interfaces");
-        }
-        if rule
-            .source_subnet
-            .is_some_and(|subnet| subnet != subnet.trunc())
-        {
-            bail!("source subnet must be a network address (no host bits)");
-        }
-        if rules[..index].iter().any(|prior| {
-            prior.from == rule.from
-                && prior.to == rule.to
-                && match (prior.source_subnet, rule.source_subnet) {
-                    (Some(a), Some(b)) => a.contains(&b.addr()) || b.contains(&a.addr()),
-                    _ => true,
-                }
-        }) {
-            bail!(
-                "duplicate or overlapping forwarding connection: {} -> {}",
-                rule.from,
-                rule.to
-            );
-        }
-    }
-    Ok(())
+    traffic_masq_protocol::validate_forwarding(rules).map_err(anyhow::Error::msg)
 }
 
 /// The maximum number of hops a persisted VPN chain may contain, matching
@@ -235,13 +213,6 @@ pub struct VpnHopConfig {
 pub struct UplinkConfig {
     pub interface: String,
     pub mode: UplinkMode,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum UplinkMode {
-    External,
-    Dhcp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -343,48 +314,6 @@ impl Default for WifiClientGlobalConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WifiBand {
-    #[default]
-    #[serde(rename = "2g")]
-    Ghz2,
-    #[serde(rename = "5g")]
-    Ghz5,
-}
-
-impl WifiBand {
-    pub fn channels(self) -> &'static [u8] {
-        const GHZ2: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
-        const GHZ5: &[u8] = &[
-            32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 96, 100, 104, 108, 112, 116, 120, 124, 128,
-            132, 136, 140, 144, 149, 153, 157, 161, 165, 169, 173, 177,
-        ];
-        match self {
-            WifiBand::Ghz2 => GHZ2,
-            WifiBand::Ghz5 => GHZ5,
-        }
-    }
-}
-
-impl std::fmt::Display for WifiBand {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            WifiBand::Ghz2 => write!(f, "2g"),
-            WifiBand::Ghz5 => write!(f, "5g"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WifiChannelWidth {
-    #[default]
-    Ht20,
-    Ht40,
-    Vht80,
-}
-
 pub fn vht80_center_channel(channel: u8) -> Option<u8> {
     const BLOCKS: &[([u8; 4], u8)] = &[
         ([36, 40, 44, 48], 42),
@@ -402,23 +331,7 @@ pub fn vht80_center_channel(channel: u8) -> Option<u8> {
         .map(|(_, center)| *center)
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WifiSecurity {
-    #[default]
-    Wpa2,
-    Wpa2Wpa3,
-    Wpa3,
-    Open,
-}
-
-impl WifiSecurity {
-    pub fn requires_passphrase(self) -> bool {
-        !matches!(self, WifiSecurity::Open)
-    }
-}
-
-pub const MAX_WIFI_STATIONS: u16 = 2007;
+pub use traffic_masq_protocol::MAX_WIFI_STATIONS;
 
 pub const MAX_SSID_BYTES: usize = 32;
 
@@ -456,22 +369,6 @@ pub struct WifiApConfig {
     pub passphrase_file: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WifiClientSecurity {
-    #[default]
-    Wpa2,
-    Wpa3,
-    Wpa2Wpa3,
-    Open,
-}
-
-impl WifiClientSecurity {
-    pub fn requires_passphrase(self) -> bool {
-        !matches!(self, WifiClientSecurity::Open)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WifiClientConfig {
     pub ssid: String,
@@ -493,14 +390,6 @@ pub struct VpnConfig {
 
     #[serde(default)]
     pub policy: VpnTrafficPolicyConfig,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VpnPolicyMode {
-    #[default]
-    Direct,
-    Vpn,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

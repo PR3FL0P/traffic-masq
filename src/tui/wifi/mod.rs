@@ -5,16 +5,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use zeroize::Zeroize;
 
-use crate::api::client::ApiClient;
-use crate::api::model::{
-    InterfaceStatus, Request, Response, WifiClientProfileWriteRequest, WifiEditRequest,
-    WifiErrorDetail,
+use crate::tui::api::client::ApiClient;
+use crate::tui::api::model::{
+    Request, Response, WifiClientProfileWriteRequest, WifiEditRequest, WifiErrorDetail,
 };
-use crate::config::{WifiBand, WifiChannelWidth, WifiClientSecurity, WifiSecurity};
-use crate::wifi::supervisor::WifiHealth;
-use crate::wifi::{
-    WifiApStatus, WifiClientProfileSummary, WifiClientStatus, WpaSupplicantScanResult,
-    WpaSupplicantScanSecurity,
+use traffic_masq_protocol::{
+    InterfaceStatusView as InterfaceStatus, WifiApSpecView, WifiApStatusView as WifiApStatus,
+    WifiBand, WifiChannelWidth, WifiClientProfileSummary, WifiClientSecurity,
+    WifiClientStatusView as WifiClientStatus, WifiHealthView as WifiHealth, WifiSecurity,
+    WpaSupplicantScanResult, WpaSupplicantScanSecurity,
 };
 
 use super::layout::{panel, UiLayout};
@@ -189,7 +188,7 @@ pub(crate) struct WifiEditor {
     original_profile_id: Option<String>,
     dirty: bool,
     discard_requested: bool,
-    original_spec: Option<crate::wifi::WifiApSpec>,
+    original_spec: Option<WifiApSpecView>,
     radio_settings: Option<WifiEditRequest>,
     pub(crate) cursor: usize,
 }
@@ -785,7 +784,7 @@ pub(crate) fn render_wifi(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
                 Style::default().fg(theme::TEXT),
             ));
             let advice_text = advice_opt.map(|s| s.to_string()).unwrap_or_else(|| {
-                crate::wifi::process::format_competing_manager_advice(competing, &row.interface)
+                traffic_masq_protocol::format_competing_manager_advice(competing, &row.interface)
             });
             for line in advice_text.lines() {
                 lines.push(Line::styled(
@@ -930,16 +929,10 @@ async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
                         config: Some(config),
                         ..
                     }) => {
-                        let spec = match crate::wifi::WifiApSpec::from_interface_config(
+                        let spec = WifiApSpecView::from_validated_interface_config(
                             &row.interface,
                             &config,
-                        ) {
-                            Ok(spec) => spec,
-                            Err(error) => {
-                                app.push_message(LogLevel::Error, error.to_string());
-                                return;
-                            }
-                        };
+                        );
                         let mut editor = WifiEditor::from_row(&row);
                         editor.existing = spec.as_ref().is_some_and(|s| s.requires_passphrase());
                         editor.configure_dhcp = spec.is_none() && config.dhcp.is_none();
@@ -1091,7 +1084,7 @@ async fn start_scan(app: &mut TuiApp, client: &ApiClient, interface: String) {
 
 pub(crate) async fn load_wifi_data(app: &mut TuiApp, client: &ApiClient) {
     app.wifi.error = None;
-    let interfaces = match client.request(&Request::ListInterfaces).await {
+    let interfaces: Vec<InterfaceStatus> = match client.request(&Request::ListInterfaces).await {
         Ok(Response::Interfaces { interfaces }) => interfaces,
         Ok(response) => {
             report_unexpected(app, response);
@@ -1104,7 +1097,7 @@ pub(crate) async fn load_wifi_data(app: &mut TuiApp, client: &ApiClient) {
             return;
         }
     };
-    let ap = match client.request(&Request::WifiStatus).await {
+    let ap: Vec<WifiApStatus> = match client.request(&Request::WifiStatus).await {
         Ok(Response::WifiStatus { interfaces }) => {
             app.wifi.ap_disabled = false;
             interfaces
@@ -1124,13 +1117,13 @@ pub(crate) async fn load_wifi_data(app: &mut TuiApp, client: &ApiClient) {
             Vec::new()
         }
     };
-    let clients = match client.request(&Request::WifiClientStatus).await {
+    let clients: Vec<WifiClientStatus> = match client.request(&Request::WifiClientStatus).await {
         Ok(Response::WifiClientStatus { interfaces }) => {
             app.wifi.client_disabled = false;
             interfaces
         }
         Ok(Response::WifiClientError {
-            detail: crate::api::model::WifiClientErrorDetail::WifiClientDisabled,
+            detail: crate::tui::api::model::WifiClientErrorDetail::WifiClientDisabled,
         }) => {
             app.wifi.client_disabled = true;
             Vec::new()
@@ -1171,8 +1164,8 @@ pub(crate) async fn load_wifi_data(app: &mut TuiApp, client: &ApiClient) {
     app.wifi.replace_rows(rows);
 }
 
-fn configured_role(config: Option<&crate::config::InterfaceConfig>) -> WifiRole {
-    use crate::config::InterfaceRole;
+fn configured_role(config: Option<&traffic_masq_protocol::InterfaceConfigView>) -> WifiRole {
+    use traffic_masq_protocol::InterfaceRole;
     match config
         .filter(|config| config.managed)
         .map(|config| config.role)

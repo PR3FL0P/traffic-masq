@@ -458,7 +458,7 @@ fn existing_ap_request_preserves_unedited_radio_settings() {
         client: None,
     };
     let mut editor = WifiEditor::from_row(&row);
-    editor.original_spec = Some(crate::wifi::WifiApSpec {
+    editor.original_spec = Some(WifiApSpecView {
         interface: "wlan0".into(),
         ssid: "old".into(),
         country_code: Some("US".into()),
@@ -722,7 +722,7 @@ async fn wifi_profiles_menu_shows_management_and_create_new() {
 fn unconfigured_radio_never_defaults_to_ap_and_role_mapping_is_strict() {
     let status = InterfaceStatus {
         owned_ipv4_addresses: None,
-        interface: crate::netlink::NetworkInterface {
+        interface: traffic_masq_protocol::NetworkInterfaceView {
             index: 1,
             name: "wlan0".into(),
             is_up: true,
@@ -1004,7 +1004,7 @@ fn wifi_profile_actions_list_area_excludes_header_for_mouse_clicks() {
 
 #[test]
 fn render_wifi_displays_conflict_advice_when_competing_managers_present() {
-    use crate::wifi::{HostapdState, WifiApSpec};
+    use traffic_masq_protocol::{HostapdStateView as HostapdState, WifiApSpecView as WifiApSpec};
 
     let mut app = TuiApp {
         wifi: WifiData {
@@ -1072,8 +1072,7 @@ fn render_wifi_displays_conflict_advice_when_competing_managers_present() {
 
 #[test]
 fn describe_row_state_reports_connected_when_healthy() {
-    use crate::wifi::client::ctrl::WpaState;
-    use crate::wifi::client::WifiClientSpec;
+    use traffic_masq_protocol::{WifiClientSpecView as WifiClientSpec, WpaStateView as WpaState};
 
     let row = WifiRow {
         interface: "wlan0".to_string(),
@@ -1101,8 +1100,7 @@ fn describe_row_state_reports_connected_when_healthy() {
 
 #[test]
 fn describe_row_state_reports_joining_starting_when_starting() {
-    use crate::wifi::client::ctrl::WpaState;
-    use crate::wifi::client::WifiClientSpec;
+    use traffic_masq_protocol::{WifiClientSpecView as WifiClientSpec, WpaStateView as WpaState};
 
     let row = WifiRow {
         interface: "wlan0".to_string(),
@@ -1130,9 +1128,10 @@ fn describe_row_state_reports_joining_starting_when_starting() {
 
 #[test]
 fn describe_row_state_respects_role_precedence() {
-    use crate::wifi::client::ctrl::WpaState;
-    use crate::wifi::client::WifiClientSpec;
-    use crate::wifi::{HostapdState, WifiApSpec};
+    use traffic_masq_protocol::{
+        HostapdStateView as HostapdState, WifiApSpecView as WifiApSpec,
+        WifiClientSpecView as WifiClientSpec, WpaStateView as WpaState,
+    };
 
     let client_status = WifiClientStatus {
         interface: "wlan0".to_string(),
@@ -1203,9 +1202,10 @@ fn describe_row_state_reports_not_configured_when_empty() {
 
 #[test]
 fn render_wifi_client_conflict_advice_when_ap_also_present() {
-    use crate::wifi::client::ctrl::WpaState;
-    use crate::wifi::client::WifiClientSpec;
-    use crate::wifi::{HostapdState, WifiApSpec};
+    use traffic_masq_protocol::{
+        HostapdStateView as HostapdState, WifiApSpecView as WifiApSpec,
+        WifiClientSpecView as WifiClientSpec, WpaStateView as WpaState,
+    };
 
     let mut app = TuiApp {
         wifi: WifiData {
@@ -1780,8 +1780,8 @@ fn ap_profile_actions_fit_small_terminal_and_mouse_skips_header() {
 
 #[test]
 fn configured_network_role_determines_wifi_role_before_activation() {
-    use crate::config::{InterfaceConfig, InterfaceRole};
-    let mut config = InterfaceConfig {
+    use traffic_masq_protocol::{InterfaceConfigView, InterfaceRole};
+    let mut config = InterfaceConfigView {
         role: InterfaceRole::Input,
         managed: true,
         ipv4: None,

@@ -184,7 +184,7 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
             };
             status_lines.push(Line::styled(text, style));
         }
-        let recovery_hint = match recovery.known_action() {
+        let recovery_hint = match recovery.operator_action.parse::<RecoveryAction>().ok() {
             Some(RecoveryAction::RetryRollback) => {
                 "Press r to retry rollback after repairing the reported cause"
             }
@@ -503,27 +503,29 @@ pub(super) fn format_coordinator_status(status: CoordinatorStatus) -> &'static s
     }
 }
 
-pub(super) fn summarize_uplink(target: &RouterDataplaneTarget) -> String {
+pub(super) fn summarize_uplink(target: &RouterDataplaneTargetView) -> String {
     match target {
-        RouterDataplaneTarget::Enabled(desired) => {
+        RouterDataplaneTargetView::Enabled(desired) => {
             if desired.forwarding.is_some() {
                 "per-connection".into()
             } else {
                 desired.uplink.clone()
             }
         }
-        RouterDataplaneTarget::Disabled => "none (dataplane disabled)".to_string(),
+        RouterDataplaneTargetView::Disabled => "none (dataplane disabled)".to_string(),
     }
 }
 
-pub(super) fn format_forwarding_status(dataplane: &crate::firewall::RouterDataplanePlan) -> String {
+pub(super) fn format_forwarding_status(
+    dataplane: &traffic_masq_protocol::RouterDataplanePlanView,
+) -> String {
     let forwarding = if dataplane.snapshot.ipv4_forwarding {
         "forwarding on"
     } else {
         "forwarding off"
     };
     let nat = match &dataplane.target {
-        RouterDataplaneTarget::Enabled(desired)
+        RouterDataplaneTargetView::Enabled(desired)
             if desired
                 .forwarding
                 .as_ref()
@@ -531,8 +533,8 @@ pub(super) fn format_forwarding_status(dataplane: &crate::firewall::RouterDatapl
         {
             "NAT desired"
         }
-        RouterDataplaneTarget::Enabled(_) => "NAT disabled",
-        RouterDataplaneTarget::Disabled => "NAT disabled",
+        RouterDataplaneTargetView::Enabled(_) => "NAT disabled",
+        RouterDataplaneTargetView::Disabled => "NAT disabled",
     };
     let apply = if dataplane.requires_apply {
         "drift: requires apply"

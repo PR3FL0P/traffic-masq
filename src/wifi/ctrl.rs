@@ -75,11 +75,7 @@ fn parse_status(reply: &str) -> Result<HostapdStatus, CtrlError> {
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Station {
-    pub mac: MacAddr,
-    pub raw: std::collections::BTreeMap<String, String>,
-}
+pub use traffic_masq_protocol::Station;
 
 fn parse_station(reply: &str) -> Result<Station, CtrlError> {
     let mut lines = reply.lines();

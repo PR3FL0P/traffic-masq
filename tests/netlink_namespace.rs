@@ -309,7 +309,8 @@ async fn an_unconfirmed_change_converges_and_expires_on_a_live_kernel() -> Resul
     use traffic_masq::core::interface::InterfaceManager;
     use traffic_masq::core::override_manager::RuntimeOverrideManager;
     use traffic_masq::core::ownership::AddressOwnershipJournal;
-    use traffic_masq::core::transaction::NetworkTransactionManager;
+    use traffic_masq::core::transaction::{InterfaceChange, NetworkTransactionManager};
+    use traffic_masq::wifi::WifiPassphraseUpdate;
 
     let fixture = NetnsFixture::new()?;
     let state_dir = tempfile::tempdir()?;
@@ -385,9 +386,13 @@ async fn an_unconfirmed_change_converges_and_expires_on_a_live_kernel() -> Resul
     let change = manager
         .apply(
             &fixture.host_if,
-            &interface(proposed),
-            Some(InterfaceRole::Output),
-            false,
+            InterfaceChange {
+                config: &interface(proposed),
+                previous: Some(&interface(committed)),
+                current_role: Some(InterfaceRole::Output),
+                passphrase: WifiPassphraseUpdate::Keep,
+                allow_management_change: false,
+            },
         )
         .await
         .context("apply must not return before the change has been converged to")?;

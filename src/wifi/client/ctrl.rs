@@ -9,31 +9,7 @@ use crate::wifi::ctrl_transport::{self, CtrlSocket, EventClient, EventConnection
 
 pub use crate::wifi::ctrl_transport::{CtrlError, MacAddr, MacAddrParseError};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WpaSupplicantScanSecurity {
-    Open,
-    Wpa2Psk,
-    Wpa3Sae,
-    Wpa2Wpa3Transition,
-    EnterpriseOrUnsupported,
-    Unknown,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WpaSupplicantScanResult {
-    pub bssid: MacAddr,
-
-    pub frequency_mhz: u32,
-    pub signal_dbm: i32,
-    pub ssid: String,
-    /// Exact SSID octets; `ssid` is the display representation for binary names.
-    #[serde(default)]
-    pub ssid_bytes: Vec<u8>,
-
-    pub raw_flags: String,
-    pub security: WpaSupplicantScanSecurity,
-}
+pub use traffic_masq_protocol::{WpaSupplicantScanResult, WpaSupplicantScanSecurity};
 
 fn classify_scan_security(flags: &str) -> WpaSupplicantScanSecurity {
     let tokens: Vec<&str> = flags

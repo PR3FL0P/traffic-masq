@@ -1,3 +1,5 @@
+pub use traffic_masq_protocol::CoordinatorStatus;
+
 use crate::core::mutation::NetworkMutationGate;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
@@ -60,16 +62,6 @@ pub struct StalePlanError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[error("no router transaction is pending")]
 pub struct NoPendingTransactionError;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CoordinatorStatus {
-    CommitIndeterminate,
-    Idle,
-    Pending,
-    RollbackFailed,
-    RecoveredButJournalCleanupPending,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoordinatorView {

@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+pub use traffic_masq_protocol::WifiClientProfileSummary;
+
 use crate::atomic_file::{self, PrivateDirError, PRIVATE_DIR_MODE, PRIVATE_FILE_MODE};
 use crate::config::{InterfaceConfig, InterfaceRole, WifiClientConfig, WifiClientSecurity};
 use crate::wifi::{PassphraseError, WifiPassphrase};
@@ -83,20 +85,6 @@ pub struct WifiClientProfileMetadata {
     pub autoconnect: bool,
     pub created_at: i64,
     pub modified_at: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WifiClientProfileSummary {
-    pub id: String,
-    pub ssid: String,
-    pub country_code: Option<String>,
-    pub security: WifiClientSecurity,
-    pub priority: i32,
-    #[serde(default)]
-    pub autoconnect: bool,
-    pub created_at: i64,
-    pub modified_at: i64,
-    pub has_passphrase: bool,
 }
 
 pub enum WifiClientProfileSecretUpdate {

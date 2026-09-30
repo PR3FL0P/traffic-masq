@@ -5,9 +5,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Gauge, Paragraph};
 
-use crate::api::client::ApiClient;
-use crate::api::model::{InterfaceEditRequest, Request, Response};
-use crate::config::InterfaceRole;
+use crate::tui::api::client::ApiClient;
+use crate::tui::api::model::{InterfaceEditRequest, Request, Response};
+use traffic_masq_protocol::InterfaceRole;
 
 use super::layout::panel;
 use super::logs::LogLevel;

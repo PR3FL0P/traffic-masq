@@ -35,16 +35,15 @@ use zeroize::Zeroizing;
 use crate::api::control::ControlService;
 use crate::api::model::{
     ApiHttpsSettings, DhcpClientConfigRequest, DhcpEditRequest, InterfaceEditRequest,
-    ProvisionWifiAccessPointRequest, Request, Response, RouterProposalRequest,
-    RouterProvisioningApplyRequest, RouterProvisioningPreviewRequest, SecuritySettings,
-    WifiClientEditRequest, WifiClientProfileActivationRequest, WifiClientProfileWriteRequest,
-    WifiEditRequest,
+    ProvisionWifiAccessPointRequest, Request, Response, RouterProvisioningApplyRequest,
+    RouterProvisioningPreviewRequest, SecuritySettings, WifiClientEditRequest,
+    WifiClientProfileActivationRequest, WifiClientProfileWriteRequest, WifiEditRequest,
 };
 use crate::api::HTTP_CONNECTION_TIMEOUT;
 use crate::auth::{
     AuthError, AuthService, LoginSession, Principal, Role, MINIMUM_PASSWORD_CHARACTERS,
 };
-use crate::config::{AppConfig, DhcpInterfaceConfig, InterfaceConfig, TcpApiConfig};
+use crate::config::{AppConfig, TcpApiConfig};
 
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -724,7 +723,7 @@ async fn put_dhcp_config(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
     AxumPath(interface): AxumPath<String>,
-    Json(config): Json<DhcpInterfaceConfig>,
+    Json(config): Json<DhcpEditRequest>,
 ) -> Result<Json<Response>, ApiError> {
     dispatch_control(
         &state,
@@ -769,7 +768,7 @@ async fn list_dhcp_leases(
 
 #[derive(Deserialize)]
 struct InterfaceChangeRequest {
-    config: InterfaceConfig,
+    config: traffic_masq_protocol::InterfaceConfigView,
     #[serde(default)]
     allow_management_change: bool,
 }
@@ -918,7 +917,7 @@ async fn router_status(
 async fn router_plan(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
-    Json(proposal): Json<RouterProposalRequest>,
+    Json(proposal): Json<traffic_masq_protocol::RouterProposalRequestView>,
 ) -> Result<Json<Response>, ApiError> {
     dispatch_control(&state, &principal, Request::RouterPlan { proposal }).await
 }
@@ -926,7 +925,7 @@ async fn router_plan(
 async fn router_apply(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
-    Json(proposal): Json<RouterProposalRequest>,
+    Json(proposal): Json<traffic_masq_protocol::RouterProposalRequestView>,
 ) -> Result<Json<Response>, ApiError> {
     dispatch_control(&state, &principal, Request::RouterApply { proposal }).await
 }

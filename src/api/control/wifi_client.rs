@@ -165,7 +165,9 @@ impl ControlService {
                 }
             }
         }
-        Response::WifiClientStatus { interfaces }
+        Response::WifiClientStatus {
+            interfaces: interfaces.into_iter().map(Into::into).collect(),
+        }
     }
 
     pub(super) async fn get_wifi_client_config(&self, interface: String) -> Response {
@@ -187,7 +189,10 @@ impl ControlService {
             },
             None => None,
         };
-        Response::WifiClientConfig { interface, spec }
+        Response::WifiClientConfig {
+            interface,
+            spec: spec.map(Into::into),
+        }
     }
 
     pub(super) async fn configure_wifi_client(
@@ -543,7 +548,7 @@ impl ControlService {
         }
 
         match wifi_client.configure(spec.clone()).await {
-            Ok(()) => Response::WifiClientConfigured { spec },
+            Ok(()) => Response::WifiClientConfigured { spec: spec.into() },
             Err(error) => {
                 let secret_restore = match previous_secret.as_ref() {
                     Some(previous) => wifi_client.set_passphrase(&interface, previous).await,
@@ -991,7 +996,7 @@ impl ControlService {
                 phase: self.wifi_client_activation_phase(&interface, &status).await,
                 interface,
                 profile,
-                status,
+                status: status.into(),
             },
             None => wifi_client_profile_error(WifiClientProfileErrorDetail::ActivationFailed {
                 message: "supplicant disappeared after profile activation".to_string(),
@@ -1113,7 +1118,9 @@ impl ControlService {
         self.wifi_autoconnect.lock().await.resume(&interface);
 
         match wifi_client.status(&interface).await {
-            Some(status) => Response::WifiClientConfigured { spec: status.spec },
+            Some(status) => Response::WifiClientConfigured {
+                spec: status.spec.into(),
+            },
             None => wifi_client_error(WifiClientErrorDetail::InterfaceNotFound),
         }
     }

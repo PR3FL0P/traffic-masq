@@ -2,7 +2,7 @@ use super::*;
 
 fn status(index: u32) -> InterfaceStatus {
     InterfaceStatus {
-        interface: crate::netlink::NetworkInterface {
+        interface: traffic_masq_protocol::NetworkInterfaceView {
             index,
             name: format!("eth{index}"),
             is_up: true,
@@ -385,7 +385,7 @@ async fn partial_api_failure_does_not_clear_other_status_or_fetch_dhcp() {
                         service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
                             let response = match req.uri().path() {
                                 "/api/v1/interfaces" => Response::Interfaces {
-                                    interfaces: vec![status(1)],
+                                    interfaces: vec![status(1).into()],
                                 },
                                 "/api/v1/interfaces/eth1/config" => Response::InterfaceConfig {
                                     interface: "eth1".into(),

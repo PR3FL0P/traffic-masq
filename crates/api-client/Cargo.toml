@@ -1,0 +1,22 @@
+[package]
+name = "traffic-masq-api-client"
+version = "0.1.0"
+edition = "2021"
+license-file = "../../LICENSE"
+rust-version = "1.95"
+description = "Unix-socket HTTP transport for the traffic-masq API"
+
+[dependencies]
+anyhow = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+ipnet = { version = "2", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+traffic-masq-protocol = { path = "../protocol" }
+zeroize = { version = "1", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"

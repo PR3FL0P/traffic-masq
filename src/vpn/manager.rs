@@ -24,13 +24,8 @@ use crate::vpn::{VpnDriver, VpnDriverError};
 /// once those callers are repointed onto the chain exclusively.
 pub const OWNED_INTERFACE_NAME: &str = "tm-wg0";
 
-/// The interface name for a given chain hop: `tm-wg-<hop_index>`. Deliberately
-/// namespaced apart from [`OWNED_INTERFACE_NAME`] (`tm-wg0` vs. `tm-wg-0`) so
-/// the two activation paths can never collide on the same kernel interface
-/// during the coexistence window.
-pub fn hop_interface_name(hop_index: u32) -> String {
-    format!("tm-wg-{hop_index}")
-}
+/// Distinct from [`OWNED_INTERFACE_NAME`] during the coexistence window.
+pub use traffic_masq_protocol::hop_interface_name;
 
 fn new_launch_marker() -> String {
     let mut token = [0u8; 16];

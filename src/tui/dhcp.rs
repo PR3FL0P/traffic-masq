@@ -6,9 +6,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::api::client::ApiClient;
-use crate::api::model::{DhcpEditRequest, Request, Response};
-use crate::dhcp::lease::DhcpLease;
+use crate::tui::api::client::ApiClient;
+use crate::tui::api::model::{DhcpEditRequest, Request, Response};
+use traffic_masq_protocol::DhcpLeaseView;
 
 use super::layout::panel;
 use super::logs::LogLevel;
@@ -113,7 +113,7 @@ impl DhcpEditor {
 #[derive(Debug, Clone)]
 pub(crate) struct DhcpLeasesView {
     pub(crate) interface: String,
-    pub(crate) leases: Vec<DhcpLease>,
+    pub(crate) leases: Vec<DhcpLeaseView>,
     pub(crate) scroll: usize,
     pub(crate) return_screen: Screen,
 }
@@ -374,7 +374,7 @@ pub(crate) async fn handle_dhcp_interface_list_key(
 
 fn suggest_pool(address: Ipv4Addr, prefix_len: u8) -> Option<(Ipv4Addr, Ipv4Addr)> {
     let cidr = ipnet::Ipv4Net::new(address, prefix_len).ok()?;
-    crate::dhcp::defaults::suggest_pool(cidr).ok()
+    traffic_masq_protocol::suggest_pool(cidr).ok()
 }
 
 fn is_candidate_ipv4(addr: Ipv4Addr, prefix_len: u8) -> bool {
@@ -393,7 +393,7 @@ fn is_candidate_ipv4(addr: Ipv4Addr, prefix_len: u8) -> bool {
 }
 
 fn candidate_cidr_from_status(
-    status: &crate::api::model::InterfaceStatus,
+    status: &traffic_masq_protocol::InterfaceStatusView,
 ) -> Option<ipnet::Ipv4Net> {
     let owned = status.owned_ipv4_addresses.as_deref().unwrap_or(&[]);
     let addresses = if !owned.is_empty() {

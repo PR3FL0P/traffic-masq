@@ -42,7 +42,7 @@ async fn shutdown_interrupts_an_incomplete_handshake() {
 use std::net::Ipv4Addr;
 
 use super::*;
-use crate::config::InterfaceRole;
+use crate::config::{InterfaceConfig, InterfaceRole};
 
 fn principal(role: Role) -> Principal {
     Principal {
@@ -62,16 +62,6 @@ fn interface_config() -> InterfaceConfig {
         dhcp_client: None,
         wifi: None,
         wifi_client: None,
-    }
-}
-
-fn dhcp_config() -> DhcpInterfaceConfig {
-    DhcpInterfaceConfig {
-        pool_start: Ipv4Addr::new(192, 0, 2, 10),
-        pool_end: Ipv4Addr::new(192, 0, 2, 20),
-        router: Ipv4Addr::new(192, 0, 2, 1),
-        dns_servers: Vec::new(),
-        lease_seconds: None,
     }
 }
 
@@ -161,7 +151,7 @@ fn every_control_request_has_the_expected_authorization_class() {
         },
         Request::DryRunInterface {
             interface: "eth0".to_owned(),
-            config: interface_config(),
+            config: interface_config().into(),
             allow_management_change: false,
         },
         Request::DryRunInterfaceEdit {
@@ -193,7 +183,7 @@ fn every_control_request_has_the_expected_authorization_class() {
         Request::ResetApiHttpsSettings,
         Request::ConfigureDhcp {
             interface: "eth0".to_owned(),
-            config: dhcp_config(),
+            config: dhcp_edit(),
         },
         Request::ConfigureDhcpSettings {
             interface: "eth0".to_owned(),
@@ -217,7 +207,7 @@ fn every_control_request_has_the_expected_authorization_class() {
         },
         Request::ApplyInterface {
             interface: "eth0".to_owned(),
-            config: interface_config(),
+            config: interface_config().into(),
             allow_management_change: false,
         },
         Request::ApplyInterfaceEdit {

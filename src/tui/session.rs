@@ -11,9 +11,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use crate::api::client::{ApiClient, ClientAuthentication};
-use crate::api::model::{Request, Response};
-use crate::atomic_file;
+use crate::tui::api::client::{ApiClient, ClientAuthentication};
+use crate::tui::api::model::{Request, Response};
+use traffic_masq_atomic_file as atomic_file;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]

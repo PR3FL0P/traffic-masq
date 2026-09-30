@@ -9,7 +9,7 @@ pub(super) fn current_router_proposal(app: &TuiApp) -> RouterProposalRequest {
 
 pub(super) async fn lease_counts_for_plan(
     client: &ApiClient,
-    plan: &RouterPlan,
+    plan: &RouterPlanView,
 ) -> Vec<(String, usize)> {
     let mut counts = Vec::with_capacity(plan.desired.dhcp.len());
     for dhcp in &plan.desired.dhcp {
@@ -55,7 +55,7 @@ pub(crate) fn render_router_plan(frame: &mut ratatui::Frame<'_>, area: Rect, app
             summarize_uplink(&plan.dataplane.target)
         )),
     ];
-    if let RouterDataplaneTarget::Enabled(desired) = &plan.dataplane.target {
+    if let RouterDataplaneTargetView::Enabled(desired) = &plan.dataplane.target {
         if let Some(connections) = &desired.forwarding {
             for connection in connections {
                 lines.push(Line::from(format!(
@@ -209,7 +209,9 @@ pub(crate) fn render_router_plan(frame: &mut ratatui::Frame<'_>, area: Rect, app
     );
 }
 
-pub(super) fn summarize_output_interfaces(interfaces: &[RouterInterfaceDesired]) -> Vec<String> {
+pub(super) fn summarize_output_interfaces(
+    interfaces: &[RouterInterfaceDesiredView],
+) -> Vec<String> {
     interfaces
         .iter()
         .filter(|interface| interface.config.role == InterfaceRole::Output)
@@ -225,7 +227,7 @@ pub(super) fn summarize_output_interfaces(interfaces: &[RouterInterfaceDesired])
 }
 
 pub(super) fn summarize_dhcp(
-    dhcp: &[DhcpServiceSpec],
+    dhcp: &[traffic_masq_protocol::DhcpServiceView],
     lease_counts: &[(String, usize)],
 ) -> Vec<String> {
     dhcp.iter()
@@ -248,7 +250,7 @@ pub(super) fn summarize_dhcp(
         .collect()
 }
 
-pub(super) fn ap_without_dhcp_warnings(desired: &RouterDesired) -> Vec<String> {
+pub(super) fn ap_without_dhcp_warnings(desired: &RouterDesiredView) -> Vec<String> {
     desired
         .interfaces
         .iter()
@@ -265,7 +267,12 @@ pub(super) fn ap_without_dhcp_warnings(desired: &RouterDesired) -> Vec<String> {
 
 pub(crate) async fn open_router_plan(app: &mut TuiApp, client: &ApiClient) {
     let proposal = current_router_proposal(app);
-    match client.request(&Request::RouterPlan { proposal }).await {
+    match client
+        .request(&Request::RouterPlan {
+            proposal: proposal.into(),
+        })
+        .await
+    {
         Ok(Response::RouterPlan { plan }) => {
             app.router.lease_counts = lease_counts_for_plan(client, &plan).await;
             app.router.plan = Some(plan);
@@ -329,7 +336,12 @@ pub(crate) async fn handle_router_plan_key(app: &mut TuiApp, key: KeyCode, clien
 
 async fn router_apply_current_plan(app: &mut TuiApp, client: &ApiClient) {
     let proposal = current_router_proposal(app);
-    match client.request(&Request::RouterApply { proposal }).await {
+    match client
+        .request(&Request::RouterApply {
+            proposal: proposal.into(),
+        })
+        .await
+    {
         Ok(Response::RouterTransactionPending { token, plan }) => {
             app.router_pending = Some(RouterPendingView {
                 token,

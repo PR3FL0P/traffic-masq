@@ -7,17 +7,20 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Gauge, Paragraph, Row, Table};
 
-use crate::api::client::ApiClient;
-use crate::api::model::{
-    Request, Response, RouteStatus, RouterErrorDetail, RouterProposalRequest, RouterRecoveryNotice,
-};
-use crate::config::{InterfaceRole, OwnedIpv4RouteConfig, RouterConfig};
-use crate::core::recovery::RecoveryAction;
-use crate::core::router::{RouterDesired, RouterHealthReport, RouterInterfaceDesired, RouterPlan};
-use crate::core::router_transaction::CoordinatorStatus;
+#[cfg(test)]
 use crate::dhcp::supervisor::DhcpServiceSpec;
-use crate::firewall::RouterDataplaneTarget;
-use crate::netlink::RouteOwner;
+use crate::tui::api::client::ApiClient;
+use crate::tui::api::model::{Request, Response, RouterErrorDetail, RouterRecoveryNotice};
+use traffic_masq_protocol::RecoveryAction;
+use traffic_masq_protocol::{CoordinatorStatus, RouterHealthReport};
+use traffic_masq_protocol::{
+    InterfaceRole, OwnedIpv4RouteConfigView as OwnedIpv4RouteConfig,
+    RouterConfigView as RouterConfig, RouterProposalRequestView as RouterProposalRequest,
+};
+use traffic_masq_protocol::{RouteOwnerView as RouteOwner, RouteStatusView as RouteStatus};
+use traffic_masq_protocol::{
+    RouterDataplaneTargetView, RouterDesiredView, RouterInterfaceDesiredView, RouterPlanView,
+};
 
 use super::layout::panel;
 use super::logs::LogLevel;
@@ -59,7 +62,7 @@ pub(crate) struct RouterData {
     pub(crate) selected_route: usize,
     pub(crate) proposed_router_config: RouterConfig,
     pub(crate) staged: bool,
-    pub(crate) plan: Option<RouterPlan>,
+    pub(crate) plan: Option<RouterPlanView>,
     pub(crate) plan_scroll: usize,
     pub(crate) plan_max_scroll: usize,
     pub(crate) editor: Option<RouteEditor>,
@@ -244,7 +247,7 @@ impl RouteEditor {
 pub(crate) struct RouterPendingView {
     pub(crate) token: String,
     #[allow(dead_code)]
-    pub(crate) plan: RouterPlan,
+    pub(crate) plan: RouterPlanView,
     pub(crate) applied_at_unix: u64,
     pub(crate) rollback_failure: Option<Vec<String>>,
     pub(crate) recovery: Option<RouterRecoveryNotice>,

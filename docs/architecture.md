@@ -7,6 +7,8 @@ interface state itself and cannot make changes.
 | Module | Responsibility |
 | --- | --- |
 | `api` | HTTP, authorization and control-operation limits |
+| `crates/protocol` (`traffic-masq-protocol`) | API wire DTOs independent of daemon internals |
+| `crates/api-client` (`traffic-masq-api-client`) | Unix-socket HTTP transport, auth/session, request mapping and response decoding |
 | `core` | Configuration, ownership, plans, transactions and reconciliation |
 | `crates/netlink` (`traffic-masq-netlink`) | Kernel interfaces, IPv4 addresses, routes, rules and change events |
 | `firewall` | nftables and IPv4 forwarding |
@@ -18,6 +20,23 @@ interface state itself and cannot make changes.
 The root library re-exports `traffic-masq-netlink` as `traffic_masq::netlink`
 for existing callers. The netlink crate depends only on kernel protocol and
 runtime libraries; application orchestration depends on it, never the reverse.
+
+`api::model` re-exports the protocol DTOs for current callers. The request
+envelope now lives in protocol. Interface changes and router proposals use
+protocol-owned DTOs converted to daemon configuration at the control boundary.
+DHCP configuration requests use a protocol DTO converted at the same boundary.
+The response envelope also lives in protocol. VPN views, router health,
+coordinator and pending-change status, DHCP lease views, interface status and
+plans, routes, Wi-Fi status, and the complete router plan are protocol DTOs.
+The response alias `ControlResponse` contains no daemon model types. The TUI
+still imports daemon configuration and runtime modules directly; those imports
+must be removed before the TUI can become a client-only crate.
+`config` re-exports shared interface, Wi-Fi and VPN enum values from protocol;
+`core::router_provisioning` similarly re-exports downstream overrides.
+The root `api::client::ApiClient` aliases the standalone `ControlApiClient`.
+The client crate maps protocol
+requests to REST endpoints and owns auth/session behavior without importing the
+daemon crate.
 
 ## Applying changes
 

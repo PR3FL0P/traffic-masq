@@ -1,5 +1,27 @@
 use super::runtime::compensation_message;
 use super::*;
+use crate::api::model::{VpnActiveStatus, VpnProfileSummary};
+
+fn vpn_profile_summary(summary: crate::vpn::WireGuardProfileSummary) -> VpnProfileSummary {
+    VpnProfileSummary {
+        name: summary.name,
+        size_bytes: summary.size_bytes,
+        modified_unix: summary.modified.and_then(|modified| {
+            modified
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .ok()
+                .map(|duration| duration.as_secs())
+        }),
+    }
+}
+
+fn vpn_active_status(status: crate::vpn::VpnActiveStatus) -> VpnActiveStatus {
+    VpnActiveStatus {
+        profile_name: status.profile_name,
+        interface: status.interface,
+        up: status.up,
+    }
+}
 
 impl ControlService {
     pub(super) async fn vpn_config(&self) -> Response {
@@ -60,7 +82,7 @@ impl ControlService {
         };
         match vpn.list_profiles() {
             Ok(profiles) => Response::VpnProfiles {
-                profiles: profiles.into_iter().map(Into::into).collect(),
+                profiles: profiles.into_iter().map(vpn_profile_summary).collect(),
             },
             Err(error) => classify_vpn_error(error),
         }
@@ -123,7 +145,7 @@ impl ControlService {
         };
         match vpn.status().await {
             Ok(active) => Response::VpnStatus {
-                active: active.map(Into::into),
+                active: active.map(vpn_active_status),
             },
             Err(error) => classify_vpn_error(error),
         }
@@ -141,7 +163,7 @@ impl ControlService {
         }
         match vpn.status().await {
             Ok(Some(active)) => Response::VpnActivated {
-                active: active.into(),
+                active: vpn_active_status(active),
             },
             Ok(None) => {
                 tracing::error!("VPN activation reported success but no interface is active");
@@ -205,7 +227,7 @@ impl ControlService {
             status: VpnPolicyStatusView {
                 mode,
                 mode_override_active,
-                tunnel: tunnel.map(Into::into),
+                tunnel: tunnel.map(vpn_active_status),
                 tunnel_healthy,
                 policy_active,
                 kill_switch_active: policy_active,

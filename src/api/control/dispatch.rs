@@ -160,7 +160,9 @@ impl ControlService {
             },
             Request::ListInterfaces => {
                 match interface_statuses(self.network.as_ref(), &self.transactions).await {
-                    Ok(interfaces) => Response::Interfaces { interfaces },
+                    Ok(interfaces) => Response::Interfaces {
+                        interfaces: interfaces.into_iter().map(Into::into).collect(),
+                    },
                     Err(error) => error_response(error),
                 }
             }
@@ -183,7 +185,7 @@ impl ControlService {
             Request::RenewDhcpClient { interface } => self.renew_dhcp_client(interface).await,
             Request::ReleaseDhcpClient { interface } => self.release_dhcp_client(interface).await,
             Request::GetDhcpConfig { interface } => Response::DhcpConfig {
-                spec: self.dhcp.spec(&interface).await,
+                spec: self.dhcp.spec(&interface).await.map(Into::into),
                 interface,
             },
             Request::ConfigureDhcp {
@@ -191,7 +193,7 @@ impl ControlService {
                 config: dhcp_config,
             } => match build_effective_dhcp_service(
                 &interface,
-                dhcp_config,
+                dhcp_config.into(),
                 &self.overrides,
                 self.network.as_ref(),
                 self.base_config.dhcp.default_lease_seconds,
@@ -202,7 +204,7 @@ impl ControlService {
                     let _mutation = self.dhcp_mutations.lock().await;
                     match configure_dhcp_persisted(&self.dhcp, &self.overrides, spec.clone()).await
                     {
-                        Ok(()) => Response::DhcpConfigured { spec },
+                        Ok(()) => Response::DhcpConfigured { spec: spec.into() },
                         Err(error) => error_response(error),
                     }
                 }
@@ -224,7 +226,7 @@ impl ControlService {
                     let _mutation = self.dhcp_mutations.lock().await;
                     match configure_dhcp_persisted(&self.dhcp, &self.overrides, spec.clone()).await
                     {
-                        Ok(()) => Response::DhcpConfigured { spec },
+                        Ok(()) => Response::DhcpConfigured { spec: spec.into() },
                         Err(error) => error_response(error),
                     }
                 }
@@ -247,7 +249,17 @@ impl ControlService {
                 let store =
                     LeaseStore::for_interface(&self.base_config.dhcp.leases_dir, &interface);
                 match store.load().await {
-                    Ok(leases) => Response::Leases { interface, leases },
+                    Ok(leases) => Response::Leases {
+                        interface,
+                        leases: leases
+                            .into_iter()
+                            .map(|lease| traffic_masq_protocol::DhcpLeaseView {
+                                mac: lease.mac,
+                                ip: lease.ip,
+                                expires_at_unix: lease.expires_at_unix,
+                            })
+                            .collect(),
+                    },
                     Err(error) => error_response(error),
                 }
             }
@@ -256,6 +268,7 @@ impl ControlService {
                 config,
                 allow_management_change,
             } => {
+                let config: InterfaceConfig = config.into();
                 let current = match self.overrides.effective_interface(&interface).await {
                     Ok(current) => current,
                     Err(error) => {
@@ -299,7 +312,7 @@ impl ControlService {
                     )
                     .await
                 {
-                    Ok(plan) => Response::InterfacePlan { plan },
+                    Ok(plan) => Response::InterfacePlan { plan: plan.into() },
                     Err(error) => error_response(error),
                 }
             }
@@ -349,7 +362,7 @@ impl ControlService {
                             )
                             .await
                         {
-                            Ok(plan) => Response::InterfacePlan { plan },
+                            Ok(plan) => Response::InterfacePlan { plan: plan.into() },
                             Err(error) => error_response(error),
                         }
                     }
@@ -361,6 +374,7 @@ impl ControlService {
                 config,
                 allow_management_change,
             } => {
+                let config: InterfaceConfig = config.into();
                 let current = match self.overrides.effective_interface(&interface).await {
                     Ok(current) => current,
                     Err(error) => {
@@ -509,8 +523,8 @@ impl ControlService {
                 changes: self.transactions.pending().await,
             },
             Request::RouterStatus => self.router_status().await,
-            Request::RouterPlan { proposal } => self.router_plan(proposal).await,
-            Request::RouterApply { proposal } => self.router_apply(proposal).await,
+            Request::RouterPlan { proposal } => self.router_plan(proposal.into()).await,
+            Request::RouterApply { proposal } => self.router_apply(proposal.into()).await,
             Request::RouterCommit { token } => self.router_commit(token).await,
             Request::RouterRollback { token } => self.router_rollback(token).await,
             Request::RouterPendingTransaction => self.router_pending_transaction().await,

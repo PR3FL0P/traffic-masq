@@ -23,9 +23,8 @@ async fn editor_uses_saved_address_even_when_dashboard_is_empty() {
         }
     });
     let mut app = TuiApp::default();
-    app.dashboard
-        .interfaces
-        .push(crate::api::model::InterfaceStatus {
+    app.dashboard.interfaces.push(
+        crate::api::model::InterfaceStatus {
             interface: crate::netlink::NetworkInterface {
                 index: 1,
                 name: "lan0".into(),
@@ -37,7 +36,9 @@ async fn editor_uses_saved_address_even_when_dashboard_is_empty() {
             ipv4_addresses: vec![],
             owned_ipv4_addresses: None,
             has_default_route: false,
-        });
+        }
+        .into(),
+    );
     let client = ApiClient::new(socket);
     open_dhcp_editor(&mut app, &client).await;
     server.await.unwrap();
@@ -74,9 +75,8 @@ async fn editor_falls_back_to_status_address_ignoring_link_local() {
         }
     });
     let mut app = TuiApp::default();
-    app.dashboard
-        .interfaces
-        .push(crate::api::model::InterfaceStatus {
+    app.dashboard.interfaces.push(
+        crate::api::model::InterfaceStatus {
             interface: crate::netlink::NetworkInterface {
                 index: 1,
                 name: "lan0".into(),
@@ -101,7 +101,9 @@ async fn editor_falls_back_to_status_address_ignoring_link_local() {
             ],
             owned_ipv4_addresses: None,
             has_default_route: false,
-        });
+        }
+        .into(),
+    );
     let client = ApiClient::new(socket);
     open_dhcp_editor(&mut app, &client).await;
     server.await.unwrap();
@@ -134,9 +136,8 @@ async fn editor_leaves_fields_empty_if_only_link_local_address_present() {
         }
     });
     let mut app = TuiApp::default();
-    app.dashboard
-        .interfaces
-        .push(crate::api::model::InterfaceStatus {
+    app.dashboard.interfaces.push(
+        crate::api::model::InterfaceStatus {
             interface: crate::netlink::NetworkInterface {
                 index: 1,
                 name: "lan0".into(),
@@ -153,7 +154,9 @@ async fn editor_leaves_fields_empty_if_only_link_local_address_present() {
             }],
             owned_ipv4_addresses: None,
             has_default_route: false,
-        });
+        }
+        .into(),
+    );
     let client = ApiClient::new(socket);
     open_dhcp_editor(&mut app, &client).await;
     server.await.unwrap();

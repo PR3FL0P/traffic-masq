@@ -9,8 +9,8 @@ use ratatui::widgets::Paragraph;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::config::InterfaceRole;
-use crate::vpn::manager::hop_interface_name;
+use traffic_masq_protocol::hop_interface_name;
+use traffic_masq_protocol::InterfaceRole;
 
 use super::layout::panel;
 use super::router::RouterData;

@@ -149,7 +149,7 @@ pub(super) async fn submit_wifi_connect(app: &mut TuiApp, client: &ApiClient) {
         }
     }
 
-    use crate::api::model::{ProvisionWifiClientRequest, WifiClientIpPolicy};
+    use crate::tui::api::model::{ProvisionWifiClientRequest, WifiClientIpPolicy};
     let ip_policy = match static_cidr {
         Some(cidr) => WifiClientIpPolicy::Static {
             cidr: cidr.parse().expect("validated CIDR"),

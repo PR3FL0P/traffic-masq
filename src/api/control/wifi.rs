@@ -19,7 +19,9 @@ impl ControlService {
                 }
             }
         }
-        Response::WifiStatus { interfaces }
+        Response::WifiStatus {
+            interfaces: interfaces.into_iter().map(Into::into).collect(),
+        }
     }
 
     pub(super) async fn get_wifi_config(&self, interface: String) -> Response {
@@ -41,7 +43,10 @@ impl ControlService {
             },
             None => None,
         };
-        Response::WifiConfig { interface, spec }
+        Response::WifiConfig {
+            interface,
+            spec: spec.map(Into::into),
+        }
     }
 
     pub(super) async fn configure_wifi(
@@ -315,7 +320,7 @@ impl ControlService {
         }
 
         match wifi.configure(spec.clone()).await {
-            Ok(()) => Response::WifiConfigured { spec },
+            Ok(()) => Response::WifiConfigured { spec: spec.into() },
             Err(error) => {
                 let secret_restore = match previous_secret.as_ref() {
                     Some(previous) => wifi.set_passphrase(&interface, previous).await,
@@ -382,7 +387,7 @@ impl ControlService {
             return wifi_disabled();
         };
         match wifi.reload(&interface).await {
-            Ok(spec) => Response::WifiConfigured { spec },
+            Ok(spec) => Response::WifiConfigured { spec: spec.into() },
             Err(error) => classify_wifi_error(error),
         }
     }

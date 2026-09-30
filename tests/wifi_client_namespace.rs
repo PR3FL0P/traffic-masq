@@ -234,7 +234,7 @@ impl WifiClientNamespaceFixture {
                 match client.request(&Request::WifiClientStatus).await {
                     Ok(Response::WifiClientStatus { interfaces }) => {
                         if let Some(status) = interfaces.iter().find(|s| s.interface == STA_IF) {
-                            if status.wpa_state == WpaState::Completed {
+                            if status.wpa_state == WpaState::Completed.into() {
                                 return Ok(status.pid);
                             }
                         }

@@ -9,10 +9,12 @@ use ratatui::widgets::{Paragraph, Sparkline};
 
 use crossterm::event::KeyCode;
 
-use crate::api::client::ApiClient;
-use crate::api::model::{InterfaceStatus, RouteStatus, VpnPolicyStatusView};
-use crate::config::InterfaceRole;
-use crate::core::transaction::PendingNetworkChange;
+use crate::tui::api::client::ApiClient;
+use crate::tui::api::model::VpnPolicyStatusView;
+use traffic_masq_protocol::InterfaceRole;
+use traffic_masq_protocol::InterfaceStatusView as InterfaceStatus;
+use traffic_masq_protocol::PendingNetworkChange;
+use traffic_masq_protocol::RouteStatusView as RouteStatus;
 
 use super::layout::panel;
 use super::theme;

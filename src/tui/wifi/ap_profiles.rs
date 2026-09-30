@@ -1,5 +1,5 @@
 use super::*;
-use crate::api::model::WifiApProfileSummary;
+use crate::tui::api::model::WifiApProfileSummary;
 
 #[derive(Debug, Clone)]
 pub(crate) struct WifiApProfilesView {

@@ -5,8 +5,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use zeroize::Zeroize;
 
-use crate::api::client::ApiClient;
-use crate::api::model::{Request, Response, VpnActiveStatus, VpnErrorDetail, VpnProfileSummary};
+use crate::tui::api::client::ApiClient;
+use crate::tui::api::model::{
+    Request, Response, VpnActiveStatus, VpnErrorDetail, VpnProfileSummary,
+};
 
 use super::layout::panel;
 use super::logs::LogLevel;

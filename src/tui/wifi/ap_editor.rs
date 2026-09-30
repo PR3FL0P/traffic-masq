@@ -274,7 +274,7 @@ pub(crate) async fn handle_wifi_editor_key(app: &mut TuiApp, key: KeyCode, clien
                         settings
                             .max_stations
                             .saturating_add(1)
-                            .min(crate::config::MAX_WIFI_STATIONS)
+                            .min(traffic_masq_protocol::MAX_WIFI_STATIONS)
                     }
                 }
                 WifiField::Dhcp => {
@@ -419,9 +419,9 @@ async fn save_ap_profile(app: &mut TuiApp, client: &ApiClient) -> bool {
         return false;
     }
     let request = Request::SaveWifiApProfile {
-        profile: crate::api::model::WifiApProfileWriteRequest {
+        profile: crate::tui::api::model::WifiApProfileWriteRequest {
             id: editor.profile_id.clone(),
-            configuration: crate::api::model::ProvisionWifiAccessPointRequest {
+            configuration: crate::tui::api::model::ProvisionWifiAccessPointRequest {
                 settings: ap_settings(editor),
                 passphrase: (editor.security.requires_passphrase()
                     && !editor.passphrase.is_empty())

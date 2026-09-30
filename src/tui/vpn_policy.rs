@@ -4,9 +4,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 
-use crate::api::client::ApiClient;
-use crate::api::model::{Request, Response, VpnPolicyErrorDetail, VpnPolicyStatusView};
-use crate::config::VpnPolicyMode;
+use crate::tui::api::client::ApiClient;
+use crate::tui::api::model::{Request, Response, VpnPolicyErrorDetail, VpnPolicyStatusView};
+use traffic_masq_protocol::VpnPolicyMode;
 
 use super::layout::panel;
 use super::logs::LogLevel;

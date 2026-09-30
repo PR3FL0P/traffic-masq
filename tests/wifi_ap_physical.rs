@@ -219,7 +219,7 @@ impl PhysicalWifiFixture {
                             .iter()
                             .find(|status| status.interface == self.namespace_interface)
                         {
-                            if status.hostapd_state == HostapdState::Enabled {
+                            if status.hostapd_state == HostapdState::Enabled.into() {
                                 if status.spec.ssid != self.ssid {
                                     bail!("daemon enabled an access point with an unexpected SSID");
                                 }

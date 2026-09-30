@@ -210,7 +210,7 @@ impl PhysicalWifiFixture {
                             .iter()
                             .find(|status| status.interface == self.namespace_interface)
                         {
-                            if status.wpa_state == WpaState::Completed {
+                            if status.wpa_state == WpaState::Completed.into() {
                                 if status.spec.ssid != self.ssid {
                                     bail!("daemon completed association to an unexpected SSID");
                                 }

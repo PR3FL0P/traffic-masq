@@ -5,18 +5,20 @@ use super::{
     router::{RouterData, RouterPane},
     theme, Screen, TuiApp,
 };
-use crate::api::{
+use crate::tui::api::{
     client::ApiClient,
-    model::{Request, Response, RouterProposalRequest},
+    model::{Request, Response},
 };
-use crate::config::{validate_forwarding, ForwardingConfig, InterfaceRole};
-use crate::firewall::RouterDataplaneTarget;
 use crossterm::event::KeyCode;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::Style,
     text::{Line, Span},
     widgets::{Cell, Paragraph, Row, Table},
+};
+use traffic_masq_protocol::{
+    validate_forwarding, ForwardingConfigView as ForwardingConfig, InterfaceRole,
+    RouterDataplaneTargetView, RouterProposalRequestView as RouterProposalRequest,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +76,7 @@ impl ForwardingEditor {
         } else {
             rules.push(rule);
         }
-        validate_forwarding(&rules)?;
+        validate_forwarding(&rules).map_err(anyhow::Error::msg)?;
         Ok(rules)
     }
 }
@@ -91,7 +93,7 @@ pub(crate) fn displayed_rules(router: &RouterData) -> Option<Vec<ForwardingConfi
         return Some(vec![]);
     }
     let plan = router.plan.as_ref()?;
-    if let RouterDataplaneTarget::Enabled(desired) = &plan.dataplane.target {
+    if let RouterDataplaneTargetView::Enabled(desired) = &plan.dataplane.target {
         Some(
             desired
                 .outputs
@@ -138,10 +140,13 @@ async fn load_rules(app: &mut TuiApp, client: &ApiClient) -> Option<Vec<Forwardi
         set_router: Some(legacy),
         ..Default::default()
     };
-    if let Ok(Response::RouterPlan { plan }) =
-        client.request(&Request::RouterPlan { proposal }).await
+    if let Ok(Response::RouterPlan { plan }) = client
+        .request(&Request::RouterPlan {
+            proposal: proposal.into(),
+        })
+        .await
     {
-        if let RouterDataplaneTarget::Enabled(desired) = plan.dataplane.target {
+        if let RouterDataplaneTargetView::Enabled(desired) = plan.dataplane.target {
             return Some(
                 desired
                     .outputs
@@ -259,21 +264,18 @@ fn preferred_new_connection_endpoints(
     let to = explicit_egress
         .and_then(|egress| interfaces.iter().position(|name| name == egress))
         .or_else(|| {
-            app.dashboard
-                .routes
-                .as_ref()
-                .and_then(|routes| {
-                    routes
-                        .iter()
-                        .filter(|route| route.destination.prefix_len() == 0)
-                        .filter_map(|route| {
-                            let name = route.output_interface.as_ref()?;
-                            let index = interfaces.iter().position(|candidate| candidate == name)?;
-                            Some((route.table != 254, route.metric.unwrap_or(u32::MAX), index))
-                        })
-                        .min()
-                        .map(|(_, _, index)| index)
-                })
+            app.dashboard.routes.as_ref().and_then(|routes| {
+                routes
+                    .iter()
+                    .filter(|route| route.destination.prefix_len() == 0)
+                    .filter_map(|route| {
+                        let name = route.output_interface.as_ref()?;
+                        let index = interfaces.iter().position(|candidate| candidate == name)?;
+                        Some((route.table != 254, route.metric.unwrap_or(u32::MAX), index))
+                    })
+                    .min()
+                    .map(|(_, _, index)| index)
+            })
         })
         .or_else(|| {
             app.dashboard.interfaces.iter().find_map(|status| {

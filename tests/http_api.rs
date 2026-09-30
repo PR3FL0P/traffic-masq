@@ -482,7 +482,7 @@ async fn authenticated_http_client_controls_daemon_over_unix_socket() -> Result<
             ..
         } => {
             assert!(!config.managed);
-            assert_eq!(config, managed_false);
+            assert_eq!(config, managed_false.into());
             assert!(!allow_management_change);
         }
         response => panic!("unexpected response: {response:?}"),
@@ -927,7 +927,7 @@ async fn router_transaction_workflow_plan_apply_commit_over_http() -> Result<()>
 
     match admin
         .request(&Request::RouterPlan {
-            proposal: router_proposal(),
+            proposal: router_proposal().into(),
         })
         .await?
     {
@@ -937,7 +937,7 @@ async fn router_transaction_workflow_plan_apply_commit_over_http() -> Result<()>
 
     let token = match admin
         .request(&Request::RouterApply {
-            proposal: router_proposal(),
+            proposal: router_proposal().into(),
         })
         .await?
     {
@@ -1000,7 +1000,7 @@ async fn router_transaction_workflow_plan_apply_rollback_over_http() -> Result<(
 
     match admin
         .request(&Request::RouterApply {
-            proposal: router_proposal(),
+            proposal: router_proposal().into(),
         })
         .await?
     {
@@ -2379,7 +2379,7 @@ async fn http_routes_list_and_router_config_endpoints_work() -> Result<()> {
             assert_eq!(routes.len(), 1);
             assert_eq!(routes[0].destination, "0.0.0.0/0".parse().unwrap());
             assert_eq!(routes[0].output_interface.as_deref(), Some("eth0"));
-            assert_eq!(routes[0].owner, traffic_masq::netlink::RouteOwner::Boot);
+            assert_eq!(routes[0].owner, traffic_masq_protocol::RouteOwnerView::Boot);
         }
         response => panic!("unexpected response: {response:?}"),
     }

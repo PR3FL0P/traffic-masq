@@ -1,7 +1,9 @@
 use super::*;
-use crate::api::model::InterfaceStatus;
-use crate::netlink::{Ipv4AddressInfo, NetworkInterface};
 use ratatui::{backend::TestBackend, Terminal};
+use traffic_masq_protocol::{
+    InterfaceStatusView as InterfaceStatus, Ipv4AddressInfoView as Ipv4AddressInfo,
+    NetworkInterfaceView as NetworkInterface,
+};
 
 fn status(index: u32) -> InterfaceStatus {
     InterfaceStatus {
@@ -69,14 +71,14 @@ fn interface_list_keeps_selected_row_visible_and_click_offset_correct() {
 #[test]
 fn preview_buttons_are_visible_and_cancel_has_a_click_target() {
     let mut app = TuiApp {
-        preview: Some(crate::core::interface::InterfaceChangePlan {
+        preview: Some(traffic_masq_protocol::InterfaceChangePlanView {
             interface: "eth0".into(),
             delete_ipv4: vec![],
             retag_ipv4: None,
             add_ipv4: None,
             set_link_up: false,
             management_change: false,
-            dhcp_action: crate::core::interface::DhcpChangeAction::Unchanged,
+            dhcp_action: traffic_masq_protocol::DhcpChangeActionView::Unchanged,
             releasing_management: false,
         }),
         preview_scroll: usize::MAX,

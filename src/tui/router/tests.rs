@@ -11,7 +11,10 @@ use super::view::{
 };
 use super::*;
 use crate::config::InterfaceConfig;
-use crate::firewall::{RouterDataplaneDesired, RouterDataplanePlan, RouterDataplaneSnapshot};
+use crate::core::router::RouterInterfaceDesired;
+use crate::firewall::{
+    RouterDataplaneDesired, RouterDataplanePlan, RouterDataplaneSnapshot, RouterDataplaneTarget,
+};
 use std::net::Ipv4Addr;
 
 fn dhcp_spec(interface: &str) -> DhcpServiceSpec {
@@ -87,12 +90,13 @@ fn staged_explicit_forwarding_requires_a_plan_even_when_committed_router_is_disa
         ..Default::default()
     };
     router.proposed_router_config.enabled = true;
-    router.proposed_router_config.forwarding = Some(vec![crate::config::ForwardingConfig {
-        source_subnet: None,
-        from: "lan0".to_string(),
-        to: "wan0".to_string(),
-        masquerade: true,
-    }]);
+    router.proposed_router_config.forwarding =
+        Some(vec![traffic_masq_protocol::ForwardingConfigView {
+            source_subnet: None,
+            from: "lan0".to_string(),
+            to: "wan0".to_string(),
+            masquerade: true,
+        }]);
 
     assert!(router_plan_needed(&router));
 }
@@ -416,11 +420,12 @@ fn deleting_last_default_route_preserves_permission_in_candidate() {
             allow_default_route_change: true,
             owned_routes: vec![original.clone()],
             ..Default::default()
-        },
+        }
+        .into(),
         ..Default::default()
     };
     let mut app = TuiApp::default();
-    app.router.proposed_router_config = config.router.clone();
+    app.router.proposed_router_config = config.router.clone().into();
     app.router.routes = vec![route_status(&original, RouteOwner::TrafficMasqStatic)];
 
     delete_selected_route(&mut app);
@@ -430,7 +435,7 @@ fn deleting_last_default_route_preserves_permission_in_candidate() {
     let candidate = RouterCandidate::build(
         &config,
         &crate::state::overrides::RuntimeOverrides::default(),
-        &RouterIntentProposal::new().set_router(app.router.proposed_router_config),
+        &RouterIntentProposal::new().set_router(app.router.proposed_router_config.into()),
     )
     .expect("deleting the last standalone route builds a valid candidate");
     assert!(candidate.desired().routes.is_empty());
@@ -755,8 +760,14 @@ async fn periodic_router_status_refresh_does_not_request_a_plan() {
     assert!(app.router.enabled);
     assert!(app.router.ready);
     assert!(app.router.proposed_router_config.enabled);
-    assert!(matches!(app.router.error, Some(RouterErrorDetail::StalePlan)));
-    assert!(server.await.unwrap(), "periodic refresh made a second API request");
+    assert!(matches!(
+        app.router.error,
+        Some(RouterErrorDetail::StalePlan)
+    ));
+    assert!(
+        server.await.unwrap(),
+        "periodic refresh made a second API request"
+    );
 }
 
 #[tokio::test]
@@ -909,6 +920,8 @@ fn summarizes_only_output_interfaces_with_subnet() {
         },
     ];
 
+    let interfaces: Vec<RouterInterfaceDesiredView> =
+        interfaces.into_iter().map(Into::into).collect();
     let summary = summarize_output_interfaces(&interfaces);
 
     assert_eq!(summary, vec!["lan0 (192.168.10.1/24)"]);
@@ -919,6 +932,8 @@ fn summarizes_dhcp_with_known_and_missing_lease_counts() {
     let dhcp = vec![dhcp_spec("lan0"), dhcp_spec("lan1")];
     let lease_counts = vec![("lan0".to_string(), 3usize)];
 
+    let dhcp: Vec<traffic_masq_protocol::DhcpServiceView> =
+        dhcp.into_iter().map(Into::into).collect();
     let summary = summarize_dhcp(&dhcp, &lease_counts);
 
     assert_eq!(
@@ -937,9 +952,9 @@ fn summarizes_uplink_for_enabled_and_disabled_dataplane() {
         uplink: "wan0".to_string(),
         outputs: Vec::new(),
     });
-    assert_eq!(summarize_uplink(&enabled), "wan0");
+    assert_eq!(summarize_uplink(&enabled.into()), "wan0");
     assert_eq!(
-        summarize_uplink(&RouterDataplaneTarget::Disabled),
+        summarize_uplink(&RouterDataplaneTargetView::Disabled),
         "none (dataplane disabled)"
     );
 }
@@ -961,7 +976,7 @@ fn formats_forwarding_status_reflects_snapshot_target_and_drift() {
     };
 
     assert_eq!(
-        format_forwarding_status(&plan),
+        format_forwarding_status(&plan.into()),
         "forwarding on, NAT desired, drift: requires apply"
     );
 }
@@ -988,7 +1003,7 @@ fn forwarding_status_does_not_claim_nat_for_non_masqueraded_rules() {
     };
 
     assert_eq!(
-        format_forwarding_status(&plan),
+        format_forwarding_status(&plan.into()),
         "forwarding on, NAT disabled, in sync"
     );
 }

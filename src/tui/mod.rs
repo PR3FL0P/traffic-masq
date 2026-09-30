@@ -20,13 +20,14 @@ use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
 use zeroize::Zeroize;
 
-use crate::api::client::ApiClient;
-use crate::api::model::{DhcpClientStatusView, InterfaceStatus, Request, Response};
-use crate::core::interface::InterfaceChangePlan;
-use crate::core::transaction::PendingNetworkChange;
 use crate::netlink::{NetworkProvider, RtnetlinkNetworkProvider};
+use crate::tui::api::client::ApiClient;
+use crate::tui::api::model::{DhcpClientStatusView, Request, Response};
+use traffic_masq_protocol::{InterfaceChangePlanView, PendingNetworkChange};
+use traffic_masq_protocol::{InterfaceStatusView as InterfaceStatus, Ipv4AddressInfoView};
 
 mod access;
+pub(crate) mod api;
 mod dashboard;
 mod dhcp;
 mod dhcp_client;
@@ -254,7 +255,7 @@ struct TuiApp {
     dhcp_interfaces: Vec<String>,
     dhcp_client_selected: Option<String>,
     dhcp_client_scroll: usize,
-    preview: Option<InterfaceChangePlan>,
+    preview: Option<InterfaceChangePlanView>,
     preview_scroll: usize,
     preview_max_scroll: usize,
     pending: Option<PendingNetworkChange>,
@@ -1679,10 +1680,7 @@ fn normalize_selection(app: &mut TuiApp) {
         .min(app.dashboard.interfaces.len());
 }
 
-fn address_marker(
-    status: &InterfaceStatus,
-    address: &crate::netlink::Ipv4AddressInfo,
-) -> &'static str {
+fn address_marker(status: &InterfaceStatus, address: &Ipv4AddressInfoView) -> &'static str {
     if let Some(owned) = &status.owned_ipv4_addresses {
         if owned.contains(address) {
             ""
@@ -1691,10 +1689,10 @@ fn address_marker(
         }
     } else {
         match address.owner() {
-            crate::netlink::AddressOwner::TrafficMasqStatic
-            | crate::netlink::AddressOwner::TrafficMasqDhcp => "",
-            crate::netlink::AddressOwner::Foreign(_) => "[ext] ",
-            crate::netlink::AddressOwner::Untagged => "[?] ",
+            traffic_masq_protocol::AddressOwnerView::TrafficMasqStatic
+            | traffic_masq_protocol::AddressOwnerView::TrafficMasqDhcp => "",
+            traffic_masq_protocol::AddressOwnerView::Untagged => "[?] ",
+            traffic_masq_protocol::AddressOwnerView::Foreign(_) => "[ext] ",
         }
     }
 }
@@ -1775,7 +1773,7 @@ async fn load_daemon_dashboard(client: &ApiClient) -> DashboardData {
                     .insert(name.clone(), config.as_ref().is_some_and(|c| c.managed));
                 data.roles.insert(
                     name,
-                    config.map_or(crate::config::InterfaceRole::None, |c| c.role),
+                    config.map_or(traffic_masq_protocol::InterfaceRole::None, |c| c.role),
                 );
             }
             other => errors.push(format!(
@@ -1829,8 +1827,23 @@ async fn load_direct_dashboard(network: Option<&RtnetlinkNetworkProvider>) -> Da
                     route.destination.prefix_len() == 0
                         && route.output_interface_index == Some(interface.index)
                 }),
-                interface,
-                ipv4_addresses,
+                interface: traffic_masq_protocol::NetworkInterfaceView {
+                    index: interface.index,
+                    name: interface.name,
+                    is_up: interface.is_up,
+                    rx_bytes: interface.rx_bytes,
+                    tx_bytes: interface.tx_bytes,
+                    is_wireless: interface.is_wireless,
+                },
+                ipv4_addresses: ipv4_addresses
+                    .into_iter()
+                    .map(|address| Ipv4AddressInfoView {
+                        interface_index: address.interface_index,
+                        address: address.address,
+                        prefix_len: address.prefix_len,
+                        protocol: address.protocol,
+                    })
+                    .collect(),
             }),
             Err(error) => {
                 return DashboardData {
@@ -1849,7 +1862,17 @@ async fn load_direct_dashboard(network: Option<&RtnetlinkNetworkProvider>) -> Da
                 .iter()
                 .find(|s| Some(s.interface.index) == route.output_interface_index)
                 .map(|s| s.interface.name.clone());
-            crate::api::model::RouteStatus::from_info(route, name)
+            traffic_masq_protocol::RouteStatusView {
+                destination: route.destination,
+                gateway: route.gateway,
+                output_interface: name,
+                output_interface_index: route.output_interface_index,
+                table: route.table,
+                metric: route.metric,
+                protocol: route.protocol,
+                scope: route.scope,
+                owner: traffic_masq_protocol::RouteOwnerView::from_protocol(route.protocol),
+            }
         })
         .collect();
     DashboardData {

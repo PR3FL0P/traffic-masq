@@ -93,7 +93,7 @@ impl ControlService {
             .unwrap_or(false);
         Ok(Response::InterfaceConfig {
             interface,
-            config,
+            config: config.map(Into::into),
             allow_management_change,
         })
     }

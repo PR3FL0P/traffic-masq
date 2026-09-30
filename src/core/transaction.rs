@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::config::{InterfaceConfig, InterfaceRole};
+
 use crate::core::desired::{ConvergerState, DesiredNetworkState};
 use crate::core::interface::{
     DhcpChangeAction, InterfaceChangePlan, InterfaceManager, InterfaceSnapshot,
@@ -19,6 +20,7 @@ use crate::wifi::{
     secret::{WifiPassphrase, WifiPassphraseUpdate},
     store::{PassphraseStore, WifiCredentialRole},
 };
+pub use traffic_masq_protocol::{NetworkChangePhase, PendingNetworkChange};
 
 /// How long an apply waits for convergence to reach what it proposed.
 ///
@@ -30,19 +32,6 @@ use crate::wifi::{
 // readiness. Leave headroom so the transaction layer never times out a
 // subsystem that is still within its own documented startup budget.
 const CONVERGENCE_DEADLINE: Duration = Duration::from_secs(20);
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PendingNetworkChange {
-    pub token: String,
-    pub interface: String,
-    pub rollback_timeout_seconds: u64,
-    /// Advisory wall-clock display time; rollback waits for admitted operations.
-    pub expires_at_unix: u64,
-    #[serde(default)]
-    pub phase: NetworkChangePhase,
-    #[serde(default)]
-    pub last_error: Option<String>,
-}
 
 #[derive(Deserialize)]
 struct InterfaceJournalHeader {
@@ -433,25 +422,6 @@ struct Inner {
     /// before it builds the converger, and the two have to share one state —
     /// see [`NetworkTransactionManager::set_desired_state`].
     desired: std::sync::Mutex<DesiredNetworkState>,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NetworkChangePhase {
-    #[default]
-    AwaitingCommit,
-    RollbackRequired,
-    CommitIndeterminate,
-}
-
-impl PendingNetworkChange {
-    pub fn can_commit(&self) -> bool {
-        self.phase == NetworkChangePhase::AwaitingCommit
-    }
-
-    pub fn can_rollback(&self) -> bool {
-        self.phase != NetworkChangePhase::CommitIndeterminate
-    }
 }
 
 #[derive(Clone)]

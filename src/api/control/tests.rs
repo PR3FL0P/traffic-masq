@@ -824,10 +824,10 @@ async fn router_requests_are_rejected_when_router_mode_is_disabled() {
     for request in [
         Request::RouterStatus,
         Request::RouterPlan {
-            proposal: router_proposal(),
+            proposal: router_proposal().into(),
         },
         Request::RouterApply {
-            proposal: router_proposal(),
+            proposal: router_proposal().into(),
         },
         Request::RouterCommit {
             token: String::new(),
@@ -937,7 +937,12 @@ async fn dhcp_uplink_plan_auto_enables_interface_dhcp_client() {
         .unwrap()
         .mode = UplinkMode::Dhcp;
 
-    match service.dispatch(Request::RouterPlan { proposal }).await {
+    match service
+        .dispatch(Request::RouterPlan {
+            proposal: proposal.into(),
+        })
+        .await
+    {
         Response::RouterPlan { plan } => {
             let dhcp = plan
                 .desired
@@ -997,7 +1002,12 @@ async fn dhcp_uplink_plan_preserves_explicit_interface_override_while_enabling_d
         },
     );
 
-    match service.dispatch(Request::RouterPlan { proposal }).await {
+    match service
+        .dispatch(Request::RouterPlan {
+            proposal: proposal.into(),
+        })
+        .await
+    {
         Response::RouterPlan { plan } => {
             let uplink = plan
                 .desired
@@ -1027,7 +1037,7 @@ async fn router_plan_apply_commit_workflow_dispatches_through_control_service() 
 
     match service
         .dispatch(Request::RouterPlan {
-            proposal: router_proposal(),
+            proposal: router_proposal().into(),
         })
         .await
     {
@@ -1037,7 +1047,7 @@ async fn router_plan_apply_commit_workflow_dispatches_through_control_service() 
 
     let token = match service
         .dispatch(Request::RouterApply {
-            proposal: router_proposal(),
+            proposal: router_proposal().into(),
         })
         .await
     {
@@ -1090,7 +1100,7 @@ async fn router_plan_apply_rollback_workflow_dispatches_through_control_service(
 
     match service
         .dispatch(Request::RouterApply {
-            proposal: router_proposal(),
+            proposal: router_proposal().into(),
         })
         .await
     {
@@ -1149,13 +1159,13 @@ async fn second_concurrent_router_apply_is_rejected_with_typed_conflict() {
 
     service
         .dispatch(Request::RouterApply {
-            proposal: router_proposal(),
+            proposal: router_proposal().into(),
         })
         .await;
 
     match service
         .dispatch(Request::RouterApply {
-            proposal: router_proposal(),
+            proposal: router_proposal().into(),
         })
         .await
     {
@@ -2976,8 +2986,8 @@ async fn wifi_set_passphrase_applies_live_via_reload() {
 
 #[test]
 fn no_wifi_response_variant_can_hold_a_passphrase() {
-    fn assert_no_passphrase_field(spec: &WifiApSpec) {
-        let WifiApSpec {
+    fn assert_no_passphrase_field(spec: &crate::api::model::WifiApSpecView) {
+        let crate::api::model::WifiApSpecView {
             interface: _,
             ssid: _,
             country_code: _,
@@ -6370,12 +6380,12 @@ async fn list_routes_and_get_router_config_dispatch() {
             assert_eq!(routes[0].output_interface.as_deref(), Some("wlan0"));
             assert_eq!(
                 routes[0].owner,
-                crate::netlink::RouteOwner::TrafficMasqStatic
+                traffic_masq_protocol::RouteOwnerView::TrafficMasqStatic
             );
 
             assert_eq!(routes[1].destination, "0.0.0.0/0".parse().unwrap());
             assert_eq!(routes[1].output_interface.as_deref(), Some("eth0"));
-            assert_eq!(routes[1].owner, crate::netlink::RouteOwner::Boot);
+            assert_eq!(routes[1].owner, traffic_masq_protocol::RouteOwnerView::Boot);
         }
         other => panic!("unexpected response: {other:?}"),
     }
@@ -6390,7 +6400,10 @@ async fn list_routes_and_get_router_config_dispatch() {
             assert_eq!(routes.len(), 3);
             assert_eq!(routes[2].table, 255);
             assert_eq!(routes[2].destination, "127.0.0.1/32".parse().unwrap());
-            assert_eq!(routes[2].owner, crate::netlink::RouteOwner::Kernel);
+            assert_eq!(
+                routes[2].owner,
+                traffic_masq_protocol::RouteOwnerView::Kernel
+            );
         }
         other => panic!("unexpected response: {other:?}"),
     }
@@ -6437,7 +6450,7 @@ async fn unrelated_recovery_does_not_block_interface_commit_or_rollback() {
         let token = match service
             .dispatch(Request::ApplyInterface {
                 interface: "eth0".into(),
-                config: interface.clone(),
+                config: interface.clone().into(),
                 allow_management_change: false,
             })
             .await
