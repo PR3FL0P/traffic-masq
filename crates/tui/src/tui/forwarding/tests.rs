@@ -127,7 +127,7 @@ async fn editing_replaces_the_selected_connection_and_preserves_route_intent() {
 #[tokio::test]
 async fn invalid_subnet_and_cancel_do_not_modify_the_draft() {
     let mut app = TuiApp::default();
-    app.router.proposed_router_config.forwarding = Some(vec![connection("lan0", "wan0").into()]);
+    app.router.proposed_router_config.forwarding = Some(vec![connection("lan0", "wan0")]);
     app.router.staged = true;
     let before = app.router.proposed_router_config.clone();
     let mut form = editor();
@@ -160,7 +160,7 @@ fn disjoint_source_subnets_share_a_pair_but_overlap_is_rejected() {
 async fn route_shortcut_prefills_egress_without_changing_routes_or_staging() {
     let mut app = TuiApp::default();
     app.router.staged = true; // A local draft avoids any API request.
-    app.router.proposed_router_config.forwarding = Some(vec![connection("lan0", "wan0").into()]);
+    app.router.proposed_router_config.forwarding = Some(vec![connection("lan0", "wan0")]);
     let route = traffic_masq_protocol::RouteStatusView {
         destination: "10.0.0.0/8".parse().unwrap(),
         gateway: None,
@@ -191,7 +191,7 @@ async fn section_keys_mouse_and_action_arrows_preserve_the_shared_draft() {
     };
     app.ui.input_enabled = true;
     app.router.staged = true;
-    app.router.proposed_router_config.forwarding = Some(vec![connection("lan0", "wan0").into()]);
+    app.router.proposed_router_config.forwarding = Some(vec![connection("lan0", "wan0")]);
     let before = app.router.proposed_router_config.clone();
     let client = ApiClient::new("/must-not-be-used.sock");
     super::super::handle_key(&mut app, KeyCode::Char('2'), &client, false).await;
@@ -234,8 +234,7 @@ fn sharing_sections_and_controls_fit_small_and_large_terminals() {
             ..Default::default()
         };
         app.router.pane = RouterPane::Sharing;
-        app.router.proposed_router_config.forwarding =
-            Some(vec![connection("lan0", "wg0").into(); 20]);
+        app.router.proposed_router_config.forwarding = Some(vec![connection("lan0", "wg0"); 20]);
         app.router.selected_connection = 19;
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal

@@ -121,11 +121,11 @@ impl traffic_masq_protocol::ForwardingRule for ForwardingConfig {
         self.source_subnet
     }
 
-    fn from_interface(&self) -> &str {
+    fn ingress_interface(&self) -> &str {
         &self.from
     }
 
-    fn to_interface(&self) -> &str {
+    fn egress_interface(&self) -> &str {
         &self.to
     }
 }

@@ -61,8 +61,8 @@ pub struct ForwardingConfigView {
 
 pub trait ForwardingRule {
     fn source_subnet(&self) -> Option<Ipv4Net>;
-    fn from_interface(&self) -> &str;
-    fn to_interface(&self) -> &str;
+    fn ingress_interface(&self) -> &str;
+    fn egress_interface(&self) -> &str;
 }
 
 impl ForwardingRule for ForwardingConfigView {
@@ -70,11 +70,11 @@ impl ForwardingRule for ForwardingConfigView {
         self.source_subnet
     }
 
-    fn from_interface(&self) -> &str {
+    fn ingress_interface(&self) -> &str {
         &self.from
     }
 
-    fn to_interface(&self) -> &str {
+    fn egress_interface(&self) -> &str {
         &self.to
     }
 }
@@ -82,9 +82,9 @@ impl ForwardingRule for ForwardingConfigView {
 /// Validate forwarding intent before it is submitted to the daemon.
 pub fn validate_forwarding<R: ForwardingRule>(rules: &[R]) -> Result<(), String> {
     for (index, rule) in rules.iter().enumerate() {
-        validate_interface_name(rule.from_interface())?;
-        validate_interface_name(rule.to_interface())?;
-        if rule.from_interface() == rule.to_interface() {
+        validate_interface_name(rule.ingress_interface())?;
+        validate_interface_name(rule.egress_interface())?;
+        if rule.ingress_interface() == rule.egress_interface() {
             return Err("forwarding requires different ingress and egress interfaces".into());
         }
         if rule
@@ -94,8 +94,8 @@ pub fn validate_forwarding<R: ForwardingRule>(rules: &[R]) -> Result<(), String>
             return Err("source subnet must be a network address (no host bits)".into());
         }
         if rules[..index].iter().any(|prior| {
-            prior.from_interface() == rule.from_interface()
-                && prior.to_interface() == rule.to_interface()
+            prior.ingress_interface() == rule.ingress_interface()
+                && prior.egress_interface() == rule.egress_interface()
                 && match (prior.source_subnet(), rule.source_subnet()) {
                     (Some(a), Some(b)) => a.contains(&b.addr()) || b.contains(&a.addr()),
                     _ => true,
@@ -103,8 +103,8 @@ pub fn validate_forwarding<R: ForwardingRule>(rules: &[R]) -> Result<(), String>
         }) {
             return Err(format!(
                 "duplicate or overlapping forwarding connection: {} -> {}",
-                rule.from_interface(),
-                rule.to_interface()
+                rule.ingress_interface(),
+                rule.egress_interface()
             ));
         }
     }

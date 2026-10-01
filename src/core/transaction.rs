@@ -1262,7 +1262,7 @@ impl NetworkTransactionManager {
                 continue;
             }
             let previous_config = desired.committed_interface(name).await?;
-            let target = previous_config.clone().unwrap_or_else(|| InterfaceConfig {
+            let target = previous_config.clone().unwrap_or(InterfaceConfig {
                 role: InterfaceRole::Output,
                 managed: false,
                 ipv4: None,

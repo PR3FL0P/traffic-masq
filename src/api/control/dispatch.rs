@@ -440,8 +440,8 @@ impl ControlService {
                         InterfaceChange {
                             config: &config,
                             previous: current.as_ref(),
-                            current_role: current_role,
-                            allow_management_change: allow_management_change,
+                            current_role,
+                            allow_management_change,
                             passphrase: crate::wifi::WifiPassphraseUpdate::Keep,
                         },
                     )
@@ -493,8 +493,8 @@ impl ControlService {
                                 InterfaceChange {
                                     config: &config,
                                     previous: current.as_ref(),
-                                    current_role: current_role,
-                                    allow_management_change: allow_management_change,
+                                    current_role,
+                                    allow_management_change,
                                     passphrase: crate::wifi::WifiPassphraseUpdate::Keep,
                                 },
                             )

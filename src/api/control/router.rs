@@ -1038,6 +1038,16 @@ pub(super) fn classify_router_error(error: anyhow::Error) -> Response {
     Response::RouterError { detail }
 }
 
+async fn restore_staged_and_finish(
+    secrets: &ProvisioningSecretTransactionStore,
+) -> anyhow::Result<bool> {
+    let restored = secrets.restore(None).await?;
+    if restored {
+        secrets.finish(None).await?;
+    }
+    Ok(restored)
+}
+
 #[cfg(test)]
 mod recovery_notice_tests {
     use super::*;
@@ -1113,14 +1123,4 @@ mod recovery_notice_tests {
         assert!(router_recovery_notice(CoordinatorStatus::Idle, Vec::new()).is_none());
         assert!(router_recovery_notice(CoordinatorStatus::Pending, Vec::new()).is_none());
     }
-}
-
-async fn restore_staged_and_finish(
-    secrets: &ProvisioningSecretTransactionStore,
-) -> anyhow::Result<bool> {
-    let restored = secrets.restore(None).await?;
-    if restored {
-        secrets.finish(None).await?;
-    }
-    Ok(restored)
 }

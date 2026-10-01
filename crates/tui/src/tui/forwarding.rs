@@ -140,11 +140,8 @@ async fn load_rules(app: &mut TuiApp, client: &ApiClient) -> Option<Vec<Forwardi
         set_router: Some(legacy),
         ..Default::default()
     };
-    if let Ok(Response::RouterPlan { plan }) = client
-        .request(&Request::RouterPlan {
-            proposal: proposal.into(),
-        })
-        .await
+    if let Ok(Response::RouterPlan { plan }) =
+        client.request(&Request::RouterPlan { proposal }).await
     {
         if let RouterDataplaneTargetView::Enabled(desired) = plan.dataplane.target {
             return Some(

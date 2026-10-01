@@ -853,9 +853,9 @@ async fn rollback_publishes_restore_intent_even_when_secret_restore_fails() {
                 previous: None,
                 current_role: Some(InterfaceRole::Output),
                 allow_management_change: false,
-                passphrase: Some(WifiPassphrase::new("new-password").expect("passphrase"))
-                    .map(WifiPassphraseUpdate::Set)
-                    .unwrap_or(WifiPassphraseUpdate::Keep),
+                passphrase: WifiPassphraseUpdate::Set(
+                    WifiPassphrase::new("new-password").expect("passphrase"),
+                ),
             },
         )
         .await

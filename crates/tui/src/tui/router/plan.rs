@@ -267,12 +267,7 @@ pub(super) fn ap_without_dhcp_warnings(desired: &RouterDesiredView) -> Vec<Strin
 
 pub(crate) async fn open_router_plan(app: &mut TuiApp, client: &ApiClient) {
     let proposal = current_router_proposal(app);
-    match client
-        .request(&Request::RouterPlan {
-            proposal: proposal.into(),
-        })
-        .await
-    {
+    match client.request(&Request::RouterPlan { proposal }).await {
         Ok(Response::RouterPlan { plan }) => {
             app.router.lease_counts = lease_counts_for_plan(client, &plan).await;
             app.router.plan = Some(plan);
@@ -336,12 +331,7 @@ pub(crate) async fn handle_router_plan_key(app: &mut TuiApp, key: KeyCode, clien
 
 async fn router_apply_current_plan(app: &mut TuiApp, client: &ApiClient) {
     let proposal = current_router_proposal(app);
-    match client
-        .request(&Request::RouterApply {
-            proposal: proposal.into(),
-        })
-        .await
-    {
+    match client.request(&Request::RouterApply { proposal }).await {
         Ok(Response::RouterTransactionPending { token, plan }) => {
             app.router_pending = Some(RouterPendingView {
                 token,
