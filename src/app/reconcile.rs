@@ -30,6 +30,8 @@ use super::{shutdown_requested, ProductionVpnPolicyManager};
 
 const PROCESS_LIVENESS_INTERVAL: Duration = Duration::from_secs(1);
 const ROUTER_DATAPLANE_INTEGRITY_INTERVAL: Duration = Duration::from_secs(15);
+const NETWORK_RECONCILE_RETRY_BASE: Duration = Duration::from_secs(1);
+const NETWORK_RECONCILE_RETRY_MAX: Duration = Duration::from_secs(30);
 
 #[async_trait]
 pub(super) trait DhcpRuntimeReconciler: Send + Sync {
@@ -171,6 +173,26 @@ fn log_router_dataplane_convergence_error(error: &anyhow::Error) {
     } else {
         tracing::warn!(error = %format!("{error:#}"), "router dataplane convergence failed");
     }
+}
+
+async fn reconcile_router_dataplane(
+    router: &RouterTransactionCoordinator,
+    desired: RouterDesired,
+    network: &dyn NetworkProvider,
+) -> Result<()> {
+    // A missing adapter cannot be repaired by writes. Check before opening a
+    // repair journal: compensation would otherwise reconfigure healthy LAN
+    // services and generate new kernel events on every unsuccessful pass.
+    let missing =
+        super::router_startup::missing_router_repair_interfaces(&desired, network).await?;
+    if let Some(interface) = missing.first() {
+        return Err(crate::firewall::RouterDataplaneInterfaceMissing {
+            role: "router".into(),
+            interface: interface.clone(),
+        }
+        .into());
+    }
+    router.reconcile_dataplane(desired).await
 }
 
 pub(super) fn interface_needs_reapply(
@@ -485,8 +507,9 @@ pub(super) async fn reconcile_network_runtime_once<
 
 /// Converge the machine towards the desired state, driven by events.
 ///
-/// There is no periodic interface pass. The things that can make interface
-/// state disagree all announce themselves:
+/// Successful passes wait for events. Failed passes also retry with bounded
+/// backoff, since transient I/O failures can clear without a notification.
+/// Changes that can make interface state disagree announce themselves:
 ///
 /// - the desired state moved (an override was written),
 /// - rtnetlink state moved (link, address, route or policy rule),
@@ -505,16 +528,47 @@ pub(super) fn spawn_runtime_network_reconcile(
     dhcp_client: DhcpClientSupervisor,
     network_mutations: Arc<NetworkMutationGate>,
     router: Option<RouterTransactionCoordinator>,
+    kernel_events: mpsc::UnboundedReceiver<KernelEvent>,
+    shutdown: watch::Receiver<bool>,
+) -> JoinHandle<Result<()>> {
+    spawn_runtime_network_reconcile_with_recovery_events(
+        desired,
+        journal,
+        network,
+        dhcp,
+        wifi,
+        wifi_client,
+        dhcp_client,
+        network_mutations,
+        router,
+        kernel_events,
+        crate::core::recovery::subscribe(),
+        shutdown,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn spawn_runtime_network_reconcile_with_recovery_events(
+    desired: DesiredNetworkState,
+    journal: AddressOwnershipJournal,
+    network: Arc<dyn NetworkProvider>,
+    dhcp: DhcpSupervisor,
+    wifi: Option<HostapdSupervisor>,
+    wifi_client: Option<WifiClientSupervisor>,
+    dhcp_client: DhcpClientSupervisor,
+    network_mutations: Arc<NetworkMutationGate>,
+    router: Option<RouterTransactionCoordinator>,
     mut kernel_events: mpsc::UnboundedReceiver<KernelEvent>,
+    mut recovery_events: watch::Receiver<u64>,
     mut shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<Result<()>> {
     // Attach synchronously, before the task is scheduled. Once the API is
     // serving, a transaction must never observe daemon state as `Detached`
     // merely because Tokio has not polled the reconciler yet.
     desired.attach_converger();
-    let mut recovery_events = crate::core::recovery::subscribe();
     tokio::spawn(async move {
-        loop {
+        let mut retry_delay = NETWORK_RECONCILE_RETRY_BASE;
+        'converge: loop {
             if shutdown_requested(&shutdown) {
                 break;
             }
@@ -527,7 +581,7 @@ pub(super) fn spawn_runtime_network_reconcile(
             // caller cannot mistake an older pass for an answer about its own
             // change.
             let version = desired.version();
-            let (result, router_busy) = {
+            let (result, router_busy, router_retry_needed) = {
                 // Interface transactions are themselves driven by this
                 // converger, so both use a shared/read gate. Direct API and
                 // router mutations take the exclusive/write side. This keeps
@@ -542,7 +596,7 @@ pub(super) fn spawn_runtime_network_reconcile(
                     None => false,
                 };
                 if router_busy {
-                    (None, true)
+                    (None, true, false)
                 } else {
                     let result = reconcile_network_runtime_once(
                         &desired,
@@ -556,24 +610,43 @@ pub(super) fn spawn_runtime_network_reconcile(
                     .await;
                     // Tentative interface state is owned by its transaction.
                     // Router drift repair runs only against settled intent.
+                    let mut router_retry_needed = false;
                     if !desired.has_pending().await {
                         if let Some(router) = &router {
                             let repair = async {
                                 let effective = desired.effective().await?;
-                                router
-                                    .reconcile_dataplane(RouterDesired::from_effective_config(
-                                        &effective,
-                                    )?)
-                                    .await
+                                reconcile_router_dataplane(
+                                    router,
+                                    RouterDesired::from_effective_config(&effective)?,
+                                    network.as_ref(),
+                                )
+                                .await
                             }
                             .await;
                             if let Err(error) = repair {
+                                router_retry_needed = true;
                                 log_router_dataplane_convergence_error(&error);
                             }
                         }
                     }
-                    (Some(result), false)
+                    (Some(result), false, router_retry_needed)
                 }
+            };
+            // Journal retirement performed by this pass publishes recovery
+            // receipts too. Acknowledge those before waiting so a failed
+            // repair cannot use its own cleanup notification to bypass backoff.
+            recovery_events.borrow_and_update();
+            let retry_needed = router_retry_needed
+                || match &result {
+                    Some(Ok(failures)) => !failures.is_empty(),
+                    Some(Err(_)) => true,
+                    None => false,
+                };
+            let retry_at = time::Instant::now() + retry_delay;
+            retry_delay = if retry_needed {
+                (retry_delay * 2).min(NETWORK_RECONCILE_RETRY_MAX)
+            } else {
+                NETWORK_RECONCILE_RETRY_BASE
             };
             if let Some(result) = result {
                 if let Err(error) = &result {
@@ -584,7 +657,8 @@ pub(super) fn spawn_runtime_network_reconcile(
                 tracing::debug!("runtime reconcile suspended while a router transaction is pending recovery/confirmation");
             }
 
-            tokio::select! {
+            loop {
+                tokio::select! {
                 event = kernel_events.recv() => match event {
                     Some(_) => {
                         // A single `ip addr add` is several netlink messages, and
@@ -592,6 +666,10 @@ pub(super) fn spawn_runtime_network_reconcile(
                         // whatever queued up into the one pass that follows —
                         // convergence re-reads everything anyway.
                         while kernel_events.try_recv().is_ok() {}
+                        // Failed repairs can echo their own writes back to us.
+                        // Keep draining notifications, but respect the retry
+                        // deadline. New operator intent still wakes us below.
+                        if !retry_needed { break; }
                     }
                     None => {
                         let message =
@@ -601,21 +679,26 @@ pub(super) fn spawn_runtime_network_reconcile(
                         bail!(message);
                     }
                 },
-                () = desired.changed() => {}
-                _ = recovery_events.changed() => {}
+                () = desired.changed() => {
+                    retry_delay = NETWORK_RECONCILE_RETRY_BASE;
+                    break;
+                }
+                _ = recovery_events.changed() => { break; }
+                () = time::sleep_until(retry_at), if retry_needed => { break; }
                 // I/O failures may clear without a kernel notification. Retry
                 // unresolved startup snapshots even while the network is quiet.
                 () = time::sleep(Duration::from_secs(30)),
-                    if !router_busy && !crate::core::recovery::blocked_interfaces(desired.state_dir()).is_empty() => {}
+                    if !router_busy && !crate::core::recovery::blocked_interfaces(desired.state_dir()).is_empty() => { break; }
                 () = async {
                     if let Some(router) = &router {
                         router.wait_until_idle().await;
                     }
-                }, if router_busy => {}
+                }, if router_busy => { break; }
                 changed = shutdown.changed() => match changed {
-                    Ok(()) if shutdown_requested(&shutdown) => break,
-                    Ok(()) => {}
-                    Err(_) => break,
+                    Ok(()) if shutdown_requested(&shutdown) => break 'converge,
+                    Ok(()) => { break; }
+                    Err(_) => break 'converge,
+                }
                 }
             }
         }
@@ -769,6 +852,7 @@ pub(super) fn spawn_process_liveness_checks(
 pub(super) fn spawn_router_dataplane_integrity_checks(
     desired: DesiredNetworkState,
     overrides: RuntimeOverrideManager,
+    network_provider: Arc<dyn NetworkProvider>,
     network_mutations: Arc<NetworkMutationGate>,
     router: Option<RouterTransactionCoordinator>,
     vpn_policy: Option<Arc<ProductionVpnPolicyManager>>,
@@ -805,7 +889,9 @@ pub(super) fn spawn_router_dataplane_integrity_checks(
                         let effective = desired.effective().await?;
                         let router_desired = RouterDesired::from_effective_config(&effective)?;
                         if let Some(router) = &router {
-                            router.reconcile_dataplane(router_desired.clone()).await?;
+                            reconcile_router_dataplane(
+                                router, router_desired.clone(), network_provider.as_ref(),
+                            ).await?;
                         }
 
                         // The legacy single-hop VPN policy owns the same hop-0

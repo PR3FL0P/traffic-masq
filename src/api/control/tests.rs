@@ -4581,6 +4581,60 @@ async fn dhcp_client_control_list_get_and_typed_missing_states() {
 }
 
 #[tokio::test]
+async fn dhcp_client_control_rejects_interface_transitions_without_mutation() {
+    for (role, managed, ipv4) in [
+        (InterfaceRole::None, false, None),
+        (InterfaceRole::None, true, None),
+        (InterfaceRole::Output, true, Some("192.168.50.1/24")),
+        (InterfaceRole::Input, false, None),
+        (InterfaceRole::Input, true, Some("192.168.50.1/24")),
+    ] {
+        let fixture = dhcp_client_control_fixture(false).await;
+        let mut original = fixture
+            .overrides
+            .effective_interface("wan0")
+            .await
+            .unwrap()
+            .unwrap();
+        original.role = role;
+        original.managed = managed;
+        original.ipv4 = ipv4.map(|value| value.parse().unwrap());
+        original.wifi_client = None;
+        if role == InterfaceRole::Output {
+            original.dhcp = Some(dhcp_config());
+        }
+        fixture
+            .overrides
+            .set_interface("wan0".into(), original.clone(), false)
+            .await
+            .unwrap();
+        let before = fixture.overrides.snapshot().await;
+        let persisted_before = std::fs::read(fixture.overrides.path()).unwrap();
+
+        let response = fixture
+            .service
+            .dispatch(Request::ConfigureDhcpClient {
+                interface: "wan0".into(),
+                config: DhcpClientConfigRequest::default(),
+            })
+            .await;
+        assert!(
+            matches!(response, Response::DhcpClientError {
+                detail: DhcpClientErrorDetail::InvalidConfig { ref message }
+            } if message.contains("apply and commit")),
+            "{role:?}, managed={managed}, ipv4={ipv4:?}: {response:?}"
+        );
+        assert_eq!(fixture.overrides.snapshot().await, before);
+        assert_eq!(
+            std::fs::read(fixture.overrides.path()).unwrap(),
+            persisted_before
+        );
+        assert!(fixture.supervisor.spec("wan0").await.is_none());
+        assert!(fixture.service.transactions.pending().await.is_empty());
+    }
+}
+
+#[tokio::test]
 async fn dhcp_client_control_configure_preserves_wifi_client() {
     let fixture = dhcp_client_control_fixture(false).await;
     let response = fixture

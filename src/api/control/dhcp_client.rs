@@ -61,11 +61,18 @@ impl ControlService {
         else {
             return dhcp_client_error(DhcpClientErrorDetail::InterfaceNotFound);
         };
-        interface_config.role = InterfaceRole::Input;
-        interface_config.managed = true;
-        interface_config.ipv4 = None;
-        interface_config.dhcp = None;
-        interface_config.wifi = None;
+        // This immediate operation only edits DHCP policy. Role, ownership and
+        // static-address transitions belong to the confirmed interface path.
+        if interface_config.role != InterfaceRole::Input
+            || !interface_config.managed
+            || interface_config.ipv4.is_some()
+        {
+            return dhcp_client_error(DhcpClientErrorDetail::InvalidConfig {
+                message: format!(
+                    "DHCP client on {interface} requires a managed input interface without a static IPv4 address; apply and commit those changes through Interfaces first"
+                ),
+            });
+        }
         interface_config.dhcp_client = Some(dhcp_client_request_to_config(&request, true));
         let spec = match DhcpClientSpec::from_interface_config(&interface, &interface_config) {
             Ok(Some(spec)) => spec,

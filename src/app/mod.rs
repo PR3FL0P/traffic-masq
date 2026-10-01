@@ -763,6 +763,7 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     let integrity_task = spawn_router_dataplane_integrity_checks(
         desired_state.clone(),
         overrides.clone(),
+        network_provider.clone(),
         network_mutations.clone(),
         router_coordinator.clone(),
         vpn_policy_manager,

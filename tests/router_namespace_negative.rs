@@ -1,5 +1,6 @@
 use std::fs;
 use std::net::Ipv4Addr;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -43,6 +44,8 @@ struct FixtureOptions {
 
     bogus_uplink: bool,
 
+    fail_firewall_apply: bool,
+
     foreign_state: bool,
 
     management_interface: bool,
@@ -53,6 +56,7 @@ impl Default for FixtureOptions {
         Self {
             bring_uplink_up: true,
             bogus_uplink: false,
+            fail_firewall_apply: false,
             foreign_state: false,
             management_interface: false,
         }
@@ -176,45 +180,7 @@ impl RouterNamespaceFixture {
         run("ip", &["link", "set", &self.lan_if, "up"])?;
 
         if !self.options.bogus_uplink {
-            create_veth(&self.uplink_if, &self.upstream_if, &self.upstream_ns)?;
-            run(
-                "ip",
-                &[
-                    "addr",
-                    "add",
-                    &format!("{UPLINK_HOST_ADDR}/24"),
-                    "dev",
-                    &self.uplink_if,
-                ],
-            )?;
-            if self.options.bring_uplink_up {
-                run("ip", &["link", "set", &self.uplink_if, "up"])?;
-            }
-
-            run("ip", &["-n", &self.upstream_ns, "link", "set", "lo", "up"])?;
-            run(
-                "ip",
-                &[
-                    "-n",
-                    &self.upstream_ns,
-                    "addr",
-                    "add",
-                    &format!("{UPSTREAM_ADDR}/24"),
-                    "dev",
-                    &self.upstream_if,
-                ],
-            )?;
-            run(
-                "ip",
-                &[
-                    "-n",
-                    &self.upstream_ns,
-                    "link",
-                    "set",
-                    &self.upstream_if,
-                    "up",
-                ],
-            )?;
+            self.setup_uplink()?;
         }
 
         run("ip", &["-n", &self.client_ns, "link", "set", "lo", "up"])?;
@@ -245,21 +211,19 @@ impl RouterNamespaceFixture {
         }
 
         if self.options.management_interface {
-            create_veth(&self.management_if, &self.management_peer_if, "").or_else(|_| {
-                run(
-                    "ip",
-                    &[
-                        "link",
-                        "add",
-                        &self.management_if,
-                        "type",
-                        "veth",
-                        "peer",
-                        "name",
-                        &self.management_peer_if,
-                    ],
-                )
-            })?;
+            run(
+                "ip",
+                &[
+                    "link",
+                    "add",
+                    &self.management_if,
+                    "type",
+                    "veth",
+                    "peer",
+                    "name",
+                    &self.management_peer_if,
+                ],
+            )?;
             run(
                 "ip",
                 &["addr", "add", MANAGEMENT_ADDR, "dev", &self.management_if],
@@ -273,22 +237,100 @@ impl RouterNamespaceFixture {
         Ok(())
     }
 
-    async fn start_daemon(&mut self) -> Result<()> {
-        let binary = env!("CARGO_BIN_EXE_traffic-masqd");
-        let stdout_log = fs::File::create(self.temp.path().join("daemon-stdout.log"))
-            .context("failed to create daemon stdout log")?;
-        let stderr_log = fs::File::create(self.temp.path().join("daemon-stderr.log"))
-            .context("failed to create daemon stderr log")?;
-        let child = Command::new(binary)
+    fn setup_uplink(&self) -> Result<()> {
+        create_veth(&self.uplink_if, &self.upstream_if, &self.upstream_ns)?;
+        run(
+            "ip",
+            &[
+                "addr",
+                "add",
+                &format!("{UPLINK_HOST_ADDR}/24"),
+                "dev",
+                &self.uplink_if,
+            ],
+        )?;
+        if self.options.bring_uplink_up {
+            run("ip", &["link", "set", &self.uplink_if, "up"])?;
+        }
+
+        run("ip", &["-n", &self.upstream_ns, "link", "set", "lo", "up"])?;
+        run(
+            "ip",
+            &[
+                "-n",
+                &self.upstream_ns,
+                "addr",
+                "add",
+                &format!("{UPSTREAM_ADDR}/24"),
+                "dev",
+                &self.upstream_if,
+            ],
+        )?;
+        run(
+            "ip",
+            &[
+                "-n",
+                &self.upstream_ns,
+                "link",
+                "set",
+                &self.upstream_if,
+                "up",
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn spawn_daemon(&mut self) -> Result<()> {
+        let stdout_log = fs::File::create(self.temp.path().join("daemon-stdout.log"))?;
+        let stderr_log = fs::File::create(self.temp.path().join("daemon-stderr.log"))?;
+        let mut command = Command::new(env!("CARGO_BIN_EXE_traffic-masqd"));
+        command
             .arg("--config")
             .arg(&self.config_path)
             .arg("run")
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout_log))
-            .stderr(Stdio::from(stderr_log))
-            .spawn()
-            .context("failed to spawn traffic-masqd")?;
-        self.daemon = Some(child);
+            .stderr(Stdio::from(stderr_log));
+        if self.options.fail_firewall_apply {
+            let bin = self.temp.path().join("bin");
+            fs::create_dir_all(&bin)?;
+            let host_path = std::env::var_os("PATH").context("PATH is required")?;
+            let real_nft = std::env::split_paths(&host_path)
+                .map(|path| path.join("nft"))
+                .find(|path| path.is_file())
+                .context("nft is required")?
+                .canonicalize()?;
+            std::os::unix::fs::symlink(real_nft, bin.join("nft-real"))?;
+            let wrapper = bin.join("nft");
+            fs::write(
+                &wrapper,
+                r#"#!/bin/sh
+set -eu
+wrapper_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+if [ "${1:-}" = '-f' ] && [ ! -e "$wrapper_dir/failed" ]; then
+    touch "$wrapper_dir/failed"
+    cat >/dev/null
+    echo 'injected nft apply failure' >&2
+    exit 1
+fi
+exec "$wrapper_dir/nft-real" "$@"
+"#,
+            )?;
+            fs::set_permissions(wrapper, fs::Permissions::from_mode(0o755))?;
+            command.env(
+                "PATH",
+                std::env::join_paths(
+                    std::iter::once(bin).chain(std::env::split_paths(&host_path)),
+                )?,
+            );
+        }
+        // Keep ownership even when an expected startup failure times out.
+        self.daemon = Some(command.spawn().context("failed to spawn traffic-masqd")?);
+        Ok(())
+    }
+
+    async fn start_daemon(&mut self) -> Result<()> {
+        self.spawn_daemon()?;
 
         let client = ApiClient::new(self.config.runtime.socket_path.clone());
         let ready = timeout(WAIT_TIMEOUT, async {
@@ -313,20 +355,8 @@ impl RouterNamespaceFixture {
     }
 
     async fn start_daemon_expect_failure(&mut self) -> Result<()> {
-        let binary = env!("CARGO_BIN_EXE_traffic-masqd");
-        let stdout_log = fs::File::create(self.temp.path().join("daemon-stdout.log"))
-            .context("failed to create daemon stdout log")?;
-        let stderr_log = fs::File::create(self.temp.path().join("daemon-stderr.log"))
-            .context("failed to create daemon stderr log")?;
-        let mut child = Command::new(binary)
-            .arg("--config")
-            .arg(&self.config_path)
-            .arg("run")
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(stdout_log))
-            .stderr(Stdio::from(stderr_log))
-            .spawn()
-            .context("failed to spawn traffic-masqd")?;
+        self.spawn_daemon()?;
+        let child = self.daemon.as_mut().expect("spawned daemon");
 
         let status = timeout(WAIT_TIMEOUT, async {
             loop {
@@ -346,7 +376,7 @@ impl RouterNamespaceFixture {
     }
 
     async fn stop_daemon_gracefully(&mut self) -> Result<()> {
-        let Some(mut child) = self.daemon.take() else {
+        let Some(child) = self.daemon.as_mut() else {
             bail!("daemon was not running");
         };
         let pid = i32::try_from(child.id()).context("daemon PID exceeds pid_t range")?;
@@ -366,6 +396,7 @@ impl RouterNamespaceFixture {
         if !exited.success() {
             bail!("traffic-masqd exited with non-zero status on graceful shutdown: {exited}");
         }
+        self.daemon.take();
         Ok(())
     }
 
@@ -422,9 +453,9 @@ impl RouterNamespaceFixture {
 
     fn cleanup(&mut self) {
         if let Some(mut child) = self.daemon.take() {
-            if let Ok(pid) = i32::try_from(child.id()) {
-                let _ = kill(Pid::from_raw(pid), Signal::SIGTERM);
-            }
+            // Normal scenarios stop gracefully explicitly. Failure cleanup
+            // must not block forever waiting for an unhealthy test daemon.
+            let _ = child.kill();
             let _ = child.wait();
         }
         let _ = Command::new("nft")
@@ -871,12 +902,97 @@ async fn invalid_overlapping_output_subnet_is_rejected_before_any_mutation() -> 
 }
 
 #[tokio::test]
+#[ignore = "requires isolated Linux namespaces, iproute2, nftables, udhcpc and python3"]
+async fn absent_uplink_waits_without_reconfiguring_lan_and_recovers_when_added() -> Result<()> {
+    let _test_guard = NAMESPACE_TEST_LOCK.lock().await;
+    let mut fixture = RouterNamespaceFixture::new(FixtureOptions {
+        bogus_uplink: true,
+        ..FixtureOptions::default()
+    })
+    .await?;
+
+    let result: Result<()> = async {
+        fixture.start_daemon().await?;
+        acquire_lease(&fixture).await?;
+        let lan_before = host_ipv4_addresses(&fixture.lan_if)?;
+        assert_no_owned_nft_table()?;
+        tokio::time::sleep(Duration::from_millis(3200)).await;
+        assert!(fixture.daemon_is_alive());
+        assert_eq!(lan_before, host_ipv4_addresses(&fixture.lan_if)?);
+        assert_eq!(
+            fs::read_to_string("/proc/sys/net/ipv4/ip_forward")?.trim(),
+            fixture.forwarding_baseline,
+            "missing uplink must not enable forwarding without a firewall"
+        );
+        let log = fs::read_to_string(fixture.temp.path().join("daemon-stderr.log"))?;
+        assert!(
+            !log.contains("rolling back interface to its snapshot"),
+            "missing uplink must not compensate healthy LAN state: {log}"
+        );
+        assert!(
+            log.matches("router dataplane convergence is deferred")
+                .count()
+                <= 4,
+            "missing-uplink repair must respect retry backoff: {log}"
+        );
+        assert!(
+            !fixture
+                .config
+                .runtime
+                .state_dir
+                .join("router-transaction.json")
+                .exists(),
+            "an absent device must not create a router repair journal"
+        );
+
+        // The configured adapter now appears, without restarting the daemon.
+        fixture.uplink_if = fixture
+            .config
+            .router
+            .uplink
+            .as_ref()
+            .unwrap()
+            .interface
+            .clone();
+        fixture.options.bogus_uplink = false;
+        fixture.setup_uplink()?;
+        timeout(Duration::from_secs(35), async {
+            loop {
+                if Command::new("nft")
+                    .args(["list", "table", "inet", "traffic_masq"])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()?
+                    .success()
+                {
+                    break Ok::<_, anyhow::Error>(());
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .context("router did not recover after uplink appeared")??;
+        let server = spawn_echo_server(&fixture)?;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(connect_and_echo(&fixture, 20).await?, "traffic-masq-e2e");
+        assert!(server.wait_with_output()?.status.success());
+        fixture.stop_daemon_gracefully().await?;
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        fixture.dump_state_on_failure("missing uplink recovery");
+    }
+    result
+}
+
+#[tokio::test]
 #[ignore = "requires root, Linux, iproute2 and nftables; spawns a real traffic-masqd process; run only on a disposable test host"]
 async fn firewall_apply_failure_rolls_back_interfaces_routes_and_forwarding() -> Result<()> {
     let _test_guard = NAMESPACE_TEST_LOCK.lock().await;
 
     let mut fixture = RouterNamespaceFixture::new(FixtureOptions {
-        bogus_uplink: true,
+        fail_firewall_apply: true,
         ..FixtureOptions::default()
     })
     .await?;
@@ -892,6 +1008,8 @@ async fn firewall_apply_failure_rolls_back_interfaces_routes_and_forwarding() ->
             .await
             .context("timed out waiting for traffic-masqd to fail at startup")??;
 
+        let stderr = fs::read_to_string(fixture.temp.path().join("daemon-stderr.log"))?;
+        assert!(stderr.contains("injected nft apply failure"), "wrong startup failure: {stderr}");
         assert_no_owned_nft_table()?;
         let forwarding = fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
             .context("failed to read IPv4 forwarding sysctl")?;
@@ -1222,14 +1340,17 @@ async fn management_interface_is_never_touched_without_explicit_allow() -> Resul
     );
 
     let result: Result<()> = async {
-        timeout(WAIT_TIMEOUT, fixture.start_daemon_expect_failure())
+        timeout(WAIT_TIMEOUT, fixture.start_daemon())
             .await
-            .context("timed out waiting for traffic-masqd to refuse the management interface change")??;
+            .context("timed out starting with a protected management interface")??;
+        timeout(WAIT_TIMEOUT, acquire_lease(&fixture))
+            .await
+            .context("unaffected router LAN must remain operational")??;
 
         let management_after = host_ipv4_addresses(&fixture.management_if)?;
         assert_eq!(
             management_before, management_after,
-            "management interface must be completely untouched by a daemon that refused to start"
+            "degraded startup must leave the management interface untouched"
         );
 
         let stderr_log = fixture.temp.path().join("daemon-stderr.log");
@@ -1242,6 +1363,12 @@ async fn management_interface_is_never_touched_without_explicit_allow() -> Resul
                 || log_contents.contains("refusing")
                 || stdout_contents.contains("refusing"),
             "daemon output should explain the refusal; stdout={stdout_contents:?} stderr={log_contents:?}"
+        );
+        fixture.stop_daemon_gracefully().await?;
+        assert_eq!(
+            management_before,
+            host_ipv4_addresses(&fixture.management_if)?,
+            "shutdown must preserve the protected management interface"
         );
         Ok(())
     }

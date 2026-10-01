@@ -26,6 +26,233 @@ use crate::vpn::{VpnManager, VpnProvider};
 use super::*;
 use crate::test_support::{FakeNetworkProvider, StaticKeyVpnProvider};
 
+struct ReconcileReadNetwork {
+    failures_remaining: std::sync::atomic::AtomicUsize,
+    reads: mpsc::UnboundedSender<()>,
+}
+
+#[async_trait]
+impl NetworkProvider for ReconcileReadNetwork {
+    async fn list_interfaces(&self) -> Result<Vec<crate::netlink::NetworkInterface>> {
+        self.reads.send(()).unwrap();
+        if self
+            .failures_remaining
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            anyhow::bail!("injected transient network read failure");
+        }
+        Ok(Vec::new())
+    }
+
+    async fn list_ipv4_addresses(&self, _: &str) -> Result<Vec<Ipv4AddressInfo>> {
+        Ok(Vec::new())
+    }
+
+    async fn set_link_up(&self, _: &str) -> Result<()> {
+        unreachable!("test has no observed interfaces")
+    }
+
+    async fn set_link_down(&self, _: &str) -> Result<()> {
+        unreachable!("test has no observed interfaces")
+    }
+
+    async fn add_ipv4_address(
+        &self,
+        _: &str,
+        _: Ipv4Addr,
+        _: u8,
+        _: AddressOwnership,
+    ) -> Result<()> {
+        unreachable!("test has no observed interfaces")
+    }
+
+    async fn delete_ipv4_address(&self, _: &str, _: Ipv4Addr, _: u8) -> Result<()> {
+        unreachable!("test has no observed interfaces")
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct ReconcileRetryFixture {
+    // Isolate recovery notifications from other tests in the same process.
+    _kernel_events: mpsc::UnboundedSender<crate::netlink::events::KernelEvent>,
+    _recovery_events: watch::Sender<u64>,
+    desired: DesiredNetworkState,
+    shutdown: watch::Sender<bool>,
+    task: tokio::task::JoinHandle<Result<()>>,
+    network: Arc<ReconcileReadNetwork>,
+    reads: mpsc::UnboundedReceiver<()>,
+    _directory: tempfile::TempDir,
+}
+
+#[cfg(target_os = "linux")]
+impl ReconcileRetryFixture {
+    async fn start(failures: usize, missing_interface: bool) -> Self {
+        let directory = tempdir().unwrap();
+        let mut config = AppConfig::default();
+        config.runtime.state_dir = directory.path().to_path_buf();
+        config.dhcp.leases_dir = directory.path().join("leases");
+        if missing_interface {
+            config.network.interfaces.insert(
+                "wan0".into(),
+                InterfaceConfig {
+                    role: InterfaceRole::Input,
+                    managed: true,
+                    ipv4: None,
+                    dhcp: None,
+                    dhcp_client: None,
+                    wifi: None,
+                    wifi_client: None,
+                    nat: false,
+                },
+            );
+        }
+        let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+            .await
+            .unwrap();
+        let desired = DesiredNetworkState::new(config.clone(), overrides);
+        let (reads_tx, reads) = mpsc::unbounded_channel();
+        let network = Arc::new(ReconcileReadNetwork {
+            failures_remaining: std::sync::atomic::AtomicUsize::new(failures),
+            reads: reads_tx,
+        });
+        let dhcp = DhcpSupervisor::start(&config).await.unwrap();
+        let dhcp_client = DhcpClientSupervisor::start_with_launcher(
+            &config,
+            network.clone(),
+            Arc::new(LinuxDhcpClientLauncher),
+        )
+        .await
+        .unwrap();
+        let (kernel_events_tx, kernel_events) = mpsc::unbounded_channel();
+        let (recovery_events_tx, recovery_events) = watch::channel(0);
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let task = super::reconcile::spawn_runtime_network_reconcile_with_recovery_events(
+            desired.clone(),
+            AddressOwnershipJournal::in_memory(),
+            network.clone(),
+            dhcp,
+            None,
+            None,
+            dhcp_client,
+            Arc::new(NetworkMutationGate::default()),
+            None,
+            kernel_events,
+            recovery_events,
+            shutdown,
+        );
+        Self {
+            _kernel_events: kernel_events_tx,
+            _recovery_events: recovery_events_tx,
+            desired,
+            shutdown: shutdown_tx,
+            task,
+            network,
+            reads,
+            _directory: directory,
+        }
+    }
+
+    async fn wait_for_pass(&mut self) {
+        tokio::time::timeout(Duration::from_secs(5), self.reads.recv())
+            .await
+            .expect("convergence pass should run")
+            .expect("network observer stays open");
+    }
+
+    async fn advance_to_retry(&mut self, delay: Duration) {
+        tokio::time::pause();
+        tokio::time::advance(delay / 2).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(matches!(
+            self.reads.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        tokio::time::advance(delay / 2 + Duration::from_millis(2)).await;
+        // Filesystem work uses the blocking pool; let it finish without the
+        // paused clock automatically skipping ahead to the next retry.
+        tokio::time::resume();
+        self.wait_for_pass().await;
+    }
+
+    async fn stop(self) {
+        self.shutdown.send(true).unwrap();
+        self.task.await.unwrap().unwrap();
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn runtime_reconcile_retries_transient_errors_then_waits_for_events() {
+    let mut fixture = ReconcileRetryFixture::start(1, false).await;
+    fixture.wait_for_pass().await;
+    fixture.advance_to_retry(Duration::from_secs(1)).await;
+
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(120)).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert!(matches!(
+        fixture.reads.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    tokio::time::resume();
+
+    // Success resets backoff, and new events still trigger immediate passes.
+    fixture
+        .network
+        .failures_remaining
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    fixture
+        ._kernel_events
+        .send(crate::netlink::events::KernelEvent::Changed)
+        .unwrap();
+    fixture.wait_for_pass().await;
+    fixture.advance_to_retry(Duration::from_secs(1)).await;
+    fixture.stop().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn runtime_reconcile_retries_interface_failures_with_capped_backoff() {
+    let mut fixture = ReconcileRetryFixture::start(0, true).await;
+    fixture.wait_for_pass().await;
+    for seconds in [1, 2, 4, 8, 16, 30, 30] {
+        fixture.advance_to_retry(Duration::from_secs(seconds)).await;
+    }
+    fixture.stop().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn kernel_notifications_do_not_bypass_failed_reconcile_backoff() {
+    let mut fixture = ReconcileRetryFixture::start(0, true).await;
+    fixture.wait_for_pass().await;
+    for seconds in [1, 2, 4] {
+        for _ in 0..100 {
+            fixture
+                ._kernel_events
+                .send(crate::netlink::events::KernelEvent::Changed)
+                .unwrap();
+        }
+        fixture.advance_to_retry(Duration::from_secs(seconds)).await;
+    }
+    // Operator recovery remains responsive even during a failed-pass backoff.
+    fixture._recovery_events.send(1).unwrap();
+    fixture.wait_for_pass().await;
+    fixture.desired.request_convergence();
+    fixture.wait_for_pass().await;
+    fixture.advance_to_retry(Duration::from_secs(1)).await;
+    fixture.stop().await;
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn closed_kernel_event_stream_fails_the_runtime_converger() {
