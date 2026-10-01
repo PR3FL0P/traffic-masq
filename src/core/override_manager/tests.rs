@@ -717,3 +717,48 @@ async fn router_recovery_manager_ignores_unrelated_invalid_override_fields_until
     assert!(snapshot.api.is_none());
     assert!(manager.hydrate_strict().await.is_err());
 }
+
+#[test]
+fn cancelled_persistence_fences_mutations_until_commit_proof_is_reloaded() {
+    use std::future::Future;
+    use std::task::Poll;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let directory = tempdir().unwrap();
+    runtime.block_on(async {
+        let manager = RuntimeOverrideManager::load(directory.path(), &base_config())
+            .await
+            .unwrap();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (entered, ready) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            entered.send(()).unwrap();
+            let _ = blocked.recv();
+        });
+        ready.recv().unwrap();
+        {
+            let mut saving = std::pin::pin!(manager.save_committed(RuntimeOverrides::default()));
+            std::future::poll_fn(|cx| {
+                assert!(
+                    saving.as_mut().poll(cx).is_pending(),
+                    "storage must be waiting for the blocking worker"
+                );
+                Poll::Ready(())
+            })
+            .await;
+            // Drop the save future while its storage operation is outstanding.
+        }
+        assert!(crate::core::recovery::check_commit(directory.path()).is_err());
+        assert!(manager
+            .save_committed(RuntimeOverrides::default())
+            .await
+            .is_err());
+        assert_eq!(manager.committed_revision().await, 0);
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+    });
+}

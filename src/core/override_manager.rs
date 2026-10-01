@@ -21,6 +21,24 @@ use crate::core::router::RouterDesired;
 use crate::core::router_candidate::{RouterCandidate, RouterIntentProposal};
 use crate::state::overrides::{InterfaceOverride, RuntimeOverrideStore, RuntimeOverrides};
 
+/// Cancellation while storage is writing has the same uncertain outcome as a
+/// failed write with failed compensation. Never let a timer guess it aborted.
+struct CommitPersistenceGuard<'a> {
+    root: &'a std::path::Path,
+    armed: bool,
+}
+
+impl Drop for CommitPersistenceGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            crate::core::recovery::fence_commit(
+                self.root,
+                "commit persistence was interrupted; durable outcome is unknown".into(),
+            );
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeOverrideManager {
     store: RuntimeOverrideStore,
@@ -216,7 +234,10 @@ impl RuntimeOverrideManager {
             .revision
             .checked_add(1)
             .context("runtime override revision overflow")?;
-        if let Err(error) = self.store.save(&candidate).await {
+        let mut guard = CommitPersistenceGuard { root, armed: true };
+        let persisted = self.store.save(&candidate).await;
+        guard.armed = false; // A returned result is known; errors below carry their own proof.
+        if let Err(error) = persisted {
             if crate::atomic_file::is_indeterminate_write(&error) {
                 crate::core::recovery::fence_commit(root, format!("{error:#}"));
                 return Err(error.context("commit_indeterminate: repair storage access and restart the daemon; confirmation and rollback are blocked"));
