@@ -1994,7 +1994,7 @@ async fn sharing_repair_defers_before_mutations_and_resumes_after_replug() {
     );
     let router = RouterTransactionCoordinator::new(
         RouterManager::new(Arc::new(subsystems)),
-        overrides,
+        overrides.clone(),
         Duration::from_secs(30),
     );
     for _ in 0..3 {
@@ -2018,6 +2018,27 @@ async fn sharing_repair_defers_before_mutations_and_resumes_after_replug() {
     assert_eq!(provider.restore_calls.load(Ordering::SeqCst), 0);
     assert!(network.routes.lock().await.is_empty());
 
+    // API-driven full repair and narrow repair must reject the missing
+    // dependency too, before a journal makes compensation necessary.
+    for error in [
+        router.repair(desired.clone()).await.unwrap_err(),
+        router
+            .reconcile_dataplane(desired.clone())
+            .await
+            .unwrap_err(),
+        router.manager().plan(desired.clone()).await.unwrap_err(),
+    ] {
+        assert_eq!(
+            crate::firewall::missing_router_dataplane_interface(&error)
+                .unwrap()
+                .interface,
+            "wan0"
+        );
+    }
+    assert_eq!(provider.apply_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.restore_calls.load(Ordering::SeqCst), 0);
+    assert!(!directory.path().join("router-transaction.json").exists());
+
     network.add_interface("wan0", 3).await;
     provider.missing_next_apply.lock().await.take();
     for _ in 0..2 {
@@ -2027,6 +2048,43 @@ async fn sharing_repair_defers_before_mutations_and_resumes_after_replug() {
     }
     assert_eq!(provider.apply_calls.load(Ordering::SeqCst), 1);
     assert_eq!(provider.restore_calls.load(Ordering::SeqCst), 0);
+
+    // The adapter can disappear between a plan preview and execution. The
+    // executor must check again before journaling or touching healthy LANs.
+    let candidate = overrides
+        .build_candidate(&crate::core::router_candidate::RouterIntentProposal::new())
+        .await
+        .unwrap();
+    let plan = router.plan(candidate).await.unwrap();
+    network.interfaces.lock().await.remove("wan0");
+    let addresses_before = network.addresses.lock().await.clone();
+    let error = router.apply(plan).await.unwrap_err();
+    assert_eq!(
+        crate::firewall::missing_router_dataplane_interface(&error)
+            .unwrap()
+            .interface,
+        "wan0"
+    );
+    assert_eq!(*network.addresses.lock().await, addresses_before);
+    assert_eq!(provider.apply_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.restore_calls.load(Ordering::SeqCst), 0);
+    assert!(!directory.path().join("router-transaction.json").exists());
+
+    // Removing the rules remains possible with the old egress unplugged.
+    // Its snapshot can still be restored on rollback: recovery is independent
+    // of whether the committed forwarding endpoints are currently present.
+    let mut disabled = config.router.clone();
+    disabled.forwarding = Some(Vec::new());
+    let candidate = overrides
+        .build_candidate(
+            &crate::core::router_candidate::RouterIntentProposal::new().set_router(disabled),
+        )
+        .await
+        .unwrap();
+    let plan = router.plan(candidate).await.unwrap();
+    let token = router.apply(plan).await.unwrap();
+    assert!(provider.state.lock().await.owned.is_none());
+    router.rollback_with_token(&token).await.unwrap();
     assert_eq!(
         provider.state.lock().await.owned,
         match desired.dataplane {

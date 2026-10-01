@@ -243,6 +243,10 @@ impl RouterTransactionCoordinator {
 
         let committed_revision = self.inner.overrides.committed_revision().await;
         plan.candidate.ensure_base_revision(committed_revision)?;
+        self.inner
+            .manager
+            .preflight(plan.candidate.desired())
+            .await?;
 
         let current_snapshot = self
             .inner
@@ -367,6 +371,7 @@ impl RouterTransactionCoordinator {
         if dataplane_only && !self.inner.manager.dataplane_needs_reconcile(&desired).await {
             return Ok(());
         }
+        self.inner.manager.preflight(&desired).await?;
         self.inner.manager.prepare_recovery(&desired).await?;
         let candidate = self
             .inner

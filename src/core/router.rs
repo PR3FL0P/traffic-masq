@@ -48,6 +48,40 @@ pub struct RouterDesired {
 }
 
 impl RouterDesired {
+    /// Interfaces that must already exist before applying intent. Router-owned
+    /// VPN hops are created during apply; externally managed tunnels are not.
+    pub(crate) fn required_existing_interfaces(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self
+            .interfaces
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        if let RouterDataplaneTarget::Enabled(dataplane) = &self.dataplane {
+            if let Some(rules) = &dataplane.forwarding {
+                for rule in rules {
+                    names.extend([rule.from.as_str(), rule.to.as_str()]);
+                }
+            } else {
+                names.push(&dataplane.uplink);
+                names.extend(
+                    dataplane
+                        .outputs
+                        .iter()
+                        .map(|output| output.interface.as_str()),
+                );
+            }
+        }
+        names.extend(
+            self.routes
+                .iter()
+                .filter_map(|route| route.output_interface.as_deref()),
+        );
+        names.retain(|name| !self.vpn_chain.iter().any(|hop| hop.interface == *name));
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
     /// Derive and validate router intent, including interfaces, VPN chain, routes, and forwarding.
     pub fn from_effective_config(config: &AppConfig) -> Result<Self> {
         config.validate()?;
@@ -418,6 +452,12 @@ pub struct RouterSnapshot {
 
 #[async_trait]
 pub trait RouterSubsystems: Send + Sync {
+    /// Reject unavailable dependencies before opening a journal or mutating
+    /// any subsystem. Recovery of an existing snapshot must bypass this check.
+    async fn preflight(&self, _desired: &RouterDesired) -> Result<()> {
+        Ok(())
+    }
+
     /// Rebuild volatile ownership/runtime bookkeeping from durable proofs
     /// before crash recovery or startup repair touches the data plane.
     /// Implementations must not adopt resources without an ownership proof.
@@ -616,6 +656,7 @@ impl RouterManager {
 
     /// Inspect router subsystems and prepare the ordered operations required by desired intent.
     pub async fn plan(&self, desired: RouterDesired) -> Result<RouterPlan> {
+        self.preflight(&desired).await?;
         let RouterSubsystemPlan {
             interfaces,
             uplink_wifi,
@@ -690,6 +731,7 @@ impl RouterManager {
 
     /// Repair route and firewall drift for the supplied committed router intent.
     pub async fn reconcile_dataplane(&self, desired: &RouterDesired) -> Result<()> {
+        self.preflight(desired).await?;
         if self.subsystems.health_vpn_chain(desired).await.is_err() {
             let plan = self.subsystems.plan_vpn_chain(desired).await?;
             self.subsystems.apply_vpn_chain(&plan).await?;
@@ -717,12 +759,17 @@ impl RouterManager {
         self.subsystems.prepare_recovery(current).await
     }
 
+    pub async fn preflight(&self, desired: &RouterDesired) -> Result<()> {
+        self.subsystems.preflight(desired).await
+    }
+
     pub async fn retain_router_interfaces(&self, interfaces: &[String]) {
         self.subsystems.retain_router_interfaces(interfaces).await;
     }
 
     /// Apply router operations in dependency order and verify DHCP readiness before dependent work.
     pub async fn apply(&self, plan: &RouterPlan) -> Result<()> {
+        self.preflight(&plan.desired).await?;
         // Ownership changes only when execution begins. A dry-run plan calls
         // snapshot_for too, and must not acquire resources merely by observing
         // them. Adopt before the apply snapshot so DHCP/Wi-Fi teardown covers

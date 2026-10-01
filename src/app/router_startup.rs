@@ -115,45 +115,12 @@ pub(super) async fn missing_router_repair_interfaces(
         .list_interfaces()
         .await
         .context("failed to observe interfaces before router startup repair")?;
-    let mut required: Vec<&str> = desired
-        .interfaces
-        .iter()
-        .map(|entry| entry.name.as_str())
-        .collect();
-    if let crate::firewall::RouterDataplaneTarget::Enabled(dataplane) = &desired.dataplane {
-        if let Some(rules) = &dataplane.forwarding {
-            for rule in rules {
-                required.extend([rule.from.as_str(), rule.to.as_str()]);
-            }
-        } else {
-            required.push(&dataplane.uplink);
-            required.extend(
-                dataplane
-                    .outputs
-                    .iter()
-                    .map(|output| output.interface.as_str()),
-            );
-        }
-    }
-    required.extend(
-        desired
-            .routes
-            .iter()
-            .filter_map(|route| route.output_interface.as_deref()),
-    );
-    let mut missing: Vec<String> = required
+    Ok(desired
+        .required_existing_interfaces()
         .into_iter()
-        .filter(|name| {
-            // Router-owned VPN hops are created by repair itself. External
-            // tunnels referenced in explicit forwarding must already exist.
-            !desired.vpn_chain.iter().any(|hop| hop.interface == *name)
-        })
         .filter(|name| !observed.iter().any(|interface| interface.name == *name))
         .map(str::to_owned)
-        .collect();
-    missing.sort();
-    missing.dedup();
-    Ok(missing)
+        .collect())
 }
 
 pub(super) async fn restore_router_dataplane<P>(state: &RouterRuntimeState<P>) -> Result<()>

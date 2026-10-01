@@ -92,6 +92,15 @@ pub struct InterfaceManager {
 }
 
 impl InterfaceManager {
+    pub(crate) async fn missing_interfaces(&self, names: &[&str]) -> Result<Vec<String>> {
+        let observed = self.provider.list_interfaces().await?;
+        Ok(names
+            .iter()
+            .filter(|name| !observed.iter().any(|interface| interface.name == **name))
+            .map(|name| (*name).to_owned())
+            .collect())
+    }
+
     pub(crate) fn validate_wifi_radio_policy(
         &self,
         network: &crate::config::NetworkConfig,

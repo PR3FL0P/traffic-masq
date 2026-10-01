@@ -438,6 +438,21 @@ where
     P: RouterDataplaneProvider + Send + Sync,
     E: RouterDataplaneEventSink + Send + Sync,
 {
+    async fn preflight(&self, desired: &RouterDesired) -> Result<()> {
+        let missing = self
+            .interfaces
+            .missing_interfaces(&desired.required_existing_interfaces())
+            .await?;
+        if let Some(interface) = missing.first() {
+            return Err(crate::firewall::RouterDataplaneInterfaceMissing {
+                role: "router".into(),
+                interface: interface.clone(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     async fn prepare_recovery(&self, current: &RouterDesired) -> Result<()> {
         self.vpn_chain.prepare_recovery(current).await
     }
