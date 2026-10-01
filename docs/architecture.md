@@ -43,7 +43,10 @@ hostapd, iw, and wpa_supplicant live with the Wi-Fi supervisors. The app's
 API binding; `router_startup` wires the production coordinator and restores
 temporary route/dataplane baselines; `vpn_startup` prepares VPN control and
 legacy policy migration; `reconcile` owns runtime network convergence and
-integrity workers.
+integrity workers. After those workers stop and pending rollback is attempted,
+`daemon_shutdown` chooses the final restore policy and cleans up runtime
+resources. An uncertain commit keeps recovery evidence and prevents baseline
+restoration.
 
 `api::model` re-exports the protocol DTOs for current callers. The request
 envelope now lives in protocol. Interface changes and router proposals use

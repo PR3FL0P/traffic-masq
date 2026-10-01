@@ -2,6 +2,7 @@
 
 use crate::core::mutation::NetworkMutationGate;
 
+mod daemon_shutdown;
 pub mod init;
 pub mod installer;
 mod process;
@@ -19,7 +20,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use tokio::signal;
 #[cfg(test)]
 use tokio::sync::mpsc;
@@ -53,6 +54,7 @@ use crate::netlink::{NetworkProvider, RtnetlinkNetworkProvider};
 use crate::vpn::ProductionVpnManager;
 use crate::wifi::{HostapdSupervisor, WifiClientSupervisor};
 
+use daemon_shutdown::ShutdownResources;
 use process::ProcessGuard;
 #[cfg(test)]
 use reconcile::{
@@ -64,9 +66,11 @@ use reconcile::{
     spawn_process_liveness_checks, spawn_router_dataplane_integrity_checks,
     spawn_runtime_network_reconcile,
 };
+#[cfg(test)]
+use router_startup::restore_router_dataplane;
 use router_startup::{
     apply_router_dataplane, missing_router_repair_interfaces, production_dataplane_provider,
-    production_router_coordinator, restore_router_dataplane, rollback_router_dataplane,
+    production_router_coordinator, rollback_router_dataplane,
 };
 use startup_recovery::StartupRecovery;
 use vpn_startup::{
@@ -659,7 +663,7 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
 
     let transactions = control.transactions();
     let socket_path = bindings.socket_path().to_path_buf();
-    let session_reaper = spawn_session_reaper(auth.clone(), shutdown.clone());
+    let reaper_auth = auth.clone();
     let autoconnect_control = control.clone();
     let server = bindings.into_server(control, auth);
 
@@ -717,6 +721,7 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     // rather than left to fall out of scope at the end of the function, to
     // mark the handoff at the point it actually happens.
     drop(stack);
+    let session_reaper = spawn_session_reaper(reaper_auth, shutdown.clone());
 
     let (liveness_stop, liveness_shutdown) = watch::channel(false);
     let liveness_task = spawn_process_liveness_checks(
@@ -839,100 +844,18 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     let graceful_signal = shutdown_requested(&shutdown);
     tracing::info!(graceful_signal, "traffic-masqd stopping");
 
-    let mut cleanup_errors = Vec::new();
-    let shutdown_request =
-        match shutdown_control::request_for_current_process(&effective_config.runtime.pid_path) {
-            Ok(request) => request,
-            Err(error) => {
-                tracing::warn!(%error, "ignoring invalid transient shutdown request");
-                None
-            }
-        };
-    let restore_requested = shutdown_request
-        .as_ref()
-        .is_some_and(|request| request.restores_interfaces());
-    let commit_uncertain =
-        crate::core::recovery::check_commit(&effective_config.runtime.state_dir).err();
-    if let Some(error) = &commit_uncertain {
-        cleanup_errors.push(error.to_string());
+    ShutdownResources {
+        config: &effective_config,
+        transactions: &transactions,
+        router_state: router_state.as_deref(),
+        vpn: vpn_manager.as_deref(),
+        dhcp_client: &dhcp_client,
+        dhcp: &dhcp,
+        wifi: wifi_supervisor.as_ref(),
+        wifi_client: wifi_client_supervisor.as_ref(),
     }
-    // Preserve runtime ownership and all recovery evidence until startup can
-    // resolve the persisted commit token. Baseline cleanup would be an unsafe rollback.
-    let restore_interfaces = commit_uncertain.is_none()
-        && (restore_requested
-            || !graceful_signal
-            || effective_config.runtime.shutdown_policy == ShutdownPolicy::RestoreInterfaces);
-    let shutdown_policy = if restore_interfaces {
-        ShutdownPolicy::RestoreInterfaces
-    } else {
-        ShutdownPolicy::PreserveInterfaces
-    };
-    if restore_requested {
-        tracing::info!(
-            "administrative shutdown requested restoration of traffic-masq-owned network state"
-        );
-    }
-
-    dhcp_client.shutdown(shutdown_policy).await;
-
-    let network_cleanup = if restore_interfaces {
-        transactions.restore_baselines().await
-    } else {
-        transactions.rollback_all_pending().await
-    };
-    if let Err(error) = network_cleanup {
-        tracing::error!(%error, "network cleanup failed during daemon shutdown");
-        cleanup_errors.push(error.to_string());
-    }
-
-    if restore_interfaces {
-        if let Some(state) = &router_state {
-            if let Err(error) = restore_router_dataplane(state).await {
-                tracing::error!(%error, "router cleanup failed during daemon shutdown");
-                cleanup_errors.push(error.to_string());
-            }
-        }
-    }
-
-    if let Some(vpn) = &vpn_manager {
-        if let Err(error) = vpn.shutdown(shutdown_policy).await {
-            tracing::error!(%error, "VPN shutdown cleanup failed");
-            cleanup_errors.push(error.to_string());
-        }
-    }
-
-    dhcp.shutdown().await;
-
-    if let Some(wifi) = &wifi_supervisor {
-        wifi.shutdown(shutdown_policy).await;
-    }
-
-    if let Some(wifi_client) = &wifi_client_supervisor {
-        wifi_client.shutdown(shutdown_policy).await;
-    }
-
-    if let Err(error) = api_result {
-        cleanup_errors.push(format!("HTTP API failed: {error:#}"));
-    }
-    if let Some(error) = reconcile_error {
-        cleanup_errors.push(error);
-    }
-    if cleanup_errors.is_empty() {
-        if let Some(request) = &shutdown_request {
-            if let Err(error) =
-                shutdown_control::acknowledge(&effective_config.runtime.pid_path, request)
-            {
-                cleanup_errors.push(format!(
-                    "failed to acknowledge requested shutdown cleanup: {error:#}"
-                ));
-            }
-        }
-    }
-    if cleanup_errors.is_empty() {
-        Ok(())
-    } else {
-        bail!(cleanup_errors.join("; "))
-    }
+    .finish(graceful_signal, api_result, reconcile_error)
+    .await
 }
 
 fn shutdown_requested(shutdown: &watch::Receiver<bool>) -> bool {

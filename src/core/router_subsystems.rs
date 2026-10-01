@@ -200,17 +200,7 @@ where
         dataplane: RouterDataplaneManager<P, NoopRouterDataplaneEventSink>,
         router_interfaces: Vec<String>,
     ) -> Self {
-        Self {
-            interfaces,
-            routes,
-            dhcp,
-            dataplane,
-            router_interfaces: RwLock::new(router_interfaces),
-            dhcp_client: None,
-            access_points: None,
-            stations: None,
-            vpn_chain: VpnChainRuntime::new(),
-        }
+        Self::with_event_sink(interfaces, routes, dhcp, dataplane, router_interfaces)
     }
 
     pub fn new_with_dhcp_client(
@@ -221,17 +211,9 @@ where
         router_interfaces: Vec<String>,
         dhcp_client: Arc<dyn RouterDhcpClientRuntime>,
     ) -> Self {
-        Self {
-            interfaces,
-            routes,
-            dhcp,
-            dataplane,
-            router_interfaces: RwLock::new(router_interfaces),
-            dhcp_client: Some(dhcp_client),
-            access_points: None,
-            stations: None,
-            vpn_chain: VpnChainRuntime::new(),
-        }
+        let mut subsystems = Self::new(interfaces, routes, dhcp, dataplane, router_interfaces);
+        subsystems.dhcp_client = Some(dhcp_client);
+        subsystems
     }
 }
 
