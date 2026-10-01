@@ -53,6 +53,9 @@ async fn mock_api(
 
 fn radio(name: &str) -> WifiRow {
     WifiRow {
+        presence: traffic_masq_protocol::InterfacePresence::Present,
+        configured: None,
+        revision: None,
         interface: name.into(),
         role: WifiRole::Client,
         ap: None,
@@ -248,6 +251,9 @@ fn scan(
 async fn ap_options_open_only_on_activation_and_radio_edits_reach_request() {
     let mut app = TuiApp::default();
     app.wifi.rows.push(WifiRow {
+        presence: traffic_masq_protocol::InterfacePresence::Present,
+        configured: None,
+        revision: None,
         interface: "wlan0".into(),
         role: WifiRole::AccessPoint,
         ap: None,
@@ -383,6 +389,9 @@ fn profile_editor_builds_create_and_update_payload_without_echoing_saved_secret(
 #[test]
 fn ap_request_is_atomic_and_enables_derived_dhcp_by_default() {
     let row = WifiRow {
+        presence: traffic_masq_protocol::InterfacePresence::Present,
+        configured: None,
+        revision: None,
         interface: "wlan0".into(),
         role: WifiRole::AccessPoint,
         ap: None,
@@ -425,6 +434,9 @@ async fn ap_apply_enters_shared_commit_confirm_screen() {
     }])
     .await;
     let row = WifiRow {
+        presence: traffic_masq_protocol::InterfacePresence::Present,
+        configured: None,
+        revision: None,
         interface: "wlan0".into(),
         role: WifiRole::AccessPoint,
         ap: None,
@@ -454,6 +466,9 @@ async fn ap_apply_enters_shared_commit_confirm_screen() {
 #[test]
 fn existing_ap_request_preserves_unedited_radio_settings() {
     let row = WifiRow {
+        presence: traffic_masq_protocol::InterfacePresence::Present,
+        configured: None,
+        revision: None,
         interface: "wlan0".into(),
         role: WifiRole::AccessPoint,
         ap: None,
@@ -755,12 +770,18 @@ fn primary_navigation_moves_from_radios_into_role_actions() {
     let data = WifiData {
         rows: vec![
             WifiRow {
+                presence: traffic_masq_protocol::InterfacePresence::Present,
+                configured: None,
+                revision: None,
                 interface: "wlan0".into(),
                 role: WifiRole::Client,
                 ap: None,
                 client: None,
             },
             WifiRow {
+                presence: traffic_masq_protocol::InterfacePresence::Present,
+                configured: None,
+                revision: None,
                 interface: "wlan1".into(),
                 role: WifiRole::AccessPoint,
                 ap: None,
@@ -784,6 +805,9 @@ fn primary_navigation_moves_from_radios_into_role_actions() {
 async fn wifi_editor_cursor_navigation_and_editing() {
     let mut app = TuiApp::default();
     let row = WifiRow {
+        presence: traffic_masq_protocol::InterfacePresence::Present,
+        configured: None,
+        revision: None,
         interface: "wlan0".into(),
         role: WifiRole::AccessPoint,
         ap: None,
@@ -1011,6 +1035,9 @@ fn render_wifi_displays_conflict_advice_when_competing_managers_present() {
     let mut app = TuiApp {
         wifi: WifiData {
             rows: vec![WifiRow {
+                presence: traffic_masq_protocol::InterfacePresence::Present,
+                configured: None,
+                revision: None,
                 interface: "wlp1s0".to_string(),
                 role: WifiRole::AccessPoint,
                 ap: Some(WifiApStatus {
@@ -1077,6 +1104,9 @@ fn describe_row_state_reports_connected_when_healthy() {
     use traffic_masq_protocol::{WifiClientSpecView as WifiClientSpec, WpaStateView as WpaState};
 
     let row = WifiRow {
+        presence: traffic_masq_protocol::InterfacePresence::Present,
+        configured: None,
+        revision: None,
         interface: "wlan0".to_string(),
         role: WifiRole::Client,
         ap: None,
@@ -1105,6 +1135,9 @@ fn describe_row_state_reports_joining_starting_when_starting() {
     use traffic_masq_protocol::{WifiClientSpecView as WifiClientSpec, WpaStateView as WpaState};
 
     let row = WifiRow {
+        presence: traffic_masq_protocol::InterfacePresence::Present,
+        configured: None,
+        revision: None,
         interface: "wlan0".to_string(),
         role: WifiRole::Client,
         ap: None,
@@ -1174,6 +1207,9 @@ fn describe_row_state_respects_role_precedence() {
 
     // When role is Client, must display client state even if AP is present
     let client_row = WifiRow {
+        presence: traffic_masq_protocol::InterfacePresence::Present,
+        configured: None,
+        revision: None,
         interface: "wlan0".to_string(),
         role: WifiRole::Client,
         ap: Some(ap_status.clone()),
@@ -1183,6 +1219,9 @@ fn describe_row_state_respects_role_precedence() {
 
     // When role is AccessPoint, must display AP state even if client is present
     let ap_row = WifiRow {
+        presence: traffic_masq_protocol::InterfacePresence::Present,
+        configured: None,
+        revision: None,
         interface: "wlan0".to_string(),
         role: WifiRole::AccessPoint,
         ap: Some(ap_status),
@@ -1194,6 +1233,9 @@ fn describe_row_state_respects_role_precedence() {
 #[test]
 fn describe_row_state_reports_not_configured_when_empty() {
     let row = WifiRow {
+        presence: traffic_masq_protocol::InterfacePresence::Present,
+        configured: None,
+        revision: None,
         interface: "wlan0".to_string(),
         role: WifiRole::Client,
         ap: None,
@@ -1212,6 +1254,9 @@ fn render_wifi_client_conflict_advice_when_ap_also_present() {
     let mut app = TuiApp {
         wifi: WifiData {
             rows: vec![WifiRow {
+                presence: traffic_masq_protocol::InterfacePresence::Present,
+                configured: None,
+                revision: None,
                 interface: "wlp1s0".to_string(),
                 role: WifiRole::Client,
                 ap: Some(WifiApStatus {
@@ -1436,6 +1481,9 @@ async fn profile_deactivation_enters_pending_change_and_returns_to_profiles() {
 #[test]
 fn open_ap_request_discards_typed_passphrase_and_requests_clear() {
     let row = WifiRow {
+        presence: traffic_masq_protocol::InterfacePresence::Present,
+        configured: None,
+        revision: None,
         interface: "wlan0".into(),
         role: WifiRole::AccessPoint,
         ap: None,
@@ -1927,4 +1975,32 @@ async fn control_o_submits_wifi_connection_from_any_field() {
         server.await.unwrap(),
         vec!["PUT /api/v1/wifi-client/wlan0/provision"]
     );
+}
+
+#[test]
+fn saved_missing_ap_opens_editor_without_fake_runtime_and_unknown_is_distinct() {
+    let config: traffic_masq_protocol::InterfaceConfigView =
+        serde_json::from_value(serde_json::json!({
+            "role": "output", "managed": true, "ipv4": "192.168.50.1/24", "nat": true,
+            "wifi": {"ssid": "saved-ap", "security": "wpa2", "channel": 11, "hidden": true}
+        }))
+        .unwrap();
+    let mut row = radio("usb0");
+    row.presence = traffic_masq_protocol::InterfacePresence::Missing;
+    row.configured = Some(config);
+    row.revision = Some(7);
+    row.role = WifiRole::AccessPoint;
+    assert!(row.ap.is_none());
+    assert!(describe_row_state(&row).contains("saved-ap"));
+    assert!(describe_row_state(&row).contains("missing"));
+    let editor = WifiEditor::from_row(&row);
+    assert_eq!(editor.ssid, "saved-ap");
+    assert_eq!(editor.original_spec.as_ref().unwrap().channel, 11);
+    assert!(editor.original_spec.as_ref().unwrap().hidden);
+    assert_eq!(editor.offline_intent.as_ref().unwrap().0, 7);
+    assert!(!editor.configure_dhcp);
+    row.presence = traffic_masq_protocol::InterfacePresence::Unknown;
+    assert!(describe_row_state(&row).contains("observation unavailable"));
+    assert!(!describe_row_state(&row).contains("missing"));
+    assert!(WifiEditor::from_row(&row).offline_intent.is_none());
 }

@@ -6,15 +6,17 @@ use ratatui::widgets::Paragraph;
 use zeroize::Zeroize;
 
 use crate::tui::api::client::ApiClient;
-use crate::tui::api::model::{
-    Request, Response, WifiClientProfileWriteRequest, WifiEditRequest, WifiErrorDetail,
-};
+use crate::tui::api::model::{Request, Response, WifiClientProfileWriteRequest, WifiEditRequest};
 use traffic_masq_protocol::{
-    InterfaceStatusView as InterfaceStatus, WifiApSpecView, WifiApStatusView as WifiApStatus,
-    WifiBand, WifiChannelWidth, WifiClientProfileSummary, WifiClientSecurity,
-    WifiClientStatusView as WifiClientStatus, WifiHealthView as WifiHealth, WifiSecurity,
-    WpaSupplicantScanResult, WpaSupplicantScanSecurity,
+    WifiApSpecView, WifiApStatusView as WifiApStatus, WifiBand, WifiChannelWidth,
+    WifiClientProfileSummary, WifiClientSecurity, WifiClientStatusView as WifiClientStatus,
+    WifiHealthView as WifiHealth, WifiSecurity, WpaSupplicantScanResult, WpaSupplicantScanSecurity,
 };
+
+#[cfg(test)]
+use crate::tui::api::model::WifiErrorDetail;
+#[cfg(test)]
+use traffic_masq_protocol::InterfaceStatusView as InterfaceStatus;
 
 use super::layout::{panel, UiLayout};
 use super::logs::LogLevel;
@@ -60,6 +62,9 @@ pub(crate) enum WifiRole {
 
 #[derive(Debug, Clone)]
 pub(crate) struct WifiRow {
+    pub(crate) presence: traffic_masq_protocol::InterfacePresence,
+    pub(crate) configured: Option<traffic_masq_protocol::InterfaceConfigView>,
+    pub(crate) revision: Option<u64>,
     pub(crate) interface: String,
     pub(crate) role: WifiRole,
     pub(crate) ap: Option<WifiApStatus>,
@@ -173,6 +178,7 @@ fn move_field<T: Copy + PartialEq>(fields: &[T], field: T, forward: bool) -> T {
 
 #[derive(Clone)]
 pub(crate) struct WifiEditor {
+    offline_intent: Option<(u64, traffic_masq_protocol::InterfaceConfigView)>,
     pub(crate) interface: String,
     pub(crate) field: WifiField,
     pub(crate) ssid: String,
@@ -208,37 +214,53 @@ impl std::fmt::Debug for WifiEditor {
 
 impl WifiEditor {
     fn from_row(row: &WifiRow) -> Self {
-        let (ssid, security, country_code) = row.ap.as_ref().map_or_else(
+        let spec = row
+            .ap
+            .as_ref()
+            .map(|status| status.spec.clone())
+            .or_else(|| {
+                row.configured.as_ref().and_then(|config| {
+                    WifiApSpecView::from_validated_interface_config(&row.interface, config)
+                })
+            });
+        let (ssid, security, country_code) = spec.as_ref().map_or_else(
             || ("traffic-masq".into(), WifiSecurity::Wpa2, String::new()),
             |status| {
                 (
-                    status.spec.ssid.clone(),
-                    status.spec.security,
-                    status.spec.country_code.clone().unwrap_or_default(),
+                    status.ssid.clone(),
+                    status.security,
+                    status.country_code.clone().unwrap_or_default(),
                 )
             },
         );
         let cursor = super::input::grapheme_count(&ssid);
         Self {
+            offline_intent: if row.presence == traffic_masq_protocol::InterfacePresence::Missing {
+                row.revision.zip(row.configured.clone())
+            } else {
+                None
+            },
             interface: row.interface.clone(),
             field: WifiField::Ssid,
             ssid,
             security,
             passphrase: String::new(),
             country_code,
-            existing: row
-                .ap
-                .as_ref()
-                .is_some_and(|s| s.spec.requires_passphrase()),
-            configure_dhcp: row.ap.is_none() && CONFIGURE_DHCP_BY_DEFAULT,
+            existing: spec.as_ref().is_some_and(|spec| spec.requires_passphrase()),
+            configure_dhcp: spec.is_none() && CONFIGURE_DHCP_BY_DEFAULT,
             disable_dhcp: false,
-            subnet: String::new(),
+            subnet: row
+                .configured
+                .as_ref()
+                .and_then(|config| config.ipv4)
+                .map(|ip| ip.to_string())
+                .unwrap_or_default(),
             profile_id: String::new(),
             profile_mode: false,
             original_profile_id: None,
             dirty: false,
             discard_requested: false,
-            original_spec: row.ap.as_ref().map(|status| status.spec.clone()),
+            original_spec: spec,
             radio_settings: None,
             cursor,
         }
@@ -916,6 +938,18 @@ async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
     let Some((action, _)) = actions(row.role).get(slot).copied() else {
         return;
     };
+    if row.presence != traffic_masq_protocol::InterfacePresence::Present
+        && matches!(
+            action,
+            PrimaryAction::Scan | PrimaryAction::Reconnect | PrimaryAction::Reload
+        )
+    {
+        app.push_message(
+            LogLevel::Warn,
+            "This action requires a present radio; saved configuration can still be edited",
+        );
+        return;
+    }
     match action {
         PrimaryAction::ConfigureAp => {
             if !subsystem_disabled(app, WifiRole::AccessPoint) {
@@ -934,6 +968,10 @@ async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
                             &config,
                         );
                         let mut editor = WifiEditor::from_row(&row);
+                        if row.presence == traffic_masq_protocol::InterfacePresence::Missing {
+                            editor.offline_intent =
+                                row.revision.map(|revision| (revision, config.clone()));
+                        }
                         editor.existing = spec.as_ref().is_some_and(|s| s.requires_passphrase());
                         editor.configure_dhcp = spec.is_none() && config.dhcp.is_none();
                         if let Some(spec) = &spec {
@@ -975,6 +1013,38 @@ async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
             .await
         }
         PrimaryAction::Deactivate => {
+            if row.presence == traffic_masq_protocol::InterfacePresence::Missing {
+                if let (Some(expected_revision), Some(mut config)) =
+                    (row.revision, row.configured.clone())
+                {
+                    if row.role == WifiRole::Client {
+                        config.wifi_client = None;
+                        if let Some(policy) = config
+                            .dhcp_client
+                            .as_mut()
+                            .filter(|policy| policy.wifi_owned)
+                        {
+                            policy.enabled = false;
+                            policy.wifi_owned = false;
+                        }
+                    } else {
+                        config.wifi = None;
+                    }
+                    request_simple(
+                        app,
+                        client,
+                        Request::SaveWifiInterface {
+                            interface: row.interface,
+                            config,
+                            expected_revision,
+                            passphrase: None,
+                        },
+                        "Saved Wi-Fi disabled",
+                    )
+                    .await;
+                }
+                return;
+            }
             let request = if row.role == WifiRole::Client {
                 Request::DeactivateWifiClientProfile {
                     interface: row.interface,
@@ -1027,6 +1097,22 @@ async fn request_simple(app: &mut TuiApp, client: &ApiClient, request: Request, 
                 "Wi-Fi change applied tentatively; confirm before the rollback timer expires",
             );
         }
+        Ok(Response::InterfaceIntentSaved {
+            interface,
+            deferred,
+            ..
+        }) => {
+            app.push_message(
+                LogLevel::Info,
+                if deferred {
+                    format!("Saved; application waits for interface {interface}")
+                } else {
+                    "Saved configuration updated".into()
+                },
+            );
+            load_wifi_data(app, client).await;
+        }
+        Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
         Ok(Response::WifiConfigured { .. })
         | Ok(Response::WifiClientConfigured { .. })
         | Ok(Response::WifiClientDisabled { .. })
@@ -1083,85 +1169,34 @@ async fn start_scan(app: &mut TuiApp, client: &ApiClient, interface: String) {
 }
 
 pub(crate) async fn load_wifi_data(app: &mut TuiApp, client: &ApiClient) {
-    app.wifi.error = None;
-    let interfaces: Vec<InterfaceStatus> = match client.request(&Request::ListInterfaces).await {
-        Ok(Response::Interfaces { interfaces }) => interfaces,
-        Ok(response) => {
-            report_unexpected(app, response);
-            app.wifi.replace_rows(Vec::new());
-            return;
-        }
-        Err(error) => {
-            app.wifi.error = Some(error.to_string());
-            app.wifi.replace_rows(Vec::new());
-            return;
-        }
-    };
-    let ap: Vec<WifiApStatus> = match client.request(&Request::WifiStatus).await {
-        Ok(Response::WifiStatus { interfaces }) => {
+    match client.request(&Request::ListWifiInventory).await {
+        Ok(Response::WifiInventory {
+            revision,
+            interfaces,
+            observation_error,
+        }) => {
+            let rows = interfaces
+                .into_iter()
+                .map(|entry| WifiRow {
+                    role: configured_role(entry.interface.configured.as_ref()),
+                    interface: entry.interface.name,
+                    presence: entry.interface.presence,
+                    configured: entry.interface.configured,
+                    revision: Some(revision),
+                    ap: entry.ap_runtime,
+                    client: entry.client_runtime,
+                })
+                .collect();
+            app.wifi.error = observation_error;
             app.wifi.ap_disabled = false;
-            interfaces
-        }
-        Ok(Response::WifiError {
-            detail: WifiErrorDetail::WifiDisabled,
-        }) => {
-            app.wifi.ap_disabled = true;
-            Vec::new()
-        }
-        Ok(response) => {
-            report_unexpected(app, response);
-            Vec::new()
-        }
-        Err(error) => {
-            app.wifi.error = Some(error.to_string());
-            Vec::new()
-        }
-    };
-    let clients: Vec<WifiClientStatus> = match client.request(&Request::WifiClientStatus).await {
-        Ok(Response::WifiClientStatus { interfaces }) => {
             app.wifi.client_disabled = false;
-            interfaces
+            app.wifi.replace_rows(rows);
         }
-        Ok(Response::WifiClientError {
-            detail: crate::tui::api::model::WifiClientErrorDetail::WifiClientDisabled,
-        }) => {
-            app.wifi.client_disabled = true;
-            Vec::new()
+        result => {
+            // Retain selection and editors if observation or transport failed.
+            app.wifi.error = Some(format!("Wi-Fi inventory unavailable: {result:?}"));
         }
-        Ok(response) => {
-            report_unexpected(app, response);
-            Vec::new()
-        }
-        Err(error) => {
-            app.wifi.error = Some(error.to_string());
-            Vec::new()
-        }
-    };
-    let mut rows = build_rows(&interfaces, &ap, &clients);
-    for row in rows.iter_mut() {
-        let config = match client
-            .request(&Request::GetInterfaceConfig {
-                interface: row.interface.clone(),
-            })
-            .await
-        {
-            Ok(Response::InterfaceConfig {
-                config: Some(config),
-                ..
-            }) => Some(config),
-            Ok(Response::InterfaceConfig { config: None, .. }) => None,
-            result => {
-                app.wifi.error = Some(format!(
-                    "Could not refresh {} configuration: {result:?}",
-                    row.interface
-                ));
-                app.wifi.replace_rows(Vec::new());
-                return;
-            }
-        };
-        row.role = configured_role(config.as_ref());
     }
-    app.wifi.replace_rows(rows);
 }
 
 fn configured_role(config: Option<&traffic_masq_protocol::InterfaceConfigView>) -> WifiRole {
@@ -1176,6 +1211,7 @@ fn configured_role(config: Option<&traffic_masq_protocol::InterfaceConfigView>) 
     }
 }
 
+#[cfg(test)]
 pub(crate) fn build_rows(
     interfaces: &[InterfaceStatus],
     ap: &[WifiApStatus],
@@ -1193,6 +1229,9 @@ pub(crate) fn build_rows(
                 .cloned();
             let role = WifiRole::Unknown;
             WifiRow {
+                presence: traffic_masq_protocol::InterfacePresence::Present,
+                configured: None,
+                revision: None,
                 interface,
                 role,
                 ap: ap_status,
@@ -1313,6 +1352,22 @@ fn role_label(role: WifiRole) -> &'static str {
     }
 }
 fn describe_row_state(row: &WifiRow) -> String {
+    if row.presence == traffic_masq_protocol::InterfacePresence::Unknown {
+        return "device observation unavailable; saved settings retained".into();
+    }
+    if row.presence == traffic_masq_protocol::InterfacePresence::Missing {
+        let ssid = row.configured.as_ref().and_then(|config| {
+            config
+                .wifi
+                .as_ref()
+                .map(|wifi| wifi.ssid.as_str())
+                .or_else(|| config.wifi_client.as_ref().map(|wifi| wifi.ssid.as_str()))
+        });
+        return ssid.map_or_else(
+            || "interface missing".into(),
+            |ssid| format!("interface missing; saved {ssid}, inactive"),
+        );
+    }
     match row.role {
         WifiRole::AccessPoint => {
             if let Some(ap) = &row.ap {

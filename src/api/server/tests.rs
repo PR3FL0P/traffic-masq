@@ -139,6 +139,7 @@ fn every_control_request_has_the_expected_authorization_class() {
         Request::GetApiHttpsConfig,
         Request::ListInterfaces,
         Request::ListInterfaceInventory,
+        Request::ListWifiInventory,
         Request::DhcpStatus,
         Request::DhcpClientStatus,
         Request::GetDhcpClient {
@@ -178,6 +179,12 @@ fn every_control_request_has_the_expected_authorization_class() {
     }
 
     let mutation_requests = [
+        Request::SaveWifiInterface {
+            interface: "wlan0".into(),
+            config: interface_config().into(),
+            expected_revision: 0,
+            passphrase: None,
+        },
         Request::SaveInterfaceConfig {
             interface: "usb0".into(),
             config: interface_config().into(),

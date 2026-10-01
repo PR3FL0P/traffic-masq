@@ -95,6 +95,9 @@ pub(super) fn open_ap_profile_editor(
 ) {
     // A new profile must never inherit the running AP's credential state.
     let mut editor = WifiEditor::from_row(&WifiRow {
+        presence: traffic_masq_protocol::InterfacePresence::Present,
+        configured: None,
+        revision: None,
         interface,
         role: WifiRole::Unknown,
         ap: None,

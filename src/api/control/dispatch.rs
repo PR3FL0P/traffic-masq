@@ -184,6 +184,22 @@ impl ControlService {
                 Ok(response) => response,
                 Err(error) => error_response(error),
             },
+            Request::ListWifiInventory => match self.wifi_inventory().await {
+                Ok(response) => response,
+                Err(error) => error_response(error),
+            },
+            Request::SaveWifiInterface {
+                interface,
+                config,
+                expected_revision,
+                passphrase,
+            } => match self
+                .save_wifi_interface(interface, config.into(), expected_revision, passphrase)
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => error_response(error),
+            },
             Request::ListInterfaceInventory => match self.interface_inventory().await {
                 Ok(response) => response,
                 Err(error) => error_response(error),
@@ -735,7 +751,8 @@ impl ControlService {
 fn is_network_mutation(request: &Request) -> bool {
     matches!(
         request,
-        Request::SaveInterfaceConfig { .. }
+        Request::SaveWifiInterface { .. }
+            | Request::SaveInterfaceConfig { .. }
             | Request::ForgetInterfaceConfig { .. }
             | Request::ResetInterfaceOverride { .. }
             | Request::ConfigureDhcpClient { .. }
@@ -829,7 +846,8 @@ fn is_provisioning_secret_recovery_request(request: &Request) -> bool {
 
 fn recovery_interface(request: &Request) -> Option<&str> {
     match request {
-        Request::SaveInterfaceConfig { interface, .. }
+        Request::SaveWifiInterface { interface, .. }
+        | Request::SaveInterfaceConfig { interface, .. }
         | Request::ForgetInterfaceConfig { interface, .. }
         | Request::ResetInterfaceOverride { interface, .. }
         | Request::GetInterfaceConfig { interface, .. }

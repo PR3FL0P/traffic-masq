@@ -2336,11 +2336,17 @@ async fn wifi_requests_are_rejected_when_wifi_is_disabled() {
     });
     let service = ControlService::new(config, network, dhcp, overrides);
 
+    assert!(matches!(
+        service
+            .dispatch(Request::GetWifiConfig {
+                interface: "wlan0".to_string(),
+            })
+            .await,
+        Response::WifiConfig { spec: None, .. }
+    ));
+
     for request in [
         Request::WifiStatus,
-        Request::GetWifiConfig {
-            interface: "wlan0".to_string(),
-        },
         Request::ConfigureWifi {
             interface: "wlan0".to_string(),
             settings: WifiEditRequest {
@@ -3558,11 +3564,17 @@ async fn wifi_client_requests_are_rejected_when_client_mode_is_disabled() {
     });
     let service = ControlService::new(config, network, dhcp, overrides);
 
+    assert!(matches!(
+        service
+            .dispatch(Request::GetWifiClientConfig {
+                interface: "wlan1".to_string(),
+            })
+            .await,
+        Response::WifiClientConfig { spec: None, .. }
+    ));
+
     for request in [
         Request::WifiClientStatus,
-        Request::GetWifiClientConfig {
-            interface: "wlan1".to_string(),
-        },
         Request::DisableWifiClient {
             interface: "wlan1".to_string(),
         },
@@ -7799,4 +7811,346 @@ async fn offline_save_preserves_retained_runtime_ownership() {
         Some(config)
     );
     assert!(fixture.supervisor.spec("wan0").await.is_some());
+}
+
+async fn saved_wifi_without_runtime() -> (ControlService, tempfile::TempDir) {
+    let directory = tempdir().unwrap();
+    let mut base = wifi_base_config(directory.path());
+    base.network
+        .interfaces
+        .get_mut("wlan0")
+        .unwrap()
+        .wifi
+        .as_mut()
+        .unwrap()
+        .security = WifiSecurity::Wpa2;
+    let store = crate::wifi::store::PassphraseStore::for_role(
+        directory.path(),
+        crate::wifi::store::WifiCredentialRole::Ap,
+    );
+    store
+        .set("wlan0", &WifiPassphrase::new("previous-password").unwrap())
+        .unwrap();
+    base.network
+        .interfaces
+        .get_mut("wlan0")
+        .unwrap()
+        .wifi
+        .as_mut()
+        .unwrap()
+        .passphrase_file = Some(store.directory().join("wlan0"));
+    let overrides = RuntimeOverrideManager::load(directory.path(), &base)
+        .await
+        .unwrap();
+    let dhcp = DhcpSupervisor::start(&base).await.unwrap();
+    let service = ControlService::new(
+        base,
+        Arc::new(crate::test_support::FakeNetworkProvider::default()),
+        dhcp,
+        overrides,
+    );
+    (service, directory)
+}
+
+#[tokio::test]
+async fn wifi_inventory_and_config_include_saved_missing_ap_without_runtime() {
+    let (service, _directory) = saved_wifi_without_runtime().await;
+    match service.dispatch(Request::ListWifiInventory).await {
+        Response::WifiInventory { interfaces, .. } => {
+            assert_eq!(interfaces.len(), 1);
+            let row = &interfaces[0];
+            assert_eq!(
+                row.interface.presence,
+                traffic_masq_protocol::InterfacePresence::Missing
+            );
+            assert!(row.interface.observed.is_none());
+            assert!(row.ap_runtime.is_none());
+            assert!(row.client_runtime.is_none());
+            assert_eq!(
+                row.interface
+                    .configured
+                    .as_ref()
+                    .unwrap()
+                    .wifi
+                    .as_ref()
+                    .unwrap()
+                    .ssid,
+                "net-a"
+            );
+        }
+        response => panic!("{response:?}"),
+    }
+    assert!(matches!(
+        service
+            .dispatch(Request::GetWifiConfig {
+                interface: "wlan0".into()
+            })
+            .await,
+        Response::WifiConfig { spec: Some(_), .. }
+    ));
+}
+
+#[tokio::test]
+async fn missing_wifi_password_creates_new_durable_reference_and_preserves_old_secret() {
+    let (service, directory) = saved_wifi_without_runtime().await;
+    let old_config = service
+        .overrides
+        .effective_interface("wlan0")
+        .await
+        .unwrap()
+        .unwrap();
+    let old_file = old_config
+        .wifi
+        .as_ref()
+        .unwrap()
+        .passphrase_file
+        .clone()
+        .unwrap();
+    let response = service
+        .dispatch(Request::WifiSetPassphrase {
+            interface: "wlan0".into(),
+            passphrase: "replacement-password".into(),
+        })
+        .await;
+    assert!(
+        matches!(
+            response,
+            Response::InterfaceIntentSaved { deferred: true, .. }
+        ),
+        "{response:?}"
+    );
+    let saved = service
+        .overrides
+        .effective_interface("wlan0")
+        .await
+        .unwrap()
+        .unwrap();
+    let new_file = saved.wifi.unwrap().passphrase_file.unwrap();
+    assert_ne!(old_file, new_file);
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&new_file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::metadata(new_file.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    let wire = serde_json::to_string(&response).unwrap();
+    assert!(!wire.contains("replacement-password"));
+    assert!(!wire.contains("previous-password"));
+    assert_eq!(
+        std::fs::read_to_string(&old_file).unwrap(),
+        "previous-password"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&new_file).unwrap(),
+        "replacement-password"
+    );
+    let restarted = RuntimeOverrideManager::load(directory.path(), &service.base_config)
+        .await
+        .unwrap();
+    assert_eq!(
+        restarted
+            .effective_interface("wlan0")
+            .await
+            .unwrap()
+            .unwrap()
+            .wifi
+            .unwrap()
+            .passphrase_file,
+        Some(new_file)
+    );
+    let response = service
+        .dispatch(Request::DisableWifi {
+            interface: "wlan0".into(),
+        })
+        .await;
+    assert!(
+        matches!(response, Response::InterfaceIntentSaved { .. }),
+        "{response:?}"
+    );
+    assert!(service
+        .overrides
+        .effective_interface("wlan0")
+        .await
+        .unwrap()
+        .unwrap()
+        .wifi
+        .is_none());
+    assert!(old_file.exists());
+}
+
+#[tokio::test]
+async fn offline_wifi_secret_commit_failure_keeps_previous_intent_and_credential() {
+    let (service, _directory) = saved_wifi_without_runtime().await;
+    let previous = service
+        .overrides
+        .effective_interface("wlan0")
+        .await
+        .unwrap()
+        .unwrap();
+    let previous_file = previous
+        .wifi
+        .as_ref()
+        .unwrap()
+        .passphrase_file
+        .as_ref()
+        .unwrap();
+    std::fs::create_dir(service.overrides.path()).unwrap();
+    let response = service
+        .dispatch(Request::SaveWifiInterface {
+            interface: "wlan0".into(),
+            config: previous.clone().into(),
+            expected_revision: 0,
+            passphrase: Some("replacement-password".into()),
+        })
+        .await;
+    assert!(matches!(response, Response::Error { .. }), "{response:?}");
+    assert_eq!(service.overrides.committed_revision().await, 0);
+    assert_eq!(
+        service
+            .overrides
+            .effective_interface("wlan0")
+            .await
+            .unwrap(),
+        Some(previous.clone())
+    );
+    assert_eq!(
+        std::fs::read_to_string(previous_file).unwrap(),
+        "previous-password"
+    );
+}
+
+#[tokio::test]
+async fn stale_wifi_editor_cannot_restore_forgotten_configuration_or_change_its_secret() {
+    let (service, _directory) = saved_wifi_without_runtime().await;
+    let previous = service
+        .overrides
+        .effective_interface("wlan0")
+        .await
+        .unwrap()
+        .unwrap();
+    let old_file = previous
+        .wifi
+        .as_ref()
+        .unwrap()
+        .passphrase_file
+        .as_ref()
+        .unwrap();
+    let response = service
+        .dispatch(Request::ForgetInterfaceConfig {
+            interface: "wlan0".into(),
+            expected_revision: 0,
+        })
+        .await;
+    assert!(matches!(response, Response::InterfaceIntentSaved { .. }));
+    let response = service
+        .dispatch(Request::SaveWifiInterface {
+            interface: "wlan0".into(),
+            config: previous.clone().into(),
+            expected_revision: 0,
+            passphrase: Some("replacement-password".into()),
+        })
+        .await;
+    assert!(matches!(response, Response::Error { .. }));
+    assert!(service
+        .overrides
+        .effective_interface("wlan0")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        std::fs::read_to_string(old_file).unwrap(),
+        "previous-password"
+    );
+}
+
+#[tokio::test]
+async fn saved_missing_client_password_and_disable_preserve_independent_dhcp_policy() {
+    let directory = tempdir().unwrap();
+    let mut base = wifi_base_config(directory.path());
+    let cfg = base.network.interfaces.get_mut("wlan0").unwrap();
+    cfg.role = InterfaceRole::Input;
+    cfg.ipv4 = None;
+    cfg.wifi = None;
+    cfg.dhcp_client = Some(DhcpClientInterfaceConfig {
+        enabled: true,
+        wifi_owned: false,
+        ..Default::default()
+    });
+    cfg.wifi_client = Some(WifiClientConfig {
+        ssid: "saved-uplink".into(),
+        country_code: None,
+        security: WifiClientSecurity::Wpa2,
+        passphrase_file: None,
+    });
+    let overrides = RuntimeOverrideManager::load(directory.path(), &base)
+        .await
+        .unwrap();
+    let dhcp = DhcpSupervisor::start(&base).await.unwrap();
+    let service = ControlService::new(
+        base.clone(),
+        Arc::new(crate::test_support::FakeNetworkProvider::default()),
+        dhcp,
+        overrides,
+    );
+    assert!(matches!(
+        service
+            .dispatch(Request::GetWifiClientConfig {
+                interface: "wlan0".into()
+            })
+            .await,
+        Response::WifiClientConfig { spec: Some(_), .. }
+    ));
+    let response = service
+        .dispatch(Request::WifiClientSetPassphrase {
+            interface: "wlan0".into(),
+            passphrase: "client-password".into(),
+        })
+        .await;
+    assert!(
+        matches!(response, Response::InterfaceIntentSaved { .. }),
+        "{response:?}"
+    );
+    let saved = service
+        .overrides
+        .effective_interface("wlan0")
+        .await
+        .unwrap()
+        .unwrap();
+    let file = saved.wifi_client.unwrap().passphrase_file.unwrap();
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "client-password");
+    let response = service
+        .dispatch(Request::DisableWifiClient {
+            interface: "wlan0".into(),
+        })
+        .await;
+    assert!(
+        matches!(response, Response::InterfaceIntentSaved { .. }),
+        "{response:?}"
+    );
+    let saved = service
+        .overrides
+        .effective_interface("wlan0")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(saved.wifi_client.is_none());
+    assert!(saved.dhcp_client.unwrap().enabled);
+    assert!(file.exists());
+    let restarted = RuntimeOverrideManager::load(directory.path(), &base)
+        .await
+        .unwrap();
+    assert!(restarted
+        .effective_interface("wlan0")
+        .await
+        .unwrap()
+        .unwrap()
+        .wifi_client
+        .is_none());
 }

@@ -171,9 +171,6 @@ impl ControlService {
     }
 
     pub(super) async fn get_wifi_client_config(&self, interface: String) -> Response {
-        if self.wifi_client.is_none() {
-            return wifi_client_disabled();
-        }
         let effective = match self.effective_config().await {
             Ok(effective) => effective,
             Err(message) => return wifi_client_error(WifiClientErrorDetail::Other { message }),
@@ -278,6 +275,12 @@ impl ControlService {
     }
 
     pub(super) async fn disable_wifi_client(&self, interface: String) -> Response {
+        match self.missing_wifi_edit(&interface, true, true, None).await {
+            Ok(Some(response)) => return response,
+            Ok(None) => {}
+            Err(error) => return super::runtime::error_response(error),
+        }
+
         if self.wifi_client.is_none() {
             return wifi_client_disabled();
         }
@@ -523,6 +526,15 @@ impl ControlService {
         interface: String,
         passphrase: String,
     ) -> Response {
+        match self
+            .missing_wifi_edit(&interface, true, false, Some(passphrase.clone()))
+            .await
+        {
+            Ok(Some(response)) => return response,
+            Ok(None) => {}
+            Err(error) => return super::runtime::error_response(error),
+        }
+
         let Some(wifi_client) = &self.wifi_client else {
             return wifi_client_disabled();
         };

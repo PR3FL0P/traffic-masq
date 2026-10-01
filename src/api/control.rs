@@ -12,6 +12,7 @@ mod wifi;
 mod wifi_ap_profiles;
 mod wifi_autoconnect;
 mod wifi_client;
+mod wifi_intent;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;

@@ -1134,6 +1134,13 @@ pub struct InterfaceInventoryEntry {
     pub references: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WifiInventoryEntry {
+    pub interface: InterfaceInventoryEntry,
+    pub ap_runtime: Option<WifiApStatusView>,
+    pub client_runtime: Option<WifiClientStatusView>,
+}
+
 /// Control request envelope. Interface and router proposal payloads stay typed
 /// while callers migrate those domain values to dedicated wire DTOs.
 #[derive(Clone, Serialize, Deserialize)]
@@ -1152,6 +1159,14 @@ pub enum Request<Interface, Proposal> {
     ResetSecuritySettings,
     ListInterfaces,
     ListInterfaceInventory,
+    ListWifiInventory,
+    SaveWifiInterface {
+        interface: String,
+        config: Interface,
+        expected_revision: u64,
+        #[serde(default)]
+        passphrase: Option<String>,
+    },
     SaveInterfaceConfig {
         interface: String,
         config: Interface,
@@ -1424,6 +1439,11 @@ pub enum Response<
         revision: u64,
         interfaces: Vec<InterfaceInventoryEntry>,
         suppressed_interfaces: Vec<String>,
+        observation_error: Option<String>,
+    },
+    WifiInventory {
+        revision: u64,
+        interfaces: Vec<WifiInventoryEntry>,
         observation_error: Option<String>,
     },
     InterfaceIntentSaved {
@@ -1764,6 +1784,24 @@ mod tests {
         let decoded: TestRequest = serde_json::from_value(encoded).unwrap();
         let debug = format!("{decoded:?}");
         assert!(!debug.contains("secret"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn offline_wifi_intent_preserves_revision_and_redacts_password() {
+        type TestRequest = Request<serde_json::Value, serde_json::Value>;
+        let request = TestRequest::SaveWifiInterface {
+            interface: "wlan0".into(),
+            config: serde_json::json!({"role": "output", "managed": true}),
+            expected_revision: 7,
+            passphrase: Some("private-offline-password".into()),
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["type"], "save_wifi_interface");
+        assert_eq!(encoded["expected_revision"], 7);
+        let decoded: TestRequest = serde_json::from_value(encoded).unwrap();
+        let debug = format!("{decoded:?}");
+        assert!(!debug.contains("private-offline-password"));
         assert!(debug.contains("<redacted>"));
     }
 

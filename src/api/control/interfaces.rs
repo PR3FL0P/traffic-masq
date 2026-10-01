@@ -115,31 +115,7 @@ impl ControlService {
         proposal: RouterIntentProposal,
         expected_revision: u64,
     ) -> Result<Response> {
-        traffic_masq_protocol::validate_interface_name(&interface).map_err(anyhow::Error::msg)?;
-        let observed = self.network.list_interfaces().await?;
-        if observed.iter().any(|entry| entry.name == interface) {
-            anyhow::bail!(
-                "interface {interface} is present; use a confirmed live interface transaction"
-            );
-        }
-        // An unplugged device can still have a task holding daemon resources.
-        // Intent-only writes must not strand that task or erase its cleanup proof.
-        if self.dhcp.spec(&interface).await.is_some()
-            || match &self.dhcp_client {
-                Some(runtime) => runtime.spec(&interface).await.is_some(),
-                None => false,
-            }
-            || match &self.wifi {
-                Some(runtime) => runtime.status(&interface).await.is_some(),
-                None => false,
-            }
-            || match &self.wifi_client {
-                Some(runtime) => runtime.status(&interface).await.is_some(),
-                None => false,
-            }
-        {
-            anyhow::bail!("interface {interface} retains service runtime ownership; stop its services and complete cleanup before saving offline intent");
-        }
+        let observed = self.check_missing_interface_write(&interface).await?;
         let candidate = self.overrides.build_candidate(&proposal).await?;
         if candidate.base_revision() != expected_revision {
             return Err(StaleCandidateError {
@@ -172,6 +148,38 @@ impl ControlService {
             deferred: !missing_dependencies.is_empty(),
             missing_dependencies,
         })
+    }
+
+    pub(super) async fn check_missing_interface_write(
+        &self,
+        interface: &str,
+    ) -> Result<Vec<crate::netlink::NetworkInterface>> {
+        traffic_masq_protocol::validate_interface_name(interface).map_err(anyhow::Error::msg)?;
+        let observed = self.network.list_interfaces().await?;
+        if observed.iter().any(|entry| entry.name == interface) {
+            anyhow::bail!(
+                "interface {interface} is present; use a confirmed live interface transaction"
+            );
+        }
+        // An unplugged device can still have a task holding daemon resources.
+        // Intent-only writes must not strand that task or erase its cleanup proof.
+        if self.dhcp.spec(interface).await.is_some()
+            || match &self.dhcp_client {
+                Some(runtime) => runtime.spec(interface).await.is_some(),
+                None => false,
+            }
+            || match &self.wifi {
+                Some(runtime) => runtime.status(interface).await.is_some(),
+                None => false,
+            }
+            || match &self.wifi_client {
+                Some(runtime) => runtime.status(interface).await.is_some(),
+                None => false,
+            }
+        {
+            anyhow::bail!("interface {interface} retains service runtime ownership; stop its services and complete cleanup before saving offline intent");
+        }
+        Ok(observed)
     }
 
     pub(super) async fn validate_default_route_management(

@@ -67,12 +67,18 @@ async fn wifi_click_opens_actions_for_clicked_interface() {
     };
     app.wifi.rows = vec![
         wifi::WifiRow {
+            presence: traffic_masq_protocol::InterfacePresence::Present,
+            configured: None,
+            revision: None,
             interface: "wlan0".into(),
             role: wifi::WifiRole::AccessPoint,
             ap: None,
             client: None,
         },
         wifi::WifiRow {
+            presence: traffic_masq_protocol::InterfacePresence::Present,
+            configured: None,
+            revision: None,
             interface: "wlan1".into(),
             role: wifi::WifiRole::Client,
             ap: None,

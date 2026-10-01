@@ -89,6 +89,32 @@ impl PassphraseStore {
         }
     }
 
+    /// Allocate an immutable credential version; callers atomically commit its path in intent.
+    pub fn new_revision(state_dir: &Path) -> Result<Self, PassphraseStoreError> {
+        use std::os::unix::fs::DirBuilderExt;
+        let parent = state_dir.join("wifi/credential-revisions");
+        atomic_file::ensure_private_dir(&parent, PRIVATE_DIR_MODE)?;
+        for _ in 0..16 {
+            let directory = parent.join(format!("{:032x}", rand::random::<u128>()));
+            match fs::DirBuilder::new()
+                .mode(PRIVATE_DIR_MODE)
+                .create(&directory)
+            {
+                Ok(()) => {
+                    File::open(&parent)?.sync_all()?;
+                    return Ok(Self::new(fs::canonicalize(directory)?));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate unique credential version",
+        )
+        .into())
+    }
+
     pub fn directory(&self) -> &Path {
         &self.directory
     }

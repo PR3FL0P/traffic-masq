@@ -378,8 +378,78 @@ async fn apply_ap_editor(app: &mut TuiApp, client: &ApiClient) {
         app.push_message(LogLevel::Warn, "Invalid IPv4 subnet / CIDR");
         return;
     }
-    let request = ap_provision_request(&editor);
+    let request = if let Some((expected_revision, mut config)) = editor.offline_intent.clone() {
+        let settings = ap_settings(&editor);
+        let previous_secret = config
+            .wifi
+            .as_ref()
+            .and_then(|wifi| wifi.passphrase_file.clone());
+        config.wifi = Some(traffic_masq_protocol::WifiApConfigView {
+            ssid: settings.ssid,
+            country_code: settings.country_code,
+            band: settings.band,
+            channel: settings.channel,
+            channel_width: settings.channel_width,
+            security: settings.security,
+            hidden: settings.hidden,
+            client_isolation: settings.client_isolation,
+            max_stations: settings.max_stations,
+            passphrase_file: if settings.security == WifiSecurity::Open {
+                None
+            } else {
+                previous_secret
+            },
+        });
+        if !editor.subnet.trim().is_empty() {
+            config.ipv4 = editor.subnet.trim().parse().ok();
+        }
+        if editor.disable_dhcp {
+            config.dhcp = None;
+        }
+        if editor.configure_dhcp {
+            let Some(cidr) = config.ipv4 else {
+                app.push_message(
+                    LogLevel::Warn,
+                    "A saved IPv4 subnet is required to configure DHCP offline",
+                );
+                return;
+            };
+            let (pool_start, pool_end) = match traffic_masq_protocol::suggest_pool(cidr) {
+                Ok(pool) => pool,
+                Err(message) => {
+                    app.push_message(LogLevel::Warn, message);
+                    return;
+                }
+            };
+            config.dhcp = Some(traffic_masq_protocol::DhcpInterfaceConfigView {
+                pool_start,
+                pool_end,
+                router: cidr.addr(),
+                dns_servers: Vec::new(),
+                lease_seconds: None,
+            });
+        }
+        Request::SaveWifiInterface {
+            interface: editor.interface.clone(),
+            config,
+            expected_revision,
+            passphrase: (!editor.passphrase.is_empty() && editor.security != WifiSecurity::Open)
+                .then(|| editor.passphrase.clone()),
+        }
+    } else {
+        ap_provision_request(&editor)
+    };
     match client.request(&request).await {
+        Ok(Response::InterfaceIntentSaved { interface, .. }) => {
+            app.push_message(
+                LogLevel::Info,
+                format!("Saved access point settings; application waits for interface {interface}"),
+            );
+            app.wifi_editor = None;
+            app.screen = Screen::Wifi;
+            load_wifi_data(app, client).await;
+        }
+        Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
         Ok(Response::NetworkChangePending { change }) => {
             app.push_message(
                 LogLevel::Info,
