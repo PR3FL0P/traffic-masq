@@ -1,6 +1,8 @@
 name: Compile Binaries
 
 on:
+  push:
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       profile:
@@ -12,7 +14,7 @@ on:
           - release
           - debug
       run_tests:
-        description: 'Run tests before building'
+        description: 'Run extra tests after mandatory validation'
         required: false
         default: false
         type: boolean
@@ -36,7 +38,10 @@ permissions:
   contents: read
 
 jobs:
+  validate:
+    uses: ./.github/workflows/ci.yml
   compile:
+    needs: validate
     name: Build Binaries (Linux x86_64)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -64,42 +69,40 @@ jobs:
 
       - name: Run tests
         if: ${{ inputs.run_tests == true || inputs.run_tests == 'true' }}
+        env:
+          TEST_FILTER: ${{ inputs.test_filter }}
         run: |
           # Always compile and run tests in fast debug mode (no release optimizations)
-          if [ -n "${{ inputs.test_filter }}" ] && [ "${{ inputs.test_filter }}" != "all" ]; then
-            echo "==> Running targeted tests (debug) matching: ${{ inputs.test_filter }}"
-            cargo test --workspace -- ${{ inputs.test_filter }}
-          elif [ "${{ inputs.test_filter }}" = "all" ]; then
+          if [ -n "$TEST_FILTER" ] && [ "$TEST_FILTER" != "all" ]; then
+            cargo test --locked --workspace -- "$TEST_FILTER"
+          elif [ "$TEST_FILTER" = "all" ]; then
             echo "==> Running complete test suite (debug)"
-            cargo test --workspace
+            cargo test --locked --workspace
           else
             echo "==> Running library unit test suite (debug)"
-            cargo test --workspace --lib
+            cargo test --locked --workspace --lib
           fi
 
       - name: Build binaries
         if: ${{ inputs.tests_only != true && inputs.tests_only != 'true' }}
         run: |
           if [ "${{ inputs.profile }}" = "debug" ]; then
-            cargo build --bins
+            cargo build --locked --bins
             BUILD_DIR="target/debug"
           else
-            cargo build --release --bins
+            cargo build --release --locked --bins
             BUILD_DIR="target/release"
           fi
 
-          mkdir -p release-binaries
-          cp "$BUILD_DIR/traffic-masq" release-binaries/
-          cp "$BUILD_DIR/traffic-masqd" release-binaries/
-          strip release-binaries/traffic-masq release-binaries/traffic-masqd || true
-          chmod +x release-binaries/traffic-masq release-binaries/traffic-masqd
-
-          tar -czf release-binaries/traffic-masq-linux-x86_64.tar.gz -C release-binaries traffic-masq traffic-masqd
+          BINARY_DIR="$BUILD_DIR" sh packaging/release.sh
+          (cd release && sha256sum -c ./*.sha256)
+          # Preserve direct binary downloads used by gitcompile.sh.
+          cp "$BUILD_DIR/traffic-masq" "$BUILD_DIR/traffic-masqd" release/
 
       - name: Upload compiled binaries
         if: ${{ inputs.tests_only != true && inputs.tests_only != 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: traffic-masq-binaries
-          path: release-binaries/*
+          path: release/*
           if-no-files-found: error
