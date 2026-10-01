@@ -251,6 +251,12 @@ impl RuntimeOverrideManager {
         Ok(())
     }
 
+    /// Wake convergence after runtime cleanup, including failed or interrupted edits.
+    /// The committed revision and saved intent remain unchanged.
+    pub(crate) fn request_reconcile(&self) {
+        self.changed.notify_one();
+    }
+
     /// Wait until the overrides change.
     ///
     /// One convergence consumer waits here. Retain a notification if it is

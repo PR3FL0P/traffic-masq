@@ -259,7 +259,7 @@ impl DhcpClientOwnershipApplier {
         match self.verify_identity(&lease).await {
             Ok(()) => {}
             Err(OwnershipError::Conflict(OwnershipConflict::InterfaceMissing { .. })) => {
-                self.store.remove(interface)?;
+                self.retire_missing_interface(&lease).await?;
                 return Ok(None);
             }
             Err(error) => return Err(error),
@@ -341,6 +341,54 @@ impl DhcpClientOwnershipApplier {
         Ok(true)
     }
 
+    /// An absent name alone is not evidence that its old kernel state vanished.
+    /// A renamed netdev, reused ifindex, stale routes or failed observation must
+    /// preserve the lease proof for recovery without deleting kernel state.
+    async fn retire_missing_interface(
+        &self,
+        lease: &DhcpClientLease,
+    ) -> Result<(), OwnershipError> {
+        let verify_missing = |interfaces: &[crate::netlink::NetworkInterface]| {
+            if interfaces
+                .iter()
+                .any(|item| item.name == lease.interface || item.index == lease.interface_index)
+            {
+                return Err(OwnershipError::CleanupNeeded(
+                    "missing interface identity is still present or observation changed; ownership proof retained".into(),
+                ));
+            }
+            Ok(())
+        };
+        let interfaces = self
+            .network
+            .list_interfaces()
+            .await
+            .map_err(OwnershipError::Network)?;
+        verify_missing(&interfaces)?;
+        let routes = self
+            .network
+            .list_ipv4_routes()
+            .await
+            .map_err(OwnershipError::Network)?;
+        if lease.owned_routes.iter().any(|owned| {
+            routes
+                .iter()
+                .any(|route| route_complete_matches(route, owned))
+        }) {
+            return Err(OwnershipError::CleanupNeeded(
+                "owned routes remain for a missing interface; ownership proof retained".into(),
+            ));
+        }
+        let interfaces = self
+            .network
+            .list_interfaces()
+            .await
+            .map_err(OwnershipError::Network)?;
+        verify_missing(&interfaces)?;
+        self.store.remove(&lease.interface)?;
+        Ok(())
+    }
+
     async fn cleanup_locked(&self, interface: &str) -> Result<(), OwnershipError> {
         let Some(mut lease) = self.store.load(interface)? else {
             return Ok(());
@@ -351,7 +399,7 @@ impl DhcpClientOwnershipApplier {
         match self.verify_identity(&lease).await {
             Ok(()) => {}
             Err(OwnershipError::Conflict(OwnershipConflict::InterfaceMissing { .. })) => {
-                self.store.remove(interface)?;
+                self.retire_missing_interface(&lease).await?;
                 return Ok(());
             }
             Err(error) => return Err(error),

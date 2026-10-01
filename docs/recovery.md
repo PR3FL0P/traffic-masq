@@ -63,6 +63,31 @@ state, use this order:
    diagnostic. Recovery metadata is retired or quarantined by the daemon when it
    has sufficient proof; do not delete it merely because the daemon has started.
 
+## Editing an unplugged interface
+
+Offline Save, Forget, Reset and Wi-Fi edits validate the proposed configuration
+and expected revision before stopping retained services. The daemon checks
+Wi-Fi process records and stops only the recorded, owned processes. DHCP client
+cleanup retains its lease proof if the old ifindex still exists under another
+name, exact owned routes remain, or observation fails. Missing names do not
+permit deleting kernel state from another device.
+
+The new intent commits only after service cleanup succeeds and a fresh device
+observation still reports the interface missing. Until that commit, the previous
+saved intent remains the compensation target. A cleanup or definite persistence
+failure may leave services stopped; convergence is notified and restores the
+committed configuration when its dependencies are ready. Restart reads the same
+committed intent and resolves surviving process/lease ownership records through
+normal startup recovery. Credentials referenced by the old intent remain intact.
+
+An interrupted Wi-Fi launch, an orphaned or changed process record, or a missing
+supervisor with a persisted ownership record blocks the offline edit. Preserve
+the diagnostic and state directory, repair the reported ownership/storage cause,
+and retry; an interrupted launch may require startup recovery. Do not remove
+ownership records just to make Save or Forget succeed. If commit persistence is
+indeterminate, follow [TM-REC-209](#tm-rec-209); ordinary edits and runtime
+convergence remain fenced until restart resolves durable storage.
+
 ## Recovery codes
 
 Recovery conditions have stable `TM-REC-xxx` identifiers. Most are fatal startup blockers, while `TM-REC-207` and `TM-REC-208` describe degraded router recovery states in which the control plane remains available. The identifier is the primary operator reference; the invariant remains the machine-readable description of the condition. Codes are never reused for another invariant.

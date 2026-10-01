@@ -1052,6 +1052,32 @@ impl WifiClientSupervisor {
         Ok(())
     }
 
+    /// Validate durable ownership before an offline cleanup stops any service.
+    pub async fn check_cleanup_ownership(
+        &self,
+        interface: &str,
+    ) -> Result<(), ClientSupervisorError> {
+        let _operation = self.inner.operation_lock.lock().await;
+        let store = self.record_store(interface);
+        if store.transition_pending().await? {
+            return Err(ClientSupervisorError::Configuration(anyhow::anyhow!(
+                "Wi-Fi launch transition on {interface} is incomplete; recovery required"
+            )));
+        }
+        if let Some(record) = store.load().await? {
+            let tasks = self.inner.tasks.lock().await;
+            if !tasks
+                .get(interface)
+                .is_some_and(|task| task.record == record)
+            {
+                return Err(ClientSupervisorError::NotOwned {
+                    interface: interface.to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Stop the configured process and remove its runtime configuration and ownership record.
     /// Return the previous specification, or `None` when the interface was not configured.
     pub async fn disable(

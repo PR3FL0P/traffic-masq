@@ -2076,6 +2076,8 @@ impl Drop for FakeWifiHostapd {
 
 #[derive(Default)]
 struct FakeWifiProcess {
+    after_stop: StdMutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    fail_stop: std::sync::atomic::AtomicBool,
     fail_spawn: std::sync::atomic::AtomicBool,
     responders: StdMutex<HashMap<u32, FakeWifiHostapd>>,
     configs: StdMutex<HashMap<u32, std::path::PathBuf>>,
@@ -2180,8 +2182,17 @@ impl SupervisedProcess for FakeWifiProcess {
     }
 
     async fn terminate(&self, pid: u32) -> Result<(), WifiProcessError> {
+        if self.fail_stop.load(WifiOrdering::SeqCst) {
+            return Err(WifiProcessError::Signal {
+                pid,
+                source: nix::errno::Errno::EPERM,
+            });
+        }
         self.responders.lock().unwrap().remove(&pid);
         self.configs.lock().unwrap().remove(&pid);
+        if let Some(hook) = self.after_stop.lock().unwrap().take() {
+            hook();
+        }
         Ok(())
     }
 
@@ -2234,6 +2245,7 @@ fn wifi_base_config(directory: &std::path::Path) -> AppConfig {
 }
 
 struct WifiFixture {
+    network: Arc<crate::test_support::FakeNetworkProvider>,
     service: ControlService,
     process: Arc<FakeWifiProcess>,
     _directory: tempfile::TempDir,
@@ -2271,8 +2283,10 @@ async fn wifi_enabled_fixture() -> WifiFixture {
     .await
     .expect("wifi supervisor");
     configure_wlan0(&wifi, &config).await;
-    let service = ControlService::new(config, network, dhcp, overrides).with_wifi_supervisor(wifi);
+    let service =
+        ControlService::new(config, network.clone(), dhcp, overrides).with_wifi_supervisor(wifi);
     WifiFixture {
+        network,
         service,
         process,
         _directory: directory,
@@ -2979,9 +2993,8 @@ async fn wifi_set_passphrase_applies_live_via_reload() {
     let dhcp = DhcpSupervisor::start(&config)
         .await
         .expect("dhcp supervisor");
-    let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
-        addresses: Vec::new(),
-    });
+    let network = Arc::new(crate::test_support::FakeNetworkProvider::default());
+    network.add_interface("wlan0", 1).await;
     let process = FakeWifiProcess::new();
     let wifi = WifiSupervisor::start_with_process_and_radio(
         &config,
@@ -3405,18 +3418,23 @@ fn wifi_client_base_config(directory: &std::path::Path) -> AppConfig {
 }
 
 struct WifiClientFixture {
+    network: Arc<FakeWirelessNetwork>,
     process: Arc<FakeSupplicantProcess>,
     service: ControlService,
     _directory: tempfile::TempDir,
 }
 
 struct FakeWirelessNetwork {
+    missing: std::sync::atomic::AtomicBool,
     interfaces: Vec<NetworkInterface>,
 }
 
 #[async_trait]
 impl NetworkProvider for FakeWirelessNetwork {
     async fn list_interfaces(&self) -> Result<Vec<NetworkInterface>> {
+        if self.missing.load(WifiOrdering::SeqCst) {
+            return Ok(Vec::new());
+        }
         Ok(self.interfaces.clone())
     }
 
@@ -3461,7 +3479,8 @@ async fn wifi_client_enabled_fixture() -> WifiClientFixture {
     let dhcp = DhcpSupervisor::start(&config)
         .await
         .expect("dhcp supervisor");
-    let network: Arc<dyn NetworkProvider> = Arc::new(FakeWirelessNetwork {
+    let network = Arc::new(FakeWirelessNetwork {
+        missing: Default::default(),
         interfaces: vec![
             NetworkInterface {
                 name: "wlan1".to_string(),
@@ -3499,10 +3518,11 @@ async fn wifi_client_enabled_fixture() -> WifiClientFixture {
     let dhcp_client = DhcpClientSupervisor::start(&config, network.clone())
         .await
         .expect("DHCP client supervisor");
-    let service = ControlService::new(config, network, dhcp, overrides)
+    let service = ControlService::new(config, network.clone(), dhcp, overrides)
         .with_wifi_client_supervisor(wifi_client)
         .with_dhcp_client_supervisor(dhcp_client);
     WifiClientFixture {
+        network,
         process,
         service,
         _directory: directory,
@@ -4812,6 +4832,7 @@ async fn wifi_client_deactivation_disables_only_wifi_owned_dhcp_on_commit() {
         .await
         .expect("dhcp supervisor");
     let network: Arc<dyn NetworkProvider> = Arc::new(FakeWirelessNetwork {
+        missing: Default::default(),
         interfaces: vec![NetworkInterface {
             name: "wlan1".into(),
             index: 1,
@@ -4934,6 +4955,7 @@ async fn wifi_client_deactivation_rollback_preserves_wifi_owned_dhcp_intent() {
         .await
         .expect("dhcp supervisor");
     let network: Arc<dyn NetworkProvider> = Arc::new(FakeWirelessNetwork {
+        missing: Default::default(),
         interfaces: vec![NetworkInterface {
             name: "wlan1".into(),
             index: 1,
@@ -7458,7 +7480,8 @@ async fn explicit_router_retry_bypasses_only_its_own_persisted_stop() {
 async fn missing_interface_inventory_save_forget_reset_and_stale_editor() {
     use traffic_masq_protocol::InterfacePresence;
     let directory = tempdir().unwrap();
-    let base = router_base_config();
+    let mut base = router_base_config();
+    base.runtime.state_dir = directory.path().into();
     let overrides = RuntimeOverrideManager::load(directory.path(), &base)
         .await
         .unwrap();
@@ -7783,7 +7806,7 @@ async fn unused_vpn_profile_storage_remains_available_with_execution_disabled() 
 }
 
 #[tokio::test]
-async fn offline_save_preserves_retained_runtime_ownership() {
+async fn offline_save_cleans_retained_missing_dhcp_client_runtime() {
     let fixture = dhcp_client_control_fixture(true).await;
     let config = fixture
         .overrides
@@ -7802,15 +7825,18 @@ async fn offline_save_preserves_retained_runtime_ownership() {
         })
         .await;
     assert!(
-        matches!(response, Response::Error { ref message } if message.contains("runtime ownership")),
+        matches!(
+            response,
+            Response::InterfaceIntentSaved { deferred: true, .. }
+        ),
         "{response:?}"
     );
-    assert_eq!(fixture.overrides.committed_revision().await, revision);
+    assert_eq!(fixture.overrides.committed_revision().await, revision + 1);
     assert_eq!(
         fixture.overrides.effective_interface("wan0").await.unwrap(),
         Some(config)
     );
-    assert!(fixture.supervisor.spec("wan0").await.is_some());
+    assert!(fixture.supervisor.spec("wan0").await.is_none());
 }
 
 async fn saved_wifi_without_runtime() -> (ControlService, tempfile::TempDir) {
@@ -8152,5 +8178,448 @@ async fn saved_missing_client_password_and_disable_preserve_independent_dhcp_pol
         .unwrap()
         .unwrap()
         .wifi_client
+        .is_none());
+}
+
+#[tokio::test]
+async fn unplugged_ap_disable_stops_owned_process_before_committing_intent() {
+    let fixture = wifi_enabled_fixture().await;
+    let runtime = fixture.service.wifi.as_ref().unwrap();
+    let pid = runtime.status("wlan0").await.unwrap().pid;
+    fixture.network.interfaces.lock().await.remove("wlan0");
+    let response = fixture
+        .service
+        .dispatch(Request::DisableWifi {
+            interface: "wlan0".into(),
+        })
+        .await;
+    assert!(
+        matches!(
+            response,
+            Response::InterfaceIntentSaved { deferred: true, .. }
+        ),
+        "{response:?}"
+    );
+    assert!(!fixture.process.is_alive(pid).await.unwrap());
+    assert!(runtime.status("wlan0").await.is_none());
+    assert!(fixture
+        .service
+        .overrides
+        .effective_interface("wlan0")
+        .await
+        .unwrap()
+        .unwrap()
+        .wifi
+        .is_none());
+    let restarted =
+        RuntimeOverrideManager::load(fixture._directory.path(), &fixture.service.base_config)
+            .await
+            .unwrap();
+    assert!(restarted
+        .effective_interface("wlan0")
+        .await
+        .unwrap()
+        .unwrap()
+        .wifi
+        .is_none());
+    runtime.ensure_alive().await.unwrap();
+    assert!(fixture.process.configs.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn stale_or_unknown_offline_edit_does_not_stop_retained_ap() {
+    for unknown in [false, true] {
+        let fixture = wifi_enabled_fixture().await;
+        let runtime = fixture.service.wifi.as_ref().unwrap();
+        let pid = runtime.status("wlan0").await.unwrap().pid;
+        let mut config = fixture
+            .service
+            .overrides
+            .effective_interface("wlan0")
+            .await
+            .unwrap()
+            .unwrap();
+        config.wifi = None;
+        fixture.network.interfaces.lock().await.remove("wlan0");
+        *fixture.network.fail_interface_observation.lock().await = unknown;
+        let response = fixture
+            .service
+            .dispatch(Request::SaveWifiInterface {
+                interface: "wlan0".into(),
+                config: config.into(),
+                expected_revision: if unknown { 0 } else { 7 },
+                passphrase: None,
+            })
+            .await;
+        assert!(matches!(response, Response::Error { .. }), "{response:?}");
+        assert!(fixture.process.is_alive(pid).await.unwrap());
+        assert!(runtime.status("wlan0").await.is_some());
+        assert_eq!(fixture.service.overrides.committed_revision().await, 0);
+    }
+}
+
+#[tokio::test]
+async fn unplugged_ap_persistence_failure_keeps_previous_durable_intent_and_wakes_reconcile() {
+    let fixture = wifi_enabled_fixture().await;
+    let runtime = fixture.service.wifi.as_ref().unwrap();
+    let pid = runtime.status("wlan0").await.unwrap().pid;
+    let previous = fixture
+        .service
+        .overrides
+        .effective_interface("wlan0")
+        .await
+        .unwrap()
+        .unwrap();
+    fixture.network.interfaces.lock().await.remove("wlan0");
+    std::fs::create_dir(fixture.service.overrides.path()).unwrap();
+    let response = fixture
+        .service
+        .dispatch(Request::DisableWifi {
+            interface: "wlan0".into(),
+        })
+        .await;
+    assert!(matches!(response, Response::Error { .. }), "{response:?}");
+    assert!(!fixture.process.is_alive(pid).await.unwrap());
+    assert!(runtime.status("wlan0").await.is_none());
+    assert_eq!(fixture.service.overrides.committed_revision().await, 0);
+    assert_eq!(
+        fixture
+            .service
+            .overrides
+            .effective_interface("wlan0")
+            .await
+            .unwrap(),
+        Some(previous.clone())
+    );
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        fixture.service.overrides.changed(),
+    )
+    .await
+    .unwrap();
+    std::fs::remove_dir(fixture.service.overrides.path()).unwrap();
+    let restarted =
+        RuntimeOverrideManager::load(fixture._directory.path(), &fixture.service.base_config)
+            .await
+            .unwrap();
+    assert_eq!(
+        restarted.effective_interface("wlan0").await.unwrap(),
+        Some(previous)
+    );
+}
+
+#[tokio::test]
+async fn unplugged_ap_changed_process_proof_blocks_cleanup_and_preserves_intent() {
+    let fixture = wifi_enabled_fixture().await;
+    let runtime = fixture.service.wifi.as_ref().unwrap();
+    let pid = runtime.status("wlan0").await.unwrap().pid;
+    fixture.network.interfaces.lock().await.remove("wlan0");
+    // Model PID reuse / external replacement of the recorded process identity.
+    fixture
+        .process
+        .configs
+        .lock()
+        .unwrap()
+        .insert(pid, fixture._directory.path().join("foreign.conf"));
+    let response = fixture
+        .service
+        .dispatch(Request::DisableWifi {
+            interface: "wlan0".into(),
+        })
+        .await;
+    assert!(matches!(response, Response::Error { .. }), "{response:?}");
+    assert!(fixture.process.is_alive(pid).await.unwrap());
+    assert!(runtime.status("wlan0").await.is_some());
+    assert_eq!(fixture.service.overrides.committed_revision().await, 0);
+    assert!(fixture
+        .service
+        .overrides
+        .effective_interface("wlan0")
+        .await
+        .unwrap()
+        .unwrap()
+        .wifi
+        .is_some());
+}
+
+#[tokio::test]
+async fn unplugged_client_disable_stops_supplicant_and_dhcp_before_commit() {
+    let fixture = wifi_client_enabled_fixture().await;
+    let runtime = fixture.service.wifi_client.as_ref().unwrap();
+    let dhcp = fixture.service.dhcp_client.as_ref().unwrap();
+    let pid = runtime.status("wlan1").await.unwrap().pid;
+    fixture.network.missing.store(true, WifiOrdering::SeqCst);
+    let response = fixture
+        .service
+        .dispatch(Request::DisableWifiClient {
+            interface: "wlan1".into(),
+        })
+        .await;
+    assert!(
+        matches!(
+            response,
+            Response::InterfaceIntentSaved { deferred: true, .. }
+        ),
+        "{response:?}"
+    );
+    assert!(!fixture.process.is_alive(pid).await.unwrap());
+    assert!(runtime.status("wlan1").await.is_none());
+    assert!(dhcp.spec("wlan1").await.is_none());
+    let config = fixture
+        .service
+        .overrides
+        .effective_interface("wlan1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(config.wifi_client.is_none());
+    // The fixture's DHCP policy was configured independently of Wi-Fi.
+    assert!(config.dhcp_client.unwrap().enabled);
+    runtime.ensure_alive().await.unwrap();
+    assert!(fixture.process.configs.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn unplugged_ap_provisioning_commits_new_secret_after_runtime_cleanup() {
+    let fixture = wifi_enabled_fixture().await;
+    let runtime = fixture.service.wifi.as_ref().unwrap();
+    let pid = runtime.status("wlan0").await.unwrap().pid;
+    fixture.network.interfaces.lock().await.remove("wlan0");
+    let mut config = fixture
+        .service
+        .overrides
+        .effective_interface("wlan0")
+        .await
+        .unwrap()
+        .unwrap();
+    let ap = config.wifi.as_mut().unwrap();
+    ap.ssid = "new-offline-ap".into();
+    ap.security = WifiSecurity::Wpa2;
+    let response = fixture
+        .service
+        .dispatch(Request::SaveWifiInterface {
+            interface: "wlan0".into(),
+            config: config.into(),
+            expected_revision: 0,
+            passphrase: Some("offline-new-password".into()),
+        })
+        .await;
+    assert!(
+        matches!(
+            response,
+            Response::InterfaceIntentSaved { deferred: true, .. }
+        ),
+        "{response:?}"
+    );
+    assert!(!fixture.process.is_alive(pid).await.unwrap());
+    assert!(runtime.status("wlan0").await.is_none());
+    let config = fixture
+        .service
+        .overrides
+        .effective_interface("wlan0")
+        .await
+        .unwrap()
+        .unwrap();
+    let ap = config.wifi.unwrap();
+    assert_eq!(ap.ssid, "new-offline-ap");
+    assert_eq!(
+        std::fs::read_to_string(ap.passphrase_file.unwrap()).unwrap(),
+        "offline-new-password"
+    );
+}
+
+#[tokio::test]
+async fn unplugged_ap_orphaned_or_interrupted_ownership_cannot_be_forgotten() {
+    for interrupted in [false, true] {
+        let mut fixture = wifi_enabled_fixture().await;
+        let pid = fixture
+            .service
+            .wifi
+            .as_ref()
+            .unwrap()
+            .status("wlan0")
+            .await
+            .unwrap()
+            .pid;
+        fixture.network.interfaces.lock().await.remove("wlan0");
+        if interrupted {
+            let store = crate::wifi::record::WifiRecordStore::for_access_point(
+                fixture._directory.path().join("wifi"),
+                &fixture.service.config.wifi.runtime_dir,
+                "wlan0",
+            );
+            store.mark_transition().await.unwrap();
+        } else {
+            // Reopen without task adoption: the durable process record remains.
+            fixture.service.wifi = Some(WifiSupervisor::open_with_process_for_recovery(
+                &fixture.service.config,
+                fixture.process.clone(),
+            ));
+        }
+        let response = fixture
+            .service
+            .dispatch(Request::ForgetInterfaceConfig {
+                interface: "wlan0".into(),
+                expected_revision: 0,
+            })
+            .await;
+        assert!(matches!(response, Response::Error { .. }), "{response:?}");
+        assert!(fixture.process.is_alive(pid).await.unwrap());
+        assert_eq!(fixture.service.overrides.committed_revision().await, 0);
+        assert!(fixture
+            .service
+            .overrides
+            .effective_interface("wlan0")
+            .await
+            .unwrap()
+            .is_some());
+    }
+}
+
+#[tokio::test]
+async fn unplugged_ap_cleanup_failure_retains_process_record_and_allows_verified_retry() {
+    let fixture = wifi_enabled_fixture().await;
+    let runtime = fixture.service.wifi.as_ref().unwrap();
+    let pid = runtime.status("wlan0").await.unwrap().pid;
+    fixture.network.interfaces.lock().await.remove("wlan0");
+    fixture.process.fail_stop.store(true, WifiOrdering::SeqCst);
+    let store = crate::wifi::record::WifiRecordStore::for_access_point(
+        fixture._directory.path().join("wifi"),
+        &fixture.service.config.wifi.runtime_dir,
+        "wlan0",
+    );
+    let previous = store.load().await.unwrap().unwrap();
+    let response = fixture
+        .service
+        .dispatch(Request::ForgetInterfaceConfig {
+            interface: "wlan0".into(),
+            expected_revision: 0,
+        })
+        .await;
+    assert!(
+        matches!(response, Response::Error { ref message } if message.contains("previous saved intent retained")),
+        "{response:?}"
+    );
+    assert!(fixture.process.is_alive(pid).await.unwrap());
+    assert_eq!(store.load().await.unwrap(), Some(previous));
+    assert_eq!(fixture.service.overrides.committed_revision().await, 0);
+    fixture.process.fail_stop.store(false, WifiOrdering::SeqCst);
+    let response = fixture
+        .service
+        .dispatch(Request::ForgetInterfaceConfig {
+            interface: "wlan0".into(),
+            expected_revision: 0,
+        })
+        .await;
+    assert!(
+        matches!(response, Response::InterfaceIntentSaved { .. }),
+        "{response:?}"
+    );
+    assert!(!fixture.process.is_alive(pid).await.unwrap());
+    assert!(store.load().await.unwrap().is_none());
+    assert!(fixture
+        .service
+        .overrides
+        .effective_interface("wlan0")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn replug_during_cleanup_does_not_commit_offline_intent_or_touch_replacement() {
+    let fixture = wifi_enabled_fixture().await;
+    let network = fixture.network.clone();
+    fixture.network.interfaces.lock().await.remove("wlan0");
+    let mut replacement = fixture.service.network.list_interfaces().await.unwrap();
+    assert!(replacement.is_empty());
+    replacement.push(NetworkInterface {
+        name: "wlan0".into(),
+        index: 99,
+        is_up: true,
+        rx_bytes: 0,
+        tx_bytes: 0,
+        is_wireless: true,
+    });
+    *fixture.process.after_stop.lock().unwrap() = Some(Box::new(move || {
+        network
+            .interfaces
+            .try_lock()
+            .unwrap()
+            .insert("wlan0".into(), replacement[0].clone());
+    }));
+    let response = fixture
+        .service
+        .dispatch(Request::ForgetInterfaceConfig {
+            interface: "wlan0".into(),
+            expected_revision: 0,
+        })
+        .await;
+    assert!(
+        matches!(response, Response::Error { ref message } if message.contains("observation changed")),
+        "{response:?}"
+    );
+    assert_eq!(fixture.service.overrides.committed_revision().await, 0);
+    assert!(fixture
+        .service
+        .overrides
+        .effective_interface("wlan0")
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(fixture.network.interfaces.lock().await["wlan0"].index, 99);
+    assert!(fixture.process.configs.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn partially_stopped_ap_cleanup_preserves_intent_until_storage_is_repaired() {
+    let fixture = wifi_enabled_fixture().await;
+    let runtime = fixture.service.wifi.as_ref().unwrap();
+    let pid = runtime.status("wlan0").await.unwrap().pid;
+    fixture.network.interfaces.lock().await.remove("wlan0");
+    let config_path = fixture.process.configs.lock().unwrap()[&pid].clone();
+    let bad_path = config_path.clone();
+    *fixture.process.after_stop.lock().unwrap() = Some(Box::new(move || {
+        std::fs::remove_file(&bad_path).unwrap();
+        std::fs::create_dir(&bad_path).unwrap();
+    }));
+    let response = fixture
+        .service
+        .dispatch(Request::DisableWifi {
+            interface: "wlan0".into(),
+        })
+        .await;
+    assert!(matches!(response, Response::Error { .. }), "{response:?}");
+    assert!(!fixture.process.is_alive(pid).await.unwrap());
+    assert_eq!(fixture.service.overrides.committed_revision().await, 0);
+    assert!(fixture
+        .service
+        .overrides
+        .effective_interface("wlan0")
+        .await
+        .unwrap()
+        .unwrap()
+        .wifi
+        .is_some());
+    std::fs::remove_dir(config_path).unwrap();
+    let response = fixture
+        .service
+        .dispatch(Request::DisableWifi {
+            interface: "wlan0".into(),
+        })
+        .await;
+    assert!(
+        matches!(response, Response::InterfaceIntentSaved { .. }),
+        "{response:?}"
+    );
+    assert!(runtime.status("wlan0").await.is_none());
+    assert!(fixture
+        .service
+        .overrides
+        .effective_interface("wlan0")
+        .await
+        .unwrap()
+        .unwrap()
+        .wifi
         .is_none());
 }

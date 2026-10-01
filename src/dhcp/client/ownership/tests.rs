@@ -23,6 +23,8 @@ struct FakeNetwork {
     route_adds: Mutex<usize>,
     fail_route_add: Mutex<Option<usize>>,
     hide_interface: Mutex<bool>,
+    fail_observation: Mutex<bool>,
+    fail_route_observation: Mutex<bool>,
     extra_interfaces: Mutex<Vec<NetworkInterface>>,
 }
 
@@ -39,8 +41,11 @@ impl FakeNetwork {
 #[async_trait]
 impl NetworkProvider for FakeNetwork {
     async fn list_interfaces(&self) -> Result<Vec<NetworkInterface>> {
+        if *self.fail_observation.lock().unwrap() {
+            bail!("injected device observation failure");
+        }
         if *self.hide_interface.lock().unwrap() {
-            return Ok(Vec::new());
+            return Ok(self.extra_interfaces.lock().unwrap().clone());
         }
         let mut interfaces = vec![NetworkInterface {
             index: *self.index.lock().unwrap(),
@@ -93,6 +98,9 @@ impl NetworkProvider for FakeNetwork {
         Ok(())
     }
     async fn list_ipv4_routes(&self) -> Result<Vec<Ipv4RouteInfo>> {
+        if *self.fail_route_observation.lock().unwrap() {
+            bail!("injected route observation failure");
+        }
         Ok(self.routes.lock().unwrap().clone())
     }
     async fn add_ipv4_route(&self, route: &Ipv4RouteSpec) -> Result<()> {
@@ -431,6 +439,8 @@ async fn missing_interface_cleanup_removes_record_cleanly() {
     let _bound = applier.apply(lease()).await.unwrap();
     assert!(store.load("eth0").unwrap().is_some());
 
+    network.addresses.lock().unwrap().clear();
+    network.routes.lock().unwrap().clear();
     *network.hide_interface.lock().unwrap() = true;
     applier
         .cleanup("eth0")
@@ -523,4 +533,63 @@ async fn old_index_still_present_under_another_name_blocks_retirement() {
     ));
     assert!(applier.cleanup("eth0").await.is_err());
     assert!(store.load("eth0").unwrap().is_some());
+}
+
+#[tokio::test]
+async fn missing_name_does_not_retire_renamed_identity_or_remaining_routes() {
+    for renamed in [false, true] {
+        for operation in ["cleanup", "suspend"] {
+            let network = FakeNetwork::new();
+            let (_dir, store, applier) = fixture(network.clone());
+            let bound = applier.apply(lease()).await.unwrap();
+            *network.hide_interface.lock().unwrap() = true;
+            if renamed {
+                network
+                    .extra_interfaces
+                    .lock()
+                    .unwrap()
+                    .push(NetworkInterface {
+                        index: bound.interface_index,
+                        name: "renamed0".into(),
+                        is_up: true,
+                        rx_bytes: 0,
+                        tx_bytes: 0,
+                        is_wireless: false,
+                    });
+            }
+            let addresses = network.addresses.lock().unwrap().clone();
+            let routes = network.routes.lock().unwrap().clone();
+            let result = if operation == "cleanup" {
+                applier.cleanup("eth0").await
+            } else {
+                applier
+                    .suspend("eth0", bound.expires_at_unix - 1)
+                    .await
+                    .map(|_| ())
+            };
+            assert!(result.is_err(), "{operation}, renamed={renamed}");
+            assert_eq!(store.load("eth0").unwrap(), Some(bound));
+            assert_eq!(*network.addresses.lock().unwrap(), addresses);
+            assert_eq!(*network.routes.lock().unwrap(), routes);
+            network.extra_interfaces.lock().unwrap().clear();
+            network.addresses.lock().unwrap().clear();
+            network.routes.lock().unwrap().clear();
+            applier.cleanup("eth0").await.unwrap();
+            assert!(store.load("eth0").unwrap().is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn missing_cleanup_preserves_proof_when_device_or_route_observation_fails() {
+    for routes_fail in [false, true] {
+        let network = FakeNetwork::new();
+        let (_dir, store, applier) = fixture(network.clone());
+        let bound = applier.apply(lease()).await.unwrap();
+        *network.hide_interface.lock().unwrap() = true;
+        *network.fail_observation.lock().unwrap() = !routes_fail;
+        *network.fail_route_observation.lock().unwrap() = routes_fail;
+        assert!(applier.cleanup("eth0").await.is_err());
+        assert_eq!(store.load("eth0").unwrap(), Some(bound));
+    }
 }

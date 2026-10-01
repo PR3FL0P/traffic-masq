@@ -141,6 +141,23 @@ impl ControlService {
         }
         missing_dependencies.sort();
         missing_dependencies.dedup();
+        // Cleanup has its own durable process/lease ownership proofs. Until all
+        // services stop, the existing committed intent remains the rollback
+        // target, including after interruption/restart. Never restart a service
+        // against a missing or replacement device merely to compensate a stop.
+        let _resume = MissingCleanupWakeup(&self.overrides);
+        self.cleanup_missing_interface_runtime(&interface)
+            .await
+            .map_err(|error| {
+                let message = format!("missing-device runtime cleanup failed; previous saved intent retained: {error:#}");
+                error.context(message)
+            })?;
+        self.check_missing_interface_write(&interface)
+            .await
+            .map_err(|error| {
+                let message = format!("device observation changed during cleanup; previous saved intent retained: {error:#}");
+                error.context(message)
+            })?;
         let revision = self.overrides.commit_candidate(&candidate).await?;
         Ok(Response::InterfaceIntentSaved {
             interface,
@@ -161,25 +178,66 @@ impl ControlService {
                 "interface {interface} is present; use a confirmed live interface transaction"
             );
         }
-        // An unplugged device can still have a task holding daemon resources.
-        // Intent-only writes must not strand that task or erase its cleanup proof.
-        if self.dhcp.spec(interface).await.is_some()
-            || match &self.dhcp_client {
-                Some(runtime) => runtime.spec(interface).await.is_some(),
-                None => false,
-            }
-            || match &self.wifi {
-                Some(runtime) => runtime.status(interface).await.is_some(),
-                None => false,
-            }
-            || match &self.wifi_client {
-                Some(runtime) => runtime.status(interface).await.is_some(),
-                None => false,
-            }
-        {
-            anyhow::bail!("interface {interface} retains service runtime ownership; stop its services and complete cleanup before saving offline intent");
-        }
         Ok(observed)
+    }
+
+    async fn cleanup_missing_interface_runtime(&self, interface: &str) -> Result<()> {
+        use crate::wifi::record::{WifiProcessKind, WifiRecordStore};
+        let records = self.config.runtime.state_dir.join("wifi");
+        // A missing supervisor does not prove that its persisted processes or
+        // leases are gone. Scans have no retained service task to stop here.
+        for (kind, available, directory) in [
+            (
+                WifiProcessKind::AccessPoint,
+                self.wifi.is_some(),
+                &self.config.wifi.runtime_dir,
+            ),
+            (
+                WifiProcessKind::Client,
+                self.wifi_client.is_some(),
+                &self.config.wifi_client.runtime_dir,
+            ),
+            (
+                WifiProcessKind::Scan,
+                false,
+                &self.config.wifi_client.runtime_dir,
+            ),
+        ] {
+            if !available {
+                let store = WifiRecordStore::new(kind, &records, directory, interface);
+                anyhow::ensure!(store.load().await?.is_none() && !store.transition_pending().await?,
+                    "interface {interface} retains {kind:?} ownership without a service task; recovery required");
+            }
+        }
+        if self.dhcp_client.is_none() {
+            let store = crate::dhcp::client::store::DhcpClientLeaseStore::new(
+                &self.config.runtime.state_dir,
+            )?;
+            anyhow::ensure!(store.load(interface)?.is_none(),
+                "interface {interface} retains DHCP lease ownership without its supervisor; recovery required");
+        }
+        // Check all Wi-Fi ownership documents before stopping any service.
+        // An orphan, changed proof or interrupted launch is recovery work, not
+        // authority to forget a process based on its interface name.
+        if let Some(runtime) = &self.wifi {
+            runtime.check_cleanup_ownership(interface).await?;
+        }
+        if let Some(runtime) = &self.wifi_client {
+            runtime.check_cleanup_ownership(interface).await?;
+        }
+        // Lease cleanup verifies the device identity and exact owned routes.
+        // Do it first so a conflict cannot stop otherwise healthy Wi-Fi tasks.
+        if let Some(runtime) = &self.dhcp_client {
+            runtime.disable(interface).await?;
+        }
+        if let Some(runtime) = &self.wifi_client {
+            runtime.disable(interface).await?;
+        }
+        if let Some(runtime) = &self.wifi {
+            runtime.disable(interface).await?;
+        }
+        self.dhcp.disable(interface).await?;
+        Ok(())
     }
 
     pub(super) async fn validate_default_route_management(
@@ -387,4 +445,13 @@ pub(super) async fn interface_statuses(
     }
     result.sort_by(|left, right| left.interface.name.cmp(&right.interface.name));
     Ok(result)
+}
+
+/// Also wakes the unchanged committed intent if an API future is cancelled.
+struct MissingCleanupWakeup<'a>(&'a RuntimeOverrideManager);
+
+impl Drop for MissingCleanupWakeup<'_> {
+    fn drop(&mut self) {
+        self.0.request_reconcile();
+    }
 }

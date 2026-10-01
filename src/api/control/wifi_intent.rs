@@ -45,7 +45,7 @@ impl ControlService {
         })
     }
 
-    /// Legacy service actions may save missing targets only when no runtime task holds them.
+    /// Legacy service actions save missing targets after verified runtime cleanup.
     pub(super) async fn missing_wifi_edit(
         &self,
         interface: &str,
@@ -53,20 +53,6 @@ impl ControlService {
         disable: bool,
         passphrase: Option<String>,
     ) -> Result<Option<Response>> {
-        let holds_runtime = if client {
-            match &self.wifi_client {
-                Some(runtime) => runtime.status(interface).await.is_some(),
-                None => false,
-            }
-        } else {
-            match &self.wifi {
-                Some(runtime) => runtime.status(interface).await.is_some(),
-                None => false,
-            }
-        };
-        if holds_runtime {
-            return Ok(None);
-        }
         let _execution = if disable {
             Some(self.network_mutations.execute().await)
         } else {
