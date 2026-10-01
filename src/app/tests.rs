@@ -448,22 +448,27 @@ impl WifiRuntimeReconciler for FakeWifiReconciler {
     }
 }
 
+#[derive(Clone)]
 struct FakeDataplaneProvider {
-    state: Mutex<RouterDataplaneSnapshot>,
-    fail_next_apply: Mutex<bool>,
-    missing_next_apply: Mutex<Option<(String, String)>>,
+    state: Arc<Mutex<RouterDataplaneSnapshot>>,
+    fail_next_apply: Arc<Mutex<bool>>,
+    missing_next_apply: Arc<Mutex<Option<(String, String)>>>,
+    apply_calls: Arc<std::sync::atomic::AtomicUsize>,
+    restore_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Default for FakeDataplaneProvider {
     fn default() -> Self {
         Self {
-            state: Mutex::new(RouterDataplaneSnapshot {
+            state: Arc::new(Mutex::new(RouterDataplaneSnapshot {
                 ipv4_forwarding: false,
                 owned: None,
                 owned_firewall_integrity: OwnedFirewallIntegrity::Intact,
-            }),
-            fail_next_apply: Mutex::new(false),
-            missing_next_apply: Mutex::new(None),
+            })),
+            fail_next_apply: Arc::new(Mutex::new(false)),
+            missing_next_apply: Arc::new(Mutex::new(None)),
+            apply_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            restore_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }
@@ -475,6 +480,8 @@ impl RouterDataplaneProvider for FakeDataplaneProvider {
     }
 
     async fn apply_owned(&self, desired: &RouterDataplaneDesired) -> Result<()> {
+        self.apply_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if let Some((role, interface)) = self.missing_next_apply.lock().await.take() {
             return Err(RouterDataplaneInterfaceMissing { role, interface }.into());
         }
@@ -496,6 +503,8 @@ impl RouterDataplaneProvider for FakeDataplaneProvider {
     }
 
     async fn restore_owned(&self, snapshot: &RouterDataplaneSnapshot) -> Result<()> {
+        self.restore_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         *self.state.lock().await = snapshot.clone();
         Ok(())
     }
@@ -1852,6 +1861,180 @@ async fn router_startup_repair_waits_for_missing_lan_and_uplink() {
         .is_empty());
     // Presence, not link readiness: a down interface can be raised by repair.
     assert!(network.routes.lock().await.is_empty());
+
+    let mut desired = desired;
+    desired.routes[0].output_interface = Some("route0".into());
+    assert_eq!(
+        missing_router_repair_interfaces(&desired, &network)
+            .await
+            .unwrap(),
+        vec!["route0"]
+    );
+}
+
+fn sharing_config() -> AppConfig {
+    let mut config = AppConfig::default();
+    for (name, role, ipv4) in [
+        ("lan0", InterfaceRole::Output, Some("192.168.88.1/24")),
+        ("lan1", InterfaceRole::Output, Some("192.168.111.1/24")),
+        ("wan0", InterfaceRole::Input, None),
+    ] {
+        config.network.interfaces.insert(
+            name.into(),
+            InterfaceConfig {
+                role,
+                managed: true,
+                ipv4: ipv4.map(|ip| ip.parse().unwrap()),
+                dhcp: None,
+                dhcp_client: None,
+                wifi: None,
+                wifi_client: None,
+                nat: false,
+            },
+        );
+    }
+    config.router.enabled = true;
+    config.router.forwarding = Some(
+        ["lan0", "lan1"]
+            .into_iter()
+            .map(|from| crate::config::ForwardingConfig {
+                from: from.into(),
+                to: "wan0".into(),
+                source_subnet: None,
+                masquerade: true,
+            })
+            .collect(),
+    );
+    config
+}
+
+#[tokio::test]
+async fn sharing_repair_checks_all_forwarding_interfaces_without_legacy_uplink() {
+    let config = sharing_config();
+    let desired = RouterDesired::from_effective_config(&config).unwrap();
+    assert!(!desired.interfaces.iter().any(|entry| entry.name == "wan0"));
+    let network = FakeNetworkProvider::default();
+    network.add_interface("lan0", 1).await;
+    network.add_interface("lan1", 2).await;
+    assert_eq!(
+        missing_router_repair_interfaces(&desired, &network)
+            .await
+            .unwrap(),
+        vec!["wan0"]
+    );
+    network.add_interface("wan0", 3).await;
+    assert!(missing_router_repair_interfaces(&desired, &network)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // Explicit rules may also reference interfaces with no managed config,
+    // including externally created tunnels. Both endpoints must be observed.
+    let mut config = config;
+    config.router.forwarding.as_mut().unwrap()[1].from = "external0".into();
+    config.router.forwarding.as_mut().unwrap()[1].to = "tun0".into();
+    let desired = RouterDesired::from_effective_config(&config).unwrap();
+    assert_eq!(
+        missing_router_repair_interfaces(&desired, &network)
+            .await
+            .unwrap(),
+        vec!["external0", "tun0"]
+    );
+    network.add_interface("external0", 4).await;
+    network.add_interface("tun0", 5).await;
+    assert!(missing_router_repair_interfaces(&desired, &network)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // Disabled forwarding must still permit removal of old firewall rules.
+    config.router.enabled = false;
+    let desired = RouterDesired::from_effective_config(&config).unwrap();
+    assert!(
+        missing_router_repair_interfaces(&desired, &FakeNetworkProvider::default())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn sharing_repair_defers_before_mutations_and_resumes_after_replug() {
+    use crate::core::route::RouteManager;
+    use crate::core::router::RouterManager;
+    use crate::core::router_subsystems::ProductionRouterSubsystems;
+    use crate::core::router_transaction::{CoordinatorStatus, RouterTransactionCoordinator};
+    use crate::firewall::RouterDataplaneManager;
+    use std::sync::atomic::Ordering;
+
+    let directory = tempdir().unwrap();
+    let mut config = sharing_config();
+    config.runtime.state_dir = directory.path().to_path_buf();
+    config.dhcp.leases_dir = directory.path().join("leases");
+    let desired = RouterDesired::from_effective_config(&config).unwrap();
+    let network = Arc::new(FakeNetworkProvider::default());
+    network.add_interface("lan0", 1).await;
+    network.add_interface("lan1", 2).await;
+    let provider = FakeDataplaneProvider::default();
+    *provider.missing_next_apply.lock().await = Some(("egress".into(), "wan0".into()));
+    let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+        .await
+        .unwrap();
+    let dhcp = DhcpSupervisor::start(&config).await.unwrap();
+    let subsystems = ProductionRouterSubsystems::new(
+        InterfaceManager::new(network.clone(), AddressOwnershipJournal::in_memory()),
+        RouteManager::new(network.clone()),
+        dhcp,
+        RouterDataplaneManager::new(provider.clone()),
+        desired
+            .interfaces
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect(),
+    );
+    let router = RouterTransactionCoordinator::new(
+        RouterManager::new(Arc::new(subsystems)),
+        overrides,
+        Duration::from_secs(30),
+    );
+    for _ in 0..3 {
+        let error = super::reconcile::reconcile_router_dataplane(
+            &router,
+            desired.clone(),
+            network.as_ref(),
+        )
+        .await
+        .expect_err("missing egress must defer repair before opening a journal");
+        assert_eq!(
+            crate::firewall::missing_router_dataplane_interface(&error)
+                .unwrap()
+                .interface,
+            "wan0"
+        );
+        assert_eq!(router.status().await, CoordinatorStatus::Idle);
+        assert!(!directory.path().join("router-transaction.json").exists());
+    }
+    assert_eq!(provider.apply_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.restore_calls.load(Ordering::SeqCst), 0);
+    assert!(network.routes.lock().await.is_empty());
+
+    network.add_interface("wan0", 3).await;
+    provider.missing_next_apply.lock().await.take();
+    for _ in 0..2 {
+        super::reconcile::reconcile_router_dataplane(&router, desired.clone(), network.as_ref())
+            .await
+            .unwrap();
+    }
+    assert_eq!(provider.apply_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.restore_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        provider.state.lock().await.owned,
+        match desired.dataplane {
+            crate::firewall::RouterDataplaneTarget::Enabled(wanted) => Some(wanted),
+            crate::firewall::RouterDataplaneTarget::Disabled => panic!("sharing should be enabled"),
+        }
+    );
+    assert_eq!(router.status().await, CoordinatorStatus::Idle);
 }
 
 #[tokio::test]

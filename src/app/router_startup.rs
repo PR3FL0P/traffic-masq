@@ -103,7 +103,8 @@ where
     })
 }
 
-/// Full startup repair must not snapshot/plan absent physical interfaces.
+/// Repair must not snapshot/plan absent interface dependencies, including
+/// endpoints used only by explicit forwarding rules or router-owned routes.
 /// The runtime interface converger and dataplane reconciler finish this work
 /// when the kernel announces their return. Crash recovery is never skipped.
 pub(super) async fn missing_router_repair_interfaces(
@@ -114,21 +115,41 @@ pub(super) async fn missing_router_repair_interfaces(
         .list_interfaces()
         .await
         .context("failed to observe interfaces before router startup repair")?;
-    let mut missing: Vec<String> = desired
+    let mut required: Vec<&str> = desired
         .interfaces
         .iter()
-        .filter(|entry| {
-            !desired
-                .vpn_chain
-                .iter()
-                .any(|hop| hop.interface == entry.name)
+        .map(|entry| entry.name.as_str())
+        .collect();
+    if let crate::firewall::RouterDataplaneTarget::Enabled(dataplane) = &desired.dataplane {
+        if let Some(rules) = &dataplane.forwarding {
+            for rule in rules {
+                required.extend([rule.from.as_str(), rule.to.as_str()]);
+            }
+        } else {
+            required.push(&dataplane.uplink);
+            required.extend(
+                dataplane
+                    .outputs
+                    .iter()
+                    .map(|output| output.interface.as_str()),
+            );
+        }
+    }
+    required.extend(
+        desired
+            .routes
+            .iter()
+            .filter_map(|route| route.output_interface.as_deref()),
+    );
+    let mut missing: Vec<String> = required
+        .into_iter()
+        .filter(|name| {
+            // Router-owned VPN hops are created by repair itself. External
+            // tunnels referenced in explicit forwarding must already exist.
+            !desired.vpn_chain.iter().any(|hop| hop.interface == *name)
         })
-        .filter(|entry| {
-            !observed
-                .iter()
-                .any(|interface| interface.name == entry.name)
-        })
-        .map(|entry| entry.name.clone())
+        .filter(|name| !observed.iter().any(|interface| interface.name == *name))
+        .map(str::to_owned)
         .collect();
     missing.sort();
     missing.dedup();

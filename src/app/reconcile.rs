@@ -175,7 +175,7 @@ fn log_router_dataplane_convergence_error(error: &anyhow::Error) {
     }
 }
 
-async fn reconcile_router_dataplane(
+pub(super) async fn reconcile_router_dataplane(
     router: &RouterTransactionCoordinator,
     desired: RouterDesired,
     network: &dyn NetworkProvider,
