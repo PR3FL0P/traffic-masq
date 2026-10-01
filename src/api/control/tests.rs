@@ -8623,3 +8623,372 @@ async fn partially_stopped_ap_cleanup_preserves_intent_until_storage_is_repaired
         .wifi
         .is_none());
 }
+
+async fn offline_client_profile_fixture() -> (ControlService, tempfile::TempDir) {
+    let directory = tempdir().unwrap();
+    let mut base = wifi_client_base_config(directory.path());
+    let config = base.network.interfaces.get_mut("wlan1").unwrap();
+    config.ipv4 = Some("192.0.2.10/24".parse().unwrap());
+    config.dhcp_client.as_mut().unwrap().enabled = false;
+    let overrides = RuntimeOverrideManager::load(directory.path(), &base)
+        .await
+        .unwrap();
+    let dhcp = DhcpSupervisor::start(&base).await.unwrap();
+    let service = ControlService::new(
+        base,
+        Arc::new(crate::test_support::FakeNetworkProvider::default()),
+        dhcp,
+        overrides,
+    );
+    let response = service
+        .dispatch(Request::CreateWifiClientProfile {
+            profile: WifiClientProfileWriteRequest {
+                id: "saved-uplink".into(),
+                ssid: "Offline uplink".into(),
+                country_code: Some("UA".into()),
+                security: WifiClientSecurity::Wpa2,
+                priority: 0,
+                autoconnect: false,
+                passphrase: Some("profile-original-password".into()),
+                clear_passphrase: false,
+            },
+        })
+        .await;
+    assert!(
+        matches!(response, Response::WifiClientProfile { .. }),
+        "{response:?}"
+    );
+    (service, directory)
+}
+
+#[tokio::test]
+async fn offline_client_profile_preserves_or_updates_ip_policy_without_execution() {
+    use traffic_masq_protocol::{ProvisionWifiClientRequest, WifiClientIpPolicy};
+    for policy in [
+        WifiClientIpPolicy::Preserve,
+        WifiClientIpPolicy::Dhcp,
+        WifiClientIpPolicy::Static {
+            cidr: "198.51.100.10/24".parse().unwrap(),
+        },
+    ] {
+        let (service, directory) = offline_client_profile_fixture().await;
+        let response = service
+            .dispatch(Request::SaveWifiClientProfile {
+                interface: "wlan1".into(),
+                settings: ProvisionWifiClientRequest {
+                    profile_id: "saved-uplink".into(),
+                    ip_policy: policy.clone(),
+                },
+                expected_revision: 0,
+            })
+            .await;
+        assert!(
+            matches!(
+                response,
+                Response::InterfaceIntentSaved {
+                    deferred: true,
+                    revision: 1,
+                    ..
+                }
+            ),
+            "{response:?}"
+        );
+        let config = service
+            .overrides
+            .effective_interface("wlan1")
+            .await
+            .unwrap()
+            .unwrap();
+        match policy {
+            WifiClientIpPolicy::Preserve => {
+                assert_eq!(config.ipv4, Some("192.0.2.10/24".parse().unwrap()))
+            }
+            WifiClientIpPolicy::Dhcp => {
+                assert!(config.ipv4.is_none());
+                assert!(config.dhcp_client.as_ref().unwrap().enabled);
+            }
+            WifiClientIpPolicy::Static { cidr } => {
+                assert_eq!(config.ipv4, Some(cidr));
+                assert!(!config.dhcp_client.as_ref().unwrap().enabled);
+            }
+        }
+        assert!(!config.dhcp_client.as_ref().unwrap().wifi_owned);
+        let client = config.wifi_client.as_ref().unwrap();
+        assert_eq!(client.ssid, "Offline uplink");
+        assert_eq!(
+            std::fs::read_to_string(client.passphrase_file.as_ref().unwrap()).unwrap(),
+            "profile-original-password"
+        );
+        assert!(!serde_json::to_string(&response)
+            .unwrap()
+            .contains("profile-original-password"));
+        let restarted = RuntimeOverrideManager::load(directory.path(), &service.base_config)
+            .await
+            .unwrap();
+        assert_eq!(
+            restarted.effective_interface("wlan1").await.unwrap(),
+            Some(config)
+        );
+        match service.dispatch(Request::ListWifiInventory).await {
+            Response::WifiInventory {
+                ap_execution_available,
+                client_execution_available,
+                interfaces,
+                ..
+            } => {
+                assert!(!ap_execution_available && !client_execution_available);
+                assert!(
+                    interfaces
+                        .iter()
+                        .any(|entry| entry.interface.name == "wlan1"
+                            && entry.client_runtime.is_none())
+                );
+            }
+            response => panic!("{response:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn offline_profile_reference_is_immutable_and_stale_selection_cannot_replace_it() {
+    use traffic_masq_protocol::{ProvisionWifiClientRequest, WifiClientIpPolicy};
+    let (service, _directory) = offline_client_profile_fixture().await;
+    let settings = ProvisionWifiClientRequest {
+        profile_id: "saved-uplink".into(),
+        ip_policy: WifiClientIpPolicy::Preserve,
+    };
+    assert!(matches!(
+        service
+            .dispatch(Request::SaveWifiClientProfile {
+                interface: "wlan1".into(),
+                settings: settings.clone(),
+                expected_revision: 0,
+            })
+            .await,
+        Response::InterfaceIntentSaved { .. }
+    ));
+    let previous = service
+        .overrides
+        .effective_interface("wlan1")
+        .await
+        .unwrap()
+        .unwrap();
+    let profile = WifiClientProfileWriteRequest {
+        id: "saved-uplink".into(),
+        ssid: "Updated profile".into(),
+        country_code: Some("UA".into()),
+        security: WifiClientSecurity::Wpa2,
+        priority: 0,
+        autoconnect: false,
+        passphrase: Some("profile-updated-password".into()),
+        clear_passphrase: false,
+    };
+    let response = service
+        .dispatch(Request::UpdateWifiClientProfile {
+            id: "saved-uplink".into(),
+            profile: profile.clone(),
+        })
+        .await;
+    assert!(
+        matches!(response, Response::WifiClientProfile { .. }),
+        "{response:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            previous
+                .wifi_client
+                .as_ref()
+                .unwrap()
+                .passphrase_file
+                .as_ref()
+                .unwrap()
+        )
+        .unwrap(),
+        "profile-original-password"
+    );
+    let response = service
+        .dispatch(Request::SaveWifiClientProfile {
+            interface: "wlan1".into(),
+            settings: settings.clone(),
+            expected_revision: 0,
+        })
+        .await;
+    assert!(matches!(response, Response::Error { .. }), "{response:?}");
+    assert_eq!(
+        service
+            .overrides
+            .effective_interface("wlan1")
+            .await
+            .unwrap(),
+        Some(previous)
+    );
+    let response = service
+        .dispatch(Request::DeleteWifiClientProfile {
+            id: "saved-uplink".into(),
+        })
+        .await;
+    assert!(
+        matches!(response, Response::WifiClientProfileDeleted { .. }),
+        "{response:?}"
+    );
+    let retained = service
+        .overrides
+        .effective_interface("wlan1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(retained.wifi_client.unwrap().passphrase_file.unwrap()).unwrap(),
+        "profile-original-password"
+    );
+    assert!(matches!(
+        service
+            .dispatch(Request::ForgetInterfaceConfig {
+                interface: "wlan1".into(),
+                expected_revision: 1
+            })
+            .await,
+        Response::InterfaceIntentSaved { .. }
+    ));
+    let response = service
+        .dispatch(Request::SaveWifiClientProfile {
+            interface: "wlan1".into(),
+            settings,
+            expected_revision: 2,
+        })
+        .await;
+    assert!(matches!(response, Response::Error { .. }), "{response:?}");
+    assert!(service
+        .overrides
+        .effective_interface("wlan1")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn offline_profile_save_rejects_present_target_before_stopping_supplicant() {
+    let fixture = wifi_client_enabled_fixture().await;
+    let runtime = fixture.service.wifi_client.as_ref().unwrap();
+    let pid = runtime.status("wlan1").await.unwrap().pid;
+    let response = fixture
+        .service
+        .dispatch(Request::SaveWifiClientProfile {
+            interface: "wlan1".into(),
+            settings: traffic_masq_protocol::ProvisionWifiClientRequest {
+                profile_id: "nonexistent".into(),
+                ip_policy: traffic_masq_protocol::WifiClientIpPolicy::Dhcp,
+            },
+            expected_revision: 0,
+        })
+        .await;
+    assert!(
+        matches!(response, Response::Error { ref message } if message.contains("present")),
+        "{response:?}"
+    );
+    assert!(fixture.process.is_alive(pid).await.unwrap());
+    assert_eq!(fixture.service.overrides.committed_revision().await, 0);
+}
+
+#[tokio::test]
+async fn wifi_liveness_cannot_restart_a_task_removed_or_changed_by_newer_intent() {
+    let ap = wifi_enabled_fixture().await;
+    let client = wifi_client_enabled_fixture().await;
+    ap.process.responders.lock().unwrap().clear();
+    ap.process.configs.lock().unwrap().clear();
+    client.process.responders.lock().unwrap().clear();
+    client.process.configs.lock().unwrap().clear();
+    for removed in [false, true] {
+        let mut config = ap.service.base_config.clone();
+        if removed {
+            config.network.interfaces.get_mut("wlan0").unwrap().wifi = None;
+        } else {
+            config
+                .network
+                .interfaces
+                .get_mut("wlan0")
+                .unwrap()
+                .wifi
+                .as_mut()
+                .unwrap()
+                .ssid = "newer-ap".into();
+        }
+        assert!(!ap
+            .service
+            .wifi
+            .as_ref()
+            .unwrap()
+            .ensure_alive_for_config(&config)
+            .await
+            .unwrap());
+        assert!(ap.process.configs.lock().unwrap().is_empty());
+        let mut config = client.service.base_config.clone();
+        if removed {
+            config
+                .network
+                .interfaces
+                .get_mut("wlan1")
+                .unwrap()
+                .wifi_client = None;
+        } else {
+            config
+                .network
+                .interfaces
+                .get_mut("wlan1")
+                .unwrap()
+                .wifi_client
+                .as_mut()
+                .unwrap()
+                .ssid = "newer-client".into();
+        }
+        assert!(!client
+            .service
+            .wifi_client
+            .as_ref()
+            .unwrap()
+            .ensure_alive_for_config(&config)
+            .await
+            .unwrap());
+        assert!(client.process.configs.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn offline_client_disable_suspends_autoconnect_until_explicit_profile_save() {
+    let (service, _directory) = offline_client_profile_fixture().await;
+    let response = service
+        .dispatch(Request::DisableWifiClient {
+            interface: "wlan1".into(),
+        })
+        .await;
+    assert!(
+        matches!(response, Response::InterfaceIntentSaved { .. }),
+        "{response:?}"
+    );
+    assert!(service
+        .wifi_autoconnect
+        .lock()
+        .await
+        .suspended
+        .contains("wlan1"));
+    let response = service
+        .dispatch(Request::SaveWifiClientProfile {
+            interface: "wlan1".into(),
+            expected_revision: 1,
+            settings: traffic_masq_protocol::ProvisionWifiClientRequest {
+                profile_id: "saved-uplink".into(),
+                ip_policy: traffic_masq_protocol::WifiClientIpPolicy::Dhcp,
+            },
+        })
+        .await;
+    assert!(
+        matches!(response, Response::InterfaceIntentSaved { .. }),
+        "{response:?}"
+    );
+    assert!(!service
+        .wifi_autoconnect
+        .lock()
+        .await
+        .suspended
+        .contains("wlan1"));
+}

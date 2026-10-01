@@ -531,6 +531,14 @@ async fn profile_request(
                 "Wi-Fi client deactivation is tentative; confirm before the rollback timer expires",
             );
         }
+        Ok(Response::InterfaceIntentSaved { interface, .. }) => {
+            app.push_message(
+                LogLevel::Info,
+                format!("Saved settings updated for missing interface {interface}"),
+            );
+            load_wifi_data(app, client).await;
+        }
+        Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
         Ok(Response::WifiClientProfileActivated { .. })
         | Ok(Response::WifiClientDisabled { .. }) => {
             app.push_message(LogLevel::Info, "Wi-Fi profile action applied");

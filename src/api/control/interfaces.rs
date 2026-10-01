@@ -141,6 +141,17 @@ impl ControlService {
         }
         missing_dependencies.sort();
         missing_dependencies.dedup();
+        let deactivating_client = self
+            .overrides
+            .effective_interface(&interface)
+            .await?
+            .is_some_and(|config| config.wifi_client.is_some())
+            && candidate
+                .effective_config()
+                .network
+                .interfaces
+                .get(&interface)
+                .is_none_or(|config| config.wifi_client.is_none());
         // Cleanup has its own durable process/lease ownership proofs. Until all
         // services stop, the existing committed intent remains the rollback
         // target, including after interruption/restart. Never restart a service
@@ -159,6 +170,11 @@ impl ControlService {
                 error.context(message)
             })?;
         let revision = self.overrides.commit_candidate(&candidate).await?;
+        if deactivating_client {
+            // Match confirmed live deactivation: queued autoconnect work must
+            // not undo an operator's successful offline disable/forget.
+            self.wifi_autoconnect.lock().await.suspend(&interface);
+        }
         Ok(Response::InterfaceIntentSaved {
             interface,
             revision,

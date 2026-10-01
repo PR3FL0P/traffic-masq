@@ -586,9 +586,6 @@ impl ControlService {
     }
 
     pub(super) async fn list_wifi_client_profiles(&self) -> Response {
-        if self.wifi_client.is_none() {
-            return wifi_client_profile_error(WifiClientProfileErrorDetail::WifiClientDisabled);
-        }
         match self.wifi_client_profiles.list() {
             Ok(profiles) => Response::WifiClientProfiles { profiles },
             Err(error) => classify_wifi_client_profile_error(error),
@@ -596,9 +593,6 @@ impl ControlService {
     }
 
     pub(super) async fn get_wifi_client_profile(&self, id: String) -> Response {
-        if self.wifi_client.is_none() {
-            return wifi_client_profile_error(WifiClientProfileErrorDetail::WifiClientDisabled);
-        }
         match self.wifi_client_profiles.get(&id) {
             Ok(profile) => Response::WifiClientProfile { profile },
             Err(error) => classify_wifi_client_profile_error(error),
@@ -609,9 +603,6 @@ impl ControlService {
         &self,
         mut request: WifiClientProfileWriteRequest,
     ) -> Response {
-        if self.wifi_client.is_none() {
-            return wifi_client_profile_error(WifiClientProfileErrorDetail::WifiClientDisabled);
-        }
         let _mutation = self.wifi_client_mutations.lock().await;
         let passphrase = match request.passphrase.take() {
             Some(raw) => match WifiPassphrase::new(&raw) {
@@ -638,9 +629,6 @@ impl ControlService {
         id: String,
         mut request: WifiClientProfileWriteRequest,
     ) -> Response {
-        if self.wifi_client.is_none() {
-            return wifi_client_profile_error(WifiClientProfileErrorDetail::WifiClientDisabled);
-        }
         if request.id != id {
             return wifi_client_profile_error(WifiClientProfileErrorDetail::InvalidProfile {
                 message: "profile id in the path and body must match".to_string(),
@@ -676,9 +664,6 @@ impl ControlService {
     }
 
     pub(super) async fn delete_wifi_client_profile(&self, id: String) -> Response {
-        let Some(wifi_client) = &self.wifi_client else {
-            return wifi_client_profile_error(WifiClientProfileErrorDetail::WifiClientDisabled);
-        };
         let _mutation = self.wifi_client_mutations.lock().await;
         let profile = match self.wifi_client_profiles.get(&id) {
             Ok(profile) => profile,
@@ -692,7 +677,11 @@ impl ControlService {
         };
         let mut active = Vec::new();
         for interface in effective.network.interfaces.keys() {
-            if let Some(status) = wifi_client.status(interface).await {
+            let status = match &self.wifi_client {
+                Some(runtime) => runtime.status(interface).await,
+                None => None,
+            };
+            if let Some(status) = status {
                 if status.spec.ssid == profile.ssid
                     && status.spec.country_code == profile.country_code
                     && status.spec.security == profile.security

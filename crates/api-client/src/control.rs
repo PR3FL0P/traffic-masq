@@ -109,6 +109,21 @@ pub fn map_request<Interface: Serialize, Proposal: Serialize>(
             body: None,
             synthesize_pong: false,
         },
+        Request::SaveWifiClientProfile {
+            interface,
+            settings,
+            expected_revision,
+        } => RestRequest {
+            method: Method::PUT,
+            path: format!(
+                "{API_PREFIX}/interfaces/{}/wifi-client-intent",
+                encode_path_segment(interface)
+            ),
+            body: Some(serialize_json(
+                &serde_json::json!({"settings": settings, "expected_revision": expected_revision}),
+            )?),
+            synthesize_pong: false,
+        },
         Request::SaveWifiInterface {
             interface,
             config,

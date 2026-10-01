@@ -1160,6 +1160,11 @@ pub enum Request<Interface, Proposal> {
     ListInterfaces,
     ListInterfaceInventory,
     ListWifiInventory,
+    SaveWifiClientProfile {
+        interface: String,
+        settings: ProvisionWifiClientRequest,
+        expected_revision: u64,
+    },
     SaveWifiInterface {
         interface: String,
         config: Interface,
@@ -1443,6 +1448,10 @@ pub enum Response<
     },
     WifiInventory {
         revision: u64,
+        #[serde(default = "default_true")]
+        ap_execution_available: bool,
+        #[serde(default = "default_true")]
+        client_execution_available: bool,
         interfaces: Vec<WifiInventoryEntry>,
         observation_error: Option<String>,
     },
@@ -1803,6 +1812,51 @@ mod tests {
         let debug = format!("{decoded:?}");
         assert!(!debug.contains("private-offline-password"));
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn legacy_wifi_inventory_preserves_execution_availability() {
+        let response: ControlResponse = serde_json::from_value(serde_json::json!({
+            "type": "wifi_inventory", "revision": 7, "interfaces": [], "observation_error": null
+        }))
+        .unwrap();
+        assert!(matches!(
+            response,
+            ControlResponse::WifiInventory {
+                ap_execution_available: true,
+                client_execution_available: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn offline_client_profile_request_retains_revision_and_ip_policy() {
+        let request = ControlRequest::SaveWifiClientProfile {
+            interface: "wlan0".into(),
+            expected_revision: 7,
+            settings: ProvisionWifiClientRequest {
+                profile_id: "home".into(),
+                ip_policy: WifiClientIpPolicy::Static {
+                    cidr: "192.0.2.10/24".parse().unwrap(),
+                },
+            },
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["type"], "save_wifi_client_profile");
+        assert_eq!(encoded["expected_revision"], 7);
+        let decoded: ControlRequest = serde_json::from_value(encoded).unwrap();
+        assert!(matches!(
+            decoded,
+            ControlRequest::SaveWifiClientProfile {
+                expected_revision: 7,
+                settings: ProvisionWifiClientRequest {
+                    ip_policy: WifiClientIpPolicy::Static { .. },
+                    ..
+                },
+                ..
+            }
+        ));
     }
 
     #[test]

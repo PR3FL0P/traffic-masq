@@ -53,6 +53,7 @@ async fn mock_api(
 
 fn radio(name: &str) -> WifiRow {
     WifiRow {
+        execution_available: true,
         presence: traffic_masq_protocol::InterfacePresence::Present,
         configured: None,
         revision: None,
@@ -251,6 +252,7 @@ fn scan(
 async fn ap_options_open_only_on_activation_and_radio_edits_reach_request() {
     let mut app = TuiApp::default();
     app.wifi.rows.push(WifiRow {
+        execution_available: true,
         presence: traffic_masq_protocol::InterfacePresence::Present,
         configured: None,
         revision: None,
@@ -389,6 +391,7 @@ fn profile_editor_builds_create_and_update_payload_without_echoing_saved_secret(
 #[test]
 fn ap_request_is_atomic_and_enables_derived_dhcp_by_default() {
     let row = WifiRow {
+        execution_available: true,
         presence: traffic_masq_protocol::InterfacePresence::Present,
         configured: None,
         revision: None,
@@ -434,6 +437,7 @@ async fn ap_apply_enters_shared_commit_confirm_screen() {
     }])
     .await;
     let row = WifiRow {
+        execution_available: true,
         presence: traffic_masq_protocol::InterfacePresence::Present,
         configured: None,
         revision: None,
@@ -466,6 +470,7 @@ async fn ap_apply_enters_shared_commit_confirm_screen() {
 #[test]
 fn existing_ap_request_preserves_unedited_radio_settings() {
     let row = WifiRow {
+        execution_available: true,
         presence: traffic_masq_protocol::InterfacePresence::Present,
         configured: None,
         revision: None,
@@ -770,6 +775,7 @@ fn primary_navigation_moves_from_radios_into_role_actions() {
     let data = WifiData {
         rows: vec![
             WifiRow {
+                execution_available: true,
                 presence: traffic_masq_protocol::InterfacePresence::Present,
                 configured: None,
                 revision: None,
@@ -779,6 +785,7 @@ fn primary_navigation_moves_from_radios_into_role_actions() {
                 client: None,
             },
             WifiRow {
+                execution_available: true,
                 presence: traffic_masq_protocol::InterfacePresence::Present,
                 configured: None,
                 revision: None,
@@ -805,6 +812,7 @@ fn primary_navigation_moves_from_radios_into_role_actions() {
 async fn wifi_editor_cursor_navigation_and_editing() {
     let mut app = TuiApp::default();
     let row = WifiRow {
+        execution_available: true,
         presence: traffic_masq_protocol::InterfacePresence::Present,
         configured: None,
         revision: None,
@@ -1035,6 +1043,7 @@ fn render_wifi_displays_conflict_advice_when_competing_managers_present() {
     let mut app = TuiApp {
         wifi: WifiData {
             rows: vec![WifiRow {
+                execution_available: true,
                 presence: traffic_masq_protocol::InterfacePresence::Present,
                 configured: None,
                 revision: None,
@@ -1104,6 +1113,7 @@ fn describe_row_state_reports_connected_when_healthy() {
     use traffic_masq_protocol::{WifiClientSpecView as WifiClientSpec, WpaStateView as WpaState};
 
     let row = WifiRow {
+        execution_available: true,
         presence: traffic_masq_protocol::InterfacePresence::Present,
         configured: None,
         revision: None,
@@ -1135,6 +1145,7 @@ fn describe_row_state_reports_joining_starting_when_starting() {
     use traffic_masq_protocol::{WifiClientSpecView as WifiClientSpec, WpaStateView as WpaState};
 
     let row = WifiRow {
+        execution_available: true,
         presence: traffic_masq_protocol::InterfacePresence::Present,
         configured: None,
         revision: None,
@@ -1207,6 +1218,7 @@ fn describe_row_state_respects_role_precedence() {
 
     // When role is Client, must display client state even if AP is present
     let client_row = WifiRow {
+        execution_available: true,
         presence: traffic_masq_protocol::InterfacePresence::Present,
         configured: None,
         revision: None,
@@ -1219,6 +1231,7 @@ fn describe_row_state_respects_role_precedence() {
 
     // When role is AccessPoint, must display AP state even if client is present
     let ap_row = WifiRow {
+        execution_available: true,
         presence: traffic_masq_protocol::InterfacePresence::Present,
         configured: None,
         revision: None,
@@ -1233,6 +1246,7 @@ fn describe_row_state_respects_role_precedence() {
 #[test]
 fn describe_row_state_reports_not_configured_when_empty() {
     let row = WifiRow {
+        execution_available: true,
         presence: traffic_masq_protocol::InterfacePresence::Present,
         configured: None,
         revision: None,
@@ -1254,6 +1268,7 @@ fn render_wifi_client_conflict_advice_when_ap_also_present() {
     let mut app = TuiApp {
         wifi: WifiData {
             rows: vec![WifiRow {
+                execution_available: true,
                 presence: traffic_masq_protocol::InterfacePresence::Present,
                 configured: None,
                 revision: None,
@@ -1481,6 +1496,7 @@ async fn profile_deactivation_enters_pending_change_and_returns_to_profiles() {
 #[test]
 fn open_ap_request_discards_typed_passphrase_and_requests_clear() {
     let row = WifiRow {
+        execution_available: true,
         presence: traffic_masq_protocol::InterfacePresence::Present,
         configured: None,
         revision: None,
@@ -2003,4 +2019,122 @@ fn saved_missing_ap_opens_editor_without_fake_runtime_and_unknown_is_distinct() 
     assert!(describe_row_state(&row).contains("observation unavailable"));
     assert!(!describe_row_state(&row).contains("missing"));
     assert!(WifiEditor::from_row(&row).offline_intent.is_none());
+}
+
+fn saved_client_inventory(presence: traffic_masq_protocol::InterfacePresence) -> Response {
+    let config = serde_json::from_value(serde_json::json!({
+        "role": "input", "managed": true, "ipv4": "192.0.2.10/24",
+        "wifi_client": { "ssid": "saved-uplink", "security": "open" }
+    }))
+    .unwrap();
+    Response::WifiInventory {
+        revision: 7,
+        ap_execution_available: false,
+        client_execution_available: false,
+        observation_error: None,
+        interfaces: vec![traffic_masq_protocol::WifiInventoryEntry {
+            interface: traffic_masq_protocol::InterfaceInventoryEntry {
+                name: "wlan0".into(),
+                observed: None,
+                configured: Some(config),
+                config_source: traffic_masq_protocol::InterfaceConfigSource::Base,
+                presence,
+                observation_stale: false,
+                suppressed: false,
+                readiness: traffic_masq_protocol::InterfaceReadiness::WaitingDevice,
+                blockers: Vec::new(),
+                references: Vec::new(),
+            },
+            ap_runtime: None,
+            client_runtime: None,
+        }],
+    }
+}
+
+#[tokio::test]
+async fn missing_client_profile_prompt_saves_without_live_transaction_or_runtime() {
+    use traffic_masq_protocol::InterfacePresence;
+    let (_dir, client, server) = mock_api(vec![
+        saved_client_inventory(InterfacePresence::Missing),
+        Response::InterfaceIntentSaved {
+            interface: "wlan0".into(),
+            revision: 8,
+            deferred: true,
+            missing_dependencies: vec!["wlan0".into()],
+        },
+        saved_client_inventory(InterfacePresence::Missing),
+    ])
+    .await;
+    let mut app = TuiApp::default();
+    open_wifi_connect_prompt(
+        &mut app,
+        &client,
+        "wlan0".into(),
+        "home".into(),
+        "Home".into(),
+    )
+    .await;
+    let prompt = app.wifi_connect.as_ref().unwrap();
+    assert_eq!(prompt.expected_revision, Some(7));
+    assert_eq!(prompt.current_static_ip.as_deref(), Some("192.0.2.10/24"));
+    submit_wifi_connect(&mut app, &client).await;
+    assert_eq!(
+        server.await.unwrap(),
+        vec![
+            "GET /api/v1/wifi-inventory",
+            "PUT /api/v1/interfaces/wlan0/wifi-client-intent",
+            "GET /api/v1/wifi-inventory"
+        ]
+    );
+    assert!(app.pending.is_none());
+    assert!(app.wifi_connect.is_none());
+    assert_eq!(app.screen, Screen::Wifi);
+    assert!(app.wifi.client_disabled);
+    assert!(!app.wifi.rows[0].execution_available);
+    let description = describe_row_state(&app.wifi.rows[0]);
+    assert!(description.contains("missing") && description.contains("execution unavailable"));
+}
+
+#[tokio::test]
+async fn unknown_client_observation_does_not_open_a_profile_prompt() {
+    let (_dir, client, server) = mock_api(vec![saved_client_inventory(
+        traffic_masq_protocol::InterfacePresence::Unknown,
+    )])
+    .await;
+    let mut app = TuiApp::default();
+    open_wifi_connect_prompt(
+        &mut app,
+        &client,
+        "wlan0".into(),
+        "home".into(),
+        "Home".into(),
+    )
+    .await;
+    assert!(app.wifi_connect.is_none());
+    assert_eq!(server.await.unwrap(), vec!["GET /api/v1/wifi-inventory"]);
+}
+
+#[tokio::test]
+async fn offline_profile_stale_error_keeps_the_prompt_and_revision_for_review() {
+    let (_dir, client, server) = mock_api(vec![Response::Error {
+        message: "stale revision".into(),
+    }])
+    .await;
+    let mut prompt = WifiConnectPrompt::new("wlan0".into(), "home".into(), "Home".into(), None);
+    prompt.expected_revision = Some(7);
+    let mut app = TuiApp {
+        screen: Screen::WifiConnectPrompt,
+        wifi_connect: Some(prompt),
+        ..Default::default()
+    };
+    submit_wifi_connect(&mut app, &client).await;
+    assert_eq!(
+        server.await.unwrap(),
+        vec!["PUT /api/v1/interfaces/wlan0/wifi-client-intent"]
+    );
+    assert_eq!(
+        app.wifi_connect.as_ref().unwrap().expected_revision,
+        Some(7)
+    );
+    assert!(app.pending.is_none());
 }

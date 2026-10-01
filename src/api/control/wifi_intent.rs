@@ -40,9 +40,63 @@ impl ControlService {
         }
         Ok(Response::WifiInventory {
             revision,
+            ap_execution_available: self.wifi.is_some(),
+            client_execution_available: self.wifi_client.is_some(),
             interfaces: entries,
             observation_error,
         })
+    }
+
+    pub(super) async fn save_wifi_client_profile(
+        &self,
+        interface: String,
+        settings: traffic_masq_protocol::ProvisionWifiClientRequest,
+        expected_revision: u64,
+    ) -> Result<Response> {
+        use traffic_masq_protocol::WifiClientIpPolicy;
+        self.check_missing_interface_write(&interface).await?;
+        let mut target = self
+            .overrides
+            .effective_interface(&interface)
+            .await?
+            .context("interface is not configured")?;
+        anyhow::ensure!(target.managed && target.role == InterfaceRole::Input,
+            "offline Wi-Fi client provisioning requires a managed input interface; assign its role first");
+        let profile = self.wifi_client_profiles.get(&settings.profile_id)?;
+        let secret = self
+            .wifi_client_profiles
+            .get_passphrase(&settings.profile_id)?;
+        match settings.ip_policy {
+            WifiClientIpPolicy::Preserve => {}
+            WifiClientIpPolicy::Dhcp => {
+                target.ipv4 = None;
+                let policy = target.dhcp_client.get_or_insert_with(Default::default);
+                policy.enabled = true;
+                policy.wifi_owned = false;
+            }
+            WifiClientIpPolicy::Static { cidr } => {
+                target.ipv4 = Some(cidr);
+                if let Some(policy) = target.dhcp_client.as_mut() {
+                    policy.enabled = false;
+                    policy.wifi_owned = false;
+                }
+            }
+        }
+        super::wifi_client::validate_wifi_client_interface(&interface, &target)
+            .map_err(anyhow::Error::msg)?;
+        target.wifi = None;
+        target.dhcp = None;
+        target.wifi_client = Some(WifiClientConfig {
+            ssid: profile.ssid,
+            country_code: profile.country_code,
+            security: profile.security,
+            passphrase_file: None,
+        });
+        let response = self
+            .save_wifi_interface_with_secret(interface.clone(), target, expected_revision, secret)
+            .await?;
+        self.wifi_autoconnect.lock().await.resume(&interface);
+        Ok(response)
     }
 
     /// Legacy service actions save missing targets after verified runtime cleanup.
@@ -98,9 +152,25 @@ impl ControlService {
     pub(super) async fn save_wifi_interface(
         &self,
         interface: String,
-        mut config: InterfaceConfig,
+        config: InterfaceConfig,
         expected_revision: u64,
         passphrase: Option<String>,
+    ) -> Result<Response> {
+        self.save_wifi_interface_with_secret(
+            interface,
+            config,
+            expected_revision,
+            passphrase.map(WifiPassphrase::new).transpose()?,
+        )
+        .await
+    }
+
+    async fn save_wifi_interface_with_secret(
+        &self,
+        interface: String,
+        mut config: InterfaceConfig,
+        expected_revision: u64,
+        secret: Option<WifiPassphrase>,
     ) -> Result<Response> {
         self.check_missing_interface_write(&interface).await?;
         let previous = self
@@ -125,7 +195,6 @@ impl ControlService {
             }
             .into());
         }
-        let secret = passphrase.map(WifiPassphrase::new).transpose()?;
         let mut credential = None;
         if let Some(secret) = secret.as_ref() {
             let secured = match (&mut config.wifi, &mut config.wifi_client) {

@@ -179,6 +179,14 @@ fn every_control_request_has_the_expected_authorization_class() {
     }
 
     let mutation_requests = [
+        Request::SaveWifiClientProfile {
+            interface: "wlan0".into(),
+            settings: traffic_masq_protocol::ProvisionWifiClientRequest {
+                profile_id: "saved".into(),
+                ip_policy: traffic_masq_protocol::WifiClientIpPolicy::Dhcp,
+            },
+            expected_revision: 0,
+        },
         Request::SaveWifiInterface {
             interface: "wlan0".into(),
             config: interface_config().into(),

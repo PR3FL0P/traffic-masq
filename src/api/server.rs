@@ -206,6 +206,10 @@ fn build_router(state: AppState) -> Router {
         .route("/interface-inventory", get(list_interface_inventory))
         .route("/wifi-inventory", get(list_wifi_inventory))
         .route("/interfaces/{interface}/wifi-intent", put(save_wifi_intent))
+        .route(
+            "/interfaces/{interface}/wifi-client-intent",
+            put(save_wifi_client_intent),
+        )
         .route("/interfaces/{interface}/intent", put(save_interface_intent))
         .route(
             "/interfaces/{interface}/intent/forget",
@@ -655,6 +659,30 @@ async fn list_wifi_inventory(
     Extension(principal): Extension<Principal>,
 ) -> Result<Json<Response>, ApiError> {
     dispatch_control(&state, &principal, Request::ListWifiInventory).await
+}
+
+#[derive(Deserialize)]
+struct SaveWifiClientIntentRequest {
+    settings: traffic_masq_protocol::ProvisionWifiClientRequest,
+    expected_revision: u64,
+}
+
+async fn save_wifi_client_intent(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    AxumPath(interface): AxumPath<String>,
+    Json(request): Json<SaveWifiClientIntentRequest>,
+) -> Result<Json<Response>, ApiError> {
+    dispatch_control(
+        &state,
+        &principal,
+        Request::SaveWifiClientProfile {
+            interface,
+            settings: request.settings,
+            expected_revision: request.expected_revision,
+        },
+    )
+    .await
 }
 
 #[derive(Deserialize)]
@@ -1569,7 +1597,8 @@ fn authorize_control_request(principal: &Principal, request: &Request) -> Result
 fn control_request_requires_administrator(request: &Request) -> bool {
     matches!(
         request,
-        Request::SaveWifiInterface { .. }
+        Request::SaveWifiClientProfile { .. }
+            | Request::SaveWifiInterface { .. }
             | Request::SaveInterfaceConfig { .. }
             | Request::ForgetInterfaceConfig { .. }
             | Request::ResetInterfaceOverride { .. }

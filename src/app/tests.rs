@@ -1082,6 +1082,7 @@ async fn liveness_checks_the_wifi_client_independently_of_the_access_point() {
     let wifi_client = FakeWifiReconciler::default();
 
     check_process_liveness(
+        None,
         &dhcp,
         None::<&FakeWifiReconciler>,
         Some(&wifi_client),
@@ -1100,7 +1101,14 @@ async fn liveness_covers_every_supervised_runtime() {
     let wifi_client = FakeWifiReconciler::default();
     let dhcp_client = FakeDhcpClientReconciler::default();
 
-    check_process_liveness(&dhcp, Some(&wifi), Some(&wifi_client), Some(&dhcp_client)).await;
+    check_process_liveness(
+        None,
+        &dhcp,
+        Some(&wifi),
+        Some(&wifi_client),
+        Some(&dhcp_client),
+    )
+    .await;
 
     assert_eq!(*dhcp.runtime_liveness_checks.lock().await, 1);
     assert_eq!(*wifi.liveness_checks.lock().await, 1);
@@ -1137,6 +1145,7 @@ async fn liveness_resynchronizes_wifi_association_into_dhcp_link_ready() {
         .insert(spec.interface.clone(), true);
 
     check_process_liveness(
+        None,
         &dhcp,
         None::<&FakeWifiReconciler>,
         Some(&wifi_client),
@@ -2273,4 +2282,29 @@ async fn hotplug_phy_conflict_blocks_reconciliation_before_interface_mutation() 
         .unwrap()
         .iter()
         .all(|interface| !interface.is_up));
+}
+
+#[tokio::test]
+async fn liveness_does_not_replay_dhcp_association_from_withdrawn_desired_policy() {
+    let dhcp = FakeDhcpReconciler::default();
+    let wifi = FakeWifiReconciler::default();
+    let client = FakeDhcpClientReconciler::default();
+    let spec = DhcpClientSpec {
+        interface: "wlan0".into(),
+        route_metric: 100,
+        install_default_route: true,
+        request_dns: true,
+        send_release_on_shutdown: false,
+    };
+    client.specs.lock().await.insert("wlan0".into(), spec);
+    wifi.associations.lock().await.insert("wlan0".into(), true);
+    check_process_liveness(
+        Some(&AppConfig::default()),
+        &dhcp,
+        None::<&FakeWifiReconciler>,
+        Some(&wifi),
+        Some(&client),
+    )
+    .await;
+    assert!(client.readiness.lock().await.is_empty());
 }

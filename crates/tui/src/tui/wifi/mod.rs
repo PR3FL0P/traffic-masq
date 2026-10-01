@@ -62,6 +62,7 @@ pub(crate) enum WifiRole {
 
 #[derive(Debug, Clone)]
 pub(crate) struct WifiRow {
+    pub(crate) execution_available: bool,
     pub(crate) presence: traffic_masq_protocol::InterfacePresence,
     pub(crate) configured: Option<traffic_masq_protocol::InterfaceConfigView>,
     pub(crate) revision: Option<u64>,
@@ -594,6 +595,7 @@ pub(crate) enum WifiConnectField {
 
 #[derive(Debug, Clone)]
 pub(crate) struct WifiConnectPrompt {
+    pub(crate) expected_revision: Option<u64>,
     pub(crate) interface: String,
     pub(crate) profile_id: String,
     pub(crate) ssid: String,
@@ -614,6 +616,7 @@ impl WifiConnectPrompt {
         let initial_cidr = current_static_ip.clone().unwrap_or_default();
         let cursor = initial_cidr.len();
         Self {
+            expected_revision: None,
             interface,
             profile_id,
             ssid,
@@ -952,7 +955,9 @@ async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
     }
     match action {
         PrimaryAction::ConfigureAp => {
-            if !subsystem_disabled(app, WifiRole::AccessPoint) {
+            if row.presence == traffic_masq_protocol::InterfacePresence::Missing
+                || !subsystem_disabled(app, WifiRole::AccessPoint)
+            {
                 match client
                     .request(&Request::GetInterfaceConfig {
                         interface: row.interface.clone(),
@@ -1172,12 +1177,20 @@ pub(crate) async fn load_wifi_data(app: &mut TuiApp, client: &ApiClient) {
     match client.request(&Request::ListWifiInventory).await {
         Ok(Response::WifiInventory {
             revision,
+            ap_execution_available,
+            client_execution_available,
             interfaces,
             observation_error,
         }) => {
             let rows = interfaces
                 .into_iter()
                 .map(|entry| WifiRow {
+                    execution_available: match configured_role(entry.interface.configured.as_ref())
+                    {
+                        WifiRole::AccessPoint => ap_execution_available,
+                        WifiRole::Client => client_execution_available,
+                        WifiRole::Unknown => ap_execution_available || client_execution_available,
+                    },
                     role: configured_role(entry.interface.configured.as_ref()),
                     interface: entry.interface.name,
                     presence: entry.interface.presence,
@@ -1188,8 +1201,8 @@ pub(crate) async fn load_wifi_data(app: &mut TuiApp, client: &ApiClient) {
                 })
                 .collect();
             app.wifi.error = observation_error;
-            app.wifi.ap_disabled = false;
-            app.wifi.client_disabled = false;
+            app.wifi.ap_disabled = !ap_execution_available;
+            app.wifi.client_disabled = !client_execution_available;
             app.wifi.replace_rows(rows);
         }
         result => {
@@ -1229,6 +1242,7 @@ pub(crate) fn build_rows(
                 .cloned();
             let role = WifiRole::Unknown;
             WifiRow {
+                execution_available: true,
                 presence: traffic_masq_protocol::InterfacePresence::Present,
                 configured: None,
                 revision: None,
@@ -1365,8 +1379,20 @@ fn describe_row_state(row: &WifiRow) -> String {
         });
         return ssid.map_or_else(
             || "interface missing".into(),
-            |ssid| format!("interface missing; saved {ssid}, inactive"),
+            |ssid| {
+                format!(
+                    "interface missing; saved {ssid}, inactive{}",
+                    if row.execution_available {
+                        ""
+                    } else {
+                        "; execution unavailable"
+                    }
+                )
+            },
         );
+    }
+    if !row.execution_available {
+        return "saved settings retained; Wi-Fi execution unavailable".into();
     }
     match row.role {
         WifiRole::AccessPoint => {

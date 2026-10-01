@@ -8,35 +8,60 @@ pub(crate) async fn open_wifi_connect_prompt(
     profile_id: String,
     ssid: String,
 ) {
-    let current_static_ip = match client
-        .request(&Request::GetInterfaceConfig {
-            interface: interface.clone(),
-        })
-        .await
-    {
-        Ok(Response::InterfaceConfig {
-            config: Some(cfg), ..
-        }) => cfg.ipv4.map(|ip| ip.to_string()),
-        Ok(Response::InterfaceConfig { config: None, .. }) => None,
-        Ok(response) => {
-            report_unexpected(app, response);
-            return;
-        }
-        Err(error) => {
-            app.push_message(
-                LogLevel::Warn,
-                format!("Could not read current IP configuration: {error}"),
-            );
-            return;
-        }
-    };
-
-    app.wifi_connect = Some(WifiConnectPrompt::new(
-        interface,
-        profile_id,
-        ssid,
-        current_static_ip,
-    ));
+    let (current_static_ip, expected_revision) =
+        match client.request(&Request::ListWifiInventory).await {
+            Ok(Response::WifiInventory {
+                revision,
+                interfaces,
+                observation_error,
+                ..
+            }) => {
+                if observation_error.is_some() {
+                    app.push_message(
+                        LogLevel::Warn,
+                        "Device observation unavailable; refresh before selecting a profile",
+                    );
+                    return;
+                }
+                let Some(entry) = interfaces
+                    .into_iter()
+                    .find(|entry| entry.interface.name == interface)
+                else {
+                    app.push_message(
+                        LogLevel::Warn,
+                        "Interface inventory changed; refresh before selecting a profile",
+                    );
+                    return;
+                };
+                if entry.interface.presence == traffic_masq_protocol::InterfacePresence::Unknown {
+                    app.push_message(
+                        LogLevel::Warn,
+                        "Device observation unavailable; refresh before selecting a profile",
+                    );
+                    return;
+                }
+                let cidr = entry
+                    .interface
+                    .configured
+                    .and_then(|config| config.ipv4)
+                    .map(|ip| ip.to_string());
+                (
+                    cidr,
+                    (entry.interface.presence == traffic_masq_protocol::InterfacePresence::Missing)
+                        .then_some(revision),
+                )
+            }
+            result => {
+                app.push_message(
+                    LogLevel::Warn,
+                    format!("Could not read interface inventory: {result:?}"),
+                );
+                return;
+            }
+        };
+    let mut prompt = WifiConnectPrompt::new(interface, profile_id, ssid, current_static_ip);
+    prompt.expected_revision = expected_revision;
+    app.wifi_connect = Some(prompt);
     app.screen = Screen::WifiConnectPrompt;
 }
 
@@ -156,16 +181,31 @@ pub(super) async fn submit_wifi_connect(app: &mut TuiApp, client: &ApiClient) {
         },
         None => WifiClientIpPolicy::Dhcp,
     };
-    match client
-        .request(&Request::ProvisionWifiClient {
+    let settings = ProvisionWifiClientRequest {
+        profile_id: prompt.profile_id,
+        ip_policy,
+    };
+    let request = match prompt.expected_revision {
+        Some(expected_revision) => Request::SaveWifiClientProfile {
             interface: prompt.interface.clone(),
-            settings: ProvisionWifiClientRequest {
-                profile_id: prompt.profile_id,
-                ip_policy,
-            },
-        })
-        .await
-    {
+            settings,
+            expected_revision,
+        },
+        None => Request::ProvisionWifiClient {
+            interface: prompt.interface.clone(),
+            settings,
+        },
+    };
+    match client.request(&request).await {
+        Ok(Response::InterfaceIntentSaved { interface, .. }) => {
+            app.wifi_connect = None;
+            app.screen = Screen::Wifi;
+            app.push_message(
+                LogLevel::Info,
+                format!("Saved profile settings; application waits for interface {interface}"),
+            );
+            load_wifi_data(app, client).await;
+        }
         Ok(Response::NetworkChangePending { change }) => {
             app.pending = Some(change);
             app.pending_return_screen = Screen::Wifi;
@@ -189,14 +229,25 @@ pub(crate) fn render_wifi_connect_prompt(
         return;
     };
     let block = panel(&format!(
-        "Connect to '{}' on {}",
-        prompt.ssid, prompt.interface
+        "{} '{}' on {}",
+        if prompt.expected_revision.is_some() {
+            "Save profile"
+        } else {
+            "Connect to"
+        },
+        prompt.ssid,
+        prompt.interface
     ));
     let mut lines = Vec::new();
 
     lines.push(Line::from(
         "Select how IPv4 will be obtained for this connection:",
     ));
+    if prompt.expected_revision.is_some() {
+        lines.push(Line::from(
+            "Interface missing; settings apply when the device is ready.",
+        ));
+    }
     lines.push(Line::from(""));
 
     // Option 1: DHCP
@@ -275,7 +326,11 @@ pub(crate) fn render_wifi_connect_prompt(
     let cancel_active = prompt.field == WifiConnectField::Cancel;
     lines.push(Line::from(vec![
         Span::styled(
-            if submit_active {
+            if prompt.expected_revision.is_some() && submit_active {
+                "▶ [ Save (Enter) ] "
+            } else if prompt.expected_revision.is_some() {
+                "  [ Save ] "
+            } else if submit_active {
                 "▶ [ Connect (Enter) ] "
             } else {
                 "  [ Connect ] "

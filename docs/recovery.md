@@ -80,6 +80,17 @@ committed configuration when its dependencies are ready. Restart reads the same
 committed intent and resolves surviving process/lease ownership records through
 normal startup recovery. Credentials referenced by the old intent remain intact.
 
+Wi-Fi client profiles can be read and edited even when the execution supervisor
+is unavailable. Selecting a profile for a missing managed input interface uses
+a revision-checked offline save with an explicit IPv4 policy. The selected
+profile's credential is copied to an immutable interface version; later profile
+updates or deletion do not alter that saved interface credential. Wi-Fi inventory
+reports AP/client execution availability separately from the saved settings.
+Liveness and queued association callbacks read current desired state under the
+network mutation gate and skip tasks whose specification no longer matches.
+Offline client deactivation also suspends session autoconnect after commit,
+matching confirmed live deactivation; explicitly selecting a profile resumes it.
+
 An interrupted Wi-Fi launch, an orphaned or changed process record, or a missing
 supervisor with a persisted ownership record blocks the offline edit. Preserve
 the diagnostic and state directory, repair the reported ownership/storage cause,

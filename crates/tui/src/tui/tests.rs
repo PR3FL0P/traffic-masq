@@ -67,6 +67,7 @@ async fn wifi_click_opens_actions_for_clicked_interface() {
     };
     app.wifi.rows = vec![
         wifi::WifiRow {
+            execution_available: true,
             presence: traffic_masq_protocol::InterfacePresence::Present,
             configured: None,
             revision: None,
@@ -76,6 +77,7 @@ async fn wifi_click_opens_actions_for_clicked_interface() {
             client: None,
         },
         wifi::WifiRow {
+            execution_available: true,
             presence: traffic_masq_protocol::InterfacePresence::Present,
             configured: None,
             revision: None,

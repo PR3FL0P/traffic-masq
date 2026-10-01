@@ -188,6 +188,17 @@ impl ControlService {
                 Ok(response) => response,
                 Err(error) => error_response(error),
             },
+            Request::SaveWifiClientProfile {
+                interface,
+                settings,
+                expected_revision,
+            } => match self
+                .save_wifi_client_profile(interface, settings, expected_revision)
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => error_response(error),
+            },
             Request::SaveWifiInterface {
                 interface,
                 config,
@@ -751,7 +762,8 @@ impl ControlService {
 fn is_network_mutation(request: &Request) -> bool {
     matches!(
         request,
-        Request::SaveWifiInterface { .. }
+        Request::SaveWifiClientProfile { .. }
+            | Request::SaveWifiInterface { .. }
             | Request::SaveInterfaceConfig { .. }
             | Request::ForgetInterfaceConfig { .. }
             | Request::ResetInterfaceOverride { .. }
@@ -846,7 +858,8 @@ fn is_provisioning_secret_recovery_request(request: &Request) -> bool {
 
 fn recovery_interface(request: &Request) -> Option<&str> {
     match request {
-        Request::SaveWifiInterface { interface, .. }
+        Request::SaveWifiClientProfile { interface, .. }
+        | Request::SaveWifiInterface { interface, .. }
         | Request::SaveInterfaceConfig { interface, .. }
         | Request::ForgetInterfaceConfig { interface, .. }
         | Request::ResetInterfaceOverride { interface, .. }

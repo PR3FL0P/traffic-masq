@@ -688,8 +688,27 @@ impl DhcpClientSupervisor {
 
     /// Recover stopped client tasks when their retry deadlines permit it.
     pub async fn ensure_alive(&self) -> Result<bool> {
+        self.ensure_alive_matching(None).await
+    }
+
+    /// Called under the network mutation gate with the current desired snapshot.
+    /// Stale tasks cannot restart or replay settings withdrawn by a newer edit.
+    pub async fn ensure_alive_for_config(&self, config: &AppConfig) -> Result<bool> {
+        let desired = Self::effective_specs(config)?;
+        self.ensure_alive_matching(Some(&desired)).await
+    }
+
+    async fn ensure_alive_matching(&self, desired: Option<&[DhcpClientSpec]>) -> Result<bool> {
         let _operation = self.inner.operation_lock.lock().await;
-        let interfaces: Vec<String> = self.inner.tasks.lock().await.keys().cloned().collect();
+        let interfaces: Vec<String> = self
+            .inner
+            .tasks
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, task)| desired.is_none_or(|specs| specs.contains(&task.spec)))
+            .map(|(name, _)| name.clone())
+            .collect();
         let mut changed = false;
         for interface in interfaces {
             if self.ensure_interface_alive(&interface).await {

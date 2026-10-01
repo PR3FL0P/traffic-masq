@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior};
 
-use crate::config::{InterfaceConfig, VpnPolicyMode};
+use crate::config::{AppConfig, InterfaceConfig, VpnPolicyMode};
 use crate::core::desired::DesiredNetworkState;
 use crate::core::interface::InterfaceManager;
 use crate::core::mutation::NetworkMutationGate;
@@ -75,6 +75,9 @@ pub(super) trait DhcpClientRuntimeReconciler: Send + Sync {
         Ok(())
     }
     async fn ensure_alive(&self) -> Result<bool>;
+    async fn ensure_alive_for_config(&self, _config: &AppConfig) -> Result<bool> {
+        self.ensure_alive().await
+    }
 }
 
 #[async_trait]
@@ -111,11 +114,17 @@ impl DhcpClientRuntimeReconciler for DhcpClientSupervisor {
     async fn ensure_alive(&self) -> Result<bool> {
         self.ensure_alive().await
     }
+    async fn ensure_alive_for_config(&self, config: &AppConfig) -> Result<bool> {
+        DhcpClientSupervisor::ensure_alive_for_config(self, config).await
+    }
 }
 
 #[async_trait]
 pub(super) trait WifiRuntimeReconciler: Send + Sync {
     async fn ensure_alive(&self) -> Result<bool>;
+    async fn ensure_alive_for_config(&self, _config: &AppConfig) -> Result<bool> {
+        self.ensure_alive().await
+    }
 
     async fn reconcile_interface(&self, _interface: &str, _config: &InterfaceConfig) -> Result<()> {
         Ok(())
@@ -123,6 +132,13 @@ pub(super) trait WifiRuntimeReconciler: Send + Sync {
 
     async fn association_ready(&self, _interface: &str) -> Option<bool> {
         None
+    }
+    async fn association_ready_for_config(
+        &self,
+        interface: &str,
+        _config: &AppConfig,
+    ) -> Option<bool> {
+        self.association_ready(interface).await
     }
 }
 
@@ -134,6 +150,9 @@ impl WifiRuntimeReconciler for HostapdSupervisor {
 
     async fn reconcile_interface(&self, interface: &str, config: &InterfaceConfig) -> Result<()> {
         self.reconcile_interface_config(interface, config).await
+    }
+    async fn ensure_alive_for_config(&self, config: &AppConfig) -> Result<bool> {
+        Ok(HostapdSupervisor::ensure_alive_for_config(self, config).await?)
     }
 }
 
@@ -150,6 +169,29 @@ impl WifiRuntimeReconciler for WifiClientSupervisor {
     async fn association_ready(&self, interface: &str) -> Option<bool> {
         self.status(interface)
             .await
+            .map(|status| status.wpa_state.is_connected())
+    }
+    async fn ensure_alive_for_config(&self, config: &AppConfig) -> Result<bool> {
+        Ok(WifiClientSupervisor::ensure_alive_for_config(self, config).await?)
+    }
+
+    async fn association_ready_for_config(
+        &self,
+        interface: &str,
+        config: &AppConfig,
+    ) -> Option<bool> {
+        let expected = config
+            .network
+            .interfaces
+            .get(interface)
+            .and_then(|config| {
+                crate::wifi::WifiClientSpec::from_interface_config(interface, config)
+                    .ok()
+                    .flatten()
+            })?;
+        self.status(interface)
+            .await
+            .filter(|status| status.spec == expected)
             .map(|status| status.wpa_state.is_connected())
     }
 }
@@ -721,6 +763,7 @@ pub(super) fn spawn_runtime_network_reconcile_with_recovery_events(
 ///
 /// Split from the task that drives it so it can be exercised against fakes.
 pub(super) async fn check_process_liveness<D, W, C, L>(
+    desired_config: Option<&AppConfig>,
     dhcp: &D,
     wifi: Option<&W>,
     wifi_client: Option<&C>,
@@ -735,18 +778,48 @@ pub(super) async fn check_process_liveness<D, W, C, L>(
         tracing::warn!(%error, "failed to restart the shared DHCP runtime");
     }
     if let Some(wifi) = wifi {
-        if let Err(error) = wifi.ensure_alive().await {
+        let result = match desired_config {
+            Some(config) => wifi.ensure_alive_for_config(config).await,
+            None => wifi.ensure_alive().await,
+        };
+        if let Err(error) = result {
             tracing::warn!(%error, "failed to check Wi-Fi access point liveness");
         }
     }
     if let Some(wifi_client) = wifi_client {
-        if let Err(error) = wifi_client.ensure_alive().await {
+        let result = match desired_config {
+            Some(config) => wifi_client.ensure_alive_for_config(config).await,
+            None => wifi_client.ensure_alive().await,
+        };
+        if let Err(error) = result {
             tracing::warn!(%error, "failed to check Wi-Fi client liveness");
         }
     }
     if let (Some(wifi_client), Some(dhcp_client)) = (wifi_client, dhcp_client) {
         for spec in dhcp_client.specs().await {
-            if let Some(link_ready) = wifi_client.association_ready(&spec.interface).await {
+            if let Some(config) = desired_config {
+                let expected = config
+                    .network
+                    .interfaces
+                    .get(&spec.interface)
+                    .and_then(|config| {
+                        DhcpClientSpec::from_interface_config(&spec.interface, config)
+                            .ok()
+                            .flatten()
+                    });
+                if expected.as_ref() != Some(&spec) {
+                    continue;
+                }
+            }
+            let link_ready = match desired_config {
+                Some(config) => {
+                    wifi_client
+                        .association_ready_for_config(&spec.interface, config)
+                        .await
+                }
+                None => wifi_client.association_ready(&spec.interface).await,
+            };
+            if let Some(link_ready) = link_ready {
                 if let Err(error) = dhcp_client.reconcile(spec, link_ready).await {
                     tracing::warn!(%error, "DHCP client liveness reconcile failed");
                 }
@@ -754,7 +827,11 @@ pub(super) async fn check_process_liveness<D, W, C, L>(
         }
     }
     if let Some(dhcp_client) = dhcp_client {
-        if let Err(error) = dhcp_client.ensure_alive().await {
+        let result = match desired_config {
+            Some(config) => dhcp_client.ensure_alive_for_config(config).await,
+            None => dhcp_client.ensure_alive().await,
+        };
+        if let Err(error) = result {
             tracing::warn!(%error, "failed to check DHCP client liveness");
         }
     }
@@ -802,8 +879,15 @@ pub(super) fn spawn_process_liveness_checks(
                             // Re-read status under the gate: queued events may belong to a
                             // replaced supplicant or precede a network transaction.
                             if let Some(status) = wifi.status(&interface).await.filter(|status| status.pid == pid) {
-                                if let Some(spec) = dhcp_client.spec(&interface).await {
-                                    dhcp_client.reconcile_with_link_ready(spec, status.wpa_state.is_connected()).await;
+                                if let Ok(config) = desired.effective().await {
+                                    if let Some(config) = config.network.interfaces.get(&interface) {
+                                        let client = crate::wifi::WifiClientSpec::from_interface_config(&interface, config).ok().flatten();
+                                        if client.as_ref() == Some(&status.spec) {
+                                            if let Ok(Some(spec)) = DhcpClientSpec::from_interface_config(&interface, config) {
+                                                dhcp_client.reconcile_with_link_ready(spec, status.wpa_state.is_connected()).await;
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -830,17 +914,19 @@ pub(super) fn spawn_process_liveness_checks(
                         tracing::debug!("process liveness mutations suspended while a router transaction is pending recovery/confirmation");
                         continue;
                     }
-                    let wifi_admitted = match desired.effective().await {
-                        Ok(config) => match crate::wifi::policy::WifiRadioPolicy::validate_system(&config.network) {
+                    let config = match desired.effective().await {
+                        Ok(config) => config,
+                        Err(error) => { tracing::warn!(%error, "process restart blocked by invalid desired state"); continue; }
+                    };
+                    let wifi_admitted = match crate::wifi::policy::WifiRadioPolicy::validate_system(&config.network) {
                             Ok(()) => true,
                             Err(error) => {
                                 tracing::warn!(%error, "Wi-Fi process restart blocked by radio policy");
                                 false
                             }
-                        },
-                        Err(error) => { tracing::warn!(%error, "process restart blocked by invalid desired state"); continue; }
-                    };
+                        };
                     check_process_liveness(
+                        Some(&config),
                         &dhcp,
                         wifi.as_ref().filter(|_| wifi_admitted),
                         wifi_client.as_ref().filter(|_| wifi_admitted),
