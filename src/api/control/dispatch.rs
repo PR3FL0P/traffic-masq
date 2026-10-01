@@ -184,6 +184,55 @@ impl ControlService {
                 Ok(response) => response,
                 Err(error) => error_response(error),
             },
+            Request::ListInterfaceInventory => match self.interface_inventory().await {
+                Ok(response) => response,
+                Err(error) => error_response(error),
+            },
+            Request::SaveInterfaceConfig {
+                interface,
+                config,
+                allow_management_change,
+                expected_revision,
+            } => {
+                let proposal = RouterIntentProposal::new().set_interface(
+                    interface.clone(),
+                    config.into(),
+                    allow_management_change,
+                );
+                match self
+                    .save_missing_interface_intent(interface, proposal, expected_revision)
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(error) => error_response(error),
+                }
+            }
+            Request::ForgetInterfaceConfig {
+                interface,
+                expected_revision,
+            } => {
+                let proposal = RouterIntentProposal::new().forget_interface(interface.clone());
+                match self
+                    .save_missing_interface_intent(interface, proposal, expected_revision)
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(error) => error_response(error),
+                }
+            }
+            Request::ResetInterfaceOverride {
+                interface,
+                expected_revision,
+            } => {
+                let proposal = RouterIntentProposal::new().remove_interface(interface.clone());
+                match self
+                    .save_missing_interface_intent(interface, proposal, expected_revision)
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(error) => error_response(error),
+                }
+            }
             Request::ListInterfaces => {
                 match interface_statuses(self.network.as_ref(), &self.transactions).await {
                     Ok(interfaces) => Response::Interfaces {
@@ -210,10 +259,26 @@ impl ControlService {
             Request::DisableDhcpClient { interface } => self.disable_dhcp_client(interface).await,
             Request::RenewDhcpClient { interface } => self.renew_dhcp_client(interface).await,
             Request::ReleaseDhcpClient { interface } => self.release_dhcp_client(interface).await,
-            Request::GetDhcpConfig { interface } => Response::DhcpConfig {
-                spec: self.dhcp.spec(&interface).await.map(Into::into),
-                interface,
-            },
+            Request::GetDhcpConfig { interface } => {
+                match self.overrides.effective_interface(&interface).await {
+                    Ok(Some(config)) => match DhcpServiceSpec::from_interface_config(
+                        &interface,
+                        &config,
+                        self.base_config.dhcp.default_lease_seconds,
+                    ) {
+                        Ok(spec) => Response::DhcpConfig {
+                            interface,
+                            spec: spec.map(Into::into),
+                        },
+                        Err(error) => error_response(error),
+                    },
+                    Ok(None) => Response::DhcpConfig {
+                        interface,
+                        spec: None,
+                    },
+                    Err(error) => error_response(error),
+                }
+            }
             Request::ConfigureDhcp {
                 interface,
                 config: dhcp_config,
@@ -670,7 +735,10 @@ impl ControlService {
 fn is_network_mutation(request: &Request) -> bool {
     matches!(
         request,
-        Request::ConfigureDhcpClient { .. }
+        Request::SaveInterfaceConfig { .. }
+            | Request::ForgetInterfaceConfig { .. }
+            | Request::ResetInterfaceOverride { .. }
+            | Request::ConfigureDhcpClient { .. }
             | Request::DisableDhcpClient { .. }
             | Request::RenewDhcpClient { .. }
             | Request::ReleaseDhcpClient { .. }
@@ -761,7 +829,10 @@ fn is_provisioning_secret_recovery_request(request: &Request) -> bool {
 
 fn recovery_interface(request: &Request) -> Option<&str> {
     match request {
-        Request::GetInterfaceConfig { interface, .. }
+        Request::SaveInterfaceConfig { interface, .. }
+        | Request::ForgetInterfaceConfig { interface, .. }
+        | Request::ResetInterfaceOverride { interface, .. }
+        | Request::GetInterfaceConfig { interface, .. }
         | Request::GetDhcpClient { interface, .. }
         | Request::ConfigureDhcpClient { interface, .. }
         | Request::DisableDhcpClient { interface, .. }

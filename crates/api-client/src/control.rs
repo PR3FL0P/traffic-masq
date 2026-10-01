@@ -103,6 +103,56 @@ pub fn map_request<Interface: Serialize, Proposal: Serialize>(
             body: None,
             synthesize_pong: false,
         },
+        Request::ListInterfaceInventory => RestRequest {
+            method: Method::GET,
+            path: format!("{API_PREFIX}/interface-inventory"),
+            body: None,
+            synthesize_pong: false,
+        },
+        Request::SaveInterfaceConfig {
+            interface,
+            config,
+            allow_management_change,
+            expected_revision,
+        } => RestRequest {
+            method: Method::PUT,
+            path: format!(
+                "{API_PREFIX}/interfaces/{}/intent",
+                encode_path_segment(interface)
+            ),
+            body: Some(serialize_json(
+                &serde_json::json!({"config": config, "allow_management_change": allow_management_change, "expected_revision": expected_revision}),
+            )?),
+            synthesize_pong: false,
+        },
+        Request::ForgetInterfaceConfig {
+            interface,
+            expected_revision,
+        } => RestRequest {
+            method: Method::POST,
+            path: format!(
+                "{API_PREFIX}/interfaces/{}/intent/forget",
+                encode_path_segment(interface)
+            ),
+            body: Some(serialize_json(
+                &serde_json::json!({"expected_revision": expected_revision}),
+            )?),
+            synthesize_pong: false,
+        },
+        Request::ResetInterfaceOverride {
+            interface,
+            expected_revision,
+        } => RestRequest {
+            method: Method::POST,
+            path: format!(
+                "{API_PREFIX}/interfaces/{}/intent/reset",
+                encode_path_segment(interface)
+            ),
+            body: Some(serialize_json(
+                &serde_json::json!({"expected_revision": expected_revision}),
+            )?),
+            synthesize_pong: false,
+        },
         Request::ListInterfaces => RestRequest {
             method: Method::GET,
             path: format!("{API_PREFIX}/interfaces"),

@@ -7441,3 +7441,362 @@ async fn explicit_router_retry_bypasses_only_its_own_persisted_stop() {
     ));
     assert!(!journal.exists());
 }
+
+#[tokio::test]
+async fn missing_interface_inventory_save_forget_reset_and_stale_editor() {
+    use traffic_masq_protocol::InterfacePresence;
+    let directory = tempdir().unwrap();
+    let base = router_base_config();
+    let overrides = RuntimeOverrideManager::load(directory.path(), &base)
+        .await
+        .unwrap();
+    let dhcp = DhcpSupervisor::start(&base).await.unwrap();
+    let service = ControlService::new(
+        base.clone(),
+        Arc::new(FakeNetwork {
+            addresses: Vec::new(),
+        }),
+        dhcp,
+        overrides.clone(),
+    );
+    let revision = match service.dispatch(Request::ListInterfaceInventory).await {
+        Response::InterfaceInventory {
+            interfaces,
+            revision,
+            ..
+        } => {
+            let lan = interfaces
+                .iter()
+                .find(|entry| entry.name == "lan0")
+                .unwrap();
+            assert_eq!(lan.presence, InterfacePresence::Missing);
+            assert!(lan.observed.is_none());
+            assert!(lan.configured.is_some());
+            revision
+        }
+        response => panic!("{response:?}"),
+    };
+    let response = service
+        .dispatch(Request::ForgetInterfaceConfig {
+            interface: "lan0".into(),
+            expected_revision: revision,
+        })
+        .await;
+    assert!(
+        matches!(response, Response::InterfaceIntentSaved { .. }),
+        "{response:?}"
+    );
+    assert!(overrides
+        .effective_interface("lan0")
+        .await
+        .unwrap()
+        .is_none());
+    let response = service
+        .dispatch(Request::SaveInterfaceConfig {
+            interface: "lan0".into(),
+            config: base.network.interfaces["lan0"].clone().into(),
+            allow_management_change: false,
+            expected_revision: revision,
+        })
+        .await;
+    assert!(matches!(response, Response::Error { .. }));
+    assert!(overrides
+        .effective_interface("lan0")
+        .await
+        .unwrap()
+        .is_none());
+    let restarted = RuntimeOverrideManager::load(directory.path(), &base)
+        .await
+        .unwrap();
+    assert!(restarted
+        .effective_interface("lan0")
+        .await
+        .unwrap()
+        .is_none());
+    let response = service
+        .dispatch(Request::ResetInterfaceOverride {
+            interface: "lan0".into(),
+            expected_revision: overrides.committed_revision().await,
+        })
+        .await;
+    assert!(
+        matches!(response, Response::InterfaceIntentSaved { .. }),
+        "{response:?}"
+    );
+    assert_eq!(
+        overrides.effective_interface("lan0").await.unwrap(),
+        Some(base.network.interfaces["lan0"].clone())
+    );
+}
+
+#[tokio::test]
+async fn inventory_observation_failure_retains_cache_and_blocks_offline_writes() {
+    use traffic_masq_protocol::InterfacePresence;
+    let directory = tempdir().unwrap();
+    let mut base = router_base_config();
+    base.runtime.state_dir = directory.path().into();
+    let overrides = RuntimeOverrideManager::load(directory.path(), &base)
+        .await
+        .unwrap();
+    let network = Arc::new(crate::test_support::FakeNetworkProvider::default());
+    network.add_interface("lan0", 7).await;
+    let dhcp = DhcpSupervisor::start(&base).await.unwrap();
+    let service = ControlService::new(base, network.clone(), dhcp, overrides.clone());
+    assert!(matches!(
+        service.dispatch(Request::ListInterfaceInventory).await,
+        Response::InterfaceInventory { .. }
+    ));
+    *network.fail_interface_observation.lock().await = true;
+    match service.dispatch(Request::ListInterfaceInventory).await {
+        Response::InterfaceInventory {
+            interfaces,
+            observation_error,
+            ..
+        } => {
+            assert!(observation_error.is_some());
+            let lan = interfaces
+                .iter()
+                .find(|entry| entry.name == "lan0")
+                .unwrap();
+            assert_eq!(lan.presence, InterfacePresence::Unknown);
+            assert!(lan.observation_stale);
+            assert_eq!(lan.observed.as_ref().unwrap().interface.index, 7);
+            assert!(interfaces
+                .iter()
+                .all(|entry| entry.presence == InterfacePresence::Unknown));
+        }
+        response => panic!("{response:?}"),
+    }
+    let revision = overrides.committed_revision().await;
+    assert!(matches!(
+        service
+            .dispatch(Request::ForgetInterfaceConfig {
+                interface: "lan0".into(),
+                expected_revision: revision,
+            })
+            .await,
+        Response::Error { .. }
+    ));
+    assert_eq!(overrides.committed_revision().await, revision);
+    assert!(overrides
+        .effective_interface("lan0")
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn dhcp_client_disable_persists_when_runtime_spec_is_absent() {
+    let fixture = dhcp_client_control_fixture(true).await;
+    fixture.supervisor.disable("wan0").await.unwrap();
+    assert!(fixture.supervisor.spec("wan0").await.is_none());
+    let response = fixture
+        .service
+        .dispatch(Request::DisableDhcpClient {
+            interface: "wan0".into(),
+        })
+        .await;
+    assert!(
+        matches!(response, Response::DhcpClientDisabled { .. }),
+        "{response:?}"
+    );
+    assert!(
+        !fixture
+            .overrides
+            .effective_interface("wan0")
+            .await
+            .unwrap()
+            .unwrap()
+            .dhcp_client
+            .unwrap()
+            .enabled
+    );
+    let reloaded =
+        crate::state::overrides::RuntimeOverrideStore::in_state_dir(fixture.directory.path())
+            .load()
+            .await
+            .unwrap();
+    assert!(
+        !reloaded.interfaces["wan0"]
+            .config
+            .dhcp_client
+            .as_ref()
+            .unwrap()
+            .enabled
+    );
+}
+
+#[tokio::test]
+async fn saved_dhcp_pool_is_readable_without_device_or_runtime_spec() {
+    let directory = tempdir().unwrap();
+    let mut base = router_base_config();
+    base.runtime.state_dir = directory.path().into();
+    let lan = base.network.interfaces.get_mut("lan0").unwrap();
+    lan.ipv4 = Some("192.168.50.1/24".parse().unwrap());
+    lan.dhcp = Some(dhcp_config());
+    let overrides = RuntimeOverrideManager::load(directory.path(), &base)
+        .await
+        .unwrap();
+    let runtime_base = router_base_config();
+    let dhcp = DhcpSupervisor::start(&runtime_base).await.unwrap();
+    assert!(dhcp.spec("lan0").await.is_none());
+    let service = ControlService::new(
+        base,
+        Arc::new(FakeNetwork {
+            addresses: Vec::new(),
+        }),
+        dhcp,
+        overrides,
+    );
+    match service
+        .dispatch(Request::GetDhcpConfig {
+            interface: "lan0".into(),
+        })
+        .await
+    {
+        Response::DhcpConfig {
+            spec: Some(spec), ..
+        } => {
+            assert_eq!(spec.pool_start, dhcp_config().pool_start);
+            assert_eq!(spec.pool_end, dhcp_config().pool_end);
+        }
+        response => panic!("{response:?}"),
+    }
+}
+
+#[tokio::test]
+async fn offline_intent_writers_reject_live_targets_and_serialize_stale_revisions() {
+    let directory = tempdir().unwrap();
+    let mut base = router_base_config();
+    base.runtime.state_dir = directory.path().into();
+    let overrides = RuntimeOverrideManager::load(directory.path(), &base)
+        .await
+        .unwrap();
+    let network = Arc::new(crate::test_support::FakeNetworkProvider::default());
+    network.add_interface("lan0", 7).await;
+    let dhcp = DhcpSupervisor::start(&base).await.unwrap();
+    let service = ControlService::new(base.clone(), network.clone(), dhcp, overrides.clone());
+    let response = service
+        .dispatch(Request::ForgetInterfaceConfig {
+            interface: "lan0".into(),
+            expected_revision: 0,
+        })
+        .await;
+    assert!(matches!(response, Response::Error { .. }));
+    assert_eq!(overrides.committed_revision().await, 0);
+    network.interfaces.lock().await.clear();
+    let forget = Request::ForgetInterfaceConfig {
+        interface: "lan0".into(),
+        expected_revision: 0,
+    };
+    let save = Request::SaveInterfaceConfig {
+        interface: "lan0".into(),
+        config: base.network.interfaces["lan0"].clone().into(),
+        expected_revision: 0,
+        allow_management_change: false,
+    };
+    let (first, second) = tokio::join!(service.dispatch(forget), service.dispatch(save));
+    assert_eq!(
+        [first, second]
+            .iter()
+            .filter(|response| matches!(response, Response::InterfaceIntentSaved { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(overrides.committed_revision().await, 1);
+}
+
+#[tokio::test]
+async fn offline_intent_respects_interface_recovery_fence() {
+    let directory = tempdir().unwrap();
+    let mut base = router_base_config();
+    base.runtime.state_dir = directory.path().into();
+    let overrides = RuntimeOverrideManager::load(directory.path(), &base)
+        .await
+        .unwrap();
+    let dhcp = DhcpSupervisor::start(&base).await.unwrap();
+    let service = ControlService::new(
+        base,
+        Arc::new(FakeNetwork {
+            addresses: Vec::new(),
+        }),
+        dhcp,
+        overrides.clone(),
+    );
+    crate::core::recovery::block_interface(
+        directory.path(),
+        "lan0",
+        "retained transaction proof".into(),
+    );
+    let response = service
+        .dispatch(Request::ForgetInterfaceConfig {
+            interface: "lan0".into(),
+            expected_revision: 0,
+        })
+        .await;
+    crate::core::recovery::unblock_interface(directory.path(), "lan0");
+    assert!(matches!(response, Response::Error { .. }), "{response:?}");
+    assert_eq!(overrides.committed_revision().await, 0);
+    assert!(overrides
+        .effective_interface("lan0")
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn unused_vpn_profile_storage_remains_available_with_execution_disabled() {
+    let (service, _directory) = vpn_enabled_service().await;
+    service.overrides.set_vpn_enabled(false).await.unwrap();
+    assert!(matches!(
+        service
+            .dispatch(Request::VpnImportProfile {
+                name: "offline.conf".into(),
+                contents: valid_vpn_profile_contents()
+            })
+            .await,
+        Response::VpnProfileImported { .. }
+    ));
+    assert!(
+        matches!(service.dispatch(Request::VpnListProfiles).await, Response::VpnProfiles { profiles } if profiles.len() == 1)
+    );
+    assert!(matches!(
+        service
+            .dispatch(Request::VpnDeleteProfile {
+                name: "offline.conf".into()
+            })
+            .await,
+        Response::VpnProfileDeleted { .. }
+    ));
+}
+
+#[tokio::test]
+async fn offline_save_preserves_retained_runtime_ownership() {
+    let fixture = dhcp_client_control_fixture(true).await;
+    let config = fixture
+        .overrides
+        .effective_interface("wan0")
+        .await
+        .unwrap()
+        .unwrap();
+    let revision = fixture.overrides.committed_revision().await;
+    let response = fixture
+        .service
+        .dispatch(Request::SaveInterfaceConfig {
+            interface: "wan0".into(),
+            config: config.clone().into(),
+            allow_management_change: false,
+            expected_revision: revision,
+        })
+        .await;
+    assert!(
+        matches!(response, Response::Error { ref message } if message.contains("runtime ownership")),
+        "{response:?}"
+    );
+    assert_eq!(fixture.overrides.committed_revision().await, revision);
+    assert_eq!(
+        fixture.overrides.effective_interface("wan0").await.unwrap(),
+        Some(config)
+    );
+    assert!(fixture.supervisor.spec("wan0").await.is_some());
+}

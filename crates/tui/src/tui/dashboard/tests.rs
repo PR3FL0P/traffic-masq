@@ -385,7 +385,7 @@ async fn partial_api_failure_does_not_clear_other_status_or_fetch_dhcp() {
                         TokioIo::new(stream),
                         service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
                             let response = match req.uri().path() {
-                                "/api/v1/interfaces" => Response::Interfaces {
+                                "/api/v1/interface-inventory" => Response::Interfaces {
                                     interfaces: vec![status(1)],
                                 },
                                 "/api/v1/interfaces/eth1/config" => Response::InterfaceConfig {

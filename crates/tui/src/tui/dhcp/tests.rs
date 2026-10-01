@@ -232,6 +232,7 @@ fn dhcp_field_reaches_every_action_row_and_clamps_at_both_ends() {
 #[test]
 fn dhcp_editor_active_value_is_none_for_action_rows_only() {
     let mut editor = DhcpEditor {
+        offline_intent: None,
         interface: "lan0".to_string(),
         field: DhcpField::Save,
         pool_start: String::new(),
@@ -255,6 +256,7 @@ async fn dhcp_editor_cursor_navigation_and_editing() {
     let mut app = TuiApp {
         screen: Screen::DhcpEditor,
         dhcp_editor: Some(DhcpEditor {
+            offline_intent: None,
             interface: "lan0".to_string(),
             field: DhcpField::PoolStart,
             pool_start: "192.168.1.10".to_string(),
@@ -281,4 +283,57 @@ async fn dhcp_editor_cursor_navigation_and_editing() {
     handle_dhcp_editor_key(&mut app, KeyCode::Backspace, &client).await;
     assert_eq!(app.dhcp_editor.as_ref().unwrap().pool_start, "192.168.1.10");
     assert_eq!(app.dhcp_editor.as_ref().unwrap().cursor, 11);
+}
+
+#[tokio::test]
+async fn missing_dhcp_editor_saves_revision_checked_intent_without_live_apply() {
+    use http_body_util::{BodyExt, Full};
+    use hyper::{body::Bytes, server::conn::http1, service::service_fn};
+    use hyper_util::rt::TokioIo;
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("api.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        http1::Builder::new().serve_connection(TokioIo::new(stream), service_fn(|request: hyper::Request<hyper::body::Incoming>| async move {
+            assert_eq!(request.method(), hyper::Method::PUT);
+            assert_eq!(request.uri().path(), "/api/v1/interfaces/usb0/intent");
+            let body = request.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["expected_revision"], 42);
+            assert_eq!(body["config"]["nat"], false);
+            assert_eq!(body["config"]["dhcp"]["pool_start"], "192.168.50.10");
+            let response = serde_json::json!({"type": "interface_intent_saved", "interface": "usb0", "revision": 43, "deferred": true, "missing_dependencies": ["usb0"]});
+            Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(Bytes::from(response.to_string()))))
+        })).await.unwrap();
+    });
+    let config = traffic_masq_protocol::InterfaceConfigView {
+        role: traffic_masq_protocol::InterfaceRole::Output,
+        managed: true,
+        ipv4: Some("192.168.50.1/24".parse().unwrap()),
+        dhcp: None,
+        dhcp_client: None,
+        wifi: None,
+        wifi_client: None,
+        nat: false,
+    };
+    let mut app = TuiApp {
+        screen: Screen::DhcpEditor,
+        dhcp_editor: Some(DhcpEditor {
+            interface: "usb0".into(),
+            offline_intent: Some((42, config)),
+            field: DhcpField::Save,
+            pool_start: "192.168.50.10".into(),
+            pool_end: "192.168.50.100".into(),
+            router: "192.168.50.1".into(),
+            dns_servers: String::new(),
+            lease_seconds: "3600".into(),
+            cursor: 0,
+        }),
+        ..Default::default()
+    };
+    let client = ApiClient::new(socket);
+    submit_dhcp_config(&mut app, &client).await;
+    server.await.unwrap();
+    assert_eq!(app.screen, Screen::DhcpInterfaceList);
 }

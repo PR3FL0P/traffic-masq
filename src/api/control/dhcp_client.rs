@@ -172,9 +172,6 @@ impl ControlService {
             },
             None => true,
         };
-        if previous.is_none() {
-            return dhcp_client_error(DhcpClientErrorDetail::Disabled);
-        }
         config
             .dhcp_client
             .get_or_insert_with(Default::default)

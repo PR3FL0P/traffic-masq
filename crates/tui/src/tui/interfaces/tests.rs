@@ -2,6 +2,9 @@ use super::*;
 
 fn default_route_editor(allow_management_change: bool) -> InterfaceEditor {
     InterfaceEditor {
+        saved_config: None,
+        offline_revision: None,
+        intent_confirmation: None,
         interface: "wlan0".into(),
         field: InterfaceEditorField::Save,
         cidr: "192.168.1.10/24".into(),

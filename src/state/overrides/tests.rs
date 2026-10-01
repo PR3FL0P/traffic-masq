@@ -242,3 +242,77 @@ async fn router_recovery_state_can_use_a_separately_parsed_commit_token() {
     assert_eq!(state.revision, 7);
     assert!(state.committed_router_transaction.is_none());
 }
+
+#[tokio::test]
+async fn suppression_survives_restart_base_changes_and_recovery_loading() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = RuntimeOverrideStore::in_state_dir(directory.path());
+    let mut base = base_config();
+    base.network
+        .interfaces
+        .insert("usb0".into(), interface_config("192.168.10.1/24"));
+    let mut overrides = RuntimeOverrides::default();
+    overrides.forget_interface("usb0");
+    store.save(&overrides).await.unwrap();
+    base.network
+        .interfaces
+        .insert("usb0".into(), interface_config("192.168.20.1/24"));
+    let mut loaded = store.load().await.unwrap();
+    assert!(!loaded
+        .effective_config(&base)
+        .unwrap()
+        .network
+        .interfaces
+        .contains_key("usb0"));
+    let proof = store.load_recovery_commit_proof().await.unwrap();
+    assert!(!proof
+        .router_recovery_overrides()
+        .unwrap()
+        .effective_router_recovery_config(&base)
+        .unwrap()
+        .network
+        .interfaces
+        .contains_key("usb0"));
+    loaded.reset_interface_override("usb0");
+    assert_eq!(
+        loaded.effective_config(&base).unwrap().network.interfaces["usb0"],
+        base.network.interfaces["usb0"]
+    );
+}
+
+#[tokio::test]
+async fn version_three_migrates_with_empty_suppression() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = RuntimeOverrideStore::in_state_dir(directory.path());
+    tokio::fs::write(store.path(), br#"{"schema_version":3,"revision":7}"#)
+        .await
+        .unwrap();
+    let loaded = store.load().await.unwrap();
+    assert_eq!(loaded.schema_version, CURRENT_RUNTIME_OVERRIDES_SCHEMA);
+    assert_eq!(loaded.revision, 7);
+    assert!(loaded.suppressed_interfaces.is_empty());
+    assert!(store
+        .load_recovery_commit_proof()
+        .await
+        .unwrap()
+        .router_recovery_overrides()
+        .unwrap()
+        .suppressed_interfaces
+        .is_empty());
+}
+
+#[test]
+fn suppression_conflict_rejects_derived_dhcp_resurrection() {
+    let mut overrides = RuntimeOverrides::default();
+    overrides.forget_interface("usb0");
+    overrides.interfaces.insert(
+        "usb0".into(),
+        InterfaceOverride {
+            config: interface_config("192.168.10.1/24"),
+            allow_management_change: false,
+            dhcp_client_only: true,
+        },
+    );
+    assert!(overrides.normalized().is_err());
+    assert!(overrides.effective_network(&base_config().network).is_err());
+}

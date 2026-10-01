@@ -396,7 +396,10 @@ async fn version_two_records_upgrade_without_losing_revision() {
         .await
         .unwrap();
     let snapshot = manager.snapshot().await;
-    assert_eq!(snapshot.schema_version, 3);
+    assert_eq!(
+        snapshot.schema_version,
+        crate::state::overrides::CURRENT_RUNTIME_OVERRIDES_SCHEMA
+    );
     assert_eq!(snapshot.revision, 7);
     assert!(snapshot.committed_router_transaction.is_none());
 }
@@ -405,14 +408,20 @@ async fn version_two_records_upgrade_without_losing_revision() {
 async fn rejects_future_schema_version() {
     let directory = tempdir().expect("tempdir");
     let store = RuntimeOverrideStore::in_state_dir(directory.path());
-    tokio::fs::write(store.path(), br#"{"schema_version":4,"revision":0}"#)
-        .await
-        .unwrap();
+    let future = crate::state::overrides::CURRENT_RUNTIME_OVERRIDES_SCHEMA + 1;
+    tokio::fs::write(
+        store.path(),
+        serde_json::to_vec(&serde_json::json!({"schema_version": future, "revision": 0})).unwrap(),
+    )
+    .await
+    .unwrap();
 
     let error = RuntimeOverrideManager::load(directory.path(), &base_config())
         .await
         .expect_err("future schema");
-    assert!(error.to_string().contains("future schema version 4"));
+    assert!(error
+        .to_string()
+        .contains(&format!("future schema version {future}")));
 }
 
 #[tokio::test]

@@ -527,3 +527,43 @@ fn validated_candidate_is_not_mutable_through_its_accessors() {
     assert_eq!(candidate.desired().dhcp.len(), 2);
     assert_eq!(candidate.digest(), digest);
 }
+
+#[test]
+fn forget_and_reset_have_distinct_digests_and_setting_restores_intent() {
+    let base = base_config();
+    let committed = RuntimeOverrides::default();
+    let forgotten = RouterCandidate::build(
+        &base,
+        &committed,
+        &RouterIntentProposal::new().forget_interface("lan0"),
+    )
+    .unwrap();
+    assert!(!forgotten
+        .effective_config()
+        .network
+        .interfaces
+        .contains_key("lan0"));
+    let reset = RouterCandidate::build(
+        &base,
+        forgotten.document(),
+        &RouterIntentProposal::new().remove_interface("lan0"),
+    )
+    .unwrap();
+    assert!(reset
+        .effective_config()
+        .network
+        .interfaces
+        .contains_key("lan0"));
+    assert_ne!(forgotten.digest(), reset.digest());
+    let restored = RouterCandidate::build(
+        &base,
+        forgotten.document(),
+        &RouterIntentProposal::new().set_interface(
+            "lan0",
+            base.network.interfaces["lan0"].clone(),
+            false,
+        ),
+    )
+    .unwrap();
+    assert!(!restored.document().suppressed_interfaces.contains("lan0"));
+}

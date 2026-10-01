@@ -1,6 +1,179 @@
 use super::*;
 
 impl ControlService {
+    pub(super) async fn interface_inventory(&self) -> Result<Response> {
+        use traffic_masq_protocol::{
+            InterfaceConfigSource, InterfaceInventoryEntry, InterfacePresence, InterfaceReadiness,
+            InterfaceReadinessBlocker,
+        };
+        let snapshot = self.overrides.snapshot().await;
+        let effective = snapshot.effective_config(&self.base_config)?;
+        let observation = interface_statuses(self.network.as_ref(), &self.transactions).await;
+        let mut cache = self.interface_observation.lock().await;
+        let observation_error = match observation {
+            Ok(observed) => {
+                *cache = observed;
+                None
+            }
+            Err(error) => Some(format!("{error:#}")),
+        };
+        let mut names: BTreeSet<String> = effective.network.interfaces.keys().cloned().collect();
+        names.extend(snapshot.suppressed_interfaces.iter().cloned());
+        names.extend(cache.iter().map(|entry| entry.interface.name.clone()));
+        let mut references: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        if let Some(uplink) = &effective.router.uplink {
+            references
+                .entry(uplink.interface.clone())
+                .or_default()
+                .push("router.uplink".into());
+        }
+        for (index, rule) in effective.router.forwarding.iter().flatten().enumerate() {
+            references
+                .entry(rule.from.clone())
+                .or_default()
+                .push(format!("router.forwarding[{index}].from"));
+            references
+                .entry(rule.to.clone())
+                .or_default()
+                .push(format!("router.forwarding[{index}].to"));
+        }
+        for (index, route) in effective.router.owned_routes.iter().enumerate() {
+            if let Some(name) = &route.output_interface {
+                references
+                    .entry(name.clone())
+                    .or_default()
+                    .push(format!("router.owned_routes[{index}]"));
+            }
+        }
+        names.extend(references.keys().cloned());
+        let interfaces = names
+            .into_iter()
+            .map(|name| {
+                let observed = cache
+                    .iter()
+                    .find(|entry| entry.interface.name == name)
+                    .cloned();
+                let configured = effective.network.interfaces.get(&name).cloned();
+                let config_source = match snapshot.interfaces.get(&name) {
+                    Some(value) if value.dhcp_client_only => InterfaceConfigSource::Derived,
+                    Some(_) => InterfaceConfigSource::Override,
+                    None if configured.is_some() => InterfaceConfigSource::Base,
+                    None => InterfaceConfigSource::None,
+                };
+                let presence = if observation_error.is_some() {
+                    InterfacePresence::Unknown
+                } else if observed.is_some() {
+                    InterfacePresence::Present
+                } else {
+                    InterfacePresence::Missing
+                };
+                let (readiness, blockers) = match presence {
+                    InterfacePresence::Unknown => (
+                        InterfaceReadiness::Unknown,
+                        vec![InterfaceReadinessBlocker::ObservationFailed {
+                            message: observation_error.clone().unwrap_or_default(),
+                        }],
+                    ),
+                    InterfacePresence::Missing
+                        if configured.is_some() || references.contains_key(&name) =>
+                    {
+                        (
+                            InterfaceReadiness::WaitingDevice,
+                            vec![InterfaceReadinessBlocker::MissingInterface {
+                                interface: name.clone(),
+                            }],
+                        )
+                    }
+                    InterfacePresence::Missing => (InterfaceReadiness::Disabled, Vec::new()),
+                    InterfacePresence::Present => (InterfaceReadiness::Ready, Vec::new()),
+                };
+                InterfaceInventoryEntry {
+                    readiness,
+                    blockers,
+                    references: references.remove(&name).unwrap_or_default(),
+                    suppressed: snapshot.suppressed_interfaces.contains(&name),
+                    name,
+                    observed: observed.map(Into::into),
+                    configured: configured.map(Into::into),
+                    config_source,
+                    presence,
+                    observation_stale: observation_error.is_some(),
+                }
+            })
+            .collect();
+        Ok(Response::InterfaceInventory {
+            revision: snapshot.revision,
+            interfaces,
+            suppressed_interfaces: snapshot.suppressed_interfaces.into_iter().collect(),
+            observation_error,
+        })
+    }
+
+    pub(super) async fn save_missing_interface_intent(
+        &self,
+        interface: String,
+        proposal: RouterIntentProposal,
+        expected_revision: u64,
+    ) -> Result<Response> {
+        traffic_masq_protocol::validate_interface_name(&interface).map_err(anyhow::Error::msg)?;
+        let observed = self.network.list_interfaces().await?;
+        if observed.iter().any(|entry| entry.name == interface) {
+            anyhow::bail!(
+                "interface {interface} is present; use a confirmed live interface transaction"
+            );
+        }
+        // An unplugged device can still have a task holding daemon resources.
+        // Intent-only writes must not strand that task or erase its cleanup proof.
+        if self.dhcp.spec(&interface).await.is_some()
+            || match &self.dhcp_client {
+                Some(runtime) => runtime.spec(&interface).await.is_some(),
+                None => false,
+            }
+            || match &self.wifi {
+                Some(runtime) => runtime.status(&interface).await.is_some(),
+                None => false,
+            }
+            || match &self.wifi_client {
+                Some(runtime) => runtime.status(&interface).await.is_some(),
+                None => false,
+            }
+        {
+            anyhow::bail!("interface {interface} retains service runtime ownership; stop its services and complete cleanup before saving offline intent");
+        }
+        let candidate = self.overrides.build_candidate(&proposal).await?;
+        if candidate.base_revision() != expected_revision {
+            return Err(StaleCandidateError {
+                candidate: expected_revision,
+                current: candidate.base_revision(),
+            }
+            .into());
+        }
+        let mut missing_dependencies: Vec<String> = candidate
+            .desired()
+            .required_existing_interfaces()
+            .into_iter()
+            .filter(|name| !observed.iter().any(|entry| entry.name == *name))
+            .map(str::to_owned)
+            .collect();
+        if candidate
+            .effective_config()
+            .network
+            .interfaces
+            .contains_key(&interface)
+        {
+            missing_dependencies.push(interface.clone());
+        }
+        missing_dependencies.sort();
+        missing_dependencies.dedup();
+        let revision = self.overrides.commit_candidate(&candidate).await?;
+        Ok(Response::InterfaceIntentSaved {
+            interface,
+            revision,
+            deferred: !missing_dependencies.is_empty(),
+            missing_dependencies,
+        })
+    }
+
     pub(super) async fn validate_default_route_management(
         &self,
         interface: &str,

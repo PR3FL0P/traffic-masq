@@ -353,6 +353,10 @@ pub(super) async fn reconcile_network_runtime_once<
         .map(|interface| (interface.name.clone(), interface))
         .collect();
 
+    desired.record_interface_presence(
+        effective.network.interfaces.keys().cloned(),
+        &observed_interfaces.keys().cloned().collect(),
+    );
     let restorations = desired.restorations().await;
     for (name, config) in &effective.network.interfaces {
         let result: Result<()> = async {
@@ -496,7 +500,13 @@ pub(super) async fn reconcile_network_runtime_once<
         }
         .await;
         if let Err(error) = result {
-            tracing::warn!(interface = %name, error = %format!("{error:#}"), "interface convergence incomplete");
+            if crate::core::recovery_control::classify(&error)
+                == crate::core::recovery_control::FailureKind::DeviceMissing
+            {
+                tracing::debug!(interface = %name, error = %format!("{error:#}"), "interface convergence waits for device");
+            } else {
+                tracing::warn!(interface = %name, error = %format!("{error:#}"), "interface convergence incomplete");
+            }
             desired.record_failure_kind(pass_version, name, &error);
             failures.insert(name.clone(), format!("{error:#}"));
         }

@@ -320,6 +320,7 @@ pub(crate) struct FakeNetworkProvider {
     pub(crate) routes: Mutex<Vec<Ipv4RouteInfo>>,
     pub(crate) rules: Mutex<Vec<Ipv4RuleInfo>>,
     pub(crate) fail_next_add_route: Mutex<bool>,
+    pub(crate) fail_interface_observation: Mutex<bool>,
     allow_missing_address_interface: bool,
     deduplicate_addresses: bool,
 }
@@ -333,6 +334,7 @@ impl Default for FakeNetworkProvider {
             routes: Mutex::new(Vec::new()),
             rules: Mutex::new(Vec::new()),
             fail_next_add_route: Mutex::new(false),
+            fail_interface_observation: Mutex::new(false),
             allow_missing_address_interface: false,
             deduplicate_addresses: true,
         }
@@ -384,6 +386,9 @@ impl NetworkProvider for FakeNetworkProvider {
         self.wireless_phys.lock().unwrap().get(interface).cloned()
     }
     async fn list_interfaces(&self) -> Result<Vec<NetworkInterface>> {
+        if *self.fail_interface_observation.lock().await {
+            anyhow::bail!("injected interface observation failure");
+        }
         Ok(self.interfaces.lock().await.values().cloned().collect())
     }
 

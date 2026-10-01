@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
@@ -12,9 +12,10 @@ use crate::config::{
     VpnPolicyMode,
 };
 
+/// Version 4 records interface suppression independently of overrides.
 /// Version 3 records router commit identity atomically with committed intent.
 /// Version 2 is readable; version 1 contained obsolete derived service maps.
-pub const CURRENT_RUNTIME_OVERRIDES_SCHEMA: u32 = 3;
+pub const CURRENT_RUNTIME_OVERRIDES_SCHEMA: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -41,6 +42,8 @@ pub struct RuntimeOverrides {
     pub vpn_enabled: Option<bool>,
     #[serde(default)]
     pub interfaces: BTreeMap<String, InterfaceOverride>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub suppressed_interfaces: BTreeSet<String>,
 }
 
 impl Default for RuntimeOverrides {
@@ -56,6 +59,7 @@ impl Default for RuntimeOverrides {
             vpn_mode: None,
             vpn_enabled: None,
             interfaces: BTreeMap::new(),
+            suppressed_interfaces: BTreeSet::new(),
         }
     }
 }
@@ -166,7 +170,14 @@ impl RecoveryCommitProof {
             })?,
         };
 
+        let suppressed_interfaces = match self.object.get("suppressed_interfaces") {
+            None => BTreeSet::new(),
+            Some(value) => serde_json::from_value(value.clone())
+                .context("invalid interface suppression required for recovery")?,
+        };
+
         Ok(RuntimeOverrides {
+            suppressed_interfaces,
             revision,
             committed_router_transaction,
             router,
@@ -196,6 +207,28 @@ fn is_false(value: &bool) -> bool {
 }
 
 impl RuntimeOverrides {
+    fn validate_suppression(&self) -> Result<()> {
+        for name in &self.suppressed_interfaces {
+            traffic_masq_protocol::validate_interface_name(name).map_err(anyhow::Error::msg)?;
+            if self.interfaces.contains_key(name) {
+                bail!(
+                    "suppressed interface {name:?} conflicts with an override or has an empty name"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub fn forget_interface(&mut self, name: &str) {
+        self.interfaces.remove(name);
+        self.suppressed_interfaces.insert(name.to_owned());
+    }
+
+    pub fn reset_interface_override(&mut self, name: &str) {
+        self.interfaces.remove(name);
+        self.suppressed_interfaces.remove(name);
+    }
+
     pub fn effective_config(&self, base: &AppConfig) -> Result<AppConfig> {
         let mut effective = base.clone();
         effective.network = self.effective_network(&base.network)?;
@@ -230,7 +263,11 @@ impl RuntimeOverrides {
     }
 
     pub fn effective_network(&self, base: &NetworkConfig) -> Result<NetworkConfig> {
+        self.validate_suppression()?;
         let mut effective = base.clone();
+        effective
+            .interfaces
+            .retain(|name, _| !self.suppressed_interfaces.contains(name));
         for (interface, value) in &self.interfaces {
             let config = if value.dhcp_client_only {
                 let mut config = base.interfaces.get(interface).cloned().with_context(|| {
@@ -257,6 +294,7 @@ impl RuntimeOverrides {
     /// and is all that is left of that: those maps were a persisted cache of
     /// what `interfaces` already determines, and nothing read them.
     pub fn normalized(&self) -> Result<Self> {
+        self.validate_suppression()?;
         let mut normalized = self.clone();
         normalized.schema_version = CURRENT_RUNTIME_OVERRIDES_SCHEMA;
         Ok(normalized)
@@ -337,7 +375,7 @@ impl RuntimeOverrideStore {
                     CURRENT_RUNTIME_OVERRIDES_SCHEMA
                 );
             }
-            if version != 2 && version != u64::from(CURRENT_RUNTIME_OVERRIDES_SCHEMA) {
+            if !(2..=u64::from(CURRENT_RUNTIME_OVERRIDES_SCHEMA)).contains(&version) {
                 bail!(
                     "runtime overrides {} use unsupported schema version {version}",
                     self.path.display()
@@ -378,7 +416,7 @@ impl RuntimeOverrideStore {
                     CURRENT_RUNTIME_OVERRIDES_SCHEMA
                 );
             }
-            if version != 2 && version != u64::from(CURRENT_RUNTIME_OVERRIDES_SCHEMA) {
+            if !(2..=u64::from(CURRENT_RUNTIME_OVERRIDES_SCHEMA)).contains(&version) {
                 bail!(
                     "runtime overrides {} use unsupported schema version {version}",
                     self.path.display()
@@ -394,6 +432,7 @@ impl RuntimeOverrideStore {
             overrides.revision = 0;
         }
         overrides.schema_version = CURRENT_RUNTIME_OVERRIDES_SCHEMA;
+        overrides.validate_suppression()?;
         Ok(overrides)
     }
 
@@ -406,7 +445,7 @@ impl RuntimeOverrideStore {
         })?;
         fs::create_dir_all(parent).await?;
 
-        let mut content = serde_json::to_vec_pretty(overrides)?;
+        let mut content = serde_json::to_vec_pretty(&overrides.normalized()?)?;
         content.push(b'\n');
 
         atomic_file::replace_preserving_on_error_async(&self.path, &content, PRIVATE_FILE_MODE)

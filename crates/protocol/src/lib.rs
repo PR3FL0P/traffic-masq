@@ -1087,6 +1087,53 @@ pub fn redact_debug_secrets(value: &mut serde_json::Value) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterfacePresence {
+    Present,
+    Missing,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterfaceConfigSource {
+    Base,
+    Override,
+    Derived,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterfaceReadiness {
+    Ready,
+    Disabled,
+    WaitingDevice,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InterfaceReadinessBlocker {
+    MissingInterface { interface: String },
+    ObservationFailed { message: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterfaceInventoryEntry {
+    pub name: String,
+    pub observed: Option<InterfaceStatusView>,
+    pub configured: Option<InterfaceConfigView>,
+    pub config_source: InterfaceConfigSource,
+    pub presence: InterfacePresence,
+    pub observation_stale: bool,
+    pub suppressed: bool,
+    pub readiness: InterfaceReadiness,
+    pub blockers: Vec<InterfaceReadinessBlocker>,
+    pub references: Vec<String>,
+}
+
 /// Control request envelope. Interface and router proposal payloads stay typed
 /// while callers migrate those domain values to dedicated wire DTOs.
 #[derive(Clone, Serialize, Deserialize)]
@@ -1104,6 +1151,21 @@ pub enum Request<Interface, Proposal> {
     },
     ResetSecuritySettings,
     ListInterfaces,
+    ListInterfaceInventory,
+    SaveInterfaceConfig {
+        interface: String,
+        config: Interface,
+        allow_management_change: bool,
+        expected_revision: u64,
+    },
+    ForgetInterfaceConfig {
+        interface: String,
+        expected_revision: u64,
+    },
+    ResetInterfaceOverride {
+        interface: String,
+        expected_revision: u64,
+    },
     GetInterfaceConfig {
         interface: String,
     },
@@ -1357,6 +1419,18 @@ pub enum Response<
     },
     Interfaces {
         interfaces: Vec<InterfaceStatus>,
+    },
+    InterfaceInventory {
+        revision: u64,
+        interfaces: Vec<InterfaceInventoryEntry>,
+        suppressed_interfaces: Vec<String>,
+        observation_error: Option<String>,
+    },
+    InterfaceIntentSaved {
+        interface: String,
+        revision: u64,
+        deferred: bool,
+        missing_dependencies: Vec<String>,
     },
     InterfaceConfig {
         interface: String,

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use anyhow::{bail, Context, Result};
@@ -25,6 +25,7 @@ pub enum RouterOverrideChange {
 pub struct RouterIntentProposal {
     router: RouterOverrideChange,
     interfaces: BTreeMap<String, Option<InterfaceOverride>>,
+    forgotten_interfaces: BTreeSet<String>,
 }
 
 impl RouterIntentProposal {
@@ -48,8 +49,10 @@ impl RouterIntentProposal {
         config: InterfaceConfig,
         allow_management_change: bool,
     ) -> Self {
+        let interface = interface.into();
+        self.forgotten_interfaces.remove(&interface);
         self.interfaces.insert(
-            interface.into(),
+            interface,
             Some(InterfaceOverride {
                 config,
                 allow_management_change,
@@ -60,7 +63,16 @@ impl RouterIntentProposal {
     }
 
     pub fn remove_interface(mut self, interface: impl Into<String>) -> Self {
-        self.interfaces.insert(interface.into(), None);
+        let interface = interface.into();
+        self.forgotten_interfaces.remove(&interface);
+        self.interfaces.insert(interface, None);
+        self
+    }
+
+    pub fn forget_interface(mut self, interface: impl Into<String>) -> Self {
+        let interface = interface.into();
+        self.interfaces.remove(&interface);
+        self.forgotten_interfaces.insert(interface);
         self
     }
 
@@ -74,12 +86,16 @@ impl RouterIntentProposal {
         for (interface, change) in &self.interfaces {
             match change {
                 Some(value) => {
+                    document.suppressed_interfaces.remove(interface);
                     document.interfaces.insert(interface.clone(), value.clone());
                 }
                 None => {
-                    document.interfaces.remove(interface);
+                    document.reset_interface_override(interface);
                 }
             }
+        }
+        for interface in &self.forgotten_interfaces {
+            document.forget_interface(interface);
         }
     }
 }
@@ -94,12 +110,14 @@ impl CandidateDigest {
             schema_version: u32,
             router: Option<&'a RouterConfig>,
             interfaces: &'a BTreeMap<String, InterfaceOverride>,
+            suppressed_interfaces: &'a BTreeSet<String>,
         }
 
         let canonical = serde_json::to_vec(&CanonicalIntent {
             schema_version: document.schema_version,
             router: document.router.as_ref(),
             interfaces: &document.interfaces,
+            suppressed_interfaces: &document.suppressed_interfaces,
         })
         .context("failed to serialize canonical router candidate intent")?;
         Ok(Self(Sha256::digest(canonical).into()))
@@ -143,6 +161,10 @@ fn apply_derived_router_requirements(
     else {
         return Ok(());
     };
+
+    if document.suppressed_interfaces.contains(&uplink.interface) {
+        bail!("router uplink interface {} is suppressed; explicitly configure it before enabling DHCP", uplink.interface);
+    }
 
     if matches!(proposal.interfaces.get(&uplink.interface), Some(None)) {
         bail!(
@@ -194,6 +216,18 @@ fn reject_unconfirmed_management_change(
     committed_effective: &AppConfig,
     proposal: &RouterIntentProposal,
 ) -> Result<()> {
+    for name in &proposal.forgotten_interfaces {
+        if committed_effective
+            .network
+            .interfaces
+            .get(name)
+            .is_some_and(|config| config.role == InterfaceRole::None)
+        {
+            bail!(
+                "refusing to forget outside-router interface {name} without explicit confirmation"
+            );
+        }
+    }
     for (name, change) in &proposal.interfaces {
         let current_role = committed_effective
             .network

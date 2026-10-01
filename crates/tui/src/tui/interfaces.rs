@@ -34,6 +34,9 @@ const INTERFACE_EDITOR_FIELDS: [InterfaceEditorField; 5] = [
 #[derive(Debug, Clone)]
 pub(crate) struct InterfaceEditor {
     pub(crate) interface: String,
+    pub(crate) saved_config: Option<traffic_masq_protocol::InterfaceConfigView>,
+    pub(crate) offline_revision: Option<u64>,
+    pub(crate) intent_confirmation: Option<bool>,
     pub(crate) field: InterfaceEditorField,
     pub(crate) cidr: String,
     pub(crate) role: InterfaceRole,
@@ -133,7 +136,118 @@ impl InterfaceEditor {
     }
 }
 
+pub(crate) fn selected_interface_name(app: &TuiApp) -> Option<String> {
+    match &app.dashboard.inventory {
+        Some(entries) => entries
+            .get(app.selected_inventory_interface)
+            .map(|entry| entry.name.clone()),
+        None => app
+            .dashboard
+            .interfaces
+            .get(app.selected_interface)
+            .map(|status| status.interface.name.clone()),
+    }
+}
+
+pub(crate) fn interface_selection(app: &TuiApp) -> usize {
+    if app.dashboard.inventory.is_some() {
+        app.selected_inventory_interface
+    } else {
+        app.selected_interface
+    }
+}
+
+pub(crate) fn set_interface_selection(app: &mut TuiApp, index: usize) {
+    if app.dashboard.inventory.is_some() {
+        app.selected_inventory_interface = index;
+    } else {
+        app.selected_interface = index;
+    }
+}
+
+pub(crate) fn interface_count(app: &TuiApp) -> usize {
+    app.dashboard
+        .inventory
+        .as_ref()
+        .map_or(app.dashboard.interfaces.len(), Vec::len)
+}
+
 pub(crate) fn render_interface_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
+    if let Some(entries) = &app.dashboard.inventory {
+        let block = panel("Interfaces | Enter: edit | missing: saved settings");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        app.ui.list_area = Some(inner);
+        app.ui.list_row_height = 1;
+        app.ui.list_count = entries.len();
+        let offset = app
+            .selected_inventory_interface
+            .saturating_sub((inner.height as usize).saturating_sub(1));
+        app.ui.list_scroll_offset = offset;
+        let lines: Vec<Line> = entries
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(inner.height as usize)
+            .map(|(index, entry)| {
+                let marker = if index == app.selected_inventory_interface {
+                    "▶"
+                } else {
+                    " "
+                };
+                let presence = match entry.presence {
+                    traffic_masq_protocol::InterfacePresence::Present => {
+                        if entry
+                            .observed
+                            .as_ref()
+                            .is_some_and(|status| status.interface.is_up)
+                        {
+                            "up"
+                        } else {
+                            "down"
+                        }
+                    }
+                    traffic_masq_protocol::InterfacePresence::Missing => "missing",
+                    traffic_masq_protocol::InterfacePresence::Unknown => "unknown",
+                };
+                let configured = entry
+                    .configured
+                    .as_ref()
+                    .and_then(|config| config.ipv4)
+                    .map(|ip| format!(" saved:{ip}"))
+                    .unwrap_or_default();
+                let addresses = entry
+                    .observed
+                    .as_ref()
+                    .map(|status| {
+                        status
+                            .ipv4_addresses
+                            .iter()
+                            .map(|address| format!("{}/{}", address.address, address.prefix_len))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                let style = if index == app.selected_inventory_interface {
+                    Style::default()
+                        .fg(theme::ACCENT)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                Line::styled(
+                    format!(
+                        "{marker} {}{}  {presence}  {addresses}{configured}",
+                        entry.name,
+                        if entry.suppressed { " [forgotten]" } else { "" }
+                    ),
+                    style,
+                )
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(lines), inner);
+        return;
+    }
     let block = panel("Interfaces | [ext] external, [?] ownership unknown");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -200,6 +314,33 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         return;
     };
 
+    if let Some(forget) = editor.intent_confirmation {
+        let entry = app
+            .dashboard
+            .inventory
+            .as_ref()
+            .and_then(|entries| entries.iter().find(|entry| entry.name == editor.interface));
+        let action = if forget {
+            "Forget saved configuration (including base)"
+        } else {
+            "Reset override and restore base configuration"
+        };
+        let references = entry
+            .map(|entry| entry.references.join(", "))
+            .unwrap_or_default();
+        let origin = entry
+            .map(|entry| format!("{:?}", entry.config_source))
+            .unwrap_or_default();
+        let text = format!("{action}: {}\nSource: {origin}\nReferences retained: {references}\nProfiles and credentials are retained.\nPress y to confirm; Esc to cancel.", editor.interface);
+        frame.render_widget(
+            Paragraph::new(text)
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .block(panel("Saved interface configuration")),
+            area,
+        );
+        return;
+    }
+
     let row = |label: &str, value: String, field: InterfaceEditorField| {
         let active = editor.field == field;
         let marker = if active { "▶ " } else { "  " };
@@ -249,6 +390,11 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         Line::from(format!("Interface: {}", editor.interface)),
         Line::from(cidr_spans),
     ];
+    if editor.offline_revision.is_some() {
+        lines.push(Line::from(
+            "Missing: Save stores settings; F5 forget; F6 reset to base",
+        ));
+    }
     if !editor.managed {
         lines.push(Line::styled(
             "IPv4 editing is disabled. Enable Configure with traffic-masq to change addresses.",
@@ -644,16 +790,16 @@ pub(crate) async fn handle_interface_list_key(
     match key {
         KeyCode::Esc => app.screen = Screen::Dashboard,
         KeyCode::Up | KeyCode::Char('k') => {
-            app.selected_interface = app.selected_interface.saturating_sub(1);
+            set_interface_selection(app, interface_selection(app).saturating_sub(1));
         }
         KeyCode::Down | KeyCode::Char('j')
-            if app.selected_interface + 1 < app.dashboard.interfaces.len() =>
+            if interface_selection(app) + 1 < interface_count(app) =>
         {
-            app.selected_interface += 1;
+            set_interface_selection(app, interface_selection(app) + 1);
         }
-        KeyCode::Home => app.selected_interface = 0,
+        KeyCode::Home => set_interface_selection(app, 0),
         KeyCode::End => {
-            app.selected_interface = app.dashboard.interfaces.len().saturating_sub(1);
+            set_interface_selection(app, interface_count(app).saturating_sub(1));
         }
         KeyCode::Enter if !direct => open_editor(app, client).await,
         KeyCode::Enter => {
@@ -664,10 +810,23 @@ pub(crate) async fn handle_interface_list_key(
 }
 
 pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
-    let Some(status) = app.dashboard.interfaces.get(app.selected_interface) else {
+    let Some(name) = selected_interface_name(app) else {
         return;
     };
-    let name = status.interface.name.clone();
+    let status = app
+        .dashboard
+        .interfaces
+        .iter()
+        .find(|status| status.interface.name == name)
+        .cloned();
+    let entry = app
+        .dashboard
+        .inventory
+        .as_ref()
+        .and_then(|entries| entries.iter().find(|entry| entry.name == name));
+    let offline_revision = entry
+        .filter(|entry| entry.presence == traffic_masq_protocol::InterfacePresence::Missing)
+        .and(app.dashboard.intent_revision);
 
     match client
         .request(&Request::GetInterfaceConfig {
@@ -687,8 +846,9 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
                 .unwrap_or_default();
 
             let current_addresses = status
-                .ipv4_addresses
-                .iter()
+                .as_ref()
+                .into_iter()
+                .flat_map(|status| status.ipv4_addresses.iter())
                 .map(|address| format!("{}/{}", address.address, address.prefix_len))
                 .collect();
             let original_managed = config.as_ref().is_some_and(|interface| interface.managed);
@@ -707,15 +867,23 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
             let cursor = super::input::grapheme_count(&cidr);
             app.editor = Some(InterfaceEditor {
                 interface: name,
+                saved_config: config.clone(),
+                offline_revision,
+                intent_confirmation: None,
                 field: InterfaceEditorField::Cidr,
                 cidr,
                 role: original_role,
                 managed: original_managed,
                 allow_management_change,
-                has_default_route: status.has_default_route,
+                has_default_route: status
+                    .as_ref()
+                    .is_some_and(|status| status.has_default_route),
                 original_managed,
                 original_cidr,
-                observed_addresses: format_addresses(status),
+                observed_addresses: status
+                    .as_ref()
+                    .map(format_addresses)
+                    .unwrap_or_else(|| vec![Span::raw("unavailable")]),
                 current_addresses,
                 current_wifi_summary,
                 current_dhcp_summary,
@@ -742,9 +910,63 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
         return;
     };
 
+    if let Some(forget) = editor.intent_confirmation {
+        if key == KeyCode::Esc {
+            editor.intent_confirmation = None;
+            return;
+        }
+        if key != KeyCode::Char('y') {
+            return;
+        }
+        let Some(expected_revision) = editor.offline_revision else {
+            return;
+        };
+        let interface = editor.interface.clone();
+        let request = if forget {
+            Request::ForgetInterfaceConfig {
+                interface,
+                expected_revision,
+            }
+        } else {
+            Request::ResetInterfaceOverride {
+                interface,
+                expected_revision,
+            }
+        };
+        match client.request(&request).await {
+            Ok(Response::InterfaceIntentSaved {
+                interface,
+                deferred,
+                ..
+            }) => {
+                app.push_message(
+                    LogLevel::Info,
+                    if deferred {
+                        format!("Saved configuration updated for {interface}; application deferred")
+                    } else {
+                        format!("Saved configuration updated for {interface}")
+                    },
+                );
+                app.screen = Screen::InterfaceList;
+            }
+            Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
+            result => app.push_message(
+                LogLevel::Error,
+                format!("Configuration update failed: {result:?}"),
+            ),
+        }
+        return;
+    }
+
     let mut unmanaged_ip_attempt = false;
 
     match key {
+        KeyCode::F(5) if editor.offline_revision.is_some() => {
+            editor.intent_confirmation = Some(true);
+        }
+        KeyCode::F(6) if editor.offline_revision.is_some() => {
+            editor.intent_confirmation = Some(false);
+        }
         KeyCode::Esc => app.screen = Screen::InterfaceList,
         KeyCode::Up | KeyCode::Char('k') if editor.field != InterfaceEditorField::Cidr => {
             editor.field = previous_editor_field(editor.field);
@@ -822,6 +1044,49 @@ pub(crate) async fn submit_dry_run(app: &mut TuiApp, client: &ApiClient) {
             return;
         }
     };
+    if let Some(expected_revision) = editor.offline_revision {
+        let Some(mut config) = editor.saved_config.clone() else {
+            app.push_message(LogLevel::Warn, "No saved interface configuration to edit");
+            return;
+        };
+        config.ipv4 = if edit.cidr.is_empty() {
+            None
+        } else {
+            edit.cidr.parse().ok()
+        };
+        config.role = edit.role;
+        config.managed = edit.managed;
+        if config.role != InterfaceRole::Output || !config.managed {
+            config.dhcp = None;
+            config.wifi = None;
+        }
+        if config.role != InterfaceRole::Input || !config.managed || config.ipv4.is_some() {
+            config.dhcp_client = None;
+        }
+        if config.role != InterfaceRole::Input {
+            config.wifi_client = None;
+        }
+        match client
+            .request(&Request::SaveInterfaceConfig {
+                interface,
+                config,
+                allow_management_change: edit.allow_management_change,
+                expected_revision,
+            })
+            .await
+        {
+            Ok(Response::InterfaceIntentSaved { interface, .. }) => {
+                app.push_message(
+                    LogLevel::Info,
+                    format!("Saved; application waits for interface {interface}"),
+                );
+                app.screen = Screen::InterfaceList;
+            }
+            Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
+            result => app.push_message(LogLevel::Error, format!("Save failed: {result:?}")),
+        }
+        return;
+    }
     match client
         .request(&Request::DryRunInterfaceEdit { interface, edit })
         .await

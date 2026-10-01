@@ -325,6 +325,7 @@ impl RuntimeOverrideManager {
         let mut candidate = state.clone();
         match previous {
             Some(previous) => {
+                candidate.suppressed_interfaces.remove(interface);
                 candidate.interfaces.insert(interface.to_string(), previous);
             }
             None => {
@@ -344,6 +345,7 @@ impl RuntimeOverrideManager {
         config.validate(&interface)?;
         let mut state = self.state.lock().await;
         let mut candidate = state.clone();
+        candidate.suppressed_interfaces.remove(&interface);
         candidate.interfaces.insert(
             interface,
             InterfaceOverride {
@@ -368,6 +370,7 @@ impl RuntimeOverrideManager {
         candidate
             .committed_interface_transactions
             .insert(interface.clone(), token.to_owned());
+        candidate.suppressed_interfaces.remove(&interface);
         candidate.interfaces.insert(
             interface,
             InterfaceOverride {
@@ -389,6 +392,7 @@ impl RuntimeOverrideManager {
         config.validate(interface)?;
         let state = self.state.lock().await;
         let mut candidate = state.clone();
+        candidate.suppressed_interfaces.remove(interface);
         candidate.interfaces.insert(
             interface.to_owned(),
             InterfaceOverride {

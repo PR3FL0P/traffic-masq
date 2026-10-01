@@ -297,6 +297,8 @@ pub(crate) fn format_rate(bytes_per_sec: u64) -> String {
 #[derive(Debug, Default)]
 pub(crate) struct DashboardData {
     pub(crate) interfaces: Vec<InterfaceStatus>,
+    pub(crate) inventory: Option<Vec<traffic_masq_protocol::InterfaceInventoryEntry>>,
+    pub(crate) intent_revision: Option<u64>,
     pub(crate) managed: std::collections::HashMap<String, bool>,
     pub(crate) roles: std::collections::HashMap<String, InterfaceRole>,
     pub(crate) routes: Option<Vec<RouteStatus>>,
@@ -318,11 +320,21 @@ pub(crate) fn accept_update(app: &mut TuiApp, mut updated: DashboardData) {
         .dashboard
         .interfaces
         .get(app.selected_interface)
-        .map(|s| s.interface.name.clone());
+        .map(|entry| entry.interface.name.clone());
+    let inventory_selected = app
+        .dashboard
+        .inventory
+        .as_ref()
+        .and_then(|entries| entries.get(app.selected_inventory_interface))
+        .map(|entry| entry.name.clone());
     updated.statistics_scroll = app.dashboard.statistics_scroll;
     updated.statistics_max_scroll = app.dashboard.statistics_max_scroll;
     if updated.error.is_some() {
         updated.last_success = app.dashboard.last_success;
+    }
+    if updated.inventory.is_none() {
+        updated.inventory = app.dashboard.inventory.clone();
+        updated.intent_revision = app.dashboard.intent_revision;
     }
     if updated.interfaces_updated.is_none() {
         updated.interfaces = std::mem::take(&mut app.dashboard.interfaces);
@@ -376,6 +388,26 @@ pub(crate) fn accept_update(app: &mut TuiApp, mut updated: DashboardData) {
         })
         .or_else(|| updated.interfaces.iter().position(|s| s.has_default_route))
         .unwrap_or(0);
+    app.selected_inventory_interface = inventory_selected
+        .as_ref()
+        .and_then(|name| {
+            updated
+                .inventory
+                .as_ref()?
+                .iter()
+                .position(|entry| &entry.name == name)
+        })
+        .unwrap_or_else(|| {
+            updated
+                .inventory
+                .as_ref()
+                .and_then(|entries| {
+                    entries.iter().position(|entry| {
+                        updated.roles.get(&entry.name) == Some(&InterfaceRole::Input)
+                    })
+                })
+                .unwrap_or(0)
+        });
     app.dashboard = updated;
 }
 

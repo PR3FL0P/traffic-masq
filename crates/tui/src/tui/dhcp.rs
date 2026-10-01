@@ -30,6 +30,7 @@ pub(crate) enum DhcpField {
 #[derive(Debug, Clone)]
 pub(crate) struct DhcpEditor {
     pub(crate) interface: String,
+    pub(crate) offline_intent: Option<(u64, traffic_masq_protocol::InterfaceConfigView)>,
     pub(crate) field: DhcpField,
     pub(crate) pool_start: String,
     pub(crate) pool_end: String,
@@ -123,6 +124,10 @@ pub(crate) fn render_dhcp_interface_list(
     area: Rect,
     app: &mut TuiApp,
 ) {
+    if app.dashboard.inventory.is_some() {
+        super::interfaces::render_interface_list(frame, area, app);
+        return;
+    }
     let block = panel("DHCP interfaces");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -357,14 +362,26 @@ pub(crate) async fn handle_dhcp_interface_list_key(
     match key {
         KeyCode::Esc => app.screen = Screen::Dashboard,
         KeyCode::Up => {
-            app.selected_interface = app.selected_interface.saturating_sub(1);
+            super::interfaces::set_interface_selection(
+                app,
+                super::interfaces::interface_selection(app).saturating_sub(1),
+            );
         }
-        KeyCode::Down if app.selected_interface + 1 < app.dashboard.interfaces.len() => {
-            app.selected_interface += 1;
+        KeyCode::Down
+            if super::interfaces::interface_selection(app) + 1
+                < super::interfaces::interface_count(app) =>
+        {
+            super::interfaces::set_interface_selection(
+                app,
+                super::interfaces::interface_selection(app) + 1,
+            );
         }
-        KeyCode::Home => app.selected_interface = 0,
+        KeyCode::Home => super::interfaces::set_interface_selection(app, 0),
         KeyCode::End => {
-            app.selected_interface = app.dashboard.interfaces.len().saturating_sub(1);
+            super::interfaces::set_interface_selection(
+                app,
+                super::interfaces::interface_count(app).saturating_sub(1),
+            );
         }
 
         KeyCode::Enter => open_dhcp_editor(app, client).await,
@@ -416,10 +433,22 @@ fn candidate_cidr_from_status(
 }
 
 pub(crate) async fn open_dhcp_editor(app: &mut TuiApp, client: &ApiClient) {
-    let Some(status) = app.dashboard.interfaces.get(app.selected_interface) else {
+    let Some(interface) = super::interfaces::selected_interface_name(app) else {
         return;
     };
-    let interface = status.interface.name.clone();
+    let status = app
+        .dashboard
+        .interfaces
+        .iter()
+        .find(|status| status.interface.name == interface)
+        .cloned();
+    let offline_intent = app
+        .dashboard
+        .inventory
+        .as_ref()
+        .and_then(|entries| entries.iter().find(|entry| entry.name == interface))
+        .filter(|entry| entry.presence == traffic_masq_protocol::InterfacePresence::Missing)
+        .and_then(|entry| Some((app.dashboard.intent_revision?, entry.configured.clone()?)));
 
     match client
         .request(&Request::GetDhcpConfig {
@@ -434,6 +463,7 @@ pub(crate) async fn open_dhcp_editor(app: &mut TuiApp, client: &ApiClient) {
             let cursor = super::input::grapheme_count(&pool_start);
             app.dhcp_editor = Some(DhcpEditor {
                 interface,
+                offline_intent,
                 field: DhcpField::PoolStart,
                 pool_start,
                 pool_end: spec.pool_end.to_string(),
@@ -481,7 +511,7 @@ pub(crate) async fn open_dhcp_editor(app: &mut TuiApp, client: &ApiClient) {
             };
             let cidr = configured_cidr
                 .filter(|cidr| is_candidate_ipv4(cidr.addr(), cidr.prefix_len()))
-                .or_else(|| candidate_cidr_from_status(status));
+                .or_else(|| status.as_ref().and_then(candidate_cidr_from_status));
             let router = cidr.map(|cidr| cidr.addr().to_string()).unwrap_or_default();
             let (pool_start, pool_end) = cidr
                 .and_then(|cidr| suggest_pool(cidr.addr(), cidr.prefix_len()))
@@ -490,6 +520,7 @@ pub(crate) async fn open_dhcp_editor(app: &mut TuiApp, client: &ApiClient) {
             let cursor = super::input::grapheme_count(&pool_start);
             app.dhcp_editor = Some(DhcpEditor {
                 interface,
+                offline_intent,
                 field: DhcpField::PoolStart,
                 pool_start,
                 pool_end,
@@ -653,6 +684,11 @@ async fn disable_dhcp_for_current_editor(app: &mut TuiApp, client: &ApiClient) {
         return;
     };
     let interface = editor.interface.clone();
+    if let Some((expected_revision, mut config)) = editor.offline_intent.clone() {
+        config.dhcp = None;
+        save_offline_dhcp(app, client, interface, config, expected_revision).await;
+        return;
+    }
     match client.request(&Request::DisableDhcp { interface }).await {
         Ok(Response::DhcpDisabled { interface }) => {
             app.push_message(LogLevel::Info, format!("DHCP disabled on {interface}"));
@@ -679,6 +715,17 @@ pub(crate) async fn submit_dhcp_config(app: &mut TuiApp, client: &ApiClient) {
             return;
         }
     };
+    if let Some((expected_revision, mut config)) = editor.offline_intent.clone() {
+        config.dhcp = Some(traffic_masq_protocol::DhcpInterfaceConfigView {
+            pool_start: settings.pool_start,
+            pool_end: settings.pool_end,
+            router: settings.router,
+            dns_servers: settings.dns_servers,
+            lease_seconds: settings.lease_seconds,
+        });
+        save_offline_dhcp(app, client, interface, config, expected_revision).await;
+        return;
+    }
     match client
         .request(&Request::ConfigureDhcpSettings {
             interface,
@@ -699,6 +746,34 @@ pub(crate) async fn submit_dhcp_config(app: &mut TuiApp, client: &ApiClient) {
             format!("Unexpected response: {response:?}"),
         ),
         Err(error) => app.push_message(LogLevel::Error, error.to_string()),
+    }
+}
+
+async fn save_offline_dhcp(
+    app: &mut TuiApp,
+    client: &ApiClient,
+    interface: String,
+    config: traffic_masq_protocol::InterfaceConfigView,
+    expected_revision: u64,
+) {
+    match client
+        .request(&Request::SaveInterfaceConfig {
+            interface,
+            config,
+            allow_management_change: false,
+            expected_revision,
+        })
+        .await
+    {
+        Ok(Response::InterfaceIntentSaved { interface, .. }) => {
+            app.push_message(
+                LogLevel::Info,
+                format!("Saved DHCP settings; application waits for interface {interface}"),
+            );
+            app.screen = Screen::DhcpInterfaceList;
+        }
+        Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
+        result => app.push_message(LogLevel::Error, format!("Save failed: {result:?}")),
     }
 }
 

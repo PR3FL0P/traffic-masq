@@ -120,3 +120,42 @@ async fn interface_plan_requires_reaching_the_end_before_apply() {
     handle_preview_key(&mut app, KeyCode::Up, &client).await;
     assert_eq!(app.preview_scroll, 6);
 }
+
+#[test]
+fn missing_saved_interface_is_visible_without_observed_identity_at_80_columns() {
+    use traffic_masq_protocol::{
+        InterfaceConfigSource, InterfaceInventoryEntry, InterfacePresence, InterfaceReadiness,
+    };
+    let mut app = TuiApp::default();
+    app.dashboard.inventory = Some(vec![InterfaceInventoryEntry {
+        name: "usb-with-a-long-name".into(),
+        observed: None,
+        configured: None,
+        config_source: InterfaceConfigSource::None,
+        presence: InterfacePresence::Missing,
+        readiness: InterfaceReadiness::Disabled,
+        blockers: Vec::new(),
+        observation_stale: false,
+        suppressed: true,
+        references: Vec::new(),
+    }]);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| render_interface_list(frame, frame.area(), &mut app))
+        .unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(text.contains("usb-with-a-long-name [forgotten]"));
+    assert!(text.contains("missing"));
+    assert_eq!(app.ui.list_count, 1);
+    assert_eq!(
+        selected_interface_name(&app).as_deref(),
+        Some("usb-with-a-long-name")
+    );
+    assert!(app.dashboard.interfaces.is_empty());
+}

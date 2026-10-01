@@ -74,9 +74,6 @@ impl ControlService {
     }
 
     pub(super) async fn vpn_list_profiles(&self) -> Response {
-        if !self.vpn_is_enabled().await {
-            return vpn_disabled();
-        }
         let Some(vpn) = &self.vpn else {
             return vpn_disabled();
         };
@@ -89,9 +86,6 @@ impl ControlService {
     }
 
     pub(super) async fn vpn_import_profile(&self, name: String, contents: String) -> Response {
-        if !self.vpn_is_enabled().await {
-            return vpn_disabled();
-        }
         let Some(vpn) = &self.vpn else {
             return vpn_disabled();
         };
@@ -107,9 +101,6 @@ impl ControlService {
     }
 
     pub(super) async fn vpn_delete_profile(&self, name: String) -> Response {
-        if !self.vpn_is_enabled().await {
-            return vpn_disabled();
-        }
         let Some(vpn) = &self.vpn else {
             return vpn_disabled();
         };

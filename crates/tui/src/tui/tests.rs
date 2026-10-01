@@ -1130,3 +1130,70 @@ async fn control_shortcuts_preserve_text_and_modal_focus() {
     .await;
     assert_eq!(app.screen, Screen::Dashboard);
 }
+
+#[tokio::test]
+async fn missing_inventory_mouse_and_keyboard_selection_is_independent_of_live_statistics() {
+    use traffic_masq_protocol::{
+        InterfaceConfigSource, InterfaceInventoryEntry, InterfacePresence, InterfaceReadiness,
+    };
+    let row = InterfaceInventoryEntry {
+        name: "usb0".into(),
+        observed: None,
+        configured: None,
+        config_source: InterfaceConfigSource::None,
+        presence: InterfacePresence::Missing,
+        readiness: InterfaceReadiness::Disabled,
+        blockers: Vec::new(),
+        observation_stale: false,
+        suppressed: true,
+        references: Vec::new(),
+    };
+    let mut other = row.clone();
+    other.name = "usb1".into();
+    let mut app = TuiApp {
+        screen: Screen::InterfaceList,
+        ..Default::default()
+    };
+    app.dashboard.inventory = Some(vec![row, other]);
+    app.ui.input_enabled = true;
+    app.ui.list_area = Some(ratatui::layout::Rect::new(5, 5, 30, 5));
+    app.ui.list_count = 2;
+    app.ui.list_row_height = 1;
+    let client = ApiClient::new("/must-not-open-a-socket");
+    let mouse = |kind, row| MouseEvent {
+        kind,
+        column: 6,
+        row,
+        modifiers: crossterm::event::KeyModifiers::NONE,
+    };
+    handle_mouse(
+        &mut app,
+        mouse(MouseEventKind::Down(MouseButton::Left), 6),
+        &client,
+        false,
+    )
+    .await;
+    assert_eq!(
+        interfaces::selected_interface_name(&app).as_deref(),
+        Some("usb1")
+    );
+    handle_mouse(&mut app, mouse(MouseEventKind::ScrollUp, 6), &client, false).await;
+    assert_eq!(
+        interfaces::selected_interface_name(&app).as_deref(),
+        Some("usb0")
+    );
+    handle_mouse(
+        &mut app,
+        mouse(MouseEventKind::ScrollDown, 6),
+        &client,
+        false,
+    )
+    .await;
+    assert_eq!(
+        interfaces::selected_interface_name(&app).as_deref(),
+        Some("usb1")
+    );
+    normalize_selection(&mut app);
+    assert_eq!(app.selected_inventory_interface, 1);
+    assert_eq!(app.selected_interface, 0);
+}

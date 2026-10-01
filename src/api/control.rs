@@ -93,6 +93,7 @@ pub struct ControlService {
     base_config: AppConfig,
     network: Arc<dyn NetworkProvider>,
     transactions: NetworkTransactionManager,
+    interface_observation: Arc<Mutex<Vec<InterfaceStatus>>>,
     /// Serializes entry into network-mutating API calls. Long-lived pending
     /// transactions are protected by coordinator status checks in dispatch.
     network_mutations: Arc<NetworkMutationGate>,
@@ -173,6 +174,7 @@ impl ControlService {
             config,
             network,
             transactions,
+            interface_observation: Default::default(),
             network_mutations,
             dhcp,
             overrides,

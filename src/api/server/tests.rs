@@ -138,6 +138,7 @@ fn every_control_request_has_the_expected_authorization_class() {
         Request::GetVpnConfig,
         Request::GetApiHttpsConfig,
         Request::ListInterfaces,
+        Request::ListInterfaceInventory,
         Request::DhcpStatus,
         Request::DhcpClientStatus,
         Request::GetDhcpClient {
@@ -177,6 +178,20 @@ fn every_control_request_has_the_expected_authorization_class() {
     }
 
     let mutation_requests = [
+        Request::SaveInterfaceConfig {
+            interface: "usb0".into(),
+            config: interface_config().into(),
+            allow_management_change: false,
+            expected_revision: 0,
+        },
+        Request::ForgetInterfaceConfig {
+            interface: "usb0".into(),
+            expected_revision: 0,
+        },
+        Request::ResetInterfaceOverride {
+            interface: "usb0".into(),
+            expected_revision: 0,
+        },
         Request::ConfigureApiHttpsSettings {
             settings: api_https_settings(),
         },

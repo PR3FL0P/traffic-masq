@@ -73,6 +73,7 @@ pub struct DesiredNetworkState {
     base: AppConfig,
     tentative: Arc<Mutex<BTreeMap<String, TentativeInterface>>>,
     tentative_changed: Arc<Notify>,
+    missing_interfaces: Arc<std::sync::Mutex<BTreeSet<String>>>,
     /// Bumped by every proposal or withdrawal, so a caller can tell whether a
     /// convergence pass had already seen its change when it ran.
     version: Arc<AtomicU64>,
@@ -94,11 +95,36 @@ impl DesiredNetworkState {
             base,
             tentative: Arc::new(Mutex::new(BTreeMap::new())),
             tentative_changed: Arc::new(Notify::new()),
+            missing_interfaces: Default::default(),
             version: Arc::new(AtomicU64::new(0)),
             passes: watch::Sender::new(ConvergencePass::default()),
             failure_kinds: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             converger: watch::Sender::new(ConvergerState::Detached),
         }
+    }
+
+    /// Record successful device observation. Failed observations must not call this.
+    pub(crate) fn record_interface_presence(
+        &self,
+        configured: impl Iterator<Item = String>,
+        observed: &BTreeSet<String>,
+    ) {
+        let missing: BTreeSet<String> =
+            configured.filter(|name| !observed.contains(name)).collect();
+        let mut previous = self
+            .missing_interfaces
+            .lock()
+            .expect("device observation state");
+        for name in missing.difference(&previous) {
+            tracing::info!(interface = %name, "saved interface configuration is waiting for its device");
+        }
+        for name in previous
+            .difference(&missing)
+            .filter(|name| observed.contains(*name))
+        {
+            tracing::info!(interface = %name, "configured interface appeared; resuming convergence");
+        }
+        *previous = missing;
     }
 
     /// The current desired-state version.

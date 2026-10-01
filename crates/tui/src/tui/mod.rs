@@ -244,6 +244,7 @@ struct TuiApp {
     last_drawn_view: Option<ViewIdentity>,
     dashboard: DashboardData,
     selected_interface: usize,
+    selected_inventory_interface: usize,
 
     dashboard_pane: dashboard::DashboardPane,
     dashboard_statistics_index: usize,
@@ -297,6 +298,7 @@ impl Default for TuiApp {
             last_drawn_view: None,
             dashboard: DashboardData::default(),
             selected_interface: 0,
+            selected_inventory_interface: 0,
             dashboard_pane: dashboard::DashboardPane::default(),
             dashboard_statistics_index: 0,
             api_access: None,
@@ -1094,13 +1096,12 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                         + (mouse.row.saturating_sub(area.y) / row_height) as usize;
                     if index < app.ui.list_count {
                         match app.screen {
-                            Screen::Dashboard
-                            | Screen::InterfaceList
-                            | Screen::DhcpInterfaceList => {
+                            Screen::Dashboard => {
                                 app.selected_interface = index;
-                                if app.screen == Screen::Dashboard {
-                                    app.dashboard_pane = dashboard::DashboardPane::Traffic;
-                                }
+                                app.dashboard_pane = dashboard::DashboardPane::Traffic;
+                            }
+                            Screen::InterfaceList | Screen::DhcpInterfaceList => {
+                                interfaces::set_interface_selection(app, index);
                             }
                             Screen::DhcpClient => {
                                 dhcp_client::select_row(app, index);
@@ -1176,7 +1177,10 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                 dashboard::handle_dashboard_key(app, KeyCode::Up, client, direct).await;
             }
             Screen::InterfaceList | Screen::DhcpInterfaceList => {
-                app.selected_interface = app.selected_interface.saturating_sub(1);
+                interfaces::set_interface_selection(
+                    app,
+                    interfaces::interface_selection(app).saturating_sub(1),
+                );
             }
             Screen::DhcpClient => dhcp_client::move_selection(app, false),
             Screen::Router => router::handle_router_key(app, KeyCode::Up, client).await,
@@ -1211,9 +1215,9 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                 dashboard::handle_dashboard_key(app, KeyCode::Down, client, direct).await;
             }
             Screen::InterfaceList | Screen::DhcpInterfaceList
-                if app.selected_interface + 1 < app.dashboard.interfaces.len() =>
+                if interfaces::interface_selection(app) + 1 < interfaces::interface_count(app) =>
             {
-                app.selected_interface += 1;
+                interfaces::set_interface_selection(app, interfaces::interface_selection(app) + 1);
             }
             Screen::DhcpClient => dhcp_client::move_selection(app, true),
             Screen::Router => router::handle_router_key(app, KeyCode::Down, client).await,
@@ -1670,6 +1674,12 @@ fn refresh_pending_screen(app: &mut TuiApp) {
 }
 
 fn normalize_selection(app: &mut TuiApp) {
+    app.selected_inventory_interface = app.selected_inventory_interface.min(
+        app.dashboard
+            .inventory
+            .as_ref()
+            .map_or(0, |entries| entries.len().saturating_sub(1)),
+    );
     if app.dashboard.interfaces.is_empty() {
         app.selected_interface = 0;
     } else if app.selected_interface >= app.dashboard.interfaces.len() {
@@ -1724,7 +1734,7 @@ async fn load_daemon_dashboard(client: &ApiClient) -> DashboardData {
     let mut data = DashboardData::default();
     let mut errors = Vec::new();
     let (interfaces, pending, routes, vpn_enabled) = tokio::join!(
-        client.request(&Request::ListInterfaces),
+        client.request(&Request::ListInterfaceInventory),
         client.request(&Request::PendingNetworkChanges),
         client.request(&Request::ListRoutes {
             include_local_table: false
@@ -1732,6 +1742,29 @@ async fn load_daemon_dashboard(client: &ApiClient) -> DashboardData {
         client.request(&Request::GetVpnConfig),
     );
     match interfaces {
+        Ok(Response::InterfaceInventory {
+            interfaces,
+            revision,
+            observation_error,
+            ..
+        }) => {
+            data.interfaces = interfaces
+                .iter()
+                .filter_map(|entry| entry.observed.clone())
+                .collect();
+            for entry in &interfaces {
+                if let Some(config) = &entry.configured {
+                    data.managed.insert(entry.name.clone(), config.managed);
+                    data.roles.insert(entry.name.clone(), config.role);
+                }
+            }
+            data.inventory = Some(interfaces);
+            data.intent_revision = Some(revision);
+            data.interfaces_updated = Some(Instant::now());
+            if let Some(error) = observation_error {
+                errors.push(format!("Interface observation unavailable: {error}"));
+            }
+        }
         Ok(Response::Interfaces { interfaces }) => {
             data.interfaces = interfaces;
             data.interfaces_updated = Some(Instant::now());

@@ -203,6 +203,16 @@ fn build_router(state: AppState) -> Router {
                 .delete(delete_security_config),
         )
         .route("/interfaces", get(list_interfaces))
+        .route("/interface-inventory", get(list_interface_inventory))
+        .route("/interfaces/{interface}/intent", put(save_interface_intent))
+        .route(
+            "/interfaces/{interface}/intent/forget",
+            post(forget_interface_intent),
+        )
+        .route(
+            "/interfaces/{interface}/intent/reset",
+            post(reset_interface_intent),
+        )
         .route("/interfaces/{interface}/config", get(get_interface_config))
         .route("/interfaces/{interface}/plan", post(plan_interface))
         .route("/interfaces/{interface}/apply", post(apply_interface))
@@ -636,6 +646,79 @@ async fn list_interfaces(
     Extension(principal): Extension<Principal>,
 ) -> Result<Json<Response>, ApiError> {
     dispatch_control(&state, &principal, Request::ListInterfaces).await
+}
+
+async fn list_interface_inventory(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<Response>, ApiError> {
+    dispatch_control(&state, &principal, Request::ListInterfaceInventory).await
+}
+
+#[derive(Deserialize)]
+struct SaveInterfaceIntentRequest {
+    config: traffic_masq_protocol::InterfaceConfigView,
+    #[serde(default)]
+    allow_management_change: bool,
+    expected_revision: u64,
+}
+
+#[derive(Deserialize)]
+struct IntentRevisionRequest {
+    expected_revision: u64,
+}
+
+async fn save_interface_intent(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    AxumPath(interface): AxumPath<String>,
+    Json(request): Json<SaveInterfaceIntentRequest>,
+) -> Result<Json<Response>, ApiError> {
+    dispatch_control(
+        &state,
+        &principal,
+        Request::SaveInterfaceConfig {
+            interface,
+            config: request.config,
+            allow_management_change: request.allow_management_change,
+            expected_revision: request.expected_revision,
+        },
+    )
+    .await
+}
+
+async fn forget_interface_intent(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    AxumPath(interface): AxumPath<String>,
+    Json(request): Json<IntentRevisionRequest>,
+) -> Result<Json<Response>, ApiError> {
+    dispatch_control(
+        &state,
+        &principal,
+        Request::ForgetInterfaceConfig {
+            interface,
+            expected_revision: request.expected_revision,
+        },
+    )
+    .await
+}
+
+async fn reset_interface_intent(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    AxumPath(interface): AxumPath<String>,
+    Json(request): Json<IntentRevisionRequest>,
+) -> Result<Json<Response>, ApiError> {
+    dispatch_control(
+        &state,
+        &principal,
+        Request::ResetInterfaceOverride {
+            interface,
+            expected_revision: request.expected_revision,
+        },
+    )
+    .await
 }
 
 async fn dhcp_status(
@@ -1450,7 +1533,10 @@ fn authorize_control_request(principal: &Principal, request: &Request) -> Result
 fn control_request_requires_administrator(request: &Request) -> bool {
     matches!(
         request,
-        Request::ConfigureApiHttpsSettings { .. }
+        Request::SaveInterfaceConfig { .. }
+            | Request::ForgetInterfaceConfig { .. }
+            | Request::ResetInterfaceOverride { .. }
+            | Request::ConfigureApiHttpsSettings { .. }
             | Request::ResetApiHttpsSettings
             | Request::ConfigureDhcp { .. }
             | Request::ConfigureDhcpSettings { .. }
