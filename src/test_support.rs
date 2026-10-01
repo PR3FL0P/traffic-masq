@@ -34,6 +34,7 @@ pub(crate) struct FakeSupervisedProcess<R: Send + 'static> {
     configs: StdMutex<HashMap<u32, PathBuf>>,
     ctrl_sockets: StdMutex<HashMap<u32, PathBuf>>,
     responders: StdMutex<HashMap<u32, R>>,
+    diagnostics: StdMutex<HashMap<u32, Vec<String>>>,
     calls: StdMutex<Vec<FakeProcessCall>>,
     next_pid: AtomicU32,
     binary_name: &'static str,
@@ -59,6 +60,7 @@ impl<R: Send + 'static> FakeSupervisedProcess<R> {
             configs: StdMutex::new(HashMap::new()),
             ctrl_sockets: StdMutex::new(HashMap::new()),
             responders: StdMutex::new(HashMap::new()),
+            diagnostics: StdMutex::new(HashMap::new()),
             calls: StdMutex::new(Vec::new()),
             next_pid: AtomicU32::new(first_pid),
             binary_name,
@@ -89,6 +91,13 @@ impl<R: Send + 'static> FakeSupervisedProcess<R> {
 
     pub(crate) fn set_spawn_profile(&self, profile: &str) {
         *self.spawn_profile.lock().unwrap() = profile.to_string();
+    }
+
+    pub(crate) fn set_diagnostics(&self, pid: u32, lines: &[&str]) {
+        self.diagnostics
+            .lock()
+            .unwrap()
+            .insert(pid, lines.iter().map(|line| (*line).to_string()).collect());
     }
 
     pub(crate) fn set_after_terminate_hook(&self, hook: impl Fn(u32) + Send + Sync + 'static) {
@@ -192,6 +201,16 @@ impl<R: Send + 'static> SupervisedProcess for FakeSupervisedProcess<R> {
         // recorded PID is gone but a stale/foreign control socket still answers.
         Ok(!self.persistent_responder.load(Ordering::Relaxed)
             && self.configs.lock().unwrap().contains_key(&pid))
+    }
+
+    async fn recent_diagnostics(&self, pid: u32) -> Result<Vec<String>, ProcessError> {
+        Ok(self
+            .diagnostics
+            .lock()
+            .unwrap()
+            .get(&pid)
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn identity_matches(

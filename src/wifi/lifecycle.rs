@@ -36,6 +36,8 @@ pub(crate) struct RetryState {
     pub(crate) consecutive_failures: u32,
     pub(crate) next_restart_earliest: Option<Instant>,
     pub(crate) last_failure: Option<String>,
+    pub(crate) retry_suspended: bool,
+    pub(crate) suspended_ifindex: Option<u32>,
 }
 
 impl RetryState {
@@ -44,6 +46,8 @@ impl RetryState {
             consecutive_failures: 1,
             next_restart_earliest: Some(Instant::now() + backoff_duration(base_seconds, 1)),
             last_failure: Some(error.to_string()),
+            retry_suspended: false,
+            suspended_ifindex: None,
         }
     }
 
@@ -54,8 +58,21 @@ impl RetryState {
 
     pub(crate) fn respawn_failed(&mut self, base_seconds: u64, error: &str) {
         self.last_failure = Some(error.to_string());
+        self.retry_suspended = false;
+        self.suspended_ifindex = None;
         self.next_restart_earliest =
             Some(Instant::now() + backoff_duration(base_seconds, self.consecutive_failures));
+    }
+
+    pub(crate) fn suspend(&mut self, error: &str, ifindex: Option<u32>) {
+        self.last_failure = Some(error.to_string());
+        self.next_restart_earliest = None;
+        self.retry_suspended = true;
+        self.suspended_ifindex = ifindex;
+    }
+
+    pub(crate) fn clear(&mut self) {
+        *self = Self::default();
     }
 }
 

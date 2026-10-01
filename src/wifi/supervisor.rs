@@ -41,10 +41,11 @@ pub enum SupervisorError {
     )]
     NotOwned { interface: String },
 
-    #[error("hostapd for {interface} did not become ready within {timeout:?}")]
+    #[error("hostapd for {interface} did not become ready within {timeout:?}{diagnostics}")]
     StartupTimeout {
         interface: String,
         timeout: Duration,
+        diagnostics: String,
     },
 
     #[error(transparent)]
@@ -216,12 +217,21 @@ impl HostapdSupervisor {
                 continue;
             }
             if let Err(error) = self.configure(spec.clone()).await {
-                tracing::warn!(
-                    interface = %error.interface(),
-                    %error,
-                    "failed to start Wi-Fi access point at startup; will keep retrying in the background"
-                );
-                self.record_failed_startup(&spec, &error.to_string()).await;
+                let error_text = error.to_string();
+                if hostapd_failure_text_should_suspend_retry(&error_text) {
+                    tracing::error!(
+                        interface = %error.interface(),
+                        %error,
+                        "failed to start Wi-Fi access point at startup; deterministic hostapd failure, automatic retry suspended until config or interface identity changes"
+                    );
+                } else {
+                    tracing::warn!(
+                        interface = %error.interface(),
+                        %error,
+                        "failed to start Wi-Fi access point at startup; will keep retrying in the background"
+                    );
+                }
+                self.record_failed_startup(&spec, &error_text).await;
             }
         }
         Ok(())
@@ -311,10 +321,22 @@ impl HostapdSupervisor {
     }
 
     /// Records a placeholder task for an interface whose access point could not
-    /// be started (e.g. a foreign manager holds the interface). The liveness
-    /// loop treats it like any other dead task and keeps retrying with backoff,
-    /// so the AP comes up as soon as the interface is freed.
+    /// be started. Transient failures keep retrying with backoff; deterministic
+    /// hostapd configuration/radio failures remain suspended until config or
+    /// interface identity changes.
     pub async fn record_failed_startup(&self, spec: &WifiApSpec, error: &str) {
+        let mut retry = RetryState::failed_startup(self.inner.restart_backoff_seconds, error);
+        if hostapd_failure_text_should_suspend_retry(error) {
+            let failure = suspended_failure_message(error);
+            retry.suspend(&failure, resolve_interface_index(&spec.interface).ok());
+        }
+        // A passphrase can change while the desired WifiApSpec stays equal.
+        // Remember the failed rendering so that credential changes resume retries.
+        let failed_rendering = if retry.retry_suspended {
+            self.render_for(spec).await.ok()
+        } else {
+            None
+        };
         let mut tasks = self.inner.tasks.lock().await;
         tasks
             .entry(spec.interface.clone())
@@ -330,11 +352,17 @@ impl HostapdSupervisor {
                     ctrl_dev: None,
                     ctrl_ino: None,
                     config_path: render::config_path(&self.inner.runtime_dir, &spec.interface),
-                    config_digest: WifiDigest::of(&[]),
-                    key_digest: WifiDigest::of(&[]),
+                    config_digest: failed_rendering
+                        .as_ref()
+                        .map(|rendered| rendered.config_digest)
+                        .unwrap_or_else(|| WifiDigest::of(&[])),
+                    key_digest: failed_rendering
+                        .as_ref()
+                        .map(|rendered| rendered.key_digest)
+                        .unwrap_or_else(|| WifiDigest::of(&[])),
                     ssid: spec.ssid.clone(),
                 },
-                retry: RetryState::failed_startup(self.inner.restart_backoff_seconds, error),
+                retry,
                 last_hostapd_state: None,
                 last_state_change_at: Instant::now(),
             });
@@ -388,6 +416,18 @@ impl HostapdSupervisor {
         let existing = self.inner.tasks.lock().await.get(&interface).cloned();
         let task = match existing {
             Some(task)
+                if task.record.pid == 0
+                    && task.retry.retry_suspended
+                    && task.spec == spec
+                    && task.record.config_digest == rendered.config_digest
+                    && task.record.key_digest == rendered.key_digest =>
+            {
+                // Reapplying the same intent and credentials must not bypass
+                // a deterministic startup failure's retry suspension.
+                self.ensure_interface_alive(&interface).await?;
+                return Ok(());
+            }
+            Some(task)
                 if task.record.config_digest == rendered.config_digest
                     && task.record.key_digest == rendered.key_digest =>
             {
@@ -405,7 +445,9 @@ impl HostapdSupervisor {
                 // A pid-0 task is the placeholder `record_failed_startup`
                 // leaves behind: there is no running hostapd to reload, so
                 // treat it exactly like a restart regardless of what changed.
-                if task.record.pid == 0 || requires_restart(&task.spec, &spec) {
+                let process_alive =
+                    task.record.pid != 0 && self.inner.process.is_alive(task.record.pid).await?;
+                if !process_alive || requires_restart(&task.spec, &spec) {
                     self.restart_task(&mut task, &spec, &rendered, &ctrl_path)
                         .await?;
                 } else {
@@ -532,8 +574,7 @@ impl HostapdSupervisor {
 
         task.spec = spec.clone();
         task.record = record;
-        task.retry.consecutive_failures = 0;
-        task.retry.next_restart_earliest = None;
+        task.retry.clear();
         Ok(())
     }
 
@@ -548,8 +589,7 @@ impl HostapdSupervisor {
         let record = self.spawn_and_record(spec, rendered, ctrl_path).await?;
         task.spec = spec.clone();
         task.record = record;
-        task.retry.consecutive_failures = 0;
-        task.retry.next_restart_earliest = None;
+        task.retry.clear();
         Ok(())
     }
 
@@ -860,38 +900,78 @@ impl HostapdSupervisor {
 
         // Never query a pathname merely because a task exists. A stale task or
         // an unlink/rebind can otherwise make STATUS read a foreign hostapd.
-        let (hostapd_state, num_stations) = match self.owned_ctrl_client(&task).await {
-            Ok(client) => match client.status().await {
-                Ok(status) => (status.state, status.num_stations),
-                Err(_) => (HostapdState::Other("unreachable".to_string()), None),
-            },
-            Err(_) => (HostapdState::Other("unreachable".to_string()), None),
-        };
-
-        let health = if let Some(error) = task.retry.last_failure.as_deref() {
-            retry_health(
-                error,
-                task.retry.consecutive_failures,
-                task.retry.next_restart_earliest,
-                interface,
-            )
-            .await
-        } else if hostapd_state == HostapdState::Enabled {
-            WifiHealth::Healthy
-        } else if hostapd_state == HostapdState::Disabled {
-            retry_health(
-                if task.spec.channel == 0 {
-                    "hostapd reports DISABLED with automatic channel selection; if ACS cannot collect survey data, select a fixed channel supported by the radio and country"
-                } else {
-                    "hostapd reports DISABLED; check the channel, country and driver diagnostics"
+        let (hostapd_state, num_stations, observation_error) =
+            match self.owned_ctrl_client(&task).await {
+                Ok(client) => match client.status().await {
+                    Ok(status) => (status.state, status.num_stations, None),
+                    Err(error) => (
+                        HostapdState::Other("unreachable".to_string()),
+                        None,
+                        Some(format!("hostapd STATUS failed: {error}")),
+                    ),
                 },
-                task.retry.consecutive_failures.max(1),
-                task.retry.next_restart_earliest,
-                interface,
-            )
-            .await
+                Err(error) => (
+                    HostapdState::Other("unreachable".to_string()),
+                    None,
+                    Some(error.to_string()),
+                ),
+            };
+
+        let health = if hostapd_state == HostapdState::Enabled {
+            WifiHealth::Healthy
+        } else if let Some(error) = task.retry.last_failure.as_deref() {
+            if task.retry.retry_suspended {
+                suspended_retry_health(error, task.retry.consecutive_failures, interface).await
+            } else {
+                retry_health(
+                    error,
+                    task.retry.consecutive_failures,
+                    task.retry.next_restart_earliest,
+                    interface,
+                )
+                .await
+            }
         } else {
-            WifiHealth::Starting
+            match &hostapd_state {
+                HostapdState::Enabled => unreachable!("handled above"),
+                HostapdState::Uninitialized
+                | HostapdState::CountryUpdate
+                | HostapdState::Acs
+                | HostapdState::HtScan
+                | HostapdState::Dfs => WifiHealth::Starting,
+                HostapdState::Disabled => {
+                    let base = if task.spec.channel == 0 {
+                        "hostapd reports DISABLED with automatic channel selection; if ACS cannot collect survey data, select a fixed channel supported by the radio and country".to_string()
+                    } else {
+                        "hostapd reports DISABLED; check the channel, country and driver diagnostics".to_string()
+                    };
+                    let error = self.with_hostapd_diagnostics(&task, base).await;
+                    retry_health(
+                        &error,
+                        task.retry.consecutive_failures.max(1),
+                        task.retry.next_restart_earliest,
+                        interface,
+                    )
+                    .await
+                }
+                HostapdState::Other(state) => {
+                    let base = observation_error.clone().unwrap_or_else(|| {
+                        if state.is_empty() {
+                            "hostapd STATUS reply did not contain a state field".to_string()
+                        } else {
+                            format!("hostapd reports unexpected state {state:?}")
+                        }
+                    });
+                    let error = self.with_hostapd_diagnostics(&task, base).await;
+                    retry_health(
+                        &error,
+                        task.retry.consecutive_failures.max(1),
+                        task.retry.next_restart_earliest,
+                        interface,
+                    )
+                    .await
+                }
+            }
         };
 
         Some(WifiApStatus {
@@ -1013,13 +1093,53 @@ impl HostapdSupervisor {
         let Some(mut task) = self.inner.tasks.lock().await.get(interface).cloned() else {
             return Ok(false);
         };
+        let mut resumed_from_suspension = false;
+
+        if task.retry.retry_suspended {
+            let current_ifindex = resolve_interface_index(interface).ok();
+            if current_ifindex.is_none() {
+                if task.retry.suspended_ifindex.is_some() {
+                    task.retry.suspended_ifindex = None;
+                    self.inner
+                        .tasks
+                        .lock()
+                        .await
+                        .insert(interface.to_string(), task);
+                }
+                return Ok(false);
+            }
+            if current_ifindex == task.retry.suspended_ifindex {
+                return Ok(false);
+            }
+
+            tracing::info!(
+                %interface,
+                previous_ifindex = ?task.retry.suspended_ifindex,
+                current_ifindex = ?current_ifindex,
+                "Wi-Fi interface identity changed; resuming suspended hostapd retries"
+            );
+            task.retry.retry_suspended = false;
+            task.retry.suspended_ifindex = None;
+            task.retry.next_restart_earliest = None;
+            if let Some(error) = task.retry.last_failure.take() {
+                task.retry.last_failure = Some(clear_suspended_failure_message(&error));
+            }
+            resumed_from_suspension = true;
+        }
 
         if task.retry.is_waiting() {
             return Ok(false);
         }
 
         let ctrl_path = self.ctrl_path(interface);
-        let trusted_ctrl_node = if self.task_ctrl_socket_is_owned(&task).await? {
+        // Check liveness before probing ownership. Once hostapd has exited, its
+        // control socket can no longer pass ownership verification; reporting
+        // that secondary fact as the root cause hides the daemon failure.
+        let process_alive =
+            task.record.pid != 0 && self.inner.process.is_alive(task.record.pid).await?;
+        let trusted_ctrl_node = if !process_alive {
+            task.record.ctrl_dev.zip(task.record.ctrl_ino)
+        } else if self.task_ctrl_socket_is_owned(&task).await? {
             match tokio::fs::symlink_metadata(&ctrl_path).await {
                 Ok(metadata) => Some((metadata.dev(), metadata.ino())),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -1037,10 +1157,28 @@ impl HostapdSupervisor {
         } else {
             None
         };
-        let status = match self.owned_ctrl_client(&task).await {
-            Ok(client) => client.status().await.ok(),
-            Err(SupervisorError::NotOwned { .. }) | Err(SupervisorError::Ctrl(_)) => None,
-            Err(error) => return Err(error),
+        let (status, observation_error) = if !process_alive {
+            (
+                None,
+                Some(if task.record.pid == 0 {
+                    task.retry
+                        .last_failure
+                        .clone()
+                        .unwrap_or_else(|| "hostapd has not started".to_string())
+                } else {
+                    format!("hostapd process {} exited", task.record.pid)
+                }),
+            )
+        } else {
+            match self.owned_ctrl_client(&task).await {
+                Ok(client) => match client.status().await {
+                    Ok(status) => (Some(status), None),
+                    Err(error) => (None, Some(format!("hostapd STATUS failed: {error}"))),
+                },
+                Err(error @ SupervisorError::NotOwned { .. })
+                | Err(error @ SupervisorError::Ctrl(_)) => (None, Some(error.to_string())),
+                Err(error) => return Err(error),
+            }
         };
         let state = status.as_ref().map(|status| status.state.clone());
         if state != task.last_hostapd_state {
@@ -1075,12 +1213,65 @@ impl HostapdSupervisor {
             return Ok(false);
         }
 
+        let base_failure = match (&state, observation_error) {
+            (_, Some(error)) => error,
+            (Some(HostapdState::Disabled), None) if task.spec.channel == 0 => {
+                "hostapd reports DISABLED with automatic channel selection; if ACS cannot collect survey data, select a fixed channel supported by the radio and country".to_string()
+            }
+            (Some(HostapdState::Disabled), None) => {
+                "hostapd reports DISABLED; check channel, country, nl80211/driver and interface diagnostics".to_string()
+            }
+            (Some(HostapdState::Other(value)), None) if value.is_empty() => {
+                "hostapd STATUS reply did not contain a state field".to_string()
+            }
+            (Some(HostapdState::Other(value)), None) => {
+                format!("hostapd reports unexpected state {value:?}")
+            }
+            (Some(state), None) => format!(
+                "hostapd remained in transitional state {state:?} for too long"
+            ),
+            (None, None) => "hostapd control interface is unreachable".to_string(),
+        };
+        let diagnostics = self
+            .inner
+            .process
+            .recent_diagnostics(task.record.pid)
+            .await
+            .unwrap_or_default();
+        let failure = match diagnostic_summary(&diagnostics) {
+            Some(tail) => format!("{base_failure}; recent hostapd diagnostics: {tail}"),
+            None => base_failure,
+        };
+        let suspend_retry = !resumed_from_suspension
+            && (hostapd_failure_should_suspend_retry(&diagnostics)
+                || hostapd_failure_text_should_suspend_retry(&failure));
+        task.retry.last_failure = Some(failure.clone());
+
         let competitors = crate::wifi::process::find_competing_network_managers().await;
-        if competitors.is_empty() {
+        if suspend_retry && competitors.is_empty() {
+            tracing::error!(
+                %interface,
+                pid = task.record.pid,
+                error = %failure,
+                "hostapd hit a deterministic configuration/radio failure; automatic retries will be suspended"
+            );
+        } else if suspend_retry {
+            let advice =
+                crate::wifi::process::format_competing_manager_advice(&competitors, interface);
+            tracing::error!(
+                %interface,
+                pid = task.record.pid,
+                competing = ?competitors,
+                error = %failure,
+                %advice,
+                "hostapd hit a deterministic configuration/radio failure; automatic retries will be suspended"
+            );
+        } else if competitors.is_empty() {
             tracing::warn!(
                 %interface,
                 pid = task.record.pid,
-                "hostapd is not responding; restarting it"
+                error = %failure,
+                "hostapd is unhealthy; restarting it"
             );
         } else {
             let advice =
@@ -1089,12 +1280,11 @@ impl HostapdSupervisor {
                 %interface,
                 pid = task.record.pid,
                 competing = ?competitors,
+                error = %failure,
                 %advice,
-                "hostapd is not responding; restarting it; other network managers are running and may be controlling this interface. Resolution advice:\n{advice}"
+                "hostapd is unhealthy; restarting it; other network managers are running and may be controlling this interface. Resolution advice:\n{advice}"
             );
         }
-        let rendered = self.render_for(&task.spec).await?;
-
         // A placeholder task from a failed startup has pid 0; there is no
         // process to stop, and signalling pid 0 would signal the whole process
         // group — including this daemon.
@@ -1139,10 +1329,25 @@ impl HostapdSupervisor {
         }
 
         task.retry.consecutive_failures = task.retry.consecutive_failures.saturating_add(1);
-        match self
-            .spawn_and_record(&task.spec, &rendered, &ctrl_path)
-            .await
-        {
+        if suspend_retry {
+            let failure = suspended_failure_message(&failure);
+            task.retry
+                .suspend(&failure, resolve_interface_index(interface).ok());
+            self.inner
+                .tasks
+                .lock()
+                .await
+                .insert(interface.to_string(), task);
+            return Ok(false);
+        }
+
+        let respawn = async {
+            let rendered = self.render_for(&task.spec).await?;
+            self.spawn_and_record(&task.spec, &rendered, &ctrl_path)
+                .await
+        }
+        .await;
+        match respawn {
             Ok(record) => {
                 task.record = record;
                 // A responsive control socket proves startup, not a working AP.
@@ -1155,14 +1360,24 @@ impl HostapdSupervisor {
                             task.retry.consecutive_failures,
                         ),
                 );
-                task.retry.last_failure = None;
                 task.last_hostapd_state = None;
                 task.last_state_change_at = Instant::now();
             }
             Err(error) => {
                 tracing::error!(%interface, %error, "failed to respawn hostapd");
-                task.retry
-                    .respawn_failed(self.inner.restart_backoff_seconds, &error.to_string());
+                // The failed launch has its own diagnostics in `error`. The old
+                // PID must not classify subsequent retries using stale output.
+                task.record.pid = 0;
+                let error_text = error.to_string();
+                if hostapd_failure_text_should_suspend_retry(&error_text) {
+                    task.retry.suspend(
+                        &suspended_failure_message(&error_text),
+                        resolve_interface_index(interface).ok(),
+                    );
+                } else {
+                    task.retry
+                        .respawn_failed(self.inner.restart_backoff_seconds, &error_text);
+                }
             }
         }
         self.inner
@@ -1171,6 +1386,16 @@ impl HostapdSupervisor {
             .await
             .insert(interface.to_string(), task);
         Ok(true)
+    }
+
+    async fn with_hostapd_diagnostics(&self, task: &ApTask, base: String) -> String {
+        let Ok(lines) = self.inner.process.recent_diagnostics(task.record.pid).await else {
+            return base;
+        };
+        match diagnostic_summary(&lines) {
+            Some(tail) => format!("{base}; recent hostapd diagnostics: {tail}"),
+            None => base,
+        }
     }
 
     /// Apply the shutdown policy to supervised processes and their ownership records.
@@ -1263,10 +1488,166 @@ async fn wait_for_ready(
     if ready {
         Ok(())
     } else {
+        let diagnostics = process
+            .recent_diagnostics(record.pid)
+            .await
+            .ok()
+            .and_then(|lines| diagnostic_summary(&lines))
+            .map(|tail| format!("; recent hostapd diagnostics: {tail}"))
+            .unwrap_or_default();
         Err(SupervisorError::StartupTimeout {
             interface: interface.to_string(),
             timeout: STARTUP_READY_TIMEOUT.max(timeout),
+            diagnostics,
         })
+    }
+}
+
+fn diagnostic_summary(lines: &[String]) -> Option<String> {
+    if lines.is_empty() {
+        return None;
+    }
+
+    const ERROR_MARKERS: &[&str] = &[
+        "unable",
+        "failed",
+        "failure",
+        "error",
+        "invalid",
+        "not supported",
+        "could not",
+        "cannot",
+        "permission denied",
+        "refused",
+        "not found",
+        "wasn't started",
+    ];
+
+    let mut selected = Vec::new();
+    for line in lines {
+        let lower = line.to_ascii_lowercase();
+        if (ERROR_MARKERS.iter().any(|marker| lower.contains(marker))
+            || hostapd_failure_text_should_suspend_retry(line))
+            && !selected.contains(line)
+        {
+            selected.push(line.clone());
+        }
+    }
+
+    if selected.len() > 8 {
+        let mut compact = selected[..4].to_vec();
+        compact.extend_from_slice(&selected[selected.len() - 4..]);
+        // Startup errors are classified from this summary after the launch is
+        // cleaned up. Do not drop the only permanent cause while compacting it.
+        if !hostapd_failure_should_suspend_retry(&compact) {
+            if let Some(cause) = selected
+                .iter()
+                .find(|line| hostapd_failure_text_should_suspend_retry(line))
+            {
+                compact[3] = cause.clone();
+            }
+        }
+        selected = compact;
+    }
+
+    if selected.is_empty() {
+        selected = lines.iter().rev().take(8).cloned().collect();
+        selected.reverse();
+    } else if let Some(exit) = lines
+        .iter()
+        .rev()
+        .find(|line| line.starts_with("process exited with "))
+    {
+        selected.push(exit.clone());
+    }
+
+    Some(selected.join(" | "))
+}
+
+fn hostapd_failure_should_suspend_retry(lines: &[String]) -> bool {
+    lines
+        .iter()
+        .any(|line| hostapd_failure_text_should_suspend_retry(line))
+}
+
+fn hostapd_failure_text_should_suspend_retry(text: &str) -> bool {
+    const DETERMINISTIC_MARKERS: &[&str] = &[
+        "acs: unable to collect survey data",
+        "acs: all study options have failed",
+        "possibly channel configuration is invalid",
+        "unknown configuration item",
+        "errors found in configuration file",
+        "invalid hw_mode",
+        "unknown hw_mode",
+        "could not select hw_mode and channel",
+        "hardware does not support configured mode",
+        "no usable channels found",
+        "configured channel is not found",
+        "channel is not allowed",
+        "frequency is not allowed",
+        "driver does not support ap",
+        "ap mode is not supported",
+    ];
+
+    let lower = text.to_ascii_lowercase();
+    if DETERMINISTIC_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return true;
+    }
+    // Driver setup can also fail because another manager holds the radio.
+    // Classify each line separately so an unrelated error cannot make a
+    // transient channel/beacon failure look deterministic.
+    lower.split(" | ").flat_map(str::lines).any(|line| {
+        [
+            "failed to set beacon parameters",
+            "nl80211: failed to set channel",
+        ]
+        .iter()
+        .any(|marker| line.contains(marker))
+            && ["invalid argument", "not supported", "-22", "-95"]
+                .iter()
+                .any(|cause| line.contains(cause))
+    })
+}
+
+const RETRY_SUSPENSION_SUFFIX: &str =
+    "automatic retry suspended until the AP configuration or interface identity changes";
+
+fn suspended_failure_message(error: &str) -> String {
+    if error.contains(RETRY_SUSPENSION_SUFFIX) {
+        error.to_string()
+    } else {
+        format!("{error}; {RETRY_SUSPENSION_SUFFIX}")
+    }
+}
+
+fn clear_suspended_failure_message(error: &str) -> String {
+    error
+        .strip_suffix(&format!("; {RETRY_SUSPENSION_SUFFIX}"))
+        .unwrap_or(error)
+        .to_string()
+}
+
+async fn suspended_retry_health(error: &str, attempts: u32, interface: &str) -> WifiHealth {
+    let competing_managers = crate::wifi::process::find_competing_network_managers().await;
+    let mut advice =
+        "Automatic retry is suspended until the AP configuration or interface identity changes."
+            .to_string();
+    if !competing_managers.is_empty() {
+        advice.push(' ');
+        advice.push_str(&crate::wifi::process::format_competing_manager_advice(
+            &competing_managers,
+            interface,
+        ));
+    }
+    WifiHealth::Retrying {
+        error: error.to_string(),
+        attempts,
+        retry_in_secs: None,
+        competing_managers,
+        advice: Some(advice),
     }
 }
 

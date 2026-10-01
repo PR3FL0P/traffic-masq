@@ -1,19 +1,64 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 use std::process::Stdio;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 use crate::wifi::record::WifiProcessKind;
+
+const MAX_WIFI_DIAGNOSTIC_LINES: usize = 32;
+const MAX_WIFI_DIAGNOSTIC_PROCESSES: usize = 128;
+const MAX_WIFI_DIAGNOSTIC_BYTES: usize = 4096;
+const OUTPUT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Keep recent launches available after exit without retaining every historical PID.
+#[derive(Debug, Default)]
+struct WifiDiagnostics {
+    lines: HashMap<u32, VecDeque<String>>,
+    launches: VecDeque<u32>,
+}
+
+impl WifiDiagnostics {
+    fn start(&mut self, pid: u32) {
+        self.launches.retain(|previous| *previous != pid);
+        self.launches.push_back(pid);
+        self.lines.insert(pid, VecDeque::new());
+        while self.launches.len() > MAX_WIFI_DIAGNOSTIC_PROCESSES {
+            if let Some(oldest) = self.launches.pop_front() {
+                self.lines.remove(&oldest);
+            }
+        }
+    }
+
+    fn push(&mut self, pid: u32, mut line: String) {
+        // An output task for an evicted launch must not recreate its entry.
+        let Some(lines) = self.lines.get_mut(&pid) else {
+            return;
+        };
+        if line.len() > MAX_WIFI_DIAGNOSTIC_BYTES {
+            let mut end = MAX_WIFI_DIAGNOSTIC_BYTES;
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            line.truncate(end);
+        }
+        lines.push_back(line);
+        while lines.len() > MAX_WIFI_DIAGNOSTIC_LINES {
+            lines.pop_front();
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ProcessError {
@@ -74,6 +119,13 @@ pub trait SupervisedProcess: Send + Sync {
     }
 
     async fn is_alive(&self, pid: u32) -> Result<bool, ProcessError>;
+
+    /// Return a bounded tail of diagnostics emitted by the supervised process.
+    /// Implementations that do not capture daemon stderr may return an empty list.
+    async fn recent_diagnostics(&self, pid: u32) -> Result<Vec<String>, ProcessError> {
+        let _ = pid;
+        Ok(Vec::new())
+    }
 
     async fn identity_matches(
         &self,
@@ -185,6 +237,10 @@ impl SupervisedProcess for std::sync::Arc<dyn SupervisedProcess> {
         (**self).is_alive(pid).await
     }
 
+    async fn recent_diagnostics(&self, pid: u32) -> Result<Vec<String>, ProcessError> {
+        (**self).recent_diagnostics(pid).await
+    }
+
     async fn identity_matches(
         &self,
         pid: u32,
@@ -254,6 +310,8 @@ impl SupervisedProcess for std::sync::Arc<dyn SupervisedProcess> {
 #[derive(Debug, Default)]
 pub struct TokioSupervisedProcess {
     children: Mutex<HashMap<u32, Child>>,
+    diagnostics: Arc<Mutex<WifiDiagnostics>>,
+    output_tasks: Mutex<HashMap<u32, Vec<JoinHandle<()>>>>,
 }
 
 impl TokioSupervisedProcess {
@@ -267,6 +325,7 @@ impl SupervisedProcess for TokioSupervisedProcess {
     async fn spawn(&self, binary: &Path, config_path: &Path) -> Result<u32, ProcessError> {
         let mut child = Command::new(binary)
             .arg(config_path)
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(false)
             .spawn()
@@ -277,16 +336,36 @@ impl SupervisedProcess for TokioSupervisedProcess {
         let pid = child
             .id()
             .expect("a freshly spawned child always has a pid");
+        self.diagnostics.lock().await.start(pid);
+        let interface = config_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("unknown");
+        let mut output_tasks = Vec::new();
+        if let Some(stdout) = child.stdout.take() {
+            output_tasks.push(capture_wifi_output(
+                stdout,
+                "hostapd",
+                interface,
+                "stdout",
+                pid,
+                self.diagnostics.clone(),
+            ));
+        }
         if let Some(stderr) = child.stderr.take() {
-            capture_wifi_stderr(
+            output_tasks.push(capture_wifi_output(
                 stderr,
                 "hostapd",
-                config_path
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .unwrap_or("unknown"),
+                interface,
+                "stderr",
                 pid,
-            );
+                self.diagnostics.clone(),
+            ));
+        }
+        {
+            let mut tasks = self.output_tasks.lock().await;
+            tasks.retain(|_, handles| !handles.iter().all(JoinHandle::is_finished));
+            tasks.insert(pid, output_tasks);
         }
         self.children.lock().await.insert(pid, child);
         Ok(pid)
@@ -303,6 +382,7 @@ impl SupervisedProcess for TokioSupervisedProcess {
             .arg(interface)
             .arg("-c")
             .arg(config_path)
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(false)
             .spawn()
@@ -313,27 +393,92 @@ impl SupervisedProcess for TokioSupervisedProcess {
         let pid = child
             .id()
             .expect("a freshly spawned child always has a pid");
+        self.diagnostics.lock().await.start(pid);
+        let mut output_tasks = Vec::new();
+        if let Some(stdout) = child.stdout.take() {
+            output_tasks.push(capture_wifi_output(
+                stdout,
+                "wpa_supplicant",
+                interface,
+                "stdout",
+                pid,
+                self.diagnostics.clone(),
+            ));
+        }
         if let Some(stderr) = child.stderr.take() {
-            capture_wifi_stderr(stderr, "wpa_supplicant", interface, pid);
+            output_tasks.push(capture_wifi_output(
+                stderr,
+                "wpa_supplicant",
+                interface,
+                "stderr",
+                pid,
+                self.diagnostics.clone(),
+            ));
+        }
+        {
+            let mut tasks = self.output_tasks.lock().await;
+            tasks.retain(|_, handles| !handles.iter().all(JoinHandle::is_finished));
+            tasks.insert(pid, output_tasks);
         }
         self.children.lock().await.insert(pid, child);
         Ok(pid)
     }
 
     async fn is_alive(&self, pid: u32) -> Result<bool, ProcessError> {
-        let mut children = self.children.lock().await;
-        if let Some(child) = children.get_mut(&pid) {
-            return match child.try_wait() {
-                Ok(None) => Ok(true),
-                Ok(Some(_status)) => {
-                    children.remove(&pid);
-                    Ok(false)
+        let exited = {
+            let mut children = self.children.lock().await;
+            if let Some(child) = children.get_mut(&pid) {
+                match child.try_wait() {
+                    Ok(None) => return Ok(true),
+                    Ok(Some(status)) => {
+                        children.remove(&pid);
+                        Some(status)
+                    }
+                    Err(source) => return Err(ProcessError::Inspect { pid, source }),
                 }
-                Err(source) => Err(ProcessError::Inspect { pid, source }),
-            };
+            } else {
+                None
+            }
+        };
+        if let Some(status) = exited {
+            // The daemon may emit its most useful failure message immediately
+            // before exit. Drain both captured streams before recording the
+            // exit status so health reporting cannot race and lose the cause.
+            let output_tasks = self
+                .output_tasks
+                .lock()
+                .await
+                .remove(&pid)
+                .unwrap_or_default();
+            for mut task in output_tasks {
+                // Descendants may inherit the pipe; EOF is not guaranteed even
+                // after our daemon has exited. Do not block supervision forever.
+                if tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, &mut task)
+                    .await
+                    .is_err()
+                {
+                    task.abort();
+                    let _ = task.await;
+                }
+            }
+            self.diagnostics
+                .lock()
+                .await
+                .push(pid, format!("process exited with {status}"));
+            return Ok(false);
         }
-        drop(children);
         Ok(probe_pid_exists(pid))
+    }
+
+    async fn recent_diagnostics(&self, pid: u32) -> Result<Vec<String>, ProcessError> {
+        Ok(self
+            .diagnostics
+            .lock()
+            .await
+            .lines
+            .get(&pid)
+            .map(|lines| lines.iter().cloned().collect())
+            .unwrap_or_default())
     }
 
     async fn identity_matches(
@@ -458,7 +603,13 @@ impl SupervisedProcess for TokioSupervisedProcess {
     ) -> Result<(), ProcessError> {
         #[cfg(target_os = "linux")]
         {
-            return self.stop_recorded_pidfd(record, kind, daemon).await;
+            self.stop_recorded_pidfd(record, kind, daemon).await?;
+            if record.pid != 0 {
+                // pidfd readiness proves exit but does not reap our Child or
+                // finish its output tasks. Finalize those before forgetting it.
+                self.is_alive(record.pid).await?;
+            }
+            return Ok(());
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -473,27 +624,38 @@ impl SupervisedProcess for TokioSupervisedProcess {
     }
 }
 
-fn capture_wifi_stderr(
-    stderr: tokio::process::ChildStderr,
+fn capture_wifi_output<R>(
+    output: R,
     daemon: &'static str,
     interface: &str,
+    stream: &'static str,
     pid: u32,
-) {
+    diagnostics: Arc<Mutex<WifiDiagnostics>>,
+) -> JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
     let interface = interface.to_string();
     tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
+        let mut lines = BufReader::new(output).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let lower = line.to_ascii_lowercase();
-            if ["passphrase", "password", "psk", "secret", "ssid2", "key="]
+            let sensitive = ["passphrase", "password", "psk", "secret", "ssid2", "key="]
                 .iter()
-                .any(|marker| lower.contains(marker))
-            {
-                tracing::warn!(daemon, %interface, pid, "Wi-Fi daemon emitted a sensitive diagnostic; content redacted");
+                .any(|marker| lower.contains(marker));
+            let diagnostic = if sensitive {
+                "Wi-Fi daemon emitted a sensitive diagnostic; content redacted".to_string()
             } else {
-                tracing::warn!(daemon, %interface, pid, stderr = %line, "Wi-Fi daemon diagnostic");
+                line.clone()
+            };
+            diagnostics.lock().await.push(pid, diagnostic);
+            if sensitive {
+                tracing::warn!(daemon, %interface, pid, stream, "Wi-Fi daemon emitted a sensitive diagnostic; content redacted");
+            } else {
+                tracing::warn!(daemon, %interface, pid, stream, output = %line, "Wi-Fi daemon diagnostic");
             }
         }
-    });
+    })
 }
 
 #[cfg(target_os = "linux")]

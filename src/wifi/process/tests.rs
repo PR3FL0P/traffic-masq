@@ -1,9 +1,52 @@
+use std::io::Write;
 use std::os::unix::net::UnixDatagram;
 use std::time::Duration;
 
 use tempfile::NamedTempFile;
 
 use super::*;
+
+#[tokio::test]
+async fn stdout_and_stderr_diagnostics_are_retained_for_supervisor_health() {
+    let mut script = NamedTempFile::new().expect("script");
+    writeln!(script, "echo 'ACS: Unable to collect survey data'").expect("write script");
+    writeln!(script, "echo 'nl80211: setup failed' >&2").expect("write script");
+    writeln!(script, "exit 7").expect("write script");
+    script.flush().expect("flush script");
+
+    let process = TokioSupervisedProcess::new();
+    let pid = process
+        .spawn(Path::new("/bin/sh"), script.path())
+        .await
+        .expect("spawn");
+
+    for _ in 0..50 {
+        if !process.is_alive(pid).await.expect("process state") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let diagnostics = process
+        .recent_diagnostics(pid)
+        .await
+        .expect("read exit diagnostics");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|line| line.contains("Unable to collect survey data")),
+        "stdout must retain hostapd diagnostics"
+    );
+    assert!(
+        diagnostics.iter().any(|line| line.contains("setup failed")),
+        "stderr must retain hostapd diagnostics"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|line| line.contains("exit status: 7")),
+        "process exit status must be retained"
+    );
+}
 
 async fn proc_cmdline_contains(pid: u32, argument: &Path) -> bool {
     tokio::fs::read(format!("/proc/{pid}/cmdline"))
@@ -528,6 +571,20 @@ async fn pidfd_stop_accepts_the_exact_recorded_starttime() {
         .stop_recorded(&record, WifiProcessKind::AccessPoint, "test")
         .await
         .expect("exact lifetime is safe to signal");
+    assert!(
+        !process.children.lock().await.contains_key(&pid),
+        "stop must reap the child"
+    );
+    assert!(
+        !process.output_tasks.lock().await.contains_key(&pid),
+        "stop must finish output tasks"
+    );
+    assert!(process
+        .recent_diagnostics(pid)
+        .await
+        .unwrap()
+        .iter()
+        .any(|line| line.starts_with("process exited with ")));
     assert!(!process.is_alive(pid).await.expect("process stopped"));
 }
 
@@ -566,4 +623,96 @@ async fn pidfd_stop_refuses_legacy_record_without_exact_starttime() {
         .await
         .expect("legacy record cannot signal process"));
     process.kill(pid).await.expect("cleanup");
+}
+
+#[test]
+fn diagnostic_history_is_bounded_across_launches_and_pid_reuse() {
+    let mut diagnostics = WifiDiagnostics::default();
+    diagnostics.start(0);
+    diagnostics.push(0, "old launch".to_string());
+    for pid in 1..=MAX_WIFI_DIAGNOSTIC_PROCESSES as u32 {
+        diagnostics.start(pid);
+        diagnostics.push(pid, format!("launch {pid}"));
+    }
+    diagnostics.push(0, "late output from evicted launch".to_string());
+    assert!(!diagnostics.lines.contains_key(&0));
+    assert_eq!(diagnostics.lines.len(), MAX_WIFI_DIAGNOSTIC_PROCESSES);
+    let newest = MAX_WIFI_DIAGNOSTIC_PROCESSES as u32;
+    assert_eq!(diagnostics.lines[&newest][0], format!("launch {newest}"));
+    diagnostics.start(newest);
+    assert!(diagnostics.lines[&newest].is_empty());
+    assert_eq!(diagnostics.launches.len(), MAX_WIFI_DIAGNOSTIC_PROCESSES);
+    for _ in 0..MAX_WIFI_DIAGNOSTIC_LINES + 1 {
+        diagnostics.push(newest, "界".repeat(MAX_WIFI_DIAGNOSTIC_BYTES));
+    }
+    assert_eq!(diagnostics.lines[&newest].len(), MAX_WIFI_DIAGNOSTIC_LINES);
+    assert!(diagnostics.lines[&newest]
+        .iter()
+        .all(|line| line.len() <= MAX_WIFI_DIAGNOSTIC_BYTES));
+}
+
+#[tokio::test]
+async fn inherited_output_pipe_does_not_block_exit_observation() {
+    let mut script = NamedTempFile::new().unwrap();
+    writeln!(script, "sleep 30 >&1 2>/dev/null &\necho $!\nexit 7").unwrap();
+    script.flush().unwrap();
+    let process = TokioSupervisedProcess::new();
+    let pid = process
+        .spawn(Path::new("/bin/sh"), script.path())
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(3), async {
+        while process.is_alive(pid).await.unwrap() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let diagnostics = process.recent_diagnostics(pid).await.unwrap();
+    // Clean up the descendant even if the liveness timeout failed.
+    for line in &diagnostics {
+        if let Ok(descendant) = line.parse::<u32>() {
+            send_signal(descendant, Signal::SIGKILL).unwrap();
+        }
+    }
+    assert!(
+        result.is_ok(),
+        "an inherited pipe must not hang the supervisor"
+    );
+    assert!(diagnostics
+        .iter()
+        .any(|line| line.contains("exit status: 7")));
+}
+
+#[tokio::test]
+async fn sensitive_output_is_redacted_in_retained_diagnostics() {
+    let mut script = NamedTempFile::new().unwrap();
+    writeln!(
+        script,
+        "echo 'password=do-not-retain'\necho 'wpa_psk=do-not-retain' >&2"
+    )
+    .unwrap();
+    script.flush().unwrap();
+    let process = TokioSupervisedProcess::new();
+    let pid = process
+        .spawn(Path::new("/bin/sh"), script.path())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while process.is_alive(pid).await.unwrap() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let diagnostics = process.recent_diagnostics(pid).await.unwrap();
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|line| line.contains("redacted"))
+            .count(),
+        2
+    );
+    assert!(!diagnostics
+        .iter()
+        .any(|line| line.contains("do-not-retain")));
 }

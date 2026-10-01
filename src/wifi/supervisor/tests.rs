@@ -1103,6 +1103,13 @@ async fn ctrl_operations_reject_a_socket_not_owned_by_the_recorded_hostapd() {
         HostapdState::Other("unreachable".to_string()),
         "STATUS must not be read from the foreign ctrl socket"
     );
+    let WifiHealth::Retrying { error, .. } = status.health else {
+        panic!("an unreachable owned control interface must be reported as an error");
+    };
+    assert!(
+        error.contains("ownership") || error.contains("control"),
+        "health should retain the concrete control/ownership failure: {error}"
+    );
 
     let configure = supervisor
         .configure(spec("wlan0", "net-b"))
@@ -1114,6 +1121,34 @@ async fn ctrl_operations_reject_a_socket_not_owned_by_the_recorded_hostapd() {
         "net-a",
         "reload path must prove ctrl ownership before rewriting hostapd config"
     );
+}
+
+#[tokio::test]
+async fn unexpected_hostapd_state_is_reported_as_an_error() {
+    let temp = tempdir().expect("tempdir");
+    let runtime_dir = temp.path().join("hostapd");
+    let process = FakeProcess::new("hostapd", 1000, "FAILED", |_, path, state| {
+        FakeHostapdCtrl::spawn_with_state(
+            path.with_extension(""),
+            SsidSource::ConfigFile(path.to_path_buf()),
+            state,
+        )
+    });
+    let supervisor = test_supervisor(temp.path(), &runtime_dir, process).await;
+    supervisor
+        .configure(spec("wlan0", "net-a"))
+        .await
+        .expect("PING-ready hostapd is accepted during startup");
+
+    let status = supervisor.status("wlan0").await.expect("configured status");
+    assert_eq!(
+        status.hostapd_state,
+        HostapdState::Other("FAILED".to_string())
+    );
+    let WifiHealth::Retrying { error, .. } = status.health else {
+        panic!("an unknown hostapd state must not be reported as Starting");
+    };
+    assert!(error.contains("FAILED"));
 }
 
 #[tokio::test]
@@ -1383,4 +1418,386 @@ async fn disabled_acs_ap_keeps_backoff_after_a_successful_spawn() {
         supervisor.status("wlan0").await.unwrap().health,
         WifiHealth::Healthy
     ));
+}
+
+#[tokio::test]
+async fn deterministic_acs_failure_suspends_retry_until_config_changes() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("hostapd");
+    let process = FakeProcess::new("hostapd", 1000, "DISABLED", |_, path, state| {
+        FakeHostapdCtrl::spawn_with_state(
+            path.with_extension(""),
+            SsidSource::ConfigFile(path.to_path_buf()),
+            state,
+        )
+    });
+    let supervisor = test_supervisor(temp.path(), &runtime, process.clone()).await;
+    let mut ap = spec("wlan0", "acs-test");
+    ap.channel = 0;
+    supervisor.configure(ap.clone()).await.unwrap();
+
+    let pid = supervisor.status("wlan0").await.unwrap().pid;
+    process.set_diagnostics(
+        pid,
+        &[
+            "ACS: Unable to collect survey data",
+            "ACS: All study options have failed",
+            "Interface initialization failed",
+            "ACS: Failed to start",
+        ],
+    );
+
+    assert!(!supervisor.ensure_alive().await.unwrap());
+    assert_eq!(
+        process.spawn_count(),
+        1,
+        "fatal ACS failure must not respawn"
+    );
+    assert!(!supervisor.ensure_alive().await.unwrap());
+    assert_eq!(process.spawn_count(), 1, "suspended retry must stay quiet");
+
+    let status = supervisor.status("wlan0").await.unwrap();
+    let WifiHealth::Retrying {
+        error,
+        retry_in_secs,
+        advice,
+        ..
+    } = status.health
+    else {
+        panic!("suspended AP must expose its failure");
+    };
+    assert!(error.contains("Unable to collect survey data"));
+    assert!(error.contains("automatic retry suspended"));
+    assert_eq!(retry_in_secs, None);
+    assert!(advice.unwrap().contains("suspended"));
+
+    process.set_spawn_profile("ENABLED");
+    let mut changed = ap;
+    changed.ssid = "changed-after-failure".to_string();
+    supervisor.configure(changed).await.unwrap();
+    assert_eq!(
+        process.spawn_count(),
+        2,
+        "changing config must restart even though the previous hostapd is dead"
+    );
+    assert!(
+        !supervisor.inner.tasks.lock().await["wlan0"]
+            .retry
+            .retry_suspended
+    );
+}
+
+#[tokio::test]
+async fn deterministic_startup_failure_is_suspended_immediately() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("hostapd");
+    let process = fake_process();
+    let supervisor = test_supervisor(temp.path(), &runtime, process.clone()).await;
+    let ap = spec("wlan0", "broken-startup");
+
+    supervisor
+        .record_failed_startup(
+            &ap,
+            "hostapd startup failed: ACS: All study options have failed",
+        )
+        .await;
+
+    assert!(!supervisor.ensure_alive().await.unwrap());
+    assert_eq!(process.spawn_count(), 0);
+    supervisor.configure(ap.clone()).await.unwrap();
+    assert_eq!(
+        process.spawn_count(),
+        0,
+        "reapplying unchanged desired state must not bypass suspension"
+    );
+    let task = supervisor.inner.tasks.lock().await["wlan0"].clone();
+    assert!(task.retry.retry_suspended);
+    assert!(task
+        .retry
+        .last_failure
+        .as_deref()
+        .unwrap()
+        .contains("automatic retry suspended"));
+}
+
+#[tokio::test]
+async fn interface_identity_change_resumes_a_suspended_retry() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("hostapd");
+    let process = FakeProcess::new("hostapd", 1000, "DISABLED", |_, path, state| {
+        FakeHostapdCtrl::spawn_with_state(
+            path.with_extension(""),
+            SsidSource::ConfigFile(path.to_path_buf()),
+            state,
+        )
+    });
+    let supervisor = test_supervisor(temp.path(), &runtime, process.clone()).await;
+    let mut ap = spec("lo", "acs-test");
+    ap.channel = 0;
+    supervisor.configure(ap).await.unwrap();
+
+    let pid = supervisor.status("lo").await.unwrap().pid;
+    process.set_diagnostics(pid, &["ACS: All study options have failed"]);
+    assert!(!supervisor.ensure_alive().await.unwrap());
+    assert!(
+        supervisor.inner.tasks.lock().await["lo"]
+            .retry
+            .retry_suspended
+    );
+
+    // Model the observation that the old interface disappeared. When the same
+    // configured name now resolves again, it is a new interface identity and
+    // the supervisor should permit one fresh attempt.
+    supervisor
+        .inner
+        .tasks
+        .lock()
+        .await
+        .get_mut("lo")
+        .unwrap()
+        .retry
+        .suspended_ifindex = None;
+    process.set_spawn_profile("ENABLED");
+    assert!(supervisor.ensure_alive().await.unwrap());
+    assert_eq!(process.spawn_count(), 2);
+    assert!(
+        !supervisor.inner.tasks.lock().await["lo"]
+            .retry
+            .retry_suspended
+    );
+}
+
+#[test]
+fn diagnostic_summary_prefers_root_cause_over_shutdown_noise() {
+    let lines = vec![
+        "ACS: Automatic channel selection started, this may take a bit".to_string(),
+        "ACS: Unable to collect survey data".to_string(),
+        "ACS: All study options have failed".to_string(),
+        "Interface initialization failed".to_string(),
+        "wlan0: AP-DISABLED".to_string(),
+        "hostapd_free_hapd_data: Interface wlan0 wasn't started".to_string(),
+        "nl80211: deinit ifname=wlan0 disabled_11b_rates=0".to_string(),
+        "wlan0: CTRL-EVENT-TERMINATING".to_string(),
+        "process exited with exit status: 0".to_string(),
+    ];
+
+    let summary = diagnostic_summary(&lines).expect("summary");
+    assert!(summary.contains("Unable to collect survey data"));
+    assert!(summary.contains("study options have failed"));
+    assert!(summary.contains("initialization failed"));
+    assert!(summary.contains("exit status: 0"));
+}
+
+#[test]
+fn deterministic_hostapd_failures_are_classified_for_suspension() {
+    for line in [
+        "ACS: Unable to collect survey data",
+        "ACS: All study options have failed",
+        "Line 12: unknown configuration item 'foo'",
+        "Hardware does not support configured mode",
+        "Could not select hw_mode and channel. (-3)",
+        "nl80211: Failed to set channel (freq=5180): -22 (Invalid argument)",
+    ] {
+        assert!(
+            hostapd_failure_should_suspend_retry(&[line.to_string()]),
+            "expected deterministic classification for: {line}"
+        );
+    }
+
+    assert!(!hostapd_failure_should_suspend_retry(&[
+        "nl80211: kernel reports: Device or resource busy".to_string(),
+        "CTRL-EVENT-TERMINATING".to_string(),
+    ]));
+}
+
+#[tokio::test]
+async fn deterministic_background_startup_failure_suspends_without_losing_its_cause() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("hostapd");
+    let process = fake_process();
+    let supervisor = test_supervisor(temp.path(), &runtime, process.clone()).await;
+    let ap = spec("wlan0", "test");
+    supervisor.configure(ap.clone()).await.unwrap();
+    process.kill_externally(1000);
+    process
+        .suppress_spawn_responder
+        .store(true, Ordering::Relaxed);
+    process.set_diagnostics(1001, &["Line 12: unknown configuration item 'foo'"]);
+
+    assert!(supervisor.ensure_alive().await.unwrap());
+    assert!(!supervisor.ensure_alive().await.unwrap());
+    supervisor.configure(ap).await.unwrap();
+    assert_eq!(process.spawn_count(), 2);
+    let status = supervisor.status("wlan0").await.unwrap();
+    let WifiHealth::Retrying {
+        error,
+        retry_in_secs,
+        ..
+    } = status.health
+    else {
+        panic!("failed background startup must retain its error");
+    };
+    assert!(error.contains("unknown configuration item"));
+    assert!(error.contains("automatic retry suspended"));
+    assert_eq!(retry_in_secs, None);
+}
+
+#[tokio::test]
+async fn transient_channel_failure_keeps_retrying() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("hostapd");
+    let process = FakeProcess::new("hostapd", 1000, "DISABLED", |_, path, state| {
+        FakeHostapdCtrl::spawn_with_state(
+            path.with_extension(""),
+            SsidSource::ConfigFile(path.to_path_buf()),
+            state,
+        )
+    });
+    let supervisor = test_supervisor(temp.path(), &runtime, process.clone()).await;
+    supervisor.configure(spec("wlan0", "test")).await.unwrap();
+    process.set_diagnostics(
+        1000,
+        &["nl80211: Failed to set channel (freq=5180): -16 (Device or resource busy)"],
+    );
+    process.set_spawn_profile("ENABLED");
+    assert!(supervisor.ensure_alive().await.unwrap());
+    assert_eq!(process.spawn_count(), 2);
+    let task = supervisor.inner.tasks.lock().await["wlan0"].clone();
+    assert!(!task.retry.retry_suspended);
+    assert!(task.retry.next_restart_earliest.is_some());
+}
+
+#[test]
+fn driver_failure_classification_requires_a_permanent_cause_on_the_same_line() {
+    for line in [
+        "nl80211: Failed to set channel: -16 (Device or resource busy)",
+        "Failed to set beacon parameters",
+        "nl80211: Failed to set channel: -1 (Operation not permitted)",
+        "nl80211: Failed to set channel: -16 (Device or resource busy)\nother operation failed: Invalid argument",
+        "nl80211: Failed to set channel: -16 (Device or resource busy) | other operation failed: Invalid argument",
+    ] {
+        assert!(!hostapd_failure_text_should_suspend_retry(line), "{line}");
+    }
+    assert!(hostapd_failure_text_should_suspend_retry(
+        "Failed to set beacon parameters: -95 (Operation not supported)"
+    ));
+}
+
+#[tokio::test]
+async fn changing_credentials_resumes_a_suspended_startup_with_the_same_spec() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("hostapd");
+    let process = fake_process();
+    let supervisor = test_supervisor(temp.path(), &runtime, process.clone()).await;
+    let mut ap = spec("wlan0", "test");
+    ap.security = WifiSecurity::Wpa2;
+    supervisor
+        .set_passphrase("wlan0", &WifiPassphrase::new("old-password").unwrap())
+        .await
+        .unwrap();
+    supervisor
+        .record_failed_startup(&ap, "unknown configuration item 'foo'")
+        .await;
+    supervisor.configure(ap.clone()).await.unwrap();
+    assert_eq!(process.spawn_count(), 0);
+    supervisor
+        .set_passphrase("wlan0", &WifiPassphrase::new("new-password").unwrap())
+        .await
+        .unwrap();
+    supervisor.configure(ap).await.unwrap();
+    assert_eq!(process.spawn_count(), 1);
+    assert!(
+        !supervisor.inner.tasks.lock().await["wlan0"]
+            .retry
+            .retry_suspended
+    );
+}
+
+#[tokio::test]
+async fn background_render_failure_is_recorded_and_backs_off() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("hostapd");
+    let process = fake_process();
+    let supervisor = test_supervisor(temp.path(), &runtime, process.clone()).await;
+    let mut ap = spec("wlan0", "test");
+    ap.security = WifiSecurity::Wpa2;
+    supervisor
+        .set_passphrase("wlan0", &WifiPassphrase::new("test-password").unwrap())
+        .await
+        .unwrap();
+    supervisor.configure(ap).await.unwrap();
+    process.kill_externally(1000);
+    supervisor.clear_passphrase("wlan0").await.unwrap();
+    assert!(supervisor.ensure_alive().await.unwrap());
+    assert!(!supervisor.ensure_alive().await.unwrap());
+    let task = supervisor.inner.tasks.lock().await["wlan0"].clone();
+    assert!(task
+        .retry
+        .last_failure
+        .as_deref()
+        .unwrap()
+        .contains("passphrase"));
+    assert!(task.retry.next_restart_earliest.unwrap() > Instant::now());
+    assert_eq!(process.spawn_count(), 1);
+}
+
+#[tokio::test]
+async fn resumed_retry_does_not_reuse_diagnostics_from_the_old_process() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("hostapd");
+    let process = FakeProcess::new("hostapd", 1000, "DISABLED", |_, path, state| {
+        FakeHostapdCtrl::spawn_with_state(
+            path.with_extension(""),
+            SsidSource::ConfigFile(path.to_path_buf()),
+            state,
+        )
+    });
+    let supervisor = test_supervisor(temp.path(), &runtime, process.clone()).await;
+    supervisor.configure(spec("lo", "test")).await.unwrap();
+    process.set_diagnostics(1000, &["ACS: All study options have failed"]);
+    assert!(!supervisor.ensure_alive().await.unwrap());
+    supervisor
+        .inner
+        .tasks
+        .lock()
+        .await
+        .get_mut("lo")
+        .unwrap()
+        .retry
+        .suspended_ifindex = None;
+    process.fail_spawn.store(true, Ordering::Relaxed);
+    assert!(supervisor.ensure_alive().await.unwrap());
+    let status = supervisor.status("lo").await.unwrap();
+    let WifiHealth::Retrying { error, .. } = status.health else {
+        panic!("spawn failure");
+    };
+    assert!(error.contains("fake spawn failure"));
+    supervisor
+        .inner
+        .tasks
+        .lock()
+        .await
+        .get_mut("lo")
+        .unwrap()
+        .retry
+        .next_restart_earliest = Some(Instant::now());
+    assert!(supervisor.ensure_alive().await.unwrap());
+    assert_eq!(process.spawn_count(), 3);
+    assert!(
+        !supervisor.inner.tasks.lock().await["lo"]
+            .retry
+            .retry_suspended
+    );
+}
+
+#[test]
+fn compact_diagnostic_summary_preserves_a_permanent_cause_in_the_middle() {
+    let mut lines: Vec<_> = (0..12)
+        .map(|index| format!("setup failed at step {index}"))
+        .collect();
+    lines[6] = "Configured channel is not found".to_string();
+    let summary = diagnostic_summary(&lines).unwrap();
+    assert!(summary.contains("Configured channel is not found"));
+    assert!(hostapd_failure_text_should_suspend_retry(&summary));
+    assert_eq!(summary.split(" | ").count(), 8);
 }
