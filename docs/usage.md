@@ -598,12 +598,19 @@ The dashboard's **Interfaces stat** panel shows link activity and
 Press **2** for aggregate statistics, then **Down/Up** to browse individual
 interfaces; **Home** returns to the aggregate view. The **DHCP Client** section
 shows configured uplink DHCP clients; DHCP status is not part of the Dashboard.
+Before configuring a DHCP client, use **Interfaces** to apply and commit a
+managed `input` interface without a static IPv4 address. DHCP configuration
+requires that prepared interface and applies immediately.
 The overview reports whether the VPN subsystem is enabled; this switch alone does not prove a tunnel is connected.
 
 An absent router dataplane interface defers startup convergence after successful
-rollback instead of stopping the daemon. The daemon retries when the interface
-appears. Check `ip link`, reconnect the adapter, or correct its name in the router
-configuration. Logs identify the missing interface and its role and include the
+rollback instead of stopping the daemon. Runtime repair checks for absent
+interfaces before opening a repair journal, preserving healthy LAN services.
+Failed convergence uses exponential backoff from one to thirty seconds; kernel
+notifications during that delay do not bypass it. After an adapter appears,
+recovery can therefore take up to thirty seconds. Changes to operator intent
+and recovery state wake convergence immediately. Check `ip link`, reconnect
+the adapter, or correct its name in the router configuration. Logs identify the missing interface and its role and include the
 underlying error. A router rollback that has already reached `RollbackFailed`
 can also leave the control plane available in degraded mode so the failure can
 be inspected and rollback retried. By contrast, startup remains blocked when

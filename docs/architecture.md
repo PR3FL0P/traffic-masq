@@ -106,6 +106,16 @@ limits queued work and waits for accepted operations during shutdown. If a
 request times out, the client must check the current state before retrying: the
 change may already have taken effect.
 
+Immediate DHCP client configuration edits only DHCP policy on an already
+managed input interface without a static address. Interface role, management
+and static-address changes must pass through interface transactions first.
+Runtime interface and router dataplane convergence retry unsuccessful passes
+with exponential backoff from one to thirty seconds. Kernel notifications are
+drained during that delay, so a failed repair cannot trigger itself repeatedly.
+Changes to operator intent or recovery state wake the worker immediately;
+successful passes return to waiting for events. An absent router interface is
+checked before a repair journal is opened, leaving healthy LAN services intact.
+
 Wi-Fi radio admission uses a shared policy: managed AP and STA interfaces may
 not share a known physical PHY, including a temporary STA used for scanning.
 The rule applies to interface transactions, router provisioning, profile

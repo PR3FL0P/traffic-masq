@@ -319,6 +319,12 @@ An empty `cidr` requests no owned static address.
 
 `DhcpClientConfig`
 
+Configuring a DHCP client requires an already managed `input` interface with
+no static IPv4 address. Apply and commit interface role, management or address
+changes through the interface transaction endpoints first. The DHCP endpoint
+changes only DHCP policy; it does not convert the interface or remove other
+services.
+
 ```json
 {
   "route_metric": 100,
