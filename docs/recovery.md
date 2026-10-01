@@ -446,3 +446,72 @@ Startup reloads the persisted commit proof: a matching token retains the committ
 change; an uncommitted journal is rolled back. Unreadable or invalid proof continues
 to block the affected recovery scope. A failed commit response in this state does
 not establish whether the configuration was committed.
+
+## Bounded automatic recovery
+
+Interface and router recovery share a bounded cycle: at most **three attempts**,
+**60 seconds per attempt**, and **180 seconds for the whole cycle**, including
+retry delays. The confirmation window before rollback remains separate. Recovery
+caused by a failed apply starts its retries without waiting for another full
+confirmation window. Startup interface retries also consume the same persisted
+cycle; restarting the daemon does not reset the attempt count or renew its
+remaining budget. A monotonic deadline additionally prevents wall-clock changes
+from extending a running cycle.
+
+Failures are classified by error types and kernel error codes, not message text:
+
+| `failure_kind` | Automatic response |
+| --- | --- |
+| `transient` | Retry within the remaining cycle, with increasing delay. |
+| `device_missing` | Allow bounded retries for a reconnect, with longer delays. |
+| `conflict` | Stop; preserve resources owned by another actor. |
+| `incompatible` | Stop; repair the configuration/environment or restore compatible state. |
+| `storage` | Stop; repair access while retaining the snapshot and control record. |
+| `commit_indeterminate` | Preserve the existing commit fence; repair storage and restart. |
+| `unknown` | Retry only within the bounded cycle; do not assume the operation had no effect. |
+
+A missing adapter cannot leave automatic recovery waiting indefinitely. After the
+budget or attempt limit is exhausted, the interface phase/router status becomes
+`recovery_required`. A later device event does **not** resume the stopped cycle.
+Inspect the current network, correct the cause, and explicitly retry rollback.
+The retry starts a new cycle only after the previous cycle has stopped; repeated
+manual requests during an active cycle do not renew its budget. Update the daemon
+and TUI together to display this new status.
+
+`PendingNetworkChange.recovery_progress` and
+`RouterRecoveryNotice.recovery_progress` expose the failure kind, attempt count,
+limit, deadline and whether automatic recovery remains enabled. Confirmation of
+a partially restored change is disabled. The TUI displays these details and
+keeps the existing explicit rollback action available.
+
+The immutable snapshot journal is accompanied by a private
+`<journal>.recovery-control` record bound to its exact SHA-256 digest. This record
+is written before runtime mutations, including application before a confirmation
+timer exists. An interrupted apply/rollback requires explicit recovery after
+restart. Stopped control records fence background reconciliation and process
+restarts, and shutdown preserves unresolved owned state instead of replaying
+baselines. Startup does not independently restore router provisioning secrets
+before the router recovery decision. Failed credential restoration prevents its
+runtime consumers from being restarted by that rollback.
+
+Keep the complete state directory, including these control records and recovery
+receipts. Do not edit/delete them to renew the budget, and do not downgrade to a
+daemon that ignores them while recovery is unresolved. If the control record is
+unreadable or corrupt, even explicit rollback stays fenced until storage/state is
+repaired. A failure to persist the decision is reported as unconfirmed persistence;
+the running daemon still stops automatic work. A prior write-ahead attempt record
+allows restart to recognize interruption when the final stop write failed.
+
+A timeout does not prove that a kernel operation was cancelled or had no effect.
+Retries re-observe runtime state through the existing ownership-aware rollback
+paths. Independent subsystem rollback still collects failures; this phase does
+not introduce a durable per-step completion ledger or automatic acceptance of a
+partially restored network. The snapshot is retired only after restoration and
+its dependent credentials/ownership are settled, or an independent committed
+token proves rollback is obsolete. A cancelled commit write uses the existing
+`commit_indeterminate` fence rather than guessing its outcome.
+
+Forward recovery into a replacement configuration, transfer to external
+management, and cross-host configuration migration remain separate operations;
+this bounded recovery mechanism does not silently commit a failed candidate or
+convert an old host's snapshot into portable configuration.
