@@ -1,4 +1,6 @@
 //! Internet sharing is independent of the route list. Editing only stages intent.
+use std::collections::HashSet;
+
 use super::{
     layout::{focused_lines_offset, panel},
     logs::LogLevel,
@@ -358,25 +360,56 @@ pub(crate) fn render_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
         .router
         .selected_connection
         .saturating_sub(visible.saturating_sub(1));
+    let observed: Option<HashSet<&str>> = app.dashboard.interfaces_updated.map(|_| {
+        app.dashboard
+            .interfaces
+            .iter()
+            .map(|status| status.interface.name.as_str())
+            .collect()
+    });
     let rows = rules_slice
         .iter()
         .enumerate()
         .skip(scroll)
         .take(visible)
         .map(|(index, rule)| {
+            let (from_missing, to_missing) = observed.as_ref().map_or((false, false), |names| {
+                (
+                    !names.contains(rule.from.as_str()),
+                    !names.contains(rule.to.as_str()),
+                )
+            });
+            let status = if observed.is_none() {
+                "Unknown"
+            } else {
+                match (from_missing, to_missing) {
+                    (true, true) => "Both missing",
+                    (true, false) => "From missing",
+                    (false, true) => "Through missing",
+                    (false, false) => "Present",
+                }
+            };
+            let interface_style = |missing| {
+                if missing {
+                    Style::default().fg(theme::WARN)
+                } else {
+                    Style::default()
+                }
+            };
             Row::new(vec![
                 Cell::from(if index == app.router.selected_connection {
                     "▶"
                 } else {
                     " "
                 }),
-                Cell::from(rule.from.clone()),
-                Cell::from(rule.to.clone()),
+                Cell::from(rule.from.clone()).style(interface_style(from_missing)),
+                Cell::from(rule.to.clone()).style(interface_style(to_missing)),
                 Cell::from(if rule.masquerade { "On" } else { "Off" }),
                 Cell::from(
                     rule.source_subnet
                         .map_or("Any".into(), |subnet| subnet.to_string()),
                 ),
+                Cell::from(status).style(interface_style(from_missing || to_missing)),
             ])
             .style(
                 if index == app.router.selected_connection && !app.router.sharing_actions_focused {
@@ -392,14 +425,15 @@ pub(crate) fn render_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
         rows,
         [
             Constraint::Length(1),
-            Constraint::Min(9),
-            Constraint::Min(9),
+            Constraint::Min(15),
+            Constraint::Min(15),
             Constraint::Length(4),
             Constraint::Length(18),
+            Constraint::Length(15),
         ],
     )
     .header(
-        Row::new(["", "From", "Through", "NAT", "Source subnet"])
+        Row::new(["", "From", "Through", "NAT", "Source subnet", "Interfaces"])
             .style(Style::default().fg(theme::MUTED)),
     )
     .block(block);
