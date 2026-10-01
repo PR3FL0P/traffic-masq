@@ -109,8 +109,32 @@ pub struct RouterHealthReport {
     pub dataplane: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryFailureKind {
+    Transient,
+    DeviceMissing,
+    Conflict,
+    Incompatible,
+    Storage,
+    CommitIndeterminate,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryProgress {
+    pub failure_kind: RecoveryFailureKind,
+    pub attempts: u32,
+    pub max_attempts: u32,
+    pub deadline_unix: u64,
+    pub automatic_recovery: bool,
+    pub last_error: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouterRecoveryNotice {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_progress: Option<RecoveryProgress>,
     pub recovery_code: String,
     pub invariant: String,
     #[serde(default)]
@@ -154,6 +178,8 @@ pub enum CoordinatorStatus {
     Idle,
     Pending,
     RollbackFailed,
+    /// Automatic recovery stopped; only an explicit rollback starts a new cycle.
+    RecoveryRequired,
     RecoveredButJournalCleanupPending,
 }
 
@@ -171,6 +197,8 @@ pub struct RouterProvisioningStatusView {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingNetworkChange {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_progress: Option<RecoveryProgress>,
     pub token: String,
     pub interface: String,
     pub rollback_timeout_seconds: u64,
@@ -188,6 +216,7 @@ pub enum NetworkChangePhase {
     #[default]
     AwaitingCommit,
     RollbackRequired,
+    RecoveryRequired,
     CommitIndeterminate,
 }
 

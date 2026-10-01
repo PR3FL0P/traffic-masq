@@ -35,6 +35,8 @@ impl ShutdownPlan {
             .as_ref()
             .is_some_and(PendingShutdownRequest::restores_interfaces);
         let commit_uncertain = crate::core::recovery::check_commit(&config.runtime.state_dir).err();
+        let stopped_recovery =
+            !crate::core::recovery_control::stopped_journals(&config.runtime.state_dir).is_empty();
         let mut errors = Vec::new();
         if let Some(error) = &commit_uncertain {
             errors.push(error.to_string());
@@ -42,7 +44,7 @@ impl ShutdownPlan {
         // Preserve runtime ownership and recovery evidence until startup can
         // resolve the persisted commit token. Baseline cleanup would be unsafe.
         let policy = Self::select_policy(
-            commit_uncertain.is_none(),
+            !stopped_recovery && commit_uncertain.is_none(),
             restore_requested,
             graceful_signal,
             config.runtime.shutdown_policy,
@@ -101,7 +103,7 @@ impl<P: RouterDataplaneProvider + Send + Sync> ShutdownResources<'_, P> {
         api_result: Result<()>,
         reconcile_error: Option<String>,
     ) -> Result<()> {
-        let plan = ShutdownPlan::for_current_process(self.config, graceful_signal);
+        let mut plan = ShutdownPlan::for_current_process(self.config, graceful_signal);
         let restore_interfaces = plan.restores_interfaces();
         let mut cleanup_errors = plan.errors;
 
@@ -117,7 +119,12 @@ impl<P: RouterDataplaneProvider + Send + Sync> ShutdownResources<'_, P> {
             cleanup_errors.push(error.to_string());
         }
 
-        if restore_interfaces {
+        // Cleanup itself may have exhausted recovery. Do not let a policy
+        // chosen before that failure authorize later baseline destruction.
+        if crate::core::recovery_control::preservation_required(&self.config.runtime.state_dir) {
+            plan.policy = ShutdownPolicy::PreserveInterfaces;
+        }
+        if plan.policy == ShutdownPolicy::RestoreInterfaces {
             if let Some(state) = self.router_state {
                 if let Err(error) = restore_router_dataplane(state).await {
                     tracing::error!(%error, "router cleanup failed during daemon shutdown");

@@ -149,9 +149,11 @@ impl InterfaceManager {
 
     /// Observe an interface and retain its current link and IPv4 state for rollback.
     pub async fn snapshot(&self, name: &str) -> Result<InterfaceSnapshot> {
-        self.snapshot_if_present(name)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("interface not found: {name}"))
+        self.snapshot_if_present(name).await?.ok_or_else(|| {
+            anyhow::Error::new(crate::netlink::MissingInterface {
+                interface: name.to_owned(),
+            })
+        })
     }
 
     /// Snapshot an interface, or report that it is simply not there.

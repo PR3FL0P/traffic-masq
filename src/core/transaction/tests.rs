@@ -889,7 +889,7 @@ async fn rollback_publishes_restore_intent_even_when_secret_restore_fails() {
     );
     let status = manager.pending().await;
     assert_eq!(status[0].token, pending.token);
-    assert_eq!(status[0].phase, NetworkChangePhase::RollbackRequired);
+    assert_eq!(status[0].phase, NetworkChangePhase::RecoveryRequired);
     assert!(status[0].last_error.is_some());
     assert!(!status[0].can_commit());
     assert!(status[0].can_rollback());
@@ -1530,4 +1530,53 @@ async fn explicit_file_on_role_switch_cannot_be_shadowed_by_stale_target_secret(
         target.get("test0").unwrap().unwrap().expose(),
         "stale-password"
     );
+}
+
+#[tokio::test]
+async fn stopped_interface_recovery_exposes_token_after_restart_and_requires_manual_retry() {
+    let directory = tempdir().unwrap();
+    let desired = desired_state(directory.path()).await;
+    let provider = fake_network();
+    let interfaces = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
+    let manager = NetworkTransactionManager::new(
+        interfaces.clone(),
+        Duration::from_secs(3600),
+        desired.clone(),
+    );
+    let snapshot = interfaces.snapshot("test0").await.unwrap();
+    manager
+        .write_journal("stopped-token", snapshot)
+        .await
+        .unwrap();
+    let path = manager.journal_path("test0");
+    recovery_control::run::<(), _>(&path, false, async {
+        Err(recovery_control::failure(
+            recovery_control::FailureKind::Conflict,
+            "external change",
+        ))
+    })
+    .await
+    .unwrap_err();
+    recovery_control::forget(&path);
+    recover_interface_transactions(
+        directory.path(),
+        &interfaces,
+        &crate::state::overrides::RuntimeOverrides::default(),
+        &wifi_runtime_dirs(),
+    )
+    .await
+    .unwrap();
+    assert!(recovery_control::stopped(&path));
+    let restarted = NetworkTransactionManager::new(interfaces, Duration::from_secs(3600), desired);
+    let pending = restarted.pending().await;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].phase, NetworkChangePhase::RecoveryRequired);
+    assert!(!pending[0].can_commit());
+    assert!(pending[0].can_rollback());
+    assert!(restarted.rollback_all_pending().await.is_err());
+    assert!(path.exists());
+    restarted.rollback("stopped-token").await.unwrap();
+    assert!(!path.exists());
+    assert!(restarted.pending().await.is_empty());
+    assert!(crate::core::recovery::check_scope(directory.path(), Some("test0")).is_ok());
 }

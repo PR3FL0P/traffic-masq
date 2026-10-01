@@ -438,6 +438,19 @@ pub(super) fn recovery_notice_summary(notice: &RouterRecoveryNotice) -> Vec<Stri
     } else {
         format!("Recovery {}: {}", notice.recovery_code, notice.summary)
     }];
+    if let Some(progress) = &notice.recovery_progress {
+        lines.push(format!(
+            "Recovery: {:?}, attempts {}/{}; {}",
+            progress.failure_kind,
+            progress.attempts,
+            progress.max_attempts,
+            if progress.automatic_recovery {
+                "automatic retries active"
+            } else {
+                "automatic retries stopped"
+            }
+        ));
+    }
     if !notice.blocked_operation.is_empty() {
         lines.push(format!("Blocked: {}", notice.blocked_operation));
     }
@@ -464,6 +477,19 @@ pub(super) fn recovery_notice_text(
     )];
     if !notice.summary.is_empty() {
         lines.push(format!("Reason: {}", notice.summary));
+    }
+    if let Some(progress) = &notice.recovery_progress {
+        lines.push(format!(
+            "Recovery: {:?}, attempts {}/{}; {}",
+            progress.failure_kind,
+            progress.attempts,
+            progress.max_attempts,
+            if progress.automatic_recovery {
+                "automatic retries active"
+            } else {
+                "automatic retries stopped"
+            }
+        ));
     }
     if !notice.blocked_operation.is_empty() {
         lines.push(format!("Blocked: {}", notice.blocked_operation));
@@ -500,6 +526,7 @@ pub(super) fn format_coordinator_status(status: CoordinatorStatus) -> &'static s
         }
         CoordinatorStatus::Pending => "pending",
         CoordinatorStatus::RollbackFailed => "rollback failed (recovery required)",
+        CoordinatorStatus::RecoveryRequired => "recovery required (automatic attempts stopped)",
     }
 }
 

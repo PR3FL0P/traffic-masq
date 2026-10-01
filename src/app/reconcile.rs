@@ -298,6 +298,7 @@ pub(super) async fn reconcile_network_runtime_once<
     dhcp_client: Option<&L>,
 ) -> Result<BTreeMap<String, String>> {
     crate::core::recovery::check_commit(desired.state_dir())?;
+    let pass_version = desired.version();
     let effective = desired.effective().await?;
     crate::wifi::policy::WifiRadioPolicy::validate(&effective.network, |name| {
         network.wireless_phy(name)
@@ -320,7 +321,9 @@ pub(super) async fn reconcile_network_runtime_once<
     // intent, never a tentative role switch, before allowing its consumer.
     // Retry migration failures on later passes even after journal recovery
     // itself has succeeded and removed the interface's recovery fence.
-    crate::wifi::store::migrate_legacy_passphrases(&desired.committed_config().await?).await?;
+    if crate::core::recovery_control::stopped_journals(desired.state_dir()).is_empty() {
+        crate::wifi::store::migrate_legacy_passphrases(&desired.committed_config().await?).await?;
+    }
     let observed_interfaces: HashMap<_, _> = network
         .list_interfaces()
         .await?
@@ -351,19 +354,22 @@ pub(super) async fn reconcile_network_runtime_once<
                     .as_ref()
                     .map(ToString::to_string)
                     .unwrap_or_else(|| "none".to_string());
-                bail!(
-                    "interface {name} is absent; convergence is deferred until it appears \
+                return Err(crate::core::recovery_control::failure(
+                    crate::core::recovery_control::FailureKind::DeviceMissing,
+                    format!(
+                        "interface {name} is absent; convergence is deferred until it appears \
                      (desired: managed={}, role={:?}, ipv4={desired_ipv4}, dhcp_server={}, \
                      dhcp_client={}, wifi_ap={}, wifi_client={}). Check that the interface name \
                      exists and the device/link is present; if it was renamed or removed, update \
                      or remove its traffic-masq configuration",
-                    config.managed,
-                    config.role,
-                    config.dhcp.is_some(),
-                    config.dhcp_client.is_some(),
-                    config.wifi.is_some(),
-                    config.wifi_client.is_some(),
-                );
+                        config.managed,
+                        config.role,
+                        config.dhcp.is_some(),
+                        config.dhcp_client.is_some(),
+                        config.wifi.is_some(),
+                        config.wifi_client.is_some(),
+                    ),
+                ));
             };
 
             // Release AP ownership before starting a station on the same radio.
@@ -469,6 +475,7 @@ pub(super) async fn reconcile_network_runtime_once<
         .await;
         if let Err(error) = result {
             tracing::warn!(interface = %name, error = %format!("{error:#}"), "interface convergence incomplete");
+            desired.record_failure_kind(pass_version, name, &error);
             failures.insert(name.clone(), format!("{error:#}"));
         }
     }
@@ -693,7 +700,8 @@ pub(super) fn spawn_process_liveness_checks(
                     }
                     if let Ok((interface, pid)) = event {
                         let _network_mutation = network_mutations.execute().await;
-                    if crate::core::recovery::check_commit(&state_dir).is_err() { continue; }
+                    if crate::core::recovery::check_commit(&state_dir).is_err()
+                        || crate::core::recovery_control::check_runtime(&state_dir, None).is_err() { continue; }
                         if let Some(router) = &router {
                             if router.status().await != crate::core::router_transaction::CoordinatorStatus::Idle { continue; }
                         }
@@ -718,7 +726,8 @@ pub(super) fn spawn_process_liveness_checks(
                     // otherwise a DHCP/Wi-Fi readiness pass can replay state it
                     // observed just before a transaction converged.
                     let _network_mutation = network_mutations.execute().await;
-                    if crate::core::recovery::check_commit(&state_dir).is_err() { continue; }
+                    if crate::core::recovery::check_commit(&state_dir).is_err()
+                        || crate::core::recovery_control::check_runtime(&state_dir, None).is_err() { continue; }
                     let router_busy = match &router {
                         Some(router) => router.status().await
                             != crate::core::router_transaction::CoordinatorStatus::Idle,

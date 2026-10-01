@@ -199,6 +199,7 @@ async fn connect_failure_uses_one_backend_operation() {
 #[tokio::test]
 async fn static_connect_retains_pending_transaction_without_auto_commit() {
     let change = traffic_masq_protocol::PendingNetworkChange {
+        recovery_progress: None,
         phase: Default::default(),
         last_error: None,
         token: "pending-token".into(),
@@ -411,6 +412,7 @@ fn ap_request_is_atomic_and_enables_derived_dhcp_by_default() {
 #[tokio::test]
 async fn ap_apply_enters_shared_commit_confirm_screen() {
     let change = traffic_masq_protocol::PendingNetworkChange {
+        recovery_progress: None,
         phase: Default::default(),
         last_error: None,
         token: "ap-token".into(),
@@ -1351,6 +1353,7 @@ async fn request_simple_surfaces_wifi_error_and_client_error() {
 #[tokio::test]
 async fn request_simple_enters_pending_change_for_transactional_deactivation() {
     let change = traffic_masq_protocol::PendingNetworkChange {
+        recovery_progress: None,
         phase: Default::default(),
         last_error: None,
         token: "wifi-disable-token".into(),
@@ -1383,6 +1386,7 @@ async fn request_simple_enters_pending_change_for_transactional_deactivation() {
 #[tokio::test]
 async fn profile_deactivation_enters_pending_change_and_returns_to_profiles() {
     let change = traffic_masq_protocol::PendingNetworkChange {
+        recovery_progress: None,
         phase: Default::default(),
         last_error: None,
         token: "wifi-profile-disable-token".into(),
@@ -1663,6 +1667,7 @@ async fn ap_profile_save_does_not_activate_and_returns_to_selected_profile() {
 async fn ap_profile_apply_uses_saved_profile_and_commit_confirmation() {
     let mut app = ap_profiles_app(WifiProfilesMode::ProfileActions);
     let change = traffic_masq_protocol::PendingNetworkChange {
+        recovery_progress: None,
         phase: Default::default(),
         last_error: None,
         token: "ap-profile-token".into(),

@@ -302,7 +302,10 @@ async fn finish_router_pending(app: &mut TuiApp, client: &ApiClient, commit: boo
             }
         }
         Ok(Response::RouterPendingTransaction {
-            status: CoordinatorStatus::RollbackFailed | CoordinatorStatus::CommitIndeterminate,
+            status:
+                CoordinatorStatus::RollbackFailed
+                | CoordinatorStatus::RecoveryRequired
+                | CoordinatorStatus::CommitIndeterminate,
             rollback_failure,
             recovery,
             ..
@@ -342,7 +345,10 @@ pub(crate) async fn refresh_router_pending_screen(app: &mut TuiApp, client: &Api
             }
         }
         Ok(Response::RouterPendingTransaction {
-            status: CoordinatorStatus::RollbackFailed | CoordinatorStatus::CommitIndeterminate,
+            status:
+                CoordinatorStatus::RollbackFailed
+                | CoordinatorStatus::RecoveryRequired
+                | CoordinatorStatus::CommitIndeterminate,
             rollback_failure,
             recovery,
             ..

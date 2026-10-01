@@ -7336,3 +7336,54 @@ async fn wifi_provisioning_rejects_interfaces_without_the_required_role() {
         );
     }
 }
+
+#[tokio::test]
+async fn explicit_router_retry_bypasses_only_its_own_persisted_stop() {
+    let (service, directory) = router_enabled_service().await;
+    let token = match service
+        .dispatch(Request::RouterApply {
+            proposal: router_proposal().into(),
+        })
+        .await
+    {
+        Response::RouterTransactionPending { token, .. } => token,
+        response => panic!("unexpected response: {response:?}"),
+    };
+    let journal = directory.path().join("router-transaction.json");
+    crate::core::recovery_control::stop(
+        &journal,
+        crate::core::recovery_control::FailureKind::Conflict,
+        "external conflict",
+    )
+    .await
+    .unwrap();
+    match service.dispatch(Request::RouterPendingTransaction).await {
+        Response::RouterPendingTransaction {
+            status,
+            recovery: Some(notice),
+            ..
+        } => {
+            assert_eq!(status, CoordinatorStatus::RecoveryRequired);
+            let progress = notice.recovery_progress.unwrap();
+            assert_eq!(
+                progress.failure_kind,
+                traffic_masq_protocol::RecoveryFailureKind::Conflict
+            );
+            assert!(!progress.automatic_recovery);
+        }
+        response => panic!("unexpected response: {response:?}"),
+    }
+    assert!(!matches!(
+        service
+            .dispatch(Request::RouterCommit {
+                token: token.clone()
+            })
+            .await,
+        Response::RouterCommitted { .. }
+    ));
+    assert!(matches!(
+        service.dispatch(Request::RouterRollback { token }).await,
+        Response::RouterRolledBack
+    ));
+    assert!(!journal.exists());
+}

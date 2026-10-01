@@ -1,0 +1,276 @@
+use super::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+async fn journal() -> (tempfile::TempDir, PathBuf) {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("router-transaction.json");
+    tokio::fs::write(&path, br#"{"token":"one","snapshot":{}}"#)
+        .await
+        .unwrap();
+    (root, path)
+}
+
+#[test]
+fn classification_uses_types_instead_of_error_text() {
+    assert_eq!(
+        classify(&anyhow::anyhow!("interface not found: fake")),
+        FailureKind::Unknown
+    );
+    assert_eq!(
+        classify(
+            &anyhow::Error::new(crate::netlink::MissingInterface {
+                interface: "wan0".into()
+            })
+            .context("snapshot failed")
+        ),
+        FailureKind::DeviceMissing
+    );
+    assert_eq!(
+        classify(&std::io::Error::from(std::io::ErrorKind::Interrupted).into()),
+        FailureKind::Transient
+    );
+    assert_eq!(
+        classify(&std::io::Error::from(std::io::ErrorKind::PermissionDenied).into()),
+        FailureKind::Storage
+    );
+    assert_eq!(
+        classify(
+            &crate::core::route::ForeignRouteConflict {
+                destination: "192.0.2.0/24".parse().unwrap(),
+                table: 254,
+                metric: 0,
+                owner: "foreign".into(),
+            }
+            .into()
+        ),
+        FailureKind::Conflict
+    );
+}
+
+#[tokio::test]
+async fn missing_device_stops_and_late_arrival_requires_explicit_retry() {
+    let (_root, path) = journal().await;
+    let original = tokio::fs::read(&path).await.unwrap();
+    let mutations = AtomicUsize::new(0);
+    for attempt in 1..=MAX_ATTEMPTS {
+        assert!(run(&path, false, async {
+            mutations.fetch_add(1, Ordering::SeqCst);
+            Err::<(), _>(failure(FailureKind::DeviceMissing, "adapter absent"))
+        })
+        .await
+        .is_err());
+        assert_eq!(progress(&path).unwrap().attempts, attempt);
+    }
+    assert!(stopped(&path));
+    assert!(!progress(&path).unwrap().automatic_recovery);
+    assert!(run(&path, false, async {
+        mutations.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    })
+    .await
+    .is_err());
+    assert_eq!(mutations.load(Ordering::SeqCst), MAX_ATTEMPTS as usize);
+    assert_eq!(tokio::fs::read(&path).await.unwrap(), original);
+    forget(&path); // simulate a new process
+    assert!(restore_stop(&path).await.unwrap());
+    run(&path, true, async {
+        mutations.fetch_add(1, Ordering::SeqCst);
+        crate::core::recovery::retire(&path).await
+    })
+    .await
+    .unwrap();
+    assert!(!path.exists());
+    assert!(!control_path(&path).exists());
+    assert!(!stopped(&path));
+}
+
+#[tokio::test]
+async fn permanent_failure_stops_immediately_and_preserves_snapshot() {
+    for kind in [
+        FailureKind::Conflict,
+        FailureKind::Incompatible,
+        FailureKind::Storage,
+        FailureKind::CommitIndeterminate,
+    ] {
+        let (_root, path) = journal().await;
+        run::<(), _>(&path, false, async {
+            Err(failure(kind, "requires repair"))
+        })
+        .await
+        .unwrap_err();
+        assert!(stopped(&path));
+        assert_eq!(progress(&path).unwrap().attempts, 1);
+        assert_eq!(progress(&path).unwrap().failure_kind, kind);
+        forget(&path);
+        assert!(restore_stop(&path).await.unwrap());
+        assert!(path.exists());
+    }
+}
+
+#[tokio::test]
+async fn interrupted_attempt_is_fenced_in_process_and_after_restart() {
+    let (_root, path) = journal().await;
+    let worker_path = path.clone();
+    let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let worker_entered = entered.clone();
+    let task = tokio::spawn(async move {
+        run::<(), _>(&worker_path, false, async {
+            worker_entered.notify_one();
+            std::future::pending().await
+        })
+        .await
+    });
+    entered.notified().await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(stopped(&path));
+    forget(&path);
+    assert!(restore_stop(&path).await.unwrap());
+    assert!(run(&path, false, async {
+        panic!("interrupted attempt cannot resume automatically");
+        #[allow(unreachable_code)]
+        Ok(())
+    })
+    .await
+    .is_err());
+}
+
+#[tokio::test]
+async fn application_cancellation_is_durable_before_a_timer_exists() {
+    let (_root, path) = journal().await;
+    let guard = begin_apply(&path).await.unwrap();
+    drop(guard);
+    assert!(stopped(&path));
+    forget(&path);
+    assert!(restore_stop(&path).await.unwrap());
+    assert_eq!(progress(&path).unwrap().attempts, 0);
+}
+
+#[tokio::test]
+async fn corrupt_control_never_authorizes_even_manual_mutations() {
+    let (_root, path) = journal().await;
+    tokio::fs::write(control_path(&path), b"corrupt")
+        .await
+        .unwrap();
+    for manual in [false, true] {
+        assert!(run(&path, manual, async {
+            panic!("untrusted metadata must fence mutations");
+            #[allow(unreachable_code)]
+            Ok(())
+        })
+        .await
+        .is_err());
+        assert!(stopped(&path));
+    }
+}
+
+#[tokio::test]
+async fn failed_control_write_is_visible_and_blocks_runtime() {
+    let (root, path) = journal().await;
+    tokio::fs::create_dir(control_path(&path)).await.unwrap();
+    let error = begin_apply(&path)
+        .await
+        .err()
+        .expect("write-ahead control persistence must fail");
+    assert!(format!("{error:#}").contains("persistence is unconfirmed"));
+    assert!(stopped(&path));
+    assert!(check_runtime(root.path(), Some("wan0")).is_err());
+}
+
+#[tokio::test]
+async fn scope_retry_cannot_bypass_ownership_or_other_stops() {
+    let root = tempfile::tempdir().unwrap();
+    let directory = root.path().join("interface-transactions");
+    tokio::fs::create_dir(&directory).await.unwrap();
+    let path = directory.join("lan0.json");
+    tokio::fs::write(&path, b"snapshot").await.unwrap();
+    run::<(), _>(&path, false, async {
+        Err(failure(FailureKind::Conflict, "conflict"))
+    })
+    .await
+    .unwrap_err();
+    crate::core::recovery::block_interface(root.path(), "lan0", "transaction failed".into());
+    assert!(crate::core::recovery::check_scope(root.path(), Some("lan0")).is_err());
+    assert!(crate::core::recovery::check_scope(root.path(), Some("lan1")).is_ok());
+    assert!(crate::core::recovery::check_rollback_scope(root.path(), Some("lan0"), &path).is_ok());
+    crate::core::recovery::block_interface_nonretryable(
+        root.path(),
+        "lan0",
+        &root.path().join("ownership"),
+        "ownership untrusted".into(),
+    );
+    assert!(crate::core::recovery::check_rollback_scope(root.path(), Some("lan0"), &path).is_err());
+}
+
+#[tokio::test]
+async fn stale_control_has_no_authority_over_a_different_snapshot() {
+    let (_root, path) = journal().await;
+    run::<(), _>(&path, false, async {
+        Err(failure(FailureKind::Storage, "disk"))
+    })
+    .await
+    .unwrap_err();
+    forget(&path);
+    tokio::fs::write(&path, br#"{"token":"two","snapshot":{}}"#)
+        .await
+        .unwrap();
+    assert!(!restore_stop(&path).await.unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn elapsed_budget_cannot_be_reset_by_a_different_failure_or_clock() {
+    let (_root, path) = journal().await;
+    run::<(), _>(&path, false, async {
+        Err(failure(FailureKind::Transient, "busy"))
+    })
+    .await
+    .unwrap_err();
+    tokio::time::advance(RECOVERY_TIMEOUT).await;
+    assert!(run(&path, false, async {
+        panic!("expired cycle must not perform another operation");
+        #[allow(unreachable_code)]
+        Ok(())
+    })
+    .await
+    .is_err());
+    assert!(stopped(&path));
+    assert_eq!(progress(&path).unwrap().attempts, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn individual_attempt_has_a_deadline_and_retains_unknown_outcome() {
+    let (_root, path) = journal().await;
+    let worker_path = path.clone();
+    let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+    let worker_entered = entered.clone();
+    let task = tokio::spawn(async move {
+        run::<(), _>(&worker_path, false, async {
+            worker_entered.notify_one();
+            std::future::pending().await
+        })
+        .await
+    });
+    entered.notified().await;
+    tokio::time::advance(ATTEMPT_TIMEOUT).await;
+    assert!(task.await.unwrap().is_err());
+    assert!(path.exists());
+    assert_eq!(progress(&path).unwrap().attempts, 1);
+}
+
+#[tokio::test]
+async fn stopped_shutdown_policy_preserves_resources_even_for_requested_restore() {
+    let (root, path) = journal().await;
+    stop(&path, FailureKind::Conflict, "changed externally")
+        .await
+        .unwrap();
+    assert!(preservation_required(root.path()));
+    assert!(crate::core::recovery::check_scope(root.path(), None).is_err());
+    assert!(crate::core::recovery::check_rollback_scope(root.path(), None, &path).is_ok());
+    crate::core::recovery::fence_commit(root.path(), "commit unknown".into());
+    assert_eq!(
+        progress(&path).unwrap().failure_kind,
+        FailureKind::CommitIndeterminate
+    );
+    assert!(!progress(&path).unwrap().automatic_recovery);
+    assert!(crate::core::recovery::check_rollback_scope(root.path(), None, &path).is_err());
+}

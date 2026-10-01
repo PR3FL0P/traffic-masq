@@ -15,6 +15,7 @@ use crate::core::interface::{
     DhcpChangeAction, InterfaceChangePlan, InterfaceManager, InterfaceSnapshot,
 };
 use crate::core::mutation::NetworkMutationGate;
+use crate::core::recovery_control;
 use crate::dhcp::supervisor::{DhcpServiceSpec, DhcpSupervisor};
 use crate::wifi::{
     secret::{WifiPassphrase, WifiPassphraseUpdate},
@@ -310,6 +311,12 @@ async fn recover_interface_journals(
     wifi_runtime_dirs: &crate::wifi::WifiRuntimeDirs,
 ) {
     for name in names {
+        let recovery_path = state_dir
+            .join("interface-transactions")
+            .join(format!("{name}.json"));
+        if recovery_control::stopped(&recovery_path) {
+            continue;
+        }
         if excluded.contains(&name) {
             tracing::error!(
                 interface = %name,
@@ -343,33 +350,40 @@ async fn recover_interface_journals(
                 );
                 return crate::core::recovery::retire(&path).await;
             }
-            let record: InterfaceJournal = serde_json::from_slice(&bytes)?;
-            anyhow::ensure!(
+            recovery_control::run(&path, false, async {
+                let record: InterfaceJournal = serde_json::from_slice(&bytes)?;
+                anyhow::ensure!(
                 matches!(record.version, 1..=3) && record.snapshot.name == name,
-                "invariant=valid_interface_snapshot: unsupported schema or interface mismatch"
+                recovery_control::failure(recovery_control::FailureKind::Incompatible,
+                    "invariant=valid_interface_snapshot: unsupported schema or interface mismatch")
             );
-            anyhow::ensure!(
-                record.version < 3
-                    || record
-                        .secret
-                        .as_ref()
-                        .is_none_or(|secret| secret.role.is_some()),
-                "role missing from Wi-Fi secret snapshot"
-            );
-            if committed.get(&name) != Some(&record.token) {
-                if let Some(secret) = &record.secret {
-                    secret.restore(state_dir, &name)?;
+                anyhow::ensure!(
+                    record.version < 3
+                        || record
+                            .secret
+                            .as_ref()
+                            .is_none_or(|secret| secret.role.is_some()),
+                    recovery_control::failure(
+                        recovery_control::FailureKind::Incompatible,
+                        "role missing from Wi-Fi secret snapshot"
+                    )
+                );
+                if committed.get(&name) != Some(&record.token) {
+                    if let Some(secret) = &record.secret {
+                        secret.restore(state_dir, &name)?;
+                    }
+                    crate::wifi::lifecycle::stop_recorded_interface(
+                        state_dir,
+                        wifi_runtime_dirs,
+                        &name,
+                    )
+                    .await?;
+                    manager.rollback(&record.snapshot).await?;
+                    tracing::warn!(interface = %name, "restored interrupted interface transaction");
                 }
-                crate::wifi::lifecycle::stop_recorded_interface(
-                    state_dir,
-                    wifi_runtime_dirs,
-                    &name,
-                )
-                .await?;
-                manager.rollback(&record.snapshot).await?;
-                tracing::warn!(interface = %name, "restored interrupted interface transaction");
-            }
-            crate::core::recovery::retire(&path).await
+                crate::core::recovery::retire(&path).await
+            })
+            .await
         }
         .await;
         match result {
@@ -416,6 +430,7 @@ struct Inner {
     operation_lock: Mutex<()>,
     runtime_gate: std::sync::Mutex<Option<Arc<NetworkMutationGate>>>,
     token_counter: AtomicU64,
+    timer_epochs: std::sync::Mutex<HashMap<String, u64>>,
     dhcp: Option<DhcpSupervisor>,
     default_lease_seconds: u32,
     /// Where proposals go. Replaceable because the daemon builds the service
@@ -527,6 +542,7 @@ impl NetworkTransactionManager {
                 operation_lock: Mutex::new(()),
                 runtime_gate: std::sync::Mutex::new(None),
                 token_counter: AtomicU64::new(0),
+                timer_epochs: std::sync::Mutex::new(HashMap::new()),
                 dhcp,
                 default_lease_seconds,
                 desired: std::sync::Mutex::new(desired),
@@ -738,15 +754,23 @@ impl NetworkTransactionManager {
         };
         self.write_journal_record(&token, snapshot.clone(), secret.clone())
             .await?;
-        let staged = match (&passphrase_update, store.as_ref()) {
-            (WifiPassphraseUpdate::Keep, _) => Ok(()),
-            (WifiPassphraseUpdate::Set(passphrase), Some(store)) => store
-                .set(interface, passphrase)
-                .map_err(anyhow::Error::from),
-            (WifiPassphraseUpdate::Clear, Some(store)) => {
-                store.clear(interface).map_err(anyhow::Error::from)
-            }
-            _ => unreachable!("secret role checked before journaling"),
+        let (apply_guard, stage_error) =
+            match recovery_control::begin_apply(&self.journal_path(interface)).await {
+                Ok(guard) => (Some(guard), None),
+                Err(error) => (None, Some(error)),
+            };
+        let staged = match stage_error {
+            Some(error) => Err(error),
+            None => match (&passphrase_update, store.as_ref()) {
+                (WifiPassphraseUpdate::Keep, _) => Ok(()),
+                (WifiPassphraseUpdate::Set(passphrase), Some(store)) => store
+                    .set(interface, passphrase)
+                    .map_err(anyhow::Error::from),
+                (WifiPassphraseUpdate::Clear, Some(store)) => {
+                    store.clear(interface).map_err(anyhow::Error::from)
+                }
+                _ => unreachable!("secret role checked before journaling"),
+            },
         };
         if staged.is_ok() {
             desired
@@ -754,31 +778,40 @@ impl NetworkTransactionManager {
                 .await;
         }
         drop(execution);
-        let applied = match staged {
+        let mut applied = match staged {
             Ok(()) => self.await_convergence(&desired, interface).await,
             Err(error) => Err(error),
         };
+        if let Some(guard) = apply_guard {
+            if let Err(error) = guard.finish().await {
+                applied = Err(error);
+            }
+        }
         if let Err(error) = applied {
-            let execution = match &gate {
-                Some(gate) => Some(gate.execute().await),
-                None => None,
-            };
-            let secret_restored = match &secret {
-                Some(secret) => secret.restore(desired.state_dir(), interface),
-                None => Ok(()),
-            };
-            desired
-                .restore(&token, snapshot.clone(), previous_config.clone())
-                .await;
-            drop(execution);
-            let restoration = match secret_restored {
-                Ok(()) => self.await_convergence(&desired, interface).await,
-                Err(error) => Err(error),
-            };
-            let rollback = match restoration {
-                Ok(()) => self.clear_journal(interface).await,
-                Err(error) => Err(error),
-            };
+            let path = self.journal_path(interface);
+            let rollback = recovery_control::run(&path, false, async {
+                let execution = match &gate {
+                    Some(gate) => Some(gate.execute().await),
+                    None => None,
+                };
+                let secret_restored = match &secret {
+                    Some(secret) => secret.restore(desired.state_dir(), interface),
+                    None => Ok(()),
+                };
+                desired
+                    .restore(&token, snapshot.clone(), previous_config.clone())
+                    .await;
+                drop(execution);
+                let restoration = match secret_restored {
+                    Ok(()) => self.await_convergence(&desired, interface).await,
+                    Err(error) => Err(error),
+                };
+                match restoration {
+                    Ok(()) => self.clear_journal(interface).await,
+                    Err(error) => Err(error),
+                }
+            })
+            .await;
             if let Err(rollback_error) = rollback {
                 // The requested state is no longer desired, but until a fresh
                 // convergence pass proves the committed state was restored the
@@ -788,11 +821,16 @@ impl NetworkTransactionManager {
                 // also failed.
                 let rollback_timeout_seconds = self.inner.rollback_timeout.as_secs();
                 let info = PendingNetworkChange {
+                    recovery_progress: None,
                     token: token.clone(),
                     interface: interface.to_string(),
                     rollback_timeout_seconds,
                     expires_at_unix: current_unix_time().saturating_add(rollback_timeout_seconds),
-                    phase: NetworkChangePhase::RollbackRequired,
+                    phase: if recovery_control::stopped(&path) {
+                        NetworkChangePhase::RecoveryRequired
+                    } else {
+                        NetworkChangePhase::RollbackRequired
+                    },
                     last_error: Some(format!("apply: {error:#}; rollback: {rollback_error:#}")),
                 };
                 self.inner.pending.lock().await.insert(
@@ -806,7 +844,7 @@ impl NetworkTransactionManager {
                         secret: secret.clone(),
                     },
                 );
-                self.spawn_rollback_timer(token.clone());
+                self.spawn_timer(token.clone(), false);
                 bail!(
                     "network change failed to converge: {error}; rollback also failed: {rollback_error}; recovery remains pending as token {token}"
                 );
@@ -820,6 +858,7 @@ impl NetworkTransactionManager {
         // and it starts when the machine changed.
         let rollback_timeout_seconds = self.inner.rollback_timeout.as_secs();
         let info = PendingNetworkChange {
+            recovery_progress: None,
             token,
             interface: interface.to_string(),
             rollback_timeout_seconds,
@@ -876,16 +915,25 @@ impl NetworkTransactionManager {
             .await
         {
             Ok(pass) => pass,
-            Err(_) => bail!(
-                "timed out waiting for interface {interface} to be converged to the requested configuration"
-            ),
+            Err(_) => return Err(recovery_control::failure(recovery_control::FailureKind::Transient,
+                format!("timed out waiting for interface {interface} to be converged to the requested configuration"))),
         };
 
         if let Some(error) = pass.error {
-            bail!("convergence failed: {error}");
+            return Err(recovery_control::failure(
+                pass.error_kind
+                    .unwrap_or(recovery_control::FailureKind::Unknown),
+                format!("convergence failed: {error}"),
+            ));
         }
         match pass.failures.get(interface) {
-            Some(error) => bail!("{error}"),
+            Some(error) => Err(recovery_control::failure(
+                pass.failure_kinds
+                    .get(interface)
+                    .copied()
+                    .unwrap_or(recovery_control::FailureKind::Unknown),
+                error.clone(),
+            )),
             None => Ok(()),
         }
     }
@@ -961,6 +1009,11 @@ impl NetworkTransactionManager {
             .remove(token)
             .expect("pending transaction cannot change while operation lock is held");
 
+        self.inner
+            .timer_epochs
+            .lock()
+            .expect("interface timer epoch lock")
+            .remove(token);
         if let Err(error) = self.clear_journal(&interface).await {
             tracing::warn!(%error, "failed to remove committed interface journal");
         }
@@ -975,7 +1028,12 @@ impl NetworkTransactionManager {
     /// Restore the pre-apply snapshot through convergence. A failed restoration
     /// is rollback-only and remains journaled and visible until a retry succeeds.
     pub async fn rollback(&self, token: &str) -> Result<PendingNetworkChange> {
+        self.rollback_inner(token, true).await
+    }
+
+    async fn rollback_inner(&self, token: &str, manual: bool) -> Result<PendingNetworkChange> {
         let _operation = self.inner.operation_lock.lock().await;
+        self.import_stopped_journals().await?;
         crate::core::recovery::check_commit(self.desired().state_dir())?;
         let pending = {
             let mut pending = self.inner.pending.lock().await;
@@ -990,34 +1048,77 @@ impl NetworkTransactionManager {
             %token,
             "network change is being rolled back; the committed configuration will be converged to"
         );
-        let desired = self.desired();
-        let gate = self.runtime_gate();
-        let execution = match &gate {
-            Some(gate) => Some(gate.execute().await),
-            None => None,
-        };
-        let secret_restored = match &pending.secret {
-            Some(secret) => secret.restore(desired.state_dir(), &pending.info.interface),
-            None => Ok(()),
-        };
-        // Publishing rollback intent must not depend on secret-store I/O. If
-        // restoring the passphrase fails, keep the transaction rollback-only
-        // and journaled, but still stop converging toward the failed candidate.
-        desired
-            .restore(
-                token,
-                pending.snapshot.clone(),
-                pending.previous_config.clone(),
-            )
-            .await;
-        drop(execution);
-        let restoration = match secret_restored {
-            Ok(()) => {
-                self.await_convergence(&desired, &pending.info.interface)
-                    .await
+        let path = self.journal_path(&pending.info.interface);
+        if self
+            .desired()
+            .committed_overrides()
+            .await
+            .committed_interface_transactions
+            .get(&pending.info.interface)
+            .map(String::as_str)
+            == Some(token)
+        {
+            self.desired().withdraw(token).await;
+            self.clear_journal(&pending.info.interface).await?;
+            self.inner.pending.lock().await.remove(token);
+            self.inner
+                .timer_epochs
+                .lock()
+                .expect("interface timer epoch lock")
+                .remove(token);
+            if manual {
+                bail!("network change {token} was already committed; rollback is unavailable");
             }
-            Err(error) => Err(error),
-        };
+            return Ok(pending.info);
+        }
+        if manual {
+            crate::core::recovery::check_rollback_scope(
+                self.desired().state_dir(),
+                Some(&pending.info.interface),
+                &path,
+            )?;
+        }
+        let restoration = recovery_control::run(&path, manual, async {
+            // Startup transaction blocks are retryable. Ownership blocks remain fenced.
+            if crate::core::recovery::retryable_blocked_interfaces(self.desired().state_dir())
+                .contains(&pending.info.interface)
+            {
+                crate::core::recovery::unblock_interface(
+                    self.desired().state_dir(),
+                    &pending.info.interface,
+                );
+            }
+            let desired = self.desired();
+            let gate = self.runtime_gate();
+            let execution = match &gate {
+                Some(gate) => Some(gate.execute().await),
+                None => None,
+            };
+            let secret_restored = match &pending.secret {
+                Some(secret) => secret.restore(desired.state_dir(), &pending.info.interface),
+                None => Ok(()),
+            };
+            // Publishing rollback intent must not depend on secret-store I/O. If
+            // restoring the passphrase fails, keep the transaction rollback-only
+            // and journaled, but still stop converging toward the failed candidate.
+            desired
+                .restore(
+                    token,
+                    pending.snapshot.clone(),
+                    pending.previous_config.clone(),
+                )
+                .await;
+            drop(execution);
+            match secret_restored {
+                Ok(()) => {
+                    self.await_convergence(&desired, &pending.info.interface)
+                        .await
+                }
+                Err(error) => Err(error),
+            }?;
+            self.clear_journal(&pending.info.interface).await
+        })
+        .await;
         if let Err(error) = restoration {
             self.inner
                 .pending
@@ -1027,6 +1128,18 @@ impl NetworkTransactionManager {
                 .expect("operation lock held")
                 .info
                 .last_error = Some(format!("{error:#}"));
+            if recovery_control::stopped(&path) {
+                self.inner
+                    .pending
+                    .lock()
+                    .await
+                    .get_mut(token)
+                    .expect("operation lock held")
+                    .info
+                    .phase = NetworkChangePhase::RecoveryRequired;
+            } else if manual {
+                self.spawn_timer(token.to_owned(), false);
+            }
             // Keep both the pending record and recovery journal. The desired
             // state already points back at the committed configuration, so a
             // later retry only needs to verify convergence; reporting success
@@ -1037,19 +1150,13 @@ impl NetworkTransactionManager {
             );
         }
 
-        if let Err(error) = self.clear_journal(&pending.info.interface).await {
-            self.inner
-                .pending
-                .lock()
-                .await
-                .get_mut(token)
-                .expect("operation lock held")
-                .info
-                .last_error = Some(format!("{error:#}"));
-            return Err(error);
-        }
-        desired.withdraw(token).await;
+        self.desired().withdraw(token).await;
         self.inner.pending.lock().await.remove(token);
+        self.inner
+            .timer_epochs
+            .lock()
+            .expect("interface timer epoch lock")
+            .remove(token);
         Ok(pending.info)
     }
 
@@ -1058,7 +1165,7 @@ impl NetworkTransactionManager {
         let tokens: Vec<_> = self.inner.pending.lock().await.keys().cloned().collect();
         let mut errors = Vec::new();
         for token in tokens {
-            if let Err(error) = self.rollback(&token).await {
+            if let Err(error) = self.rollback_inner(&token, false).await {
                 errors.push(format!("{token}: {error}"));
             }
         }
@@ -1091,6 +1198,22 @@ impl NetworkTransactionManager {
             .map(|error| error.to_string())
             .collect();
         for snapshot in baselines.into_iter().rev() {
+            if crate::core::recovery::check_scope(self.desired().state_dir(), Some(&snapshot.name))
+                .is_err()
+                || self
+                    .inner
+                    .pending
+                    .lock()
+                    .await
+                    .values()
+                    .any(|pending| pending.info.interface == snapshot.name)
+            {
+                errors.push(format!(
+                    "{}: baseline preserved because recovery is unresolved",
+                    snapshot.name
+                ));
+                continue;
+            }
             if let Err(error) = self.inner.interface_manager.rollback(&snapshot).await {
                 errors.push(format!("{}: {error}", snapshot.name));
             }
@@ -1105,8 +1228,86 @@ impl NetworkTransactionManager {
         }
     }
 
+    fn journal_path(&self, interface: &str) -> std::path::PathBuf {
+        self.desired()
+            .state_dir()
+            .join("interface-transactions")
+            .join(format!("{interface}.json"))
+    }
+
+    /// Reconstruct tokens for stopped startup journals so the existing rollback API
+    /// remains usable. Never import malformed snapshots or unrelated ownership blocks.
+    async fn import_stopped_journals(&self) -> Result<()> {
+        let desired = self.desired();
+        for path in recovery_control::stopped_journals(desired.state_dir()) {
+            if path.parent() != Some(desired.state_dir().join("interface-transactions").as_path()) {
+                continue;
+            }
+            let name = path
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| anyhow::anyhow!("invalid recovery scope"))?;
+            let bytes = zeroize::Zeroizing::new(tokio::fs::read(&path).await?);
+            let Ok(record) = serde_json::from_slice::<InterfaceJournal>(&bytes) else {
+                continue;
+            };
+            if !matches!(record.version, 1..=3)
+                || record.snapshot.name != name
+                || (record.version == 3
+                    && record
+                        .secret
+                        .as_ref()
+                        .is_some_and(|secret| secret.role.is_none()))
+            {
+                continue;
+            }
+            let previous_config = desired.committed_interface(name).await?;
+            let target = previous_config.clone().unwrap_or_else(|| InterfaceConfig {
+                role: InterfaceRole::Output,
+                managed: false,
+                ipv4: None,
+                dhcp: None,
+                dhcp_client: None,
+                wifi: None,
+                wifi_client: None,
+                nat: false,
+            });
+            let mut pending = self.inner.pending.lock().await;
+            // A concurrent explicit retry may have retired this snapshot while
+            // it was being read. Never resurrect its pending token afterwards.
+            if !recovery_control::stopped(&path) {
+                continue;
+            }
+            pending
+                .entry(record.token.clone())
+                .or_insert(PendingTransaction {
+                    info: PendingNetworkChange {
+                        recovery_progress: None,
+                        token: record.token,
+                        interface: name.to_owned(),
+                        rollback_timeout_seconds: self.inner.rollback_timeout.as_secs(),
+                        expires_at_unix: 0,
+                        phase: NetworkChangePhase::RecoveryRequired,
+                        last_error: Some(
+                            "automatic recovery stopped; explicit rollback retry required".into(),
+                        ),
+                    },
+                    target,
+                    allow_management_change: false,
+                    snapshot: record.snapshot,
+                    previous_config,
+                    secret: record.secret,
+                });
+        }
+        Ok(())
+    }
+
     /// Return pending changes, including rollback-only entries, sorted by token.
     pub async fn pending(&self) -> Vec<PendingNetworkChange> {
+        // Read failures remain fenced; listing must not mutate the network.
+        if let Err(error) = self.import_stopped_journals().await {
+            tracing::error!(%error, "failed to expose stopped interface recovery");
+        }
         let mut pending: Vec<_> = self
             .inner
             .pending
@@ -1119,6 +1320,15 @@ impl NetworkTransactionManager {
             for change in &mut pending {
                 change.phase = NetworkChangePhase::CommitIndeterminate;
                 change.last_error = Some(error.clone());
+            }
+        }
+        for change in &mut pending {
+            change.recovery_progress =
+                recovery_control::progress(&self.journal_path(&change.interface));
+            if change.phase != NetworkChangePhase::CommitIndeterminate
+                && recovery_control::stopped(&self.journal_path(&change.interface))
+            {
+                change.phase = NetworkChangePhase::RecoveryRequired;
             }
         }
         pending.sort_by(|left, right| left.token.cmp(&right.token));
@@ -1177,10 +1387,48 @@ impl NetworkTransactionManager {
     }
 
     fn spawn_rollback_timer(&self, token: String) {
+        self.spawn_timer(token, true);
+    }
+
+    fn spawn_timer(&self, token: String, confirmation: bool) {
         let manager = self.clone();
+        let epoch = {
+            let mut epochs = self
+                .inner
+                .timer_epochs
+                .lock()
+                .expect("interface timer epoch lock");
+            let epoch = epochs.entry(token.clone()).or_default();
+            *epoch += 1;
+            *epoch
+        };
         tokio::spawn(async move {
-            tokio::time::sleep(manager.inner.rollback_timeout).await;
+            let timeout = if confirmation {
+                manager.inner.rollback_timeout
+            } else {
+                let interface = manager
+                    .inner
+                    .pending
+                    .lock()
+                    .await
+                    .get(&token)
+                    .map(|entry| entry.info.interface.clone());
+                interface.map_or(Duration::from_secs(1), |interface| {
+                    recovery_control::retry_delay(&manager.journal_path(&interface))
+                })
+            };
+            tokio::time::sleep(timeout).await;
             loop {
+                if manager
+                    .inner
+                    .timer_epochs
+                    .lock()
+                    .expect("interface timer epoch lock")
+                    .get(&token)
+                    != Some(&epoch)
+                {
+                    return;
+                }
                 // Admission precedes operation_lock; execution must remain available
                 // to the converger. Release admission before the retry delay.
                 let gate = manager.runtime_gate();
@@ -1188,13 +1436,23 @@ impl NetworkTransactionManager {
                     Some(gate) => Some(gate.admit().await),
                     None => None,
                 };
+                if manager
+                    .inner
+                    .timer_epochs
+                    .lock()
+                    .expect("interface timer epoch lock")
+                    .get(&token)
+                    != Some(&epoch)
+                {
+                    return;
+                }
                 if crate::core::recovery::check_commit(manager.desired().state_dir()).is_err() {
                     return;
                 }
                 if !manager.inner.pending.lock().await.contains_key(&token) {
                     return;
                 }
-                match manager.rollback(&token).await {
+                match manager.rollback_inner(&token, false).await {
                     Ok(_) => {
                         tracing::warn!(%token, "network change automatically rolled back after timeout");
                         return;
@@ -1204,7 +1462,21 @@ impl NetworkTransactionManager {
                     }
                 }
                 drop(admission);
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                let interface = manager
+                    .inner
+                    .pending
+                    .lock()
+                    .await
+                    .get(&token)
+                    .map(|entry| entry.info.interface.clone());
+                let Some(interface) = interface else {
+                    return;
+                };
+                let path = manager.journal_path(&interface);
+                if recovery_control::stopped(&path) {
+                    return;
+                }
+                tokio::time::sleep(recovery_control::retry_delay(&path)).await;
             }
         });
     }

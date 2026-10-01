@@ -8,6 +8,7 @@ fn router_recovery_notice(
 ) -> Option<RouterRecoveryNotice> {
     if status == CoordinatorStatus::CommitIndeterminate {
         return Some(RouterRecoveryNotice {
+            recovery_progress: None,
             recovery_code: RecoveryCode::CommitIndeterminate.as_str().to_owned(),
             invariant: RecoveryCode::CommitIndeterminate.invariant().to_owned(),
             summary: "Commit persistence and compensation failed; the durable outcome is unknown."
@@ -22,6 +23,11 @@ fn router_recovery_notice(
         });
     }
     let (code, action, summary) = match status {
+        CoordinatorStatus::RecoveryRequired => (
+            RecoveryCode::RouterRollbackFailed,
+            RecoveryAction::RetryRollback,
+            "Automatic recovery stopped. Repair the reported cause and explicitly retry rollback.",
+        ),
         CoordinatorStatus::RollbackFailed => (
             RecoveryCode::RouterRollbackFailed,
             RecoveryAction::RetryRollback,
@@ -38,6 +44,7 @@ fn router_recovery_notice(
     };
 
     Some(RouterRecoveryNotice {
+        recovery_progress: None,
         recovery_code: code.as_str().to_owned(),
         invariant: code.invariant().to_owned(),
         summary: summary.to_owned(),
@@ -63,7 +70,16 @@ impl ControlService {
         let health = router.manager().health(&desired).await;
         let coordinator = router.view().await;
         let status = coordinator.status();
-        let recovery = router_recovery_notice(status, coordinator.failures());
+        let recovery = router_recovery_notice(status, coordinator.failures()).map(|mut notice| {
+            notice.recovery_progress = crate::core::recovery_control::progress(
+                &self
+                    .config
+                    .runtime
+                    .state_dir
+                    .join("router-transaction.json"),
+            );
+            notice
+        });
         Response::RouterStatus {
             enabled: desired.enabled,
             ready: desired.enabled && health.ready(),
@@ -289,7 +305,10 @@ impl ControlService {
                     }
                 }
                 let coordinator = router.view().await;
-                if coordinator.status() == CoordinatorStatus::RollbackFailed {
+                if matches!(
+                    coordinator.status(),
+                    CoordinatorStatus::RollbackFailed | CoordinatorStatus::RecoveryRequired
+                ) {
                     Response::RouterError {
                         detail: RouterErrorDetail::RollbackFailed {
                             failures: coordinator.rollback_failures,
@@ -308,9 +327,21 @@ impl ControlService {
         };
         let coordinator = router.view().await;
         let status = coordinator.status();
-        let rollback_failure = (status == CoordinatorStatus::RollbackFailed)
-            .then(|| coordinator.rollback_failures.clone());
-        let recovery = router_recovery_notice(status, coordinator.failures());
+        let rollback_failure = (matches!(
+            status,
+            CoordinatorStatus::RollbackFailed | CoordinatorStatus::RecoveryRequired
+        ))
+        .then(|| coordinator.rollback_failures.clone());
+        let recovery = router_recovery_notice(status, coordinator.failures()).map(|mut notice| {
+            notice.recovery_progress = crate::core::recovery_control::progress(
+                &self
+                    .config
+                    .runtime
+                    .state_dir
+                    .join("router-transaction.json"),
+            );
+            notice
+        });
         let token = coordinator.token;
         Response::RouterPendingTransaction {
             token,
@@ -364,6 +395,7 @@ impl ControlService {
                 return provisioning_error(RouterProvisioningErrorDetail::TransactionPending);
             }
             CoordinatorStatus::RollbackFailed
+            | CoordinatorStatus::RecoveryRequired
             | CoordinatorStatus::CommitIndeterminate
             | CoordinatorStatus::RecoveredButJournalCleanupPending => {
                 return provisioning_error(RouterProvisioningErrorDetail::RollbackRecoveryRequired);
@@ -562,7 +594,10 @@ impl ControlService {
                 // rollback itself ran while the new secret was still present,
                 // so reconcile once more after restoring it to ensure running
                 // Wi-Fi daemons also use the committed secret.
-                if router.status().await != CoordinatorStatus::RollbackFailed {
+                if !matches!(
+                    router.status().await,
+                    CoordinatorStatus::RollbackFailed | CoordinatorStatus::RecoveryRequired
+                ) {
                     match secret_tx.restore(None).await {
                         Ok(true) => {
                             let committed = match self.current_router_desired().await {
@@ -676,7 +711,9 @@ impl ControlService {
         let failures = coordinator.failures();
         let ready = desired.enabled && readiness.ready() && !unconfigured;
         let stage = match status {
-            CoordinatorStatus::RollbackFailed => ProvisioningStage::RollbackFailed,
+            CoordinatorStatus::RollbackFailed | CoordinatorStatus::RecoveryRequired => {
+                ProvisioningStage::RollbackFailed
+            }
             CoordinatorStatus::RecoveredButJournalCleanupPending
             | CoordinatorStatus::CommitIndeterminate => ProvisioningStage::Degraded,
             CoordinatorStatus::Pending => ProvisioningStage::AwaitingConfirmation,
@@ -890,7 +927,7 @@ impl ControlService {
             }
 
             if router.status().await == CoordinatorStatus::Pending {
-                if let Err(error) = router.rollback_with_token(&token).await {
+                if let Err(error) = router.rollback_for_shutdown().await {
                     tracing::error!(%error, %token, "router provisioning timeout rollback failed; secret journal retained");
                     return;
                 }

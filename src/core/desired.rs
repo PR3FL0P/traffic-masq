@@ -46,6 +46,8 @@ pub struct ConvergencePass {
     pub version: u64,
     /// Interfaces the pass could not bring to the desired state, and why.
     pub failures: BTreeMap<String, String>,
+    pub failure_kinds: BTreeMap<String, crate::core::recovery_control::FailureKind>,
+    pub error_kind: Option<crate::core::recovery_control::FailureKind>,
     /// Failure before individual interfaces could be reconciled.
     pub error: Option<String>,
 }
@@ -75,6 +77,8 @@ pub struct DesiredNetworkState {
     /// convergence pass had already seen its change when it ran.
     version: Arc<AtomicU64>,
     passes: watch::Sender<ConvergencePass>,
+    failure_kinds:
+        Arc<std::sync::Mutex<BTreeMap<(u64, String), crate::core::recovery_control::FailureKind>>>,
     /// Lifecycle of the convergence loop driving this state.
     ///
     /// Waiting for a pass only means something while the converger is alive.
@@ -92,6 +96,7 @@ impl DesiredNetworkState {
             tentative_changed: Arc::new(Notify::new()),
             version: Arc::new(AtomicU64::new(0)),
             passes: watch::Sender::new(ConvergencePass::default()),
+            failure_kinds: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             converger: watch::Sender::new(ConvergerState::Detached),
         }
     }
@@ -141,7 +146,32 @@ impl DesiredNetworkState {
         self.report_result(version, Ok(failures));
     }
 
+    pub fn record_failure_kind(&self, version: u64, interface: &str, error: &anyhow::Error) {
+        self.failure_kinds
+            .lock()
+            .expect("convergence failure kind lock")
+            .insert(
+                (version, interface.to_owned()),
+                crate::core::recovery_control::classify(error),
+            );
+    }
+
     pub fn report_result(&self, version: u64, result: Result<BTreeMap<String, String>>) {
+        let error_kind = result
+            .as_ref()
+            .err()
+            .map(crate::core::recovery_control::classify);
+        let mut kinds = self
+            .failure_kinds
+            .lock()
+            .expect("convergence failure kind lock");
+        let failure_kinds = kinds
+            .iter()
+            .filter(|((pass, _), _)| *pass == version)
+            .map(|((_, interface), kind)| (interface.clone(), *kind))
+            .collect();
+        kinds.retain(|(pass, _), _| *pass > version);
+        drop(kinds);
         let (failures, error) = match result {
             Ok(failures) => (failures, None),
             Err(error) => (BTreeMap::new(), Some(format!("{error:#}"))),
@@ -150,6 +180,8 @@ impl DesiredNetworkState {
         self.passes.send_replace(ConvergencePass {
             version,
             failures,
+            failure_kinds,
+            error_kind,
             error,
         });
     }
@@ -166,6 +198,8 @@ impl DesiredNetworkState {
                 ConvergerState::Failed(error) => {
                     return ConvergencePass {
                         version,
+                        failure_kinds: BTreeMap::new(),
+                        error_kind: None,
                         failures: BTreeMap::new(),
                         error: Some(format!("network converger failed: {error}")),
                     };
@@ -173,6 +207,8 @@ impl DesiredNetworkState {
                 ConvergerState::Stopped => {
                     return ConvergencePass {
                         version,
+                        failure_kinds: BTreeMap::new(),
+                        error_kind: None,
                         failures: BTreeMap::new(),
                         error: Some("network converger stopped".into()),
                     };
@@ -190,7 +226,9 @@ impl DesiredNetworkState {
                     if changed.is_err() {
                         return ConvergencePass {
                             version,
-                            failures: BTreeMap::new(),
+                            failure_kinds: BTreeMap::new(),
+                        error_kind: None,
+                        failures: BTreeMap::new(),
                             error: Some("convergence result channel stopped".into()),
                         };
                     }
@@ -199,7 +237,9 @@ impl DesiredNetworkState {
                     if changed.is_err() {
                         return ConvergencePass {
                             version,
-                            failures: BTreeMap::new(),
+                            failure_kinds: BTreeMap::new(),
+                        error_kind: None,
+                        failures: BTreeMap::new(),
                             error: Some("network converger state channel stopped".into()),
                         };
                     }

@@ -178,8 +178,9 @@ impl ProvisioningSecretTransactionStore {
                 Some(raw) => match WifiPassphrase::new(raw.clone()) {
                     Ok(secret) => passphrases.set(interface, &secret),
                     Err(error) => {
-                        failures.push(format!(
-                            "{interface}: invalid journaled passphrase: {error}"
+                        failures.push(crate::core::recovery_control::failure(
+                            crate::core::recovery_control::FailureKind::Incompatible,
+                            format!("{interface}: invalid journaled passphrase: {error}"),
                         ));
                         continue;
                     }
@@ -187,18 +188,14 @@ impl ProvisioningSecretTransactionStore {
                 None => passphrases.clear(interface),
             };
             if let Err(error) = result {
-                failures.push(format!("{interface}: {error}"));
+                failures.push(anyhow::Error::new(error).context(interface.clone()));
             }
         }
 
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            bail!(
-                "failed to restore router provisioning secrets: {}",
-                failures.join("; ")
-            )
-        }
+        crate::core::recovery_control::aggregate(
+            failures,
+            "failed to restore router provisioning secrets",
+        )
     }
 
     async fn load(&self) -> Result<Option<ProvisioningSecretJournal>> {

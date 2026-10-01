@@ -676,6 +676,7 @@ fn router_buttons_wrap_and_remain_visible_at_supported_sizes() {
 fn degraded_recovery_marks_router_mutations_as_blocked() {
     let router = RouterData {
         recovery: Some(RouterRecoveryNotice {
+            recovery_progress: None,
             recovery_code: "TM-REC-207".into(),
             invariant: "router_rollback_failed".into(),
             summary: "rollback failed".into(),
@@ -787,6 +788,7 @@ async fn failed_status_refresh_preserves_last_known_recovery() {
     let mut app = TuiApp::default();
     app.router.coordinator_status = Some(CoordinatorStatus::RollbackFailed);
     app.router.recovery = Some(RouterRecoveryNotice {
+        recovery_progress: None,
         recovery_code: "TM-REC-207".into(),
         invariant: "router_rollback_failed".into(),
         summary: "rollback failed".into(),
@@ -1054,6 +1056,7 @@ fn health_report_details_is_empty_when_every_subsystem_is_healthy() {
 #[test]
 fn main_router_recovery_summary_stays_compact() {
     let notice = RouterRecoveryNotice {
+        recovery_progress: None,
         recovery_code: "TM-REC-207".into(),
         invariant: "router_rollback_failed".into(),
         summary: "rollback failed".into(),
@@ -1073,6 +1076,7 @@ fn main_router_recovery_summary_stays_compact() {
 #[test]
 fn formats_structured_router_recovery_notice() {
     let notice = RouterRecoveryNotice {
+        recovery_progress: None,
         recovery_code: "TM-REC-207".into(),
         invariant: "router_rollback_failed".into(),
         summary: "Previous router rollback did not fully restore runtime state.".into(),

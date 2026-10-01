@@ -348,6 +348,7 @@ fn overview_shows_pending_count_and_vpn_configuration_without_dhcp() {
     app.dashboard
         .pending_network_changes
         .push(PendingNetworkChange {
+            recovery_progress: None,
             phase: Default::default(),
             last_error: None,
             interface: "eth1".into(),

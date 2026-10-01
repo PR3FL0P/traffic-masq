@@ -527,6 +527,19 @@ pub(crate) fn render_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
         Line::from(format!("Rollback scheduled in: {seconds}s / {timeout}s")),
     ];
 
+    if let Some(progress) = &change.recovery_progress {
+        lines.push(Line::from(format!(
+            "Cause: {:?}; attempts {}/{}; automatic recovery {}",
+            progress.failure_kind,
+            progress.attempts,
+            progress.max_attempts,
+            if progress.automatic_recovery {
+                "active"
+            } else {
+                "stopped"
+            }
+        )));
+    }
     if let Some(error) = &change.last_error {
         lines.push(Line::from(format!("Last error: {error}")));
     }

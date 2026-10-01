@@ -78,6 +78,8 @@ struct FakeSubsystems {
     events: StdMutex<Vec<String>>,
     apply_fail: StdMutex<Option<&'static str>>,
     rollback_fail: StdMutex<Option<&'static str>>,
+    pause_apply: std::sync::atomic::AtomicBool,
+    apply_entered: tokio::sync::Notify,
     prepare_fail: std::sync::atomic::AtomicBool,
     prepare_attempts: std::sync::atomic::AtomicUsize,
     drifted: StdMutex<bool>,
@@ -91,6 +93,8 @@ impl FakeSubsystems {
             events: StdMutex::new(Vec::new()),
             apply_fail: StdMutex::new(None),
             rollback_fail: StdMutex::new(None),
+            pause_apply: std::sync::atomic::AtomicBool::new(false),
+            apply_entered: tokio::sync::Notify::new(),
             prepare_fail: std::sync::atomic::AtomicBool::new(false),
             prepare_attempts: std::sync::atomic::AtomicUsize::new(0),
             drifted: StdMutex::new(false),
@@ -216,6 +220,10 @@ impl RouterSubsystems for FakeSubsystems {
         })
     }
     async fn apply_interfaces(&self, _: &[InterfaceChangePlan]) -> Result<()> {
+        if self.pause_apply.load(Ordering::SeqCst) {
+            self.apply_entered.notify_one();
+            std::future::pending::<()>().await;
+        }
         self.fail_if_matched("apply_interfaces", &self.apply_fail)
     }
     async fn apply_routes(&self, _: &RoutePlan) -> Result<()> {
@@ -552,6 +560,7 @@ async fn write_journal_creates_missing_parent_directory() {
             rollback_timeout: Duration::from_secs(60),
             state: Mutex::new(CoordinatorState::Idle),
             token_counter: AtomicU64::new(0),
+            timer_epoch: AtomicU64::new(0),
             timeout_mutation_gate: StdRwLock::new(None),
             idle_epoch: watch::channel(0).0,
         }),
@@ -794,7 +803,7 @@ async fn rollback_journal_cleanup_failure_cannot_be_committed() {
     assert!(coordinator.rollback().await.is_err());
     assert_eq!(
         coordinator.status().await,
-        CoordinatorStatus::RollbackFailed
+        CoordinatorStatus::RecoveryRequired
     );
     assert!(coordinator
         .commit(&coordinator.pending_token().await.unwrap_or_default())
@@ -960,7 +969,7 @@ async fn provisioning_secret_restore_failure_blocks_commit_and_can_be_retried() 
     assert!(coordinator.rollback_with_token(&token).await.is_err());
     assert_eq!(
         coordinator.status().await,
-        CoordinatorStatus::RollbackFailed
+        CoordinatorStatus::RecoveryRequired
     );
     assert!(coordinator.commit(&token).await.is_err());
     assert!(secrets
@@ -1477,4 +1486,131 @@ async fn indeterminate_commit_fences_router_and_retains_recovery_evidence() {
         .events()
         .iter()
         .any(|event| event.starts_with("rollback_")));
+}
+
+#[tokio::test]
+async fn exhausted_router_recovery_survives_restart_and_shutdown_without_mutations() {
+    let fake = FakeSubsystems::new();
+    let (original, overrides, _root) = coordinator_with(fake.clone()).await;
+    let coordinator = RouterTransactionCoordinator::new(
+        original.manager(),
+        overrides.clone(),
+        Duration::from_secs(3600),
+    );
+    let plan = coordinator
+        .plan(build_candidate(&overrides).await)
+        .await
+        .unwrap();
+    let token = coordinator.apply(plan).await.unwrap();
+    coordinator.inner.timer_epoch.fetch_add(1, Ordering::SeqCst);
+    fake.fail_rollback("rollback_routes");
+    for _ in 0..recovery_control::MAX_ATTEMPTS {
+        coordinator.rollback_timeout_fired(&token).await;
+    }
+    assert_eq!(
+        coordinator.status().await,
+        CoordinatorStatus::RecoveryRequired
+    );
+    assert_eq!(
+        recovery_control::progress(&coordinator.inner.journal)
+            .unwrap()
+            .attempts,
+        recovery_control::MAX_ATTEMPTS
+    );
+    let before = fake.events();
+    assert!(!coordinator.rollback_timeout_fired(&token).await);
+    assert!(coordinator.rollback_for_shutdown().await.is_err());
+    assert_eq!(fake.events(), before);
+    recovery_control::forget(&coordinator.inner.journal);
+    let restarted = RouterTransactionCoordinator::new(
+        coordinator.manager(),
+        overrides.clone(),
+        Duration::from_secs(3600),
+    );
+    assert!(restarted.recover().await.is_err());
+    assert_eq!(
+        restarted.status().await,
+        CoordinatorStatus::RecoveryRequired
+    );
+    assert_eq!(fake.events(), before);
+    *fake.rollback_fail.lock().unwrap() = None;
+    assert!(!restarted.rollback_timeout_fired(&token).await);
+    assert_eq!(
+        fake.events(),
+        before,
+        "late repair cannot resume automatically"
+    );
+    restarted.rollback_with_token(&token).await.unwrap();
+    assert_eq!(restarted.status().await, CoordinatorStatus::Idle);
+    assert!(!restarted.inner.journal.exists());
+    assert_eq!(overrides.committed_revision().await, 0);
+}
+
+#[tokio::test]
+async fn persisted_commit_proof_prevents_rollback_of_stale_volatile_pending_state() {
+    let fake = FakeSubsystems::new();
+    let (original, overrides, _directory) = coordinator_with(fake.clone()).await;
+    let coordinator = RouterTransactionCoordinator::new(
+        original.manager(),
+        overrides.clone(),
+        Duration::from_secs(3600),
+    );
+    let plan = coordinator
+        .plan(build_candidate(&overrides).await)
+        .await
+        .unwrap();
+    let token = coordinator.apply(plan).await.unwrap();
+    let candidate = match &*coordinator.inner.state.lock().await {
+        CoordinatorState::Pending(pending) => pending.candidate.clone(),
+        _ => panic!("transaction must be pending"),
+    };
+    // Model cancellation after persistence, before coordinator bookkeeping.
+    overrides
+        .commit_candidate_with_token(&candidate, Some(&token))
+        .await
+        .unwrap();
+    let before = fake.events();
+    assert!(!coordinator.rollback_timeout_fired(&token).await);
+    assert_eq!(fake.events(), before);
+    assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
+    assert_eq!(overrides.committed_revision().await, 1);
+    assert!(!coordinator.inner.journal.exists());
+}
+
+#[tokio::test]
+async fn cancelled_router_apply_keeps_a_recovery_token_and_cannot_be_confirmed() {
+    let fake = FakeSubsystems::new();
+    let (original, overrides, _directory) = coordinator_with(fake.clone()).await;
+    let coordinator = RouterTransactionCoordinator::new(
+        original.manager(),
+        overrides.clone(),
+        Duration::from_secs(3600),
+    );
+    let plan = coordinator
+        .plan(build_candidate(&overrides).await)
+        .await
+        .unwrap();
+    fake.pause_apply.store(true, Ordering::SeqCst);
+    let worker = coordinator.clone();
+    let applying = tokio::spawn(async move { worker.apply(plan).await });
+    fake.apply_entered.notified().await;
+    applying.abort();
+    assert!(applying.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        coordinator.status().await,
+        CoordinatorStatus::RecoveryRequired
+    );
+    let token = coordinator
+        .pending_token()
+        .await
+        .expect("cancelled apply must remain inspectable");
+    assert!(coordinator.commit(&token).await.is_err());
+    assert!(coordinator.inner.journal.exists());
+    let before = fake.events();
+    assert!(coordinator.rollback_for_shutdown().await.is_err());
+    assert_eq!(fake.events(), before);
+    coordinator.rollback_with_token(&token).await.unwrap();
+    assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
+    assert!(!coordinator.inner.journal.exists());
+    assert_eq!(overrides.committed_revision().await, 0);
 }

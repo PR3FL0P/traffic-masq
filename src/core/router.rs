@@ -884,7 +884,40 @@ impl RouterManager {
         .await
     }
 
+    /// Preserve error types until the recovery policy has classified the failure.
+    pub async fn rollback_to_classified(&self, snapshot: &RouterSnapshot) -> Result<()> {
+        let errors = self
+            .rollback_stages_classified(
+                snapshot,
+                &[
+                    Stage::UplinkDhcpRestore,
+                    Stage::Interfaces,
+                    Stage::UplinkWifi,
+                    Stage::UplinkDhcpCandidate,
+                    Stage::VpnChain,
+                    Stage::OutputWifi,
+                    Stage::Dhcp,
+                    Stage::Routes,
+                    Stage::Dataplane,
+                ],
+            )
+            .await;
+        crate::core::recovery_control::aggregate(errors, "router rollback was incomplete")
+    }
+
     async fn rollback_stages(&self, snapshot: &RouterSnapshot, stages: &[Stage]) -> Vec<String> {
+        self.rollback_stages_classified(snapshot, stages)
+            .await
+            .into_iter()
+            .map(|error| format!("{error:#}"))
+            .collect()
+    }
+
+    async fn rollback_stages_classified(
+        &self,
+        snapshot: &RouterSnapshot,
+        stages: &[Stage],
+    ) -> Vec<anyhow::Error> {
         let mut rollback_failures = Vec::new();
         for stage in stages.iter().rev() {
             let result = match stage {
@@ -932,7 +965,7 @@ impl RouterManager {
                 }
             };
             if let Err(error) = result {
-                rollback_failures.push(format!("{}: {error}", stage.name()));
+                rollback_failures.push(error.context(stage.name()));
             }
         }
         rollback_failures

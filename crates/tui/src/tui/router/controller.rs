@@ -183,7 +183,7 @@ async fn handle_router_recovery_action(app: &mut TuiApp, client: &ApiClient) {
         }
         Ok(Response::RouterPendingTransaction {
             token: Some(token),
-            status: CoordinatorStatus::RollbackFailed,
+            status: CoordinatorStatus::RollbackFailed | CoordinatorStatus::RecoveryRequired,
             recovery,
             ..
         }) => {
@@ -230,7 +230,7 @@ async fn handle_router_recovery_action(app: &mut TuiApp, client: &ApiClient) {
             load_router_data(app, client).await;
         }
         Ok(Response::RouterPendingTransaction {
-            status: CoordinatorStatus::RollbackFailed,
+            status: CoordinatorStatus::RollbackFailed | CoordinatorStatus::RecoveryRequired,
             token: None,
             ..
         }) => app.push_message(

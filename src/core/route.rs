@@ -238,7 +238,10 @@ impl RouteManager {
                     .iter()
                     .any(|entry| route_info_matches(entry, route))
                 {
-                    errors.push(format!("operation=delete_route; object={}; invariant=restore_owned_routes: {error}", route.destination));
+                    errors.push(error.context(format!(
+                        "operation=delete_route; object={}; invariant=restore_owned_routes",
+                        route.destination
+                    )));
                 }
             }
         }
@@ -255,16 +258,15 @@ impl RouteManager {
                     .iter()
                     .any(|entry| route_info_matches(entry, route))
                 {
-                    errors.push(format!("operation=restore_route; object={}; invariant=restore_owned_routes: {error}", route.destination));
+                    errors.push(error.context(format!(
+                        "operation=restore_route; object={}; invariant=restore_owned_routes",
+                        route.destination
+                    )));
                 }
             }
         }
 
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            bail!("route rollback was incomplete: {}", errors.join("; "))
-        }
+        crate::core::recovery_control::aggregate(errors, "route rollback was incomplete")
     }
 
     /// Apply the planned route additions and deletions through the network provider.
@@ -307,13 +309,14 @@ impl RouteManager {
         let mut resolved = Vec::with_capacity(desired.len());
 
         for route in desired {
-            let output_interface_index =
-                match route.output_interface.as_deref() {
-                    Some(name) => Some(*interfaces.get(name).ok_or_else(|| {
-                        anyhow::anyhow!("route output interface not found: {name}")
-                    })?),
-                    None => None,
-                };
+            let output_interface_index = match route.output_interface.as_deref() {
+                Some(name) => Some(*interfaces.get(name).ok_or_else(|| {
+                    anyhow::Error::new(crate::netlink::MissingInterface {
+                        interface: name.to_owned(),
+                    })
+                })?),
+                None => None,
+            };
             let spec = Ipv4RouteSpec {
                 destination: route.destination.trunc(),
                 gateway: route.gateway,

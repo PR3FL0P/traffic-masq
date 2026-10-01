@@ -24,6 +24,29 @@ use rtnetlink::{new_connection, Handle, IpVersion};
 use serde::{Deserialize, Serialize};
 use tokio::{sync::Mutex, task::JoinHandle};
 
+/// A missing device is distinct from an observation/storage failure.
+#[derive(Debug)]
+pub struct MissingInterface {
+    pub interface: String,
+}
+impl std::fmt::Display for MissingInterface {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "interface not found: {}", self.interface)
+    }
+}
+impl std::error::Error for MissingInterface {}
+
+/// Preserve kernel errno information for recovery policy without exposing the
+/// rtnetlink dependency to callers.
+pub fn netlink_os_error(error: &anyhow::Error) -> Option<i32> {
+    error
+        .chain()
+        .find_map(|cause| match cause.downcast_ref::<rtnetlink::Error>() {
+            Some(rtnetlink::Error::NetlinkError(message)) => Some(message.raw_code().abs()),
+            _ => None,
+        })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkInterface {
     pub index: u32,
@@ -615,7 +638,11 @@ impl RtnetlinkNetworkProvider {
             .try_next()
             .await
             .with_context(|| format!("RTM_GETLINK while resolving interface {name}"))?
-            .ok_or_else(|| anyhow::anyhow!("interface not found: {name}"))?;
+            .ok_or_else(|| {
+                anyhow::Error::new(MissingInterface {
+                    interface: name.to_owned(),
+                })
+            })?;
         Ok(link.header.index)
     }
 
@@ -839,7 +866,11 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
             .try_next()
             .await
             .with_context(|| format!("RTM_GETLINK while reading hardware address for {interface}"))?
-            .ok_or_else(|| anyhow::anyhow!("interface not found: {interface}"))?;
+            .ok_or_else(|| {
+                anyhow::Error::new(MissingInterface {
+                    interface: interface.to_owned(),
+                })
+            })?;
         link.attributes
             .into_iter()
             .find_map(|attribute| match attribute {

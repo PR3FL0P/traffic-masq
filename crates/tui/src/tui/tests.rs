@@ -21,6 +21,7 @@ async fn rollback_click_sends_rollback_request() {
     let mut app = TuiApp {
         screen: Screen::PendingChange,
         pending: Some(PendingNetworkChange {
+            recovery_progress: None,
             phase: Default::default(),
             last_error: None,
             token: "test-token".into(),
@@ -382,6 +383,7 @@ fn disconnected_dashboard_does_not_claim_rollback() {
     let mut app = TuiApp {
         screen: Screen::PendingChange,
         pending: Some(PendingNetworkChange {
+            recovery_progress: None,
             phase: Default::default(),
             last_error: None,
             token: "keep".into(),
@@ -894,6 +896,7 @@ async fn small_terminal_escape_sends_rollback_request() {
     let mut app = TuiApp {
         screen: Screen::PendingChange,
         pending: Some(PendingNetworkChange {
+            recovery_progress: None,
             phase: Default::default(),
             last_error: None,
             token: "test-token".into(),
@@ -968,6 +971,7 @@ async fn small_terminal_enter_sends_commit_request() {
     let mut app = TuiApp {
         screen: Screen::PendingChange,
         pending: Some(PendingNetworkChange {
+            recovery_progress: None,
             phase: Default::default(),
             last_error: None,
             token: "test-token".into(),
@@ -1002,6 +1006,7 @@ async fn small_terminal_enter_sends_commit_request() {
 fn pending_refresh_exposes_recovery_and_removes_confirmation_controls() {
     use traffic_masq_protocol::NetworkChangePhase;
     let initial = PendingNetworkChange {
+        recovery_progress: None,
         token: "recovering".into(),
         interface: "eth0".into(),
         rollback_timeout_seconds: 60,

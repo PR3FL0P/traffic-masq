@@ -160,12 +160,20 @@ pub(super) async fn prepare(config: &AppConfig) -> Result<StartupRecovery> {
 
     // Provisioning secrets belong to the router recovery scope. Run this only after independent
     // interface recovery, so a router-secret problem cannot suppress interface rollback.
-    let provisioning_recovery =
-        crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore::in_state_dir(
-            &config.runtime.state_dir,
-        )
-        .recover(committed_router_transaction.as_deref())
-        .await;
+    let secrets = crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore::in_state_dir(
+        &config.runtime.state_dir,
+    );
+    // A router journal owns both runtime and secret compensation. Its bounded
+    // coordinator must decide whether recovery may run before restoring secrets.
+    let provisioning_recovery = if router_recovery_pending {
+        secrets
+            .unresolved_after_committed_cleanup(committed_router_transaction.as_deref())
+            .await
+    } else {
+        secrets
+            .recover(committed_router_transaction.as_deref())
+            .await
+    };
     if let Err(error) = provisioning_recovery {
         return Err(crate::core::recovery::context_if_missing(
             error,
@@ -199,7 +207,11 @@ pub(super) async fn prepare(config: &AppConfig) -> Result<StartupRecovery> {
         config.validate()?;
         (overrides.hydrate_strict().await?, true)
     };
-    crate::wifi::store::migrate_legacy_passphrases(&effective_config).await?;
+    if !router_recovery_pending
+        && crate::core::recovery_control::stopped_journals(&config.runtime.state_dir).is_empty()
+    {
+        crate::wifi::store::migrate_legacy_passphrases(&effective_config).await?;
+    }
     let override_snapshot = overrides.snapshot().await;
     let management_allowlist = management_allowlist(&override_snapshot);
 

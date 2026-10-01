@@ -49,12 +49,36 @@ impl ControlService {
                     .map(|change| change.interface),
                 _ => None,
             };
-            if let Err(error) = crate::core::recovery::check_scope(
-                &self.config.runtime.state_dir,
-                transaction_interface
-                    .as_deref()
-                    .or_else(|| recovery_interface(&request)),
-            ) {
+            let scope = transaction_interface
+                .as_deref()
+                .or_else(|| recovery_interface(&request));
+            let retry_journal = match &request {
+                Request::RollbackNetworkChange { .. } => {
+                    transaction_interface.as_ref().map(|interface| {
+                        self.config
+                            .runtime
+                            .state_dir
+                            .join("interface-transactions")
+                            .join(format!("{interface}.json"))
+                    })
+                }
+                Request::RouterRollback { .. } => Some(
+                    self.config
+                        .runtime
+                        .state_dir
+                        .join("router-transaction.json"),
+                ),
+                _ => None,
+            };
+            let admitted = match retry_journal {
+                Some(path) => crate::core::recovery::check_rollback_scope(
+                    &self.config.runtime.state_dir,
+                    scope,
+                    &path,
+                ),
+                None => crate::core::recovery::check_scope(&self.config.runtime.state_dir, scope),
+            };
+            if let Err(error) = admitted {
                 return Response::Error {
                     message: format!("{error:#}"),
                 };
@@ -119,7 +143,9 @@ impl ControlService {
                             message: "kernel state recovered; journal housekeeping is pending and will retry automatically; overlapping mutations are temporarily blocked".to_owned(),
                         };
                     }
-                    CoordinatorStatus::RollbackFailed | CoordinatorStatus::CommitIndeterminate => {
+                    CoordinatorStatus::RollbackFailed
+                    | CoordinatorStatus::RecoveryRequired
+                    | CoordinatorStatus::CommitIndeterminate => {
                         return Response::Error {
                             message: "router rollback recovery is required; direct network mutations are blocked until recovery completes".to_owned(),
                         };

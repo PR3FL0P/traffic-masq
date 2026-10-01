@@ -1,6 +1,7 @@
 pub use traffic_masq_protocol::CoordinatorStatus;
 
 use crate::core::mutation::NetworkMutationGate;
+use crate::core::recovery_control;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -79,6 +80,7 @@ pub enum RouterPhase {
     Idle,
     Pending,
     RollbackRequired,
+    RecoveryRequired,
 }
 
 impl CoordinatorView {
@@ -94,6 +96,7 @@ impl CoordinatorView {
             RouterPhase::Idle => CoordinatorStatus::Idle,
             RouterPhase::Pending => CoordinatorStatus::Pending,
             RouterPhase::RollbackRequired => CoordinatorStatus::RollbackFailed,
+            RouterPhase::RecoveryRequired => CoordinatorStatus::RecoveryRequired,
         }
     }
 
@@ -134,6 +137,8 @@ enum CoordinatorState {
 enum RollbackTrigger {
     Manual,
     Timeout,
+    Startup,
+    Shutdown,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -156,6 +161,7 @@ struct Inner {
     state: Mutex<CoordinatorState>,
     journal: std::path::PathBuf,
     token_counter: AtomicU64,
+    timer_epoch: AtomicU64,
     timeout_mutation_gate: StdRwLock<Option<Arc<NetworkMutationGate>>>,
     idle_epoch: watch::Sender<u64>,
 }
@@ -179,6 +185,7 @@ impl RouterTransactionCoordinator {
                 rollback_timeout,
                 state: Mutex::new(CoordinatorState::Idle),
                 token_counter: AtomicU64::new(0),
+                timer_epoch: AtomicU64::new(0),
                 timeout_mutation_gate: StdRwLock::new(None),
                 idle_epoch: watch::channel(0).0,
             }),
@@ -254,47 +261,67 @@ impl RouterTransactionCoordinator {
             plan.candidate.desired(),
         )
         .await?;
-        if let Err(error) = self.inner.manager.apply(&plan.plan).await {
-            // Retry the complete snapshot: a failed apply may also have failed
-            // its compensation. Keep the journal until restoration succeeds.
-            let mut failures = self.rollback_snapshot(&token, &current_snapshot).await;
-            if failures.is_empty() {
-                if let Err(ownership_error) = self.retain_committed_router_interfaces().await {
-                    failures.push(format!(
-                        "failed to restore committed router ownership: {ownership_error:#}"
-                    ));
+        // Cancellation must leave an inspectable token and original snapshot.
+        *state = CoordinatorState::Pending(PendingTransaction {
+            token: token.clone(),
+            candidate: plan.candidate.clone(),
+            snapshot: current_snapshot.clone(),
+        });
+        let applied = match recovery_control::begin_apply(&self.inner.journal).await {
+            Ok(guard) => {
+                let result = match tokio::time::timeout(
+                    recovery_control::ATTEMPT_TIMEOUT,
+                    self.inner.manager.apply(&plan.plan),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(recovery_control::failure(
+                        recovery_control::FailureKind::Transient,
+                        "router apply timed out; runtime outcome must be re-observed",
+                    )),
+                };
+                match guard.finish().await {
+                    Ok(()) => result,
+                    Err(error) => Err(error),
                 }
             }
-            if failures.is_empty() {
-                if let Err(cleanup_error) = self.clear_journal().await {
-                    *state = CoordinatorState::RollbackFailed(RollbackFailure {
-                        recovery_desired: None,
-                        token: token.clone(),
-                        candidate: plan.candidate,
-                        snapshot: current_snapshot,
-                        failures: vec![format!(
-                            "failed to clear rollback journal: {cleanup_error:#}"
-                        )],
-                    });
-                    self.spawn_rollback_timer(token.clone());
-                    return Err(error.context(format!(
-                        "rollback journal cleanup failed: {cleanup_error:#}"
-                    )));
-                }
-            } else {
+            Err(error) => Err(error),
+        };
+        if let Err(error) = applied {
+            *state = CoordinatorState::RollbackFailed(RollbackFailure {
+                token: token.clone(),
+                candidate: plan.candidate.clone(),
+                snapshot: current_snapshot.clone(),
+                failures: vec![format!("apply failed: {error:#}")],
+                recovery_desired: Some(plan.candidate.desired().clone()),
+            });
+            // Retry the complete snapshot: a failed apply may also have failed
+            // its compensation. Keep the journal until restoration succeeds.
+            let failures = self
+                .rollback_snapshot(
+                    &token,
+                    &current_snapshot,
+                    false,
+                    Some(plan.candidate.desired()),
+                )
+                .await;
+            if !failures.is_empty() {
                 let recovery = failures.join("; ");
                 *state = CoordinatorState::RollbackFailed(RollbackFailure {
-                    recovery_desired: None,
+                    recovery_desired: Some(plan.candidate.desired().clone()),
                     token: token.clone(),
                     candidate: plan.candidate,
                     snapshot: current_snapshot,
                     failures,
                 });
-                self.spawn_rollback_timer(token.clone());
+                self.spawn_timer(token.clone(), false);
                 return Err(error.context(format!(
                     "router rollback recovery remains required: {recovery}"
                 )));
             }
+            *state = CoordinatorState::Idle;
+            self.notify_idle();
             return Err(error);
         }
 
@@ -350,36 +377,56 @@ impl RouterTransactionCoordinator {
         let token = self.next_token();
         self.write_journal(candidate.base_revision(), &token, &snapshot, &desired)
             .await?;
-        let result = if dataplane_only {
-            self.inner.manager.reconcile_dataplane(&desired).await
-        } else {
-            match self.inner.manager.plan(desired).await {
-                Ok(plan) => self.inner.manager.apply(&plan).await,
-                Err(error) => Err(error),
+        *state = CoordinatorState::RollbackFailed(RollbackFailure {
+            token: token.clone(),
+            candidate: candidate.clone(),
+            snapshot: snapshot.clone(),
+            failures: vec!["router repair was interrupted".into()],
+            recovery_desired: Some(desired.clone()),
+        });
+        let result = match recovery_control::begin_apply(&self.inner.journal).await {
+            Ok(guard) => {
+                let work = async {
+                    if dataplane_only {
+                        self.inner.manager.reconcile_dataplane(&desired).await
+                    } else {
+                        match self.inner.manager.plan(desired).await {
+                            Ok(plan) => self.inner.manager.apply(&plan).await,
+                            Err(error) => Err(error),
+                        }
+                    }
+                };
+                let result =
+                    match tokio::time::timeout(recovery_control::ATTEMPT_TIMEOUT, work).await {
+                        Ok(result) => result,
+                        Err(_) => Err(recovery_control::failure(
+                            recovery_control::FailureKind::Transient,
+                            "router repair timed out; runtime outcome must be re-observed",
+                        )),
+                    };
+                match guard.finish().await {
+                    Ok(()) => result,
+                    Err(error) => Err(error),
+                }
             }
+            Err(error) => Err(error),
         };
         if let Err(error) = result {
-            let mut failures = self.inner.manager.rollback_to(&snapshot).await;
-            if failures.is_empty() {
-                if let Err(ownership_error) = self.retain_committed_router_interfaces().await {
-                    failures.push(format!(
-                        "failed to restore committed router ownership: {ownership_error:#}"
-                    ));
-                }
-            }
-            if failures.is_empty() {
-                if let Err(cleanup) = self.clear_journal().await {
-                    failures.push(cleanup.to_string());
-                }
-            }
+            let failures = self.rollback_snapshot(&token, &snapshot, false, None).await;
             if !failures.is_empty() {
                 *state = CoordinatorState::RollbackFailed(RollbackFailure {
                     recovery_desired: None,
-                    token,
+                    token: token.clone(),
                     candidate,
                     snapshot,
                     failures,
                 });
+                if !recovery_control::stopped(&self.inner.journal) {
+                    self.spawn_timer(token, false);
+                }
+            } else {
+                *state = CoordinatorState::Idle;
+                self.notify_idle();
             }
             return Err(error);
         }
@@ -406,6 +453,8 @@ impl RouterTransactionCoordinator {
             });
             return Err(error);
         }
+        *state = CoordinatorState::Idle;
+        self.notify_idle();
         Ok(())
     }
 
@@ -420,6 +469,9 @@ impl RouterTransactionCoordinator {
                 .parent()
                 .expect("state directory"),
         )?;
+        if recovery_control::progress(&self.inner.journal).is_some() {
+            return Err(CoordinatorConflict::RollbackRecoveryRequired.into());
+        }
         let pending = match &*state {
             CoordinatorState::Pending(pending) => pending.clone(),
             CoordinatorState::Idle => return Err(NoPendingTransactionError.into()),
@@ -464,8 +516,15 @@ impl RouterTransactionCoordinator {
     /// Restore the pending router snapshot, retaining failure state when restoration is incomplete.
     pub async fn rollback(&self) -> Result<()> {
         let mut state = self.inner.state.lock().await;
-        self.rollback_locked(&mut state, RollbackTrigger::Manual)
-            .await
+        let result = self
+            .rollback_locked(&mut state, RollbackTrigger::Manual)
+            .await;
+        if result.is_err() && !recovery_control::stopped(&self.inner.journal) {
+            if let CoordinatorState::RollbackFailed(failure) = &*state {
+                self.spawn_timer(failure.token.clone(), false);
+            }
+        }
+        result
     }
 
     /// Return an internally consistent view of coordinator state under one lock.
@@ -488,14 +547,24 @@ impl RouterTransactionCoordinator {
                 rollback_failures: Vec::new(),
             },
             CoordinatorState::Pending(pending) => CoordinatorView {
-                phase: RouterPhase::Pending,
+                phase: if recovery_control::stopped(&self.inner.journal) {
+                    RouterPhase::RecoveryRequired
+                } else if recovery_control::progress(&self.inner.journal).is_some() {
+                    RouterPhase::RollbackRequired
+                } else {
+                    RouterPhase::Pending
+                },
                 commit_uncertainty,
                 cleanup_pending,
                 token: Some(pending.token.clone()),
                 rollback_failures: Vec::new(),
             },
             CoordinatorState::RollbackFailed(failure) => CoordinatorView {
-                phase: RouterPhase::RollbackRequired,
+                phase: if recovery_control::stopped(&self.inner.journal) {
+                    RouterPhase::RecoveryRequired
+                } else {
+                    RouterPhase::RollbackRequired
+                },
                 commit_uncertainty,
                 cleanup_pending,
                 token: Some(failure.token.clone()),
@@ -525,8 +594,15 @@ impl RouterTransactionCoordinator {
             expected == token,
             "router transaction token does not match pending transaction"
         );
-        self.rollback_locked(&mut state, RollbackTrigger::Manual)
-            .await
+        let result = self
+            .rollback_locked(&mut state, RollbackTrigger::Manual)
+            .await;
+        if result.is_err() && !recovery_control::stopped(&self.inner.journal) {
+            if let CoordinatorState::RollbackFailed(failure) = &*state {
+                self.spawn_timer(failure.token.clone(), false);
+            }
+        }
+        result
     }
 
     /// Report whether the coordinator is idle, awaiting confirmation, or awaiting rollback recovery.
@@ -580,20 +656,26 @@ impl RouterTransactionCoordinator {
                 .parent()
                 .expect("state directory"),
         )?;
-        // A failed startup prepare may have discovered only part of a VPN
-        // chain. Never let a manual retry retire that journal using incomplete
-        // volatile ownership; reconstruct it first and retain the intent on error.
-        if let CoordinatorState::RollbackFailed(failure) = &mut **state {
-            if let Some(desired) = &failure.recovery_desired {
-                if let Err(error) = self.inner.manager.prepare_recovery(desired).await {
-                    failure.failures = vec![format!("failed to prepare recovery: {error:#}")];
-                    return Err(
-                        error.context("failed to reconstruct partially-applied router state")
-                    );
-                }
-                failure.recovery_desired = None;
-            }
+        if trigger == RollbackTrigger::Manual {
+            crate::core::recovery::check_rollback_scope(
+                self.inner
+                    .overrides
+                    .path()
+                    .parent()
+                    .expect("state directory"),
+                None,
+                &self.inner.journal,
+            )?;
         }
+        let recovery_desired = match &**state {
+            CoordinatorState::RollbackFailed(failure) => failure.recovery_desired.clone(),
+            CoordinatorState::Pending(pending)
+                if recovery_control::progress(&self.inner.journal).is_some() =>
+            {
+                Some(pending.candidate.desired().clone())
+            }
+            _ => None,
+        };
         let (token, candidate, snapshot) = match &**state {
             CoordinatorState::Pending(pending) => (
                 pending.token.clone(),
@@ -608,30 +690,63 @@ impl RouterTransactionCoordinator {
             CoordinatorState::Idle => return Err(NoPendingTransactionError.into()),
         };
 
-        let mut failures = self.rollback_snapshot(&token, &snapshot).await;
-        if failures.is_empty() {
-            // Applying a candidate widens the volatile ownership scope before
-            // its apply-time snapshot. The snapshot therefore contains both
-            // committed and candidate-only interfaces and cannot be used to
-            // decide what remains owned after an abort. Restore ownership from
-            // the durable committed intent instead.
-            if let Err(error) = self.retain_committed_router_interfaces().await {
-                failures.push(format!(
-                    "failed to restore committed router ownership: {error:#}"
-                ));
-            }
+        // A request may have been cancelled after durable commit but before
+        // clearing volatile pending state. Commit proof always wins over rollback.
+        if self
+            .inner
+            .overrides
+            .snapshot()
+            .await
+            .committed_router_transaction
+            .as_deref()
+            == Some(token.as_str())
+        {
+            self.retain_committed_router_interfaces_for_recovery()
+                .await?;
+            self.clear_journal().await?;
+            **state = CoordinatorState::Idle;
+            self.notify_idle();
+            return if trigger == RollbackTrigger::Manual {
+                Err(NoPendingTransactionError.into())
+            } else {
+                Ok(())
+            };
         }
-        if failures.is_empty() {
-            if let Err(error) = self.clear_journal().await {
-                **state = CoordinatorState::RollbackFailed(RollbackFailure {
-                    recovery_desired: None,
-                    token,
-                    candidate,
-                    snapshot,
-                    failures: vec![format!("failed to clear rollback journal: {error:#}")],
-                });
-                return Err(error.context("network restored but rollback journal cleanup failed"));
+        let journal_exists = match crate::atomic_file::regular_file_exists(&self.inner.journal) {
+            Ok(exists) => exists,
+            Err(error) => {
+                if let Err(persistence) = recovery_control::stop(
+                    &self.inner.journal,
+                    recovery_control::FailureKind::Storage,
+                    format!("{error:#}"),
+                )
+                .await
+                {
+                    return Err(
+                        persistence.context(format!("journal inspection failed: {error:#}"))
+                    );
+                }
+                return Err(error.into());
             }
+        };
+        if trigger == RollbackTrigger::Manual && !journal_exists {
+            self.write_journal(
+                candidate.base_revision(),
+                &token,
+                &snapshot,
+                candidate.desired(),
+            )
+            .await?;
+        }
+        let failures = self
+            .rollback_snapshot(
+                &token,
+                &snapshot,
+                trigger == RollbackTrigger::Manual,
+                recovery_desired.as_ref(),
+            )
+            .await;
+        if failures.is_empty() {
             **state = CoordinatorState::Idle;
             self.notify_idle();
             if trigger == RollbackTrigger::Timeout {
@@ -641,7 +756,7 @@ impl RouterTransactionCoordinator {
         } else {
             let message = failures.join("; ");
             **state = CoordinatorState::RollbackFailed(RollbackFailure {
-                recovery_desired: None,
+                recovery_desired: recovery_desired.clone(),
                 token,
                 candidate,
                 snapshot,
@@ -651,29 +766,42 @@ impl RouterTransactionCoordinator {
         }
     }
 
-    async fn rollback_snapshot(&self, token: &str, snapshot: &RouterSnapshot) -> Vec<String> {
-        let secrets = crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore::in_state_dir(
-            self.inner.overrides.path().parent().expect("override store has a parent"),
-        );
-        // Runtime restoration can need the old credentials to start a station
-        // or AP. Restore them before the snapshot, including apply compensation
-        // where the provisioning journal has not been bound to a token yet.
-        let restored = secrets.restore(Some(token)).await;
-        let mut failures = self.inner.manager.rollback_to(snapshot).await;
-        match restored {
-            Err(error) => {
-                failures.push(format!("failed to restore provisioning secrets: {error:#}"))
+    async fn rollback_snapshot(
+        &self,
+        token: &str,
+        snapshot: &RouterSnapshot,
+        manual: bool,
+        recovery_desired: Option<&RouterDesired>,
+    ) -> Vec<String> {
+        let result = recovery_control::run(&self.inner.journal, manual, async {
+            if let Some(desired) = recovery_desired {
+                self.inner.manager.prepare_recovery(desired).await
+                    .context("failed to reconstruct partially-applied router state")?;
             }
-            Ok(true) if failures.is_empty() => {
-                if let Err(error) = secrets.finish(Some(token)).await {
-                    failures.push(format!(
-                        "failed to clear provisioning secret journal: {error:#}"
-                    ));
-                }
+            let secrets = crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore::in_state_dir(
+                self.inner.overrides.path().parent().expect("override store has a parent"),
+            );
+            // Do not start runtime consumers until their credentials are restored.
+            let restored = secrets.restore(Some(token)).await.context("failed to restore provisioning secrets")?;
+            self.inner.manager.rollback_to_classified(snapshot).await?;
+            if restored {
+                secrets.finish(Some(token)).await?;
             }
-            _ => {}
-        }
-        failures
+            self.retain_committed_router_interfaces_for_recovery().await?;
+            self.clear_journal().await?;
+            Ok(())
+        }).await;
+        result
+            .err()
+            .map(|error| vec![format!("{error:#}")])
+            .unwrap_or_default()
+    }
+
+    /// Shutdown is automatic work and must never restart a stopped cycle.
+    pub async fn rollback_for_shutdown(&self) -> Result<()> {
+        let mut state = self.inner.state.lock().await;
+        self.rollback_locked(&mut state, RollbackTrigger::Shutdown)
+            .await
     }
 
     async fn retain_committed_router_interfaces(&self) -> Result<()> {
@@ -708,7 +836,12 @@ impl RouterTransactionCoordinator {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn rollback_timeout_fired(&self, token: &str) -> bool {
+        self.rollback_timeout_fired_for_epoch(token, None).await
+    }
+
+    async fn rollback_timeout_fired_for_epoch(&self, token: &str, epoch: Option<u64>) -> bool {
         let gate = self
             .inner
             .timeout_mutation_gate
@@ -720,6 +853,9 @@ impl RouterTransactionCoordinator {
             None => None,
         };
         let mut state = self.inner.state.lock().await;
+        if epoch.is_some_and(|epoch| self.inner.timer_epoch.load(Ordering::SeqCst) != epoch) {
+            return false;
+        }
         if crate::core::recovery::check_commit(
             self.inner
                 .overrides
@@ -741,19 +877,32 @@ impl RouterTransactionCoordinator {
             .await
         {
             tracing::error!(%error, "automatic router rollback failed; will retry");
-            return true;
+            return !recovery_control::stopped(&self.inner.journal);
         }
         false
     }
 
     fn spawn_rollback_timer(&self, token: String) {
+        self.spawn_timer(token, true);
+    }
+
+    fn spawn_timer(&self, token: String, confirmation: bool) {
         let coordinator = self.clone();
-        let timeout = self.inner.rollback_timeout;
+        let epoch = self.inner.timer_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        let timeout = if confirmation {
+            self.inner.rollback_timeout
+        } else {
+            recovery_control::retry_delay(&self.inner.journal)
+        };
         tokio::spawn(async move {
             tokio::time::sleep(timeout).await;
-            while coordinator.rollback_timeout_fired(&token).await {
+            while coordinator.inner.timer_epoch.load(Ordering::SeqCst) == epoch
+                && coordinator
+                    .rollback_timeout_fired_for_epoch(&token, Some(epoch))
+                    .await
+            {
                 // No mutation/state locks are retained between attempts.
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::time::sleep(recovery_control::retry_delay(&coordinator.inner.journal)).await;
             }
         });
     }
@@ -950,24 +1099,14 @@ impl RouterTransactionCoordinator {
                 token: journal.token.clone(), candidate, snapshot: journal.snapshot.clone(),
                 failures: vec![format!("journal={}; operation=startup_rollback; invariant=restore_snapshot; metadata_safe_to_remove=false", self.inner.journal.display())],
             });
-            if let Some(current_desired) = journal.current_desired.as_ref() {
-                if let Err(error) = self.inner.manager.prepare_recovery(current_desired).await {
-                    if let CoordinatorState::RollbackFailed(failure) = &mut *state {
-                        failure.failures.push(format!("operation=prepare_recovery; invariant=prove_partial_ownership: {error:#}"));
-                    }
-                    return Err(error).context("failed to reconstruct partially-applied router state; metadata_safe_to_remove=false");
+            if let Err(error) = self
+                .rollback_locked(&mut state, RollbackTrigger::Startup)
+                .await
+            {
+                if !recovery_control::stopped(&self.inner.journal) {
+                    self.spawn_timer(journal.token.clone(), false);
                 }
-            }
-            if let CoordinatorState::RollbackFailed(failure) = &mut *state {
-                failure.recovery_desired = None;
-            }
-            let failures = self.inner.manager.rollback_to(&journal.snapshot).await;
-            if !failures.is_empty() {
-                let message = failures.join("; ");
-                if let CoordinatorState::RollbackFailed(failure) = &mut *state {
-                    failure.failures = failures;
-                }
-                anyhow::bail!("invariant=restore_snapshot; journal={}; object=router; operation=rollback; metadata_safe_to_remove=false: {message}", self.inner.journal.display());
+                return Err(error);
             }
             tracing::warn!("restored interrupted router transaction");
         }

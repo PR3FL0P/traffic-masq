@@ -86,6 +86,7 @@ impl RouterData {
                 self.coordinator_status,
                 Some(
                     CoordinatorStatus::RollbackFailed
+                        | CoordinatorStatus::RecoveryRequired
                         | CoordinatorStatus::CommitIndeterminate
                         | CoordinatorStatus::RecoveredButJournalCleanupPending
                 )

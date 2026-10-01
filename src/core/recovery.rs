@@ -381,6 +381,7 @@ pub async fn retire(path: &Path) -> Result<()> {
         Err(error) => return Err(error).context("operation=read_completed_journal; invariant=retain_recovery_proof; metadata_safe_to_remove=true"),
     };
     let digest = Sha256::digest(&bytes).to_vec();
+    crate::core::recovery_control::forget(path);
     let first = pending()
         .lock()
         .expect("recovery housekeeping lock")
@@ -442,6 +443,7 @@ async fn housekeeping(path: &Path) -> Result<()> {
         Err(error) => return Err(error.into()),
     }
     crate::atomic_file::remove_preserving_on_error_async(&receipt(path), 0o600).await?;
+    crate::core::recovery_control::remove_control(path).await?;
     pending()
         .lock()
         .expect("recovery housekeeping lock")
@@ -461,6 +463,11 @@ pub async fn before_write(path: &Path) -> Result<()> {
     // A crash can occur between unlinking the journal and its receipt. Never
     // let an orphan receipt authenticate a future identical secret journal.
     crate::atomic_file::remove_preserving_on_error_async(&receipt(path), 0o600).await?;
+    crate::atomic_file::remove_preserving_on_error_async(
+        &crate::core::recovery_control::control_path(path),
+        0o600,
+    )
+    .await?;
     Ok(())
 }
 
@@ -611,7 +618,18 @@ pub(crate) fn check_commit(root: &Path) -> Result<()> {
 }
 
 pub fn check_scope(root: &Path, interface: Option<&str>) -> Result<()> {
+    check_scope_inner(root, interface, None)
+}
+
+/// An explicit retry may bypass only its own transaction stop, never an
+/// ownership block, another recovery scope, cleanup, or uncertain commit.
+pub fn check_rollback_scope(root: &Path, interface: Option<&str>, journal: &Path) -> Result<()> {
+    check_scope_inner(root, interface, Some(journal))
+}
+
+fn check_scope_inner(root: &Path, interface: Option<&str>, retry: Option<&Path>) -> Result<()> {
     check_commit(root)?;
+    crate::core::recovery_control::check_runtime_except(root, interface, retry)?;
     let cleanup = pending().lock().expect("recovery housekeeping lock");
     for path in cleanup.keys().filter(|path| path.starts_with(root)) {
         let scoped = path.parent() == Some(root.join("interface-transactions").as_path());
@@ -624,6 +642,15 @@ pub fn check_scope(root: &Path, interface: Option<&str>) -> Result<()> {
     let guard = blocked().lock().expect("recovery scope lock");
     if let Some(scopes) = guard.get(root) {
         for (name, block) in scopes {
+            let journal = root
+                .join("interface-transactions")
+                .join(format!("{name}.json"));
+            if block.retry_transaction
+                && retry == Some(journal.as_path())
+                && crate::core::recovery_control::stopped(&journal)
+            {
+                continue;
+            }
             if interface.is_none_or(|interface| interface == name) {
                 anyhow::bail!("interface={name}; invariant=restore_before_mutation; operation=admit_mutation; metadata_safe_to_remove=false; recovery blocked: {}", block.reason);
             }

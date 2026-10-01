@@ -191,6 +191,14 @@ impl<'a> StartupRollback<'a> {
     }
 }
 
+fn recovery_shutdown_policy(root: &std::path::Path) -> ShutdownPolicy {
+    if crate::core::recovery_control::preservation_required(root) {
+        ShutdownPolicy::PreserveInterfaces
+    } else {
+        ShutdownPolicy::RestoreInterfaces
+    }
+}
+
 fn router_recovery_allows_degraded_startup(
     status: crate::core::router_transaction::CoordinatorStatus,
     foreign_route_conflict: bool,
@@ -198,6 +206,7 @@ fn router_recovery_allows_degraded_startup(
     matches!(
         status,
         crate::core::router_transaction::CoordinatorStatus::RollbackFailed
+            | crate::core::router_transaction::CoordinatorStatus::RecoveryRequired
             | crate::core::router_transaction::CoordinatorStatus::RecoveredButJournalCleanupPending
     ) || foreign_route_conflict
 }
@@ -246,7 +255,12 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     stack.push({
         let interface_manager = interface_manager.clone();
         let startup_baselines = startup_baselines.clone();
-        async move { rollback_interfaces(&interface_manager, &startup_baselines).await }
+        let root = config.runtime.state_dir.clone();
+        async move {
+            if !crate::core::recovery_control::preservation_required(&root) {
+                rollback_interfaces(&interface_manager, &startup_baselines).await;
+            }
+        }
     });
 
     if shutdown_requested(&shutdown) && !router_recovery_pending {
@@ -269,7 +283,8 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     };
     if let Some(wifi) = &wifi_supervisor {
         let wifi = wifi.clone();
-        stack.push(async move { wifi.shutdown(ShutdownPolicy::RestoreInterfaces).await });
+        let root = config.runtime.state_dir.clone();
+        stack.push(async move { wifi.shutdown(recovery_shutdown_policy(&root)).await });
     }
 
     if shutdown_requested(&shutdown) && !router_recovery_pending {
@@ -292,11 +307,8 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     };
     if let Some(wifi_client) = &wifi_client_supervisor {
         let wifi_client = wifi_client.clone();
-        stack.push(async move {
-            wifi_client
-                .shutdown(ShutdownPolicy::RestoreInterfaces)
-                .await
-        });
+        let root = config.runtime.state_dir.clone();
+        stack.push(async move { wifi_client.shutdown(recovery_shutdown_policy(&root)).await });
     }
 
     if shutdown_requested(&shutdown) && !router_recovery_pending {
@@ -346,11 +358,8 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     };
     stack.push({
         let dhcp_client = dhcp_client.clone();
-        async move {
-            dhcp_client
-                .shutdown(ShutdownPolicy::RestoreInterfaces)
-                .await
-        }
+        let root = config.runtime.state_dir.clone();
+        async move { dhcp_client.shutdown(recovery_shutdown_policy(&root)).await }
     });
 
     // Serializes request/background control-plane mutations. Autonomous DHCP
@@ -407,7 +416,12 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     };
     if let Some(state) = &router_state {
         let state = state.clone();
-        stack.push(async move { rollback_router_dataplane(&state).await });
+        let root = config.runtime.state_dir.clone();
+        stack.push(async move {
+            if !crate::core::recovery_control::preservation_required(&root) {
+                rollback_router_dataplane(&state).await;
+            }
+        });
     }
 
     if shutdown_requested(&shutdown) && !router_recovery_pending {
@@ -520,7 +534,15 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     }
     let desired = strict_desired;
 
-    if router_recovery_pending {
+    if router_recovery_pending
+        && match &router_coordinator {
+            Some(coordinator) => {
+                coordinator.status().await
+                    == crate::core::router_transaction::CoordinatorStatus::Idle
+            }
+            None => false,
+        }
+    {
         // The rollback coordinator was given inert runtime adapters. Only after the journal is
         // resolved and strict admission succeeds may normal startup cleanup/configuration run.
         if let Some(wifi) = &wifi_supervisor {
@@ -599,8 +621,9 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     };
     if let Some(vpn) = &vpn_manager {
         let vpn = vpn.clone();
+        let root = config.runtime.state_dir.clone();
         stack.push(async move {
-            if let Err(error) = vpn.shutdown(ShutdownPolicy::RestoreInterfaces).await {
+            if let Err(error) = vpn.shutdown(recovery_shutdown_policy(&root)).await {
                 tracing::error!(%error, "failed to shut down VPN manager during startup rollback");
             }
         });
@@ -817,7 +840,7 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     if let Some(coordinator) = &router_coordinator {
         let _network_mutation = network_mutations.write().await;
         if coordinator.status().await != crate::core::router_transaction::CoordinatorStatus::Idle {
-            if let Err(error) = coordinator.rollback().await {
+            if let Err(error) = coordinator.rollback_for_shutdown().await {
                 tracing::error!(%error, "failed to roll back router transaction during shutdown");
             }
         }

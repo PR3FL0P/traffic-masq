@@ -287,6 +287,7 @@ impl ControlService {
                 crate::core::router_transaction::CoordinatorStatus::Idle => {}
                 crate::core::router_transaction::CoordinatorStatus::Pending
                 | crate::core::router_transaction::CoordinatorStatus::CommitIndeterminate
+                | crate::core::router_transaction::CoordinatorStatus::RecoveryRequired
                 | crate::core::router_transaction::CoordinatorStatus::RollbackFailed | crate::core::router_transaction::CoordinatorStatus::RecoveredButJournalCleanupPending => {
                     return vpn_policy_error(VpnPolicyErrorDetail::Other {
                         message: "a router transaction is pending; refusing to change VPN mode \

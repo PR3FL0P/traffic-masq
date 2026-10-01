@@ -698,14 +698,10 @@ where
         let mut errors = Vec::new();
         for entry in snapshot {
             if let Err(error) = self.interfaces.rollback(entry).await {
-                errors.push(format!("{}: {error}", entry.name));
+                errors.push(error.context(entry.name.clone()));
             }
         }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            bail!("interface rollback was incomplete: {}", errors.join("; "))
-        }
+        crate::core::recovery_control::aggregate(errors, "interface rollback was incomplete")
     }
 
     async fn rollback_uplink_wifi(&self, snapshot: &[WifiSnapshot<WifiClientSpec>]) -> Result<()> {
