@@ -35,7 +35,10 @@ keeps profile storage, activation policy, and ownership recovery.
 captures one router-scoped `RouterSnapshot` with `snapshot_for`, including
 absent DHCP services and clients needed for rollback. `RouterSubsystems::plan_for`
 collects a full plan; route, VPN, and dataplane planning remain available for
-targeted drift repair. The app's
+targeted drift repair. The production adapter delegates VPN hop ownership,
+relay routing, policy, and compensation to a concrete VPN chain runtime while
+`RouterManager` retains the transaction order. Wi-Fi startup checks for
+hostapd, iw, and wpa_supplicant live with the Wi-Fi supervisors. The app's
 `startup_recovery` module validates durable proofs before normal admission or
 API binding; `router_startup` wires the production coordinator and restores
 temporary route/dataplane baselines; `vpn_startup` prepares VPN control and

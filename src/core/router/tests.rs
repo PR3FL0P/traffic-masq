@@ -330,6 +330,38 @@ fn plan() -> RouterPlan {
     }
 }
 
+fn plan_with_vpn_chain() -> RouterPlan {
+    let mut config = enabled_config();
+    config.vpn.enabled = true;
+    config.router.vpn_chain.push(crate::config::VpnHopConfig {
+        profile_name: "home.conf".into(),
+    });
+    let desired = RouterDesired::from_effective_config(&config).unwrap();
+    let mut plan = plan();
+    plan.vpn_chain = VpnChainPlan {
+        hops: desired.vpn_chain.clone(),
+    };
+    plan.dataplane.target = desired.dataplane.clone();
+    plan.desired = desired;
+    plan
+}
+
+fn ap_spec(ssid: &str) -> WifiApSpec {
+    WifiApSpec {
+        interface: "wlan0".into(),
+        ssid: ssid.into(),
+        country_code: None,
+        band: crate::config::WifiBand::Ghz2,
+        channel: 1,
+        channel_width: crate::config::WifiChannelWidth::Ht20,
+        security: crate::config::WifiSecurity::Open,
+        hidden: false,
+        client_isolation: false,
+        max_stations: 32,
+        passphrase_file: None,
+    }
+}
+
 #[async_trait]
 impl RouterSubsystems for FakeSubsystems {
     async fn plan_for(&self, desired: &RouterDesired) -> Result<RouterSubsystemPlan> {
@@ -407,8 +439,20 @@ impl RouterSubsystems for FakeSubsystems {
     async fn apply_uplink_dhcp_candidate(&self, _: Option<&DhcpClientSpec>) -> Result<bool> {
         Ok(self.quiesce_dhcp)
     }
-    async fn apply_output_wifi(&self, _: &[WifiPlan<WifiApSpec>]) -> Result<()> {
-        self.event("apply_output_wifi")
+    async fn apply_output_wifi(&self, plan: &[WifiPlan<WifiApSpec>]) -> Result<()> {
+        let event = match plan {
+            [WifiPlan::Stop { .. }] => "apply_output_wifi_stop",
+            [WifiPlan::Start { .. }] => "apply_output_wifi_start",
+            _ => "apply_output_wifi",
+        };
+        self.event(event)
+    }
+    async fn apply_vpn_chain(&self, plan: &VpnChainPlan) -> Result<()> {
+        if plan.hops.is_empty() {
+            Ok(())
+        } else {
+            self.event("apply_vpn_chain")
+        }
     }
     async fn apply_routes(&self, _: &RoutePlan) -> Result<()> {
         self.event("apply_routes")
@@ -446,6 +490,13 @@ impl RouterSubsystems for FakeSubsystems {
     async fn rollback_output_wifi(&self, _: &[WifiSnapshot<WifiApSpec>]) -> Result<()> {
         self.event("rollback_output_wifi")
     }
+    async fn rollback_vpn_chain(&self, snapshot: &VpnChainSnapshot) -> Result<()> {
+        if snapshot.hops.is_empty() {
+            Ok(())
+        } else {
+            self.event("rollback_vpn_chain")
+        }
+    }
     async fn rollback_routes(&self, _: &RouteSnapshot) -> Result<()> {
         self.event("rollback_routes")
     }
@@ -464,6 +515,13 @@ impl RouterSubsystems for FakeSubsystems {
     async fn health_output_wifi(&self, _: &RouterDesired) -> Result<()> {
         self.event("health_output_wifi")
     }
+    async fn health_vpn_chain(&self, desired: &RouterDesired) -> Result<()> {
+        if desired.vpn_chain.is_empty() {
+            Ok(())
+        } else {
+            self.event("health_vpn_chain")
+        }
+    }
     async fn health_routes(&self, _: &RouterDesired) -> Result<()> {
         self.event("health_routes")
     }
@@ -480,19 +538,7 @@ async fn access_point_stop_precedes_station_apply_and_is_compensated_on_failure(
     let fake = FakeSubsystems::new(Some("apply_uplink_wifi"));
     let mut plan = plan();
     plan.output_wifi.push(WifiPlan::Stop {
-        current: WifiApSpec {
-            interface: "wlan0".into(),
-            ssid: "old-ap".into(),
-            country_code: None,
-            band: crate::config::WifiBand::Ghz2,
-            channel: 1,
-            channel_width: crate::config::WifiChannelWidth::Ht20,
-            security: crate::config::WifiSecurity::Open,
-            hidden: false,
-            client_isolation: false,
-            max_stations: 32,
-            passphrase_file: None,
-        },
+        current: ap_spec("old-ap"),
     });
     RouterManager::new(fake.clone())
         .apply(&plan)
@@ -500,8 +546,68 @@ async fn access_point_stop_precedes_station_apply_and_is_compensated_on_failure(
         .unwrap_err();
     let events = fake.events();
     let position = |name: &str| events.iter().position(|event| event == name).unwrap();
-    assert!(position("apply_output_wifi") < position("apply_uplink_wifi"));
+    assert!(position("apply_output_wifi_stop") < position("apply_uplink_wifi"));
     assert!(position("rollback_uplink_wifi") < position("rollback_output_wifi"));
+}
+
+#[tokio::test]
+async fn ap_stop_precedes_uplink_and_ap_start_follows_vpn() {
+    let fake = FakeSubsystems::new(None);
+    let mut plan = plan_with_vpn_chain();
+    plan.output_wifi = vec![
+        WifiPlan::Stop {
+            current: ap_spec("old-ap"),
+        },
+        WifiPlan::Start {
+            desired: ap_spec("new-ap"),
+        },
+    ];
+
+    RouterManager::new(fake.clone()).apply(&plan).await.unwrap();
+
+    let events = fake.events();
+    let position = |name: &str| events.iter().position(|event| event == name).unwrap();
+    assert!(position("apply_output_wifi_stop") < position("apply_uplink_wifi"));
+    assert!(position("apply_uplink_wifi") < position("apply_vpn_chain"));
+    assert!(position("apply_vpn_chain") < position("apply_output_wifi_start"));
+    assert!(position("apply_output_wifi_start") < position("apply_dhcp"));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.starts_with("apply_output_wifi"))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn crash_recovery_restores_all_stages_with_dhcp_around_interfaces() {
+    let fake = FakeSubsystems::with_quiesced_dhcp(None);
+    let manager = RouterManager::new(fake.clone());
+    let plan = plan_with_vpn_chain();
+    let mut snapshot = manager.snapshot_for(&plan.desired).await.unwrap();
+    let hop = plan.vpn_chain.hops[0].clone();
+    snapshot.vpn_chain = VpnChainSnapshot {
+        hops: vec![hop.interface.clone()],
+        previous_hops: vec![hop],
+    };
+
+    assert!(manager.rollback_to(&snapshot).await.is_empty());
+    assert_eq!(
+        fake.events(),
+        [
+            "snapshot_for",
+            "rollback_dataplane",
+            "rollback_routes",
+            "rollback_dhcp",
+            "rollback_output_wifi",
+            "rollback_vpn_chain",
+            "rollback_candidate_uplink_dhcp",
+            "rollback_uplink_wifi",
+            "rollback_interfaces",
+            "rollback_uplink_dhcp",
+        ]
+    );
 }
 
 #[tokio::test]

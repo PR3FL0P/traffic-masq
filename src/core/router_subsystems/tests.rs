@@ -541,6 +541,7 @@ use crate::core::vpn_chain::{VpnHopDesired, VpnHopKind, VpnHopRoutingDesired};
 use crate::core::vpn_policy::VpnPolicyReservedIds;
 use crate::firewall::vpn::test_support::FakeNftExecutor;
 use crate::netlink::{Ipv4RuleInfo, Ipv4RuleSpec as NetIpv4RuleSpec};
+use crate::vpn::active_profile::ActiveProfileStore;
 use crate::vpn::store::WireGuardProfileStore;
 use crate::vpn::wireguard::{WireGuardKey, WireGuardPeerConfig};
 use crate::vpn::{ProviderError, VpnProvider};

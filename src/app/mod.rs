@@ -15,7 +15,6 @@ mod startup_recovery;
 mod vpn_startup;
 
 use std::future::Future;
-use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -143,66 +142,6 @@ fn spawn_wifi_autoconnect(
     })
 }
 
-async fn preflight_hostapd_binary(binary: &Path) -> Result<()> {
-    crate::command::probe(binary).await.with_context(|| {
-        format!(
-            "hostapd binary {} is not runnable — install hostapd or fix wifi.hostapd_binary",
-            binary.display()
-        )
-    })?;
-    Ok(())
-}
-
-async fn preflight_iw_binary(binary: &Path) -> Result<()> {
-    crate::command::probe(binary).await.with_context(|| {
-        format!(
-            "iw binary {} is not runnable — install iw or fix wifi.iw_binary",
-            binary.display()
-        )
-    })?;
-    Ok(())
-}
-
-async fn build_wifi_supervisor(effective_config: &AppConfig) -> Result<Option<HostapdSupervisor>> {
-    // Built regardless of `wifi.enabled`: constructing the supervisor has no
-    // side effects, and gating it made enabling Wi-Fi a boot-time decision —
-    // with no supervisor every Wi-Fi request answers "disabled", which is the
-    // state you are in when you want to turn it on.
-    //
-    // `enabled` survives as a startup hint: if this box declares that it uses
-    // Wi-Fi, a missing binary is still reported immediately rather than at the
-    // first attempt to configure an access point.
-    if effective_config.wifi.enabled {
-        preflight_hostapd_binary(&effective_config.wifi.hostapd_binary).await?;
-        preflight_iw_binary(&effective_config.wifi.iw_binary).await?;
-    }
-    let supervisor = HostapdSupervisor::start(effective_config).await?;
-    Ok(Some(supervisor))
-}
-
-async fn preflight_wpa_supplicant_binary(binary: &Path) -> Result<()> {
-    crate::command::probe(binary).await
-        .with_context(|| {
-            format!(
-                "wpa_supplicant binary {} is not runnable — install wpa_supplicant or fix wifi_client.wpa_supplicant_binary",
-                binary.display()
-            )
-        })?;
-    Ok(())
-}
-
-async fn build_wifi_client_supervisor(
-    effective_config: &AppConfig,
-) -> Result<Option<WifiClientSupervisor>> {
-    // Same reasoning as `build_wifi_supervisor`.
-    if effective_config.wifi_client.enabled {
-        preflight_wpa_supplicant_binary(&effective_config.wifi_client.wpa_supplicant_binary)
-            .await?;
-    }
-    let supervisor = WifiClientSupervisor::start(effective_config).await?;
-    Ok(Some(supervisor))
-}
-
 /// Open the configured authentication store and reset the device administrator password.
 pub async fn reset_device_password(config: &AppConfig, password: &str) -> Result<Principal> {
     config.validate()?;
@@ -315,8 +254,8 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     let wifi_supervisor = if router_recovery_pending {
         Some(HostapdSupervisor::open_for_recovery(&startup_config))
     } else {
-        match build_wifi_supervisor(&startup_config).await {
-            Ok(supervisor) => supervisor,
+        match crate::wifi::startup::start_ap(&startup_config).await {
+            Ok(supervisor) => Some(supervisor),
             Err(error) => {
                 tracing::error!(subsystem = "wifi_ap", operation = "initialize_supervisor",
                     error = %format!("{error:#}"), "Wi-Fi subsystem unavailable; other subsystems will still start");
@@ -338,8 +277,8 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     let wifi_client_supervisor = if router_recovery_pending {
         Some(WifiClientSupervisor::open_for_recovery(&startup_config))
     } else {
-        match build_wifi_client_supervisor(&startup_config).await {
-            Ok(supervisor) => supervisor,
+        match crate::wifi::startup::start_client(&startup_config).await {
+            Ok(supervisor) => Some(supervisor),
             Err(error) => {
                 tracing::error!(subsystem = "wifi_client", operation = "initialize_supervisor",
                     error = %format!("{error:#}"), "Wi-Fi subsystem unavailable; other subsystems will still start");

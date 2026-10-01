@@ -14,6 +14,7 @@ pub(crate) mod radio;
 pub mod record;
 pub mod render;
 pub mod secret;
+pub(crate) mod startup;
 pub mod store;
 pub mod supervisor;
 
