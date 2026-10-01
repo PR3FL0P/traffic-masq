@@ -5,8 +5,8 @@ x86-64 archive containing the two binaries. Tests are optional and off by
 default; enable `run_tests` to run them. The workflow does not run on tags or
 produce a checksum. Publishing a GitHub release is a separate step.
 
-1. Update the version in `Cargo.toml`, regenerate `Cargo.lock`, and prepare
-   release notes.
+1. Update versions in the root and affected workspace crates' `Cargo.toml` files,
+   regenerate `Cargo.lock`, and prepare release notes.
 2. Run the [standard checks](../README.md#checks) and
    `sh packaging/test-namespaces.sh` on a disposable VM. The latter includes
    both VPN test suites.
@@ -34,6 +34,12 @@ release profile. Download its `traffic-masq-binaries` artifact, which contains
 the two binaries and `traffic-masq-linux-x86_64.tar.gz`. Generate a checksum
 separately if publishing that archive. The workflow's optional tests run with
 `cargo test --workspace --lib` by default; `test_filter=all` runs `cargo test --workspace`.
+
+The local archive is named `traffic-masq-<version>-<target>.tar.gz` and has a
+matching `.tar.gz.sha256` file. It includes a top-level directory of the same
+name containing both binaries, documentation, examples and packaging scripts.
+The CI archive contains only the two binaries at its root. Its `tests_only`
+input skips build and packaging; also enable `run_tests` to execute tests.
 
 Use `BINARY_DIR`, `OUTPUT_DIR` and `TARGET` to package binaries built elsewhere.
 When cross-compiling, set both `BINARY_DIR` and the actual `TARGET` explicitly.

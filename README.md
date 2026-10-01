@@ -126,28 +126,32 @@ address and a DHCP pool to a wireless interface alone does not create an AP.
 
 ## Saved access-point profiles
 
-In **Wi-Fi**, select a managed output radio and choose **Configure AP**. Set
-SSID, security, password, country, band/channel/width and client options. Enter
-**Profile ID** (1–15 ASCII letters, digits, dots, underscores or hyphens) and
-choose **Save / update profile**. Saving does not change the running network.
-For a new protected profile, enter its password explicitly.
+In **Wi-Fi**, open **Saved AP profiles**, then **Create new profile** or
+**Management** to select an existing profile. Set its ID, SSID, security,
+password, country, band/channel/width, client options, DHCP policy and optional
+IPv4 subnet. IDs use 1–15 ASCII letters, digits, dots, underscores or hyphens.
+Choose **Create profile** or **Update profile** to save and return to the list.
+Saving does not change the running network; existing profile IDs are fixed.
+For a new protected profile, enter its password explicitly. A blank password
+while editing retains that profile's saved password.
 
-**Load profile** opens a list: select a profile with Up/Down and press Enter; the selected
-ID appears in **Profile ID**. A blank password keeps that profile's saved password.
-**Save / update profile** saves edits to a loaded profile; **Apply** applies the saved profile to the selected radio. Unsaved edits must be saved first. Esc asks before discarding edited AP settings.
-Confirm the resulting network change before its deadline, or it rolls back.
-Deleting a profile leaves running APs unchanged. Profiles are reusable across
-radios; each target still needs a managed output role and an IPv4 subnet.
+When the profile list is opened from an output interface, select a profile and
+choose **Apply profile**. The target must be managed with an output role.
+Verify connectivity and commit the pending change before its deadline.
+Deleting a profile requires confirmation and leaves running APs unchanged.
+Esc asks before discarding edited AP settings.
 
-Profiles include radio/security settings and the option to derive DHCP from the
-target interface's subnet. They do not copy IP addresses, routing or NAT rules.
-The existing DHCP configuration is preserved when **Configure DHCP** is off.
+Profiles are reusable across radios and include radio/security settings, an
+optional subnet and DHCP policy (preserve, enable/configure, or disable).
+Applying a stored subnet can change the target's IPv4 address; review it before
+reusing a profile on another LAN. Profiles do not contain routing or NAT rules.
 
 The authenticated REST API provides:
 
 - `GET /api/v1/wifi-ap-profiles`: list profiles without passwords.
 - `PUT /api/v1/wifi-ap-profiles`: create/update a profile, with `id`, `settings`,
-  optional `passphrase`, `clear_passphrase` and `configure_dhcp`.
+  optional `passphrase`, `clear_passphrase`, `configure_dhcp`, `subnet` and
+  `disable_dhcp`.
 - `DELETE /api/v1/wifi-ap-profiles/{id}`: delete a saved profile.
 - `PUT /api/v1/wifi/{interface}/profile`: apply `{ "profile_id": "guest" }` and
   return the normal pending network-change token for confirmation.
@@ -264,6 +268,7 @@ It keeps configuration, passwords, state, logs and dependency packages.
 ## More documentation
 
 - [Operating guide](docs/usage.md): installation options, configuration and TUI behavior.
+- [Configuration reference](docs/configuration.md): supported TOML fields, defaults and examples.
 - [HTTP API](docs/api.md): authentication, endpoints, JSON schemas and commit-confirm flows.
 - [Recovery runbook](docs/recovery.md): `TM-REC-xxx` operator procedures for startup-blocking and degraded recovery.
 - [Service integration](packaging/INIT.md): init systems, updates and service ownership.
@@ -275,7 +280,7 @@ It keeps configuration, passwords, state, logs and dependency packages.
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --locked --all-targets -- -D warnings
+cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
 sh packaging/smoke-test.sh
 ```

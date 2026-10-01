@@ -19,7 +19,7 @@ The supported build toolchain is Rust 1.95.0, pinned in `rust-toolchain.toml`.
 
 - Linux
 - root access for `traffic-masqd`
-- kernel support for nftables and WireGuard
+- kernel support for nftables when using routing/firewall features, and WireGuard when using VPN
 - `nft` in `PATH`, built with JSON support
 - two or more network interfaces for router operation
 - `hostapd` and `iw` for Wi-Fi access point mode
@@ -58,7 +58,7 @@ target/release/traffic-masqd
 The default tests need no privileges and do not change the host network:
 
 ```sh
-cargo test --locked
+cargo test --locked --workspace
 ```
 
 Run the eight network and VPN suites through the isolated runner:
@@ -221,9 +221,10 @@ not the runtime overrides saved by the TUI or API. Inspect the effective
 interface/router settings through the TUI or API. `config validate` validates
 the file configuration; it does not test live connectivity.
 
-A complete configuration template is available at
+An Internet-sharing configuration example is available at
 [`examples/config.toml`](../examples/config.toml). Replace all interface names and
-addresses before use.
+addresses before use. See the [configuration reference](configuration.md) for
+all supported sections, optional fields, defaults and Wi-Fi/DHCP examples.
 
 The daemon also exposes a versioned JSON API on its Unix socket and, when
 explicitly enabled, over HTTPS. See the [HTTP API reference](api.md) for
@@ -432,6 +433,22 @@ does not update the running AP. Repeated unsuccessful AP starts use exponential
 restart backoff (up to five minutes); answering control-socket PING does not
 reset that backoff until hostapd reports `ENABLED`.
 
+### WireGuard profile compatibility
+
+Import a profile with a plain basename ending in `.conf` (for example
+`office.conf`). The parser reads `[Interface]` fields `PrivateKey`, `ListenPort`,
+`Address`, `DNS`, `MTU`, and `[Peer]` fields `PublicKey`, `AllowedIPs`, `Endpoint`,
+`PersistentKeepalive`, `PresharedKey`. A private key and at least one peer with
+a public key are required. Keys must decode to 32 bytes.
+
+Endpoints must be numeric socket addresses, such as `203.0.113.10:51820` or
+`[2001:db8::10]:51820`; hostname resolution is not implemented. Unknown keys
+are ignored, including `wg-quick` hooks (`PreUp`, `PostUp`, `PreDown`,
+`PostDown`) and `Table`. Hooks are never executed. `DNS` values are parsed as
+IP addresses but do not configure the system resolver. Profile activation and
+traffic-policy routing are separate operations; importing a `wg-quick` file
+does not reproduce all of `wg-quick`'s behavior.
+
 ## Daemon commands
 
 ```text
@@ -444,8 +461,8 @@ traffic-masqd [--config <path>] <command>
 | `uninstall` | Remove installed binaries and service files, preserving configuration and state. |
 | `reset [--dry-run] [--yes] [--force-offline]` | Clear configuration and persistent state; see [reset requirements](#reset-all-settings). |
 | `run` | Run in the foreground (also the default when no command is supplied). |
-| `start [--timeout-seconds N]` | Start in the background. |
-| `stop [--timeout-seconds N]` | Stop the daemon. |
+| `start [--timeout-seconds N]` | Start through the registered service manager, or detach without registration; default readiness timeout is 10 seconds. |
+| `stop [--timeout-seconds N]` | Stop through the registered service manager, or directly without registration; default timeout is 30 seconds. |
 | `status` | Print process and API state. |
 | `logs [-n N] [--follow]` | Read the daemon log. |
 | `auth set-password` | Reset the password while the daemon is stopped. |
@@ -465,6 +482,12 @@ traffic-masq [--socket <path>] [--direct | --change-password | --check-conflicts
 | `--direct` | Read interface state without the daemon. |
 | `--change-password` | Change the password through a running daemon. |
 | `--check-conflicts` | Report detected competing network managers and resolution advice. |
+
+The conflict scan reads process names in `/proc`; it does not require a daemon
+session and does not change services. It reports possible competitors, not
+proof that they manage a particular interface. It excludes `hostapd` and
+`wpa_supplicant`, which traffic-masq also supervises. An empty result does not
+rule out unreadable processes or an independently launched Wi-Fi worker.
 
 Direct mode is read-only. DHCP, router, VPN, and settings operations are not
 available in this mode.

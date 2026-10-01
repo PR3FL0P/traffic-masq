@@ -1,4 +1,4 @@
-# TUI Module (`src/tui`)
+# TUI Module (`crates/tui/src/tui`)
 
 > **Developer & AI Agent Reference Manual**  
 > This document details the architecture, design principles, invariants, and best practices for developing and maintaining the Terminal User Interface (`traffic-masq`) module.
@@ -7,7 +7,7 @@
 
 ## 1. Overview & Architecture
 
-The `src/tui` module implements the interactive terminal client binary (`traffic-masq`) built on top of [Ratatui](https://github.com/ratatui/ratatui) and [Crossterm](https://github.com/crossterm-rs/crossterm).
+The `crates/tui/src/tui` module implements the interactive terminal client binary (`traffic-masq`) built on top of [Ratatui](https://github.com/ratatui/ratatui) and [Crossterm](https://github.com/crossterm-rs/crossterm).
 
 The TUI serves as the primary operational console for the `traffic-masq` networking suite, allowing network operators to configure network interfaces, uplink DHCP clients, DHCP servers, Wi-Fi access points, Wi-Fi client connections, WireGuard VPN tunnels, and router provisioning without losing access to remote machines.
 
@@ -40,7 +40,8 @@ The TUI serves as the primary operational console for the `traffic-masq` network
 | [`dhcp_client.rs`](dhcp_client.rs) | Uplink DHCP client supervision view with interface-name-based selection, scrolling, lease renewal/release, and defaults configuration. | `render`, `refresh`, `handle_key` |
 | [`router/mod.rs`](router/mod.rs) | Router façade and shared state; route editing, controller/API orchestration, rendering, pending transaction views, and tests are split into `router/` submodules. | `RouterData`, `RouteEditorField`, `RouterPendingView`, `render_router` |
 | [`wifi/mod.rs`](wifi/mod.rs) | Wi-Fi façade and shared state/model mapping; owns radio list behavior and re-exports screen handlers. | `WifiData`, `WifiRole`, `WifiEditor`, `WifiScanPicker`, `WifiProfileEditor`, `WifiConnectPrompt` |
-| [`wifi/`](wifi) | Wi-Fi screen implementations split by responsibility: AP editor, scan picker, saved profiles, profile editor, connect/IP prompt, and Wi-Fi-specific tests. | `ap_editor`, `scan`, `profiles`, `profile_editor`, `connect` |
+| [`wifi/ap_profiles.rs`](wifi/ap_profiles.rs) | Saved AP profile menu, library, edit/delete/apply actions and deletion confirmation. | `WifiApProfilesView`, `open_ap_profiles`, `render_wifi_ap_profiles` |
+| [`wifi/`](wifi) | Wi-Fi screen implementations split by responsibility: AP editor, scan picker, saved profiles, profile editor, connect/IP prompt, and Wi-Fi-specific tests. | `ap_editor`, `scan`, `profiles`, `profile_editor`, `ap_profiles`, `connect` |
 | [`vpn.rs`](vpn.rs) | WireGuard VPN profile management, connection lifecycle, configuration import wizard, deletion confirmation. | `VpnData`, `VpnFocus`, `VpnImportEditor` |
 | [`vpn_policy.rs`](vpn_policy.rs) | Policy routing rules for WireGuard (routing marks, table IDs, client bypass policies). | `VpnPolicyData`, `VpnPolicyEditor` |
 | [`settings.rs`](settings.rs) | Daemon configuration, rollback timeout settings, session preferences, device password update wizard, security override reset. | `SecurityEditor`, `SettingsField`, `PasswordChangeEditor` |
@@ -77,7 +78,7 @@ In a terminal application, performing long-running network operations directly i
    - Non-cancellable writes: `"Operation in progress Xs; rollback deadline in Ys. Q: exit after result; other actions disabled"`
 3. **Cancellable vs. Non-Cancellable Operations:**
    - **Reads/Refreshes (`cancellable = true`):** If the user presses any key during a background refresh, the future is dropped immediately, returning the input event so the operator's action is processed without latency.
-   - **Mutations/Applies (`cancellable = false`):** The TUI never cancels or retries network mutations. The control client's mutation deadline is deliberately outside the server's hard HTTP connection deadline, so an admitted mutation normally resolves server-side before the client can report an unknown outcome. The UI permits pressing `q` to queue an exit after the response arrives, but blocks other inputs.
+   - **Mutations/Applies (`cancellable = false`):** The TUI never cancels or retries network mutations. Ctrl+C also queues an exit until the response arrives. The control client's mutation deadline is deliberately outside the server's hard HTTP connection deadline, so an admitted mutation normally resolves server-side before the client can report an unknown outcome. The UI permits pressing `q` to queue an exit after the response arrives, but blocks other inputs.
 4. **Resize-Safe Progress Rendering:** At the same terminal size, the progress banner reuses the last rendered frame so footer/status context stays intact. After a resize, the stale snapshot is discarded and progress is rendered against the new geometry instead of replaying old coordinates.
 
 ### 3.2. Commit-Confirm & Immediate Mutation Flows
@@ -147,13 +148,13 @@ Never manipulate UTF-8 strings by raw byte indexing. The helper `input::TextEdit
    - File and directory permissions must be strictly verified: owner UID match, directory mode `0700`, file mode `0600`.
    - Must reject symlinks and open files with `O_NOFOLLOW`.
    - Writes are performed atomically using temporary files and directory fsyncs.
-   - Changing the device password immediately invalidates all stored sessions across all clients.
+   - Changing the device password revokes sessions on the daemon; cached token files on other clients can remain on disk but no longer authenticate. If `$XDG_STATE_HOME` is absent or relative, storage falls back to the effective user's `~/.local/state`. Session preferences use a separate `<hash>.preferences.json` file in the same directory.
 
 ---
 
 ## 4. Best Practices for Modifying the TUI
 
-When adding features, screens, or fixing bugs in `src/tui`, adhere to the following rules:
+When adding features, screens, or fixing bugs in `crates/tui/src/tui`, adhere to the following rules:
 
 ### Rule 1: Use Typed Enums, Never Magic Numbers
 Do not use raw integers for button slots, action indices, or menu choices.

@@ -9,7 +9,9 @@ daemon never exposes an unencrypted TCP listener.
 The API is currently intended to be used together with the same release of the
 daemon. Additive fields and response variants may appear within version 1, so
 clients should ignore unknown object fields and handle unknown `type` values.
-Request bodies are limited to 64 KiB.
+Request bodies are limited to 64 KiB. HTTP/1 connections close after one
+request and have a 60-second server deadline; TLS handshakes have a 10-second
+deadline. A lost response does not cancel an admitted control operation.
 
 ## Quick start
 
@@ -348,7 +350,15 @@ An empty `cidr` requests no owned static address.
 
 Each `set_interfaces` value has the `InterfaceChange` shape. Omitted proposal
 fields default to `null`, `false`, or an empty collection. `set_router` and
-`clear_router` are mutually exclusive.
+`clear_router` are mutually exclusive. This is a complete router replacement:
+include the routes and settings you want to retain in `set_router`.
+
+A forwarding rule accepts optional `source_subnet`, a network CIDR without host
+bits such as `"192.168.50.0/24"`. `masquerade` defaults to `true`. Omitted or
+`null` `forwarding` selects legacy uplink behavior; `[]` disables all explicit
+connections. Explicit forwarding requires direct global VPN policy and an empty
+`vpn_chain`. See the [router configuration reference](configuration.md#router)
+for uplink, static-route and VPN-chain fields.
 
 `ApiHttpsSettings`
 
@@ -364,6 +374,9 @@ fields default to `null`, `false`, or an empty collection. `set_router` and
 Changing these desired settings does not rebind the running listener. Restart
 the daemon after saving them. Use certificate files and a private key readable
 by the daemon.
+
+The terminal client currently connects only through a Unix socket; use an
+HTTP client for HTTPS access. Initial password setup still requires local root.
 
 `SecuritySettings`
 
@@ -426,6 +439,9 @@ are flattened rather than nested under `configuration`:
 ```json
 { "ssid": "Upstream", "country_code": "UA", "security": "wpa2" }
 ```
+
+SSID is 1–32 bytes; AP country is required for `5g`. Protected Wi-Fi
+passphrases are 8–63 printable ASCII characters.
 
 Client security is `wpa2`, `wpa3`, `wpa2_wpa3`, or `open`.
 
