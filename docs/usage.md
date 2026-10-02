@@ -87,6 +87,40 @@ excludes Wi-Fi simulation and physical hardware tests.
 
 Wi-Fi namespace tests also need `modprobe`, `modinfo` and `mac80211_hwsim`.
 Physical tests use `TRAFFIC_MASQ_*` variables for interfaces, SSIDs and PSK files.
+The physical runner accepts an explicit adapter. Inspect its kernel identity
+through the daemon's network provider without changing the connection:
+
+```sh
+sh packaging/test-wifi-physical.sh --interface wlp1s0 --suite inspect
+```
+
+To test actual WPA2 association with the daemon and wpa_supplicant, supply
+the network SSID and an absolute path to a regular password file with mode
+0600. Authenticate sudo in your terminal first; Cargo builds as your user:
+
+```sh
+sudo -v
+sh packaging/test-wifi-physical.sh --interface wlp1s0 --suite client \
+  --ssid 'your-network' --psk-file /absolute/path/to/wifi-password --sudo
+```
+
+`--suite ap` uses the same arguments for a hostapd AP test and requires an
+external station to connect during the test. Client/AP tests temporarily move
+the selected PHY into a network namespace and return it during cleanup. They
+refuse the current best-route interface and a PHY with other named interfaces.
+The inspection suite does not test association, scanning or AP startup.
+
+The default `functional` suite needs no Wi-Fi password. It starts a real daemon
+on the selected radio in a temporary namespace, scans nearby networks through
+the same HTTP API as the TUI, previews/applies/commits `198.18.0.1/24`, verifies
+the actual kernel address, then removes it and confirms removal. Run within
+range of an AP; an empty scan fails this functional check.
+
+```sh
+sudo -v
+sh packaging/test-wifi-physical.sh --interface wlp1s0 --sudo
+```
+
 Some need Internet access, a second radio or someone to unplug a cable. Read
 the selected test's setup and use a disposable host. Do not run all ignored
 tests together on your workstation.

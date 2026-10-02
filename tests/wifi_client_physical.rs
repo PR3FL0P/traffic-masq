@@ -31,7 +31,7 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 struct Inputs {
     interface: String,
     ssid: String,
-    psk_file: PathBuf,
+    psk_file: Option<PathBuf>,
 }
 
 struct PhysicalWifiFixture {
@@ -51,10 +51,15 @@ struct PhysicalWifiFixture {
 
 impl PhysicalWifiFixture {
     fn new() -> Result<Self> {
+        Self::with_inputs(Inputs::from_env()?)
+    }
+
+    fn with_inputs(inputs: Inputs) -> Result<Self> {
         require_linux_root_and_tools()?;
-        let inputs = Inputs::from_env()?;
         validate_interface(&inputs.interface, "TRAFFIC_MASQ_WIFI_INTERFACE")?;
-        validate_psk_file(&inputs.psk_file, "TRAFFIC_MASQ_WIFI_PSK_FILE")?;
+        if let Some(path) = &inputs.psk_file {
+            validate_psk_file(path, "TRAFFIC_MASQ_WIFI_PSK_FILE")?;
+        }
         refuse_management_uplink(&inputs.interface)?;
 
         let phy = interface_phy(&inputs.interface)?;
@@ -91,7 +96,7 @@ impl PhysicalWifiFixture {
         Ok(fixture)
     }
 
-    fn setup(&mut self, psk_file: PathBuf) -> Result<()> {
+    fn setup(&mut self, psk_file: Option<PathBuf>) -> Result<()> {
         run("ip", &["netns", "add", &self.namespace])?;
         run(
             "iw",
@@ -128,7 +133,11 @@ impl PhysicalWifiFixture {
         self.config.runtime.log_dir = self.temp.path().join("log");
         self.config.runtime.socket_path = self.temp.path().join("traffic-masqd.sock");
         self.config.runtime.pid_path = self.temp.path().join("traffic-masqd.pid");
-        self.config.runtime.shutdown_policy = ShutdownPolicy::PreserveInterfaces;
+        self.config.runtime.shutdown_policy = if psk_file.is_some() {
+            ShutdownPolicy::PreserveInterfaces
+        } else {
+            ShutdownPolicy::RestoreInterfaces
+        };
         self.config.auth.database_path = self.temp.path().join("auth.sqlite3");
         self.config.auth.argon2_memory_kib = 1_024;
         self.config.auth.argon2_iterations = 1;
@@ -148,17 +157,21 @@ impl PhysicalWifiFixture {
                 dhcp: None,
                 dhcp_client: None,
                 wifi: None,
-                wifi_client: Some(WifiClientConfig {
-                    ssid: self.ssid.clone(),
-                    country_code: None,
-                    security: match env::var("TRAFFIC_MASQ_WIFI_SECURITY").as_deref() {
-                        Ok("wpa3") => WifiClientSecurity::Wpa3,
-                        Ok("wpa2_wpa3") => WifiClientSecurity::Wpa2Wpa3,
-                        Ok("wpa2") | Err(_) => WifiClientSecurity::Wpa2,
-                        Ok(other) => bail!("unsupported TRAFFIC_MASQ_WIFI_SECURITY: {other}"),
-                    },
-                    passphrase_file: Some(psk_file),
-                }),
+                wifi_client: if let Some(psk_file) = psk_file {
+                    Some(WifiClientConfig {
+                        ssid: self.ssid.clone(),
+                        country_code: None,
+                        security: match env::var("TRAFFIC_MASQ_WIFI_SECURITY").as_deref() {
+                            Ok("wpa3") => WifiClientSecurity::Wpa3,
+                            Ok("wpa2_wpa3") => WifiClientSecurity::Wpa2Wpa3,
+                            Ok("wpa2") | Err(_) => WifiClientSecurity::Wpa2,
+                            Ok(other) => bail!("unsupported TRAFFIC_MASQ_WIFI_SECURITY: {other}"),
+                        },
+                        passphrase_file: Some(psk_file),
+                    })
+                } else {
+                    None
+                },
             },
         );
         self.config
@@ -172,7 +185,7 @@ impl PhysicalWifiFixture {
         Ok(())
     }
 
-    async fn run_test(&mut self) -> Result<()> {
+    async fn start_daemon(&mut self) -> Result<ApiClient> {
         let stdout = fs::File::create(self.temp.path().join("daemon.stdout"))?;
         let stderr = fs::File::create(self.temp.path().join("daemon.stderr"))?;
         self.daemon = Some(spawn_ns(
@@ -201,6 +214,11 @@ impl PhysicalWifiFixture {
             .await
             .context("failed to initialize authentication for physical Wi-Fi test")?;
 
+        Ok(client)
+    }
+
+    async fn run_test(&mut self) -> Result<()> {
+        let client = self.start_daemon().await?;
         timeout(WAIT_TIMEOUT, async {
             loop {
                 ensure_child_running(self.daemon.as_mut(), "traffic-masqd")?;
@@ -355,7 +373,7 @@ impl Inputs {
         Ok(Self {
             interface: required_env("TRAFFIC_MASQ_WIFI_INTERFACE")?,
             ssid: required_env("TRAFFIC_MASQ_WIFI_SSID")?,
-            psk_file: PathBuf::from(required_env("TRAFFIC_MASQ_WIFI_PSK_FILE")?),
+            psk_file: Some(PathBuf::from(required_env("TRAFFIC_MASQ_WIFI_PSK_FILE")?)),
         })
     }
 }
@@ -371,6 +389,148 @@ async fn physical_wpa2_client_associates_without_touching_management_uplink() ->
         return Err(error);
     }
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "moves a selected physical PHY; requires root and a separate management uplink"]
+async fn physical_tui_scan_discovers_real_networks() -> Result<()> {
+    run_physical_tui_test(true).await
+}
+
+#[tokio::test]
+#[ignore = "moves a selected physical PHY; requires root and a separate management uplink"]
+async fn physical_tui_static_ipv4_reaches_the_kernel() -> Result<()> {
+    run_physical_tui_test(false).await
+}
+
+async fn run_physical_tui_test(scan: bool) -> Result<()> {
+    let _guard = PHYSICAL_WIFI_TEST_LOCK.lock().await;
+    let mut fixture = PhysicalWifiFixture::with_inputs(Inputs {
+        interface: required_env("TRAFFIC_MASQ_WIFI_INTERFACE")?,
+        ssid: "scan-only-test".into(),
+        psk_file: None,
+    })?;
+    let result = async {
+        let client = fixture.start_daemon().await?;
+        let interface = fixture.namespace_interface.clone();
+        if scan {
+            match client
+                .request(&Request::WifiClientScan {
+                    interface: interface.clone(),
+                })
+                .await?
+            {
+                Response::WifiClientScanResults {
+                    interface: scanned,
+                    results,
+                } => {
+                    assert_eq!(scanned, interface);
+                    anyhow::ensure!(
+                        !results.is_empty(),
+                        "no networks discovered by the real scan; run within range of an AP"
+                    );
+                    println!("Real daemon scan returned {} networks", results.len());
+                }
+                response => bail!("TUI scan request failed: {response:?}"),
+            }
+            fixture.stop_daemon().await?;
+            return Ok(());
+        }
+        let edit = traffic_masq::api::model::InterfaceEditRequest {
+            cidr: "198.18.0.1/24".into(),
+            role: InterfaceRole::Input,
+            managed: true,
+            allow_management_change: true,
+        };
+        match client
+            .request(&Request::DryRunInterfaceEdit {
+                interface: interface.clone(),
+                edit: edit.clone(),
+            })
+            .await?
+        {
+            Response::InterfacePlan { plan } => assert!(plan.add_ipv4.is_some()),
+            response => bail!("TUI IP preview failed: {response:?}"),
+        }
+        let token = match client
+            .request(&Request::ApplyInterfaceEdit {
+                interface: interface.clone(),
+                edit,
+            })
+            .await?
+        {
+            Response::NetworkChangePending { change } => change.token,
+            response => bail!("TUI IP apply failed: {response:?}"),
+        };
+        let kernel = output_ns(
+            &fixture.namespace,
+            "ip",
+            &["-j", "-4", "address", "show", "dev", &interface],
+        )?;
+        anyhow::ensure!(kernel.status.success(), "kernel address observation failed");
+        let links: serde_json::Value = serde_json::from_slice(&kernel.stdout)?;
+        assert!(
+            links[0]["addr_info"]
+                .as_array()
+                .context("ip addr_info missing")?
+                .iter()
+                .any(|address| address["local"] == "198.18.0.1" && address["prefixlen"] == 24),
+            "API success must correspond to the real kernel address"
+        );
+        match client
+            .request(&Request::CommitNetworkChange { token })
+            .await?
+        {
+            Response::NetworkChangeCommitted { .. } => {}
+            response => bail!("TUI IP confirmation failed: {response:?}"),
+        }
+        println!("Real daemon IP preview, apply, kernel verification and commit passed");
+        let clear = traffic_masq::api::model::InterfaceEditRequest {
+            cidr: String::new(),
+            role: InterfaceRole::Input,
+            managed: true,
+            allow_management_change: true,
+        };
+        let token = match client
+            .request(&Request::ApplyInterfaceEdit {
+                interface: interface.clone(),
+                edit: clear,
+            })
+            .await?
+        {
+            Response::NetworkChangePending { change } => change.token,
+            response => bail!("TUI IP removal failed: {response:?}"),
+        };
+        let kernel = output_ns(
+            &fixture.namespace,
+            "ip",
+            &["-j", "-4", "address", "show", "dev", &interface],
+        )?;
+        anyhow::ensure!(
+            kernel.status.success(),
+            "kernel address observation failed after removal"
+        );
+        let links: serde_json::Value = serde_json::from_slice(&kernel.stdout)?;
+        assert!(!links[0]["addr_info"]
+            .as_array()
+            .context("ip addr_info missing")?
+            .iter()
+            .any(|address| address["local"] == "198.18.0.1"));
+        match client
+            .request(&Request::CommitNetworkChange { token })
+            .await?
+        {
+            Response::NetworkChangeCommitted { .. } => {}
+            response => bail!("TUI IP removal confirmation failed: {response:?}"),
+        }
+        fixture.stop_daemon().await?;
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        fixture.dump_diagnostics("scan/IP test failure");
+    }
+    result
 }
 
 fn required_env(name: &str) -> Result<String> {
