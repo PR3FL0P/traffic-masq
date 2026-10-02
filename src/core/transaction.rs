@@ -788,6 +788,12 @@ impl NetworkTransactionManager {
             }
         }
         if let Err(error) = applied {
+            let running_network_managers = if config.wifi_client.is_some() {
+                crate::wifi::process::find_competing_network_managers().await
+            } else {
+                Vec::new()
+            };
+            tracing::warn!(%interface, %token, error = %format!("{error:#}"), ?running_network_managers, "interface change failed; restoring previous configuration");
             let path = self.journal_path(interface);
             let rollback = recovery_control::run(&path, false, async {
                 let execution = match &gate {

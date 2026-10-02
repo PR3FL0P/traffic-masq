@@ -537,10 +537,13 @@ impl DhcpClientSupervisor {
             if let DhcpClientRunState::Degraded { reason } = status.state {
                 bail!("DHCP client on {interface} is degraded: {reason}");
             }
-            anyhow::ensure!(
-                Instant::now() < deadline,
-                "DHCP lease is not ready on {interface}"
-            );
+            if Instant::now() >= deadline {
+                tracing::warn!(%interface, state = ?status.state, timeout_seconds = 5, "DHCP readiness timed out without a lease; inspect DHCP packet and address-probe events");
+                bail!(
+                    "DHCP lease is not ready on {interface} after 5 seconds (state: {:?})",
+                    status.state
+                );
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }

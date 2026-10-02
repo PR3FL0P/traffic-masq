@@ -685,15 +685,20 @@ impl WifiClientSupervisor {
     ) -> Result<Option<OwnedWpaCtrlSession>, ClientSupervisorError> {
         let session = match self.owned_ctrl_session(task).await {
             Ok(session) => session,
-            Err(ClientSupervisorError::NotOwned { .. }) | Err(ClientSupervisorError::Ctrl(_)) => {
-                return Ok(None)
+            Err(
+                error @ (ClientSupervisorError::NotOwned { .. } | ClientSupervisorError::Ctrl(_)),
+            ) => {
+                tracing::warn!(interface = %task.spec.interface, pid = task.record.pid, error = %format!("{error:#}"), "wpa_supplicant control session unavailable");
+                return Ok(None);
             }
             Err(error) => return Err(error),
         };
-        if session.client.ping().await.is_ok() {
-            Ok(Some(session))
-        } else {
-            Ok(None)
+        match session.client.ping().await {
+            Ok(()) => Ok(Some(session)),
+            Err(error) => {
+                tracing::warn!(interface = %task.spec.interface, pid = task.record.pid, error = %format!("{error:#}"), "wpa_supplicant PING failed");
+                Ok(None)
+            }
         }
     }
 
@@ -704,7 +709,7 @@ impl WifiClientSupervisor {
         rendered: &RenderedClientConfig,
         ctrl_path: &Path,
     ) -> Result<(), ClientSupervisorError> {
-        self.stop_task(task).await?;
+        self.stop_task(task, "configuration changed").await?;
         let record = self.spawn_and_record(spec, rendered, ctrl_path).await?;
         task.spec = spec.clone();
         task.record = record;
@@ -721,6 +726,15 @@ impl WifiClientSupervisor {
         ctrl_path: &Path,
     ) -> Result<ClientTask, ClientSupervisorError> {
         let outcome = self.observe_ownership(spec, rendered, ctrl_path).await?;
+        match &outcome {
+            OwnershipOutcome::DigestMismatch(record) => {
+                tracing::info!(interface = %spec.interface, pid = record.pid, reason = "configuration digest changed", "replacing recorded wpa_supplicant")
+            }
+            OwnershipOutcome::UnreachableOwned(record) => {
+                tracing::warn!(interface = %spec.interface, pid = record.pid, reason = "owned control endpoint unreachable", "replacing recorded wpa_supplicant")
+            }
+            _ => {}
+        }
         let record = match outcome {
             OwnershipOutcome::Absent => self.spawn_and_record(spec, rendered, ctrl_path).await?,
             OwnershipOutcome::Adopted(record) => record,
@@ -932,6 +946,7 @@ impl WifiClientSupervisor {
             }
         };
 
+        tracing::info!(interface = %spec.interface, pid, purpose = "association", "wpa_supplicant started");
         let result = async {
             let process_start_ticks = self
                 .inner
@@ -977,7 +992,9 @@ impl WifiClientSupervisor {
 
         match result {
             Ok(record) => Ok(record),
-            Err(error) => match self.graceful_stop(pid).await {
+            Err(error) => {
+                tracing::warn!(interface = %spec.interface, pid, error = %format!("{error:#}"), "wpa_supplicant startup failed; stopping process");
+                match self.graceful_stop(pid).await {
                 Ok(()) => match store.clear().await {
                     Ok(()) => {
                         let _ = tokio::fs::remove_file(&rendered.path).await;
@@ -990,7 +1007,8 @@ impl WifiClientSupervisor {
                 Err(cleanup) => Err(ClientSupervisorError::Configuration(anyhow::anyhow!(
                     "wpa_supplicant startup failed: {error}; cleanup also failed: {cleanup}; recovery required"
                 ))),
-            },
+                }
+            }
         }
     }
 
@@ -1031,7 +1049,11 @@ impl WifiClientSupervisor {
         }
     }
 
-    async fn stop_task(&self, task: &ClientTask) -> Result<(), ClientSupervisorError> {
+    async fn stop_task(
+        &self,
+        task: &ClientTask,
+        reason: &'static str,
+    ) -> Result<(), ClientSupervisorError> {
         if task.record.pid == 0 || !self.inner.process.is_alive(task.record.pid).await? {
             return Ok(());
         }
@@ -1040,6 +1062,7 @@ impl WifiClientSupervisor {
                 interface: task.spec.interface.clone(),
             });
         }
+        tracing::info!(interface = %task.spec.interface, pid = task.record.pid, reason, "stopping configured wpa_supplicant");
         self.inner
             .process
             .stop_recorded(&task.record, WifiProcessKind::Client, "wpa_supplicant")
@@ -1089,7 +1112,8 @@ impl WifiClientSupervisor {
             return Ok(None);
         };
 
-        self.stop_task(&task).await?;
+        self.stop_task(&task, "Wi-Fi client configuration removed")
+            .await?;
         self.record_store(interface).clear().await?;
         let runtime_config = config_path(&self.inner.runtime_dir, interface);
         match tokio::fs::remove_file(&runtime_config).await {
@@ -1298,6 +1322,7 @@ impl WifiClientSupervisor {
             }
         };
 
+        tracing::info!(%interface, pid, purpose = "scan", "temporary wpa_supplicant started");
         let spawned_record = async {
             let process_start_ticks = self
                 .inner
@@ -1330,6 +1355,7 @@ impl WifiClientSupervisor {
         let record = match spawned_record {
             Ok(record) => record,
             Err(error) => {
+                tracing::warn!(%interface, pid, error = %format!("{error:#}"), "failed to record temporary wpa_supplicant ownership; stopping process");
                 return match self.graceful_stop(pid).await {
                     Ok(()) => {
                         let cleanup = store.clear().await;
@@ -1370,6 +1396,16 @@ impl WifiClientSupervisor {
             Err(error) => (Err(error), None),
         };
 
+        match &scan_result {
+            Ok(results) => {
+                tracing::info!(%interface, pid, networks = results.len(), reason = "scan completed", "stopping temporary wpa_supplicant")
+            }
+            Err(error) => {
+                let running_network_managers =
+                    crate::wifi::process::find_competing_network_managers().await;
+                tracing::warn!(%interface, pid, error = %format!("{error:#}"), ?running_network_managers, reason = "scan failed", "stopping temporary wpa_supplicant");
+            }
+        }
         match self.graceful_stop(pid).await {
             Ok(()) => {
                 let clear_result = store.clear().await;
@@ -1541,7 +1577,13 @@ impl WifiClientSupervisor {
         let ctrl_path = self.ctrl_path(interface);
         let session = self.task_process_session(&task).await?;
         let status = match session {
-            Some(session) => session.client.status().await.ok(),
+            Some(session) => match session.client.status().await {
+                Ok(status) => Some(status),
+                Err(error) => {
+                    tracing::warn!(%interface, pid = task.record.pid, error = %format!("{error:#}"), "wpa_supplicant STATUS failed");
+                    None
+                }
+            },
             None => None,
         };
 
@@ -1619,7 +1661,15 @@ impl WifiClientSupervisor {
         // Placeholder tasks (failed startup) have pid 0; signalling pid 0
         // would signal the whole process group, including this daemon.
         if task.record.pid != 0 {
-            self.stop_task(&task).await?;
+            self.stop_task(
+                &task,
+                if stuck {
+                    "association grace period expired"
+                } else {
+                    "control endpoint unavailable"
+                },
+            )
+            .await?;
         }
 
         // Do not probe an endpoint after the owned process has stopped. At
@@ -1677,7 +1727,10 @@ impl WifiClientSupervisor {
 
         for (interface, task) in tasks {
             if policy == ShutdownPolicy::RestoreInterfaces {
-                if let Err(error) = self.stop_task(&task).await {
+                if let Err(error) = self
+                    .stop_task(&task, "daemon shutdown restoring interfaces")
+                    .await
+                {
                     tracing::error!(%interface, %error, "failed to stop wpa_supplicant during shutdown; ownership record retained");
                     continue;
                 }

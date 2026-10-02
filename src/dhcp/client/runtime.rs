@@ -859,11 +859,18 @@ where
         let mut wake = None;
         for action in actions {
             match action {
-                Action::Send { packet, kind } => self.transport.send(&packet, kind).await?,
+                Action::Send { packet, kind } => {
+                    self.transport.send(&packet, kind).await?;
+                    let message_type = crate::dhcp::packet::DhcpPacket::parse(&packet)
+                        .ok()
+                        .and_then(|packet| packet.message_type());
+                    tracing::info!(interface = %self.config.interface, ?message_type, ?kind, "DHCP packet sent");
+                }
                 Action::WakeAt(deadline) => {
                     wake = Some(wake.map_or(deadline, |old: Duration| old.min(deadline)))
                 }
                 Action::LeaseAcquired(lease) => {
+                    tracing::info!(interface = %self.config.interface, address = %lease.address, server = %lease.server_identifier, "DHCP ACK accepted; probing for duplicate address");
                     if self
                         .dad
                         .is_duplicate(
@@ -873,18 +880,26 @@ where
                         )
                         .await?
                     {
+                        tracing::warn!(interface = %self.config.interface, address = %lease.address, "DHCP address conflict detected; declining lease");
                         let actions = self
                             .state_machine
                             .address_conflict(self.now(), random_jitter());
                         let conflict_wake = Box::pin(self.drive(actions)).await?;
                         wake = conflict_wake.or(wake);
                     } else {
+                        let address = lease.address;
                         self.sink.lease_acquired(lease).await?;
+                        tracing::info!(interface = %self.config.interface, %address, "DHCP lease installed");
                     }
                 }
                 Action::LeaseLost => self.sink.lease_lost().await?,
                 Action::CleanupNeeded(lease) => self.sink.cleanup_needed(lease).await?,
-                Action::ReplyIgnored(_) => {}
+                Action::ReplyIgnored(super::state_machine::IgnoreReason::Invalid(reason)) => {
+                    tracing::warn!(interface = %self.config.interface, %reason, "DHCP reply rejected");
+                }
+                Action::ReplyIgnored(reason) => {
+                    tracing::debug!(interface = %self.config.interface, ?reason, "DHCP reply ignored");
+                }
             }
         }
         Ok(wake)

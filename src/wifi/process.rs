@@ -650,9 +650,11 @@ where
             };
             diagnostics.lock().await.push(pid, diagnostic);
             if sensitive {
-                tracing::warn!(daemon, %interface, pid, stream, "Wi-Fi daemon emitted a sensitive diagnostic; content redacted");
-            } else {
+                tracing::info!(daemon, %interface, pid, stream, "Wi-Fi daemon emitted a sensitive diagnostic; content redacted");
+            } else if stream == "stderr" {
                 tracing::warn!(daemon, %interface, pid, stream, output = %line, "Wi-Fi daemon diagnostic");
+            } else {
+                tracing::info!(daemon, %interface, pid, stream, output = %line, "Wi-Fi daemon diagnostic");
             }
         }
     })
