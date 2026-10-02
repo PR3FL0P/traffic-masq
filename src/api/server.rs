@@ -254,6 +254,7 @@ fn build_router(state: AppState) -> Router {
         .route("/network-transactions", get(pending_transactions))
         .route("/network-transactions/commit", post(commit_transaction))
         .route("/network-transactions/rollback", post(rollback_transaction))
+        .route("/route-inventory", get(list_route_inventory))
         .route("/routes", get(routes_list))
         .route("/router/config", get(router_get_config))
         .route("/router/status", get(router_status))
@@ -1032,6 +1033,21 @@ async fn rollback_transaction(
 pub struct ListRoutesQuery {
     #[serde(default)]
     pub include_local_table: bool,
+}
+
+async fn list_route_inventory(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Query(query): Query<ListRoutesQuery>,
+) -> Result<Json<Response>, ApiError> {
+    dispatch_control(
+        &state,
+        &principal,
+        Request::ListRouteInventory {
+            include_local_table: query.include_local_table,
+        },
+    )
+    .await
 }
 
 async fn routes_list(

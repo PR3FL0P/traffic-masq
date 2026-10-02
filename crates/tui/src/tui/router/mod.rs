@@ -53,6 +53,15 @@ use view::{
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct RouterData {
+    pub(crate) desired_revision: Option<u64>,
+    pub(crate) last_applied_revision: Option<u64>,
+    pub(crate) editor_revision: Option<u64>,
+    pub(crate) saved_router_config: Option<RouterConfig>,
+    pub(crate) route_inventory: Option<Vec<traffic_masq_protocol::RouteInventoryEntry>>,
+    pub(crate) saved_device_readiness: Option<traffic_masq_protocol::InterfaceReadiness>,
+    pub(crate) observation_error: Option<String>,
+    pub(crate) saved_interfaces: Vec<traffic_masq_protocol::InterfaceInventoryEntry>,
+    pub(crate) offline_preview: Option<OfflineRouterPreview>,
     pub(crate) enabled: bool,
     pub(crate) ready: bool,
     pub(crate) coordinator_status: Option<CoordinatorStatus>,
@@ -79,7 +88,84 @@ pub(crate) struct RouterData {
     pub(crate) sharing_actions_focused: bool,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct OfflineRouterPreview {
+    pub(crate) baseline: RouterConfig,
+    pub(crate) config: RouterConfig,
+    pub(crate) revision: u64,
+    pub(crate) blockers: Vec<traffic_masq_protocol::InterfaceReadinessBlocker>,
+}
+
+pub(super) fn row_config(
+    row: &traffic_masq_protocol::RouteInventoryEntry,
+) -> Option<OwnedIpv4RouteConfig> {
+    row.configured.clone().or_else(|| {
+        row.observed.as_ref().map(|route| OwnedIpv4RouteConfig {
+            destination: route.destination,
+            gateway: route.gateway,
+            output_interface: route.output_interface.clone(),
+            table: route.table,
+            metric: route.metric,
+        })
+    })
+}
+
 impl RouterData {
+    pub(crate) fn route_rows(&self) -> Vec<traffic_masq_protocol::RouteInventoryEntry> {
+        use traffic_masq_protocol::RouteInventoryEntry;
+        let Some(inventory) = &self.route_inventory else {
+            return self
+                .routes
+                .iter()
+                .map(|route| RouteInventoryEntry {
+                    configured: route.owner.is_editable().then(|| OwnedIpv4RouteConfig {
+                        destination: route.destination,
+                        gateway: route.gateway,
+                        output_interface: route.output_interface.clone(),
+                        table: route.table,
+                        metric: route.metric,
+                    }),
+                    observed: Some(route.clone()),
+                    output_presence: None,
+                })
+                .collect();
+        };
+        let mut rows: Vec<_> = inventory
+            .iter()
+            .filter(|row| row_config(row).is_some())
+            .filter(|row| {
+                !self.staged
+                    || row.configured.as_ref().is_none_or(|config| {
+                        self.proposed_router_config.owned_routes.contains(config)
+                    })
+            })
+            .cloned()
+            .collect();
+        if self.staged {
+            for config in &self.proposed_router_config.owned_routes {
+                if !rows
+                    .iter()
+                    .any(|row| row.configured.as_ref() == Some(config))
+                {
+                    let presence = config.output_interface.as_ref().map(|name| {
+                        self.saved_interfaces
+                            .iter()
+                            .find(|entry| entry.name == *name)
+                            .map_or(traffic_masq_protocol::InterfacePresence::Unknown, |entry| {
+                                entry.presence
+                            })
+                    });
+                    rows.push(RouteInventoryEntry {
+                        configured: Some(config.clone()),
+                        observed: None,
+                        output_presence: presence,
+                    });
+                }
+            }
+        }
+        rows
+    }
+
     pub(crate) fn recovery_blocks_mutations(&self) -> bool {
         self.recovery.is_some()
             || matches!(

@@ -191,48 +191,51 @@ pub(super) fn save_route_editor(app: &mut TuiApp) {
         app.router.proposed_router_config.allow_default_route_change = true;
     }
 
-    app.router.proposed_router_config.enabled = true;
+    if app.router.route_inventory.is_none() {
+        app.router.proposed_router_config.enabled = true;
+    }
     app.router
         .proposed_router_config
         .owned_routes
         .push(new_route.clone());
 
-    // Update app.router.routes to reflect staged route in table:
-    if let Some(ref orig) = original {
-        if let Some(pos) = app.router.routes.iter().position(|r| {
-            r.table == orig.table
-                && r.destination == orig.destination
-                && r.metric.unwrap_or(0) == orig.metric.unwrap_or(0)
-        }) {
-            app.router.routes.remove(pos);
+    if app.router.route_inventory.is_none() {
+        // Update app.router.routes to reflect staged route in table:
+        if let Some(ref orig) = original {
+            if let Some(pos) = app.router.routes.iter().position(|r| {
+                r.table == orig.table
+                    && r.destination == orig.destination
+                    && r.metric.unwrap_or(0) == orig.metric.unwrap_or(0)
+            }) {
+                app.router.routes.remove(pos);
+            }
         }
+        app.router.routes.push(RouteStatus {
+            destination: new_route.destination,
+            gateway: new_route.gateway,
+            output_interface: new_route.output_interface,
+            output_interface_index: None,
+            table: new_route.table,
+            metric: new_route.metric,
+            protocol: traffic_masq_netlink::TRAFFIC_MASQ_ROUTE_PROTOCOL,
+            scope: 0,
+            owner: RouteOwner::TrafficMasqStatic,
+        });
+        // Sort routes deterministically:
+        app.router.routes.sort_by(|a, b| {
+            let table_order = |t: u32| match t {
+                254 => 0,
+                255 => 2,
+                _ => 1,
+            };
+            table_order(a.table)
+                .cmp(&table_order(b.table))
+                .then_with(|| a.table.cmp(&b.table))
+                .then_with(|| b.destination.prefix_len().cmp(&a.destination.prefix_len()))
+                .then_with(|| a.destination.network().cmp(&b.destination.network()))
+                .then_with(|| a.metric.unwrap_or(0).cmp(&b.metric.unwrap_or(0)))
+        });
     }
-    app.router.routes.push(RouteStatus {
-        destination: new_route.destination,
-        gateway: new_route.gateway,
-        output_interface: new_route.output_interface,
-        output_interface_index: None,
-        table: new_route.table,
-        metric: new_route.metric,
-        protocol: traffic_masq_netlink::TRAFFIC_MASQ_ROUTE_PROTOCOL,
-        scope: 0,
-        owner: RouteOwner::TrafficMasqStatic,
-    });
-    // Sort routes deterministically:
-    app.router.routes.sort_by(|a, b| {
-        let table_order = |t: u32| match t {
-            254 => 0,
-            255 => 2,
-            _ => 1,
-        };
-        table_order(a.table)
-            .cmp(&table_order(b.table))
-            .then_with(|| a.table.cmp(&b.table))
-            .then_with(|| b.destination.prefix_len().cmp(&a.destination.prefix_len()))
-            .then_with(|| a.destination.network().cmp(&b.destination.network()))
-            .then_with(|| a.metric.unwrap_or(0).cmp(&b.metric.unwrap_or(0)))
-    });
-
     app.router.staged = true;
     app.router.editor = None;
     app.screen = Screen::Router;
@@ -243,11 +246,17 @@ pub(super) fn save_route_editor(app: &mut TuiApp) {
 }
 
 pub(super) fn delete_selected_route(app: &mut TuiApp) {
-    if app.router.routes.is_empty() || app.router.selected_route >= app.router.routes.len() {
+    let rows = app.router.route_rows();
+    let Some(row) = rows.get(app.router.selected_route) else {
         return;
-    }
-    let route = &app.router.routes[app.router.selected_route];
-    if !route.owner.is_editable() {
+    };
+    let Some(config) = row_config(row) else {
+        return;
+    };
+    if row.configured.is_none() {
+        let Some(route) = row.observed.as_ref() else {
+            return;
+        };
         let message = match manual_route_delete_command(route) {
             Ok(command) => format!(
                 "Delete route manually: {}\n\n\
@@ -269,9 +278,12 @@ pub(super) fn delete_selected_route(app: &mut TuiApp) {
         app.message_open = true;
         return;
     }
-    let target_dest = route.destination;
-    let target_table = route.table;
-    let target_metric = route.metric.unwrap_or(0);
+    let target_dest = config.destination;
+    let target_table = config.table;
+    let target_metric = config.metric.unwrap_or(0);
+    if target_dest.prefix_len() == 0 {
+        app.router.proposed_router_config.allow_default_route_change = true;
+    }
 
     if let Some(pos) = app
         .router
@@ -297,9 +309,14 @@ pub(super) fn delete_selected_route(app: &mut TuiApp) {
     {
         app.router.proposed_router_config.enabled = false;
     }
-    app.router.routes.remove(app.router.selected_route);
-    if app.router.selected_route >= app.router.routes.len() && !app.router.routes.is_empty() {
-        app.router.selected_route = app.router.routes.len() - 1;
+    if app.router.route_inventory.is_none() {
+        app.router.routes.remove(app.router.selected_route);
+    }
+    app.router.staged = true;
+    if app.router.selected_route >= app.router.route_rows().len()
+        && !app.router.route_rows().is_empty()
+    {
+        app.router.selected_route = app.router.route_rows().len() - 1;
     }
     app.router.staged = true;
     app.router.warning_message = None;
@@ -334,23 +351,25 @@ pub(super) fn manual_route_delete_command(route: &RouteStatus) -> Result<String,
 }
 
 pub(super) async fn open_route_editor_for_selected(app: &mut TuiApp, client: &ApiClient) {
-    if app.router.routes.is_empty() || app.router.selected_route >= app.router.routes.len() {
+    let rows = app.router.route_rows();
+    let Some(row) = rows.get(app.router.selected_route) else {
         return;
-    }
-    let route = &app.router.routes[app.router.selected_route];
-    if !route.owner.is_editable() {
-        app.router.warning_message = Some("External route is read-only".to_string());
-        app.push_message(LogLevel::Warn, "External route is read-only");
-        return;
-    }
-    let orig = OwnedIpv4RouteConfig {
-        destination: route.destination,
-        gateway: route.gateway,
-        output_interface: route.output_interface.clone(),
-        table: route.table,
-        metric: route.metric,
     };
-    let available_interfaces = fetch_available_interfaces(app, client).await;
+    let Some(orig) = row.configured.clone() else {
+        app.router.warning_message =
+            Some("Observed route is read-only; it has no saved intent".into());
+        app.push_message(
+            LogLevel::Warn,
+            "Observed route is read-only; it has no saved intent",
+        );
+        return;
+    };
+    let mut available_interfaces = fetch_available_interfaces(app, client).await;
+    if let Some(name) = &orig.output_interface {
+        available_interfaces.push(name.clone());
+    }
+    available_interfaces.sort();
+    available_interfaces.dedup();
     let dest_str = orig.destination.to_string();
     let cursor = super::super::input::grapheme_count(&dest_str);
     app.router.editor = Some(RouteEditor {
@@ -388,6 +407,14 @@ pub(super) async fn open_route_editor_for_add(app: &mut TuiApp, client: &ApiClie
 }
 
 pub(super) async fn fetch_available_interfaces(app: &TuiApp, client: &ApiClient) -> Vec<String> {
+    if !app.router.saved_interfaces.is_empty() {
+        return app
+            .router
+            .saved_interfaces
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
+    }
     if !app.dashboard.interfaces.is_empty() {
         return app
             .dashboard

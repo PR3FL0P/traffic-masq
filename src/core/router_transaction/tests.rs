@@ -563,6 +563,7 @@ async fn write_journal_creates_missing_parent_directory() {
             timer_epoch: AtomicU64::new(0),
             timeout_mutation_gate: StdRwLock::new(None),
             idle_epoch: watch::channel(0).0,
+            last_applied_revision: StdRwLock::new(None),
         }),
     };
 
@@ -588,6 +589,7 @@ async fn full_lifecycle_applies_and_commits() {
     let plan = coordinator.plan(candidate).await.expect("plan");
     coordinator.apply(plan).await.expect("apply");
     assert_eq!(coordinator.status().await, CoordinatorStatus::Pending);
+    assert!(coordinator.last_applied_revision().is_none());
     let pending = coordinator.view().await;
     assert_eq!(pending.phase, RouterPhase::Pending);
     assert!(pending.commit_uncertainty.is_none());
@@ -655,6 +657,7 @@ async fn repair_reapplies_committed_intent_without_creating_a_revision() {
     .expect("desired");
 
     coordinator.repair(desired).await.expect("repair");
+    assert_eq!(coordinator.last_applied_revision(), Some(1));
 
     assert_eq!(overrides.committed_revision().await, 1);
     assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);

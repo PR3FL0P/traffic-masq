@@ -25,7 +25,7 @@ pub use network_manager_advice::{
     InitSystem,
 };
 pub use recovery_action::RecoveryAction;
-pub use route::{RouteOwnerView, RouteStatusView};
+pub use route::{RouteInventoryEntry, RouteOwnerView, RouteStatusView};
 pub use router::{
     validate_forwarding, validate_interface_name, ForwardingConfigView, ForwardingRule,
     InterfaceOverrideRequestView, OwnedIpv4RouteConfigView, RouterConfigView,
@@ -1270,6 +1270,10 @@ pub enum Request<Interface, Proposal> {
         token: String,
     },
     RouterPendingTransaction,
+    ListRouteInventory {
+        #[serde(default)]
+        include_local_table: bool,
+    },
     ListRoutes {
         #[serde(default)]
         include_local_table: bool,
@@ -1522,6 +1526,10 @@ pub enum Response<
         message: String,
     },
     RouterStatus {
+        #[serde(default)]
+        desired_revision: Option<u64>,
+        #[serde(default)]
+        last_applied_revision: Option<u64>,
         enabled: bool,
         ready: bool,
         coordinator_status: CoordinatorStatus,
@@ -1562,6 +1570,12 @@ pub enum Response<
         rollback_failure: Option<Vec<String>>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recovery: Option<RouterRecoveryNotice>,
+    },
+    RouteInventory {
+        revision: u64,
+        config: RouterConfig,
+        routes: Vec<RouteInventoryEntry>,
+        observation_error: Option<String>,
     },
     Routes {
         routes: Vec<RouteStatus>,
@@ -1835,6 +1849,22 @@ mod tests {
         let debug = format!("{decoded:?}");
         assert!(!debug.contains("private-offline-password"));
         assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn legacy_router_status_reports_unknown_revisions() {
+        let response: ControlResponse = serde_json::from_value(serde_json::json!({
+            "type": "router_status", "enabled": false, "ready": false,
+            "coordinator_status": "idle", "health": { "interfaces": null, "routes": null, "dhcp": null, "uplink_dhcp": null, "dataplane": null }
+        })).unwrap();
+        assert!(matches!(
+            response,
+            ControlResponse::RouterStatus {
+                desired_revision: None,
+                last_applied_revision: None,
+                ..
+            }
+        ));
     }
 
     #[test]

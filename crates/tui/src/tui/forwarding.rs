@@ -7,10 +7,7 @@ use super::{
     router::{RouterData, RouterPane},
     theme, Screen, TuiApp,
 };
-use crate::tui::api::{
-    client::ApiClient,
-    model::{Request, Response},
-};
+use crate::tui::api::client::ApiClient;
 use crossterm::event::KeyCode;
 use ratatui::{
     layout::{Constraint, Layout, Rect},
@@ -20,7 +17,6 @@ use ratatui::{
 };
 use traffic_masq_protocol::{
     validate_forwarding, ForwardingConfigView as ForwardingConfig, InterfaceRole,
-    RouterDataplaneTargetView, RouterProposalRequestView as RouterProposalRequest,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,85 +90,52 @@ pub(crate) fn displayed_rules(router: &RouterData) -> Option<Vec<ForwardingConfi
     if router.proposed_router_config.uplink.is_none() {
         return Some(vec![]);
     }
-    let plan = router.plan.as_ref()?;
-    if let RouterDataplaneTargetView::Enabled(desired) = &plan.dataplane.target {
-        Some(
-            desired
-                .outputs
-                .iter()
-                .map(|output| ForwardingConfig {
-                    from: output.interface.clone(),
-                    to: desired.uplink.clone(),
+    let uplink = router.proposed_router_config.uplink.as_ref()?;
+    Some(
+        router
+            .saved_interfaces
+            .iter()
+            .filter_map(|entry| {
+                let config = entry.configured.as_ref()?;
+                if config.role != InterfaceRole::Output || !config.managed || !config.nat {
+                    return None;
+                }
+                Some(ForwardingConfig {
+                    from: entry.name.clone(),
+                    to: uplink.interface.clone(),
                     masquerade: true,
-                    source_subnet: None,
+                    source_subnet: Some(config.ipv4?.trunc()),
                 })
-                .collect(),
-        )
-    } else {
-        None
-    }
+            })
+            .collect(),
+    )
 }
 
 async fn load_rules(app: &mut TuiApp, client: &ApiClient) -> Option<Vec<ForwardingConfig>> {
     if !app.router.staged {
-        match client.request(&Request::GetRouterConfig).await {
-            Ok(Response::RouterConfig { config }) => app.router.proposed_router_config = config,
-            _ => {
-                app.push_message(
-                    LogLevel::Error,
-                    "Could not load sharing configuration; refresh and try again",
-                );
-                return None;
-            }
-        }
+        super::router::load_router_data(app, client).await;
     }
     if !app.router.proposed_router_config.vpn_chain.is_empty() {
         app.push_message(LogLevel::Warn, "The global VPN chain uses legacy forwarding. Configure its tunnel routing before switching to per-interface sharing.");
         return None;
     }
-    if let Some(rules) = &app.router.proposed_router_config.forwarding {
-        return Some(rules.clone());
+    let rules = displayed_rules(&app.router);
+    if rules.is_none() {
+        app.push_message(
+            LogLevel::Error,
+            "Could not load saved sharing configuration; refresh and try again",
+        );
     }
-    if app.router.proposed_router_config.uplink.is_none() {
-        return Some(vec![]);
-    }
-    let mut legacy = app.router.proposed_router_config.clone();
-    legacy.enabled = true;
-    let proposal = RouterProposalRequest {
-        set_router: Some(legacy),
-        ..Default::default()
-    };
-    if let Ok(Response::RouterPlan { plan }) =
-        client.request(&Request::RouterPlan { proposal }).await
-    {
-        if let RouterDataplaneTargetView::Enabled(desired) = plan.dataplane.target {
-            return Some(
-                desired
-                    .outputs
-                    .into_iter()
-                    .map(|output| ForwardingConfig {
-                        from: output.interface,
-                        to: desired.uplink.clone(),
-                        masquerade: true,
-                        source_subnet: None,
-                    })
-                    .collect(),
-            );
-        }
-    }
-    app.push_message(
-        LogLevel::Error,
-        "Could not load existing sharing rules; refresh and review the router plan",
-    );
-    None
+    rules
 }
 
 pub(crate) async fn open_from_route(app: &mut TuiApp, client: &ApiClient) {
     let Some(interface) = app
         .router
-        .routes
+        .route_rows()
         .get(app.router.selected_route)
-        .and_then(|route| route.output_interface.clone())
+        .and_then(super::router::row_config)
+        .and_then(|route| route.output_interface)
     else {
         app.push_message(
             LogLevel::Warn,
@@ -210,6 +173,12 @@ async fn open(app: &mut TuiApp, client: &ApiClient, edit: bool, egress: Option<S
         .iter()
         .map(|status| status.interface.name.clone())
         .collect();
+    interfaces.extend(
+        app.router
+            .saved_interfaces
+            .iter()
+            .map(|entry| entry.name.clone()),
+    );
     for rule in &rules {
         interfaces.extend([rule.from.clone(), rule.to.clone()]);
     }
@@ -318,7 +287,9 @@ fn stage(app: &mut TuiApp, rules: Vec<ForwardingConfig>) {
         .selected_connection
         .min(rules.len().saturating_sub(1));
     app.router.proposed_router_config.forwarding = Some(rules);
-    app.router.proposed_router_config.enabled = true;
+    if app.router.route_inventory.is_none() {
+        app.router.proposed_router_config.enabled = true;
+    }
     app.router.staged = true;
     app.router.error = None;
 }
@@ -373,13 +344,19 @@ pub(crate) fn render_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
         .skip(scroll)
         .take(visible)
         .map(|(index, rule)| {
+            let inventory_unknown = [&rule.from, &rule.to].iter().any(|name| {
+                app.router.saved_interfaces.iter().any(|entry| {
+                    entry.name == **name
+                        && entry.presence == traffic_masq_protocol::InterfacePresence::Unknown
+                })
+            });
             let (from_missing, to_missing) = observed.as_ref().map_or((false, false), |names| {
                 (
                     !names.contains(rule.from.as_str()),
                     !names.contains(rule.to.as_str()),
                 )
             });
-            let status = if observed.is_none() {
+            let status = if observed.is_none() || inventory_unknown {
                 "Unknown"
             } else {
                 match (from_missing, to_missing) {

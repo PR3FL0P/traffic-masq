@@ -164,6 +164,7 @@ struct Inner {
     timer_epoch: AtomicU64,
     timeout_mutation_gate: StdRwLock<Option<Arc<NetworkMutationGate>>>,
     idle_epoch: watch::Sender<u64>,
+    last_applied_revision: StdRwLock<Option<u64>>,
 }
 
 #[derive(Clone)]
@@ -188,8 +189,27 @@ impl RouterTransactionCoordinator {
                 timer_epoch: AtomicU64::new(0),
                 timeout_mutation_gate: StdRwLock::new(None),
                 idle_epoch: watch::channel(0).0,
+                last_applied_revision: StdRwLock::new(None),
             }),
         }
+    }
+
+    /// Historical verification within this process, not proof of current
+    /// health. Offline cleanup does not claim a newly applied revision.
+    pub fn last_applied_revision(&self) -> Option<u64> {
+        *self
+            .inner
+            .last_applied_revision
+            .read()
+            .expect("applied revision lock")
+    }
+
+    fn record_applied_revision(&self, revision: u64) {
+        *self
+            .inner
+            .last_applied_revision
+            .write()
+            .expect("applied revision lock") = Some(revision);
     }
 
     /// Gate used by the automatic timeout rollback. API-driven router
@@ -414,6 +434,17 @@ impl RouterTransactionCoordinator {
             }
         }
         if dataplane_only && !self.inner.manager.dataplane_needs_reconcile(&desired).await {
+            self.inner.manager.preflight(&desired).await?;
+            let committed = self
+                .inner
+                .overrides
+                .build_candidate(&crate::core::router_candidate::RouterIntentProposal::new())
+                .await?;
+            anyhow::ensure!(
+                committed.desired() == &desired,
+                "router verification no longer matches committed intent"
+            );
+            self.record_applied_revision(committed.base_revision());
             return Ok(());
         }
         self.inner.manager.preflight(&desired).await?;
@@ -423,6 +454,8 @@ impl RouterTransactionCoordinator {
             .overrides
             .build_candidate(&crate::core::router_candidate::RouterIntentProposal::new())
             .await?;
+        let verified_revision =
+            (candidate.desired() == &desired).then_some(candidate.base_revision());
         let snapshot = self.inner.manager.snapshot_for(&desired).await?;
         let token = self.next_token();
         self.write_journal(candidate.base_revision(), &token, &snapshot, &desired)
@@ -503,6 +536,9 @@ impl RouterTransactionCoordinator {
             });
             return Err(error);
         }
+        if let Some(revision) = verified_revision {
+            self.record_applied_revision(revision);
+        }
         *state = CoordinatorState::Idle;
         self.notify_idle();
         Ok(())
@@ -539,6 +575,8 @@ impl RouterTransactionCoordinator {
             .overrides
             .commit_candidate_with_token(&pending.candidate, Some(&pending.token))
             .await?;
+
+        self.record_applied_revision(revision);
 
         // Ownership now matches the intent that is in force. Interfaces this
         // intent dropped were torn down as part of the apply, so holding onto

@@ -249,3 +249,61 @@ fn sharing_sections_and_controls_fit_small_and_large_terminals() {
         }
     }
 }
+
+#[tokio::test]
+async fn legacy_sharing_can_be_read_and_edited_from_saved_settings_without_devices() {
+    use traffic_masq_protocol::{
+        InterfaceConfigSource, InterfaceConfigView, InterfaceInventoryEntry, InterfacePresence,
+        InterfaceReadiness,
+    };
+    let mut app = TuiApp::default();
+    app.router.topology.loaded = true;
+    app.router.staged = true;
+    app.router.route_inventory = Some(vec![]);
+    app.router.proposed_router_config.uplink = Some(traffic_masq_protocol::UplinkConfigView {
+        interface: "unplugged_wan".into(),
+        mode: traffic_masq_protocol::UplinkMode::External,
+    });
+    app.router.saved_interfaces.push(InterfaceInventoryEntry {
+        name: "unplugged_lan".into(),
+        observed: None,
+        configured: Some(InterfaceConfigView {
+            role: InterfaceRole::Output,
+            managed: true,
+            ipv4: Some("192.168.50.1/24".parse().unwrap()),
+            dhcp: None,
+            dhcp_client: None,
+            wifi: None,
+            wifi_client: None,
+            nat: true,
+        }),
+        config_source: InterfaceConfigSource::Base,
+        presence: InterfacePresence::Missing,
+        observation_stale: false,
+        suppressed: false,
+        readiness: InterfaceReadiness::WaitingDevice,
+        blockers: vec![],
+        references: vec![],
+    });
+    let rules = displayed_rules(&app.router).unwrap();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].from, "unplugged_lan");
+    assert_eq!(rules[0].to, "unplugged_wan");
+    assert_eq!(
+        rules[0].source_subnet,
+        Some("192.168.50.0/24".parse().unwrap())
+    );
+    assert!(app.router.plan.is_none());
+    open(&mut app, &ApiClient::new("/must-not-be-used"), true, None).await;
+    assert!(app.forwarding.is_some());
+    assert_eq!(app.screen, Screen::Forwarding);
+    app.forwarding.as_mut().unwrap().field = Field::Save;
+    handle_key(
+        &mut app,
+        KeyCode::Enter,
+        &ApiClient::new("/must-not-be-used"),
+    )
+    .await;
+    assert_eq!(app.router.proposed_router_config.forwarding, Some(rules));
+    assert!(!app.router.proposed_router_config.enabled);
+}

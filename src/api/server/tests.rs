@@ -139,6 +139,9 @@ fn every_control_request_has_the_expected_authorization_class() {
         Request::GetApiHttpsConfig,
         Request::ListInterfaces,
         Request::ListInterfaceInventory,
+        Request::ListRouteInventory {
+            include_local_table: false,
+        },
         Request::ListWifiInventory,
         Request::DhcpStatus,
         Request::DhcpClientStatus,

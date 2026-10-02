@@ -38,6 +38,109 @@ pub(super) fn resolve_ifindex_name(app: &TuiApp, index: Option<u32>) -> Option<S
 }
 
 pub(crate) fn render_router_plan(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
+    if let Some(preview) = &app.router.offline_preview {
+        let mut lines = vec![
+            Line::from(format!(
+                "Save router intent at revision {}",
+                preview.revision
+            )),
+            Line::from("Saved settings will wait for dependencies; no new rules are applied."),
+        ];
+        for blocker in &preview.blockers {
+            lines.push(Line::from(match blocker {
+                traffic_masq_protocol::InterfaceReadinessBlocker::MissingInterface {
+                    interface,
+                } => format!("Waiting for interface: {interface}"),
+                traffic_masq_protocol::InterfaceReadinessBlocker::ObservationFailed { message } => {
+                    format!("Observation unknown: {message}")
+                }
+            }));
+        }
+        lines.push(Line::from(format!(
+            "Routing: {}",
+            if preview.config.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        )));
+        let route_lines = |label: &str, route: &OwnedIpv4RouteConfig| {
+            vec![
+                Line::from(format!(
+                    "{label}: {} via {}",
+                    route.destination,
+                    route
+                        .gateway
+                        .map_or("direct".into(), |gateway| gateway.to_string())
+                )),
+                Line::from(format!(
+                    "  dev {} table {} metric {}",
+                    route.output_interface.as_deref().unwrap_or("-"),
+                    route.table,
+                    route.metric.unwrap_or(0)
+                )),
+            ]
+        };
+        for route in &preview.config.owned_routes {
+            lines.extend(route_lines("Saved route", route));
+        }
+        for route in &preview.baseline.owned_routes {
+            if !preview.config.owned_routes.contains(route) {
+                lines.extend(route_lines("Removed route", route));
+            }
+        }
+        for rule in preview.config.forwarding.as_deref().unwrap_or(&[]) {
+            lines.push(Line::from(format!(
+                "Share: {} → {} ({})",
+                rule.from,
+                rule.to,
+                if rule.masquerade { "NAT" } else { "no NAT" }
+            )));
+            lines.push(Line::from(format!(
+                "  source {}",
+                rule.source_subnet
+                    .map_or("any".into(), |subnet| subnet.to_string())
+            )));
+        }
+        for rule in preview.baseline.forwarding.as_deref().unwrap_or(&[]) {
+            if !preview
+                .config
+                .forwarding
+                .as_deref()
+                .unwrap_or(&[])
+                .contains(rule)
+            {
+                lines.push(Line::from(format!(
+                    "Removed share: {} → {}",
+                    rule.from, rule.to
+                )));
+            }
+        }
+        if preview.baseline.forwarding.is_none()
+            && preview.config.forwarding.is_some()
+            && preview.baseline.uplink.is_some()
+        {
+            lines.push(Line::from("Legacy sharing will use explicit saved rules."));
+        }
+        if preview.config.allow_default_route_change {
+            lines.push(Line::styled(
+                "Default route changes are permitted.",
+                Style::default().fg(theme::WARN),
+            ));
+        }
+        lines.push(Line::from("Removed owned rules are cleaned up after Save."));
+        lines.push(Line::from("Esc: cancel | Enter at end: Save intent"));
+        let block = panel("Saved router intent preview");
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        app.router.plan_max_scroll = lines.len().saturating_sub(inner.height.max(1) as usize);
+        app.router.plan_scroll = app.router.plan_scroll.min(app.router.plan_max_scroll);
+        frame.render_widget(
+            Paragraph::new(lines).scroll((app.router.plan_scroll.min(u16::MAX as usize) as u16, 0)),
+            inner,
+        );
+        return;
+    }
     let Some(plan) = &app.router.plan else {
         return;
     };
@@ -266,6 +369,77 @@ pub(super) fn ap_without_dhcp_warnings(desired: &RouterDesiredView) -> Vec<Strin
 }
 
 pub(crate) async fn open_router_plan(app: &mut TuiApp, client: &ApiClient) {
+    app.router.offline_preview = None;
+    let proposal = current_router_proposal(app);
+    match client
+        .request(&Request::RouterIntentPreview { proposal })
+        .await
+    {
+        Ok(Response::RouterIntentPreview {
+            revision,
+            config,
+            device_readiness,
+            blockers,
+            execution_available,
+            ..
+        }) => {
+            if app
+                .router
+                .editor_revision
+                .is_some_and(|editor_revision| editor_revision != revision)
+            {
+                app.push_message(LogLevel::Error, "Router configuration changed while editing; draft retained. Press c in Router to discard and reload before saving.");
+                return;
+            }
+            if device_readiness == traffic_masq_protocol::InterfaceReadiness::Unknown {
+                app.push_message(LogLevel::Error, "Device observation is unknown; router draft retained. Retry preview after observation recovers.");
+                return;
+            }
+            if !execution_available
+                || device_readiness == traffic_masq_protocol::InterfaceReadiness::WaitingDevice
+                || app.router.saved_device_readiness
+                    == Some(traffic_masq_protocol::InterfaceReadiness::WaitingDevice)
+            {
+                let Some(editor_revision) = app.router.editor_revision else {
+                    app.push_message(
+                        LogLevel::Error,
+                        "Load saved router configuration and its revision before saving.",
+                    );
+                    return;
+                };
+                app.router.offline_preview = Some(OfflineRouterPreview {
+                    baseline: app
+                        .router
+                        .saved_router_config
+                        .clone()
+                        .unwrap_or_else(|| app.router.proposed_router_config.clone()),
+                    config,
+                    revision: editor_revision,
+                    blockers,
+                });
+                app.router.plan = None;
+                app.router.plan_scroll = 0;
+                app.router.plan_max_scroll = 0;
+                app.screen = Screen::RouterPlan;
+                return;
+            }
+        }
+        Ok(Response::RouterError { detail }) => {
+            app.push_message(LogLevel::Error, describe_router_error(&detail));
+            return;
+        }
+        Ok(response) => {
+            app.push_message(
+                LogLevel::Error,
+                format!("Could not preview router intent: {response:?}"),
+            );
+            return;
+        }
+        Err(error) => {
+            app.push_message(LogLevel::Error, error.to_string());
+            return;
+        }
+    }
     let proposal = current_router_proposal(app);
     match client.request(&Request::RouterPlan { proposal }).await {
         Ok(Response::RouterPlan { plan }) => {
@@ -330,6 +504,77 @@ pub(crate) async fn handle_router_plan_key(app: &mut TuiApp, key: KeyCode, clien
 }
 
 async fn router_apply_current_plan(app: &mut TuiApp, client: &ApiClient) {
+    if let Some(preview) = app.router.offline_preview.clone() {
+        let saved_config = preview.config.clone();
+        match client
+            .request(&Request::SaveRouterIntent {
+                config: preview.config,
+                expected_revision: preview.revision,
+            })
+            .await
+        {
+            Ok(Response::RouterIntentSaved {
+                revision,
+                missing_dependencies,
+                cleanup_blockers,
+                execution_available,
+                ..
+            }) => {
+                app.router.saved_router_config = Some(saved_config.clone());
+                app.router.proposed_router_config = saved_config.clone();
+                app.router.route_inventory = Some(
+                    saved_config
+                        .owned_routes
+                        .iter()
+                        .map(|config| traffic_masq_protocol::RouteInventoryEntry {
+                            configured: Some(config.clone()),
+                            observed: None,
+                            output_presence: config
+                                .output_interface
+                                .as_ref()
+                                .map(|_| traffic_masq_protocol::InterfacePresence::Unknown),
+                        })
+                        .collect(),
+                );
+                app.router.routes.clear();
+                app.router.observation_error =
+                    Some("Runtime observation pending after Save".into());
+                app.router.desired_revision = Some(revision);
+                app.router.staged = false;
+                app.router.offline_preview = None;
+                app.router.editor_revision = Some(revision);
+                app.screen = Screen::Router;
+                let waiting = if !missing_dependencies.is_empty() {
+                    format!("waiting for {}", missing_dependencies.join(", "))
+                } else if !execution_available {
+                    "execution unavailable".into()
+                } else {
+                    "application deferred".into()
+                };
+                super::controller::load_router_data(app, client).await;
+                app.push_message(
+                    LogLevel::Info,
+                    format!("Saved router intent revision {revision}; {waiting}"),
+                );
+                for blocker in cleanup_blockers {
+                    app.push_message(
+                        LogLevel::Warn,
+                        format!("Saved; cleanup incomplete: {blocker}"),
+                    );
+                }
+            }
+            Ok(Response::RouterError { detail }) => {
+                app.push_message(LogLevel::Error, describe_router_error(&detail))
+            }
+            Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
+            Ok(response) => app.push_message(
+                LogLevel::Error,
+                format!("Unexpected Save response: {response:?}"),
+            ),
+            Err(error) => app.push_message(LogLevel::Error, error.to_string()),
+        }
+        return;
+    }
     let proposal = current_router_proposal(app);
     match client.request(&Request::RouterApply { proposal }).await {
         Ok(Response::RouterTransactionPending { token, plan }) => {

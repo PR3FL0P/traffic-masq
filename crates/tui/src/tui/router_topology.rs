@@ -82,7 +82,10 @@ fn arrow() -> Line<'static> {
 }
 
 fn topology_lines(router: &RouterData, expanded: bool) -> Vec<Line<'static>> {
-    let selected = router.routes.get(router.selected_route);
+    let rows = router.route_rows();
+    let selected_row = rows.get(router.selected_route);
+    let selected_route = selected_row.and_then(super::router::row_config);
+    let selected = selected_route.as_ref();
     let related =
         |name: &str| selected.is_some_and(|route| route.output_interface.as_deref() == Some(name));
     let desired = router.plan.as_ref().map(|plan| &plan.desired);
@@ -274,7 +277,10 @@ fn topology_lines(router: &RouterData, expanded: bool) -> Vec<Line<'static>> {
                         |gateway| format!("Gateway: {gateway}"),
                     ),
                     Some(route.owner.is_owned()),
-                    selected == Some(route),
+                    selected.is_some_and(|selected| {
+                        selected.destination == route.destination
+                            && selected.output_interface == route.output_interface
+                    }),
                 ));
                 lines.push(note(format!(
                     "    table {} / metric {}",
@@ -298,7 +304,10 @@ fn topology_lines(router: &RouterData, expanded: bool) -> Vec<Line<'static>> {
                         route.output_interface.as_deref().unwrap_or("unknown")
                     ),
                     Some(route.owner.is_owned()),
-                    selected == Some(route),
+                    selected.is_some_and(|selected| {
+                        selected.destination == route.destination
+                            && selected.output_interface == route.output_interface
+                    }),
                 ));
                 lines.push(node(
                     route.gateway.map_or_else(
@@ -306,7 +315,10 @@ fn topology_lines(router: &RouterData, expanded: bool) -> Vec<Line<'static>> {
                         |gateway| format!("Gateway: {gateway}"),
                     ),
                     Some(route.owner.is_owned()),
-                    selected == Some(route),
+                    selected.is_some_and(|selected| {
+                        selected.destination == route.destination
+                            && selected.output_interface == route.output_interface
+                    }),
                 ));
                 lines.push(note(format!(
                     "    table {} / metric {}",
@@ -327,12 +339,17 @@ fn topology_lines(router: &RouterData, expanded: bool) -> Vec<Line<'static>> {
     if let Some(route) = selected {
         lines.push(node(
             route.destination.to_string(),
-            Some(route.owner.is_owned()),
+            Some(selected_row.is_some_and(|row| row.configured.is_some())),
             true,
         ));
         lines.push(node(
-            format!("{}", route.owner),
-            Some(route.owner.is_owned()),
+            selected_row
+                .and_then(|row| row.observed.as_ref())
+                .map_or_else(
+                    || "saved / not observed".into(),
+                    |route| route.owner.to_string(),
+                ),
+            Some(selected_row.is_some_and(|row| row.configured.is_some())),
             false,
         ));
         lines.push(note(format!(

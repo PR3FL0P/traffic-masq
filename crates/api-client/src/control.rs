@@ -404,6 +404,14 @@ pub fn map_request<Interface: Serialize, Proposal: Serialize>(
             body: None,
             synthesize_pong: false,
         },
+        Request::ListRouteInventory {
+            include_local_table,
+        } => RestRequest {
+            method: Method::GET,
+            path: format!("{API_PREFIX}/route-inventory?include_local_table={include_local_table}"),
+            body: None,
+            synthesize_pong: false,
+        },
         Request::ListRoutes {
             include_local_table,
         } => RestRequest {
@@ -826,6 +834,20 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&mapped.body.unwrap()).unwrap();
         assert_eq!(body["expected_revision"], 19);
         assert_eq!(body["config"]["enabled"], false);
+    }
+
+    #[test]
+    fn maps_saved_route_inventory() {
+        let mapped = map_request(&Request::ListRouteInventory {
+            include_local_table: false,
+        })
+        .unwrap();
+        assert_eq!(mapped.method, Method::GET);
+        assert_eq!(
+            mapped.path,
+            "/api/v1/route-inventory?include_local_table=false"
+        );
+        assert!(mapped.body.is_none());
     }
 
     #[test]

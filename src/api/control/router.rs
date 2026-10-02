@@ -63,11 +63,16 @@ impl ControlService {
         let Some(router) = &self.router else {
             return router_disabled();
         };
-        let desired = match self.current_router_desired().await {
-            Ok(desired) => desired,
-            Err(response) => return response,
+        let candidate = match self
+            .overrides
+            .build_candidate(&RouterIntentProposal::new())
+            .await
+        {
+            Ok(candidate) => candidate,
+            Err(error) => return classify_router_error(error),
         };
-        let health = router.manager().health(&desired).await;
+        let desired = candidate.desired();
+        let health = router.manager().health(desired).await;
         let coordinator = router.view().await;
         let status = coordinator.status();
         let recovery = router_recovery_notice(status, coordinator.failures()).map(|mut notice| {
@@ -81,11 +86,101 @@ impl ControlService {
             notice
         });
         Response::RouterStatus {
+            desired_revision: Some(candidate.base_revision()),
+            last_applied_revision: router
+                .last_applied_revision()
+                .filter(|revision| *revision <= candidate.base_revision()),
             enabled: desired.enabled,
             ready: desired.enabled && health.ready(),
             coordinator_status: status,
             health,
             recovery,
+        }
+    }
+
+    pub(super) async fn list_route_inventory(&self, include_local_table: bool) -> Response {
+        use traffic_masq_protocol::{InterfacePresence, RouteInventoryEntry};
+        let document = self.overrides.snapshot().await;
+        let effective = match document.effective_config(&self.base_config) {
+            Ok(config) => config,
+            Err(error) => return classify_router_error(error),
+        };
+        let (interfaces, observed) = tokio::join!(
+            self.network.list_interfaces(),
+            self.network.list_ipv4_routes()
+        );
+        let mut errors = Vec::new();
+        let interfaces = match interfaces {
+            Ok(value) => Some(value),
+            Err(error) => {
+                errors.push(format!("interface observation failed: {error:#}"));
+                None
+            }
+        };
+        let observed = match observed {
+            Ok(value) => value,
+            Err(error) => {
+                errors.push(format!("route observation failed: {error:#}"));
+                Vec::new()
+            }
+        };
+        let mut observed: Vec<traffic_masq_protocol::RouteStatusView> = observed
+            .into_iter()
+            .filter(|route| include_local_table || route.table != 255)
+            .map(|route| {
+                let name = interfaces
+                    .as_ref()
+                    .and_then(|interfaces| {
+                        interfaces
+                            .iter()
+                            .find(|interface| Some(interface.index) == route.output_interface_index)
+                    })
+                    .map(|interface| interface.name.clone());
+                RouteStatus::from_info(&route, name).into()
+            })
+            .collect();
+        let mut routes = Vec::new();
+        for configured in &effective.router.owned_routes {
+            let matching = observed.iter().position(|route| {
+                route.owner == traffic_masq_protocol::RouteOwnerView::TrafficMasqStatic
+                    && route.destination == configured.destination && route.gateway == configured.gateway
+                    && route.table == configured.table && route.metric.unwrap_or(0) == configured.metric.unwrap_or(0)
+                    && route.output_interface == configured.output_interface
+                    // Unknown ifindex/name resolution must not adopt an observation.
+                    && (configured.output_interface.is_some() || route.output_interface_index.is_none())
+            });
+            let presence = configured
+                .output_interface
+                .as_ref()
+                .map(|name| match &interfaces {
+                    None => InterfacePresence::Unknown,
+                    Some(interfaces)
+                        if interfaces.iter().any(|interface| interface.name == *name) =>
+                    {
+                        InterfacePresence::Present
+                    }
+                    Some(_) => InterfacePresence::Missing,
+                });
+            routes.push(RouteInventoryEntry {
+                configured: Some(configured.clone().into()),
+                observed: matching.map(|index| observed.remove(index)),
+                output_presence: presence,
+            });
+        }
+        routes.extend(observed.into_iter().map(|observed| RouteInventoryEntry {
+            configured: None,
+            observed: Some(observed),
+            output_presence: None,
+        }));
+        Response::RouteInventory {
+            revision: document.revision,
+            config: effective.router.into(),
+            routes,
+            observation_error: if errors.is_empty() {
+                None
+            } else {
+                Some(errors.join("; "))
+            },
         }
     }
 

@@ -179,6 +179,7 @@ Body names in the tables refer to the [request schemas](#request-schemas).
 | `DELETE` | `/dhcp-client/{interface}` | — | Disable DHCP client immediately | Administrator |
 | `POST` | `/dhcp-client/{interface}/renew` | — | Renew the lease | Administrator |
 | `POST` | `/dhcp-client/{interface}/release` | — | Release the lease | Administrator |
+| `GET` | `/route-inventory?include_local_table=false` | — | Saved router configuration/revision and configured/observed route inventory | Authenticated |
 | `GET` | `/routes?include_local_table=false` | — | Observed IPv4 routes; local table is excluded by default | Authenticated |
 
 ### Router and provisioning
@@ -227,8 +228,27 @@ After commit, cleanup only removes obsolete daemon-owned routes and previously
 applied firewall permissions. It does not install new routes/rules, reconfigure
 services, or change global IPv4 forwarding. Unavailable dependencies defer the
 whole remaining dataplane. Startup and reconcile retry removal using the latest
-committed intent, even while devices remain missing. Historical applied
-revision reporting and offline TUI router editors are not yet available.
+committed intent, even while devices remain missing.
+
+`GET /route-inventory` returns the effective saved router `config`, its
+`revision`, and rows with independent optional `configured` and `observed`
+values. Saved routes survive missing devices and observation failure; output
+presence is `present`, `missing`, or `unknown`. `observation_error` reports
+incomplete observation. Only exact daemon-owned matches merge with saved rows;
+foreign routes remain separate. `/routes` keeps its observed-only contract.
+
+Router status exposes `desired_revision` and `last_applied_revision` (nullable
+for compatibility). Last applied is historical evidence from a successful
+commit, repair, or verification in the current daemon process; it resets on
+restart until verified again. It does not certify current health, and offline
+Save/removal-only cleanup does not advance it.
+
+The TUI Routes and Sharing editors use saved inventory. Missing routes have no
+invented runtime ifindex; unconfigured observed routes remain read-only.
+Offline Plan reviews additions/removals and saves the latched revision through
+`PUT /router/intent`. Unknown observation or a stale revision retains the draft;
+press `c` on the router screen to discard it and reload. Ready live changes
+continue to require the confirmed router transaction.
 
 Router transactions and interface/network transactions have separate commit
 endpoints. Use the endpoint corresponding to the apply response.

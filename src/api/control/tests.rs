@@ -9457,3 +9457,183 @@ async fn uncertain_router_intent_commit_never_cleans_runtime_and_fences_later_sa
     );
     assert!(fake.cleanup_targets.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn route_inventory_keeps_missing_saved_routes_and_does_not_adopt_foreign_routes() {
+    use traffic_masq_protocol::InterfacePresence;
+    let directory = tempdir().unwrap();
+    let mut config = router_base_config();
+    config.runtime.state_dir = directory.path().into();
+    let saved = crate::config::OwnedIpv4RouteConfig {
+        destination: "203.0.113.0/24".parse().unwrap(),
+        gateway: None,
+        output_interface: Some("wan0".into()),
+        table: 254,
+        metric: Some(100),
+    };
+    config.router.owned_routes = vec![saved.clone()];
+    let observed = crate::netlink::Ipv4RouteInfo {
+        destination: saved.destination,
+        gateway: None,
+        output_interface_index: Some(7),
+        table: 254,
+        metric: Some(100),
+        protocol: 4,
+        scope: 253,
+    };
+    let network = Arc::new(crate::test_support::FakeNetworkProvider::default());
+    *network.routes.lock().await = vec![observed.clone()];
+    let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+        .await
+        .unwrap();
+    let dhcp = DhcpSupervisor::start(&config).await.unwrap();
+    let service = ControlService::new(config, network.clone(), dhcp, overrides);
+    match service
+        .dispatch(Request::ListRouteInventory {
+            include_local_table: false,
+        })
+        .await
+    {
+        Response::RouteInventory {
+            revision,
+            config,
+            routes,
+            observation_error,
+        } => {
+            assert_eq!(revision, 0);
+            assert!(!config.enabled);
+            assert_eq!(routes.len(), 2);
+            assert!(routes[0].configured.is_some());
+            assert!(routes[0].observed.is_none());
+            assert_eq!(routes[0].output_presence, Some(InterfacePresence::Missing));
+            assert!(routes[1].configured.is_none());
+            assert_eq!(routes[1].observed.as_ref().unwrap().protocol, 4);
+            assert!(observation_error.is_none());
+        }
+        response => panic!("{response:?}"),
+    }
+    network.add_interface("wan0", 7).await;
+    *network.routes.lock().await = vec![crate::netlink::Ipv4RouteInfo {
+        protocol: crate::netlink::TRAFFIC_MASQ_ROUTE_PROTOCOL,
+        ..observed
+    }];
+    match service
+        .dispatch(Request::ListRouteInventory {
+            include_local_table: false,
+        })
+        .await
+    {
+        Response::RouteInventory { routes, .. } => {
+            assert_eq!(routes.len(), 1);
+            assert!(routes[0].configured.is_some() && routes[0].observed.is_some());
+            assert_eq!(routes[0].output_presence, Some(InterfacePresence::Present));
+        }
+        response => panic!("{response:?}"),
+    }
+    *network.fail_interface_observation.lock().await = true;
+    match service
+        .dispatch(Request::ListRouteInventory {
+            include_local_table: false,
+        })
+        .await
+    {
+        Response::RouteInventory {
+            routes,
+            observation_error,
+            ..
+        } => {
+            assert_eq!(routes[0].output_presence, Some(InterfacePresence::Unknown));
+            assert!(routes[0].observed.is_none());
+            assert!(routes[1].configured.is_none());
+            assert!(observation_error.is_some());
+        }
+        response => panic!("{response:?}"),
+    }
+}
+
+#[tokio::test]
+async fn route_inventory_reports_observation_failure_without_losing_saved_configuration() {
+    let directory = tempdir().unwrap();
+    let mut config = router_with_two_saved_sharing_rules();
+    config.runtime.state_dir = directory.path().into();
+    let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+        .await
+        .unwrap();
+    let dhcp = DhcpSupervisor::start(&config).await.unwrap();
+    let service = ControlService::new(
+        config.clone(),
+        Arc::new(RouteFakeNetwork {
+            interfaces: vec![],
+            routes: vec![],
+            route_error: Some("netlink unavailable"),
+        }),
+        dhcp,
+        overrides,
+    );
+    match service
+        .dispatch(Request::ListRouteInventory {
+            include_local_table: false,
+        })
+        .await
+    {
+        Response::RouteInventory {
+            config: saved,
+            routes,
+            observation_error,
+            ..
+        } => {
+            assert_eq!(saved.owned_routes.len(), config.router.owned_routes.len());
+            assert!(routes
+                .iter()
+                .all(|row| row.configured.is_some() && row.observed.is_none()));
+            assert!(observation_error.unwrap().contains("netlink unavailable"));
+        }
+        response => panic!("{response:?}"),
+    }
+}
+
+#[tokio::test]
+async fn router_status_separates_saved_revision_from_historical_applied_revision() {
+    let (service, _) = router_service_with_config(
+        Arc::new(FakeRouterSubsystems::default()),
+        router_with_two_saved_sharing_rules(),
+    )
+    .await;
+    let router = service.router.as_ref().unwrap();
+    assert!(router.last_applied_revision().is_none());
+    router
+        .repair(service.current_router_desired().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(router.last_applied_revision(), Some(0));
+    let mut saved = service.effective_config().await.unwrap().router;
+    saved.forwarding = Some(vec![]);
+    assert!(matches!(
+        service
+            .dispatch(Request::SaveRouterIntent {
+                config: saved.into(),
+                expected_revision: 0
+            })
+            .await,
+        Response::RouterIntentSaved { revision: 1, .. }
+    ));
+    assert!(matches!(
+        service.dispatch(Request::RouterStatus).await,
+        Response::RouterStatus {
+            desired_revision: Some(1),
+            last_applied_revision: Some(0),
+            ..
+        }
+    ));
+    let restarted = RouterTransactionCoordinator::new(
+        router.manager(),
+        service.overrides.clone(),
+        Duration::from_secs(30),
+    );
+    assert!(restarted.last_applied_revision().is_none());
+    restarted
+        .reconcile_dataplane(service.current_router_desired().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(restarted.last_applied_revision(), Some(1));
+}

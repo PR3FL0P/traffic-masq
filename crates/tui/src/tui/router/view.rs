@@ -17,9 +17,9 @@ pub(super) fn format_owner_badge(owner: RouteOwner) -> Span<'static> {
 
 pub(super) fn router_action_buttons(router: &RouterData) -> [(RouterAction, &'static str); 8] {
     let manual_delete = router
-        .routes
+        .route_rows()
         .get(router.selected_route)
-        .is_some_and(|route| !route.owner.is_editable());
+        .is_some_and(|row| row.configured.is_none());
     [
         (RouterAction::AddRoute, "[Add route]"),
         (RouterAction::EditRoute, "[Edit route]"),
@@ -166,7 +166,7 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
     if router.staged {
         status_lines.push(Line::styled(
             format!(
-                "Staged configuration: {} owned route(s); review all changes with [Plan / Apply]",
+                "Staged configuration: {} owned route(s); review with [Plan / Apply]; c: discard draft",
                 router.proposed_router_config.owned_routes.len()
             ),
             Style::default()
@@ -224,6 +224,26 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         ));
     }
 
+    status_lines.insert(
+        1,
+        Line::from(format!(
+            "Saved rev: {} | Last applied: {}",
+            router
+                .desired_revision
+                .or(router.editor_revision)
+                .map_or("unknown".into(), |revision| revision.to_string()),
+            router
+                .last_applied_revision
+                .map_or("unknown".into(), |revision| revision.to_string())
+        )),
+    );
+    if let Some(error) = &router.observation_error {
+        status_lines.push(Line::styled(
+            format!("Observation unknown: {error}"),
+            Style::default().fg(theme::WARN),
+        ));
+    }
+
     let buttons = router_action_buttons(router);
     let button_positions = router_button_positions(&buttons, area.width.saturating_sub(2));
     let base_actions_height = button_positions.last().map_or(0, |(_, y)| y + 1) + 2;
@@ -265,21 +285,18 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         "Table",
         "Owner",
     ];
-    let route_cells: Vec<_> = router
-        .routes
+    let route_rows = router.route_rows();
+    let route_cells: Vec<_> = route_rows
         .iter()
+        .filter_map(row_config)
         .map(|route| {
             [
                 route.destination.to_string(),
                 route
                     .gateway
-                    .map(|g| g.to_string())
-                    .unwrap_or_else(|| "direct".into()),
-                route.output_interface.clone().unwrap_or_else(|| "-".into()),
-                route
-                    .metric
-                    .map(|m| m.to_string())
-                    .unwrap_or_else(|| "-".into()),
+                    .map_or("direct".into(), |gateway| gateway.to_string()),
+                route.output_interface.unwrap_or_else(|| "-".into()),
+                route.metric.map_or("-".into(), |metric| metric.to_string()),
                 match route.table {
                     254 => "main (254)".into(),
                     255 => "local (255)".into(),
@@ -298,9 +315,14 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
             .max()
             .unwrap_or(0)
             .max(headers[column + 1].len());
+        let width = if area.width < 100 {
+            width.min([16, 12, 12, 5, 7][column])
+        } else {
+            width
+        };
         widths.push(Constraint::Length(width as u16));
     }
-    widths.push(Constraint::Min(5));
+    widths.push(Constraint::Min(12));
     let header = Row::new(headers).style(
         Style::default()
             .fg(theme::MUTED)
@@ -323,12 +345,11 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         table_inner.height.saturating_sub(header_offset as u16),
     ));
     app.ui.list_row_height = 1;
-    app.ui.list_count = router.routes.len();
+    app.ui.list_count = route_rows.len();
     app.ui.list_scroll_offset = scroll;
 
-    if !router.routes.is_empty() {
-        for (index, route) in router
-            .routes
+    if !route_rows.is_empty() {
+        for (index, row) in route_rows
             .iter()
             .enumerate()
             .skip(scroll)
@@ -336,7 +357,7 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         {
             let is_selected = index == router.selected_route;
             let marker = if is_selected { "▶" } else { " " };
-            let mut style = if !route.owner.is_owned() {
+            let mut style = if row.configured.is_none() {
                 Style::default().fg(theme::WARN)
             } else if is_selected {
                 Style::default().fg(theme::ACCENT)
@@ -352,7 +373,30 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
                     .iter()
                     .map(|value| Cell::from(value.as_str())),
             );
-            cells.push(Cell::from(format_owner_badge(route.owner)));
+            let badge = if row.configured.is_some() {
+                let state = if router.staged {
+                    "staged"
+                } else if !router.proposed_router_config.enabled {
+                    "disabled"
+                } else if router.observation_error.is_some()
+                    || row.output_presence
+                        == Some(traffic_masq_protocol::InterfacePresence::Unknown)
+                {
+                    "unknown"
+                } else if row.output_presence
+                    == Some(traffic_masq_protocol::InterfacePresence::Missing)
+                {
+                    "missing"
+                } else if row.observed.is_some() {
+                    "observed"
+                } else {
+                    "inactive"
+                };
+                Span::styled(format!("saved/{state}"), Style::default().fg(theme::GOOD))
+            } else {
+                format_owner_badge(row.observed.as_ref().unwrap().owner)
+            };
+            cells.push(Cell::from(badge));
             rows.push(Row::new(cells).style(style));
         }
     }
@@ -360,7 +404,7 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         Table::new(rows, widths).header(header).column_spacing(2),
         table_inner,
     );
-    if router.routes.is_empty() {
+    if route_rows.is_empty() {
         frame.render_widget(
             Paragraph::new("   No routes found.").style(Style::default().fg(theme::MUTED)),
             app.ui.list_area.unwrap(),

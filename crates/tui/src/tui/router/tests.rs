@@ -718,6 +718,8 @@ async fn periodic_router_status_refresh_does_not_request_a_plan() {
         }
 
         let body = serde_json::to_vec(&Response::RouterStatus {
+            desired_revision: Some(4),
+            last_applied_revision: Some(3),
             enabled: true,
             ready: true,
             coordinator_status: CoordinatorStatus::Idle,
@@ -1130,4 +1132,290 @@ fn formats_coordinator_status_for_each_variant() {
         format_coordinator_status(CoordinatorStatus::RollbackFailed),
         "rollback failed (recovery required)"
     );
+}
+
+async fn router_mock_api(
+    responses: Vec<Response>,
+) -> (
+    tempfile::TempDir,
+    ApiClient,
+    tokio::task::JoinHandle<Vec<(String, serde_json::Value)>>,
+) {
+    use http_body_util::{BodyExt, Full};
+    use hyper::{body::Bytes, server::conn::http1, service::service_fn};
+    use hyper_util::rt::TokioIo;
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("api.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let requests = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        for response in responses {
+            let (stream, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let body = serde_json::to_vec(&response).unwrap();
+            let requests = requests.clone();
+            http1::Builder::new()
+                .serve_connection(
+                    TokioIo::new(stream),
+                    service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                        let requests = requests.clone();
+                        let body = body.clone();
+                        async move {
+                            let path = format!("{} {}", request.method(), request.uri().path());
+                            let request_body =
+                                request.into_body().collect().await.unwrap().to_bytes();
+                            let json = serde_json::from_slice(&request_body)
+                                .unwrap_or(serde_json::Value::Null);
+                            requests.lock().await.push((path, json));
+                            Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(
+                                Bytes::from(body),
+                            )))
+                        }
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        let result = requests.lock().await.clone();
+        result
+    });
+    (directory, ApiClient::new(socket), server)
+}
+
+fn intent_preview(
+    config: RouterConfig,
+    revision: u64,
+    readiness: traffic_masq_protocol::InterfaceReadiness,
+) -> Response {
+    Response::RouterIntentPreview {
+        revision,
+        desired: RouterDesiredView {
+            enabled: config.enabled,
+            uplink_wifi: None,
+            uplink_dhcp: None,
+            output_wifi: vec![],
+            dhcp: vec![],
+            routes: config.owned_routes.clone(),
+            allow_default_route_change: config.allow_default_route_change,
+            vpn_chain: vec![],
+            dataplane: RouterDataplaneTargetView::Disabled,
+            interfaces: vec![],
+        },
+        config,
+        device_readiness: readiness,
+        blockers: vec![
+            traffic_masq_protocol::InterfaceReadinessBlocker::MissingInterface {
+                interface: "missing0".into(),
+            },
+        ],
+        execution_available: true,
+    }
+}
+
+fn missing_route_row(config: OwnedIpv4RouteConfig) -> traffic_masq_protocol::RouteInventoryEntry {
+    traffic_masq_protocol::RouteInventoryEntry {
+        configured: Some(config),
+        observed: None,
+        output_presence: Some(traffic_masq_protocol::InterfacePresence::Missing),
+    }
+}
+
+#[tokio::test]
+async fn offline_router_preview_saves_latched_revision_and_retains_draft_on_stale_error() {
+    let mut app = TuiApp {
+        screen: Screen::Router,
+        ..Default::default()
+    };
+    app.router.editor_revision = Some(7);
+    app.router.staged = true;
+    app.router.proposed_router_config.owned_routes = vec![route_config("203.0.113.0/24")];
+    let config = app.router.proposed_router_config.clone();
+    let (_directory, client, server) = router_mock_api(vec![
+        intent_preview(
+            config.clone(),
+            7,
+            traffic_masq_protocol::InterfaceReadiness::WaitingDevice,
+        ),
+        Response::RouterError {
+            detail: RouterErrorDetail::StaleCandidate {
+                candidate_revision: 7,
+                current_revision: 8,
+            },
+        },
+    ])
+    .await;
+    open_router_plan(&mut app, &client).await;
+    assert_eq!(app.screen, Screen::RouterPlan);
+    assert!(app.router.offline_preview.is_some());
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| super::super::render(frame, &mut app, false))
+        .unwrap();
+    app.router.plan_scroll = app.router.plan_max_scroll;
+    super::plan::handle_router_plan_key(&mut app, KeyCode::Enter, &client).await;
+    assert_eq!(app.router.proposed_router_config, config);
+    assert_eq!(app.router.editor_revision, Some(7));
+    assert!(app.router.staged && app.router.offline_preview.is_some());
+    let requests = server.await.unwrap();
+    assert_eq!(requests[0].0, "POST /api/v1/router/intent/preview");
+    assert_eq!(requests[1].0, "PUT /api/v1/router/intent");
+    assert_eq!(requests[1].1["expected_revision"], 7);
+    assert_eq!(
+        requests[1].1["config"],
+        serde_json::to_value(config).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn unknown_or_stale_router_preview_never_proceeds_to_save() {
+    for (revision, readiness) in [
+        (7, traffic_masq_protocol::InterfaceReadiness::Unknown),
+        (8, traffic_masq_protocol::InterfaceReadiness::WaitingDevice),
+    ] {
+        let mut app = TuiApp {
+            screen: Screen::Router,
+            ..Default::default()
+        };
+        app.router.editor_revision = Some(7);
+        app.router.staged = true;
+        let config = app.router.proposed_router_config.clone();
+        let (_directory, client, server) =
+            router_mock_api(vec![intent_preview(config.clone(), revision, readiness)]).await;
+        open_router_plan(&mut app, &client).await;
+        assert_eq!(app.screen, Screen::Router);
+        assert!(app.router.offline_preview.is_none());
+        assert!(app.router.staged);
+        assert_eq!(app.router.proposed_router_config, config);
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn offline_router_save_reports_deferred_result_and_reloads_inventory() {
+    let mut app = TuiApp {
+        screen: Screen::Router,
+        ..Default::default()
+    };
+    app.router.editor_revision = Some(7);
+    app.router.staged = true;
+    app.router.proposed_router_config.owned_routes = vec![route_config("203.0.113.0/24")];
+    let config = app.router.proposed_router_config.clone();
+    let row = missing_route_row(config.owned_routes[0].clone());
+    let (_directory, client, server) = router_mock_api(vec![
+        intent_preview(
+            config.clone(),
+            7,
+            traffic_masq_protocol::InterfaceReadiness::WaitingDevice,
+        ),
+        Response::RouterIntentSaved {
+            revision: 8,
+            deferred: true,
+            missing_dependencies: vec!["missing0".into()],
+            cleanup_blockers: vec![],
+            execution_available: true,
+        },
+        Response::RouterStatus {
+            desired_revision: Some(8),
+            last_applied_revision: Some(6),
+            enabled: false,
+            ready: false,
+            coordinator_status: CoordinatorStatus::Idle,
+            health: RouterHealthReport::default(),
+            recovery: None,
+        },
+        Response::RouteInventory {
+            revision: 8,
+            config: config.clone(),
+            routes: vec![row],
+            observation_error: None,
+        },
+        Response::InterfaceInventory {
+            revision: 8,
+            interfaces: vec![],
+            suppressed_interfaces: vec![],
+            observation_error: None,
+        },
+        intent_preview(
+            config,
+            8,
+            traffic_masq_protocol::InterfaceReadiness::WaitingDevice,
+        ),
+    ])
+    .await;
+    open_router_plan(&mut app, &client).await;
+    super::plan::handle_router_plan_key(&mut app, KeyCode::Enter, &client).await;
+    assert_eq!(app.screen, Screen::Router);
+    assert!(!app.router.staged);
+    assert_eq!(app.router.editor_revision, Some(8));
+    assert_eq!(app.router.last_applied_revision, Some(6));
+    assert!(app.router.routes.is_empty());
+    assert_eq!(app.router.route_rows().len(), 1);
+    assert!(app
+        .message
+        .as_deref()
+        .unwrap()
+        .contains("Saved router intent revision 8; waiting for missing0"));
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 6);
+    assert!(!requests
+        .iter()
+        .any(|(path, _)| path.ends_with("/router/apply")));
+}
+
+#[tokio::test]
+async fn saved_missing_route_editor_keeps_name_without_fabricating_runtime() {
+    let mut app = TuiApp {
+        screen: Screen::Router,
+        ..Default::default()
+    };
+    let mut config = route_config("203.0.113.0/24");
+    config.output_interface = Some("unplugged0".into());
+    app.router.proposed_router_config.owned_routes = vec![config.clone()];
+    app.router.route_inventory = Some(vec![missing_route_row(config)]);
+    super::editor::open_route_editor_for_selected(&mut app, &ApiClient::new("/must-not-exist"))
+        .await;
+    assert_eq!(
+        app.router
+            .editor
+            .as_ref()
+            .unwrap()
+            .output_interface
+            .as_deref(),
+        Some("unplugged0")
+    );
+    assert!(app
+        .router
+        .editor
+        .as_ref()
+        .unwrap()
+        .available_interfaces
+        .contains(&"unplugged0".into()));
+    app.router.editor.as_mut().unwrap().metric = "500".into();
+    save_route_editor(&mut app);
+    assert!(!app.router.proposed_router_config.enabled);
+    assert!(app.router.routes.is_empty());
+    assert!(app.router.route_rows()[0].observed.is_none());
+    delete_selected_route(&mut app);
+    assert!(app.router.proposed_router_config.owned_routes.is_empty());
+    assert!(app.router.route_rows().is_empty());
+}
+
+#[tokio::test]
+async fn unsaved_observed_owned_route_is_read_only_in_inventory() {
+    let mut app = TuiApp::default();
+    app.router.route_inventory = Some(vec![traffic_masq_protocol::RouteInventoryEntry {
+        configured: None,
+        observed: Some(route_status(
+            &route_config("203.0.113.0/24"),
+            RouteOwner::TrafficMasqStatic,
+        )),
+        output_presence: None,
+    }]);
+    super::editor::open_route_editor_for_selected(&mut app, &ApiClient::new("/must-not-be-used"))
+        .await;
+    assert!(app.router.editor.is_none());
+    assert!(!app.router.staged);
 }

@@ -656,6 +656,9 @@ impl ControlService {
             Request::RouterCommit { token } => self.router_commit(token).await,
             Request::RouterRollback { token } => self.router_rollback(token).await,
             Request::RouterPendingTransaction => self.router_pending_transaction().await,
+            Request::ListRouteInventory {
+                include_local_table,
+            } => self.list_route_inventory(include_local_table).await,
             Request::ListRoutes {
                 include_local_table,
             } => self.list_routes(include_local_table).await,

@@ -27,6 +27,17 @@ pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &A
             handle_router_recovery_action(app, client).await;
             return;
         }
+        KeyCode::Char('c') if app.router.staged => {
+            app.router.staged = false;
+            app.router.offline_preview = None;
+            app.router.editor = None;
+            load_router_data(app, client).await;
+            app.push_message(
+                LogLevel::Info,
+                "Router draft discarded; saved configuration reloaded",
+            );
+            return;
+        }
         KeyCode::Char('e') => {
             if app.router.recovery_blocks_mutations() {
                 app.push_message(
@@ -108,8 +119,8 @@ pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &A
                     app.router.warning_message = None;
                 }
                 KeyCode::Down => {
-                    if !app.router.routes.is_empty()
-                        && app.router.selected_route + 1 < app.router.routes.len()
+                    if !app.router.route_rows().is_empty()
+                        && app.router.selected_route + 1 < app.router.route_rows().len()
                     {
                         app.router.selected_route += 1;
                     }
@@ -298,12 +309,16 @@ pub(super) fn router_plan_needed(router: &RouterData) -> bool {
 async fn load_router_status(app: &mut TuiApp, client: &ApiClient) -> bool {
     match client.request(&Request::RouterStatus).await {
         Ok(Response::RouterStatus {
+            desired_revision,
+            last_applied_revision,
             enabled,
             ready,
             coordinator_status,
             health,
             recovery,
         }) => {
+            app.router.desired_revision = desired_revision;
+            app.router.last_applied_revision = last_applied_revision;
             app.router.enabled = enabled;
             app.router.ready = ready;
             app.router.coordinator_status = Some(coordinator_status);
@@ -344,36 +359,75 @@ async fn load_router_status(app: &mut TuiApp, client: &ApiClient) -> bool {
 /// Refresh router configuration, status, and pending transaction state from the daemon.
 pub(crate) async fn load_router_data(app: &mut TuiApp, client: &ApiClient) {
     app.router.error = None;
-    if !load_router_status(app, client).await {
-        return;
-    }
-
-    let mut topology_loaded = true;
+    // Saved inventory remains usable even when execution status is unavailable.
+    let _ = load_router_status(app, client).await;
     if !app.router.staged {
-        if let Ok(Response::RouterConfig { config }) =
-            client.request(&Request::GetRouterConfig).await
-        {
-            app.router.proposed_router_config = config;
-        } else {
-            topology_loaded = false;
-        }
-
-        if let Ok(Response::Routes { routes }) = client
-            .request(&Request::ListRoutes {
+        let selected = app
+            .router
+            .route_rows()
+            .get(app.router.selected_route)
+            .and_then(row_config);
+        match client
+            .request(&Request::ListRouteInventory {
                 include_local_table: false,
             })
             .await
         {
-            app.router.routes = routes;
-            if app.router.selected_route >= app.router.routes.len() && !app.router.routes.is_empty()
-            {
-                app.router.selected_route = app.router.routes.len() - 1;
+            Ok(Response::RouteInventory {
+                revision,
+                config,
+                routes,
+                observation_error,
+            }) => {
+                app.router.saved_router_config = Some(config.clone());
+                app.router.proposed_router_config = config;
+                app.router.editor_revision = Some(revision);
+                app.router.routes = routes
+                    .iter()
+                    .filter_map(|row| row.observed.clone())
+                    .collect();
+                app.router.route_inventory = Some(routes);
+                app.router.observation_error = observation_error;
+                app.router.topology.loaded = true;
+                let rows = app.router.route_rows();
+                app.router.selected_route = selected
+                    .as_ref()
+                    .and_then(|selected| {
+                        rows.iter()
+                            .position(|row| row_config(row).as_ref() == Some(selected))
+                    })
+                    .unwrap_or(app.router.selected_route.min(rows.len().saturating_sub(1)));
             }
-        } else {
-            topology_loaded = false;
+            Ok(response) => {
+                app.push_message(
+                    LogLevel::Error,
+                    format!("Could not load saved routes: {response:?}"),
+                );
+                app.router.topology.loaded = false;
+                return;
+            }
+            Err(error) => {
+                app.router.observation_error = Some(error.to_string());
+                app.push_message(LogLevel::Error, error.to_string());
+                return;
+            }
+        }
+        match client.request(&Request::ListInterfaceInventory).await {
+            Ok(Response::InterfaceInventory {
+                interfaces,
+                revision,
+                ..
+            }) if Some(revision) == app.router.editor_revision => {
+                app.router.saved_interfaces = interfaces;
+            }
+            _ => {
+                app.router.saved_interfaces.clear();
+                app.router.topology.loaded = false;
+                app.push_message(LogLevel::Error, "Could not load interface settings at the router revision; refresh before editing sharing");
+                return;
+            }
         }
     }
-    app.router.topology.loaded = topology_loaded;
 
     if !router_plan_needed(&app.router) {
         app.router.plan = None;
@@ -382,6 +436,45 @@ pub(crate) async fn load_router_data(app: &mut TuiApp, client: &ApiClient) {
     }
 
     let proposal = current_router_proposal(app);
+    match client
+        .request(&Request::RouterIntentPreview {
+            proposal: proposal.clone(),
+        })
+        .await
+    {
+        Ok(Response::RouterIntentPreview {
+            device_readiness: traffic_masq_protocol::InterfaceReadiness::Ready,
+            execution_available: true,
+            ..
+        }) => {
+            if !app.router.staged {
+                app.router.saved_device_readiness =
+                    Some(traffic_masq_protocol::InterfaceReadiness::Ready);
+            }
+        }
+        Ok(Response::RouterIntentPreview {
+            device_readiness, ..
+        }) => {
+            if !app.router.staged {
+                app.router.saved_device_readiness = Some(device_readiness);
+            }
+            app.router.plan = None;
+            return;
+        }
+        Ok(response) => {
+            app.push_message(
+                LogLevel::Error,
+                format!("Could not inspect router intent: {response:?}"),
+            );
+            app.router.plan = None;
+            return;
+        }
+        Err(error) => {
+            app.push_message(LogLevel::Error, error.to_string());
+            app.router.plan = None;
+            return;
+        }
+    }
     match client.request(&Request::RouterPlan { proposal }).await {
         Ok(Response::RouterPlan { plan }) => {
             app.router.lease_counts = lease_counts_for_plan(client, &plan).await;

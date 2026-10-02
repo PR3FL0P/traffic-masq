@@ -68,3 +68,11 @@ pub struct RouteStatusView {
     pub scope: u8,
     pub owner: RouteOwnerView,
 }
+
+/// Saved intent and kernel observation remain distinct; no synthetic ifindex.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteInventoryEntry {
+    pub configured: Option<crate::OwnedIpv4RouteConfigView>,
+    pub observed: Option<RouteStatusView>,
+    pub output_presence: Option<crate::InterfacePresence>,
+}
