@@ -413,7 +413,7 @@ fn latest_log_path(directory: &Path) -> Result<PathBuf> {
     }
     candidates
         .into_iter()
-        .max_by_key(|(modified, _)| *modified)
+        .max()
         .map(|(_, path)| path)
         .ok_or_else(|| anyhow::anyhow!("no traffic-masqd logs found in {}", directory.display()))
 }

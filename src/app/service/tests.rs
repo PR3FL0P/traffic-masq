@@ -35,8 +35,31 @@ fn prints_and_selects_latest_rolling_log() {
     let older = directory.path().join("traffic-masqd.log.2026-01-01");
     let latest = directory.path().join("traffic-masqd.log.2026-01-02");
     fs::write(&older, "old\n").expect("older log");
-    std::thread::sleep(Duration::from_millis(10));
     fs::write(&latest, "one\ntwo\nthree\n").expect("latest log");
+    let timestamp = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    for (path, seconds) in [(&older, 0), (&latest, 60)] {
+        fs::File::open(path)
+            .expect("open log")
+            .set_times(fs::FileTimes::new().set_modified(timestamp + Duration::from_secs(seconds)))
+            .expect("set log timestamp");
+    }
+    assert_eq!(latest_log_path(directory.path()).expect("latest"), latest);
+}
+
+#[test]
+fn latest_rolling_log_is_deterministic_when_timestamps_match() {
+    let directory = tempdir().expect("tempdir");
+    let older = directory.path().join("traffic-masqd.log.2026-01-01");
+    let latest = directory.path().join("traffic-masqd.log.2026-01-02");
+    let timestamp = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    // Reverse creation order to ensure directory iteration cannot decide ties.
+    for path in [&latest, &older] {
+        fs::write(path, "log\n").expect("write log");
+        fs::File::open(path)
+            .expect("open log")
+            .set_times(fs::FileTimes::new().set_modified(timestamp))
+            .expect("set log timestamp");
+    }
     assert_eq!(latest_log_path(directory.path()).expect("latest"), latest);
 }
 
