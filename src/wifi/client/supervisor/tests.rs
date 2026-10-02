@@ -100,7 +100,7 @@ impl FakeSupplicantCtrl {
                         "OK\n".to_string()
                     }
                     "BSS FIRST" => "id=0\nbssid=02:00:00:00:00:01\nfreq=2412\nlevel=-42\nflags=[WPA2-PSK-CCMP][SAE][ESS]\nssid=upstream\n".to_string(),
-                    "BSS NEXT-0" => "FAIL\n".to_string(),
+                    "BSS NEXT-0" => String::new(),
                     "RECONNECT" => {
                         for addr in &attached {
                             let _ = socket.send_to_addr(b"<3>CTRL-EVENT-CONNECTED - Connection to 02:00:00:00:00:01 completed\n", addr);

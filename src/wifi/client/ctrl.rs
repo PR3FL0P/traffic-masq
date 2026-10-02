@@ -268,7 +268,9 @@ impl WpaSupplicantCtrlClient {
                 Err(CtrlError::Failed) => return Ok(results),
                 Err(error) => return Err(error),
             };
-            if reply.trim() == "FAIL" {
+            // wpa_supplicant returns a zero-length datagram when FIRST/NEXT
+            // has no entry. FAIL is also accepted for older responders.
+            if reply.trim().is_empty() || reply.trim() == "FAIL" {
                 return Ok(results);
             }
             let (id, result) = parse_bss(&reply)?;

@@ -3231,7 +3231,7 @@ impl FakeSupplicant {
                         "OK\n".to_string()
                     }
                     "BSS FIRST" => "id=0\nbssid=02:00:00:00:00:01\nfreq=2412\nlevel=-42\nflags=[WPA2-PSK-CCMP][SAE][ESS]\nssid=upstream\n".to_string(),
-                    "BSS NEXT-0" => "FAIL\n".to_string(),
+                    "BSS NEXT-0" => String::new(),
                     "RECONNECT" | "DISCONNECT" | "REASSOCIATE" => "OK\n".to_string(),
                     _ => "UNKNOWN COMMAND\n".to_string(),
                 };

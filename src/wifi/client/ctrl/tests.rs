@@ -1,6 +1,29 @@
 use super::*;
 
 #[tokio::test]
+async fn empty_bss_table_returns_no_networks() {
+    for reply in ["", "FAIL\n"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ctrl");
+        let socket = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let server = tokio::task::spawn_blocking(move || {
+            let mut buffer = [0u8; 128];
+            let (len, peer) = socket.recv_from(&mut buffer).unwrap();
+            assert_eq!(&buffer[..len], b"BSS FIRST");
+            socket.send_to_addr(reply.as_bytes(), &peer).unwrap();
+        });
+        let client = WpaSupplicantCtrlClient::connect(&path, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(client.scan_results().await.unwrap().is_empty());
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn bss_iteration_reads_more_than_one_control_reply_can_hold() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("ctrl");
@@ -21,7 +44,7 @@ async fn bss_iteration_reads_more_than_one_control_reply_can_hold() {
                     + 1
             };
             let reply = if index == 200 {
-                "FAIL\n".to_string()
+                String::new()
             } else {
                 format!("id={index}\nbssid=02:00:00:00:{:02x}:{:02x}\nfreq=2412\nlevel=-40\nflags=[ESS]\nssid=network-{index}\n", index / 256, index % 256)
             };

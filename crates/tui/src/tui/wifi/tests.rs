@@ -1,5 +1,31 @@
 use super::*;
 
+#[tokio::test]
+async fn scan_request_opens_the_network_picker_with_returned_networks() {
+    let networks = vec![scan(
+        "nearby",
+        -42,
+        WpaSupplicantScanSecurity::Wpa2Psk,
+        "02:00:00:00:00:01",
+    )];
+    let (_directory, client, server) = mock_api(vec![Response::WifiClientScanResults {
+        interface: "wlp1s0".into(),
+        results: networks.clone(),
+    }])
+    .await;
+    let mut app = TuiApp::default();
+    app.wifi.rows.push(radio("wlp1s0"));
+    start_scan(&mut app, &client, "wlp1s0".into()).await;
+    assert_eq!(
+        server.await.unwrap(),
+        vec!["POST /api/v1/wifi-client/wlp1s0/scan"]
+    );
+    assert_eq!(app.screen, Screen::WifiScan);
+    let picker = app.wifi_scan.unwrap();
+    assert_eq!(picker.interface, "wlp1s0");
+    assert_eq!(picker.networks, networks);
+}
+
 async fn mock_api(
     responses: Vec<Response>,
 ) -> (

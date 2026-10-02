@@ -119,7 +119,7 @@ fn handle_command(
         }
         "SCAN" => "OK\n".to_string(),
         "BSS FIRST" => format!("id=0\nbssid={BSSID}\nfreq=2412\nlevel=-42\nflags=[WPA2-PSK-CCMP][SAE][ESS]\nssid=upstream\n"),
-        "BSS NEXT-0" => "FAIL\n".to_string(),
+        "BSS NEXT-0" => String::new(),
         "RECONNECT" => {
             *state = "SCANNING".to_string();
             "OK\n".to_string()
