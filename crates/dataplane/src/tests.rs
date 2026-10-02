@@ -1406,3 +1406,80 @@ async fn owned_operations_preserve_foreign_state() {
         vec!["foreign-table".to_string()]
     );
 }
+
+#[test]
+fn cleanup_removed_firewall_retains_only_existing_permissions_without_devices() {
+    let applied = desired();
+    let mut rules = applied.forwarding_rules();
+    rules.remove(1);
+    rules.push(ForwardingConfig {
+        from: "new0".into(),
+        to: "new1".into(),
+        source_subnet: None,
+        masquerade: true,
+    });
+    let target = RouterDataplaneTarget::Enabled(RouterDataplaneDesired {
+        forwarding: Some(rules),
+        uplink: String::new(),
+        outputs: vec![],
+    });
+    let backend = NftablesBackend::new(FakeNftExecutor::with_responses(vec![
+        Ok(nft_ruleset(Some(&applied))),
+        Ok(vec![]),
+    ]));
+    backend.cleanup_removed(&target).unwrap();
+    let calls = backend.executor.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    let batch = std::str::from_utf8(&calls[1].1).unwrap();
+    assert!(batch.contains("delete table inet traffic_masq"));
+    assert!(batch.contains("iifname \"lan0\" oifname \"eth0\""));
+    assert!(!batch.contains("lan1"));
+    assert!(!batch.contains("new0"));
+    assert!(!batch.contains("foreign"));
+}
+
+#[test]
+fn cleanup_removed_firewall_never_recreates_retired_permissions() {
+    let current = forwarding_desired();
+    let first = current.forwarding.as_ref().unwrap()[0].clone();
+    let mut saved = current.clone();
+    saved.forwarding.as_mut().unwrap().remove(0);
+    let retained = retained_firewall(
+        Some(&current),
+        &RouterDataplaneTarget::Enabled(saved.clone()),
+    )
+    .unwrap();
+    assert!(!retained.forwarding_rules().contains(&first));
+    assert_eq!(
+        retained_firewall(Some(&retained), &RouterDataplaneTarget::Enabled(current)),
+        Some(retained.clone())
+    );
+    saved.forwarding = Some(vec![]);
+    assert!(retained_firewall(Some(&retained), &RouterDataplaneTarget::Enabled(saved)).is_none());
+    let backend =
+        NftablesBackend::new(FakeNftExecutor::with_responses(vec![Ok(nft_ruleset(None))]));
+    backend
+        .cleanup_removed(&RouterDataplaneTarget::Disabled)
+        .unwrap();
+    assert_eq!(backend.executor.calls.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn cleanup_removed_firewall_refuses_drifted_or_unproven_ownership() {
+    let mut drifted = nft_ruleset_value(&desired());
+    owned_entries(&mut drifted)
+        .retain(|entry| entry.pointer("/rule/chain").and_then(Value::as_str) != Some("forward"));
+    for observed in [
+        serde_json::to_vec(&drifted).unwrap(),
+        serde_json::to_vec(&serde_json::json!({
+            "nftables": [{"table": {"family": NFT_FAMILY, "name": NFT_TABLE, "comment": "foreign"}}]
+        }))
+        .unwrap(),
+    ] {
+        let backend = NftablesBackend::new(FakeNftExecutor::with_responses(vec![Ok(observed)]));
+        assert!(backend
+            .cleanup_removed(&RouterDataplaneTarget::Disabled)
+            .is_err());
+        assert_eq!(backend.executor.calls.lock().unwrap().len(), 1);
+    }
+}

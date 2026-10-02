@@ -453,6 +453,21 @@ where
         Ok(())
     }
 
+    async fn cleanup_removed_dataplane(&self, desired: &RouterDesired) -> Result<()> {
+        let mut errors = Vec::new();
+        if let Err(error) = self.dataplane.cleanup_removed(&desired.dataplane).await {
+            errors.push(error.context("removed firewall permissions remain"));
+        }
+        if let Err(error) = self
+            .routes
+            .cleanup_removed(&desired.routes, desired.allow_default_route_change)
+            .await
+        {
+            errors.push(error.context("obsolete owned routes remain"));
+        }
+        crate::core::recovery_control::aggregate(errors, "router removal-only cleanup incomplete")
+    }
+
     async fn prepare_recovery(&self, current: &RouterDesired) -> Result<()> {
         self.vpn_chain.prepare_recovery(current).await
     }

@@ -147,6 +147,21 @@ pub struct RouterDataplaneDesired {
 }
 
 impl RouterDataplaneDesired {
+    /// Canonical directional permissions, also for legacy sharing metadata.
+    pub fn forwarding_rules(&self) -> Vec<ForwardingConfig> {
+        self.forwarding.clone().unwrap_or_else(|| {
+            self.outputs
+                .iter()
+                .map(|output| ForwardingConfig {
+                    source_subnet: Some(output.subnet.trunc()),
+                    from: output.interface.clone(),
+                    to: self.uplink.clone(),
+                    masquerade: true,
+                })
+                .collect()
+        })
+    }
+
     pub fn validate(&self) -> Result<()> {
         if let Some(rules) = &self.forwarding {
             if !self.uplink.is_empty() || !self.outputs.is_empty() {
@@ -187,6 +202,36 @@ impl RouterDataplaneDesired {
 
         Ok(())
     }
+}
+
+// Intersect committed permissions with proven applied permissions. Preserve
+// the original metadata when nothing was removed, including legacy format.
+fn retained_firewall(
+    current: Option<&RouterDataplaneDesired>,
+    target: &RouterDataplaneTarget,
+) -> Option<RouterDataplaneDesired> {
+    let current = current?;
+    let permitted = match target {
+        RouterDataplaneTarget::Disabled => return None,
+        RouterDataplaneTarget::Enabled(desired) => desired.forwarding_rules(),
+    };
+    let existing = current.forwarding_rules();
+    let retained: Vec<_> = existing
+        .iter()
+        .filter(|rule| permitted.contains(rule))
+        .cloned()
+        .collect();
+    if retained.len() == existing.len() {
+        return Some(current.clone());
+    }
+    if retained.is_empty() {
+        return None;
+    }
+    Some(RouterDataplaneDesired {
+        forwarding: Some(retained),
+        uplink: String::new(),
+        outputs: Vec::new(),
+    })
 }
 
 pub trait NftExecutor: Send + Sync + 'static {
@@ -256,6 +301,28 @@ where
         self.executor
             .execute(&["-f", "-"], batch.as_bytes())
             .context("failed to apply atomic owned nftables batch")?;
+        Ok(())
+    }
+
+    /// Retire permissions absent from committed intent. This never grants a
+    /// new permission, repairs drift, or requires the referenced devices.
+    pub fn cleanup_removed(&self, target: &RouterDataplaneTarget) -> Result<()> {
+        if let RouterDataplaneTarget::Enabled(desired) = target {
+            desired.validate()?;
+        }
+        let current = self.observe()?;
+        let retained = retained_firewall(current.desired.as_ref(), target);
+        if retained == current.desired {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            current.integrity == OwnedFirewallIntegrity::Intact,
+            "cannot retire firewall permissions: owned structure is drifted"
+        );
+        let batch = render_nftables_batch(current.desired.is_some(), retained.as_ref())?;
+        self.executor
+            .execute(&["-f", "-"], batch.as_bytes())
+            .context("failed to retire removed owned firewall permissions")?;
         Ok(())
     }
 
@@ -847,6 +914,14 @@ pub trait RouterDataplaneProvider: Send + Sync {
     async fn apply_owned(&self, desired: &RouterDataplaneDesired) -> Result<()>;
     async fn disable_owned(&self) -> Result<()>;
     async fn restore_owned(&self, snapshot: &RouterDataplaneSnapshot) -> Result<()>;
+    async fn cleanup_removed(&self, target: &RouterDataplaneTarget) -> Result<()> {
+        let observed = self.observe().await?;
+        anyhow::ensure!(
+            retained_firewall(observed.owned.as_ref(), target) == observed.owned,
+            "removal-only firewall cleanup is unavailable"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -948,6 +1023,12 @@ where
             .context("failed to remove owned firewall state")
     }
 
+    async fn cleanup_removed(&self, target: &RouterDataplaneTarget) -> Result<()> {
+        let backend = self.nftables.clone();
+        let target = target.clone();
+        tokio::task::spawn_blocking(move || backend.cleanup_removed(&target)).await?
+    }
+
     async fn restore_owned(&self, snapshot: &RouterDataplaneSnapshot) -> Result<()> {
         let (firewall_result, forwarding_result) = if snapshot.ipv4_forwarding {
             let firewall = self
@@ -1015,6 +1096,10 @@ where
     pub async fn plan(&self, desired: RouterDataplaneDesired) -> Result<RouterDataplanePlan> {
         self.plan_target(RouterDataplaneTarget::Enabled(desired))
             .await
+    }
+
+    pub async fn cleanup_removed(&self, target: &RouterDataplaneTarget) -> Result<()> {
+        self.provider.cleanup_removed(target).await
     }
 
     pub async fn snapshot(&self) -> Result<RouterDataplaneSnapshot> {

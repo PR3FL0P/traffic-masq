@@ -400,6 +400,10 @@ use tempfile::tempdir;
 
 #[derive(Default)]
 struct FakeRouterSubsystems {
+    cleanup_targets: std::sync::Mutex<Vec<RouterDesired>>,
+    cleanup_started: tokio::sync::Notify,
+    cleanup_hold: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
+    cleanup_failure: std::sync::Mutex<bool>,
     unhealthy_interfaces: std::sync::Mutex<bool>,
     unhealthy_routes: std::sync::Mutex<bool>,
     unhealthy_dhcp: std::sync::Mutex<bool>,
@@ -444,6 +448,20 @@ fn fake_router_snapshot() -> RouterSnapshot {
 
 #[async_trait]
 impl RouterSubsystems for FakeRouterSubsystems {
+    async fn cleanup_removed_dataplane(&self, desired: &RouterDesired) -> Result<()> {
+        self.cleanup_targets.lock().unwrap().push(desired.clone());
+        let hold = self.cleanup_hold.lock().unwrap().clone();
+        self.cleanup_started.notify_one();
+        if let Some(hold) = hold {
+            hold.notified().await;
+        }
+        anyhow::ensure!(
+            !*self.cleanup_failure.lock().unwrap(),
+            "injected cleanup failure"
+        );
+        Ok(())
+    }
+
     async fn plan_for(&self, desired: &RouterDesired) -> Result<RouterSubsystemPlan> {
         let interfaces = vec![InterfaceChangePlan {
             interface: "lan0".into(),
@@ -9136,4 +9154,306 @@ async fn router_intent_preview_distinguishes_unknown_and_ready_and_rejects_inval
         Response::RouterError { .. }
     ));
     assert_eq!(overrides.committed_revision().await, 0);
+}
+
+fn router_with_two_saved_sharing_rules() -> AppConfig {
+    let mut config = router_base_config_with_router_enabled();
+    config
+        .router
+        .owned_routes
+        .push(crate::config::OwnedIpv4RouteConfig {
+            destination: "203.0.113.0/24".parse().unwrap(),
+            gateway: None,
+            output_interface: Some("wan0".into()),
+            table: 254,
+            metric: Some(100),
+        });
+    config.router.forwarding = Some(vec![
+        crate::config::ForwardingConfig {
+            from: "lan0".into(),
+            to: "wan0".into(),
+            source_subnet: None,
+            masquerade: true,
+        },
+        crate::config::ForwardingConfig {
+            from: "absent_lan".into(),
+            to: "absent_wan".into(),
+            source_subnet: None,
+            masquerade: true,
+        },
+    ]);
+    config
+}
+
+#[tokio::test]
+async fn saved_router_intent_removes_missing_rules_independently_and_survives_restart() {
+    let fake = Arc::new(FakeRouterSubsystems::default());
+    let base = router_with_two_saved_sharing_rules();
+    let (service, directory) = router_service_with_config(fake.clone(), base.clone()).await;
+    let original = service.current_router_desired().await.unwrap();
+    let mut saved = base.router.clone();
+    saved.owned_routes.clear();
+    saved.forwarding.as_mut().unwrap().remove(0);
+    let revision = match service
+        .dispatch(Request::SaveRouterIntent {
+            config: saved.clone().into(),
+            expected_revision: 0,
+        })
+        .await
+    {
+        Response::RouterIntentSaved {
+            revision,
+            deferred,
+            missing_dependencies,
+            cleanup_blockers,
+            ..
+        } => {
+            assert!(deferred);
+            assert!(missing_dependencies.contains(&"absent_wan".into()));
+            assert!(cleanup_blockers.is_empty());
+            revision
+        }
+        response => panic!("{response:?}"),
+    };
+    assert_eq!(service.effective_config().await.unwrap().router, saved);
+    assert!(service
+        .router
+        .as_ref()
+        .unwrap()
+        .cleanup_removed_dataplane(&original)
+        .await
+        .is_err());
+    let restarted = RuntimeOverrideManager::load(directory.path(), &service.config)
+        .await
+        .unwrap();
+    let snapshot = restarted.snapshot().await;
+    assert_eq!(snapshot.router.as_ref(), Some(&saved));
+    assert!(matches!(
+        service
+            .dispatch(Request::SaveRouterIntent {
+                config: base.router.into(),
+                expected_revision: 0,
+            })
+            .await,
+        Response::RouterError {
+            detail: RouterErrorDetail::StaleCandidate { .. }
+        }
+    ));
+    assert_eq!(fake.cleanup_targets.lock().unwrap().len(), 1);
+    saved.forwarding = Some(vec![]);
+    assert!(matches!(
+        service
+            .dispatch(Request::SaveRouterIntent {
+                config: saved.clone().into(),
+                expected_revision: revision,
+            })
+            .await,
+        Response::RouterIntentSaved { .. }
+    ));
+    assert_eq!(service.effective_config().await.unwrap().router, saved);
+    assert_eq!(fake.cleanup_targets.lock().unwrap().len(), 2);
+    assert!(!directory.path().join("router-transaction.json").exists());
+}
+
+#[tokio::test]
+async fn saved_router_intent_reports_cleanup_failure_after_durable_commit() {
+    let fake = Arc::new(FakeRouterSubsystems::default());
+    *fake.cleanup_failure.lock().unwrap() = true;
+    let base = router_with_two_saved_sharing_rules();
+    let (service, _) = router_service_with_config(fake.clone(), base.clone()).await;
+    let mut saved = base.router;
+    saved.forwarding = Some(vec![]);
+    assert!(matches!(service.dispatch(Request::SaveRouterIntent {
+        config: saved.clone().into(), expected_revision: 0,
+    }).await, Response::RouterIntentSaved { revision: 1, cleanup_blockers, .. }
+        if cleanup_blockers.iter().any(|blocker| blocker.contains("injected cleanup failure"))));
+    assert_eq!(service.effective_config().await.unwrap().router, saved);
+    assert_eq!(
+        service.router.as_ref().unwrap().status().await,
+        CoordinatorStatus::Idle
+    );
+    *fake.cleanup_failure.lock().unwrap() = false;
+    service
+        .router
+        .as_ref()
+        .unwrap()
+        .cleanup_removed_dataplane(&service.current_router_desired().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(service.overrides.committed_revision().await, 1);
+}
+
+#[tokio::test]
+async fn saved_router_intent_blocks_unknown_live_and_non_router_changes() {
+    let directory = tempdir().unwrap();
+    let mut config = router_with_two_saved_sharing_rules();
+    config.runtime.state_dir = directory.path().into();
+    let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+        .await
+        .unwrap();
+    let dhcp = DhcpSupervisor::start(&config).await.unwrap();
+    let network = Arc::new(crate::test_support::FakeNetworkProvider::default());
+    let fake = Arc::new(FakeRouterSubsystems::default());
+    let coordinator = RouterTransactionCoordinator::new(
+        crate::core::router::RouterManager::new(fake.clone()),
+        overrides.clone(),
+        Duration::from_secs(30),
+    );
+    let service = ControlService::new(config.clone(), network.clone(), dhcp, overrides.clone())
+        .with_router_coordinator(coordinator);
+    let mut saved = config.router.clone();
+    saved.forwarding.as_mut().unwrap().pop();
+    *network.fail_interface_observation.lock().await = true;
+    assert!(matches!(
+        service
+            .dispatch(Request::SaveRouterIntent {
+                config: saved.clone().into(),
+                expected_revision: 0
+            })
+            .await,
+        Response::RouterError { .. }
+    ));
+    *network.fail_interface_observation.lock().await = false;
+    for (index, name) in ["lan0", "wan0", "absent_lan", "absent_wan"]
+        .into_iter()
+        .enumerate()
+    {
+        network.add_interface(name, index as u32 + 1).await;
+    }
+    assert!(matches!(
+        service
+            .dispatch(Request::SaveRouterIntent {
+                config: saved.clone().into(),
+                expected_revision: 0
+            })
+            .await,
+        Response::RouterError { .. }
+    ));
+    saved.uplink = None;
+    assert!(matches!(
+        service
+            .dispatch(Request::SaveRouterIntent {
+                config: saved.into(),
+                expected_revision: 0
+            })
+            .await,
+        Response::RouterError { .. }
+    ));
+    assert_eq!(overrides.committed_revision().await, 0);
+    assert!(fake.cleanup_targets.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn saved_router_intent_preserves_pending_transaction_and_supports_disabled_storage() {
+    let fake = Arc::new(FakeRouterSubsystems::default());
+    let base = router_with_two_saved_sharing_rules();
+    let (service, _) = router_service_with_config(fake.clone(), base.clone()).await;
+    let token = match service
+        .dispatch(Request::RouterApply {
+            proposal: Default::default(),
+        })
+        .await
+    {
+        Response::RouterTransactionPending { token, .. } => token,
+        response => panic!("{response:?}"),
+    };
+    assert!(matches!(
+        service
+            .dispatch(Request::SaveRouterIntent {
+                config: base.router.into(),
+                expected_revision: 0
+            })
+            .await,
+        Response::Error { .. }
+    ));
+    assert_eq!(service.overrides.committed_revision().await, 0);
+    assert!(fake.cleanup_targets.lock().unwrap().is_empty());
+    assert!(matches!(
+        service.dispatch(Request::RouterRollback { token }).await,
+        Response::RouterRolledBack
+    ));
+
+    let directory = tempdir().unwrap();
+    let mut base = router_base_config();
+    base.runtime.state_dir = directory.path().into();
+    let overrides = RuntimeOverrideManager::load(directory.path(), &base)
+        .await
+        .unwrap();
+    let dhcp = DhcpSupervisor::start(&base).await.unwrap();
+    let service = ControlService::new(
+        base,
+        Arc::new(FakeNetwork { addresses: vec![] }),
+        dhcp,
+        overrides,
+    );
+    let saved = crate::config::RouterConfig {
+        forwarding: Some(vec![]),
+        ..Default::default()
+    };
+    assert!(
+        matches!(service.dispatch(Request::SaveRouterIntent { config: saved.into(), expected_revision: 0 }).await,
+        Response::RouterIntentSaved { execution_available: false, cleanup_blockers, .. } if !cleanup_blockers.is_empty())
+    );
+}
+
+#[tokio::test]
+async fn cancelled_router_cleanup_keeps_coordination_until_writes_settle() {
+    let fake = Arc::new(FakeRouterSubsystems::default());
+    let hold = Arc::new(tokio::sync::Notify::new());
+    *fake.cleanup_hold.lock().unwrap() = Some(hold.clone());
+    let (service, _) =
+        router_service_with_config(fake.clone(), router_with_two_saved_sharing_rules()).await;
+    let router = service.router.clone().unwrap();
+    let desired = service.current_router_desired().await.unwrap();
+    let caller = tokio::spawn({
+        let router = router.clone();
+        async move { router.cleanup_removed_dataplane(&desired).await }
+    });
+    fake.cleanup_started.notified().await;
+    caller.abort();
+    let _ = caller.await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), router.status())
+            .await
+            .is_err()
+    );
+    hold.notify_one();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), router.status())
+            .await
+            .unwrap(),
+        CoordinatorStatus::Idle
+    );
+    assert_eq!(service.overrides.committed_revision().await, 0);
+}
+
+#[tokio::test]
+async fn uncertain_router_intent_commit_never_cleans_runtime_and_fences_later_saves() {
+    let fake = Arc::new(FakeRouterSubsystems::default());
+    let (service, _) =
+        router_service_with_config(fake.clone(), router_with_two_saved_sharing_rules()).await;
+    service
+        .overrides
+        .save_committed(service.overrides.snapshot().await)
+        .await
+        .unwrap();
+    let revision = service.overrides.committed_revision().await;
+    crate::atomic_file::fail_replacement_and_compensation(service.overrides.path());
+    let mut saved = service.effective_config().await.unwrap().router;
+    saved.forwarding = Some(vec![]);
+    assert!(matches!(
+        service
+            .dispatch(Request::SaveRouterIntent {
+                config: saved.clone().into(),
+                expected_revision: revision
+            })
+            .await,
+        Response::RouterError { .. }
+    ));
+    assert!(fake.cleanup_targets.lock().unwrap().is_empty());
+    assert!(
+        matches!(service.dispatch(Request::SaveRouterIntent { config: saved.into(), expected_revision: revision }).await,
+        Response::Error { message } if message.contains("commit_indeterminate"))
+    );
+    assert!(fake.cleanup_targets.lock().unwrap().is_empty());
 }

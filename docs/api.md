@@ -187,6 +187,7 @@ Body names in the tables refer to the [request schemas](#request-schemas).
 | --- | --- | --- | --- | --- |
 | `GET` | `/router/config` | — | Effective router configuration | Authenticated |
 | `GET` | `/router/status` | — | Readiness, coordinator and recovery state | Authenticated |
+| `PUT` | `/router/intent` | `{ "config": RouterConfig, "expected_revision": integer }` | Save sharing/owned-route intent with deferred execution and cleanup result | Administrator |
 | `POST` | `/router/intent/preview` | `RouterProposal` | Validate saved intent and report device dependencies without runtime preflight | Authenticated |
 | `POST` | `/router/plan` | `RouterProposal` | Build a plan without applying it | Authenticated |
 | `POST` | `/router/apply` | `RouterProposal` | Tentatively apply and return a token | Administrator |
@@ -208,6 +209,26 @@ route conflicts, ownership, or runtime readiness. Structural validation and
 management-change authorization still apply. Preview neither saves intent nor
 opens a transaction; `/router/plan` and `/router/apply` retain strict preflight.
 The returned revision is not an applied dataplane revision.
+
+`PUT /router/intent` saves sharing and owned-route configuration when current
+or candidate dependencies are missing, or router execution is unavailable.
+It requires the current revision from preview and retains structural validation.
+Present dependencies require a confirmed live transaction; failed observation
+rejects Save. Changing uplink, VPN chain, or derived interface policy requires a
+live transaction too. Router enable/disable is allowed only without a VPN chain.
+
+`RouterIntentSaved` reports the committed revision, `deferred`, missing
+interfaces, execution availability, and `cleanup_blockers`. A nonempty cleanup
+blocker means **intent was saved but removed runtime resources may remain**;
+it is not a failed Save and must not be retried with the old revision. Pending
+transactions, recovery fences, and indeterminate persistence block Save.
+
+After commit, cleanup only removes obsolete daemon-owned routes and previously
+applied firewall permissions. It does not install new routes/rules, reconfigure
+services, or change global IPv4 forwarding. Unavailable dependencies defer the
+whole remaining dataplane. Startup and reconcile retry removal using the latest
+committed intent, even while devices remain missing. Historical applied
+revision reporting and offline TUI router editors are not yet available.
 
 Router transactions and interface/network transactions have separate commit
 endpoints. Use the endpoint corresponding to the apply response.

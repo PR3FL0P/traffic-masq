@@ -257,6 +257,7 @@ fn build_router(state: AppState) -> Router {
         .route("/routes", get(routes_list))
         .route("/router/config", get(router_get_config))
         .route("/router/status", get(router_status))
+        .route("/router/intent", put(save_router_intent))
         .route("/router/intent/preview", post(router_intent_preview))
         .route("/router/plan", post(router_plan))
         .route("/router/apply", post(router_apply))
@@ -1062,6 +1063,28 @@ async fn router_status(
     dispatch_control(&state, &principal, Request::RouterStatus).await
 }
 
+#[derive(Deserialize)]
+struct SaveRouterIntentBody {
+    config: traffic_masq_protocol::RouterConfigView,
+    expected_revision: u64,
+}
+
+async fn save_router_intent(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Json(request): Json<SaveRouterIntentBody>,
+) -> Result<Json<Response>, ApiError> {
+    dispatch_control(
+        &state,
+        &principal,
+        Request::SaveRouterIntent {
+            config: request.config,
+            expected_revision: request.expected_revision,
+        },
+    )
+    .await
+}
+
 async fn router_intent_preview(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1611,7 +1634,8 @@ fn authorize_control_request(principal: &Principal, request: &Request) -> Result
 fn control_request_requires_administrator(request: &Request) -> bool {
     matches!(
         request,
-        Request::SaveWifiClientProfile { .. }
+        Request::SaveRouterIntent { .. }
+            | Request::SaveWifiClientProfile { .. }
             | Request::SaveWifiInterface { .. }
             | Request::SaveInterfaceConfig { .. }
             | Request::ForgetInterfaceConfig { .. }

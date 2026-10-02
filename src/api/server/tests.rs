@@ -253,6 +253,10 @@ fn every_control_request_has_the_expected_authorization_class() {
         Request::RollbackNetworkChange {
             token: "transaction-token".to_owned(),
         },
+        Request::SaveRouterIntent {
+            config: Default::default(),
+            expected_revision: 0,
+        },
         Request::SetVpnEnabled { enabled: true },
         Request::VpnPolicySetMode {
             mode: crate::config::VpnPolicyMode::Direct,

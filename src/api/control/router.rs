@@ -146,6 +146,59 @@ impl ControlService {
         }
     }
 
+    /// Save sharing/route intent when a dependency is absent. Live edits keep
+    /// using confirmed transactions; interface and VPN changes are not admitted.
+    pub(super) async fn save_router_intent(
+        &self,
+        config: crate::config::RouterConfig,
+        expected_revision: u64,
+    ) -> Response {
+        let result = async {
+            let current = self.effective_config().await.map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(config.uplink == current.router.uplink && config.vpn_chain == current.router.vpn_chain,
+                "offline router Save only changes sharing and owned routes; use a live transaction to change uplink or VPN chain");
+            anyhow::ensure!(config.enabled == current.router.enabled || current.router.vpn_chain.is_empty(),
+                "use a live transaction to change execution of a VPN router");
+            let candidate = self.overrides.build_candidate(&RouterIntentProposal::new().set_router(config)).await?;
+            anyhow::ensure!(candidate.effective_config().network.interfaces == current.network.interfaces,
+                "router candidate also changes interface policy; use a live transaction");
+            if candidate.base_revision() != expected_revision {
+                return Err(StaleCandidateError { candidate: expected_revision, current: candidate.base_revision() }.into());
+            }
+            let previous = RouterDesired::from_effective_config(&current)?;
+            let observed = self.network.list_interfaces().await?;
+            let missing = |desired: &RouterDesired| -> Vec<String> {
+                desired.required_existing_interfaces().into_iter()
+                    .filter(|name| !observed.iter().any(|entry| entry.name == *name))
+                    .map(str::to_owned).collect()
+            };
+            let missing_dependencies = missing(candidate.desired());
+            anyhow::ensure!(!missing_dependencies.is_empty() || !missing(&previous).is_empty() || self.router.is_none(),
+                "router dependencies are present; use a confirmed live router transaction");
+            let revision = self.overrides.commit_candidate(&candidate).await?;
+            // Do not compensate after commit: the committed intent authorizes
+            // deletions, and cancellation/restart resumes them through reconcile.
+            let cleanup_blockers = match &self.router {
+                Some(router) => match router.cleanup_removed_dataplane(candidate.desired()).await {
+                    Ok(()) => Vec::new(),
+                    Err(error) => vec![format!("{error:#}")],
+                },
+                None => vec!["router execution is unavailable; applied dataplane cleanup cannot be verified".into()],
+            };
+            Ok(Response::RouterIntentSaved {
+                revision,
+                deferred: true,
+                missing_dependencies,
+                cleanup_blockers,
+                execution_available: self.router.is_some(),
+            })
+        }.await;
+        match result {
+            Ok(response) => response,
+            Err(error) => classify_router_error(error),
+        }
+    }
+
     /// Build intent without kernel snapshots, binary checks or ownership adoption.
     /// The revision belongs to the candidate's committed base, not applied runtime.
     pub(super) async fn router_intent_preview(&self, proposal: RouterProposalRequest) -> Response {

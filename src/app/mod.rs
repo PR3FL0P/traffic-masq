@@ -581,6 +581,10 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
                 }
             }
             Ok(missing) => {
+                if let Err(error) = coordinator.cleanup_removed_dataplane(&desired).await {
+                    tracing::error!(operation = "cleanup_removed_router_dataplane", error = %format!("{error:#}"),
+                        "obsolete router dataplane cleanup incomplete; convergence will retry");
+                }
                 tracing::warn!(
                     interfaces = %missing.join(", "),
                     hint = "Check ip link; reconnect the adapters or correct the interface names in router configuration. Runtime convergence will retry when they appear.",

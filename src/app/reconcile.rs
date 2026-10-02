@@ -228,6 +228,7 @@ pub(super) async fn reconcile_router_dataplane(
     let missing =
         super::router_startup::missing_router_repair_interfaces(&desired, network).await?;
     if let Some(interface) = missing.first() {
+        router.cleanup_removed_dataplane(&desired).await?;
         return Err(crate::firewall::RouterDataplaneInterfaceMissing {
             role: "router".into(),
             interface: interface.clone(),

@@ -183,6 +183,58 @@ impl RouteManager {
         Ok(plan)
     }
 
+    /// Delete obsolete owned routes without resolving or creating missing ones.
+    /// If a desired output name is absent, keep scalar-matching routes: its
+    /// old ifindex cannot be inferred safely from an absent device's name.
+    pub async fn cleanup_removed(
+        &self,
+        desired: &[ManagedIpv4Route],
+        allow_default_route_change: bool,
+    ) -> Result<()> {
+        let interfaces = self.provider.list_interfaces().await?;
+        let current = self.owned_routes().await?;
+        let delete: Vec<_> = current
+            .into_iter()
+            .filter(|observed| {
+                !desired.iter().any(|route| {
+                    route.destination.trunc() == observed.destination.trunc()
+                        && route.gateway == observed.gateway
+                        && route.table == observed.table
+                        && route.metric.unwrap_or(0) == observed.metric.unwrap_or(0)
+                        && match route.output_interface.as_deref() {
+                            None => observed.output_interface_index.is_none(),
+                            Some(name) => interfaces
+                                .iter()
+                                .find(|interface| interface.name == name)
+                                .is_none_or(|interface| {
+                                    observed.output_interface_index == Some(interface.index)
+                                }),
+                        }
+                })
+            })
+            .collect();
+        anyhow::ensure!(
+            allow_default_route_change
+                || delete
+                    .iter()
+                    .all(|route| route.destination.prefix_len() != 0),
+            "refusing to remove an owned IPv4 default route without explicit permission"
+        );
+        for route in delete {
+            if let Err(error) = self.provider.delete_ipv4_route(&route).await {
+                if self
+                    .owned_routes()
+                    .await?
+                    .iter()
+                    .any(|entry| route_info_matches(entry, &route))
+                {
+                    return Err(error.context("failed to retire obsolete owned route"));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Report missing or stale daemon-owned routes against the desired route set.
     pub async fn health(&self, desired: &[ManagedIpv4Route]) -> Result<RouteHealth> {
         let plan = self.plan(desired, true).await?;

@@ -641,6 +641,13 @@ impl ControlService {
                 changes: self.transactions.pending().await,
             },
             Request::RouterStatus => self.router_status().await,
+            Request::SaveRouterIntent {
+                config,
+                expected_revision,
+            } => {
+                self.save_router_intent(config.into(), expected_revision)
+                    .await
+            }
             Request::RouterIntentPreview { proposal } => {
                 self.router_intent_preview(proposal.into()).await
             }
@@ -765,7 +772,8 @@ impl ControlService {
 fn is_network_mutation(request: &Request) -> bool {
     matches!(
         request,
-        Request::SaveWifiClientProfile { .. }
+        Request::SaveRouterIntent { .. }
+            | Request::SaveWifiClientProfile { .. }
             | Request::SaveWifiInterface { .. }
             | Request::SaveInterfaceConfig { .. }
             | Request::ForgetInterfaceConfig { .. }

@@ -551,3 +551,28 @@ Forward recovery into a replacement configuration, transfer to external
 management, and cross-host configuration migration remain separate operations;
 this bounded recovery mechanism does not silently commit a failed candidate or
 convert an old host's snapshot into portable configuration.
+
+### Saved router intent and removal-only cleanup
+
+Offline sharing/route Save first commits validated intent through the shared
+revision-checked override writer. No runtime deletion happens on failed or
+indeterminate commit. Cleanup then intersects proven nft permissions with the
+committed intent and deletes obsolete routes carrying the daemon route protocol.
+It never opens a rollback journal, installs candidate resources, or compensates
+by restoring deleted permissions. Interrupted removal is idempotently resumed
+from committed intent at startup and on missing-device reconciliation.
+
+Cleanup requires valid nft ownership metadata and intact structure before
+changing its table; ambiguous or drifted ownership is a blocker. Foreign tables
+and routes, DHCP-owned routes, services, and global forwarding are preserved.
+Default-route deletion still requires explicit permission. If a still-saved
+route references a missing output name, scalar-matching owned routes are retained
+until that dependency can be resolved: an absent name does not prove an ifindex.
+Removing that route from intent permits exact owned deletion without the device.
+
+Caller cancellation does not release router coordination while an nft blocking
+write remains in flight. Cleanup runs to completion under coordinator state
+ownership, and stale cleanup intent is rejected before mutation. API success
+includes `cleanup_blockers` if deletion fails; saved intent remains authoritative.
+Inspect router health and the reported ownership/storage cause, repair it, and
+let convergence retry. Existing transaction/recovery fences remain in effect.

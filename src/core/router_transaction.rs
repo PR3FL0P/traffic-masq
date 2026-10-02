@@ -349,6 +349,51 @@ impl RouterTransactionCoordinator {
         self.repair_inner(desired, true).await
     }
 
+    /// Cleanup follows durable commit and is idempotent. Interruption needs no
+    /// rollback journal: restart repeats deletions from the latest committed
+    /// intent and ownership proofs, never restoring deleted permissions.
+    pub async fn cleanup_removed_dataplane(&self, desired: &RouterDesired) -> Result<()> {
+        // Detached caller cancellation must not release coordination while an
+        // nft spawn_blocking write is still running. This task retains state
+        // ownership until all removal operations settle.
+        let coordinator = self.clone();
+        let desired = desired.clone();
+        tokio::spawn(async move { coordinator.cleanup_removed_dataplane_inner(&desired).await })
+            .await
+            .context("router cleanup worker failed")?
+    }
+
+    async fn cleanup_removed_dataplane_inner(&self, desired: &RouterDesired) -> Result<()> {
+        crate::core::recovery::check_scope(
+            self.inner
+                .overrides
+                .path()
+                .parent()
+                .expect("state directory"),
+            None,
+        )?;
+        let state = self.inner.state.lock().await;
+        match &*state {
+            CoordinatorState::Idle => {}
+            CoordinatorState::Pending(_) => {
+                return Err(CoordinatorConflict::TransactionPending.into())
+            }
+            CoordinatorState::RollbackFailed(_) => {
+                return Err(CoordinatorConflict::RollbackRecoveryRequired.into())
+            }
+        }
+        let committed = self
+            .inner
+            .overrides
+            .build_candidate(&crate::core::router_candidate::RouterIntentProposal::new())
+            .await?;
+        anyhow::ensure!(
+            committed.desired() == desired,
+            "router cleanup no longer matches committed intent"
+        );
+        self.inner.manager.cleanup_removed_dataplane(desired).await
+    }
+
     async fn repair_inner(&self, desired: RouterDesired, dataplane_only: bool) -> Result<()> {
         crate::core::recovery::check_scope(
             self.inner

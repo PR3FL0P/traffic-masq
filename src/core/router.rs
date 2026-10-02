@@ -458,6 +458,11 @@ pub trait RouterSubsystems: Send + Sync {
         Ok(())
     }
 
+    /// Removal-only convergence of committed intent; no services or additions.
+    async fn cleanup_removed_dataplane(&self, _desired: &RouterDesired) -> Result<()> {
+        anyhow::bail!("removal-only router cleanup is unavailable")
+    }
+
     /// Rebuild volatile ownership/runtime bookkeeping from durable proofs
     /// before crash recovery or startup repair touches the data plane.
     /// Implementations must not adopt resources without an ownership proof.
@@ -727,6 +732,10 @@ impl RouterManager {
         self.subsystems.health_routes(desired).await.is_err()
             || self.subsystems.health_vpn_chain(desired).await.is_err()
             || self.subsystems.health_dataplane(desired).await.is_err()
+    }
+
+    pub async fn cleanup_removed_dataplane(&self, desired: &RouterDesired) -> Result<()> {
+        self.subsystems.cleanup_removed_dataplane(desired).await
     }
 
     /// Repair route and firewall drift for the supplied committed router intent.

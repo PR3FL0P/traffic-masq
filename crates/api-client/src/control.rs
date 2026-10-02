@@ -357,6 +357,17 @@ pub fn map_request<Interface: Serialize, Proposal: Serialize>(
             body: None,
             synthesize_pong: false,
         },
+        Request::SaveRouterIntent {
+            config,
+            expected_revision,
+        } => RestRequest {
+            method: Method::PUT,
+            path: format!("{API_PREFIX}/router/intent"),
+            body: Some(serialize_json(
+                &serde_json::json!({ "config": config, "expected_revision": expected_revision }),
+            )?),
+            synthesize_pong: false,
+        },
         Request::RouterIntentPreview { proposal } => RestRequest {
             method: Method::POST,
             path: format!("{API_PREFIX}/router/intent/preview"),
@@ -801,6 +812,20 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&mapped.body.unwrap()).unwrap(),
             proposal
         );
+    }
+
+    #[test]
+    fn maps_revision_checked_router_intent_save() {
+        let mapped = map_request(&Request::SaveRouterIntent {
+            config: Default::default(),
+            expected_revision: 19,
+        })
+        .unwrap();
+        assert_eq!(mapped.method, Method::PUT);
+        assert_eq!(mapped.path, "/api/v1/router/intent");
+        let body: serde_json::Value = serde_json::from_slice(&mapped.body.unwrap()).unwrap();
+        assert_eq!(body["expected_revision"], 19);
+        assert_eq!(body["config"]["enabled"], false);
     }
 
     #[test]

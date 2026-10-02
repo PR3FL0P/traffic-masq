@@ -465,3 +465,38 @@ async fn repeated_route_rollback_does_not_duplicate_restored_objects() {
         &owned
     ));
 }
+
+#[tokio::test]
+async fn cleanup_removed_routes_preserves_foreign_and_still_saved_missing_routes() {
+    let provider = Arc::new(FakeNetwork::default());
+    let kept = route("203.0.113.0/24", TRAFFIC_MASQ_ROUTE_PROTOCOL);
+    let removed = route("198.51.100.0/24", TRAFFIC_MASQ_ROUTE_PROTOCOL);
+    let foreign = route("192.0.2.0/24", 4);
+    *provider.routes.lock().await = vec![kept.clone(), removed, foreign.clone()];
+    let manager = RouteManager::new(provider.clone());
+    let mut saved = desired("203.0.113.0/24");
+    saved.output_interface = Some("missing0".into());
+    manager.cleanup_removed(&[saved], false).await.unwrap();
+    assert_eq!(provider.route_snapshot().await, vec![kept, foreign.clone()]);
+    // A later committed removal is independent of other absent endpoints.
+    manager.cleanup_removed(&[], false).await.unwrap();
+    manager.cleanup_removed(&[], false).await.unwrap();
+    assert_eq!(provider.route_snapshot().await, vec![foreign]);
+}
+
+#[tokio::test]
+async fn cleanup_removed_routes_requires_permission_for_default_and_never_adds_routes() {
+    let provider = Arc::new(FakeNetwork::default());
+    let default = route("0.0.0.0/0", TRAFFIC_MASQ_ROUTE_PROTOCOL);
+    *provider.routes.lock().await = vec![default.clone()];
+    let manager = RouteManager::new(provider.clone());
+    let mut missing = desired("203.0.113.0/24");
+    missing.output_interface = Some("missing0".into());
+    assert!(manager
+        .cleanup_removed(&[missing.clone()], false)
+        .await
+        .is_err());
+    assert_eq!(provider.route_snapshot().await, vec![default]);
+    manager.cleanup_removed(&[missing], true).await.unwrap();
+    assert!(provider.route_snapshot().await.is_empty());
+}
