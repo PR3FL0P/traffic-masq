@@ -146,6 +146,59 @@ impl ControlService {
         }
     }
 
+    /// Build intent without kernel snapshots, binary checks or ownership adoption.
+    /// The revision belongs to the candidate's committed base, not applied runtime.
+    pub(super) async fn router_intent_preview(&self, proposal: RouterProposalRequest) -> Response {
+        let candidate = match self
+            .overrides
+            .build_candidate(&build_router_proposal(proposal))
+            .await
+        {
+            Ok(candidate) => candidate,
+            Err(error) => return classify_router_error(error),
+        };
+        let required = candidate.desired().required_existing_interfaces();
+        let (device_readiness, blockers) = if required.is_empty() {
+            (traffic_masq_protocol::InterfaceReadiness::Ready, Vec::new())
+        } else {
+            match self.network.list_interfaces().await {
+                Ok(observed) => {
+                    let blockers: Vec<_> = required
+                        .into_iter()
+                        .filter(|name| !observed.iter().any(|interface| interface.name == *name))
+                        .map(|interface| {
+                            traffic_masq_protocol::InterfaceReadinessBlocker::MissingInterface {
+                                interface: interface.to_owned(),
+                            }
+                        })
+                        .collect();
+                    let readiness = if blockers.is_empty() {
+                        traffic_masq_protocol::InterfaceReadiness::Ready
+                    } else {
+                        traffic_masq_protocol::InterfaceReadiness::WaitingDevice
+                    };
+                    (readiness, blockers)
+                }
+                Err(error) => (
+                    traffic_masq_protocol::InterfaceReadiness::Unknown,
+                    vec![
+                        traffic_masq_protocol::InterfaceReadinessBlocker::ObservationFailed {
+                            message: error.to_string(),
+                        },
+                    ],
+                ),
+            }
+        };
+        Response::RouterIntentPreview {
+            revision: candidate.base_revision(),
+            config: candidate.effective_config().router.clone().into(),
+            desired: candidate.desired().clone().into(),
+            device_readiness,
+            blockers,
+            execution_available: self.router.is_some(),
+        }
+    }
+
     pub(super) async fn router_plan(&self, proposal: RouterProposalRequest) -> Response {
         let Some(router) = &self.router else {
             return router_disabled();

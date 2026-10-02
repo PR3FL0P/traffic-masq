@@ -357,6 +357,12 @@ pub fn map_request<Interface: Serialize, Proposal: Serialize>(
             body: None,
             synthesize_pong: false,
         },
+        Request::RouterIntentPreview { proposal } => RestRequest {
+            method: Method::POST,
+            path: format!("{API_PREFIX}/router/intent/preview"),
+            body: Some(serialize_json(proposal)?),
+            synthesize_pong: false,
+        },
         Request::RouterPlan { proposal } => RestRequest {
             method: Method::POST,
             path: format!("{API_PREFIX}/router/plan"),
@@ -791,6 +797,21 @@ mod tests {
         .unwrap();
         assert_eq!(mapped.method, Method::POST);
         assert_eq!(mapped.path, "/api/v1/router/plan");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&mapped.body.unwrap()).unwrap(),
+            proposal
+        );
+    }
+
+    #[test]
+    fn maps_router_intent_preview() {
+        let proposal = serde_json::json!({"clear_router": true});
+        let mapped = map_request(&Request::RouterIntentPreview {
+            proposal: proposal.clone(),
+        })
+        .unwrap();
+        assert_eq!(mapped.method, Method::POST);
+        assert_eq!(mapped.path, "/api/v1/router/intent/preview");
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&mapped.body.unwrap()).unwrap(),
             proposal

@@ -160,6 +160,9 @@ fn every_control_request_has_the_expected_authorization_class() {
             interface: "eth0".to_owned(),
             edit: interface_edit(),
         },
+        Request::RouterIntentPreview {
+            proposal: Default::default(),
+        },
         Request::PendingNetworkChanges,
         Request::VpnPolicyStatus,
         Request::GetSecurityConfig,

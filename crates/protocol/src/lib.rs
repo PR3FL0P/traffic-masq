@@ -1250,6 +1250,9 @@ pub enum Request<Interface, Proposal> {
     },
     PendingNetworkChanges,
     RouterStatus,
+    RouterIntentPreview {
+        proposal: Proposal,
+    },
     RouterPlan {
         proposal: Proposal,
     },
@@ -1521,6 +1524,15 @@ pub enum Response<
         health: RouterHealthReport,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recovery: Option<RouterRecoveryNotice>,
+    },
+    /// Structurally validated intent; device readiness is not runtime preflight.
+    RouterIntentPreview {
+        revision: u64,
+        config: RouterConfig,
+        desired: RouterDesiredView,
+        device_readiness: InterfaceReadiness,
+        blockers: Vec<InterfaceReadinessBlocker>,
+        execution_available: bool,
     },
     RouterPlan {
         plan: RouterPlan,

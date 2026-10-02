@@ -8992,3 +8992,148 @@ async fn offline_client_disable_suspends_autoconnect_until_explicit_profile_save
         .suspended
         .contains("wlan1"));
 }
+
+#[tokio::test]
+async fn router_intent_preview_with_missing_dependencies_is_observational() {
+    use traffic_masq_protocol::{InterfaceReadiness, InterfaceReadinessBlocker};
+    let (service, directory) = router_enabled_service().await;
+    let revision = service.overrides.committed_revision().await;
+    match service
+        .dispatch(Request::RouterIntentPreview {
+            proposal: router_proposal().into(),
+        })
+        .await
+    {
+        Response::RouterIntentPreview {
+            revision: preview_revision,
+            config,
+            desired,
+            device_readiness,
+            blockers,
+            execution_available,
+        } => {
+            assert_eq!(preview_revision, revision);
+            assert!(config.enabled && desired.enabled && execution_available);
+            assert_eq!(device_readiness, InterfaceReadiness::WaitingDevice);
+            assert_eq!(
+                blockers,
+                vec![
+                    InterfaceReadinessBlocker::MissingInterface {
+                        interface: "lan0".into()
+                    },
+                    InterfaceReadinessBlocker::MissingInterface {
+                        interface: "wan0".into()
+                    },
+                ]
+            );
+            // Legacy sharing is derived without a device or a runtime plan.
+            assert!(matches!(
+                desired.dataplane,
+                traffic_masq_protocol::RouterDataplaneTargetView::Enabled(_)
+            ));
+        }
+        response => panic!("{response:?}"),
+    }
+    assert_eq!(service.overrides.committed_revision().await, revision);
+    assert!(!service.effective_config().await.unwrap().router.enabled);
+    assert!(matches!(
+        service.dispatch(Request::RouterPendingTransaction).await,
+        Response::RouterPendingTransaction { token: None, .. }
+    ));
+    assert!(!directory.path().join("router-transaction.json").exists());
+}
+
+#[tokio::test]
+async fn router_intent_preview_without_execution_preserves_disabled_saved_routes() {
+    let directory = tempdir().unwrap();
+    let mut config = router_base_config();
+    config.runtime.state_dir = directory.path().into();
+    config
+        .router
+        .owned_routes
+        .push(crate::config::OwnedIpv4RouteConfig {
+            destination: "10.30.0.0/16".parse().unwrap(),
+            gateway: None,
+            output_interface: Some("lan0".into()),
+            table: 254,
+            metric: Some(50),
+        });
+    let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+        .await
+        .unwrap();
+    let dhcp = DhcpSupervisor::start(&config).await.unwrap();
+    let service = ControlService::new(
+        config,
+        Arc::new(FakeNetwork { addresses: vec![] }),
+        dhcp,
+        overrides,
+    );
+    match service
+        .dispatch(Request::RouterIntentPreview {
+            proposal: Default::default(),
+        })
+        .await
+    {
+        Response::RouterIntentPreview {
+            config,
+            desired,
+            execution_available,
+            ..
+        } => {
+            assert!(!execution_available);
+            assert!(!config.enabled);
+            assert_eq!(config.owned_routes.len(), 1);
+            assert_eq!(
+                config.owned_routes[0].output_interface.as_deref(),
+                Some("lan0")
+            );
+            assert!(desired.routes.is_empty());
+        }
+        response => panic!("{response:?}"),
+    }
+}
+
+#[tokio::test]
+async fn router_intent_preview_distinguishes_unknown_and_ready_and_rejects_invalid_intent() {
+    use traffic_masq_protocol::{InterfaceReadiness, InterfaceReadinessBlocker};
+    let directory = tempdir().unwrap();
+    let mut config = router_base_config();
+    config.runtime.state_dir = directory.path().into();
+    let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+        .await
+        .unwrap();
+    let dhcp = DhcpSupervisor::start(&config).await.unwrap();
+    let network = Arc::new(crate::test_support::FakeNetworkProvider::default());
+    let service = ControlService::new(config, network.clone(), dhcp, overrides.clone());
+    network.add_interface("lan0", 7).await;
+    network.add_interface("wan0", 8).await;
+    assert!(matches!(service.dispatch(Request::RouterIntentPreview {
+        proposal: router_proposal().into(),
+    }).await, Response::RouterIntentPreview {
+        device_readiness: InterfaceReadiness::Ready, blockers, ..
+    } if blockers.is_empty()));
+    *network.fail_interface_observation.lock().await = true;
+    assert!(matches!(service.dispatch(Request::RouterIntentPreview {
+        proposal: router_proposal().into(),
+    }).await, Response::RouterIntentPreview {
+        device_readiness: InterfaceReadiness::Unknown, blockers, ..
+    } if matches!(blockers.as_slice(), [InterfaceReadinessBlocker::ObservationFailed { .. }])));
+    let mut invalid = router_proposal();
+    invalid
+        .set_router
+        .as_mut()
+        .unwrap()
+        .uplink
+        .as_mut()
+        .unwrap()
+        .interface = "not-configured".into();
+    assert!(matches!(
+        service
+            .dispatch(Request::RouterIntentPreview {
+                proposal: invalid.into()
+            })
+            .await,
+        Response::RouterError { .. }
+    ));
+    assert_eq!(overrides.committed_revision().await, 0);
+}

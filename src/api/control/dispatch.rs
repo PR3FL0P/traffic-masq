@@ -641,6 +641,9 @@ impl ControlService {
                 changes: self.transactions.pending().await,
             },
             Request::RouterStatus => self.router_status().await,
+            Request::RouterIntentPreview { proposal } => {
+                self.router_intent_preview(proposal.into()).await
+            }
             Request::RouterPlan { proposal } => self.router_plan(proposal.into()).await,
             Request::RouterApply { proposal } => self.router_apply(proposal.into()).await,
             Request::RouterCommit { token } => self.router_commit(token).await,

@@ -187,6 +187,7 @@ Body names in the tables refer to the [request schemas](#request-schemas).
 | --- | --- | --- | --- | --- |
 | `GET` | `/router/config` | — | Effective router configuration | Authenticated |
 | `GET` | `/router/status` | — | Readiness, coordinator and recovery state | Authenticated |
+| `POST` | `/router/intent/preview` | `RouterProposal` | Validate saved intent and report device dependencies without runtime preflight | Authenticated |
 | `POST` | `/router/plan` | `RouterProposal` | Build a plan without applying it | Authenticated |
 | `POST` | `/router/apply` | `RouterProposal` | Tentatively apply and return a token | Administrator |
 | `POST` | `/router/commit` | `Transaction` | Commit the router transaction | Administrator |
@@ -196,6 +197,17 @@ Body names in the tables refer to the [request schemas](#request-schemas).
 | `POST` | `/router/provisioning/apply` | `RouterProvisioningApply` | Tentatively apply the complete setup | Administrator |
 | `GET` | `/router/provisioning/status` | — | Provisioning readiness and failures | Authenticated |
 | `POST` | `/router/provisioning/repair` | — | Retry repair after a degraded rollback | Administrator |
+
+`/router/intent/preview` works without router execution or present adapters. It
+returns the candidate's base `revision`, effective router `config` (including
+saved routes when disabled), derived `desired`, `execution_available`, and
+`device_readiness` with sorted missing-interface blockers. Observation failure
+returns `unknown` with an observation blocker rather than claiming missing
+devices. `ready` describes only device presence; it does not certify binaries,
+route conflicts, ownership, or runtime readiness. Structural validation and
+management-change authorization still apply. Preview neither saves intent nor
+opens a transaction; `/router/plan` and `/router/apply` retain strict preflight.
+The returned revision is not an applied dataplane revision.
 
 Router transactions and interface/network transactions have separate commit
 endpoints. Use the endpoint corresponding to the apply response.

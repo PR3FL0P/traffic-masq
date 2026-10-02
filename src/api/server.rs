@@ -257,6 +257,7 @@ fn build_router(state: AppState) -> Router {
         .route("/routes", get(routes_list))
         .route("/router/config", get(router_get_config))
         .route("/router/status", get(router_status))
+        .route("/router/intent/preview", post(router_intent_preview))
         .route("/router/plan", post(router_plan))
         .route("/router/apply", post(router_apply))
         .route("/router/commit", post(router_commit))
@@ -1059,6 +1060,19 @@ async fn router_status(
     Extension(principal): Extension<Principal>,
 ) -> Result<Json<Response>, ApiError> {
     dispatch_control(&state, &principal, Request::RouterStatus).await
+}
+
+async fn router_intent_preview(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Json(proposal): Json<traffic_masq_protocol::RouterProposalRequestView>,
+) -> Result<Json<Response>, ApiError> {
+    dispatch_control(
+        &state,
+        &principal,
+        Request::RouterIntentPreview { proposal },
+    )
+    .await
 }
 
 async fn router_plan(
