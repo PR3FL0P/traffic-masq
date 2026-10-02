@@ -839,11 +839,7 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
             allow_management_change,
             ..
         }) => {
-            let cidr = config
-                .as_ref()
-                .and_then(|interface| interface.ipv4)
-                .map(|network| network.to_string())
-                .unwrap_or_default();
+            let (cidr, managed) = editor_address_defaults(config.as_ref(), status.as_ref());
 
             let current_addresses = status
                 .as_ref()
@@ -873,7 +869,7 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
                 field: InterfaceEditorField::Cidr,
                 cidr,
                 role: original_role,
-                managed: original_managed,
+                managed,
                 allow_management_change,
                 has_default_route: status
                     .as_ref()
@@ -902,6 +898,41 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
             format!("Failed to load interface config: {error}"),
         ),
     }
+}
+
+fn editor_address_defaults(
+    config: Option<&traffic_masq_protocol::InterfaceConfigView>,
+    status: Option<&traffic_masq_protocol::InterfaceStatusView>,
+) -> (String, bool) {
+    if let Some(config) = config {
+        return (
+            config.ipv4.map(|ip| ip.to_string()).unwrap_or_default(),
+            config.managed,
+        );
+    }
+    // This is an editor draft, not recovered desired state. The daemon's
+    // ownership proof can prefill our sole static address after settings were
+    // removed; it never authorizes adopting an external or DHCP address.
+    let mut owned = status.into_iter().flat_map(|status| {
+        status.ipv4_addresses.iter().filter(move |address| {
+            matches!(
+                address.owner(),
+                traffic_masq_protocol::AddressOwnerView::TrafficMasqStatic
+                    | traffic_masq_protocol::AddressOwnerView::Untagged
+            ) && status.owned_ipv4_addresses.as_ref().map_or_else(
+                || address.owner() == traffic_masq_protocol::AddressOwnerView::TrafficMasqStatic,
+                |owned| owned.contains(address),
+            )
+        })
+    });
+    let first = owned.next();
+    let cidr = match (first, owned.next()) {
+        (Some(address), None) => format!("{}/{}", address.address, address.prefix_len),
+        _ => String::new(),
+    };
+    // A new interface has no saved instruction to keep management disabled.
+    // Kernel changes still require the usual preview, apply and confirmation.
+    (cidr, true)
 }
 
 pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {

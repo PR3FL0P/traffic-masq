@@ -137,13 +137,17 @@ impl InterfaceManager {
     /// before touching the machine; the `IFA_PROTO` tag is the kernel
     /// confirming it. Either alone is enough, which is the point: the journal
     /// survives a kernel that cannot hold tags, and the tag survives losing the
-    /// journal.
+    /// journal. An explicit foreign or DHCP tag overrides a stale static claim.
     pub async fn owns_address(&self, interface: &str, address: &Ipv4AddressInfo) -> bool {
-        address.owner() == AddressOwner::TrafficMasqStatic
-            || self
-                .journal
-                .owns(interface, address.address, address.prefix_len)
-                .await
+        match address.owner() {
+            AddressOwner::TrafficMasqStatic => true,
+            AddressOwner::TrafficMasqDhcp | AddressOwner::Foreign(_) => false,
+            AddressOwner::Untagged => {
+                self.journal
+                    .owns(interface, address.address, address.prefix_len)
+                    .await
+            }
+        }
     }
 
     /// Whether any of these addresses is ours.

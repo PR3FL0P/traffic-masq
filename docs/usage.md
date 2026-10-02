@@ -595,6 +595,14 @@ matches the requested address, it remains externally owned. Turning
 **Configure with traffic-masq** off removes owned settings and leaves all
 foreign settings intact.
 
+When no interface configuration is saved, the editor starts with configuration
+enabled so you can enter an address directly. If exactly one owned static IPv4
+address remains, the editor prefills it using the daemon’s ownership evidence.
+This also works after saved settings are removed, provided the kernel tag or
+ownership journal survives. Opening the editor changes no kernel or saved state;
+the usual preview, apply and confirmation are still required. An explicitly
+saved unmanaged configuration remains unmanaged.
+
 ### Removing an address
 
 Having no owned static address is a valid configuration. Clearing the CIDR

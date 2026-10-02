@@ -12,6 +12,79 @@ use crate::netlink::{
 
 use super::*;
 
+#[tokio::test]
+async fn owned_addresses_remain_editable_after_restart_without_saved_interface_settings() {
+    for tagged in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        let provider = Arc::new(UntaggedNetworkProvider::default());
+        let external = address_with_protocol("192.168.1.20/24", None);
+        provider
+            .0
+            .add_interface("eth0", true, vec![external.clone()])
+            .await;
+        let journal = AddressOwnershipJournal::open(directory.path()).unwrap();
+        let manager = InterfaceManager::new(provider.clone(), journal);
+        manager
+            .apply_interface(
+                "eth0",
+                &config(InterfaceRole::Output, "192.168.50.1/24"),
+                Some(InterfaceRole::Output),
+                false,
+            )
+            .await
+            .unwrap();
+        drop(manager);
+        if tagged {
+            // A reset may remove both intent and its journal. A surviving
+            // kernel tag remains independent ownership proof.
+            provider.0.addresses.lock().await.get_mut("eth0").unwrap()[1].protocol =
+                Some(TRAFFIC_MASQ_ADDRESS_PROTOCOL);
+            std::fs::remove_dir_all(directory.path().join("address-ownership")).unwrap();
+        }
+        let reopened = AddressOwnershipJournal::open(directory.path()).unwrap();
+        let observed = provider.list_ipv4_addresses("eth0").await.unwrap();
+        reopened.reconcile("eth0", &observed).await.unwrap();
+        let manager = InterfaceManager::new(provider.clone(), reopened);
+        assert!(manager.owns_address("eth0", &observed[1]).await);
+        assert!(!manager.owns_address("eth0", &external).await);
+        let target = InterfaceConfig {
+            managed: true,
+            role: InterfaceRole::None,
+            ipv4: None,
+            dhcp: None,
+            dhcp_client: None,
+            wifi: None,
+            wifi_client: None,
+            nat: true,
+        };
+        // No previous configuration or role: same plan used after settings reset.
+        let plan = manager
+            .plan_interface_transition("eth0", &target, None, None, true)
+            .await
+            .unwrap();
+        assert_eq!(plan.delete_ipv4, vec![observed[1].clone()]);
+        manager.apply_plan(&plan).await.unwrap();
+        assert_eq!(
+            provider.list_ipv4_addresses("eth0").await.unwrap(),
+            vec![external]
+        );
+    }
+}
+
+#[tokio::test]
+async fn current_foreign_or_dhcp_tag_overrides_an_old_static_claim() {
+    let journal = AddressOwnershipJournal::in_memory();
+    journal
+        .claim("eth0", "192.168.50.1".parse().unwrap(), 24)
+        .await
+        .unwrap();
+    let manager = InterfaceManager::new(Arc::new(FakeNetworkProvider::default()), journal);
+    for protocol in [Some(16), Some(TRAFFIC_MASQ_DHCP_ADDRESS_PROTOCOL)] {
+        let address = address_with_protocol("192.168.50.1/24", protocol);
+        assert!(!manager.owns_address("eth0", &address).await);
+    }
+}
+
 #[derive(Debug, Default)]
 struct FakeNetworkProvider {
     interfaces: Mutex<HashMap<String, NetworkInterface>>,

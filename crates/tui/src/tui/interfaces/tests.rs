@@ -1,5 +1,196 @@
 use super::*;
 
+fn observed_address(
+    protocol: Option<u8>,
+    owned: Option<bool>,
+) -> traffic_masq_protocol::InterfaceStatusView {
+    let address = traffic_masq_protocol::Ipv4AddressInfoView {
+        interface_index: 1,
+        address: "198.18.0.1".parse().unwrap(),
+        prefix_len: 24,
+        protocol,
+    };
+    traffic_masq_protocol::InterfaceStatusView {
+        interface: traffic_masq_protocol::NetworkInterfaceView {
+            index: 1,
+            name: "wlp1s0".into(),
+            is_up: true,
+            rx_bytes: 0,
+            tx_bytes: 0,
+            is_wireless: true,
+        },
+        owned_ipv4_addresses: owned.map(|owned| if owned { vec![address.clone()] } else { vec![] }),
+        ipv4_addresses: vec![address],
+        has_default_route: false,
+    }
+}
+
+#[test]
+fn editor_recovers_only_proven_static_addresses_after_settings_are_removed() {
+    for (protocol, proof) in [
+        (Some(201), None),
+        (Some(201), Some(true)),
+        (None, Some(true)),
+    ] {
+        let status = observed_address(protocol, proof);
+        assert_eq!(
+            editor_address_defaults(None, Some(&status)),
+            ("198.18.0.1/24".into(), true)
+        );
+    }
+    for (protocol, proof) in [
+        (None, None),
+        (None, Some(false)),
+        (Some(201), Some(false)),
+        (Some(202), Some(true)),
+        (Some(16), Some(true)),
+    ] {
+        let status = observed_address(protocol, proof);
+        assert_eq!(
+            editor_address_defaults(None, Some(&status)),
+            (String::new(), true)
+        );
+    }
+}
+
+#[test]
+fn editor_keeps_explicit_saved_configuration_and_does_not_choose_between_owned_addresses() {
+    let mut status = observed_address(Some(201), Some(true));
+    let config = traffic_masq_protocol::InterfaceConfigView {
+        managed: false,
+        role: InterfaceRole::None,
+        ipv4: None,
+        dhcp: None,
+        dhcp_client: None,
+        wifi: None,
+        wifi_client: None,
+        nat: true,
+    };
+    assert_eq!(
+        editor_address_defaults(Some(&config), Some(&status)),
+        (String::new(), false)
+    );
+    let mut second = status.ipv4_addresses[0].clone();
+    second.address = "198.18.0.2".parse().unwrap();
+    status.ipv4_addresses.push(second.clone());
+    status.owned_ipv4_addresses.as_mut().unwrap().push(second);
+    assert_eq!(
+        editor_address_defaults(None, Some(&status)),
+        (String::new(), true)
+    );
+}
+
+#[tokio::test]
+async fn keyboard_ip_edit_previews_applies_and_confirms_the_typed_address() {
+    use http_body_util::{BodyExt, Full};
+    use hyper::{body::Bytes, server::conn::http1, service::service_fn};
+    use hyper_util::rt::TokioIo;
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("api.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let change = traffic_masq_protocol::PendingNetworkChange {
+        recovery_progress: None,
+        phase: Default::default(),
+        last_error: None,
+        token: "ip-test-token".into(),
+        interface: "wlp1s0".into(),
+        rollback_timeout_seconds: 60,
+        expires_at_unix: current_unix_time() + 60,
+    };
+    let responses = vec![
+        Response::InterfaceConfig {
+            interface: "wlp1s0".into(),
+            config: None,
+            allow_management_change: false,
+        },
+        Response::InterfacePlan {
+            plan: traffic_masq_protocol::InterfaceChangePlanView {
+                interface: "wlp1s0".into(),
+                delete_ipv4: vec![],
+                retag_ipv4: None,
+                add_ipv4: None,
+                set_link_up: false,
+                management_change: false,
+                dhcp_action: traffic_masq_protocol::DhcpChangeActionView::Unchanged,
+                releasing_management: false,
+            },
+        },
+        Response::NetworkChangePending {
+            change: change.clone(),
+        },
+        Response::NetworkChangeCommitted { change },
+    ];
+    let requests = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let observed = requests.clone();
+    let server = tokio::spawn(async move {
+        for response in responses {
+            let (stream, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let requests = observed.clone();
+            let body = serde_json::to_vec(&response).unwrap();
+            http1::Builder::new()
+                .serve_connection(
+                    TokioIo::new(stream),
+                    service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                        let requests = requests.clone();
+                        let body = body.clone();
+                        async move {
+                            let path = request.uri().path().to_owned();
+                            let method = request.method().clone();
+                            let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                            let payload: serde_json::Value = if method == hyper::Method::GET {
+                                assert!(bytes.is_empty());
+                                serde_json::Value::Null
+                            } else {
+                                assert_eq!(method, hyper::Method::POST);
+                                serde_json::from_slice(&bytes).unwrap()
+                            };
+                            requests.lock().await.push((path, payload));
+                            Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(
+                                Bytes::from(body),
+                            )))
+                        }
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+    });
+    let client = ApiClient::new(socket);
+    let mut app = TuiApp::default();
+    let mut status = observed_address(None, Some(false));
+    status.ipv4_addresses.clear();
+    app.dashboard.interfaces.push(status);
+    open_editor(&mut app, &client).await;
+    assert_eq!(app.screen, Screen::InterfaceEditor);
+    assert!(app.editor.as_ref().unwrap().managed);
+    for character in "198.18.0.1/24".chars() {
+        handle_editor_key(&mut app, KeyCode::Char(character), &client).await;
+    }
+    submit_dry_run(&mut app, &client).await;
+    assert_eq!(app.screen, Screen::Preview);
+    handle_preview_key(&mut app, KeyCode::Enter, &client).await;
+    assert_eq!(app.screen, Screen::PendingChange);
+    handle_pending_key(&mut app, KeyCode::Enter, &client).await;
+    assert_eq!(app.screen, Screen::InterfaceList);
+    assert!(app.pending.is_none());
+    server.await.unwrap();
+    let requests = requests.lock().await;
+    assert_eq!(requests[0].0, "/api/v1/interfaces/wlp1s0/config");
+    let requests = &requests[1..];
+    assert_eq!(requests[0].0, "/api/v1/interfaces/wlp1s0/edit/plan");
+    assert_eq!(requests[1].0, "/api/v1/interfaces/wlp1s0/edit/apply");
+    for (_, body) in &requests[..2] {
+        assert_eq!(body["cidr"], "198.18.0.1/24");
+        assert_eq!(body["managed"], true);
+    }
+    assert_eq!(requests[2].0, "/api/v1/network-transactions/commit");
+    assert_eq!(requests[2].1["token"], "ip-test-token");
+}
+
 fn default_route_editor(allow_management_change: bool) -> InterfaceEditor {
     InterfaceEditor {
         saved_config: None,
