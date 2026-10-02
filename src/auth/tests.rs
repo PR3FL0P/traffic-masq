@@ -186,11 +186,57 @@ async fn expires_idle_sessions() {
         .await
         .expect("log in");
 
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    service
+        .authenticate_at(&login.token, login.idle_expires_at - 1)
+        .await
+        .expect("valid immediately before idle deadline");
     assert!(matches!(
-        service.authenticate(&login.token).await,
+        service
+            .authenticate_at(&login.token, login.idle_expires_at)
+            .await,
         Err(AuthError::InvalidSession)
     ));
+}
+
+#[tokio::test]
+async fn idle_refresh_is_capped_by_absolute_expiry() {
+    let (_temp_dir, service) = service().await;
+    service
+        .initialize_device_password("a secure password")
+        .await
+        .unwrap();
+    let login = service
+        .login_device("a secure password", None, None)
+        .await
+        .unwrap();
+    let created_at = login.absolute_expires_at - service.inner.session_absolute_seconds;
+    // Keep the session active up to the absolute deadline.
+    for elapsed in [60, 300, 540, 599] {
+        service
+            .authenticate_at(&login.token, created_at + elapsed)
+            .await
+            .unwrap();
+        let expiry: i64 = sqlx::query_scalar("SELECT idle_expires_at FROM sessions")
+            .fetch_one(&service.inner.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            expiry,
+            (created_at + elapsed + service.inner.session_idle_seconds)
+                .min(login.absolute_expires_at)
+        );
+    }
+    assert!(matches!(
+        service
+            .authenticate_at(&login.token, login.absolute_expires_at)
+            .await,
+        Err(AuthError::InvalidSession)
+    ));
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+        .fetch_one(&service.inner.pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
 }
 
 #[tokio::test]
@@ -242,14 +288,25 @@ async fn purge_removes_expired_sessions_that_were_never_presented_again() {
         .initialize_device_password("a secure password")
         .await
         .expect("initialize");
-    service
+    let login = service
         .login_device("a secure password", None, None)
         .await
         .expect("log in");
 
-    assert_eq!(service.purge_expired_sessions().await.expect("purge"), 0);
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
-    assert_eq!(service.purge_expired_sessions().await.expect("purge"), 1);
+    assert_eq!(
+        service
+            .purge_expired_sessions_at(login.idle_expires_at - 1)
+            .await
+            .expect("purge before deadline"),
+        0
+    );
+    assert_eq!(
+        service
+            .purge_expired_sessions_at(login.idle_expires_at)
+            .await
+            .expect("purge at deadline"),
+        1
+    );
 
     let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
         .fetch_one(&service.inner.pool)

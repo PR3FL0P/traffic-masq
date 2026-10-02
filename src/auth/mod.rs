@@ -424,8 +424,11 @@ impl AuthService {
 
     /// Validate a bearer token and enabled user, reject expired sessions, and refresh idle expiry.
     pub async fn authenticate(&self, token: &str) -> Result<Principal, AuthError> {
+        self.authenticate_at(token, unix_timestamp()?).await
+    }
+
+    async fn authenticate_at(&self, token: &str, now: i64) -> Result<Principal, AuthError> {
         let token_hash = decode_and_hash_token(token).ok_or(AuthError::InvalidSession)?;
-        let now = unix_timestamp()?;
         let row = sqlx::query(
             "SELECT s.user_id, s.last_seen_at, s.idle_expires_at, \
                     s.absolute_expires_at, u.username, u.role, u.enabled \
@@ -499,7 +502,10 @@ impl AuthService {
 
     /// Delete sessions past either expiration deadline and return the number removed.
     pub async fn purge_expired_sessions(&self) -> Result<u64, AuthError> {
-        let now = unix_timestamp()?;
+        self.purge_expired_sessions_at(unix_timestamp()?).await
+    }
+
+    async fn purge_expired_sessions_at(&self, now: i64) -> Result<u64, AuthError> {
         let result = sqlx::query(
             "DELETE FROM sessions WHERE absolute_expires_at <= ? OR idle_expires_at <= ?",
         )
