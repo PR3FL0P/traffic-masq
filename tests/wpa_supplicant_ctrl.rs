@@ -345,7 +345,7 @@ async fn a_command_socket_never_receives_attach_only_events() {
     let ctrl_path = dir.path().join("wlan0");
     let server = FakeWpaSupplicant::spawn(ctrl_path.clone(), "COMPLETED");
 
-    let (_event_client, _events) = WpaSupplicantEventClient::attach(&ctrl_path, CLIENT_TIMEOUT)
+    let (event_client, mut events) = WpaSupplicantEventClient::attach(&ctrl_path, CLIENT_TIMEOUT)
         .await
         .expect("attach");
 
@@ -353,8 +353,15 @@ async fn a_command_socket_never_receives_attach_only_events() {
 
     server.emit_event("CTRL-EVENT-SCAN-RESULTS ");
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        tokio::time::timeout(CLIENT_TIMEOUT, events.recv())
+            .await
+            .expect("event delivery")
+            .expect("event stream"),
+        WpaSupplicantEvent::ScanResults
+    );
 
     let status = command_client.status().await.expect("status is a status");
     assert_eq!(status.wpa_state, WpaState::Completed);
+    event_client.close().await;
 }

@@ -531,7 +531,7 @@ async fn failed_commit_persistence_keeps_change_pending_for_rollback() {
     converger.abort();
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn timeout_waits_for_admitted_confirmation() {
     let directory = tempdir().unwrap();
     let desired = desired_state(directory.path()).await;
@@ -559,7 +559,8 @@ async fn timeout_waits_for_admitted_confirmation() {
     // A confirmation already admitted must not be overtaken by the timer
     // while it performs validation before acquiring the operation lock.
     let admission = gate.admit().await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(100)).await;
     assert_eq!(manager.pending().await, vec![pending.clone()]);
     assert!(desired.is_tentative("test0").await);
     manager.commit(&pending.token).await.unwrap();
@@ -570,7 +571,7 @@ async fn timeout_waits_for_admitted_confirmation() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn uncommitted_change_is_automatically_rolled_back() {
     let directory = tempdir().expect("tempdir");
     let provider = fake_network();
@@ -603,7 +604,16 @@ async fn uncommitted_change_is_automatically_rolled_back() {
         ]
     );
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(200)).await;
+    tokio::time::resume();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !manager.pending().await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("automatic rollback must finish");
 
     assert!(manager.pending().await.is_empty());
     assert_eq!(

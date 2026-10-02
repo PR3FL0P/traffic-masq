@@ -291,13 +291,23 @@ async fn coordinator_with(
     RuntimeOverrideManager,
     tempfile::TempDir,
 ) {
+    coordinator_with_timeout(fake, Duration::from_secs(60)).await
+}
+
+async fn coordinator_with_timeout(
+    fake: Arc<FakeSubsystems>,
+    timeout: Duration,
+) -> (
+    RouterTransactionCoordinator,
+    RuntimeOverrideManager,
+    tempfile::TempDir,
+) {
     let directory = tempdir().expect("tempdir");
     let overrides = RuntimeOverrideManager::load(directory.path(), &base_config())
         .await
         .expect("overrides manager");
     let manager = RouterManager::new(fake);
-    let coordinator =
-        RouterTransactionCoordinator::new(manager, overrides.clone(), Duration::from_millis(30));
+    let coordinator = RouterTransactionCoordinator::new(manager, overrides.clone(), timeout);
     (coordinator, overrides, directory)
 }
 
@@ -1009,25 +1019,34 @@ async fn provisioning_apply_failure_restores_unbound_secret_before_compensation(
         .unwrap());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn timeout_rolls_back_uncommitted_transaction() {
     let fake = FakeSubsystems::new();
-    let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
+    let (coordinator, overrides, _directory) =
+        coordinator_with_timeout(fake.clone(), Duration::from_millis(30)).await;
     let candidate = build_candidate(&overrides).await;
     let plan = coordinator.plan(candidate).await.expect("plan");
     coordinator.apply(plan).await.expect("apply");
     assert_eq!(coordinator.status().await, CoordinatorStatus::Pending);
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(150)).await;
+    // Filesystem work runs outside the virtual clock. Bound its completion
+    // with real time so an idle executor cannot skip past the I/O.
+    tokio::time::resume();
+    tokio::time::timeout(Duration::from_secs(5), coordinator.wait_until_idle())
+        .await
+        .expect("rollback completion");
 
     assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
     assert_eq!(overrides.committed_revision().await, 0);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn timeout_does_not_roll_back_an_already_committed_transaction() {
     let fake = FakeSubsystems::new();
-    let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
+    let (coordinator, overrides, _directory) =
+        coordinator_with_timeout(fake.clone(), Duration::from_millis(30)).await;
     let candidate = build_candidate(&overrides).await;
     let plan = coordinator.plan(candidate).await.expect("plan");
     coordinator.apply(plan).await.expect("apply");
@@ -1036,7 +1055,14 @@ async fn timeout_does_not_roll_back_an_already_committed_transaction() {
         .await
         .expect("commit before timeout");
 
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(150)).await;
+    // Filesystem work runs outside the virtual clock. Bound its completion
+    // with real time so an idle executor cannot skip past the I/O.
+    tokio::time::resume();
+    tokio::time::timeout(Duration::from_secs(5), coordinator.wait_until_idle())
+        .await
+        .expect("rollback completion");
 
     assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
     assert_eq!(overrides.committed_revision().await, 1);
@@ -1359,7 +1385,8 @@ async fn dangling_router_journal_symlink_is_not_treated_as_missing() {
 #[tokio::test]
 async fn automatic_rollback_retries_after_transient_failure() {
     let fake = FakeSubsystems::new();
-    let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
+    let (coordinator, overrides, _directory) =
+        coordinator_with_timeout(fake.clone(), Duration::from_millis(30)).await;
     let gate = Arc::new(NetworkMutationGate::default());
     coordinator.set_timeout_mutation_gate(gate.clone());
     let plan = coordinator

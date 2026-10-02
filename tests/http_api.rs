@@ -877,7 +877,7 @@ async fn router_test_server_with(
     let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork);
     let manager = RouterManager::new(fake);
     let coordinator =
-        RouterTransactionCoordinator::new(manager, overrides.clone(), Duration::from_millis(300));
+        RouterTransactionCoordinator::new(manager, overrides.clone(), Duration::from_secs(60));
     let control = ControlService::new(config.clone(), network, dhcp.clone(), overrides)
         .with_router_coordinator(coordinator);
     let auth = AuthService::open(&config.auth).await?;
@@ -1303,7 +1303,17 @@ async fn vpn_profile_list_import_activate_status_deactivate_over_http() -> Resul
     ));
     assert!(matches!(
         admin.request(&Request::VpnListProfiles).await?,
-        Response::VpnError { .. }
+        Response::VpnProfiles { profiles } if profiles.is_empty()
+    ));
+    assert!(matches!(
+        admin
+            .request(&Request::VpnActivate {
+                name: "home.conf".into()
+            })
+            .await?,
+        Response::VpnError {
+            detail: VpnErrorDetail::VpnDisabled
+        }
     ));
     assert!(matches!(
         admin
@@ -1415,7 +1425,17 @@ async fn vpn_profile_list_import_activate_status_deactivate_over_http() -> Resul
     ));
     assert!(matches!(
         admin.request(&Request::VpnListProfiles).await?,
-        Response::VpnError { .. }
+        Response::VpnProfiles { profiles } if profiles.is_empty()
+    ));
+    assert!(matches!(
+        admin
+            .request(&Request::VpnActivate {
+                name: "home.conf".into()
+            })
+            .await?,
+        Response::VpnError {
+            detail: VpnErrorDetail::VpnDisabled
+        }
     ));
     let persisted = RuntimeOverrideManager::load(&config.runtime.state_dir, &config).await?;
     assert!(
@@ -1476,7 +1496,7 @@ async fn vpn_requests_return_vpn_disabled_when_no_vpn_manager_is_attached() -> R
 }
 
 #[tokio::test]
-async fn wifi_requests_return_wifi_disabled_when_no_supervisor_is_attached() -> Result<()> {
+async fn wifi_runtime_requires_supervisors_but_configuration_remains_available() -> Result<()> {
     let directory = tempdir()?;
     let mut config = AppConfig::default();
     config.runtime.socket_path = directory.path().join("traffic-masqd.sock");
@@ -1516,9 +1536,10 @@ async fn wifi_requests_return_wifi_disabled_when_no_supervisor_is_attached() -> 
         })
         .await?
     {
-        Response::WifiError {
-            detail: WifiErrorDetail::WifiDisabled,
-        } => {}
+        Response::WifiConfig { interface, spec } => {
+            assert_eq!(interface, "wlan0");
+            assert!(spec.is_none());
+        }
         response => panic!("unexpected response: {response:?}"),
     }
     match admin
@@ -1544,9 +1565,7 @@ async fn wifi_requests_return_wifi_disabled_when_no_supervisor_is_attached() -> 
         response => panic!("unexpected response: {response:?}"),
     }
     match admin.request(&Request::ListWifiClientProfiles).await? {
-        Response::WifiClientProfileError {
-            detail: traffic_masq::api::model::WifiClientProfileErrorDetail::WifiClientDisabled,
-        } => {}
+        Response::WifiClientProfiles { profiles } => assert!(profiles.is_empty()),
         response => panic!("unexpected response: {response:?}"),
     }
 

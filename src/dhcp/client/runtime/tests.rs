@@ -6,6 +6,9 @@ use tokio::sync::Notify;
 struct FakeTransport {
     incoming: Mutex<VecDeque<IngressDatagram>>,
     sent: Mutex<Vec<SendKind>>,
+    packets: Mutex<Vec<Vec<u8>>>,
+    receive_calls: std::sync::atomic::AtomicUsize,
+    activity: Notify,
     notify: Notify,
 }
 impl FakeTransport {
@@ -13,6 +16,9 @@ impl FakeTransport {
         Self {
             incoming: Mutex::new(incoming.into()),
             sent: Mutex::new(Vec::new()),
+            packets: Mutex::new(Vec::new()),
+            receive_calls: std::sync::atomic::AtomicUsize::new(0),
+            activity: Notify::new(),
             notify: Notify::new(),
         }
     }
@@ -20,6 +26,9 @@ impl FakeTransport {
 #[async_trait]
 impl DhcpClientTransport for FakeTransport {
     async fn receive(&self) -> Result<IngressDatagram> {
+        self.receive_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.activity.notify_one();
         loop {
             if let Some(value) = self.incoming.lock().unwrap().pop_front() {
                 return Ok(value);
@@ -27,8 +36,10 @@ impl DhcpClientTransport for FakeTransport {
             self.notify.notified().await;
         }
     }
-    async fn send(&self, _packet: &[u8], kind: SendKind) -> Result<()> {
+    async fn send(&self, packet: &[u8], kind: SendKind) -> Result<()> {
         self.sent.lock().unwrap().push(kind);
+        self.packets.lock().unwrap().push(packet.to_vec());
+        self.activity.notify_one();
         Ok(())
     }
 }
@@ -135,10 +146,7 @@ async fn arp_probe_fake_is_bounded_and_stops_on_conflict() {
 
 #[tokio::test]
 async fn actor_sends_discover_rejects_wrong_ifindex_and_cancels() {
-    let transport = Arc::new(FakeTransport::new(vec![IngressDatagram {
-        bytes: vec![0; 10],
-        interface_index: 99,
-    }]));
+    let transport = Arc::new(FakeTransport::new(Vec::new()));
     let config = DhcpClientRuntimeConfig {
         interface: "lo".into(),
         interface_index: 1,
@@ -156,13 +164,71 @@ async fn actor_sends_discover_rejects_wrong_ifindex_and_cancels() {
     .unwrap();
     let (tx, rx) = watch::channel(false);
     let task = tokio::spawn(actor.run(rx));
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // A matching, valid OFFER is essential: a malformed packet would be
+    // discarded even if the interface-index check were removed.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while transport
+            .receive_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+            < 1
+        {
+            transport.activity.notified().await;
+        }
+    })
+    .await
+    .expect("actor ready after DISCOVER");
+    let mut offer = transport.packets.lock().unwrap()[0][..240].to_vec();
+    offer[0] = 2; // BOOTREPLY; keep the DISCOVER's transaction ID and MAC.
+    offer[16..20].copy_from_slice(&[192, 0, 2, 10]);
+    offer.extend_from_slice(&[53, 1, 2, 54, 4, 192, 0, 2, 1, 255]);
+    transport
+        .incoming
+        .lock()
+        .unwrap()
+        .push_back(IngressDatagram {
+            bytes: offer.clone(),
+            interface_index: 99,
+        });
+    transport.notify.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while transport
+            .receive_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+            < 2
+        {
+            transport.activity.notified().await;
+        }
+    })
+    .await
+    .expect("actor processed foreign OFFER");
     assert_eq!(
         transport.sent.lock().unwrap().as_slice(),
         &[SendKind::Broadcast]
     );
+    transport
+        .incoming
+        .lock()
+        .unwrap()
+        .push_back(IngressDatagram {
+            bytes: offer,
+            interface_index: 1,
+        });
+    transport.notify.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while transport.sent.lock().unwrap().len() < 2 {
+            transport.activity.notified().await;
+        }
+    })
+    .await
+    .expect("matching OFFER must produce REQUEST");
+    let packets = transport.packets.lock().unwrap().clone();
+    let request = traffic_masq_dhcp_core::packet::DhcpPacket::parse(&packets[1]).unwrap();
+    assert_eq!(
+        request.message_type(),
+        Some(traffic_masq_dhcp_core::packet::DhcpMessageType::Request)
+    );
     tx.send(true).unwrap();
-    tokio::time::timeout(Duration::from_millis(200), task)
+    tokio::time::timeout(Duration::from_secs(5), task)
         .await
         .unwrap()
         .unwrap()

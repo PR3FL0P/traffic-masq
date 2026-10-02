@@ -321,7 +321,7 @@ async fn a_command_socket_never_receives_attach_only_events() {
     let ctrl_path = dir.path().join("wlan0");
     let server = FakeHostapd::spawn(ctrl_path.clone(), Vec::new());
 
-    let (_event_client, _events) =
+    let (event_client, mut events) =
         traffic_masq::wifi::HostapdEventClient::attach(&ctrl_path, CLIENT_TIMEOUT)
             .await
             .expect("attach");
@@ -332,10 +332,17 @@ async fn a_command_socket_never_receives_attach_only_events() {
 
     server.emit_event("AP-ENABLED");
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        tokio::time::timeout(CLIENT_TIMEOUT, events.recv())
+            .await
+            .expect("event delivery")
+            .expect("event stream"),
+        HostapdEvent::ApEnabled
+    );
 
     command_client
         .ping()
         .await
         .expect("ping still works cleanly");
+    event_client.close().await;
 }

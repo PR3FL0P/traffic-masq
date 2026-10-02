@@ -835,7 +835,7 @@ async fn router_service_with_config(
         .expect("overrides");
     let manager = crate::core::router::RouterManager::new(fake);
     let coordinator =
-        RouterTransactionCoordinator::new(manager, overrides.clone(), Duration::from_millis(200));
+        RouterTransactionCoordinator::new(manager, overrides.clone(), Duration::from_secs(60));
     let dhcp = DhcpSupervisor::start(&config)
         .await
         .expect("dhcp supervisor");

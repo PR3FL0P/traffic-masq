@@ -6,6 +6,26 @@ use tempfile::NamedTempFile;
 
 use super::*;
 
+async fn wait_for_exit(process: &TokioSupervisedProcess, pid: u32) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while process.is_alive(pid).await.expect("process state") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("process must exit");
+}
+
+async fn wait_for_cmdline(pid: u32, argument: &Path) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !proc_cmdline_contains(pid, argument).await {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("spawned process must expose its command line");
+}
+
 #[tokio::test]
 async fn stdout_and_stderr_diagnostics_are_retained_for_supervisor_health() {
     let mut script = NamedTempFile::new().expect("script");
@@ -20,12 +40,7 @@ async fn stdout_and_stderr_diagnostics_are_retained_for_supervisor_health() {
         .await
         .expect("spawn");
 
-    for _ in 0..50 {
-        if !process.is_alive(pid).await.expect("process state") {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wait_for_exit(&process, pid).await;
     let diagnostics = process
         .recent_diagnostics(pid)
         .await
@@ -143,14 +158,8 @@ async fn process_identity_requires_the_expected_executable_not_just_config_argv(
         .spawn(Path::new("/bin/sleep"), config)
         .await
         .expect("spawn");
+    wait_for_cmdline(pid, config).await;
     let started_at_unix = crate::wifi::lifecycle::unix_now();
-
-    for _ in 0..50 {
-        if proc_cmdline_contains(pid, config).await {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
 
     assert!(process
         .identity_matches(
@@ -244,18 +253,10 @@ async fn a_freshly_spawned_process_is_alive_and_visible_in_proc() {
         .expect("spawn");
 
     assert!(process.is_alive(pid).await.expect("is_alive"));
-    let mut found = false;
-    for _ in 0..50 {
-        if proc_cmdline_contains(pid, Path::new("300")).await {
-            found = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(found, "cmdline should contain '300'");
+    wait_for_cmdline(pid, Path::new("300")).await;
 
     process.kill(pid).await.expect("kill");
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_exit(&process, pid).await;
     assert!(!process.is_alive(pid).await.expect("is_alive after kill"));
 }
 
@@ -267,15 +268,7 @@ async fn cmdline_contains_is_false_for_a_config_path_not_in_argv() {
         .await
         .expect("spawn");
 
-    let mut ready = false;
-    for _ in 0..50 {
-        if proc_cmdline_contains(pid, Path::new("300")).await {
-            ready = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(ready, "spawned process should be visible in proc cmdline");
+    wait_for_cmdline(pid, Path::new("300")).await;
 
     assert!(!proc_cmdline_contains(pid, Path::new("600")).await);
 
@@ -291,7 +284,7 @@ async fn terminate_and_kill_on_a_pid_that_already_exited_are_not_errors() {
         .await
         .expect("spawn");
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_exit(&process, pid).await;
     process.terminate(pid).await.expect("terminate a dead pid");
     process.kill(pid).await.expect("kill a dead pid");
 }
@@ -386,6 +379,7 @@ async fn persisted_process_identity_uses_exact_kernel_starttime() {
         .spawn(Path::new("/bin/sleep"), config)
         .await
         .expect("spawn");
+    wait_for_cmdline(pid, config).await;
     let start_ticks = process
         .process_start_ticks(pid)
         .await
@@ -453,6 +447,7 @@ async fn pidfd_stop_refuses_a_record_with_the_wrong_starttime() {
         .spawn(Path::new("/bin/sleep"), config)
         .await
         .expect("spawn");
+    wait_for_cmdline(pid, config).await;
     let start_ticks = process
         .process_start_ticks(pid)
         .await
@@ -478,6 +473,18 @@ async fn pidfd_stop_refuses_a_record_with_the_wrong_starttime() {
         ssid: String::new(),
     };
 
+    // Prove that the altered record field is the reason for rejection.
+    let mut valid = record.clone();
+    valid.process_start_ticks = Some(start_ticks);
+    assert!(process
+        .identity_matches_record(
+            &valid,
+            WifiProcessKind::AccessPoint,
+            Path::new("/bin/sleep")
+        )
+        .await
+        .expect("valid identity before corrupting proof"));
+
     assert!(matches!(
         process
             .stop_recorded(&record, WifiProcessKind::AccessPoint, "test")
@@ -500,6 +507,7 @@ async fn pidfd_stop_refuses_a_record_from_another_boot() {
         .spawn(Path::new("/bin/sleep"), config)
         .await
         .expect("spawn");
+    wait_for_cmdline(pid, config).await;
     let start_ticks = process
         .process_start_ticks(pid)
         .await
@@ -519,6 +527,18 @@ async fn pidfd_stop_refuses_a_record_from_another_boot() {
         key_digest: crate::wifi::render::WifiDigest::of(&[]),
         ssid: String::new(),
     };
+
+    // Prove that the altered record field is the reason for rejection.
+    let mut valid = record.clone();
+    valid.boot_id = process.boot_id().await.unwrap();
+    assert!(process
+        .identity_matches_record(
+            &valid,
+            WifiProcessKind::AccessPoint,
+            Path::new("/bin/sleep")
+        )
+        .await
+        .expect("valid identity before corrupting proof"));
 
     assert!(matches!(
         process
@@ -542,6 +562,7 @@ async fn pidfd_stop_accepts_the_exact_recorded_starttime() {
         .spawn(Path::new("/bin/sleep"), config)
         .await
         .expect("spawn");
+    wait_for_cmdline(pid, config).await;
     let start_ticks = process
         .process_start_ticks(pid)
         .await
@@ -597,6 +618,7 @@ async fn pidfd_stop_refuses_legacy_record_without_exact_starttime() {
         .spawn(Path::new("/bin/sleep"), config)
         .await
         .expect("spawn");
+    wait_for_cmdline(pid, config).await;
     let record = crate::wifi::record::PersistedWifiRecord {
         pid,
         started_at_unix: crate::wifi::lifecycle::unix_now(),
@@ -611,6 +633,19 @@ async fn pidfd_stop_refuses_legacy_record_without_exact_starttime() {
         key_digest: crate::wifi::render::WifiDigest::of(&[]),
         ssid: String::new(),
     };
+
+    // Prove that the altered record field is the reason for rejection.
+    let mut valid = record.clone();
+    valid.process_start_ticks = process.process_start_ticks(pid).await.unwrap();
+    valid.boot_id = process.boot_id().await.unwrap();
+    assert!(process
+        .identity_matches_record(
+            &valid,
+            WifiProcessKind::AccessPoint,
+            Path::new("/bin/sleep")
+        )
+        .await
+        .expect("valid identity before corrupting proof"));
 
     assert!(matches!(
         process
