@@ -238,6 +238,7 @@ fn app_config(state_dir: &Path, runtime_dir: &Path) -> AppConfig {
         vpn: VpnConfig {
             enabled: false,
             wireguard_config_dir: state_dir.join("vpn/wireguard"),
+            wireguard_import_dir: "/etc/wireguard".into(),
             policy: Default::default(),
         },
         security: SecurityConfig {

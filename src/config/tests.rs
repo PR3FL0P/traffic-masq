@@ -79,6 +79,49 @@ fn legacy_management_role_reads_as_none_and_serializes_canonically() {
 
 use super::*;
 
+#[test]
+fn vpn_source_and_store_must_differ_before_directory_creation() {
+    let directory = tempfile::tempdir().unwrap();
+    let real = directory.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let alias = directory.path().join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let mut config = AppConfig::default();
+    config.vpn.wireguard_config_dir = real.join("profiles");
+    for source in [
+        real.join("profiles"),
+        real.join("unused/../profiles"),
+        alias.join("profiles"),
+    ] {
+        config.vpn.wireguard_import_dir = source;
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("wireguard_import_dir must differ"));
+    }
+    config.vpn.wireguard_import_dir = alias.join("sources");
+    config.validate().unwrap();
+    assert!(!real.join("profiles").exists());
+    assert!(!real.join("sources").exists());
+}
+
+#[test]
+fn vpn_directory_validation_does_not_require_daemon_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let private = directory.path().join("private");
+    std::fs::create_dir(&private).unwrap();
+    let mut config = AppConfig::default();
+    config.vpn.wireguard_config_dir = private.join("profiles");
+    config.vpn.wireguard_import_dir = private.join("sources");
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let result = config.validate();
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700)).unwrap();
+    result.expect("configuration inspection must not require daemon directory access");
+}
+
 fn input_interface() -> InterfaceConfig {
     InterfaceConfig {
         nat: true,

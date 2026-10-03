@@ -68,6 +68,8 @@ pub(crate) struct VpnImportEditor {
     pub(crate) name: String,
     pub(crate) path: String,
     pub(crate) cursor: usize,
+    pub(crate) sources: Option<(String, Vec<String>)>,
+    pub(crate) selected_source: usize,
 }
 
 impl VpnImportEditor {
@@ -258,6 +260,47 @@ pub(crate) fn render_vpn_import(frame: &mut ratatui::Frame<'_>, area: Rect, app:
     let Some(editor) = &app.vpn_import else {
         return;
     };
+    if let Some((directory, names)) = &editor.sources {
+        let mut lines = vec![
+            Line::styled(
+                format!("WireGuard configs: {directory}"),
+                Style::default().fg(theme::ACCENT),
+            ),
+            Line::from(
+                "Up/Down: select | Enter: import | r: refresh | p: local file | Esc: cancel",
+            ),
+            Line::from(""),
+        ];
+        if names.is_empty() {
+            lines.push(Line::from(
+                "No .conf files found. Put your WireGuard config in this directory.",
+            ));
+        }
+        let visible_rows = area.height.saturating_sub(5).max(1) as usize;
+        let start = editor.selected_source.saturating_sub(visible_rows - 1);
+        for (index, name) in names.iter().enumerate().skip(start).take(visible_rows) {
+            lines.push(Line::styled(
+                format!(
+                    "{} {name}",
+                    if index == editor.selected_source {
+                        "▶"
+                    } else {
+                        " "
+                    }
+                ),
+                Style::default().fg(if index == editor.selected_source {
+                    theme::ACCENT
+                } else {
+                    theme::MUTED
+                }),
+            ));
+        }
+        frame.render_widget(
+            Paragraph::new(lines).block(panel("Import WireGuard profile")),
+            area,
+        );
+        return;
+    }
     let field_line = |label: &str, value: &str, field: VpnImportField| {
         let active = editor.field == field;
         let marker = if active { "▶ " } else { "  " };
@@ -375,7 +418,7 @@ pub(crate) async fn handle_vpn_key(app: &mut TuiApp, key: KeyCode, client: &ApiC
         KeyCode::Enter => match app.vpn.focus {
             VpnFocus::List | VpnFocus::Connect => vpn_activate_selected(app, client).await,
             VpnFocus::Disconnect => vpn_deactivate(app, client).await,
-            VpnFocus::Import => open_vpn_import(app),
+            VpnFocus::Import => open_vpn_import(app, client).await,
             VpnFocus::Delete => vpn_delete_selected(app, client).await,
             VpnFocus::Policy => open_vpn_policy(app, client).await,
             VpnFocus::Refresh => load_vpn_data(app, client).await,
@@ -416,12 +459,29 @@ async fn toggle_vpn_enabled(app: &mut TuiApp, client: &ApiClient) {
     }
 }
 
-fn open_vpn_import(app: &mut TuiApp) {
+async fn open_vpn_import(app: &mut TuiApp, client: &ApiClient) {
+    let sources = match client.request(&Request::VpnListSources).await {
+        Ok(Response::VpnSources {
+            directory,
+            profiles,
+        }) => Some((directory, profiles.into_iter().map(|p| p.name).collect())),
+        Ok(Response::Error { message }) => {
+            app.push_message(LogLevel::Error, message);
+            None
+        }
+        Err(error) => {
+            app.push_message(LogLevel::Error, error.to_string());
+            None
+        }
+        _ => None,
+    };
     app.vpn_import = Some(VpnImportEditor {
         field: VpnImportField::Name,
         name: String::new(),
         path: String::new(),
         cursor: 0,
+        sources,
+        selected_source: 0,
     });
     app.screen = Screen::VpnImport;
 }
@@ -437,6 +497,24 @@ pub(crate) async fn handle_vpn_import_key(app: &mut TuiApp, key: KeyCode, client
         return;
     };
 
+    if let Some((_, names)) = &editor.sources {
+        match key {
+            KeyCode::Up => editor.selected_source = editor.selected_source.saturating_sub(1),
+            KeyCode::Down => {
+                editor.selected_source =
+                    (editor.selected_source + 1).min(names.len().saturating_sub(1))
+            }
+            KeyCode::Char('p') => editor.sources = None,
+            KeyCode::Char('r') => open_vpn_import(app, client).await,
+            KeyCode::Enter => vpn_import_submit(app, client).await,
+            KeyCode::Esc => {
+                app.vpn_import = None;
+                app.screen = Screen::Vpn;
+            }
+            _ => {}
+        }
+        return;
+    }
     match key {
         KeyCode::Esc => {
             app.vpn_import = None;
@@ -604,6 +682,29 @@ pub(crate) async fn vpn_import_submit(app: &mut TuiApp, client: &ApiClient) {
         app.screen = Screen::Vpn;
         return;
     };
+    if let Some((_, names)) = &editor.sources {
+        let Some(name) = names.get(editor.selected_source).cloned() else {
+            return;
+        };
+        match client.request(&Request::VpnImportFromSource { name }).await {
+            Ok(Response::VpnProfileImported { name }) => {
+                app.push_message(LogLevel::Info, format!("Imported profile {name}"));
+                app.vpn_import = None;
+                app.screen = Screen::Vpn;
+                load_vpn_data(app, client).await;
+            }
+            Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
+            Ok(Response::VpnError { detail }) => {
+                app.push_message(LogLevel::Error, describe_vpn_error(&detail))
+            }
+            Ok(response) => app.push_message(
+                LogLevel::Error,
+                format!("Unexpected response: {response:?}"),
+            ),
+            Err(error) => app.push_message(LogLevel::Error, error.to_string()),
+        }
+        return;
+    }
     let name = editor.name.trim().to_string();
     let path = editor.path.trim().to_string();
     if name.is_empty() || path.is_empty() {

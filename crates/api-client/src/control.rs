@@ -451,6 +451,18 @@ pub fn map_request<Interface: Serialize, Proposal: Serialize>(
             body: None,
             synthesize_pong: false,
         },
+        Request::VpnListSources => RestRequest {
+            method: Method::GET,
+            path: format!("{API_PREFIX}/vpn/sources"),
+            body: None,
+            synthesize_pong: false,
+        },
+        Request::VpnImportFromSource { name } => RestRequest {
+            method: Method::POST,
+            path: format!("{API_PREFIX}/vpn/sources/{}", encode_path_segment(name)),
+            body: None,
+            synthesize_pong: false,
+        },
         Request::VpnListProfiles => RestRequest {
             method: Method::GET,
             path: format!("{API_PREFIX}/vpn/profiles"),

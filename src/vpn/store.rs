@@ -238,3 +238,64 @@ fn restore_profile_after_failure(
 
 #[cfg(test)]
 mod tests;
+
+/// Read-only import sources: never create or chmod the system WireGuard directory.
+pub(crate) fn list_source_profiles(
+    directory: &Path,
+) -> Result<Vec<WireGuardProfileSummary>, StoreError> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut profiles = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if validate_wireguard_profile_name(&name).is_err()
+            || !name.ends_with(".conf")
+            || !entry.file_type()?.is_file()
+        {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        profiles.push(WireGuardProfileSummary {
+            name,
+            size_bytes: metadata.len(),
+            modified: metadata.modified().ok(),
+        });
+    }
+    profiles.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(profiles)
+}
+
+pub(crate) fn read_source_profile(
+    directory: &Path,
+    name: &str,
+) -> Result<Zeroizing<Vec<u8>>, StoreError> {
+    validate_wireguard_profile_name(name)?;
+    if !name.ends_with(".conf") {
+        return Err(StoreError::PathEscape);
+    }
+    let path = directory.join(name);
+    let fd = open(
+        &path,
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|error| std::io::Error::from_raw_os_error(error as i32))?;
+    let file = unsafe { File::from_raw_fd(fd) };
+    if !file.metadata()?.is_file() {
+        return Err(StoreError::PathEscape);
+    }
+    let mut contents = Zeroizing::new(Vec::new());
+    file.take(1024 * 1024 + 1).read_to_end(&mut contents)?;
+    if contents.len() > 1024 * 1024 {
+        return Err(
+            std::io::Error::new(ErrorKind::InvalidData, "WireGuard source exceeds 1 MiB").into(),
+        );
+    }
+    Ok(contents)
+}

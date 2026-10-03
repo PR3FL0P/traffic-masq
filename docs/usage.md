@@ -469,8 +469,16 @@ reset that backoff until hostapd reports `ENABLED`.
 
 ### WireGuard profile compatibility
 
-Import a profile with a plain basename ending in `.conf` (for example
-`office.conf`). The parser reads `[Interface]` fields `PrivateKey`, `ListenPort`,
+Place WireGuard configurations in `/etc/wireguard/` (or set
+`vpn.wireguard_import_dir` to another source directory). In the VPN tab select
+**Import profile**, choose a file, and press Enter. The daemon reads the source
+and saves a private copy in `vpn.wireguard_config_dir`; the TUI does not need
+read permission on the source key. Select the imported profile and connect.
+Press `r` in the browser to refresh or `p` to import a local file by path.
+Existing profiles must be removed before importing a replacement from this
+browser; active or router-referenced profiles cannot be removed.
+
+Profile names are plain basenames ending in `.conf` (for example `office.conf`). The parser reads `[Interface]` fields `PrivateKey`, `ListenPort`,
 `Address`, `DNS`, `MTU`, and `[Peer]` fields `PublicKey`, `AllowedIPs`, `Endpoint`,
 `PersistentKeepalive`, `PresharedKey`. A private key and at least one peer with
 a public key are required. Keys must decode to 32 bytes.

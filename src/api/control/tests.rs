@@ -1308,6 +1308,7 @@ async fn vpn_enabled_service_with_provider(
     let directory = tempdir().expect("tempdir");
     let mut config = router_base_config();
     config.vpn.enabled = true;
+    config.vpn.wireguard_import_dir = directory.path().join("sources");
     let overrides = RuntimeOverrideManager::load(directory.path(), &config)
         .await
         .expect("overrides");
@@ -9636,4 +9637,53 @@ async fn router_status_separates_saved_revision_from_historical_applied_revision
         .await
         .unwrap();
     assert_eq!(restarted.last_applied_revision(), Some(1));
+}
+
+#[tokio::test]
+async fn vpn_source_import_copies_profile_without_exposing_keys_or_changing_source() {
+    let (service, directory) = vpn_enabled_service().await;
+    let source = directory.path().join("sources");
+    std::fs::create_dir(&source).unwrap();
+    let contents =
+        valid_vpn_profile_contents().replace("203.0.113.1:51820", "wg010.njalla.no:51820");
+    std::fs::write(source.join("wg0.conf"), &contents).unwrap();
+    let response = service.dispatch(Request::VpnListSources).await;
+    assert!(!serde_json::to_string(&response)
+        .unwrap()
+        .contains(VALID_VPN_PRIVATE_KEY));
+    match response {
+        Response::VpnSources {
+            directory: path,
+            profiles,
+        } => {
+            assert_eq!(path, source.display().to_string());
+            assert_eq!(profiles.len(), 1);
+            assert_eq!(profiles[0].name, "wg0.conf");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        service
+            .dispatch(Request::VpnImportFromSource {
+                name: "wg0.conf".into()
+            })
+            .await,
+        Response::VpnProfileImported { .. }
+    ));
+    assert_eq!(
+        std::fs::read_to_string(source.join("wg0.conf")).unwrap(),
+        contents
+    );
+    assert_eq!(
+        std::fs::read_to_string(directory.path().join("wireguard/wg0.conf")).unwrap(),
+        contents
+    );
+    assert!(matches!(
+        service
+            .dispatch(Request::VpnImportFromSource {
+                name: "../wg0.conf".into()
+            })
+            .await,
+        Response::Error { .. }
+    ));
 }

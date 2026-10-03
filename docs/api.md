@@ -257,6 +257,8 @@ endpoints. Use the endpoint corresponding to the apply response.
 
 | Method | Path | Body | Result or purpose | Access |
 | --- | --- | --- | --- | --- |
+| `GET` | `/vpn/sources` | — | List regular `.conf` files in the configured WireGuard import directory, without contents | Administrator |
+| `POST` | `/vpn/sources/{name}` | — | Copy a source configuration into the private profile store | Administrator |
 | `GET` | `/vpn/profiles` | — | List WireGuard profile metadata | Authenticated |
 | `POST` | `/vpn/profiles` | `{ "name": string, "contents": string }` | Import a WireGuard configuration | Administrator |
 | `DELETE` | `/vpn/profiles/{name}` | — | Delete an inactive profile | Administrator |

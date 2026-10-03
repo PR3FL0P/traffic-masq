@@ -239,3 +239,49 @@ fn ensure_directory_rejects_symlinked_directory_on_list() {
     let err = store.list().unwrap_err();
     assert!(matches!(err, StoreError::SymlinkRejected(_)));
 }
+
+#[test]
+fn source_browser_lists_only_regular_configs_and_preserves_permissions() {
+    let directory = tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o750)).unwrap();
+    fs::write(directory.path().join("wg0.conf"), valid_config()).unwrap();
+    fs::write(directory.path().join("notes.txt"), "notes").unwrap();
+    symlink("wg0.conf", directory.path().join("alias.conf")).unwrap();
+    fs::create_dir(directory.path().join("folder.conf")).unwrap();
+    let profiles = list_source_profiles(directory.path()).unwrap();
+    assert_eq!(
+        profiles.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+        vec!["wg0.conf"]
+    );
+    let contents = read_source_profile(directory.path(), "wg0.conf").unwrap();
+    assert_eq!(&*contents, valid_config().as_bytes());
+    assert_eq!(
+        fs::metadata(directory.path()).unwrap().permissions().mode() & 0o777,
+        0o750
+    );
+    assert!(read_source_profile(directory.path(), "alias.conf").is_err());
+    assert!(read_source_profile(directory.path(), "../wg0.conf").is_err());
+    assert!(read_source_profile(directory.path(), "folder.conf").is_err());
+}
+
+#[test]
+fn source_import_rejects_oversized_files_and_fifos_without_blocking() {
+    let directory = tempdir().unwrap();
+    fs::write(
+        directory.path().join("large.conf"),
+        vec![b'x'; 1024 * 1024 + 1],
+    )
+    .unwrap();
+    assert!(read_source_profile(directory.path(), "large.conf").is_err());
+    let fifo = directory.path().join("fifo.conf");
+    nix::unistd::mkfifo(&fifo, Mode::from_bits_truncate(0o600)).unwrap();
+    assert!(read_source_profile(directory.path(), "fifo.conf").is_err());
+}
+
+#[test]
+fn missing_source_directory_is_empty_without_being_created() {
+    let directory = tempdir().unwrap();
+    let missing = directory.path().join("missing");
+    assert!(list_source_profiles(&missing).unwrap().is_empty());
+    assert!(!missing.exists());
+}

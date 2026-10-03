@@ -215,6 +215,16 @@ IPv4 policy. Association alone supplies no IP address or route.
 
 ## VPN, HTTPS and authentication
 
+`[vpn] wireguard_import_dir` defaults to `/etc/wireguard`. The TUI import browser
+lists regular `.conf` files there through the daemon; private keys are never
+returned in the listing. Imports copy the selected file into `wireguard_config_dir`
+with private permissions. The source directory and its permissions are unchanged.
+Each protocol keeps its own source and profile store; currently only WireGuard
+is supported. Hostname endpoints are resolved when connecting, and profile MTU
+is applied to the tunnel. `DNS` is parsed but does not change the system resolver.
+Autostart, per-profile IPv6 controls, and per-profile kill switches are not
+implemented; the existing router traffic policy manages protected LAN traffic.
+
 `[vpn] enabled` defaults to `false`; enabling it allows profile activation.
 `[vpn.policy] default_mode` defaults to `direct` and also accepts `vpn`.
 `protected_subnets` currently accepts only `all_managed_output_subnets`.

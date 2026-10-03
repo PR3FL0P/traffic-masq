@@ -281,6 +281,8 @@ fn build_router(state: AppState) -> Router {
             "/router/provisioning/repair",
             post(router_provisioning_repair),
         )
+        .route("/vpn/sources", get(vpn_list_sources))
+        .route("/vpn/sources/{name}", post(vpn_import_from_source))
         .route(
             "/vpn/profiles",
             get(vpn_list_profiles).post(vpn_import_profile),
@@ -1207,6 +1209,20 @@ async fn router_provisioning_repair(
     dispatch_control(&state, &principal, Request::RouterProvisioningRepair).await
 }
 
+async fn vpn_list_sources(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+) -> Result<Json<Response>, ApiError> {
+    dispatch_control(&state, &principal, Request::VpnListSources).await
+}
+async fn vpn_import_from_source(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<Response>, ApiError> {
+    dispatch_control(&state, &principal, Request::VpnImportFromSource { name }).await
+}
+
 async fn vpn_list_profiles(
     State(state): State<AppState>,
     Extension(principal): Extension<Principal>,
@@ -1674,6 +1690,8 @@ fn control_request_requires_administrator(request: &Request) -> bool {
             | Request::RouterRollback { .. }
             | Request::RouterProvisioningApply { .. }
             | Request::RouterProvisioningRepair
+            | Request::VpnListSources
+            | Request::VpnImportFromSource { .. }
             | Request::VpnImportProfile { .. }
             | Request::VpnDeleteProfile { .. }
             | Request::SetVpnEnabled { .. }

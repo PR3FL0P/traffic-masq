@@ -73,6 +73,49 @@ impl ControlService {
             .is_ok_and(|config| config.vpn.enabled)
     }
 
+    pub(super) async fn vpn_list_sources(&self) -> Response {
+        let config = match self.effective_config().await {
+            Ok(c) => c,
+            Err(message) => return Response::Error { message },
+        };
+        let directory = config.vpn.wireguard_import_dir;
+        match crate::vpn::store::list_source_profiles(&directory) {
+            Ok(profiles) => Response::VpnSources {
+                directory: directory.display().to_string(),
+                profiles: profiles.into_iter().map(vpn_profile_summary).collect(),
+            },
+            Err(error) => Response::Error {
+                message: error.to_string(),
+            },
+        }
+    }
+
+    pub(super) async fn vpn_import_from_source(&self, name: String) -> Response {
+        let Some(vpn) = &self.vpn else {
+            return vpn_disabled();
+        };
+        match vpn.list_profiles() {
+            Ok(profiles) if profiles.iter().any(|profile| profile.name == name) => return Response::Error { message: format!("Profile '{name}' already exists; remove the inactive profile before importing it again") },
+            Ok(_) => {},
+            Err(error) => return classify_vpn_error(error),
+        }
+        let config = match self.effective_config().await {
+            Ok(c) => c,
+            Err(message) => return Response::Error { message },
+        };
+        match crate::vpn::store::read_source_profile(&config.vpn.wireguard_import_dir, &name) {
+            Ok(contents) => match std::str::from_utf8(&contents) {
+                Ok(contents) => self.vpn_import_profile(name, contents.to_owned()).await,
+                Err(error) => Response::Error {
+                    message: error.to_string(),
+                },
+            },
+            Err(error) => Response::Error {
+                message: error.to_string(),
+            },
+        }
+    }
+
     pub(super) async fn vpn_list_profiles(&self) -> Response {
         let Some(vpn) = &self.vpn else {
             return vpn_disabled();
@@ -86,6 +129,7 @@ impl ControlService {
     }
 
     pub(super) async fn vpn_import_profile(&self, name: String, contents: String) -> Response {
+        let contents = zeroize::Zeroizing::new(contents);
         let Some(vpn) = &self.vpn else {
             return vpn_disabled();
         };

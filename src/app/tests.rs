@@ -581,6 +581,7 @@ fn vpn_policy_startup_config() -> AppConfig {
     config.vpn = VpnConfig {
         enabled: true,
         wireguard_config_dir: std::path::PathBuf::from("/var/lib/traffic-masq/vpn/wireguard"),
+        wireguard_import_dir: "/etc/wireguard".into(),
         policy: Default::default(),
     };
     config

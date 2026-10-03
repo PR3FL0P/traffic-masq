@@ -61,6 +61,8 @@ restart_backoff_seconds = 5
 [vpn]
 enabled = false
 wireguard_config_dir = "/var/lib/traffic-masq/vpn/wireguard"
+# Read-only source directory offered by the TUI import browser.
+wireguard_import_dir = "/etc/wireguard"
 
 [vpn.policy]
 default_mode = "direct"

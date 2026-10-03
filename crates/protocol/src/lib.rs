@@ -1287,6 +1287,10 @@ pub enum Request<Interface, Proposal> {
     },
     RouterProvisioningStatus,
     RouterProvisioningRepair,
+    VpnListSources,
+    VpnImportFromSource {
+        name: String,
+    },
     VpnListProfiles,
     VpnImportProfile {
         name: String,
@@ -1602,6 +1606,10 @@ pub enum Response<
     },
     RouterProvisioningError {
         detail: RouterProvisioningErrorDetail,
+    },
+    VpnSources {
+        directory: String,
+        profiles: Vec<VpnProfileSummary>,
     },
     VpnProfiles {
         profiles: Vec<VpnProfileSummary>,

@@ -345,6 +345,7 @@ fn build_config(temp: &tempfile::TempDir) -> AppConfig {
 
     config.vpn.enabled = true;
     config.vpn.wireguard_config_dir = temp.path().join("vpn-wireguard");
+    config.vpn.wireguard_import_dir = temp.path().join("wireguard-sources");
 
     config
 }
@@ -386,10 +387,21 @@ async fn run_happy_path(fixture: &mut VpnNamespaceFixture) -> Result<()> {
          PersistentKeepalive = 1\n"
     );
 
+    fs::create_dir_all(&fixture.config.vpn.wireguard_import_dir)?;
+    let source_path = fixture.config.vpn.wireguard_import_dir.join("peer.conf");
+    fs::write(&source_path, &profile_contents)?;
+    let sources = client.request(&Request::VpnListSources).await?;
+    assert!(!serde_json::to_string(&sources)?.contains(&host_private_key));
+    match sources {
+        Response::VpnSources { profiles, .. } => {
+            assert_eq!(profiles.len(), 1);
+            assert_eq!(profiles[0].name, "peer.conf");
+        }
+        other => bail!("unexpected source list: {other:?}"),
+    }
     let import_response = client
-        .request(&Request::VpnImportProfile {
+        .request(&Request::VpnImportFromSource {
             name: "peer.conf".to_string(),
-            contents: profile_contents,
         })
         .await
         .context("VpnImportProfile request failed")?;
@@ -397,6 +409,8 @@ async fn run_happy_path(fixture: &mut VpnNamespaceFixture) -> Result<()> {
         Response::VpnProfileImported { name } => assert_eq!(name, "peer.conf"),
         other => bail!("unexpected response to VpnImportProfile: {other:?}"),
     }
+
+    assert_eq!(fs::read_to_string(&source_path)?, profile_contents);
 
     let activate_response = client
         .request(&Request::VpnActivate {

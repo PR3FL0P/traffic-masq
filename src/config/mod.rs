@@ -362,9 +362,15 @@ pub struct VpnConfig {
     #[serde(default)]
     pub enabled: bool,
     pub wireguard_config_dir: PathBuf,
+    #[serde(default = "default_wireguard_import_dir")]
+    pub wireguard_import_dir: PathBuf,
 
     #[serde(default)]
     pub policy: VpnTrafficPolicyConfig,
+}
+
+fn default_wireguard_import_dir() -> PathBuf {
+    PathBuf::from("/etc/wireguard")
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -490,8 +496,39 @@ impl ApiConfig {
 impl VpnConfig {
     /// Check configuration invariants and reject incompatible or unsafe settings before application.
     fn validate(&self, router: &RouterConfig) -> Result<()> {
+        let same_directory = resolve_directory_path(&self.wireguard_import_dir)?
+            == resolve_directory_path(&self.wireguard_config_dir)?;
+        if same_directory {
+            bail!("vpn.wireguard_import_dir must differ from vpn.wireguard_config_dir");
+        }
         self.policy.validate(self.enabled, router)
     }
+}
+
+/// Resolve existing symlinks and normalize paths even before their final
+/// directories are created. Normalizing `..` after resolving each component
+/// preserves its filesystem meaning when an ancestor is a symlink.
+fn resolve_directory_path(path: &std::path::Path) -> Result<PathBuf> {
+    use std::path::Component;
+
+    let absolute = std::path::absolute(path)?;
+    let mut resolved = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            _ => resolved.push(component.as_os_str()),
+        }
+        // Configuration can be inspected without access to the daemon's
+        // private directories. Resolve readable ancestors, but do not make
+        // validation depend on permissions to inspect the complete path.
+        if let Ok(canonical) = resolved.canonicalize() {
+            resolved = canonical;
+        }
+    }
+    Ok(resolved)
 }
 
 impl VpnTrafficPolicyConfig {
@@ -1119,6 +1156,7 @@ impl Default for AppConfig {
             vpn: VpnConfig {
                 enabled: false,
                 wireguard_config_dir: PathBuf::from("/var/lib/traffic-masq/vpn/wireguard"),
+                wireguard_import_dir: "/etc/wireguard".into(),
                 policy: VpnTrafficPolicyConfig::default(),
             },
             security: SecurityConfig {

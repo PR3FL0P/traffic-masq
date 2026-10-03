@@ -671,6 +671,8 @@ impl ControlService {
             }
             Request::RouterProvisioningStatus => self.router_provisioning_status().await,
             Request::RouterProvisioningRepair => self.router_provisioning_repair().await,
+            Request::VpnListSources => self.vpn_list_sources().await,
+            Request::VpnImportFromSource { name } => self.vpn_import_from_source(name).await,
             Request::VpnListProfiles => self.vpn_list_profiles().await,
             Request::VpnImportProfile { name, contents } => {
                 self.vpn_import_profile(name, contents).await
@@ -797,6 +799,7 @@ fn is_network_mutation(request: &Request) -> bool {
             | Request::RouterRollback { .. }
             | Request::RouterProvisioningApply { .. }
             | Request::RouterProvisioningRepair
+            | Request::VpnImportFromSource { .. }
             | Request::VpnImportProfile { .. }
             | Request::VpnDeleteProfile { .. }
             | Request::SetVpnEnabled { .. }

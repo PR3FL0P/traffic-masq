@@ -127,6 +127,8 @@ fn vpn_import_editor_active_value_targets_the_selected_field() {
         name: "home".to_string(),
         path: "/etc/wireguard/home.conf".to_string(),
         cursor: 0,
+        sources: None,
+        selected_source: 0,
     };
     editor.active_value_mut().push_str(".conf");
     assert_eq!(editor.name, "home.conf");
@@ -145,6 +147,8 @@ fn vpn_import_editor_has_no_contents_field_to_retain_a_secret() {
         name: "home.conf".to_string(),
         path: "/etc/wireguard/home.conf".to_string(),
         cursor: 0,
+        sources: None,
+        selected_source: 0,
     };
     let debug = format!("{editor:?}");
     assert!(debug.contains("name"));
@@ -161,6 +165,8 @@ async fn vpn_import_editor_cursor_navigation_and_editing() {
         name: "work".to_string(),
         path: "/tmp/vpn.conf".to_string(),
         cursor: 4,
+        sources: None,
+        selected_source: 0,
     };
     editor.cursor = editor.name.len();
     app.vpn_import = Some(editor);
@@ -184,4 +190,36 @@ async fn vpn_import_editor_cursor_navigation_and_editing() {
         app.vpn_import.as_ref().unwrap().cursor,
         "/tmp/vpn.conf".len()
     );
+}
+
+#[tokio::test]
+async fn vpn_source_browser_selection_is_bounded_and_local_path_remains_available() {
+    let mut app = TuiApp {
+        screen: Screen::VpnImport,
+        vpn_import: Some(VpnImportEditor {
+            field: VpnImportField::Name,
+            name: String::new(),
+            path: String::new(),
+            cursor: 0,
+            sources: Some((
+                "/etc/wireguard".into(),
+                vec!["home.conf".into(), "work.conf".into()],
+            )),
+            selected_source: 0,
+        }),
+        ..Default::default()
+    };
+    let client = ApiClient::new("/nonexistent.sock");
+    for _ in 0..3 {
+        handle_vpn_import_key(&mut app, KeyCode::Down, &client).await;
+    }
+    assert_eq!(app.vpn_import.as_ref().unwrap().selected_source, 1);
+    for _ in 0..3 {
+        handle_vpn_import_key(&mut app, KeyCode::Up, &client).await;
+    }
+    assert_eq!(app.vpn_import.as_ref().unwrap().selected_source, 0);
+    handle_vpn_import_key(&mut app, KeyCode::Char('p'), &client).await;
+    assert!(app.vpn_import.as_ref().unwrap().sources.is_none());
+    handle_vpn_import_key(&mut app, KeyCode::Char('a'), &client).await;
+    assert_eq!(app.vpn_import.as_ref().unwrap().name, "a");
 }

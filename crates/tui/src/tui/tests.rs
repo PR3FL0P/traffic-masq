@@ -187,6 +187,8 @@ async fn tab_focus_and_modified_keys_are_consistent() {
         name: String::new(),
         path: String::new(),
         cursor: 0,
+        sources: None,
+        selected_source: 0,
     });
     handle_key_event(
         &mut app,
@@ -1068,6 +1070,8 @@ async fn control_shortcuts_preserve_text_and_modal_focus() {
             name: "draft".into(),
             path: String::new(),
             cursor: 5,
+            sources: None,
+            selected_source: 0,
         }),
         ..Default::default()
     };
