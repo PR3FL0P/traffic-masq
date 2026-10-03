@@ -392,31 +392,26 @@ async fn pending_crash_state_is_not_adopted_but_cleanup_state_recovers() {
 }
 
 #[tokio::test]
-async fn mac_mismatch_prevents_adopt_and_cleanup() {
-    for changed_index in [false, true] {
-        let network = FakeNetwork::new();
-        let (_dir, store, applier) = fixture(network.clone());
-        let mut record = lease();
-        record.state = DhcpClientLeaseState::Bound;
-        store.save(&record).unwrap();
-        *network.mac.lock().unwrap() = vec![9; 6];
-        if changed_index {
-            *network.index.lock().unwrap() = 9;
-        }
-        assert!(matches!(
-            applier.adopt("eth0", 1).await,
-            Err(OwnershipError::Conflict(
-                OwnershipConflict::InterfaceIdentity { .. }
-            ))
-        ));
-        assert!(matches!(
-            applier.cleanup("eth0").await,
-            Err(OwnershipError::Conflict(
-                OwnershipConflict::InterfaceIdentity { .. }
-            ))
-        ));
-        assert!(store.load("eth0").unwrap().is_some());
-    }
+async fn mac_mismatch_on_a_present_index_prevents_adopt_and_cleanup() {
+    let network = FakeNetwork::new();
+    let (_dir, store, applier) = fixture(network.clone());
+    let mut record = lease();
+    record.state = DhcpClientLeaseState::Bound;
+    store.save(&record).unwrap();
+    *network.mac.lock().unwrap() = vec![9; 6];
+    assert!(matches!(
+        applier.adopt("eth0", 1).await,
+        Err(OwnershipError::Conflict(
+            OwnershipConflict::InterfaceIdentity { .. }
+        ))
+    ));
+    assert!(matches!(
+        applier.cleanup("eth0").await,
+        Err(OwnershipError::Conflict(
+            OwnershipConflict::InterfaceIdentity { .. }
+        ))
+    ));
+    assert!(store.load("eth0").unwrap().is_some());
 }
 
 #[tokio::test]
@@ -451,47 +446,58 @@ async fn missing_interface_cleanup_removes_record_cleanly() {
 
 #[tokio::test]
 async fn replaced_interface_retires_journal_without_touching_replacement_state() {
-    for operation in ["adopt", "cleanup", "suspend"] {
-        let network = FakeNetwork::new();
-        let (_dir, store, applier) = fixture(network.clone());
-        store.save(&lease()).unwrap();
-        *network.index.lock().unwrap() = 9;
-        let address = Ipv4AddressInfo {
-            interface_index: 9,
-            address: lease().address,
-            prefix_len: 24,
-            protocol: Some(TRAFFIC_MASQ_DHCP_ADDRESS_PROTOCOL),
-        };
-        network.addresses.lock().unwrap().push(address.clone());
-        match operation {
-            "adopt" => assert!(applier.adopt("eth0", 1).await.unwrap().is_none()),
-            "suspend" => assert!(applier.suspend("eth0", 1).await.unwrap().is_none()),
-            _ => applier.cleanup("eth0").await.unwrap(),
+    for changed_mac in [false, true] {
+        for operation in ["adopt", "cleanup", "suspend"] {
+            let network = FakeNetwork::new();
+            let (_dir, store, applier) = fixture(network.clone());
+            store.save(&lease()).unwrap();
+            *network.index.lock().unwrap() = 9;
+            if changed_mac {
+                *network.mac.lock().unwrap() = vec![2, 0, 0, 0, 0, 9];
+            }
+            let address = Ipv4AddressInfo {
+                interface_index: 9,
+                address: lease().address,
+                prefix_len: 24,
+                protocol: Some(TRAFFIC_MASQ_DHCP_ADDRESS_PROTOCOL),
+            };
+            network.addresses.lock().unwrap().push(address.clone());
+            match operation {
+                "adopt" => assert!(applier.adopt("eth0", 1).await.unwrap().is_none()),
+                "suspend" => assert!(applier.suspend("eth0", 1).await.unwrap().is_none()),
+                _ => applier.cleanup("eth0").await.unwrap(),
+            }
+            assert!(store.load("eth0").unwrap().is_none());
+            assert_eq!(*network.addresses.lock().unwrap(), vec![address]);
+            // A retired record is not proof of ownership on the new interface.
+            let mut fresh = lease();
+            fresh.interface_index = 9;
+            fresh.hardware_address = network.mac.lock().unwrap().clone();
+            fresh.owned_routes[0].output_interface_index = Some(9);
+            assert!(matches!(
+                applier.apply(fresh).await,
+                Err(OwnershipError::Conflict(
+                    OwnershipConflict::ForeignAddress { .. }
+                ))
+            ));
         }
-        assert!(store.load("eth0").unwrap().is_none());
-        assert_eq!(*network.addresses.lock().unwrap(), vec![address]);
-        // A retired record is not proof of ownership on the new interface.
-        let mut fresh = lease();
-        fresh.interface_index = 9;
-        fresh.owned_routes[0].output_interface_index = Some(9);
-        assert!(matches!(
-            applier.apply(fresh).await,
-            Err(OwnershipError::Conflict(
-                OwnershipConflict::ForeignAddress { .. }
-            ))
-        ));
     }
 }
 
 #[tokio::test]
 async fn replaced_interface_with_observed_old_state_keeps_journal() {
-    let network = FakeNetwork::new();
-    let (_dir, store, applier) = fixture(network.clone());
-    applier.apply(lease()).await.unwrap();
-    *network.index.lock().unwrap() = 9;
-    assert!(applier.cleanup("eth0").await.is_err());
-    assert!(store.load("eth0").unwrap().is_some());
-    assert_eq!(network.routes.lock().unwrap().len(), 1);
+    for changed_mac in [false, true] {
+        let network = FakeNetwork::new();
+        let (_dir, store, applier) = fixture(network.clone());
+        applier.apply(lease()).await.unwrap();
+        *network.index.lock().unwrap() = 9;
+        if changed_mac {
+            *network.mac.lock().unwrap() = vec![9; 6];
+        }
+        assert!(applier.cleanup("eth0").await.is_err());
+        assert!(store.load("eth0").unwrap().is_some());
+        assert_eq!(network.routes.lock().unwrap().len(), 1);
+    }
 }
 
 #[tokio::test]

@@ -325,16 +325,25 @@ impl DhcpClientOwnershipApplier {
             // the journal for explicit recovery rather than orphaning its state.
             return Ok(false);
         }
-        let hardware = self
-            .network
-            .hardware_address(&lease.interface)
-            .await
-            .map_err(OwnershipError::Network)?;
-        if hardware != lease.hardware_address {
-            return Ok(false);
-        }
         // Do not discard evidence if a provider still reports exact old state.
         self.verify_absent(lease).await?;
+        let confirmed = self
+            .network
+            .list_interfaces()
+            .await
+            .map_err(OwnershipError::Network)?;
+        if confirmed
+            .iter()
+            .any(|item| item.index == lease.interface_index)
+            || !confirmed
+                .iter()
+                .any(|item| item.name == lease.interface && item.index == current.index)
+        {
+            return Err(OwnershipError::CleanupNeeded(
+                "interface observation changed while retiring DHCP ownership; proof retained"
+                    .into(),
+            ));
+        }
         self.store.remove(&lease.interface)?;
         tracing::info!(interface = %lease.interface, previous_index = lease.interface_index,
             current_index = current.index, "retired DHCP ownership for a vanished interface; fresh acquisition required");
