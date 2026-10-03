@@ -1547,7 +1547,7 @@ async fn explicit_file_on_role_switch_cannot_be_shadowed_by_stale_target_secret(
 }
 
 #[tokio::test]
-async fn stopped_interface_recovery_exposes_token_after_restart_and_requires_manual_retry() {
+async fn stopped_interface_recovery_is_rechecked_and_completed_on_restart() {
     let directory = tempdir().unwrap();
     let desired = desired_state(directory.path()).await;
     let provider = fake_network();
@@ -1580,16 +1580,8 @@ async fn stopped_interface_recovery_exposes_token_after_restart_and_requires_man
     )
     .await
     .unwrap();
-    assert!(recovery_control::stopped(&path));
+    assert!(!recovery_control::stopped(&path));
     let restarted = NetworkTransactionManager::new(interfaces, Duration::from_secs(3600), desired);
-    let pending = restarted.pending().await;
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].phase, NetworkChangePhase::RecoveryRequired);
-    assert!(!pending[0].can_commit());
-    assert!(pending[0].can_rollback());
-    assert!(restarted.rollback_all_pending().await.is_err());
-    assert!(path.exists());
-    restarted.rollback("stopped-token").await.unwrap();
     assert!(!path.exists());
     assert!(restarted.pending().await.is_empty());
     assert!(crate::core::recovery::check_scope(directory.path(), Some("test0")).is_ok());

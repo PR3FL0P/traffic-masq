@@ -393,6 +393,8 @@ impl DhcpRuntimeReconciler for FakeDhcpReconciler {
 
 #[derive(Debug, Default)]
 struct FakeDhcpClientReconciler {
+    reject_readiness: bool,
+    readiness_checks: Mutex<usize>,
     specs: Mutex<HashMap<String, DhcpClientSpec>>,
     reconcile_calls: Mutex<Vec<DhcpClientSpec>>,
     readiness: Mutex<Vec<(String, bool)>>,
@@ -402,6 +404,11 @@ struct FakeDhcpClientReconciler {
 
 #[async_trait]
 impl DhcpClientRuntimeReconciler for FakeDhcpClientReconciler {
+    async fn verify_ready(&self, _interface: &str) -> Result<()> {
+        *self.readiness_checks.lock().await += 1;
+        anyhow::ensure!(!self.reject_readiness, "DHCP server unavailable");
+        Ok(())
+    }
     async fn specs(&self) -> Vec<DhcpClientSpec> {
         self.specs.lock().await.values().cloned().collect()
     }
@@ -2105,7 +2112,7 @@ async fn sharing_repair_defers_before_mutations_and_resumes_after_replug() {
 }
 
 #[tokio::test]
-async fn runtime_retries_startup_recovery_after_replug_without_replaying_live_journals() {
+async fn startup_cancels_removed_device_transaction_without_replaying_it_after_replug() {
     let directory = tempdir().unwrap();
     let mut config = AppConfig::default();
     config.runtime.state_dir = directory.path().to_path_buf();
@@ -2160,7 +2167,7 @@ async fn runtime_retries_startup_recovery_after_replug_without_replaying_live_jo
     )
     .await
     .unwrap();
-    assert!(crate::core::recovery::check_scope(directory.path(), Some("eth0")).is_err());
+    assert!(crate::core::recovery::check_scope(directory.path(), Some("eth0")).is_ok());
     // This appeared after startup and belongs to a live transaction. A retry
     // must neither parse it nor retire it, even while another interface recovers.
     store.write("live0", b"live transaction journal").unwrap();
@@ -2183,18 +2190,17 @@ async fn runtime_retries_startup_recovery_after_replug_without_replaying_live_jo
         .await
         .unwrap();
         assert_eq!(failures.is_empty(), present, "{failures:?}");
-        assert_eq!(
-            crate::core::recovery::check_scope(directory.path(), Some("eth0")).is_ok(),
-            present
-        );
-        assert_eq!(store.read("eth0").unwrap().is_none(), present);
+        assert!(crate::core::recovery::check_scope(directory.path(), Some("eth0")).is_ok());
+        assert!(store.read("eth0").unwrap().is_none());
         assert_eq!(
             store.read("live0").unwrap().unwrap(),
             b"live transaction journal"
         );
         assert!(crate::core::recovery::check_scope(directory.path(), Some("live0")).is_ok());
     }
-    assert!(network.list_interfaces().await.unwrap()[0].is_up);
+    // A returned device follows committed unmanaged policy, not a retired
+    // snapshot belonging to an earlier incarnation of the link.
+    assert!(!network.list_interfaces().await.unwrap()[0].is_up);
 }
 
 #[test]
@@ -2307,4 +2313,126 @@ async fn liveness_does_not_replay_dhcp_association_from_withdrawn_desired_policy
     )
     .await;
     assert!(client.readiness.lock().await.is_empty());
+}
+
+async fn rollback_without_external_connectivity(device_present: bool) {
+    use crate::core::transaction::{InterfaceChange, NetworkTransactionManager};
+    let directory = tempdir().unwrap();
+    let mut config = AppConfig::default();
+    config.runtime.state_dir = directory.path().to_path_buf();
+    let previous = InterfaceConfig {
+        role: InterfaceRole::Input,
+        managed: true,
+        ipv4: None,
+        dhcp: None,
+        dhcp_client: Some(Default::default()),
+        wifi: None,
+        wifi_client: Some(crate::config::WifiClientConfig {
+            ssid: "unavailable-network".into(),
+            country_code: None,
+            security: crate::config::WifiClientSecurity::Open,
+            passphrase_file: None,
+        }),
+        nat: false,
+    };
+    config
+        .network
+        .interfaces
+        .insert("wan0".into(), previous.clone());
+    let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+        .await
+        .unwrap();
+    let desired = DesiredNetworkState::new(config, overrides);
+    let network = Arc::new(FakeNetworkProvider::default());
+    network
+        .add_interface_with_state("wan0", 7, true, Vec::new())
+        .await;
+    let journal = AddressOwnershipJournal::in_memory();
+    let manager = NetworkTransactionManager::new(
+        crate::core::interface::InterfaceManager::new(network.clone(), journal.clone()),
+        Duration::from_secs(3600),
+        desired.clone(),
+    );
+    let mut candidate = previous.clone();
+    candidate.dhcp_client = None;
+    candidate.wifi_client = None;
+    let pending = manager
+        .apply(
+            "wan0",
+            InterfaceChange {
+                config: &candidate,
+                previous: Some(&previous),
+                current_role: Some(previous.role),
+                allow_management_change: true,
+                passphrase: crate::wifi::WifiPassphraseUpdate::Keep,
+            },
+        )
+        .await
+        .unwrap();
+    if !device_present {
+        network.interfaces.lock().await.remove("wan0");
+        network.addresses.lock().await.remove("wan0");
+    }
+    desired.attach_converger();
+    let dhcp = Arc::new(FakeDhcpReconciler::default());
+    let wifi = Arc::new(FakeWifiReconciler::default()); // no association
+    let client = Arc::new(FakeDhcpClientReconciler {
+        reject_readiness: true,
+        ..Default::default()
+    });
+    let worker = {
+        let desired = desired.clone();
+        let network = network.clone();
+        let dhcp = dhcp.clone();
+        let wifi = wifi.clone();
+        let client = client.clone();
+        tokio::spawn(async move {
+            loop {
+                desired.changed().await;
+                let version = desired.version();
+                let result = reconcile_network_runtime_once(
+                    &desired,
+                    &journal,
+                    network.clone(),
+                    dhcp.as_ref(),
+                    None::<&FakeWifiReconciler>,
+                    Some(wifi.as_ref()),
+                    Some(client.as_ref()),
+                )
+                .await;
+                desired.report_result(version, result);
+            }
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(1), manager.rollback(&pending.token))
+        .await
+        .expect("rollback must not wait for Wi-Fi association or DHCP lease")
+        .expect("configuration cancellation succeeds without external connectivity");
+    assert!(manager.pending().await.is_empty());
+    assert!(!desired.is_tentative("wan0").await);
+    assert!(!directory
+        .path()
+        .join("interface-transactions/wan0.json")
+        .exists());
+    assert_eq!(*client.readiness_checks.lock().await, 0);
+    if !device_present {
+        let calls = client.disable_calls.lock().await;
+        assert!(!calls.is_empty());
+        assert!(calls.iter().all(|name| name == "wan0"));
+    }
+    assert_eq!(
+        desired.committed_interface("wan0").await.unwrap(),
+        Some(previous)
+    );
+    worker.abort();
+}
+
+#[tokio::test]
+async fn rollback_completes_without_wifi_association_or_dhcp_lease() {
+    rollback_without_external_connectivity(true).await;
+}
+
+#[tokio::test]
+async fn rollback_completes_after_device_removal_and_releases_the_interface() {
+    rollback_without_external_connectivity(false).await;
 }

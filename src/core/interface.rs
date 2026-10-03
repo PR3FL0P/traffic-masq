@@ -768,6 +768,24 @@ impl InterfaceManager {
     }
 
     /// Restore captured link/address state while respecting current ownership and external addresses.
+    /// A canceled interface transaction has no kernel snapshot to restore
+    /// after its device disappears. Runtime consumers are stopped by the caller.
+    /// General router/subsystem rollback retains its stricter failure semantics.
+    pub async fn rollback_transaction_snapshot(&self, snapshot: &InterfaceSnapshot) -> Result<()> {
+        if !self
+            .provider
+            .list_interfaces()
+            .await?
+            .iter()
+            .any(|link| link.name == snapshot.name)
+        {
+            tracing::info!(interface = %snapshot.name,
+                "rollback snapshot has no surviving kernel link; saved configuration will handle a later device return");
+            return Ok(());
+        }
+        self.rollback(snapshot).await
+    }
+
     pub async fn rollback(&self, snapshot: &InterfaceSnapshot) -> Result<()> {
         let _mutation = self.mutation_locks.lock(&snapshot.name).await;
         let current = self.provider.list_ipv4_addresses(&snapshot.name).await?;

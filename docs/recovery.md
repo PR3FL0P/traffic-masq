@@ -489,10 +489,12 @@ Interface and router recovery share a bounded cycle: at most **three attempts**,
 **60 seconds per attempt**, and **180 seconds for the whole cycle**, including
 retry delays. The confirmation window before rollback remains separate. Recovery
 caused by a failed apply starts its retries without waiting for another full
-confirmation window. Startup interface retries also consume the same persisted
-cycle; restarting the daemon does not reset the attempt count or renew its
-remaining budget. A monotonic deadline additionally prevents wall-clock changes
-from extending a running cycle.
+confirmation window. Background retries consume the same persisted cycle.
+A new daemon startup rechecks interface snapshots in a new bounded recovery
+session, including previously stopped attempts; it validates the journal and
+ownership again before changing resources. Router recovery retains its explicit
+retry policy. A monotonic deadline prevents wall-clock changes from extending a
+running cycle.
 
 Failures are classified by error types and kernel error codes, not message text:
 
@@ -506,8 +508,15 @@ Failures are classified by error types and kernel error codes, not message text:
 | `commit_indeterminate` | Preserve the existing commit fence; repair storage and restart. |
 | `unknown` | Retry only within the bounded cycle; do not assume the operation had no effect. |
 
-A missing adapter cannot leave automatic recovery waiting indefinitely. After the
-budget or attempt limit is exhausted, the interface phase/router status becomes
+Interface cancellation restores configuration without requiring Wi-Fi association
+or a DHCP lease. Those are connectivity conditions, not completion conditions for
+rollback. When its adapter is absent, cancellation stops surviving owned service
+tasks and leases; there is no vanished link state to replay. Once cleanup succeeds,
+the pending transaction and its journal are retired. A returned adapter follows
+committed configuration, which remains editable while the device is absent.
+
+If actual restoration or ownership/storage cleanup fails, after the
+budget or attempt limit is exhausted the interface phase/router status becomes
 `recovery_required`. A later device event does **not** resume the stopped cycle.
 Inspect the current network, correct the cause, and explicitly retry rollback.
 The retry starts a new cycle only after the previous cycle has stopped; repeated
@@ -523,8 +532,9 @@ keeps the existing explicit rollback action available.
 The immutable snapshot journal is accompanied by a private
 `<journal>.recovery-control` record bound to its exact SHA-256 digest. This record
 is written before runtime mutations, including application before a confirmation
-timer exists. An interrupted apply/rollback requires explicit recovery after
-restart. Stopped control records fence background reconciliation and process
+timer exists. Startup rechecks interrupted interface recovery in a fresh bounded
+session; interrupted router recovery retains its explicit retry requirement.
+Stopped control records fence background reconciliation and process
 restarts, and shutdown preserves unresolved owned state instead of replaying
 baselines. Startup does not independently restore router provisioning secrets
 before the router recovery decision. Failed credential restoration prevents its

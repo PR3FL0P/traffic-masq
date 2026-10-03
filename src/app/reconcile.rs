@@ -404,7 +404,11 @@ pub(super) async fn reconcile_network_runtime_once<
     for (name, config) in &effective.network.interfaces {
         let result: Result<()> = async {
             crate::core::recovery::check_scope(&effective.runtime.state_dir, Some(name))?;
-            let strict = desired.is_tentative(name).await || restorations.contains_key(name);
+            // Applying a candidate requires connectivity before confirmation.
+            // Canceling it restores configuration, not the availability of an
+            // external Wi-Fi network or DHCP server.
+            let restoring = restorations.contains_key(name);
+            let strict = desired.is_tentative(name).await && !restoring;
             let desired_dhcp = DhcpServiceSpec::from_interface_config(
                 name,
                 config,
@@ -418,6 +422,32 @@ pub(super) async fn reconcile_network_runtime_once<
                     plan_dhcp_reconcile(desired_dhcp, current_dhcp, false, false, false),
                 )
                 .await?;
+                if restoring {
+                    // The vanished link has no kernel address state to replay.
+                    // Stop surviving owned service tasks and leases before
+                    // completing cancellation; committed intent can be edited
+                    // or applied normally if the device returns later.
+                    let disabled = InterfaceConfig {
+                        managed: false,
+                        ipv4: None,
+                        dhcp: None,
+                        dhcp_client: None,
+                        wifi: None,
+                        wifi_client: None,
+                        nat: false,
+                        role: config.role,
+                    };
+                    if let Some(client) = dhcp_client {
+                        client.disable(name).await?;
+                    }
+                    if let Some(client) = wifi_client {
+                        client.reconcile_interface(name, &disabled).await?;
+                    }
+                    if let Some(access_point) = wifi {
+                        access_point.reconcile_interface(name, &disabled).await?;
+                    }
+                    return Ok(());
+                }
                 let desired_ipv4 = config
                     .ipv4
                     .as_ref()
@@ -484,7 +514,9 @@ pub(super) async fn reconcile_network_runtime_once<
             }
 
             if let Some(snapshot) = restorations.get(name) {
-                interface_manager.rollback(snapshot).await?;
+                interface_manager
+                    .rollback_transaction_snapshot(snapshot)
+                    .await?;
             } else {
                 let current_addresses = network.list_ipv4_addresses(name).await?;
                 let needs_apply = if config.managed {

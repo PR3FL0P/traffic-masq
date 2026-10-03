@@ -557,7 +557,11 @@ the machine to the requested state and starts a timer, 60 seconds by default.
 Committing within that window keeps the change. Expiry schedules rollback to the
 previous committed configuration; rollback waits for already admitted operations
 and may need retries. An already admitted confirmation can finish after the
-displayed expiry. Inspect pending state to learn the outcome.
+displayed expiry. Interface rollback restores configuration and owned resources;
+it does not wait for a Wi-Fi association or DHCP lease. A removed adapter does
+not keep its transaction pending once surviving owned services and leases have
+been cleaned up. Connectivity can remain unavailable after successful rollback.
+Inspect pending state to learn the outcome.
 
 Standalone DHCP and VPN controls plus Wi-Fi runtime controls such as
 reconnect/reload/passphrase updates take effect immediately and do not have an
