@@ -104,6 +104,11 @@ const ARP_PROBE_MIN: Duration = Duration::from_secs(1);
 const ARP_PROBE_MAX: Duration = Duration::from_secs(2);
 const ARP_ANNOUNCE_WAIT: Duration = Duration::from_secs(2);
 
+/// Longest conflict-free probe schedule, excluding I/O and scheduler latency.
+pub(crate) const ARP_PROBE_DURATION_MAX: Duration = ARP_PROBE_WAIT_MAX
+    .saturating_add(ARP_PROBE_MAX.saturating_mul((ARP_PROBE_COUNT - 1) as u32))
+    .saturating_add(ARP_ANNOUNCE_WAIT);
+
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy)]
 pub struct LinuxArpDad {

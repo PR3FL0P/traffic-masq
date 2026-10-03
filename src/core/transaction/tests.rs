@@ -23,8 +23,12 @@ fn wifi_runtime_dirs() -> WifiRuntimeDirs {
 }
 
 #[test]
-fn convergence_deadline_exceeds_wifi_startup_budget() {
-    assert!(CONVERGENCE_DEADLINE > crate::wifi::lifecycle::STARTUP_READY_TIMEOUT);
+fn convergence_deadline_exceeds_sequential_wifi_and_dhcp_startup_budgets() {
+    assert!(
+        CONVERGENCE_DEADLINE
+            > crate::wifi::lifecycle::STARTUP_READY_TIMEOUT
+                + crate::dhcp::client::supervisor::LEASE_READY_TIMEOUT
+    );
 }
 
 #[derive(Debug)]

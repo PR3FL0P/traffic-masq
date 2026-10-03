@@ -35,6 +35,12 @@ const BACKOFF_CEILING: Duration = Duration::from_secs(120);
 
 const TASK_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
+// Retain the acquisition budget, allow the complete mandatory ARP schedule,
+// and leave time for kernel application, durable storage and scheduling.
+pub(crate) const LEASE_READY_TIMEOUT: Duration = Duration::from_secs(5)
+    .saturating_add(crate::dhcp::client::runtime::ARP_PROBE_DURATION_MAX)
+    .saturating_add(Duration::from_secs(5));
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DhcpClientSpec {
     pub interface: String,
@@ -525,7 +531,7 @@ impl DhcpClientSupervisor {
 
     /// Wait for a lease and verify its owned kernel resources before strict convergence succeeds.
     pub(crate) async fn wait_until_ready(&self, interface: &str) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + LEASE_READY_TIMEOUT;
         loop {
             let status = self
                 .status(interface)
@@ -538,9 +544,10 @@ impl DhcpClientSupervisor {
                 bail!("DHCP client on {interface} is degraded: {reason}");
             }
             if Instant::now() >= deadline {
-                tracing::warn!(%interface, state = ?status.state, timeout_seconds = 5, "DHCP readiness timed out without a lease; inspect DHCP packet and address-probe events");
+                tracing::warn!(%interface, state = ?status.state, timeout_seconds = LEASE_READY_TIMEOUT.as_secs(), "DHCP readiness timed out without a lease; inspect DHCP packet and address-probe events");
                 bail!(
-                    "DHCP lease is not ready on {interface} after 5 seconds (state: {:?})",
+                    "DHCP lease is not ready on {interface} after {} seconds (state: {:?})",
+                    LEASE_READY_TIMEOUT.as_secs(),
                     status.state
                 );
             }

@@ -29,10 +29,11 @@ pub use traffic_masq_protocol::{NetworkChangePhase, PendingNetworkChange};
 /// changed. It exists so that a converger which has stopped — a bug, or a
 /// daemon on its way down — turns into an error the operator can see instead of
 /// a request that never answers.
-// A convergence pass may legitimately spend up to 15s waiting for hostapd
-// readiness. Leave headroom so the transaction layer never times out a
-// subsystem that is still within its own documented startup budget.
-const CONVERGENCE_DEADLINE: Duration = Duration::from_secs(20);
+// Wi-Fi association and DHCP readiness run sequentially. Cover both startup
+// budgets and leave headroom for the other convergence work.
+const CONVERGENCE_DEADLINE: Duration = crate::wifi::lifecycle::STARTUP_READY_TIMEOUT
+    .saturating_add(crate::dhcp::client::supervisor::LEASE_READY_TIMEOUT)
+    .saturating_add(Duration::from_secs(5));
 
 #[derive(Deserialize)]
 struct InterfaceJournalHeader {

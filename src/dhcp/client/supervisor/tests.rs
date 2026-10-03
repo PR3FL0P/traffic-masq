@@ -479,6 +479,62 @@ async fn an_acquired_lease_is_applied_persisted_and_reported() {
         .is_none());
 }
 
+#[tokio::test(start_paused = true)]
+async fn readiness_allows_acquisition_and_the_full_arp_probe_schedule() {
+    let state_dir = TempDir::new().expect("state dir");
+    let network = FakeNetwork::present(7).await;
+    let launcher = Arc::new(FakeLauncher::default());
+    let supervisor = supervisor_with(&state_dir, network, launcher.clone()).await;
+    let mut sink = launcher.take_sink();
+    let acquisition = async {
+        tokio::time::sleep(
+            Duration::from_secs(5) + crate::dhcp::client::runtime::ARP_PROBE_DURATION_MAX,
+        )
+        .await;
+        sink.lease_acquired(lease(Ipv4Addr::new(192, 0, 2, 42)))
+            .await
+            .expect("lease applied");
+    };
+    let (ready, ()) = tokio::join!(supervisor.wait_until_ready("wan0"), acquisition);
+    ready.expect("readiness includes acquisition, ARP and kernel application");
+    supervisor.shutdown(ShutdownPolicy::RestoreInterfaces).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn readiness_without_a_lease_remains_bounded() {
+    let state_dir = TempDir::new().expect("state dir");
+    let network = FakeNetwork::present(7).await;
+    let launcher = Arc::new(FakeLauncher::default());
+    let supervisor = supervisor_with(&state_dir, network, launcher).await;
+    let started = Instant::now();
+    let error = supervisor
+        .wait_until_ready("wan0")
+        .await
+        .expect_err("no lease");
+    assert!(error.to_string().contains("DHCP lease is not ready"));
+    assert!(started.elapsed() >= LEASE_READY_TIMEOUT);
+    assert!(started.elapsed() < LEASE_READY_TIMEOUT + Duration::from_secs(1));
+    supervisor.shutdown(ShutdownPolicy::RestoreInterfaces).await;
+}
+
+#[tokio::test]
+async fn readiness_rejects_a_lease_with_missing_owned_kernel_resources() {
+    let state_dir = TempDir::new().expect("state dir");
+    let network = FakeNetwork::present(7).await;
+    let launcher = Arc::new(FakeLauncher::default());
+    let supervisor = supervisor_with(&state_dir, network.clone(), launcher.clone()).await;
+    launcher
+        .take_sink()
+        .lease_acquired(lease(Ipv4Addr::new(192, 0, 2, 42)))
+        .await
+        .expect("lease applied");
+    network.addresses.lock().await.clear();
+    supervisor
+        .wait_until_ready("wan0")
+        .await
+        .expect_err("kernel address missing");
+}
+
 #[tokio::test]
 async fn unresolved_persisted_ownership_cleanup_blocks_a_new_actor() {
     let state_dir = TempDir::new().expect("state dir");
