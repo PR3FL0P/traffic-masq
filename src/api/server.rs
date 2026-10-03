@@ -2027,7 +2027,9 @@ async fn serve_tls_connection(stream: TlsStream<TcpStream>, service: Router) -> 
     Ok(())
 }
 
-/// Allow active connections to finish during shutdown and abort those exceeding the drain deadline.
+/// Join connection tasks and log task failures. Cancellation comes from
+/// `until_shutdown`; HTTP serving and TLS handshake wrappers own their deadlines.
+/// This helper adds no timeout and does not abort tasks.
 async fn drain_connections(connections: &mut JoinSet<()>, listener_name: &'static str) {
     while let Some(result) = connections.join_next().await {
         if let Err(error) = result {

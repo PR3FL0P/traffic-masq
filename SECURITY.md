@@ -33,8 +33,11 @@ understood but rollback itself fails, the daemon can keep the control plane
 available in `RollbackFailed` while retaining the record for diagnosis and an
 explicit retry.
 
-State schema version 3 can read version 2 records. Older binaries cannot read
-newly saved version 3 records, so back up state before upgrading. If recovery
+`runtime-overrides.json` writes schema version 4 and reads versions 2, 3 and 4.
+Version 4 adds independent interface suppression. Binaries supporting only older
+schemas cannot read newly saved version 4 records; back up state before upgrading
+and restore compatible state before downgrading. Interface, router and secret
+journals have independent schema versions. If recovery
 fails, keep `router-transaction.json` and the state directory. Deleting them to
 get past the error also removes information needed for recovery.
 
@@ -42,8 +45,12 @@ Interface changes save snapshots too. Startup restores unconfirmed changes,
 including changes to previously unmanaged interfaces, before applying committed
 configuration.
 
-Standalone DHCP, Wi-Fi and VPN operations do not use the confirmation timer.
-Their persistent effects are protected by write-ahead ownership records: DHCP
+Wi-Fi configuration, AP/STA provisioning and profile activation, and live
+operator deactivation use commit-confirm. Editing an absent adapter instead
+saves durable intent after verified cleanup, without a confirmation timer.
+Standalone DHCP and VPN actions, Wi-Fi runtime commands, passphrase updates and
+profile-library edits apply immediately.
+Their runtime effects are protected by write-ahead ownership records: DHCP
 leases record the route policy under which they were applied, Wi-Fi daemon
 records are namespaced by process kind and written before launch, and WireGuard
 activation records a launch marker before link configuration. Startup recovery

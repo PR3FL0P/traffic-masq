@@ -142,9 +142,13 @@ state directory as `commit_indeterminate`. It preserves pending journals and
 refuses further writes and rollback until storage is repaired and the daemon is
 restarted to resolve the on-disk commit proof. It must not compensate using its
 potentially obsolete in-memory revision. Interface pending responses expose
-`phase` (`awaiting_commit`, `rollback_required`, `commit_indeterminate`) and
+`phase` (`awaiting_commit`, `rollback_required`, `recovery_required`,
+`commit_indeterminate`) and
 `last_error`. Confirmation is available only in `awaiting_commit`; rollback is
-blocked in `commit_indeterminate`.
+blocked in `commit_indeterminate`. In `recovery_required`, bounded automatic
+recovery has stopped; inspect optional `recovery_progress` and explicitly retry
+rollback. Device events can separately resume recovery; see
+[bounded automatic recovery](recovery.md#bounded-automatic-recovery).
 
 Confirmation timers schedule rollback after the configured interval; they do
 not promise that runtime restoration finishes by that time. Rollback waits for

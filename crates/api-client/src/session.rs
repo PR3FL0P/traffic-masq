@@ -184,6 +184,10 @@ impl<Response: serde::de::DeserializeOwned> ApiClient<Response> {
 
     /// Translate a control request to REST, send it, and decode the typed response.
     /// Transport, HTTP status, and response decoding failures are returned to the caller.
+    /// HTTP 200 domain errors decode successfully as `Ok(Response::*Error)`;
+    /// callers must inspect the variant. GET uses 10 seconds, mutations 65.
+    /// A lost response leaves mutation outcome unknown: inspect state before
+    /// retrying and never automatically retry such a mutation.
     pub async fn request(
         &self,
         request: &traffic_masq_protocol::ControlRequest,
@@ -280,6 +284,8 @@ fn serialize_json(value: &(impl Serialize + ?Sized)) -> Result<Vec<u8>> {
     serde_json::to_vec(value).context("failed to encode API request body")
 }
 
+/// Return 65 seconds for POST/PUT/DELETE/PATCH and 10 seconds otherwise.
+/// This bounds client waiting, not the lifetime of an admitted server operation.
 pub fn control_request_timeout(method: &Method) -> std::time::Duration {
     if method == Method::POST
         || method == Method::PUT

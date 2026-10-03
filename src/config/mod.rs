@@ -168,7 +168,8 @@ pub struct RouterConfig {
     pub vpn_chain: Vec<VpnHopConfig>,
 }
 
-/// Reject invalid forwarding port ranges, addresses, protocols, and conflicting rules.
+/// Validate interface names, distinct ingress/egress, network CIDRs without host
+/// bits, and overlapping source subnets for rules with the same interface pair.
 pub fn validate_forwarding(rules: &[ForwardingConfig]) -> Result<()> {
     traffic_masq_protocol::validate_forwarding(rules).map_err(anyhow::Error::msg)
 }
@@ -427,7 +428,8 @@ impl AppConfig {
         Ok(())
     }
 
-    /// Check configuration invariants and reject incompatible or unsafe settings before application.
+    /// Validate all configuration sections, positive timers and runtime socket/lock conflicts.
+    /// Structural checks do not establish tool availability, PHY capability or connectivity.
     pub fn validate(&self) -> Result<()> {
         self.network.validate()?;
         self.router.validate(&self.network)?;
@@ -468,7 +470,7 @@ impl AppConfig {
 }
 
 impl ApiConfig {
-    /// Check configuration invariants and reject incompatible or unsafe settings before application.
+    /// Require distinct certificate/key paths when HTTPS is enabled; does not read certificates.
     fn validate(&self) -> Result<()> {
         let Some(tcp) = &self.tcp else {
             return Ok(());
@@ -494,7 +496,7 @@ impl ApiConfig {
 }
 
 impl VpnConfig {
-    /// Check configuration invariants and reject incompatible or unsafe settings before application.
+    /// Reject overlapping import/managed profile directories and invalid VPN policy.
     fn validate(&self, router: &RouterConfig) -> Result<()> {
         let same_directory = resolve_directory_path(&self.wireguard_import_dir)?
             == resolve_directory_path(&self.wireguard_config_dir)?;
@@ -532,7 +534,7 @@ fn resolve_directory_path(path: &std::path::Path) -> Result<PathBuf> {
 }
 
 impl VpnTrafficPolicyConfig {
-    /// Check configuration invariants and reject incompatible or unsafe settings before application.
+    /// Require enabled VPN and enabled router for global VPN mode.
     fn validate(&self, vpn_enabled: bool, router: &RouterConfig) -> Result<()> {
         if self.default_mode == VpnPolicyMode::Vpn && !vpn_enabled {
             bail!("vpn.policy.default_mode = \"vpn\" requires vpn.enabled = true");
@@ -545,7 +547,7 @@ impl VpnTrafficPolicyConfig {
 }
 
 impl AuthConfig {
-    /// Check configuration invariants and reject incompatible or unsafe settings before application.
+    /// Validate positive session and Argon2/concurrency limits and idle <= absolute expiry.
     fn validate(&self) -> Result<()> {
         if self.session_idle_seconds == 0 {
             bail!("auth.session_idle_seconds must be greater than zero");
@@ -574,7 +576,7 @@ impl AuthConfig {
 }
 
 impl NetworkConfig {
-    /// Check configuration invariants and reject incompatible or unsafe settings before application.
+    /// Validate each named interface and reject overlapping managed IPv4 networks.
     pub fn validate(&self) -> Result<()> {
         for (name, interface) in &self.interfaces {
             validate_interface_name(name)?;
@@ -612,7 +614,7 @@ impl NetworkConfig {
 }
 
 impl RouterConfig {
-    /// Check configuration invariants and reject incompatible or unsafe settings before application.
+    /// Validate forwarding/uplink roles, output addressing, route consent/conflicts and VPN chain length.
     fn validate(&self, network: &NetworkConfig) -> Result<()> {
         if let Some(rules) = &self.forwarding {
             validate_forwarding(rules)?;
@@ -722,7 +724,7 @@ impl RouterConfig {
 }
 
 impl OwnedIpv4RouteConfig {
-    /// Check configuration invariants and reject incompatible or unsafe settings before application.
+    /// Validate nonzero table, network CIDR, gateway shape and non-disabled output interface; no reachability probe.
     fn validate(&self, network: &NetworkConfig, _uplink: Option<&UplinkConfig>) -> Result<()> {
         if self.table == 0 {
             bail!("IPv4 route table must not be RT_TABLE_UNSPEC (0)");
@@ -768,7 +770,7 @@ impl OwnedIpv4RouteConfig {
 }
 
 impl InterfaceConfig {
-    /// Check configuration invariants and reject incompatible or unsafe settings before application.
+    /// Validate role/management, IPv4 and role-specific DHCP/AP/STA compatibility; no device probing.
     pub fn validate(&self, name: &str) -> Result<()> {
         if self.role == InterfaceRole::Disabled && self.managed {
             bail!("disabled interface cannot be managed");
@@ -861,7 +863,7 @@ impl InterfaceConfig {
 pub const MAX_DHCP_DNS_SERVERS: usize = 63;
 
 impl DhcpInterfaceConfig {
-    /// Check configuration invariants and reject incompatible or unsafe settings before application.
+    /// Validate DHCP pool order/subnet, router identity/exclusion, DNS count and positive lease time.
     fn validate(&self, _interface_name: &str, network: Ipv4Net) -> Result<()> {
         if self.dns_servers.len() > MAX_DHCP_DNS_SERVERS {
             bail!(
@@ -910,7 +912,7 @@ impl DhcpInterfaceConfig {
 }
 
 impl WifiConfig {
-    /// Check configuration invariants and reject incompatible or unsafe settings before application.
+    /// Validate absolute AP tool/runtime paths, positive backoff and duplicate SSID/band assignments; no tool probing.
     fn validate(&self, network: &NetworkConfig) -> Result<()> {
         if self.hostapd_binary.as_os_str().is_empty() {
             bail!("wifi.hostapd_binary must not be empty");
@@ -962,7 +964,7 @@ impl WifiConfig {
 }
 
 impl WifiApConfig {
-    /// Check configuration invariants and reject incompatible or unsafe settings before application.
+    /// Validate AP SSID, country, band/channel/width, station limits and secret-file policy; no PHY probing.
     fn validate(&self, interface_name: &str) -> Result<()> {
         let ssid_bytes = self.ssid.len();
         if ssid_bytes == 0 {
@@ -1039,7 +1041,7 @@ impl WifiApConfig {
 }
 
 impl WifiClientGlobalConfig {
-    /// Check configuration invariants and reject incompatible or unsafe settings before application.
+    /// Validate absolute supplicant/runtime paths and positive backoff; does not check executables exist.
     fn validate(&self) -> Result<()> {
         if self.wpa_supplicant_binary.as_os_str().is_empty() {
             bail!("wifi_client.wpa_supplicant_binary must not be empty");
@@ -1067,7 +1069,7 @@ impl WifiClientGlobalConfig {
 }
 
 impl WifiClientConfig {
-    /// Check configuration invariants and reject incompatible or unsafe settings before application.
+    /// Validate STA SSID/country and secret-file/security policy; does not inspect the radio or connect.
     fn validate(&self, interface_name: &str) -> Result<()> {
         let ssid_bytes = self.ssid.len();
         if ssid_bytes == 0 {

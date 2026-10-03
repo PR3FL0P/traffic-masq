@@ -158,6 +158,13 @@ Body names in the tables refer to the [request schemas](#request-schemas).
 
 | Method | Path | Body | Result or purpose | Access |
 | --- | --- | --- | --- | --- |
+| `GET` | `/interface-inventory` | — | `interface_inventory`: saved intent, revision and observed presence | Authenticated |
+| `GET` | `/wifi-inventory` | — | `wifi_inventory`: interface inventory plus AP/STA runtime availability | Authenticated |
+| `PUT` | `/interfaces/{interface}/intent` | `InterfaceIntentWrite` | Save missing-device intent; `interface_intent_saved` | Administrator |
+| `POST` | `/interfaces/{interface}/intent/forget` | `IntentRevision` | Remove intent and suppress base configuration | Administrator |
+| `POST` | `/interfaces/{interface}/intent/reset` | `IntentRevision` | Clear override/suppression and restore base configuration | Administrator |
+| `PUT` | `/interfaces/{interface}/wifi-intent` | `WifiIntentWrite` | Save missing-device Wi-Fi settings/optional secret | Administrator |
+| `PUT` | `/interfaces/{interface}/wifi-client-intent` | `WifiClientIntentWrite` | Save library client profile and IPv4 policy for a missing device | Administrator |
 | `GET` | `/interfaces` | — | Observed interfaces, addresses, ownership and default-route flags | Authenticated |
 | `GET` | `/interfaces/{interface}/config` | — | Effective interface configuration | Authenticated |
 | `POST` | `/interfaces/{interface}/plan` | `InterfaceChange` | Plan a complete replacement | Authenticated |
@@ -278,7 +285,7 @@ endpoints. Use the endpoint corresponding to the apply response.
 | `GET` | `/wifi` | — | AP runtime status | Authenticated |
 | `GET` | `/wifi/{interface}` | — | AP specification | Authenticated |
 | `PUT` | `/wifi/{interface}` | `WifiEdit` | Tentatively configure AP; secret is separate | Administrator |
-| `DELETE` | `/wifi/{interface}` | — | Tentatively disable AP; commit or rollback required | Administrator |
+| `DELETE` | `/wifi/{interface}` | — | Present adapter: pending change; absent saved AP: intent saved after cleanup | Administrator |
 | `PUT` | `/wifi/{interface}/passphrase` | `{ "passphrase": string }` | Store AP passphrase | Administrator |
 | `POST` | `/wifi/{interface}/provision` | `WifiApProvision` | Tentatively apply AP, secret and optional DHCP | Administrator |
 | `GET` | `/wifi/{interface}/stations` | — | Associated stations | Authenticated |
@@ -301,7 +308,7 @@ transition.
 | `GET` | `/wifi-client` | — | Wi-Fi client runtime status | Authenticated |
 | `GET` | `/wifi-client/{interface}` | — | Client specification | Authenticated |
 | `PUT` | `/wifi-client/{interface}` | `WifiClientEdit` | Tentatively configure association; secret is separate | Administrator |
-| `DELETE` | `/wifi-client/{interface}` | — | Tentatively disable client; commit or rollback required | Administrator |
+| `DELETE` | `/wifi-client/{interface}` | — | Present adapter: pending change; absent saved client: intent saved after cleanup | Administrator |
 | `PUT` | `/wifi-client/{interface}/passphrase` | `{ "passphrase": string }` | Store client passphrase | Administrator |
 | `POST` | `/wifi-client/{interface}/reconnect` | — | Request reconnection | Administrator |
 | `POST` | `/wifi-client/{interface}/scan` | — | Scan and return networks | Administrator |
@@ -312,7 +319,7 @@ transition.
 | `DELETE` | `/wifi-client/profiles/{id}` | — | Delete an inactive profile | Administrator |
 | `PUT` | `/wifi-client/{interface}/provision` | `WifiClientProvision` | Tentatively apply profile plus IPv4 policy | Administrator |
 | `PUT` | `/wifi-client/{interface}/active-profile` | `{ "profile_id": string }` | Tentatively activate a saved profile | Administrator |
-| `DELETE` | `/wifi-client/{interface}/active-profile` | — | Tentatively deactivate the current profile; commit or rollback required | Administrator |
+| `DELETE` | `/wifi-client/{interface}/active-profile` | — | Deactivate current profile; present: pending change, absent: intent saved after cleanup | Administrator |
 
 ## Request schemas
 
@@ -475,10 +482,14 @@ selection where supported.
   "passphrase": "replace-with-a-secret",
   "clear_passphrase": false,
   "configure_dhcp": true,
-  "subnet": "192.168.50.0/24",
+  "subnet": "192.168.50.1/24",
   "disable_dhcp": false
 }
 ```
+
+`subnet` here is the interface host CIDR, such as `192.168.50.1/24`,
+not the network address. DHCP uses that host as the router. In contrast,
+`forwarding.source_subnet` requires a network CIDR such as `192.168.50.0/24`.
 
 `WifiApProfileWrite` adds an `id` beside these fields; the provisioning fields
 are flattened rather than nested under `configuration`:
@@ -491,7 +502,7 @@ are flattened rather than nested under `configuration`:
     "client_isolation": true, "max_stations": 16 },
   "passphrase": "replace-with-a-secret",
   "configure_dhcp": true,
-  "subnet": "192.168.60.0/24"
+  "subnet": "192.168.60.1/24"
 }
 ```
 
@@ -561,6 +572,70 @@ optional `uplink_passphrase` and `output_passphrase`. Downstream overrides may
 specify `interface_ipv4`, `pool_start`, `pool_end`, `dns_servers`, and
 `lease_seconds`; omitted values are derived by the daemon.
 
+## Offline intent and inventory
+
+`InterfaceIntentWrite` wraps the `InterfaceChange.config` object:
+
+```json
+{
+  "config": { "role": "input", "managed": true, "ipv4": null },
+  "allow_management_change": false,
+  "expected_revision": 12
+}
+```
+
+`IntentRevision` is `{ "expected_revision": 12 }`. `WifiIntentWrite` is
+`{ "config": <InterfaceChange.config>, "expected_revision": 12,
+"passphrase": <optional string> }`. It must preserve the effective role and
+management policy; assign these through the interface intent endpoint first.
+A supplied passphrase requires exactly one secured AP or STA configuration.
+`WifiClientIntentWrite` is `{ "settings": <WifiClientProvision>,
+"expected_revision": 12 }`; it requires an existing managed input intent and a
+valid library profile, and applies its `ip_policy` without connecting.
+
+All five writes require a fresh successful observation that the device is
+absent. Present devices must use live confirmed transactions. The daemon checks
+`expected_revision`, validates the candidate, cleans up owned runtime, observes
+absence again, then commits with revision fencing. Invalid names/configuration,
+stale revisions, observation errors, retained ownership requiring recovery,
+cleanup failure or device reappearance reject the write. Observation/cleanup
+failures preserve the old intent; cleanup may already have stopped services.
+Pending router work or recovery fences also block conflicting mutations.
+Storage failures can have uncertain outcomes as described in the recovery
+runbook. These are typed domain errors, usually HTTP 200, not proof of success.
+
+Forget removes overrides and suppresses base TOML configuration for that name;
+reset removes override and suppression so base TOML becomes effective again.
+Saving intent defers runtime work until required devices are present; it does
+not apply a live change or create a confirmation token. Success has this shape:
+
+```json
+{
+  "type": "interface_intent_saved",
+  "interface": "wlan0",
+  "revision": 13,
+  "deferred": true,
+  "missing_dependencies": ["wlan0"]
+}
+```
+
+Inventory responses contain `type`, `revision`, `interfaces`, and nullable
+`observation_error`. Interface inventory additionally contains
+`suppressed_interfaces`. Each entry has `name`, nullable `configured` and
+`observed`, `config_source` (`base`, `override`, `derived`, `none`), `presence`
+(`present`, `missing`, `unknown`), `observation_stale`, `suppressed`, `readiness`
+(`ready`, `disabled`, `waiting_device`, `unknown`), `blockers` and `references`.
+Blockers are tagged by `kind`: `missing_interface` with `interface`, or
+`observation_failed` with `message`. References name dependent router fields.
+`ready` describes device presence, not successful connectivity or service health.
+On observation failure cached observations remain visible, marked stale with
+unknown presence; they must not be used as proof of absence.
+
+Wi-Fi inventory instead wraps each entry as `interface`, nullable `ap_runtime`
+and `client_runtime`, and adds `ap_execution_available` and
+`client_execution_available`. Saved Wi-Fi intent remains visible even when the
+respective executor is unavailable.
+
 ## Commit-confirm changes
 
 Interface apply, AP and client configuration or provisioning, and saved AP or
@@ -595,7 +670,13 @@ confirmation. All paths in the table are relative to `/api/v1`.
 
 Send `{ "token": "<returned token>" }` to commit or roll back. A token cannot
 confirm a later or different transaction. For network changes, `phase` is
-`awaiting_commit`, `rollback_required`, or `commit_indeterminate`. Commit is
+`awaiting_commit`, `rollback_required`, `recovery_required`, or
+`commit_indeterminate`. In `recovery_required` the bounded automatic recovery
+cycle has stopped; inspect `recovery_progress` and explicitly request rollback
+to retry. A device event may separately resume automatic recovery. The optional
+`recovery_progress` contains `failure_kind`, `attempts`, `max_attempts`,
+`deadline_unix`, `automatic_recovery`, and `last_error`; see
+[bounded recovery](recovery.md#bounded-automatic-recovery). Commit is
 available only in `awaiting_commit`; `commit_indeterminate` also blocks rollback
 until storage is repaired and startup recovery resolves the outcome. See the
 [recovery runbook](recovery.md#tm-rec-209).
@@ -609,8 +690,11 @@ mutation whose outcome is unknown.
 DHCP and VPN controls plus Wi-Fi passphrase updates and runtime controls such
 as reconnect and reload still apply immediately. Their successful responses do
 not require a commit. Wi-Fi configuration, profile activation, and
-operator-triggered AP/client deactivation require confirmation even when called
-through the non-provisioning endpoints.
+operator-triggered AP/client deactivation on a present adapter require
+confirmation even through non-provisioning endpoints. On an absent adapter
+with a saved role, DELETE saves intent after verified cleanup and returns
+`interface_intent_saved` without a token. Observation or cleanup failures leave
+the previous intent intact; explicit offline endpoints require a revision.
 
 ## Secrets and operational safety
 

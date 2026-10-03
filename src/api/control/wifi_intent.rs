@@ -47,6 +47,10 @@ impl ControlService {
         })
     }
 
+    /// Resolve a library profile and its secret for a missing managed input. Apply
+    /// IPv4 policy while preserving role/management, then save through the offline
+    /// revision-fenced intent path. No connection attempt or confirmation timer.
+    /// Admission must serialize writes; secret/validation/cleanup failures propagate.
     pub(super) async fn save_wifi_client_profile(
         &self,
         interface: String,
@@ -149,6 +153,12 @@ impl ControlService {
             .map(Some)
     }
 
+    /// Save Wi-Fi intent only for a freshly observed missing configured interface,
+    /// preserving role/management. Validate secret and candidate before publication.
+    /// A new secret uses an immutable revision directory before the intent commit;
+    /// failed/uncertain commits may retain unreferenced credentials for recovery.
+    /// Cleanup and repeated absence observation precede revision-fenced persistence.
+    /// Caller holds mutation admission; no live apply or confirmation timer.
     pub(super) async fn save_wifi_interface(
         &self,
         interface: String,

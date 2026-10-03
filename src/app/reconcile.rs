@@ -347,7 +347,12 @@ async fn reconcile_dhcp_client<L: DhcpClientRuntimeReconciler>(
 }
 
 #[allow(clippy::too_many_arguments)]
-/// Perform one desired-state reconciliation pass across interface, DHCP, and Wi-Fi services.
+/// Perform one desired-state pass across interface, DHCP and Wi-Fi services.
+/// Caller must hold the runtime mutation gate; this function does not acquire it.
+/// Check commit/recovery fences before subsystem writes and retry interface
+/// recovery first. Return per-interface failures for the supervisor to retry;
+/// global observation/recovery errors abort the pass. Presence notifications
+/// and later supervisor passes, rather than this function, schedule further work.
 pub(super) async fn reconcile_network_runtime_once<
     D: DhcpRuntimeReconciler,
     W: WifiRuntimeReconciler,
@@ -603,6 +608,10 @@ pub(super) async fn reconcile_network_runtime_once<
 /// nftables has no rtnetlink notification, so router dataplane integrity is
 /// audited separately at a low cadence without polling all interface state.
 #[allow(clippy::too_many_arguments)]
+/// Attach the desired-state converger synchronously and spawn startup/event
+/// passes. The task owns a shared mutation gate during each pass and retries
+/// transient failures with backoff, reacting to device and recovery events.
+/// The caller must signal shutdown and join it before final cleanup.
 pub(super) fn spawn_runtime_network_reconcile(
     desired: DesiredNetworkState,
     journal: AddressOwnershipJournal,
@@ -633,6 +642,10 @@ pub(super) fn spawn_runtime_network_reconcile(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Spawn convergence using explicit device/recovery event receivers. Attach
+/// before returning so API admission sees an active converger. Shared runtime
+/// gate excludes direct exclusive mutations; router-busy state skips competing
+/// router writes. Retry failed passes until shutdown; caller joins the handle.
 pub(super) fn spawn_runtime_network_reconcile_with_recovery_events(
     desired: DesiredNetworkState,
     journal: AddressOwnershipJournal,

@@ -65,26 +65,43 @@ impl DhcpRuntime {
         self
     }
 
+    /// Create a UDP socket and serve until a socket/send error or cancellation by
+    /// the caller. Invalid packets are logged and skipped. With a lease store,
+    /// persist before replying; on store error restore in-memory state and suppress
+    /// the reply. Dropping the future does not undo completed durable writes.
     pub async fn run(self) -> Result<()> {
         let socket = create_dhcp_socket(&self.config)?;
         self.run_with_socket(socket).await
     }
 
+    /// Serve indefinitely on a caller-provided nonblocking Tokio UDP socket with
+    /// appropriate bind/broadcast settings. Invalid packets/store failures are
+    /// logged and skipped; persistence precedes replies and failed persistence
+    /// restores in-memory state. Socket/send errors stop the loop. Cancellation
+    /// does not roll back completed leases.
     pub async fn run_with_socket(mut self, socket: UdpSocket) -> Result<()> {
         loop {
             self.process_next_datagram(&socket).await?;
         }
     }
 
+    /// Create a socket and process one datagram using the persistence-before-reply
+    /// contract of run_with_socket; invalid/store-failed packets still count as one.
+    /// Waits for input without its own deadline; socket/send errors propagate.
     pub async fn run_once(mut self) -> Result<()> {
         let socket = create_dhcp_socket(&self.config)?;
         self.process_next_datagram(&socket).await
     }
 
+    /// Process one datagram on a caller-provided socket, with the same validation
+    /// and persistence-before-reply behavior as run_with_socket. No input deadline.
     pub async fn run_once_with_socket(mut self, socket: UdpSocket) -> Result<()> {
         self.process_next_datagram(&socket).await
     }
 
+    /// Process packet_count datagrams, counting invalid/store-failed packets too.
+    /// Use the persistence-before-reply contract of run_with_socket; socket/send
+    /// errors stop early. Zero returns immediately; there is no input deadline.
     pub async fn run_n_with_socket(mut self, socket: UdpSocket, packet_count: usize) -> Result<()> {
         for _ in 0..packet_count {
             self.process_next_datagram(&socket).await?;
@@ -126,6 +143,10 @@ impl DhcpRuntime {
     }
 }
 
+/// Bind a reusable, broadcast-capable nonblocking IPv4 UDP socket. Requires a
+/// Tokio runtime and permission to bind the configured port; I/O errors propagate.
+/// The interface field is not used to bind this socket to a device; this helper
+/// is separate from the shared Linux per-interface packet-info runtime.
 pub fn create_dhcp_socket(config: &DhcpRuntimeConfig) -> Result<UdpSocket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
         .context("failed to create DHCP UDP socket")?;

@@ -253,6 +253,14 @@ pub enum ProfileError {
 }
 
 /// Reject profile names that cannot safely identify a stored WireGuard profile.
+/// # Examples
+///
+/// ```
+/// use traffic_masq_wireguard::validate_wireguard_profile_name;
+/// assert!(validate_wireguard_profile_name("office.conf").is_ok());
+/// assert!(validate_wireguard_profile_name("../office.conf").is_err());
+/// assert!(validate_wireguard_profile_name("office").is_err());
+/// ```
 pub fn validate_wireguard_profile_name(name: &str) -> Result<(), ProfileError> {
     if name.is_empty() {
         return Err(ProfileError::EmptyName);
@@ -273,7 +281,9 @@ pub fn validate_wireguard_profile_name(name: &str) -> Result<(), ProfileError> {
     Ok(())
 }
 
-/// Parse the supported WireGuard configuration fields and reject unsupported or invalid values.
+/// Parse required Interface PrivateKey/Address and at least one Peer PublicKey.
+/// Reject invalid known fields and unknown sections; ignore unknown keys,
+/// including wg-quick hooks, without executing them.
 fn parse_config(name: &str, raw: &[u8]) -> Result<WireGuardProfile, ProfileError> {
     validate_wireguard_profile_name(name)?;
 

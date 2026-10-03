@@ -29,20 +29,26 @@ pub struct RouterIntentProposal {
 }
 
 impl RouterIntentProposal {
+    /// Create an empty proposal; no writes or runtime mutations occur.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Replace the router override in this proposal. The last router call wins.
     pub fn set_router(mut self, router: RouterConfig) -> Self {
         self.router = RouterOverrideChange::Set(router);
         self
     }
 
+    /// Clear the router override, revealing base TOML router settings.
+    /// This does not necessarily disable the effective router. Last router call wins.
     pub fn clear_router(mut self) -> Self {
         self.router = RouterOverrideChange::Clear;
         self
     }
 
+    /// Set an interface override and remove its suppression. Repeated calls for
+    /// the same interface use the last value; management changes require consent.
     pub fn set_interface(
         mut self,
         interface: impl Into<String>,
@@ -62,6 +68,29 @@ impl RouterIntentProposal {
         self
     }
 
+    /// Reset an interface override and suppression, revealing base TOML intent.
+    /// If the base defines wlan0, removing its override restores that definition;
+    /// use forget_interface to keep it absent. Last call for this interface wins.
+    /// # Examples
+    ///
+    /// ```
+    /// use traffic_masq::config::{AppConfig, InterfaceConfig, InterfaceRole};
+    /// use traffic_masq::core::router_candidate::{RouterCandidate, RouterIntentProposal};
+    /// use traffic_masq::state::overrides::RuntimeOverrides;
+    /// let mut base = AppConfig::default();
+    /// base.network.interfaces.insert("wlan0".into(), InterfaceConfig {
+    ///     role: InterfaceRole::Input, managed: false, ipv4: None, dhcp: None,
+    ///     dhcp_client: None, wifi: None, wifi_client: None, nat: true,
+    /// });
+    /// let committed = RuntimeOverrides::default();
+    /// let forgotten = RouterCandidate::build(&base, &committed,
+    ///     &RouterIntentProposal::new().forget_interface("wlan0"))?;
+    /// assert!(!forgotten.effective_config().network.interfaces.contains_key("wlan0"));
+    /// let reset = RouterCandidate::build(&base, forgotten.document(),
+    ///     &RouterIntentProposal::new().remove_interface("wlan0"))?;
+    /// assert!(reset.effective_config().network.interfaces.contains_key("wlan0"));
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
     pub fn remove_interface(mut self, interface: impl Into<String>) -> Self {
         let interface = interface.into();
         self.forgotten_interfaces.remove(&interface);
@@ -69,6 +98,9 @@ impl RouterIntentProposal {
         self
     }
 
+    /// Remove an override and suppress the interface even when base TOML defines it.
+    /// Unlike remove_interface, this prevents base intent from returning.
+    /// A later set_interface or remove_interface cancels suppression.
     pub fn forget_interface(mut self, interface: impl Into<String>) -> Self {
         let interface = interface.into();
         self.interfaces.remove(&interface);
@@ -275,6 +307,11 @@ pub struct RouterCandidate {
 }
 
 impl RouterCandidate {
+    /// Build a normalized candidate over committed overrides and base TOML.
+    /// Validate the effective configuration, management-change consent and derived
+    /// router requirements; this does not probe runtime tools or hardware. Capture
+    /// the committed revision and digest of normalized intent, without persisting
+    /// or incrementing revision. Invalid configurations return an error.
     pub fn build(
         base: &AppConfig,
         committed: &RuntimeOverrides,
@@ -362,6 +399,9 @@ impl RouterCandidate {
         &self.desired
     }
 
+    /// Reject a stale candidate if current revision differs from its captured base.
+    /// The caller must check while holding mutation admission before publishing;
+    /// this comparison alone does not serialize writes.
     pub fn ensure_base_revision(&self, current_revision: u64) -> Result<(), StaleCandidateError> {
         if self.base_revision == current_revision {
             return Ok(());

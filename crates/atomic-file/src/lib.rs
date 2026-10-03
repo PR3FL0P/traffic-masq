@@ -174,6 +174,11 @@ pub fn ensure_private_dir(path: &Path, mode: u32) -> Result<(), PrivateDirError>
 ///
 /// The parent directory must already exist; use [`ensure_private_dir`] first if
 /// that is not guaranteed.
+///
+/// # Errors
+/// A parent fsync error can occur after rename publishes the new bytes. `Err`
+/// does not imply the old file survived. Use [`replace_preserving_on_error`]
+/// for compensation; failed compensation leaves an indeterminate outcome.
 pub fn replace(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
     replace_tracking_publication(path, contents, mode, &mut false)
 }
@@ -237,6 +242,11 @@ fn replace_tracking_publication(
 
 /// Run [`replace`] on the blocking pool so file and directory fsyncs do not
 /// block the Tokio executor. Propagate both filesystem and worker errors.
+/// # Cancellation
+/// Dropping or timing out this future does not stop an already running blocking
+/// filesystem operation. The write/removal or compensation may finish later.
+/// Callers must serialize mutations and retain recovery evidence until the
+/// durable outcome is established; cancellation is not successful rollback.
 pub async fn replace_async(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
     let path = path.to_path_buf();
     let contents = contents.to_vec();
@@ -249,6 +259,20 @@ pub async fn replace_async(path: &Path, contents: &[u8], mode: u32) -> io::Resul
 /// If the file did not exist, remove the newly created target on failure.
 /// Return the original error after successful compensation; include both errors
 /// when restoration also fails and the final on-disk state may be uncertain.
+/// # Examples
+///
+/// ```
+/// use traffic_masq_atomic_file::{replace_preserving_on_error, PRIVATE_FILE_MODE};
+/// let directory = tempfile::tempdir()?;
+/// let path = directory.path().join("intent.json");
+/// replace_preserving_on_error(&path, b"old", PRIVATE_FILE_MODE)?;
+/// // An existing symlink is refused before publication.
+/// let alias = directory.path().join("alias.json");
+/// std::os::unix::fs::symlink(&path, &alias)?;
+/// assert!(replace_preserving_on_error(&alias, b"new", PRIVATE_FILE_MODE).is_err());
+/// assert_eq!(std::fs::read(&path)?, b"old");
+/// # Ok::<(), std::io::Error>(())
+/// ```
 pub fn replace_preserving_on_error(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
     let previous = match OpenOptions::new()
         .read(true)
@@ -286,6 +310,11 @@ pub fn replace_preserving_on_error(path: &Path, contents: &[u8], mode: u32) -> i
 }
 
 /// Async wrapper for [`replace_preserving_on_error`].
+/// # Cancellation
+/// Dropping or timing out this future does not stop an already running blocking
+/// filesystem operation. The write/removal or compensation may finish later.
+/// Callers must serialize mutations and retain recovery evidence until the
+/// durable outcome is established; cancellation is not successful rollback.
 pub async fn replace_preserving_on_error_async(
     path: &Path,
     contents: &[u8],
@@ -300,7 +329,9 @@ pub async fn replace_preserving_on_error_async(
 
 /// Remove `path` durably. A successful return means both the directory entry
 /// was removed and the parent directory was fsynced, so crash recovery cannot
-/// resurrect a record that callers already treated as cleared.
+/// resurrect a record that callers already treated as cleared. Returns false
+/// for an absent entry. A parent fsync error may occur after deletion; `Err`
+/// does not imply the file still exists. See [`remove_preserving_on_error`].
 pub fn remove_durable(path: &Path) -> io::Result<bool> {
     reject_symlink(path)?;
     match fs::remove_file(path) {
@@ -345,6 +376,11 @@ pub fn remove_preserving_on_error(path: &Path, mode: u32) -> io::Result<bool> {
 }
 
 /// Async wrapper for [`remove_preserving_on_error`].
+/// # Cancellation
+/// Dropping or timing out this future does not stop an already running blocking
+/// filesystem operation. The write/removal or compensation may finish later.
+/// Callers must serialize mutations and retain recovery evidence until the
+/// durable outcome is established; cancellation is not successful rollback.
 pub async fn remove_preserving_on_error_async(path: &Path, mode: u32) -> io::Result<bool> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || remove_preserving_on_error(&path, mode))
@@ -353,6 +389,11 @@ pub async fn remove_preserving_on_error_async(path: &Path, mode: u32) -> io::Res
 }
 
 /// Async wrapper for [`remove_durable`].
+/// # Cancellation
+/// Dropping or timing out this future does not stop an already running blocking
+/// filesystem operation. The write/removal or compensation may finish later.
+/// Callers must serialize mutations and retain recovery evidence until the
+/// durable outcome is established; cancellation is not successful rollback.
 pub async fn remove_durable_async(path: &Path) -> io::Result<bool> {
     let path = path.to_path_buf();
     tokio::task::spawn_blocking(move || remove_durable(&path))

@@ -109,6 +109,11 @@ impl ControlService {
         })
     }
 
+    /// Save offline intent after verified device absence and matching revision.
+    /// Clean owned runtime before commit, repeat absence observation, then persist
+    /// with revision fencing. Cleanup/observation failures leave previous intent;
+    /// return InterfaceIntentSaved with deferred dependencies, without a timer.
+    /// The control dispatch admission gate must serialize this mutation.
     pub(super) async fn save_missing_interface_intent(
         &self,
         interface: String,
@@ -183,6 +188,9 @@ impl ControlService {
         })
     }
 
+    /// Validate the interface name and freshly observe absence. Observation errors
+    /// are errors, never proof of absence. Reject present devices, returning the
+    /// observation snapshot for dependency checks; repeat before committing.
     pub(super) async fn check_missing_interface_write(
         &self,
         interface: &str,

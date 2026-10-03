@@ -1012,6 +1012,10 @@ impl WifiClientSupervisor {
         }
     }
 
+    /// Open and ping an ownership-verified control session for at least 15 seconds.
+    /// Poll every 20 ms after completed failures; individual observation/ping
+    /// awaits are not bounded by this readiness deadline and can exceed it.
+    /// Refuse an existing socket with foreign identity rather than adopting it.
     async fn wait_for_ready(
         &self,
         identity: OwnedWpaCtrlIdentity,

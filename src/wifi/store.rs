@@ -141,6 +141,10 @@ impl PassphraseStore {
         Ok(canonical_dir.join(interface))
     }
 
+    /// Write this role-specific interface secret at mode 0600 in a private 0700
+    /// directory, replacing any previous secret. Reject unsafe names and symlinks.
+    /// A write failure attempts to restore prior bytes; RollbackFailed means the
+    /// durable outcome is uncertain. Callers must serialize writes.
     pub fn set(
         &self,
         interface: &str,
@@ -162,6 +166,9 @@ impl PassphraseStore {
         Ok(())
     }
 
+    /// Read a secret, returning None for an absent file. May create the private
+    /// directory and repair its mode to 0700 even on a read. Reject symlinks,
+    /// invalid names, invalid passphrases and I/O failures; never log the result.
     pub fn get(&self, interface: &str) -> Result<Option<WifiPassphrase>, PassphraseStoreError> {
         let canonical_dir = self.ensure_directory()?;
         let target = self.safe_target(&canonical_dir, interface)?;
@@ -181,6 +188,9 @@ impl PassphraseStore {
         Ok(Some(WifiPassphrase::new(contents.as_str())?))
     }
 
+    /// Durably remove a secret; an absent file succeeds. May create/chmod the
+    /// private directory. Reject symlinks and invalid names. Removal errors attempt
+    /// restoration; RollbackFailed reports failed compensation.
     pub fn clear(&self, interface: &str) -> Result<(), PassphraseStoreError> {
         let canonical_dir = self.ensure_directory()?;
         let target = self.safe_target(&canonical_dir, interface)?;
@@ -296,6 +306,9 @@ pub enum ResolvePassphraseError {
     #[error(transparent)]
     Passphrase(#[from] PassphraseError),
 }
+/// Return None for open APs; otherwise resolve the role-specific store first,
+/// then the configured file. Reading the store may create/chmod its directory.
+/// Returned credentials are secret; invalid values and unsafe files are errors.
 pub fn resolve_passphrase(
     spec: &WifiApSpec,
     store: &PassphraseStore,
@@ -306,6 +319,10 @@ pub fn resolve_passphrase(
     resolve_passphrase_parts(&spec.interface, spec.passphrase_file.as_deref(), store)
 }
 
+/// Prefer the interface secret in the supplied role-specific store to the file.
+/// Only fall back to passphrase_file if the store has no secret; None means
+/// neither source is configured. Store reads may create/chmod its directory.
+/// Reject symlinks, insecure file permissions, invalid passphrases and I/O errors.
 pub fn resolve_passphrase_parts(
     interface: &str,
     passphrase_file: Option<&Path>,

@@ -282,6 +282,8 @@ It keeps configuration, passwords, state, logs and dependency packages.
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
+cargo doc --locked --workspace --no-deps
+cargo test --locked --workspace --doc
 sh packaging/smoke-test.sh
 ```
 

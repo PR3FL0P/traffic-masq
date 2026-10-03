@@ -7,6 +7,8 @@ use unicode_width::UnicodeWidthStr;
 use super::theme;
 
 /// Moves within an ordered set of focusable fields without wrapping.
+/// # Panics
+/// Panics if `items` is empty. If `current` is absent, movement starts at index 0.
 pub(crate) fn move_clamped<T: Copy + PartialEq>(items: &[T], current: T, forward: bool) -> T {
     let index = items.iter().position(|item| *item == current).unwrap_or(0);
     items[if forward {
@@ -17,6 +19,8 @@ pub(crate) fn move_clamped<T: Copy + PartialEq>(items: &[T], current: T, forward
 }
 
 /// Moves within an ordered set of focusable fields and wraps at both ends.
+/// # Panics
+/// Panics if `items` is empty. If `current` is absent, movement starts at index 0.
 pub(crate) fn move_wrapped<T: Copy + PartialEq>(items: &[T], current: T, forward: bool) -> T {
     let index = items.iter().position(|item| *item == current).unwrap_or(0);
     let step = if forward { 1 } else { items.len() - 1 };

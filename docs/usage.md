@@ -59,6 +59,8 @@ The default tests need no privileges and do not change the host network:
 
 ```sh
 cargo test --locked --workspace
+cargo doc --locked --workspace --no-deps
+cargo test --locked --workspace --doc
 ```
 
 Run the eight network and VPN suites through the isolated runner:
@@ -480,7 +482,7 @@ browser; active or router-referenced profiles cannot be removed.
 
 Profile names are plain basenames ending in `.conf` (for example `office.conf`). The parser reads `[Interface]` fields `PrivateKey`, `ListenPort`,
 `Address`, `DNS`, `MTU`, and `[Peer]` fields `PublicKey`, `AllowedIPs`, `Endpoint`,
-`PersistentKeepalive`, `PresharedKey`. A private key and at least one peer with
+`PersistentKeepalive`, `PresharedKey`. An Interface `Address`, a private key and at least one peer with
 a public key are required. Keys must decode to 32 bytes.
 
 Endpoints accept numeric socket addresses, such as `203.0.113.10:51820` or
@@ -576,8 +578,10 @@ Inspect pending state to learn the outcome.
 Standalone DHCP and VPN controls plus Wi-Fi runtime controls such as
 reconnect/reload/passphrase updates take effect immediately and do not have an
 interface/router confirmation timer. Operator-triggered Wi-Fi configuration,
-profile activation, and AP/client deactivation instead use the same tentative
-commit-confirm flow as other connectivity-sensitive interface changes. The
+profile activation, and live AP/client deactivation instead use the same tentative
+commit-confirm flow as other connectivity-sensitive interface changes. For an
+absent adapter with saved intent, edits/deactivation instead save intent after
+verified cleanup without a timer; see [disconnected adapters](#editing-disconnected-adapters). The
 immediate subsystems write durable ownership or launch records before persistent
 runtime state is created, then reconcile those records against committed
 configuration on startup. This lets recovery remove only traffic-masq-owned
@@ -712,3 +716,22 @@ dependency packages are preserved. Use `--yes` for unattended removal and
 `--prefix /custom/path` if installed under a custom prefix. For a custom
 configuration, pass `--config /path/to/config.toml` so the correct daemon is
 stopped.
+
+## Editing disconnected adapters
+
+Use the Interfaces and Wi-Fi inventory to find saved adapters even when they
+are unplugged. Refresh observation and read the current revision before editing.
+Assign a managed input/output role through
+`PUT /api/v1/interfaces/{interface}/intent`, then use `wifi-intent` for AP/STA
+settings or `wifi-client-intent` for a saved client profile and IPv4 policy.
+Every request includes `expected_revision`; refresh and review again if it is
+stale. These saves clean up owned runtime and persist intent without a timer.
+Reconnect the adapter and inspect runtime status as the daemon converges.
+
+To stop managing a disconnected adapter including its base TOML definition,
+use `intent/forget`. To discard the override and return to base TOML, use
+`intent/reset`; this may restore a configured service. Observation or cleanup
+errors retain previous intent and require resolving the reported problem.
+A DELETE AP/client request also saves intent without a pending token when its
+adapter is absent and its role is saved. See the
+[offline API contract](api.md#offline-intent-and-inventory).

@@ -79,6 +79,10 @@ pub enum LeaseValidationError {
 }
 
 impl DhcpClientLease {
+    /// Validate the current schema, interface/index and identifiers, IPv4/prefix,
+    /// nonzero expiry, 0 < T1 < T2 < lease and recorded DHCP route protocol/table/
+    /// nexthop shape. This is structural validation, not proof that the current
+    /// device, addresses or routes still belong to this lease; recovery must observe them.
     pub fn validate(&self) -> Result<(), LeaseValidationError> {
         if self.schema_version != DHCP_CLIENT_LEASE_SCHEMA_VERSION {
             return Err(LeaseValidationError::UnsupportedSchema(self.schema_version));

@@ -37,7 +37,7 @@ impl TransactionPlan {
         &self.candidate
     }
 
-    /// Capture the observed router fingerprint and build a plan for a validated candidate.
+    /// Return the plan already built by the coordinator.
     pub fn plan(&self) -> &RouterPlan {
         &self.plan
     }

@@ -38,9 +38,17 @@ pub enum ProviderError {
 }
 
 #[async_trait]
+/// Low-level WireGuard mutations. Callers hold mutation admission and persist
+/// launch/ownership proof before creating or configuring links. Errors may
+/// follow partial kernel changes; retain the journal and compensate through
+/// marker-checked cleanup. These methods do not acquire the daemon gate.
 pub trait VpnProvider: Send + Sync {
+    /// Observe whether a link exists; existence alone does not prove daemon ownership.
     async fn link_exists(&self, name: &str) -> Result<bool, ProviderError>;
 
+    /// Create a new WireGuard link, recording launch_marker as its alias before
+    /// key/listen-port configuration. Errors may leave a marked link; caller must
+    /// persist launch intent first and use marker-checked cleanup.
     async fn create_link(
         &self,
         name: &str,
@@ -49,30 +57,47 @@ pub trait VpnProvider: Send + Sync {
         launch_marker: &str,
     ) -> Result<(), ProviderError>;
 
+    /// Delete only a link whose observed alias matches launch_marker, using that
+    /// snapshot's interface index. Return false for absent or foreign links and true
+    /// when deleted. Keep durable evidence if observation/deletion fails.
+    /// Delete by name without a launch-marker guard; absence may error.
+    /// Use only after independent ownership proof under serialization. Prefer
+    /// delete_link_if_launch_marker for interrupted launch/recovery cleanup.
     async fn delete_link_if_launch_marker(
         &self,
         name: &str,
         launch_marker: &str,
     ) -> Result<bool, ProviderError>;
 
+    /// Set MTU on an owned link; no ownership check occurs here.
     async fn set_mtu(&self, name: &str, mtu: u32) -> Result<(), ProviderError>;
 
+    /// Add each supplied address without removing existing addresses. Not a replace
+    /// operation; duplicate additions may error and earlier additions may survive.
+    /// Caller must verify link ownership and recover partial application.
     async fn set_addresses(&self, name: &str, addresses: &[IpNet]) -> Result<(), ProviderError>;
 
+    /// Replace the entire peer set (including clearing it for an empty slice),
+    /// resolving endpoints before sending configuration. Caller proves link ownership
+    /// and retains recovery state on errors.
     async fn set_peers(
         &self,
         name: &str,
         peers: &[WireGuardPeerConfig],
     ) -> Result<(), ProviderError>;
 
+    /// Set administrative up on an owned link; does not prove tunnel health.
     async fn set_link_up(&self, name: &str) -> Result<(), ProviderError>;
 
+    /// Set administrative down on an owned link; does not delete peer/address state.
     async fn set_link_down(&self, name: &str) -> Result<(), ProviderError>;
 
     async fn delete_link(&self, name: &str) -> Result<(), ProviderError>;
 
+    /// Read the link's public key, returning None if not configured; no private key is returned.
     async fn public_key(&self, name: &str) -> Result<Option<WireGuardKey>, ProviderError>;
 
+    /// Observe administrative up, not peer connectivity or handshake freshness.
     async fn is_up(&self, name: &str) -> Result<bool, ProviderError>;
 }
 

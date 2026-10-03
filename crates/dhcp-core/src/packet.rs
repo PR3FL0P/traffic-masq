@@ -135,6 +135,20 @@ impl<'a> DhcpPacket<'a> {
         Ok(Some(option.value))
     }
 
+    /// Decode a singleton message type from untrusted input. None means absent;
+    /// duplicate options, wrong length or an unknown type return Err.
+    /// # Examples
+    ///
+    /// ```
+    /// use traffic_masq_dhcp_core::packet::{DhcpPacket, DHCP_MAGIC_COOKIE};
+    /// let mut bytes = vec![0; 236];
+    /// bytes.extend_from_slice(&DHCP_MAGIC_COOKIE);
+    /// bytes.extend_from_slice(&[53, 1, 1, 53, 1, 3, 255]);
+    /// let packet = DhcpPacket::parse(&bytes)?;
+    /// assert!(packet.message_type().is_some()); // permissive inspection
+    /// assert!(packet.strict_message_type().is_err()); // duplicate option
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
     pub fn strict_message_type(&self) -> Result<Option<DhcpMessageType>> {
         let Some(value) = self.singleton_option(OPTION_MESSAGE_TYPE, 1)? else {
             return Ok(None);
@@ -144,47 +158,66 @@ impl<'a> DhcpPacket<'a> {
             .ok_or_else(|| anyhow::anyhow!("invalid DHCP message type {}", value[0]))
     }
 
+    /// Decode exactly one four-byte option. None means absent; duplicates or
+    /// wrong length return Err. This checks encoding, not address usability.
     pub fn strict_ipv4_option(&self, code: u8) -> Result<Option<Ipv4Addr>> {
         Ok(self
             .singleton_option(code, 4)?
             .map(|value| Ipv4Addr::new(value[0], value[1], value[2], value[3])))
     }
 
+    /// Decode exactly one four-byte big-endian value. None means absent;
+    /// duplicates or wrong length return Err. No timer semantics are checked.
     pub fn strict_u32_option(&self, code: u8) -> Result<Option<u32>> {
         self.singleton_option(code, 4)?
             .map(|value| value.try_into().map(u32::from_be_bytes).map_err(Into::into))
             .transpose()
     }
 
+    /// Read the singleton subnet-mask option; absent is None, duplicates or
+    /// wrong length are errors. Contiguous-mask semantics are checked by reply validation.
     pub fn strict_subnet_mask(&self) -> Result<Option<Ipv4Addr>> {
         self.strict_ipv4_option(OPTION_SUBNET_MASK)
     }
 
+    /// Read one nonempty router-list option. Absent is None; duplicate options
+    /// or malformed lengths return Err. Repeated addresses in the list are allowed.
     pub fn strict_routers(&self) -> Result<Option<Vec<Ipv4Addr>>> {
         self.strict_ipv4_list_option(OPTION_ROUTERS)
     }
 
+    /// Read one nonempty DNS-list option. Absent is None; duplicate options
+    /// or malformed lengths return Err. Repeated addresses in the list are allowed.
     pub fn strict_dns_servers(&self) -> Result<Option<Vec<Ipv4Addr>>> {
         self.strict_ipv4_list_option(OPTION_DNS_SERVERS)
     }
 
+    /// Read singleton lease seconds; absent is None and invalid encoding is Err.
+    /// The caller must reject zero or inconsistent timers.
     pub fn strict_lease_time(&self) -> Result<Option<u32>> {
         self.strict_u32_option(OPTION_LEASE_TIME)
     }
 
+    /// Read a singleton server IPv4 identifier; absent is None, malformed or
+    /// duplicate options are Err. The caller must validate server identity.
     pub fn strict_server_identifier(&self) -> Result<Option<Ipv4Addr>> {
         self.strict_ipv4_option(OPTION_SERVER_IDENTIFIER)
     }
 
+    /// Read singleton renewal seconds; absent is None, malformed/duplicate is Err.
+    /// The caller checks ordering against rebinding and lease timers.
     pub fn strict_renewal_time(&self) -> Result<Option<u32>> {
         self.strict_u32_option(OPTION_RENEWAL_TIME)
     }
 
+    /// Read singleton rebinding seconds; absent is None, malformed/duplicate is Err.
+    /// The caller checks ordering against renewal and lease timers.
     pub fn strict_rebinding_time(&self) -> Result<Option<u32>> {
         self.strict_u32_option(OPTION_REBINDING_TIME)
     }
 
-    /// Decode a unique nonempty list of IPv4 addresses; reject malformed or duplicate options.
+    /// Decode one nonempty IPv4 list option; reject malformed or duplicate options.
+    /// The option code must be unique; addresses within its list may repeat.
     pub fn strict_ipv4_list_option(&self, code: u8) -> Result<Option<Vec<Ipv4Addr>>> {
         let mut matching = self.options.iter().filter(|option| option.code == code);
         let Some(option) = matching.next() else {
@@ -205,6 +238,9 @@ impl<'a> DhcpPacket<'a> {
         ))
     }
 
+    /// Permissively read the first correctly sized message-type option.
+    /// None means absent or unknown type. Duplicates are not rejected; use
+    /// strict_message_type for untrusted packets.
     pub fn message_type(&self) -> Option<DhcpMessageType> {
         self.options
             .iter()
@@ -212,10 +248,16 @@ impl<'a> DhcpPacket<'a> {
             .and_then(|option| DhcpMessageType::from_u8(option.value[0]))
     }
 
+    /// Permissively read the first correctly sized requested-IP option.
+    /// None means absent or no correctly sized option. Use strict_ipv4_option
+    /// with OPTION_REQUESTED_IP to reject malformed/duplicate untrusted input.
     pub fn requested_ip(&self) -> Option<Ipv4Addr> {
         self.ipv4_option(50)
     }
 
+    /// Permissively read the first correctly sized server identifier.
+    /// None means absent or no correctly sized option; duplicates are not rejected.
+    /// Use strict_server_identifier for untrusted input.
     pub fn server_identifier(&self) -> Option<Ipv4Addr> {
         self.ipv4_option(54)
     }

@@ -197,7 +197,9 @@ Radio capability and regulatory checks still apply. `max_stations` is 1–2007.
 AP and client security values are `wpa2`, `wpa3`, `wpa2_wpa3` or `open`.
 Protected networks require an 8–63 character printable ASCII passphrase, from
 an absolute `passphrase_file` or the role-specific stored secret set through
-TUI/API. Open networks must omit `passphrase_file`. A role transition requires
+TUI/API. The role-specific stored secret takes precedence over `passphrase_file`;
+the file is read only when no stored secret exists. Open networks must omit
+`passphrase_file`. A role transition requires
 an explicit credential; AP and client secrets are separate.
 
 A station table accepts only `ssid`, optional `country_code`, `security`

@@ -97,6 +97,11 @@ pub(super) struct ShutdownResources<'a, P: RouterDataplaneProvider> {
 }
 
 impl<P: RouterDataplaneProvider + Send + Sync> ShutdownResources<'_, P> {
+    /// Finish shutdown after admitted API work and background writers have stopped.
+    /// Validate commit proof before deciding baseline restoration versus pending
+    /// rollback; stop owned services and collect cleanup/API/reconciler errors.
+    /// Failed cleanup keeps durable recovery evidence for startup rather than
+    /// claiming that all state was restored.
     pub(super) async fn finish(
         self,
         graceful_signal: bool,

@@ -418,3 +418,41 @@ fn ap_profile_mutations_require_administrator() {
         &Request::ListWifiApProfiles
     ));
 }
+
+#[test]
+fn documented_ap_and_offline_intent_examples_match_request_contracts() {
+    fn example(label: &str) -> &str {
+        let guide = include_str!("../../../docs/api.md");
+        let section = guide
+            .split_once(label)
+            .expect("documented request schema")
+            .1;
+        section
+            .split_once("```json\n")
+            .expect("JSON example")
+            .1
+            .split_once("\n```")
+            .expect("end of JSON example")
+            .0
+    }
+
+    let ap: ProvisionWifiAccessPointRequest =
+        serde_json::from_str(example("`WifiApProvision`\n")).unwrap();
+    assert!(ap.configure_dhcp);
+    crate::dhcp::defaults::suggest_pool(ap.subnet.unwrap()).unwrap();
+
+    let profile: traffic_masq_protocol::WifiApProfileWriteRequest =
+        serde_json::from_str(example("`WifiApProfileWrite` adds")).unwrap();
+    assert!(profile.configuration.configure_dhcp);
+    crate::dhcp::defaults::suggest_pool(profile.configuration.subnet.unwrap()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    crate::wifi::ap_profile::WifiApProfileStore::open(directory.path())
+        .unwrap()
+        .save(profile)
+        .unwrap();
+
+    let intent: SaveInterfaceIntentRequest =
+        serde_json::from_str(example("`InterfaceIntentWrite` wraps")).unwrap();
+    let config: InterfaceConfig = intent.config.into();
+    config.validate("wlan0").unwrap();
+}

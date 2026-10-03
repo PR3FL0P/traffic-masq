@@ -37,6 +37,10 @@ impl Drop for AbortConnection {
     }
 }
 
+/// Send one HTTP/1 request on a fresh Unix-socket connection.
+/// Return non-2xx statuses unchanged and limit the response body to 1 MiB.
+/// There is no timeout here. Dropping the future aborts its connection task,
+/// but does not cancel an operation already admitted by the daemon.
 pub async fn send(
     socket_path: &Path,
     method: Method,

@@ -23,6 +23,11 @@ pub(super) struct StartupRecovery {
     pub(super) management_allowlist: BTreeSet<String>,
 }
 
+/// Before listeners or normal convergence start, load independent commit proofs,
+/// recover interface journals and reconcile owned addresses. Isolate damaged
+/// interface scopes; global storage/proof errors fail startup. Return effective
+/// intent and strict-admission/router-recovery status so callers can fence normal
+/// writes. Recovery must precede unrelated configuration admission.
 pub(super) async fn prepare(config: &AppConfig) -> Result<StartupRecovery> {
     // Decode the durable proof envelope without admitting unrelated runtime settings. Individual
     // proof fields are handled independently below so one recovery scope cannot suppress another.

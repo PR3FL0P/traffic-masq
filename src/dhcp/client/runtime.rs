@@ -68,7 +68,11 @@ pub struct IngressDatagram {
 
 #[async_trait]
 pub trait DhcpClientTransport: Send + Sync {
+    /// Receive a datagram with its ingress interface index; the runtime filters
+    /// other interfaces. Implementations must allow receive waiting to be cancelled.
     async fn receive(&self) -> Result<IngressDatagram>;
+    /// Send according to broadcast/unicast SendKind. Errors propagate to the runtime;
+    /// a send error does not prove no packet reached the server.
     async fn send(&self, packet: &[u8], kind: SendKind) -> Result<()>;
 }
 
@@ -356,8 +360,16 @@ impl DuplicateAddressDetector for LinuxArpDad {
 
 #[async_trait]
 pub trait DhcpClientActionSink: Send {
+    /// Install/persist an accepted lease after duplicate-address probing.
+    /// The sink owns durable ownership and address/route serialization; retain proof
+    /// if apply partially fails. Do not acquire control admission from this callback
+    /// when readiness waits under it, as that would deadlock the transaction.
     async fn lease_acquired(&mut self, lease: Lease) -> Result<()>;
+    /// Remove the current lease's owned state, retaining proof on failure.
+    /// Repeated cleanup must preserve foreign replacement addresses/routes.
     async fn lease_lost(&mut self) -> Result<()>;
+    /// Clean remembered lease resources before reuse; verify recorded ownership
+    /// and retain evidence when removal fails. No foreign-resource adoption.
     async fn cleanup_needed(&mut self, lease: Lease) -> Result<()>;
 }
 
@@ -797,6 +809,11 @@ where
         self
     }
 
+    /// Drive acquisition/renewal with monotonic timers until the watch channel
+    /// is closed/true or transport/action callbacks fail. Ignore ingress for another
+    /// interface index. Callbacks own persistence and kernel-resource cleanup; this
+    /// loop does not automatically release a lease when cancelled. Cancellation may
+    /// drop an in-flight action, so supervisors must retain ownership recovery proof.
     pub async fn run(mut self, mut cancel: watch::Receiver<bool>) -> Result<()> {
         if *cancel.borrow() {
             return Ok(());

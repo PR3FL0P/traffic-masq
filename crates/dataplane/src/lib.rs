@@ -262,6 +262,9 @@ where
         tokio::task::spawn_blocking(move || backend.observe()).await?
     }
 
+    /// Run the synchronous backend on the blocking pool. Dropping/timing out this
+    /// future does not stop work already running; callers must serialize mutations
+    /// and retain snapshots until the durable/kernel outcome is known.
     pub async fn apply_async(
         self: &std::sync::Arc<Self>,
         desired: &RouterDataplaneDesired,
@@ -271,6 +274,9 @@ where
         tokio::task::spawn_blocking(move || backend.apply(&desired)).await?
     }
 
+    /// Run the synchronous backend on the blocking pool. Dropping/timing out this
+    /// future does not stop work already running; callers must serialize mutations
+    /// and retain snapshots until the durable/kernel outcome is known.
     pub async fn restore_async(
         self: &std::sync::Arc<Self>,
         snapshot: Option<&RouterDataplaneDesired>,
@@ -909,11 +915,28 @@ impl RouterDataplaneEventSink for NoopRouterDataplaneEventSink {
 }
 
 #[async_trait]
+/// Owned firewall and global IPv4 forwarding adapter. Caller serializes
+/// mutations and snapshots before apply; hooks may return Err after partial
+/// changes. Preserve unrelated firewall objects and refuse foreign replacements.
+/// Async blocking backend work may outlive cancellation; retain recovery proof.
 pub trait RouterDataplaneProvider: Send + Sync {
+    /// Observe forwarding and owned firewall metadata/integrity without changing them.
+    /// An observation error is not an empty or disabled snapshot.
     async fn observe(&self) -> Result<RouterDataplaneSnapshot>;
+    /// Install owned firewall policy before enabling IPv4 forwarding. May partially
+    /// apply on error; the caller must restore its captured snapshot.
+    /// Repeated application must still verify owned table identity.
     async fn apply_owned(&self, desired: &RouterDataplaneDesired) -> Result<()>;
+    /// Remove only owned firewall state. The production adapter leaves global IPv4
+    /// forwarding unchanged; this is not restoration of the original sysctl value.
     async fn disable_owned(&self) -> Result<()>;
+    /// Restore captured global forwarding and owned firewall state while preserving
+    /// foreign objects. Attempt both components; failure may leave a partial restore,
+    /// requiring retry with the original snapshot.
     async fn restore_owned(&self, snapshot: &RouterDataplaneSnapshot) -> Result<()>;
+    /// Remove obsolete owned forwarding paths without additions or service activation.
+    /// The default implementation only verifies no removal is needed, otherwise errors.
+    /// Use under the mutation gate and retain proof if cleanup fails.
     async fn cleanup_removed(&self, target: &RouterDataplaneTarget) -> Result<()> {
         let observed = self.observe().await?;
         anyhow::ensure!(

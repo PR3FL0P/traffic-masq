@@ -106,8 +106,12 @@ pub enum ProcessError {
 
 #[async_trait]
 pub trait SupervisedProcess: Send + Sync {
+    /// Launch the AP daemon using config_path and return its PID. Caller must
+    /// persist launch intent first; a PID alone does not establish process identity.
     async fn spawn(&self, binary: &Path, config_path: &Path) -> Result<u32, ProcessError>;
 
+    /// Launch the client for interface/config_path. Caller persists role-specific
+    /// launch intent first; the default adapter delegates to spawn.
     async fn spawn_wifi_client(
         &self,
         binary: &Path,
@@ -118,6 +122,8 @@ pub trait SupervisedProcess: Send + Sync {
         self.spawn(binary, config_path).await
     }
 
+    /// Observe PID liveness; a reused PID may be alive but foreign.
+    /// Use identity_matches_record before adopting or signalling it.
     async fn is_alive(&self, pid: u32) -> Result<bool, ProcessError>;
 
     /// Return a bounded tail of diagnostics emitted by the supervised process.
@@ -127,6 +133,9 @@ pub trait SupervisedProcess: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Compare process kind, executable, exact config invocation and start time.
+    /// Return false for a foreign lifetime; prefer identity_matches_record when
+    /// boot ID and kernel start ticks are available.
     async fn identity_matches(
         &self,
         pid: u32,
@@ -196,10 +205,19 @@ pub trait SupervisedProcess: Send + Sync {
     /// than trusting whichever process happens to answer at that pathname.
     async fn owns_unix_socket(&self, pid: u32, socket_path: &Path) -> Result<bool, ProcessError>;
 
+    /// Send graceful termination to a PID. Caller must establish its current
+    /// identity first; this primitive does not consume an ownership record.
     async fn terminate(&self, pid: u32) -> Result<(), ProcessError>;
 
+    /// Send forceful termination to a PID after caller identity verification.
+    /// Prefer stop_recorded for recovery; a numeric PID may have been reused.
     async fn kill(&self, pid: u32) -> Result<(), ProcessError>;
 
+    /// Stop only the recorded process lifetime after identity verification.
+    /// Reject changed or incomplete identity rather than signalling a foreign PID.
+    /// The default implementation checks then performs graceful stop; the Linux
+    /// adapter uses pidfd when available to bind signalling to the proved lifetime.
+    /// Errors leave ownership evidence for caller recovery; this does not clear it.
     async fn stop_recorded(
         &self,
         record: &crate::wifi::record::PersistedWifiRecord,

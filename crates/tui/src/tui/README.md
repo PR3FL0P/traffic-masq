@@ -78,7 +78,7 @@ In a terminal application, performing long-running network operations directly i
    - Non-cancellable writes: `"Operation in progress Xs; rollback deadline in Ys. Q: exit after result; other actions disabled"`
 3. **Cancellable vs. Non-Cancellable Operations:**
    - **Reads/Refreshes (`cancellable = true`):** If the user presses any key during a background refresh, the future is dropped immediately, returning the input event so the operator's action is processed without latency.
-   - **Mutations/Applies (`cancellable = false`):** The TUI never cancels or retries network mutations. Ctrl+C also queues an exit until the response arrives. The control client's mutation deadline is deliberately outside the server's hard HTTP connection deadline, so an admitted mutation normally resolves server-side before the client can report an unknown outcome. The UI permits pressing `q` to queue an exit after the response arrives, but blocks other inputs.
+   - **Mutations/Applies (`cancellable = false`):** The TUI never cancels or retries network mutations. Ctrl+C also queues an exit until the response arrives. The client waits up to 65 seconds while the HTTP connection has a 60-second deadline. Admitted operations can continue beyond either deadline; a timeout leaves the outcome unknown and requires inspecting pending/current state. The UI permits pressing `q` to queue an exit after the response arrives, but blocks other inputs.
 4. **Resize-Safe Progress Rendering:** At the same terminal size, the progress banner reuses the last rendered frame so footer/status context stays intact. After a resize, the stale snapshot is discarded and progress is rendered against the new geometry instead of replaying old coordinates.
 
 ### 3.2. Commit-Confirm & Immediate Mutation Flows
@@ -91,13 +91,13 @@ Because misconfiguring an IP address or firewall rule can sever SSH access, inte
    - The TUI transitions to a Pending screen displaying a live countdown timer:
      $$\text{Remaining} = \text{expires\_at\_unix} - \text{current\_unix\_time}()$$
    - Pressing **Enter** sends a commit request, making the change permanent.
-   - Pressing **Esc** immediately triggers a rollback.
-   - If the connection drops or the operator does not respond, the daemon automatically rolls back to the previous state when the timer expires.
+   - Pressing **Esc** sends a rollback request; completion must be verified.
+   - If the connection drops or the operator does not respond, expiry schedules daemon rollback. Admitted operations, retry cycles and commit uncertainty can delay or fence recovery; inspect pending state. See the [timing contract](../../../../docs/architecture.md#commit-uncertainty-and-confirmation-timing).
    - If rollback itself fails, the router pending screen switches to recovery mode: commit is removed, the `TM-REC-207` notice and individual failures are shown, **Enter** retries rollback, and **Esc** returns to the Router screen without discarding recovery state.
    - On the Router screen, degraded recovery shows the recovery code, invariant, blocked operation, action and runbook. Press **r** to retry a failed rollback; for `TM-REC-208` journal-cleanup-pending, cleanup retries automatically and **r** refreshes status.
 3. **Disconnect Handling:** If the daemon becomes unreachable while on a pending screen, the TUI retains the pending change state and warns the operator that the outcome is unverified rather than falsely claiming success.
 
-Standalone DHCP, Wi-Fi runtime controls such as reconnect/reload/passphrase updates, and VPN actions do not enter these pending screens and do not expose a commit timer. Operator-triggered AP/client deactivation does enter the normal pending-change screen and must be committed or rolled back. Immediate mutations rely on the daemon's durable ownership/recovery mechanisms rather than TUI rollback state.
+Standalone DHCP, Wi-Fi runtime controls such as reconnect/reload/passphrase updates, and VPN actions do not enter these pending screens and do not expose a commit timer. Live operator-triggered AP/client deactivation enters the pending-change screen. For an absent adapter, cleanup and durable intent saving return without a timer. Immediate mutations rely on the daemon's durable ownership/recovery mechanisms rather than TUI rollback state.
 
 ### 3.3. Screen and Section State Machine
 

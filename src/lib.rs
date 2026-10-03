@@ -5,11 +5,12 @@
 //! `traffic-masq-tui` crate.
 //!
 //! The project converges the running system toward a desired state. Interface,
-//! router, and Wi-Fi AP provisioning changes use commit-confirm transactions: if
-//! the operator does not confirm them in time, the previous state is restored.
-//! Standalone DHCP, other Wi-Fi mutations, and VPN mutations apply immediately
-//! and rely on durable ownership records plus startup recovery instead of a
-//! confirmation timer. Ownership
+//! router, Wi-Fi configuration, AP/STA provisioning, profile activation and live
+//! deactivation use commit-confirm. Expiry schedules rollback; admitted work and
+//! recovery retries can delay completion. Missing-device edits save durable intent
+//! after cleanup without a timer. Standalone DHCP, Wi-Fi runtime commands,
+//! passphrase and profile-library edits, and VPN mutations apply immediately and
+//! rely on durable ownership records plus startup recovery. Ownership
 //! proofs prevent the daemon from removing addresses, routes, processes, or VPN
 //! interfaces created by other software.
 //!

@@ -88,7 +88,9 @@ pub(crate) enum OwnershipOutcome {
     DigestMismatch(PersistedWifiRecord),
 }
 
-/// Retry a readiness probe until it succeeds or the timeout expires.
+/// Probe until ready within a window of at least 15 seconds (`max(timeout, 15s)`).
+/// Failed probes are separated by 20 ms (STARTUP_POLL_INTERVAL). The deadline is checked
+/// after each probe; an individual probe is not timed out and can exceed it.
 pub(crate) async fn wait_until_ready<F, Fut>(timeout: Duration, mut probe: F) -> bool
 where
     F: FnMut() -> Fut,

@@ -37,6 +37,9 @@ pub struct LeaseManager {
 }
 
 impl LeaseManager {
+    /// Create an empty pool, checking only start <= end. The caller must validate
+    /// subnet membership, network/broadcast/router exclusions and positive lease
+    /// duration before constructing a production pool.
     pub fn new(config: LeasePoolConfig) -> Result<Self> {
         if ipv4_to_u32(config.start) > ipv4_to_u32(config.end) {
             bail!("invalid DHCP pool: start address is greater than end address");
@@ -56,7 +59,9 @@ impl LeaseManager {
             .is_some_and(|lease| lease.ip == ip && !lease.is_expired_at(now_unix))
     }
 
-    /// Restore usable leases into a validated pool, excluding expired or incompatible entries.
+    /// Restore leases, skipping expired, out-of-range and duplicate MAC/IP entries.
+    /// now_unix is wall-clock Unix seconds. Only pool ordering is checked here;
+    /// the caller must validate subnet/router exclusions and positive duration.
     pub fn restore(config: LeasePoolConfig, leases: Vec<DhcpLease>, now_unix: u64) -> Result<Self> {
         let mut manager = Self::new(config)?;
 
@@ -87,7 +92,9 @@ impl LeaseManager {
         leases
     }
 
-    /// Reuse a client lease or allocate an available address, preferring a valid requested address.
+    /// Reuse an unexpired lease without extending expiry, or allocate an address
+    /// preferring a usable requested IP. Uses current wall-clock Unix seconds;
+    /// pool exhaustion is an error. Use allocate_exact for renewal.
     pub fn allocate(&mut self, mac: [u8; 6], requested_ip: Option<Ipv4Addr>) -> Result<DhcpLease> {
         let now = now_unix();
         self.reclaim_expired(now);
@@ -114,7 +121,8 @@ impl LeaseManager {
         Ok(lease)
     }
 
-    /// Allocate or renew exactly the requested address; reject unavailable or out-of-pool addresses.
+    /// Allocate or renew exactly this IP, updating expiry from current wall-clock
+    /// Unix seconds even for an existing lease. Reject unavailable/out-of-pool IPs.
     pub fn allocate_exact(&mut self, mac: [u8; 6], ip: Ipv4Addr) -> Result<DhcpLease> {
         let now = now_unix();
         self.reclaim_expired(now);

@@ -52,6 +52,10 @@ impl WifiApProfileStore {
         }
         Ok(())
     }
+    /// Read and validate the full write payload, including its secret passphrase.
+    /// Never expose this directly as a public API response. The directory is created/chmodded
+    /// at open, not by this read; invalid metadata, names, symlinks,
+    /// missing documents and I/O failures return errors.
     pub fn get(&self, id: &str) -> Result<WifiApProfileWriteRequest> {
         let bytes = Zeroizing::new(self.0.read(id)?.context("AP profile not found")?);
         let stored: StoredProfile = serde_json::from_slice(&bytes)?;
@@ -61,6 +65,9 @@ impl WifiApProfileStore {
         Self::validate(&stored.profile)?;
         Ok(stored.profile)
     }
+    /// Read validated profiles and return summaries without passphrases.
+    /// Opening the store creates/chmods private storage; listing does not. A malformed document or
+    /// I/O failure fails the list rather than silently omitting that profile.
     pub fn list(&self) -> Result<Vec<WifiApProfileSummary>> {
         self.0
             .keys()?
@@ -68,6 +75,11 @@ impl WifiApProfileStore {
             .map(|id| self.get(id).map(|p| summary(&p)))
             .collect()
     }
+    /// Validate and atomically overwrite a profile at private permissions.
+    /// A missing passphrase preserves only this profile's prior secret when secured
+    /// and clear_passphrase is false. Open profiles cannot contain a secret.
+    /// Opening the store creates/chmods private storage; validation, I/O and compensation errors
+    /// propagate. Failed compensation leaves the durable result uncertain.
     pub fn save(&self, mut profile: WifiApProfileWriteRequest) -> Result<WifiApProfileSummary> {
         // Blank credentials preserve only this profile's secret, never another AP's.
         if profile
@@ -91,6 +103,9 @@ impl WifiApProfileStore {
         self.0.write(&id, &bytes)?;
         Ok(result)
     }
+    /// Remove the stored profile, succeeding when absent; leave running APs alone.
+    /// Opening the store creates/chmods storage; deletion does not. Unsafe names/symlinks
+    /// and filesystem or compensation failures propagate.
     pub fn delete(&self, id: &str) -> Result<()> {
         self.0.remove(id)?;
         Ok(())

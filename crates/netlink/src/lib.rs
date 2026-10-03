@@ -345,6 +345,11 @@ impl Ipv4RuleSpec {
 }
 
 #[async_trait]
+/// Kernel observation and mutation adapter; methods do not establish ownership
+/// or acquire the daemon mutation gate. Callers must serialize conflicting
+/// mutations, verify durable ownership before deletion, and retain recovery
+/// evidence on errors: a failed operation may have partially changed the kernel.
+/// Unsupported default methods return errors rather than pretending to observe nothing.
 pub trait NetworkProvider: Send + Sync {
     /// Physical radio identity used by common Wi-Fi admission.
     fn wireless_phy(&self, interface: &str) -> Option<String> {
@@ -353,25 +358,34 @@ pub trait NetworkProvider: Send + Sync {
 
     /// Whether address ownership tags can be trusted on this provider.
     ///
-    /// Implementations must report observed truth, not intent: a provider that
-    /// has seen the kernel drop `IFA_PROTO` is expected to start returning
-    /// `false` so the planner and the ownership guards agree with reality.
+    /// A provider that has observed the kernel dropping `IFA_PROTO` must return
+    /// false so planners and ownership guards use the durable journal fallback.
+    /// The production adapter optimistically returns true before its first tagged
+    /// write/read-back; this is capability policy, not proof of any address
+    /// ownership. Callers must still inspect tags and retain durable evidence.
     fn supports_ipv4_address_protocol(&self) -> bool {
         false
     }
 
+    /// Observe current links; an error must not be interpreted as absence.
     async fn list_interfaces(&self) -> Result<Vec<NetworkInterface>>;
 
+    /// Observe the device hardware address; unsupported providers return an error.
     async fn hardware_address(&self, _interface: &str) -> Result<Vec<u8>> {
         anyhow::bail!("hardware-address observation is not supported by this network provider")
     }
 
+    /// Observe address/prefix and available protocol tags on this interface.
     async fn list_ipv4_addresses(&self, interface: &str) -> Result<Vec<Ipv4AddressInfo>>;
+    /// Request administrative link up; repeated requests do not imply carrier readiness.
     async fn set_link_up(&self, name: &str) -> Result<()>;
+    /// Request administrative link down; caller must authorize disruption and serialize it.
     async fn set_link_down(&self, name: &str) -> Result<()>;
-    /// Install an address. There is deliberately no default implementation and
-    /// no untagged variant of this method: a provider that cannot honour
-    /// `ownership` must say so by failing, never by silently dropping the tag.
+    /// Install an address with the requested ownership tag when supported.
+    /// A kernel that drops IFA_PROTO may still successfully install the address;
+    /// the provider must then report false from supports_ipv4_address_protocol.
+    /// Success alone is not proof of tagging or ownership: callers must retain
+    /// durable ownership journals and use fallback guards on such kernels.
     async fn add_ipv4_address(
         &self,
         interface: &str,
@@ -391,6 +405,9 @@ pub trait NetworkProvider: Send + Sync {
         anyhow::bail!("IPv4 address ownership tagging is not supported by this network provider")
     }
 
+    /// Delete this address/prefix. No ownership check is performed by this method;
+    /// callers must prove ownership and serialize against competing address writers.
+    /// Absence/error semantics are backend-dependent; re-observe before retrying.
     async fn delete_ipv4_address(
         &self,
         interface: &str,
@@ -398,10 +415,12 @@ pub trait NetworkProvider: Send + Sync {
         prefix_len: u8,
     ) -> Result<()>;
 
+    /// Observe IPv4 routes; unsupported/error results are not an empty inventory.
     async fn list_ipv4_routes(&self) -> Result<Vec<Ipv4RouteInfo>> {
         anyhow::bail!("IPv4 route observation is not supported by this network provider")
     }
 
+    /// Observe and sort routes in this table; does not establish ownership.
     async fn list_ipv4_routes_in_table(&self, table: u32) -> Result<Vec<Ipv4RouteInfo>> {
         let mut routes = self.list_ipv4_routes().await?;
         routes.retain(|route| route.table == table);
@@ -420,22 +439,30 @@ pub trait NetworkProvider: Send + Sync {
         Ok(routes)
     }
 
+    /// Install the specified route; retain proof for recovery if the kernel request fails.
+    /// A conflicting existing route is not permission to overwrite foreign state.
     async fn add_ipv4_route(&self, _route: &Ipv4RouteSpec) -> Result<()> {
         anyhow::bail!("IPv4 route creation is not supported by this network provider")
     }
 
+    /// Delete the observed route identity. Caller must verify ownership and keep
+    /// the mutation gate across observation and deletion; foreign routes must survive.
     async fn delete_ipv4_route(&self, _route: &Ipv4RouteInfo) -> Result<()> {
         anyhow::bail!("IPv4 route deletion is not supported by this network provider")
     }
 
+    /// Observe IPv4 policy rules; unsupported/error results are not an empty inventory.
     async fn list_ipv4_rules(&self) -> Result<Vec<Ipv4RuleInfo>> {
         anyhow::bail!("IPv4 rule observation is not supported by this network provider")
     }
 
+    /// Install this policy rule. Caller must reserve its identity and handle partial errors.
     async fn add_ipv4_rule(&self, _rule: &Ipv4RuleSpec) -> Result<()> {
         anyhow::bail!("IPv4 rule creation is not supported by this network provider")
     }
 
+    /// Delete the exact observed policy rule after caller ownership verification;
+    /// this low-level adapter does not authorize removal of foreign rules.
     async fn delete_ipv4_rule(&self, _rule: &Ipv4RuleInfo) -> Result<()> {
         anyhow::bail!("IPv4 rule deletion is not supported by this network provider")
     }

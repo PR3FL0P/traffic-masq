@@ -90,6 +90,11 @@ impl WireGuardProfileStore {
         Ok(target)
     }
 
+    /// Validate and import raw WireGuard bytes, overwriting the named profile at
+    /// 0600. Creates/chmods the directory to 0700; rejects unsafe names/symlinks.
+    /// On publication failure restore previous bytes or remove a new file.
+    /// RollbackFailed means restoration also failed and state is uncertain.
+    /// The returned profile contains private key material.
     pub fn import(
         &self,
         driver: &WireGuardDriver,
@@ -127,6 +132,9 @@ impl WireGuardProfileStore {
         Ok(profile)
     }
 
+    /// Read and parse a named profile, including private keys. Do not log it.
+    /// Creates/chmods the private directory to 0700. Missing files, unsafe names,
+    /// symlinks, parser failures and I/O errors are reported separately.
     pub fn read(
         &self,
         driver: &WireGuardDriver,
@@ -151,6 +159,9 @@ impl WireGuardProfileStore {
         Ok(driver.parse_named_profile(name, &raw)?)
     }
 
+    /// Return sorted metadata summaries without key material. Creates/chmods the
+    /// private directory to 0700; ignores non-files, symlinks and invalid names.
+    /// Does not parse profile contents; filesystem errors propagate.
     pub fn list(&self) -> Result<Vec<WireGuardProfileSummary>, StoreError> {
         let canonical_dir = self.ensure_directory()?;
         let mut summaries = Vec::new();
@@ -178,6 +189,9 @@ impl WireGuardProfileStore {
         Ok(summaries)
     }
 
+    /// Durably delete a profile; a missing profile is NotFound. Creates/chmods
+    /// the private directory; refuses symlinks and non-files. Attempts restoration
+    /// on failure; RollbackFailed means uncertain state. Does not stop a live tunnel.
     pub fn delete(&self, name: &str) -> Result<(), StoreError> {
         let canonical_dir = self.ensure_directory()?;
         let target = self.safe_target(&canonical_dir, name)?;

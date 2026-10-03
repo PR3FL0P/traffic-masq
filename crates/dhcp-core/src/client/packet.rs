@@ -19,6 +19,11 @@ pub struct ClientPacketOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Build Ethernet BOOTREQUEST packets for one transaction and MAC.
+/// Elapsed seconds saturate at u16::MAX; option payloads must fit 255 bytes.
+/// Discover/select/init-reboot use zero ciaddr and broadcast; renew uses the
+/// assigned ciaddr without broadcast, rebind uses it with broadcast.
+/// The builder checks address usability and encoding, not socket routing.
 pub struct ClientPacketBuilder {
     xid: u32,
     mac: [u8; 6],
@@ -214,6 +219,9 @@ pub enum ValidatedReply {
 }
 
 impl ReplyContext {
+    /// Validate an Ethernet BOOTREPLY for this xid/MAC with Offer type, usable
+    /// assigned address and singleton server identifier. Parsing alone is not
+    /// exchange validation; malformed or mismatched replies return Err.
     pub fn validate_offer(&self, packet: &DhcpPacket<'_>) -> Result<Offer> {
         self.correlate(packet)?;
         require_type(packet, DhcpMessageType::Offer)?;
@@ -226,6 +234,10 @@ impl ReplyContext {
         })
     }
 
+    /// Correlate xid/MAC and ACK type, optionally constrain server and address,
+    /// and validate mask, lease/timer invariants and address lists. Absent T1/T2
+    /// use defaults; require 0 < T1 < T2 < lease. Does not prove reachability,
+    /// address uniqueness or ownership of kernel resources.
     pub fn validate_ack(
         &self,
         packet: &DhcpPacket<'_>,
@@ -275,6 +287,9 @@ impl ReplyContext {
         })
     }
 
+    /// Correlate xid/MAC and NAK type with a usable singleton server identifier.
+    /// Reject a server differing from selected_server when supplied.
+    /// This validates the exchange, without changing any lease or runtime state.
     pub fn validate_nak(
         &self,
         packet: &DhcpPacket<'_>,

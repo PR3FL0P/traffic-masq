@@ -451,6 +451,12 @@ pub struct RouterSnapshot {
 }
 
 #[async_trait]
+/// Subsystem hooks used under router mutation serialization. Planning and
+/// snapshots are observational, and snapshots cover affected owned resources,
+/// not arbitrary system state. Apply hooks can fail after partial changes;
+/// callers must journal the snapshot before applying and recover on failure.
+/// Rollback restores only proved owned resources and must refuse foreign
+/// replacements. Retry rollback using the retained snapshot until it succeeds.
 pub trait RouterSubsystems: Send + Sync {
     /// Reject unavailable dependencies before opening a journal or mutating
     /// any subsystem. Recovery of an existing snapshot must bypass this check.
@@ -473,7 +479,9 @@ pub trait RouterSubsystems: Send + Sync {
     /// Collect the complete plan in dependency order. Keep narrow route, VPN,
     /// and dataplane planners for drift repair without replanning the router.
     async fn plan_for(&self, desired: &RouterDesired) -> Result<RouterSubsystemPlan>;
+    /// Observe route differences without mutating kernel state or ownership.
     async fn plan_routes(&self, desired: &RouterDesired) -> Result<RoutePlan>;
+    /// Observe dataplane differences without adopting resources or applying rules.
     async fn plan_dataplane(&self, desired: &RouterDesired) -> Result<RouterDataplanePlan>;
 
     /// Plan the VPN hop chain for narrow drift repair as well as full plans.
@@ -503,21 +511,27 @@ pub trait RouterSubsystems: Send + Sync {
     /// Capture recovery state for the subsystems affected by the desired router intent.
     async fn snapshot_for(&self, desired: &RouterDesired) -> Result<RouterSnapshot>;
 
+    /// Apply interface plans in order; an error may leave earlier changes applied.
     async fn apply_interfaces(&self, plan: &[InterfaceChangePlan]) -> Result<()>;
+    /// Apply client Wi-Fi plans; partial errors require snapshot-based recovery.
     async fn apply_uplink_wifi(&self, plan: &[WifiPlan<WifiClientSpec>]) -> Result<()> {
         if !plan.is_empty() {
             anyhow::bail!("uplink Wi-Fi runtime is unavailable")
         }
         Ok(())
     }
+    /// Apply AP plans; partial errors require snapshot-based recovery.
     async fn apply_output_wifi(&self, plan: &[WifiPlan<WifiApSpec>]) -> Result<()> {
         if !plan.is_empty() {
             anyhow::bail!("output Wi-Fi runtime is unavailable")
         }
         Ok(())
     }
+    /// Apply planned owned route changes, refusing conflicting foreign state.
     async fn apply_routes(&self, plan: &RoutePlan) -> Result<()>;
+    /// Apply server DHCP plans; errors may leave some services changed.
     async fn apply_dhcp(&self, plan: &[DhcpPlan]) -> Result<()>;
+    /// Apply the planned owned dataplane; retain snapshot on partial error.
     async fn apply_dataplane(&self, plan: &RouterDataplanePlan) -> Result<()>;
     /// Stop DHCP clients whose ownership must disappear before interface
     /// configuration is mutated.
@@ -540,31 +554,39 @@ pub trait RouterSubsystems: Send + Sync {
         Ok(())
     }
 
+    /// Restore recorded interfaces without removing unproved foreign addresses.
     async fn rollback_interfaces(&self, snapshot: &[InterfaceSnapshot]) -> Result<()>;
+    /// Restore recorded client intent/runtime; refuse foreign process identities.
     async fn rollback_uplink_wifi(&self, snapshot: &[WifiSnapshot<WifiClientSpec>]) -> Result<()> {
         if !snapshot.is_empty() {
             anyhow::bail!("uplink Wi-Fi runtime is unavailable")
         }
         Ok(())
     }
+    /// Restore recorded AP intent/runtime; refuse foreign process identities.
     async fn rollback_output_wifi(&self, snapshot: &[WifiSnapshot<WifiApSpec>]) -> Result<()> {
         if !snapshot.is_empty() {
             anyhow::bail!("output Wi-Fi runtime is unavailable")
         }
         Ok(())
     }
+    /// Restore scoped owned routes, refusing conflicting foreign identities.
     async fn rollback_routes(&self, snapshot: &RouteSnapshot) -> Result<()>;
+    /// Restore captured servers and stop only services recorded as previously absent.
     async fn rollback_dhcp_scoped(
         &self,
         snapshot: &[DhcpServiceSpec],
         previously_absent: &[String],
     ) -> Result<()>;
+    /// Restore the captured owned dataplane; preserve foreign tables and rules.
     async fn rollback_dataplane(&self, snapshot: &RouterDataplaneSnapshot) -> Result<()>;
     /// Stop DHCP runtime installed by the candidate before interface rollback.
     /// Previous DHCP intent is restored by `rollback_dhcp_clients` afterwards.
     async fn rollback_candidate_uplink_dhcp(&self) -> Result<()> {
         Ok(())
     }
+    /// Restore captured client leases/configuration, with legacy uplink compatibility.
+    /// Keep durable lease ownership on cleanup failure.
     async fn rollback_dhcp_clients(
         &self,
         snapshots: &[DhcpClientSnapshot],
@@ -577,6 +599,7 @@ pub trait RouterSubsystems: Send + Sync {
         let _ = legacy;
         Ok(())
     }
+    /// Restore the captured chain using recorded launch ownership; refuse foreign links.
     async fn rollback_vpn_chain(&self, snapshot: &VpnChainSnapshot) -> Result<()> {
         if !snapshot.hops.is_empty() {
             anyhow::bail!("VPN chain runtime is unavailable")
