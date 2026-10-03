@@ -16,7 +16,7 @@ use rtnetlink::{new_connection, Handle};
 use thiserror::Error;
 use tokio::task::JoinHandle;
 
-use crate::wireguard::{WireGuardKey, WireGuardPeerConfig};
+use crate::wireguard::{WireGuardEndpoint, WireGuardKey, WireGuardPeerConfig};
 
 #[derive(Debug, Error)]
 pub enum ProviderError {
@@ -54,6 +54,8 @@ pub trait VpnProvider: Send + Sync {
         name: &str,
         launch_marker: &str,
     ) -> Result<bool, ProviderError>;
+
+    async fn set_mtu(&self, name: &str, mtu: u32) -> Result<(), ProviderError>;
 
     async fn set_addresses(&self, name: &str, addresses: &[IpNet]) -> Result<(), ProviderError>;
 
@@ -100,6 +102,10 @@ impl VpnProvider for Arc<dyn VpnProvider> {
         (**self)
             .delete_link_if_launch_marker(name, launch_marker)
             .await
+    }
+
+    async fn set_mtu(&self, name: &str, mtu: u32) -> Result<(), ProviderError> {
+        (**self).set_mtu(name, mtu).await
     }
 
     async fn set_addresses(&self, name: &str, addresses: &[IpNet]) -> Result<(), ProviderError> {
@@ -197,6 +203,10 @@ impl VpnProvider for LazyNetlinkVpnProvider {
             .await?
             .delete_link_if_launch_marker(name, launch_marker)
             .await
+    }
+
+    async fn set_mtu(&self, name: &str, mtu: u32) -> Result<(), ProviderError> {
+        self.provider().await?.set_mtu(name, mtu).await
     }
 
     async fn set_addresses(&self, name: &str, addresses: &[IpNet]) -> Result<(), ProviderError> {
@@ -328,8 +338,8 @@ fn peer_to_wireguard_peer(peer: &WireGuardPeerConfig) -> WireguardPeer {
     if let Some(preshared_key) = &peer.preshared_key {
         attributes.push(WireguardPeerAttribute::PresharedKey(preshared_key.0));
     }
-    if let Some(endpoint) = peer.endpoint {
-        attributes.push(WireguardPeerAttribute::Endpoint(endpoint));
+    if let Some(WireGuardEndpoint::Address(endpoint)) = &peer.endpoint {
+        attributes.push(WireguardPeerAttribute::Endpoint(*endpoint));
     }
     if let Some(keepalive) = peer.persistent_keepalive {
         attributes.push(WireguardPeerAttribute::PersistentKeepalive(keepalive));
@@ -420,6 +430,17 @@ impl VpnProvider for NetlinkVpnProvider {
         Ok(true)
     }
 
+    async fn set_mtu(&self, name: &str, mtu: u32) -> Result<(), ProviderError> {
+        let index = self.link_index(name).await?;
+        self.rt_handle
+            .link()
+            .set(index)
+            .mtu(mtu)
+            .execute()
+            .await
+            .map_err(|error| ProviderError::Netlink(error.to_string()))
+    }
+
     async fn set_addresses(&self, name: &str, addresses: &[IpNet]) -> Result<(), ProviderError> {
         let index = self.link_index(name).await?;
         for address in addresses {
@@ -438,6 +459,18 @@ impl VpnProvider for NetlinkVpnProvider {
         name: &str,
         peers: &[WireGuardPeerConfig],
     ) -> Result<(), ProviderError> {
+        let mut peers = peers.to_vec();
+        for peer in &mut peers {
+            if let Some(endpoint) = &peer.endpoint {
+                peer.endpoint = Some(WireGuardEndpoint::Address(
+                    endpoint.resolve().await.map_err(|error| {
+                        ProviderError::Connect(format!(
+                            "WireGuard endpoint resolution failed: {error}"
+                        ))
+                    })?,
+                ));
+            }
+        }
         let wg_peers = peers.iter().map(peer_to_wireguard_peer).collect();
         self.set_device(vec![
             WireguardAttribute::IfName(name.to_string()),

@@ -381,7 +381,7 @@ async fn run_happy_path(fixture: &mut VpnNamespaceFixture) -> Result<()> {
 
     let profile_contents = format!(
         "[Interface]\nPrivateKey = {host_private_key}\nAddress = {HOST_TUNNEL_ADDR}/24\n\
-         ListenPort = {HOST_LISTEN_PORT}\n\n[Peer]\nPublicKey = {peer_public_key}\n\
+         ListenPort = {HOST_LISTEN_PORT}\nMTU = 1280\n\n[Peer]\nPublicKey = {peer_public_key}\n\
          AllowedIPs = {PEER_TUNNEL_ADDR}/32\nEndpoint = {PEER_UNDERLAY_ADDR}:{PEER_LISTEN_PORT}\n\
          PersistentKeepalive = 1\n"
     );
@@ -415,6 +415,13 @@ async fn run_happy_path(fixture: &mut VpnNamespaceFixture) -> Result<()> {
         }
         other => bail!("unexpected response to VpnActivate: {other:?}"),
     }
+
+    let link = Command::new("ip")
+        .args(["-j", "link", "show", "dev", "tm-wg0"])
+        .output()?;
+    assert!(link.status.success());
+    let link: serde_json::Value = serde_json::from_slice(&link.stdout)?;
+    assert_eq!(link[0]["mtu"], 1280);
 
     timeout(WAIT_TIMEOUT, wait_for_handshake())
         .await

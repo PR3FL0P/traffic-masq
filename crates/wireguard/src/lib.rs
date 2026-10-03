@@ -5,6 +5,6 @@ mod wireguard;
 
 pub use provider::{LazyNetlinkVpnProvider, NetlinkVpnProvider, ProviderError, VpnProvider};
 pub use wireguard::{
-    validate_wireguard_profile_name, ProfileError, WireGuardDriver, WireGuardInterfaceConfig,
-    WireGuardKey, WireGuardPeerConfig, WireGuardProfile,
+    validate_wireguard_profile_name, ProfileError, WireGuardDriver, WireGuardEndpoint,
+    WireGuardInterfaceConfig, WireGuardKey, WireGuardPeerConfig, WireGuardProfile,
 };

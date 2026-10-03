@@ -1,8 +1,8 @@
 use crate::vpn::{VpnDriver, VpnDriverError, VpnKind, VpnProvider};
 
 pub use traffic_masq_wireguard::{
-    validate_wireguard_profile_name, ProfileError, WireGuardDriver, WireGuardInterfaceConfig,
-    WireGuardKey, WireGuardPeerConfig, WireGuardProfile,
+    validate_wireguard_profile_name, ProfileError, WireGuardDriver, WireGuardEndpoint,
+    WireGuardInterfaceConfig, WireGuardKey, WireGuardPeerConfig, WireGuardProfile,
 };
 
 pub struct WireGuardVpnDriver {
@@ -83,6 +83,18 @@ impl VpnDriver for WireGuardVpnDriver {
         profile: &Self::Profile,
         launch_marker: &str,
     ) -> Result<Self::OwnershipProof, VpnDriverError> {
+        let mut peers = profile.peers.clone();
+        for peer in &mut peers {
+            if let Some(endpoint) = &peer.endpoint {
+                peer.endpoint = Some(WireGuardEndpoint::Address(
+                    endpoint.resolve().await.map_err(|error| {
+                        crate::vpn::ProviderError::Connect(format!(
+                            "WireGuard endpoint resolution failed: {error}"
+                        ))
+                    })?,
+                ));
+            }
+        }
         self.provider
             .create_link(
                 interface,
@@ -93,10 +105,13 @@ impl VpnDriver for WireGuardVpnDriver {
             .await?;
 
         let activation = async {
+            if let Some(mtu) = profile.interface.mtu {
+                self.provider.set_mtu(interface, mtu).await?;
+            }
             self.provider
                 .set_addresses(interface, &profile.interface.addresses)
                 .await?;
-            self.provider.set_peers(interface, &profile.peers).await?;
+            self.provider.set_peers(interface, &peers).await?;
             self.provider.set_link_up(interface).await?;
 
             self.provider.public_key(interface).await?.ok_or_else(|| {

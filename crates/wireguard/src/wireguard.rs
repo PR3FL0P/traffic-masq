@@ -77,11 +77,87 @@ impl fmt::Debug for WireGuardInterfaceConfig {
     }
 }
 
+/// Endpoint syntax is validated on import; DNS is resolved at connection time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireGuardEndpoint {
+    Address(SocketAddr),
+    Hostname { host: String, port: u16 },
+}
+
+impl std::str::FromStr for WireGuardEndpoint {
+    type Err = ProfileError;
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        if let Ok(address) = raw.parse::<SocketAddr>() {
+            return Ok(Self::Address(address));
+        }
+        let invalid = || ProfileError::InvalidEndpoint(raw.into());
+        let (host, port) = raw.rsplit_once(':').ok_or_else(invalid)?;
+        let port = port.parse::<u16>().map_err(|_| invalid())?;
+        if port == 0
+            || host.is_empty()
+            || host.len() > 253
+            || host.contains(':')
+            || !host
+                .strip_suffix('.')
+                .unwrap_or(host)
+                .split('.')
+                .all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && !label.starts_with('-')
+                        && !label.ends_with('-')
+                        && label
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                })
+        {
+            return Err(invalid());
+        }
+        Ok(Self::Hostname {
+            host: host.into(),
+            port,
+        })
+    }
+}
+
+impl WireGuardEndpoint {
+    pub async fn resolve(&self) -> std::io::Result<SocketAddr> {
+        match self {
+            Self::Address(address) => Ok(*address),
+            Self::Hostname { host, port } => {
+                let addresses = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    tokio::net::lookup_host((host.as_str(), *port)),
+                )
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "WireGuard endpoint DNS lookup timed out",
+                    )
+                })??;
+                let addresses: Vec<_> = addresses.collect();
+                addresses
+                    .iter()
+                    .find(|address| address.is_ipv4())
+                    .copied()
+                    .or_else(|| addresses.first().copied())
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "WireGuard endpoint DNS lookup returned no addresses",
+                        )
+                    })
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct WireGuardPeerConfig {
     pub public_key: WireGuardKey,
     pub allowed_ips: Vec<IpNet>,
-    pub endpoint: Option<SocketAddr>,
+    pub endpoint: Option<WireGuardEndpoint>,
     pub persistent_keepalive: Option<u16>,
 
     pub preshared_key: Option<WireGuardKey>,
@@ -369,7 +445,7 @@ fn parse_config(name: &str, raw: &[u8]) -> Result<WireGuardProfile, ProfileError
 
         let endpoint = match peer_raw.endpoint {
             Some(raw) => Some(
-                raw.parse::<SocketAddr>()
+                raw.parse::<WireGuardEndpoint>()
                     .map_err(|_| ProfileError::InvalidEndpoint(raw.clone()))?,
             ),
             None => None,

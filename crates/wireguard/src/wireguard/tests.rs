@@ -156,18 +156,45 @@ fn rejects_endpoint_garbage_host() {
 }
 
 #[test]
-fn rejects_endpoint_with_hostname_instead_of_ip() {
-    let bad = valid_config().replace(
-        "Endpoint = 203.0.113.1:51820\n",
-        "Endpoint = vpn.example.com:51820\n",
-    );
-    let err = WireGuardDriver
-        .parse_named_profile("home.conf", bad.as_bytes())
-        .unwrap_err();
+fn accepts_endpoint_hostname_without_resolving_it_during_import() {
+    let config = valid_config().replace("203.0.113.1:51820", "wg010.njalla.no:51820");
+    let profile = WireGuardDriver
+        .parse_named_profile("wg0.conf", config.as_bytes())
+        .unwrap();
     assert_eq!(
-        err,
-        ProfileError::InvalidEndpoint("vpn.example.com:51820".to_string())
+        profile.peers[0].endpoint,
+        Some(WireGuardEndpoint::Hostname {
+            host: "wg010.njalla.no".into(),
+            port: 51820
+        })
     );
+}
+
+#[tokio::test]
+async fn endpoint_resolution_handles_numeric_and_localhost_addresses() {
+    let numeric: WireGuardEndpoint = "192.0.2.1:51820".parse().unwrap();
+    assert_eq!(
+        numeric.resolve().await.unwrap(),
+        "192.0.2.1:51820".parse().unwrap()
+    );
+    let local: WireGuardEndpoint = "localhost:51820".parse().unwrap();
+    let address = local.resolve().await.unwrap();
+    assert!(address.ip().is_loopback());
+    assert_eq!(address.port(), 51820);
+}
+
+#[test]
+fn endpoint_hostname_allows_only_one_trailing_root_dot() {
+    for host in ["vpn.example.com", "vpn.example.com."] {
+        assert!(format!("{host}:51820").parse::<WireGuardEndpoint>().is_ok());
+    }
+    for host in ["vpn.example.com..", "vpn..example.com", "."] {
+        let endpoint = format!("{host}:51820");
+        assert_eq!(
+            endpoint.parse::<WireGuardEndpoint>().unwrap_err(),
+            ProfileError::InvalidEndpoint(endpoint)
+        );
+    }
 }
 
 #[test]

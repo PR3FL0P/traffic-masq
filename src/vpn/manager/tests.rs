@@ -646,3 +646,24 @@ fn ownership_record_round_trip_matches_kernel_reported_key() {
     assert_eq!(record.ownership_proof, expected_public);
     assert_eq!(record.interface, OWNED_INTERFACE_NAME);
 }
+
+#[tokio::test]
+async fn hostname_profile_activation_applies_mtu_and_remains_cancellable() {
+    let (manager, fake, _directory) = manager_with_store();
+    let contents = valid_config(VALID_PRIVATE_KEY)
+        .replace(
+            "Address = 10.0.0.2/24",
+            "Address = 10.13.37.172/24\nDNS = 95.215.19.53\nMTU = 1280",
+        )
+        .replace("203.0.113.1:51820", "localhost:51820");
+    manager
+        .import_profile("wg0.conf", contents.as_bytes())
+        .unwrap();
+    manager.activate("wg0.conf").await.unwrap();
+    assert_eq!(
+        fake.mtus.lock().unwrap().get(OWNED_INTERFACE_NAME).copied(),
+        Some(1280)
+    );
+    manager.deactivate().await.unwrap();
+    assert!(!fake.link_exists(OWNED_INTERFACE_NAME).await.unwrap());
+}

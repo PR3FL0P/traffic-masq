@@ -475,8 +475,10 @@ Import a profile with a plain basename ending in `.conf` (for example
 `PersistentKeepalive`, `PresharedKey`. A private key and at least one peer with
 a public key are required. Keys must decode to 32 bytes.
 
-Endpoints must be numeric socket addresses, such as `203.0.113.10:51820` or
-`[2001:db8::10]:51820`; hostname resolution is not implemented. Unknown keys
+Endpoints accept numeric socket addresses, such as `203.0.113.10:51820` or
+`[2001:db8::10]:51820`, and hostnames such as `vpn.example.org:51820`. Hostnames
+are resolved at activation, with a 10-second timeout, before creating the tunnel.
+Profile MTU is applied before bringing the tunnel up. Unknown keys
 are ignored, including `wg-quick` hooks (`PreUp`, `PostUp`, `PreDown`,
 `PostDown`) and `Table`. Hooks are never executed. `DNS` values are parsed as
 IP addresses but do not configure the system resolver. Profile activation and

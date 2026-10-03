@@ -1161,6 +1161,10 @@ impl traffic_masq::vpn::VpnProvider for FakeVpnProvider {
         Ok(true)
     }
 
+    async fn set_mtu(&self, name: &str, _mtu: u32) -> Result<(), traffic_masq::vpn::ProviderError> {
+        self.require_link(name)
+    }
+
     async fn set_addresses(
         &self,
         name: &str,

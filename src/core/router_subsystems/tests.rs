@@ -633,6 +633,10 @@ impl VpnProvider for FakeChainVpnProvider {
         Ok(true)
     }
 
+    async fn set_mtu(&self, _name: &str, _mtu: u32) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
     async fn set_addresses(
         &self,
         name: &str,

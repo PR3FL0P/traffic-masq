@@ -530,6 +530,7 @@ struct FakeVpnLink {
 /// In-memory WireGuard provider for tests that need ownership-proof semantics.
 #[derive(Default)]
 pub(crate) struct FakeVpnProvider {
+    pub(crate) mtus: StdMutex<HashMap<String, u32>>,
     links: StdMutex<HashMap<String, FakeVpnLink>>,
 }
 
@@ -618,6 +619,12 @@ impl VpnProvider for FakeVpnProvider {
         }
         self.delete_link(name).await?;
         Ok(true)
+    }
+
+    async fn set_mtu(&self, name: &str, mtu: u32) -> Result<(), ProviderError> {
+        self.require_link(name)?;
+        self.mtus.lock().unwrap().insert(name.into(), mtu);
+        Ok(())
     }
 
     async fn set_addresses(
@@ -749,6 +756,10 @@ impl VpnProvider for StaticKeyVpnProvider {
         }
         self.delete_link(name).await?;
         Ok(true)
+    }
+
+    async fn set_mtu(&self, _name: &str, _mtu: u32) -> Result<(), ProviderError> {
+        Ok(())
     }
 
     async fn set_addresses(
