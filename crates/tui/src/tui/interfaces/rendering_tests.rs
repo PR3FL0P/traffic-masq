@@ -159,3 +159,37 @@ fn missing_saved_interface_is_visible_without_observed_identity_at_80_columns() 
     );
     assert!(app.dashboard.interfaces.is_empty());
 }
+
+#[test]
+fn dhcp_inventory_has_its_own_title_and_colored_server_status() {
+    use traffic_masq_protocol::{
+        InterfaceConfigSource, InterfaceInventoryEntry, InterfacePresence, InterfaceReadiness,
+    };
+    let mut app = TuiApp::default();
+    app.dashboard.inventory = Some(vec![InterfaceInventoryEntry {
+        name: "wlan0".into(),
+        observed: None,
+        configured: None,
+        config_source: InterfaceConfigSource::None,
+        presence: InterfacePresence::Missing,
+        readiness: InterfaceReadiness::Disabled,
+        blockers: Vec::new(),
+        observation_stale: false,
+        suppressed: false,
+        references: Vec::new(),
+    }]);
+    app.dhcp_interfaces = vec!["wlan0".into()];
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| super::super::dhcp::render_dhcp_interface_list(frame, frame.area(), &mut app))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+    assert!(text.contains("DHCP servers"));
+    assert!(text.contains("active"));
+    assert!(!text.contains("Interfaces |"));
+    assert!(buffer
+        .content()
+        .iter()
+        .any(|cell| cell.symbol() == "a" && cell.fg == theme::GOOD));
+}

@@ -125,7 +125,7 @@ pub(crate) fn render_dhcp_interface_list(
     app: &mut TuiApp,
 ) {
     if app.dashboard.inventory.is_some() {
-        super::interfaces::render_interface_list(frame, area, app);
+        super::interfaces::render_interface_inventory(frame, area, app, true);
         return;
     }
     let block = panel("DHCP interfaces");

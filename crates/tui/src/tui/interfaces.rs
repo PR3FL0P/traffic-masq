@@ -173,22 +173,64 @@ pub(crate) fn interface_count(app: &TuiApp) -> usize {
 }
 
 pub(crate) fn render_interface_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
+    render_interface_inventory(frame, area, app, false);
+}
+
+pub(crate) fn render_interface_inventory(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    app: &mut TuiApp,
+    dhcp: bool,
+) {
     if let Some(entries) = &app.dashboard.inventory {
-        let block = panel("Interfaces | Enter: edit | missing: saved settings");
+        let block = panel(if dhcp {
+            "DHCP servers | Enter: configure"
+        } else {
+            "Interfaces | Enter: edit"
+        });
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        app.ui.list_area = Some(inner);
+        let name_width = entries
+            .iter()
+            .map(|entry| entry.name.chars().count() + if entry.suppressed { 12 } else { 0 })
+            .max()
+            .unwrap_or(16)
+            .max(16);
+        let header = format!(
+            "  {:<name_width$} {:<8} {:<6} {:<20} IPv4",
+            "Interface",
+            "Device",
+            "Link",
+            if dhcp { "DHCP server" } else { "Management" }
+        );
+        frame.render_widget(
+            Paragraph::new(header).style(
+                Style::default()
+                    .fg(theme::MUTED)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Rect {
+                height: inner.height.min(1),
+                ..inner
+            },
+        );
+        let rows = Rect {
+            y: inner.y.saturating_add(1),
+            height: inner.height.saturating_sub(1),
+            ..inner
+        };
+        app.ui.list_area = Some(rows);
         app.ui.list_row_height = 1;
         app.ui.list_count = entries.len();
         let offset = app
             .selected_inventory_interface
-            .saturating_sub((inner.height as usize).saturating_sub(1));
+            .saturating_sub((rows.height as usize).saturating_sub(1));
         app.ui.list_scroll_offset = offset;
         let lines: Vec<Line> = entries
             .iter()
             .enumerate()
             .skip(offset)
-            .take(inner.height as usize)
+            .take(rows.height as usize)
             .map(|(index, entry)| {
                 let marker = if index == app.selected_inventory_interface {
                     "▶"
@@ -196,19 +238,18 @@ pub(crate) fn render_interface_list(frame: &mut ratatui::Frame<'_>, area: Rect, 
                     " "
                 };
                 let presence = match entry.presence {
-                    traffic_masq_protocol::InterfacePresence::Present => {
-                        if entry
-                            .observed
-                            .as_ref()
-                            .is_some_and(|status| status.interface.is_up)
-                        {
-                            "up"
-                        } else {
-                            "down"
-                        }
-                    }
+                    traffic_masq_protocol::InterfacePresence::Present => "present",
                     traffic_masq_protocol::InterfacePresence::Missing => "missing",
                     traffic_masq_protocol::InterfacePresence::Unknown => "unknown",
+                };
+                let link = if presence == "present" {
+                    match entry.observed.as_ref() {
+                        Some(status) if status.interface.is_up => "up",
+                        Some(_) => "down",
+                        None => "?",
+                    }
+                } else {
+                    "—"
                 };
                 let configured = entry
                     .configured
@@ -235,17 +276,81 @@ pub(crate) fn render_interface_list(frame: &mut ratatui::Frame<'_>, area: Rect, 
                 } else {
                     Style::default()
                 };
-                Line::styled(
-                    format!(
-                        "{marker} {}{}  {presence}  {addresses}{configured}",
-                        entry.name,
-                        if entry.suppressed { " [forgotten]" } else { "" }
+                let presence_color = match presence {
+                    "present" => theme::MUTED,
+                    "missing" | "unknown" => theme::WARN,
+                    _ => theme::MUTED,
+                };
+                let mut spans = vec![
+                    Span::styled(
+                        format!(
+                            "{marker} {:<name_width$} ",
+                            if entry.suppressed {
+                                format!("{} [forgotten]", entry.name)
+                            } else {
+                                entry.name.clone()
+                            }
+                        ),
+                        style,
                     ),
-                    style,
-                )
+                    Span::styled(
+                        format!("{presence:<8} "),
+                        Style::default().fg(presence_color),
+                    ),
+                    Span::styled(
+                        format!("{link:<6} "),
+                        Style::default().fg(if link == "up" {
+                            theme::GOOD
+                        } else {
+                            theme::MUTED
+                        }),
+                    ),
+                ];
+                if !dhcp {
+                    let (owner, color) =
+                        if entry.presence == traffic_masq_protocol::InterfacePresence::Unknown {
+                            ("unknown", theme::WARN)
+                        } else if entry
+                            .configured
+                            .as_ref()
+                            .is_some_and(|config| config.managed)
+                        {
+                            if presence == "missing" {
+                                ("saved: traffic-masq", theme::WARN)
+                            } else {
+                                ("traffic-masq", theme::GOOD)
+                            }
+                        } else {
+                            ("unmanaged", theme::MUTED)
+                        };
+                    spans.push(Span::styled(
+                        format!("{owner:<20} "),
+                        Style::default().fg(color),
+                    ));
+                }
+                if dhcp {
+                    let active = app.dhcp_interfaces.iter().any(|name| name == &entry.name);
+                    let saved = entry
+                        .configured
+                        .as_ref()
+                        .is_some_and(|config| config.dhcp.is_some());
+                    let (label, color) = if active {
+                        ("active", theme::GOOD)
+                    } else if saved {
+                        ("configured", theme::WARN)
+                    } else {
+                        ("disabled", theme::MUTED)
+                    };
+                    spans.push(Span::styled(
+                        format!("{label:<20} "),
+                        Style::default().fg(color),
+                    ));
+                }
+                spans.push(Span::raw(format!("{addresses}{configured}")));
+                Line::from(spans)
             })
             .collect();
-        frame.render_widget(Paragraph::new(lines), inner);
+        frame.render_widget(Paragraph::new(lines), rows);
         return;
     }
     let block = panel("Interfaces | [ext] external, [?] ownership unknown");
