@@ -1,5 +1,72 @@
 use super::*;
 
+#[tokio::test]
+async fn disabling_a_missing_client_saves_without_enabled_wifi_or_dhcp() {
+    use http_body_util::{BodyExt, Full};
+    use hyper::{body::Bytes, server::conn::http1, service::service_fn};
+    use hyper_util::rt::TokioIo;
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("api.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        http1::Builder::new()
+            .serve_connection(
+                TokioIo::new(stream),
+                service_fn(
+                    |request: hyper::Request<hyper::body::Incoming>| async move {
+                        assert_eq!(request.method(), hyper::Method::PUT);
+                        assert_eq!(request.uri().path(), "/api/v1/interfaces/wlan0/intent");
+                        let body: serde_json::Value = serde_json::from_slice(
+                            &request.into_body().collect().await.unwrap().to_bytes(),
+                        )
+                        .unwrap();
+                        assert_eq!(body["expected_revision"], 7);
+                        assert_eq!(body["config"]["managed"], false);
+                        assert!(body["config"]["wifi_client"].is_null());
+                        assert!(body["config"]["dhcp_client"].is_null());
+                        let response = Response::InterfaceIntentSaved {
+                            interface: "wlan0".into(),
+                            revision: 8,
+                            deferred: true,
+                            missing_dependencies: vec!["wlan0".into()],
+                        };
+                        Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(
+                            Bytes::from(serde_json::to_vec(&response).unwrap()),
+                        )))
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+    });
+    let mut editor = default_route_editor(true);
+    editor.cidr.clear();
+    editor.original_cidr.clear();
+    editor.current_addresses.clear();
+    editor.role = InterfaceRole::Input;
+    editor.managed = false;
+    editor.offline_revision = Some(7);
+    editor.saved_config = Some(
+        serde_json::from_value(serde_json::json!({
+            "role": "input", "managed": true,
+            "wifi_client": {"ssid": "saved", "security": "open"},
+            "dhcp_client": {"enabled": true}
+        }))
+        .unwrap(),
+    );
+    let mut app = TuiApp {
+        screen: Screen::InterfaceEditor,
+        editor: Some(editor),
+        ..Default::default()
+    };
+    let client = ApiClient::new(socket);
+    handle_editor_key(&mut app, KeyCode::Enter, &client).await;
+    server.await.unwrap();
+    assert_eq!(app.screen, Screen::InterfaceList);
+    assert!(app.pending.is_none());
+}
+
 fn observed_address(
     protocol: Option<u8>,
     owned: Option<bool>,

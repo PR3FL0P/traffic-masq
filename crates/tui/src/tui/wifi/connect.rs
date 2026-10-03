@@ -9,8 +9,8 @@ pub(crate) async fn open_wifi_connect_prompt(
     ssid: String,
 ) {
     let (current_static_ip, expected_revision) =
-        match client.request(&Request::ListWifiInventory).await {
-            Ok(Response::WifiInventory {
+        match client.request(&Request::ListInterfaceInventory).await {
+            Ok(Response::InterfaceInventory {
                 revision,
                 interfaces,
                 observation_error,
@@ -23,9 +23,7 @@ pub(crate) async fn open_wifi_connect_prompt(
                     );
                     return;
                 }
-                let Some(entry) = interfaces
-                    .into_iter()
-                    .find(|entry| entry.interface.name == interface)
+                let Some(entry) = interfaces.into_iter().find(|entry| entry.name == interface)
                 else {
                     app.push_message(
                         LogLevel::Warn,
@@ -33,7 +31,7 @@ pub(crate) async fn open_wifi_connect_prompt(
                     );
                     return;
                 };
-                if entry.interface.presence == traffic_masq_protocol::InterfacePresence::Unknown {
+                if entry.presence == traffic_masq_protocol::InterfacePresence::Unknown {
                     app.push_message(
                         LogLevel::Warn,
                         "Device observation unavailable; refresh before selecting a profile",
@@ -41,13 +39,12 @@ pub(crate) async fn open_wifi_connect_prompt(
                     return;
                 }
                 let cidr = entry
-                    .interface
                     .configured
                     .and_then(|config| config.ipv4)
                     .map(|ip| ip.to_string());
                 (
                     cidr,
-                    (entry.interface.presence == traffic_masq_protocol::InterfacePresence::Missing)
+                    (entry.presence == traffic_masq_protocol::InterfacePresence::Missing)
                         .then_some(revision),
                 )
             }
@@ -155,6 +152,23 @@ pub(super) async fn submit_wifi_connect(app: &mut TuiApp, client: &ApiClient) {
     let Some(prompt) = app.wifi_connect.clone() else {
         return;
     };
+    if let Some(change) = app
+        .dashboard
+        .pending_network_changes
+        .iter()
+        .find(|change| change.interface == prompt.interface)
+        .cloned()
+    {
+        app.pending = Some(change);
+        app.pending_return_screen = Screen::Wifi;
+        app.wifi_connect = None;
+        app.screen = Screen::PendingChange;
+        app.push_message(
+            LogLevel::Warn,
+            "Inspect the pending network transaction before reconnecting Wi-Fi",
+        );
+        return;
+    }
     let static_cidr = match prompt.choice {
         WifiIpChoice::Dhcp => None,
         WifiIpChoice::KeepStatic => prompt.current_static_ip.as_deref(),
@@ -213,9 +227,11 @@ pub(super) async fn submit_wifi_connect(app: &mut TuiApp, client: &ApiClient) {
             app.screen = Screen::PendingChange;
             app.push_message(LogLevel::Info, "Wi-Fi candidate applied. Verify connectivity before confirming; otherwise it will roll back.");
         }
-        result => app.push_message(
-            LogLevel::Warn,
-            format!("Wi-Fi connection was not confirmed: {result:?}"),
+        Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
+        Err(error) => app.push_message(LogLevel::Error, error.to_string()),
+        Ok(response) => app.push_message(
+            LogLevel::Error,
+            format!("Unexpected Wi-Fi connection response: {response:?}"),
         ),
     }
 }

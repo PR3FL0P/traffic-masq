@@ -223,7 +223,7 @@ async fn connect_failure_uses_one_backend_operation() {
         vec!["PUT /api/v1/wifi-client/wlan0/provision"]
     );
     assert!(app.wifi_connect.is_some());
-    assert!(app.message.as_deref().unwrap().contains("not confirmed"));
+    assert_eq!(app.message.as_deref(), Some("activation failed"));
 }
 
 #[tokio::test]
@@ -2077,11 +2077,61 @@ fn saved_client_inventory(presence: traffic_masq_protocol::InterfacePresence) ->
     }
 }
 
+fn saved_client_interface_inventory(
+    presence: traffic_masq_protocol::InterfacePresence,
+) -> Response {
+    let Response::WifiInventory {
+        revision,
+        interfaces,
+        observation_error,
+        ..
+    } = saved_client_inventory(presence)
+    else {
+        unreachable!()
+    };
+    Response::InterfaceInventory {
+        revision,
+        interfaces: interfaces
+            .into_iter()
+            .map(|entry| entry.interface)
+            .collect(),
+        observation_error,
+        suppressed_interfaces: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn missing_client_without_wifi_settings_can_reopen_a_saved_profile_prompt() {
+    let mut inventory =
+        saved_client_interface_inventory(traffic_masq_protocol::InterfacePresence::Missing);
+    if let Response::InterfaceInventory { interfaces, .. } = &mut inventory {
+        interfaces[0].configured.as_mut().unwrap().wifi_client = None;
+    }
+    let (_dir, client, server) = mock_api(vec![inventory]).await;
+    let mut app = TuiApp::default();
+    open_wifi_connect_prompt(
+        &mut app,
+        &client,
+        "wlan0".into(),
+        "home".into(),
+        "Home".into(),
+    )
+    .await;
+    assert_eq!(
+        app.wifi_connect.as_ref().unwrap().expected_revision,
+        Some(7)
+    );
+    assert_eq!(
+        server.await.unwrap(),
+        vec!["GET /api/v1/interface-inventory"]
+    );
+}
+
 #[tokio::test]
 async fn missing_client_profile_prompt_saves_without_live_transaction_or_runtime() {
     use traffic_masq_protocol::InterfacePresence;
     let (_dir, client, server) = mock_api(vec![
-        saved_client_inventory(InterfacePresence::Missing),
+        saved_client_interface_inventory(InterfacePresence::Missing),
         Response::InterfaceIntentSaved {
             interface: "wlan0".into(),
             revision: 8,
@@ -2107,7 +2157,7 @@ async fn missing_client_profile_prompt_saves_without_live_transaction_or_runtime
     assert_eq!(
         server.await.unwrap(),
         vec![
-            "GET /api/v1/wifi-inventory",
+            "GET /api/v1/interface-inventory",
             "PUT /api/v1/interfaces/wlan0/wifi-client-intent",
             "GET /api/v1/wifi-inventory"
         ]
@@ -2123,7 +2173,7 @@ async fn missing_client_profile_prompt_saves_without_live_transaction_or_runtime
 
 #[tokio::test]
 async fn unknown_client_observation_does_not_open_a_profile_prompt() {
-    let (_dir, client, server) = mock_api(vec![saved_client_inventory(
+    let (_dir, client, server) = mock_api(vec![saved_client_interface_inventory(
         traffic_masq_protocol::InterfacePresence::Unknown,
     )])
     .await;
@@ -2137,7 +2187,10 @@ async fn unknown_client_observation_does_not_open_a_profile_prompt() {
     )
     .await;
     assert!(app.wifi_connect.is_none());
-    assert_eq!(server.await.unwrap(), vec!["GET /api/v1/wifi-inventory"]);
+    assert_eq!(
+        server.await.unwrap(),
+        vec!["GET /api/v1/interface-inventory"]
+    );
 }
 
 #[tokio::test]
@@ -2163,4 +2216,40 @@ async fn offline_profile_stale_error_keeps_the_prompt_and_revision_for_review() 
         Some(7)
     );
     assert!(app.pending.is_none());
+}
+
+#[tokio::test]
+async fn connecting_with_a_known_pending_transaction_opens_recovery_without_another_request() {
+    let client = ApiClient::new(std::path::PathBuf::from(
+        "/nonexistent/traffic-masq-api.sock",
+    ));
+    let change = traffic_masq_protocol::PendingNetworkChange {
+        recovery_progress: None,
+        phase: traffic_masq_protocol::NetworkChangePhase::RecoveryRequired,
+        last_error: Some("interface identity changed".into()),
+        token: "recovery-token".into(),
+        interface: "wlp5s0f3u3".into(),
+        rollback_timeout_seconds: 60,
+        expires_at_unix: 0,
+    };
+    let mut app = TuiApp {
+        screen: Screen::WifiConnectPrompt,
+        wifi_connect: Some(WifiConnectPrompt::new(
+            "wlp5s0f3u3".into(),
+            "home".into(),
+            "Home".into(),
+            None,
+        )),
+        ..Default::default()
+    };
+    app.dashboard.pending_network_changes.push(change.clone());
+    submit_wifi_connect(&mut app, &client).await;
+    assert_eq!(app.screen, Screen::PendingChange);
+    assert_eq!(app.pending, Some(change));
+    assert!(app.wifi_connect.is_none());
+    assert_eq!(app.pending_return_screen, Screen::Wifi);
+    assert_eq!(
+        app.message.as_deref(),
+        Some("Inspect the pending network transaction before reconnecting Wi-Fi")
+    );
 }

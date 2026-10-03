@@ -1094,7 +1094,7 @@ pub(crate) async fn submit_dry_run(app: &mut TuiApp, client: &ApiClient) {
         if config.role != InterfaceRole::Input || !config.managed || config.ipv4.is_some() {
             config.dhcp_client = None;
         }
-        if config.role != InterfaceRole::Input {
+        if config.role != InterfaceRole::Input || !config.managed {
             config.wifi_client = None;
         }
         match client
