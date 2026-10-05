@@ -81,7 +81,7 @@ pub(crate) async fn handle_wifi_connect_prompt_key(
                 Screen::Wifi
             };
         }
-        KeyCode::Up => {
+        KeyCode::Up | KeyCode::BackTab => {
             let focusable = prompt.focusable_fields();
             if let Some(pos) = focusable.iter().position(|f| *f == prompt.field) {
                 if pos > 0 {
@@ -340,33 +340,33 @@ pub(crate) fn render_wifi_connect_prompt(
     // Buttons
     let submit_active = prompt.field == WifiConnectField::Submit;
     let cancel_active = prompt.field == WifiConnectField::Cancel;
+    let submit_label = if prompt.expected_revision.is_some() && submit_active {
+        "▶ [ Save (Enter) ] "
+    } else if prompt.expected_revision.is_some() {
+        "  [ Save ] "
+    } else if submit_active {
+        "▶ [ Connect (Enter) ] "
+    } else {
+        "  [ Connect ] "
+    };
+    let cancel_label = if cancel_active {
+        "▶ [ Cancel (Esc) ]"
+    } else {
+        "  [ Cancel ]"
+    };
     lines.push(Line::from(vec![
-        Span::styled(
-            if prompt.expected_revision.is_some() && submit_active {
-                "▶ [ Save (Enter) ] "
-            } else if prompt.expected_revision.is_some() {
-                "  [ Save ] "
-            } else if submit_active {
-                "▶ [ Connect (Enter) ] "
-            } else {
-                "  [ Connect ] "
-            },
-            selected_style(submit_active),
-        ),
+        Span::styled(submit_label, selected_style(submit_active)),
         Span::raw("    "),
-        Span::styled(
-            if cancel_active {
-                "▶ [ Cancel (Esc) ]"
-            } else {
-                "  [ Cancel ]"
-            },
-            selected_style(cancel_active),
-        ),
+        Span::styled(cancel_label, selected_style(cancel_active)),
     ]));
 
     lines.push(Line::from(""));
     lines.push(Line::styled(
-        "↑/↓: focus • Enter: select • Ctrl+O: connect • Esc: cancel",
+        if prompt.expected_revision.is_some() {
+            "Tab/Shift+Tab: focus • Enter: select • Ctrl+O: save • Esc: cancel"
+        } else {
+            "Tab/Shift+Tab: focus • Enter: select • Ctrl+O: connect • Esc: cancel"
+        },
         Style::default().fg(theme::MUTED),
     ));
 
@@ -374,14 +374,20 @@ pub(crate) fn render_wifi_connect_prompt(
     let offset = layout::focused_lines_offset(&lines, inner.height);
     if buttons_line >= offset && buttons_line < offset + inner.height as usize {
         let y = inner.y + (buttons_line - offset) as u16;
-        let submit_width = if submit_active { 21 } else { 14 };
+        let submit_width = unicode_width::UnicodeWidthStr::width(submit_label) as u16;
         let cancel_x = submit_width + 4;
         app.ui
             .buttons
             .push((Rect::new(inner.x, y, submit_width.min(inner.width), 1), 0));
         if cancel_x < inner.width {
             app.ui.buttons.push((
-                Rect::new(inner.x + cancel_x, y, inner.width - cancel_x, 1),
+                Rect::new(
+                    inner.x + cancel_x,
+                    y,
+                    (unicode_width::UnicodeWidthStr::width(cancel_label) as u16)
+                        .min(inner.width - cancel_x),
+                    1,
+                ),
                 1,
             ));
         }

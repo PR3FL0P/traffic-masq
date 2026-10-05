@@ -2253,3 +2253,59 @@ async fn connecting_with_a_known_pending_transaction_opens_recovery_without_anot
         Some("Inspect the pending network transaction before reconnecting Wi-Fi")
     );
 }
+
+#[tokio::test]
+async fn connect_prompt_backtab_moves_to_previous_field_without_changing_policy() {
+    let mut prompt = WifiConnectPrompt::new("wlan0".into(), "home".into(), "Home".into(), None);
+    prompt.choice = WifiIpChoice::NewStatic;
+    prompt.field = WifiConnectField::Submit;
+    let mut app = TuiApp {
+        wifi_connect: Some(prompt),
+        ..Default::default()
+    };
+    handle_wifi_connect_prompt_key(
+        &mut app,
+        KeyCode::BackTab,
+        &ApiClient::new("/nonexistent.sock"),
+    )
+    .await;
+    let prompt = app.wifi_connect.as_ref().unwrap();
+    assert_eq!(prompt.field, WifiConnectField::StaticCidr);
+    assert_eq!(prompt.choice, WifiIpChoice::NewStatic);
+}
+
+#[test]
+fn connect_prompt_button_targets_match_live_and_offline_labels() {
+    for offline in [false, true] {
+        for field in [WifiConnectField::Submit, WifiConnectField::Cancel] {
+            let mut prompt =
+                WifiConnectPrompt::new("wlan0".into(), "home".into(), "Home".into(), None);
+            prompt.expected_revision = offline.then_some(42);
+            prompt.field = field;
+            let mut app = TuiApp {
+                wifi_connect: Some(prompt),
+                ..Default::default()
+            };
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+            terminal
+                .draw(|frame| render_wifi_connect_prompt(frame, frame.area(), &mut app))
+                .unwrap();
+            let (submit, _) = app.ui.buttons.iter().find(|(_, slot)| *slot == 0).unwrap();
+            let (cancel, _) = app.ui.buttons.iter().find(|(_, slot)| *slot == 1).unwrap();
+            let buffer = terminal.backend().buffer();
+            let label: String = (cancel.x..cancel.right())
+                .map(|x| buffer[(x, cancel.y)].symbol())
+                .collect();
+            assert_eq!(
+                label,
+                if field == WifiConnectField::Cancel {
+                    "▶ [ Cancel (Esc) ]"
+                } else {
+                    "  [ Cancel ]"
+                }
+            );
+            assert_eq!(cancel.x, submit.right() + 4);
+        }
+    }
+}
