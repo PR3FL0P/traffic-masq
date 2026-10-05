@@ -106,6 +106,14 @@ limits queued work and waits for accepted operations during shutdown. If a
 request times out, the client must check the current state before retrying: the
 change may already have taken effect.
 
+Async nftables operations reserve execution before entering the blocking pool
+and transfer that reservation to the worker. Cancellation leaves the reservation
+with queued or running work until it finishes; observation, rollback, and
+removal-only cleanup wait for that outcome. The production executor shares the
+reservation across router and VPN backends, including rebuilt VPN hop adapters.
+Private state directory creation syncs the directory and its ancestors, including
+on retries after a failed sync, before a caller can rely on durable records.
+
 Immediate DHCP client configuration edits only DHCP policy on an already
 managed input interface without a static address. Interface role, management
 and static-address changes must pass through interface transactions first.
