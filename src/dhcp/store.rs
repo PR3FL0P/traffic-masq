@@ -42,7 +42,7 @@ impl LeaseStore {
             .path
             .parent()
             .ok_or_else(|| anyhow::anyhow!("lease path has no parent: {}", self.path.display()))?;
-        fs::create_dir_all(parent)
+        atomic_file::create_dir_all_durable_async(parent)
             .await
             .with_context(|| format!("failed to create lease directory {}", parent.display()))?;
 

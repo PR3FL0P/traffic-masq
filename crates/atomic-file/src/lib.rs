@@ -62,6 +62,13 @@ fn write_faults() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf
     FAULTS.get_or_init(Default::default)
 }
 
+#[cfg(test)]
+fn directory_sync_faults() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
+    static FAULTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
+        std::sync::OnceLock::new();
+    FAULTS.get_or_init(Default::default)
+}
+
 /// Fail after publishing the next replacement, then before publishing its compensation.
 #[cfg(any(test, feature = "fault-injection"))]
 #[doc(hidden)]
@@ -140,7 +147,7 @@ pub fn regular_file_exists(path: &Path) -> io::Result<bool> {
     }
 }
 
-/// Create `path` if it is missing and force `mode` on it.
+/// Create `path` if it is missing and force `mode` on it durably.
 ///
 /// An existing symlink or non-directory is refused rather than replaced: this
 /// runs as root, and silently writing through whatever is already there is the
@@ -160,6 +167,45 @@ pub fn ensure_private_dir(path: &Path, mode: u32) -> Result<(), PrivateDirError>
         Err(error) => return Err(error.into()),
     }
     fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    sync_directory_ancestors(path)?;
+    Ok(())
+}
+
+/// Create a directory tree and persist every link to its parents.
+/// Existing parent permissions are preserved. Callers must trust parents.
+/// Sync existing ancestors too: a prior failed call may have created a tree
+/// without persisting it, so existence alone is not a durability proof.
+pub fn create_dir_all_durable(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    sync_directory_ancestors(path)
+}
+
+/// Create and sync a directory tree on the blocking pool.
+pub async fn create_dir_all_durable_async(path: &Path) -> io::Result<()> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || create_dir_all_durable(&path))
+        .await
+        .map_err(io::Error::other)?
+}
+
+fn sync_directory_ancestors(path: &Path) -> io::Result<()> {
+    let mut previous = None;
+    for directory in path.ancestors() {
+        // Relative paths end at the empty path, whose containing directory is `.`.
+        let directory = if directory.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            directory
+        };
+        if previous != Some(directory) {
+            #[cfg(test)]
+            if directory_sync_faults().lock().unwrap().remove(directory) {
+                return Err(io::Error::other("injected directory sync failure"));
+            }
+            File::open(directory)?.sync_all()?;
+        }
+        previous = Some(directory);
+    }
     Ok(())
 }
 

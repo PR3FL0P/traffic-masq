@@ -56,7 +56,7 @@ impl PrivateJsonDirectory {
         }
         let root = state_root.as_ref();
         reject_symlink(root)?;
-        fs::create_dir_all(root)?;
+        atomic_file::create_dir_all_durable(root)?;
         reject_symlink(root)?;
         let directory = root.join(name);
         atomic_file::ensure_private_dir(&directory, PRIVATE_DIR_MODE)?;

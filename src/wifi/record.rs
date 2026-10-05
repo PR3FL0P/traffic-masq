@@ -353,7 +353,7 @@ impl WifiRecordStore {
     pub async fn mark_transition(&self) -> Result<(), WifiRecordError> {
         let path = self.transition_path();
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
+            atomic_file::create_dir_all_durable_async(parent)
                 .await
                 .map_err(|error| WifiRecordError::Write(path.clone(), error))?;
         }
@@ -399,7 +399,7 @@ impl WifiRecordStore {
 
     async fn save_primary(&self, record: &PersistedWifiRecord) -> Result<(), WifiRecordError> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
+            atomic_file::create_dir_all_durable_async(parent)
                 .await
                 .map_err(|error| WifiRecordError::Write(self.path.clone(), error))?;
         }

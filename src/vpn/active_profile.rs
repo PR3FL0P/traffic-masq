@@ -103,7 +103,7 @@ impl ActivationIntentStore {
 
     pub async fn save(&self, intent: &PersistedActivationIntent) -> Result<(), ActiveProfileError> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
+            atomic_file::create_dir_all_durable_async(parent)
                 .await
                 .map_err(|error| ActiveProfileError::Write(self.path.clone(), error))?;
         }
@@ -181,7 +181,7 @@ impl ActiveProfileStore {
 
     pub async fn save(&self, record: &PersistedActiveProfile) -> Result<(), ActiveProfileError> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
+            atomic_file::create_dir_all_durable_async(parent)
                 .await
                 .map_err(|error| ActiveProfileError::Write(self.path.clone(), error))?;
         }

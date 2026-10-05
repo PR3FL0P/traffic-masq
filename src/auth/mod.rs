@@ -561,7 +561,7 @@ async fn initialize_schema(pool: &SqlitePool) -> Result<(), AuthError> {
 async fn create_database_parent(database_path: &Path) -> Result<(), AuthError> {
     if let Some(parent) = database_path.parent() {
         if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent).await?;
+            crate::atomic_file::create_dir_all_durable_async(parent).await?;
         }
     }
     Ok(())

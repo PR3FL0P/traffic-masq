@@ -92,6 +92,68 @@ fn ensure_private_dir_creates_and_tightens() {
 }
 
 #[test]
+fn private_directory_creation_requires_durable_parents_even_after_a_failed_attempt() {
+    let directory = tempdir().unwrap();
+    let parent = directory.path().join("wifi");
+    let target = parent.join("credentials");
+    directory_sync_faults()
+        .lock()
+        .unwrap()
+        .insert(parent.clone());
+    assert!(matches!(
+        ensure_private_dir(&target, PRIVATE_DIR_MODE),
+        Err(PrivateDirError::Io(_))
+    ));
+    assert!(
+        target.is_dir(),
+        "a failed sync can leave the new tree present"
+    );
+    // Neither the leaf's existence nor a successful sync of its immediate
+    // parent proves that the parent itself survived the previous attempt.
+    directory_sync_faults()
+        .lock()
+        .unwrap()
+        .insert(directory.path().to_owned());
+    assert!(matches!(
+        ensure_private_dir(&target, PRIVATE_DIR_MODE),
+        Err(PrivateDirError::Io(_))
+    ));
+    ensure_private_dir(&target, PRIVATE_DIR_MODE).unwrap();
+    assert_eq!(
+        fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        PRIVATE_DIR_MODE
+    );
+}
+
+#[tokio::test]
+async fn durable_directory_creation_preserves_existing_permissions_and_propagates_sync_errors() {
+    let directory = tempdir().unwrap();
+    let parent = directory.path().join("state");
+    fs::create_dir(&parent).unwrap();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o750)).unwrap();
+    let target = parent.join("nested/store");
+    directory_sync_faults()
+        .lock()
+        .unwrap()
+        .insert(parent.clone());
+    assert!(create_dir_all_durable_async(&target).await.is_err());
+    create_dir_all_durable_async(&target).await.unwrap();
+    assert!(target.is_dir());
+    assert_eq!(
+        fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+        0o750
+    );
+}
+
+#[test]
+fn private_directory_creation_supports_a_bare_relative_path() {
+    let directory = tempfile::tempdir_in(".").unwrap();
+    let target = Path::new(directory.path().file_name().unwrap());
+    ensure_private_dir(target, PRIVATE_DIR_MODE).unwrap();
+    replace(&target.join("journal.json"), b"{}", PRIVATE_FILE_MODE).unwrap();
+}
+
+#[test]
 fn ensure_private_dir_tightens_a_loose_existing_directory() {
     let directory = tempdir().expect("tempdir");
     let target = directory.path().join("store");

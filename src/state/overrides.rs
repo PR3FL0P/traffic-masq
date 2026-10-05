@@ -443,7 +443,7 @@ impl RuntimeOverrideStore {
                 self.path.display()
             )
         })?;
-        fs::create_dir_all(parent).await?;
+        atomic_file::create_dir_all_durable_async(parent).await?;
 
         let mut content = serde_json::to_vec_pretty(&overrides.normalized()?)?;
         content.push(b'\n');
