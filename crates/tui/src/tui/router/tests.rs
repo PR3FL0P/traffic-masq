@@ -1419,3 +1419,23 @@ async fn unsaved_observed_owned_route_is_read_only_in_inventory() {
     assert!(app.router.editor.is_none());
     assert!(!app.router.staged);
 }
+
+#[tokio::test]
+async fn plan_distinguishes_unavailable_lease_counts_from_an_empty_lease_list() {
+    let (_directory, client, server) = router_mock_api(vec![
+        Response::Error {
+            message: "DHCP runtime unavailable".into(),
+        },
+        Response::Leases {
+            interface: "lan1".into(),
+            leases: vec![],
+        },
+    ])
+    .await;
+    let services = vec![dhcp_spec("lan0"), dhcp_spec("lan1")];
+    let counts = super::plan::lease_counts_for_plan(&client, &services).await;
+    assert_eq!(server.await.unwrap().len(), 2);
+    let summary = summarize_dhcp(&services, &counts);
+    assert!(summary[0].contains("lease count unavailable"));
+    assert!(summary[1].contains("0 lease(s)"));
+}

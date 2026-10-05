@@ -9,20 +9,20 @@ pub(super) fn current_router_proposal(app: &TuiApp) -> RouterProposalRequest {
 
 pub(super) async fn lease_counts_for_plan(
     client: &ApiClient,
-    plan: &RouterPlanView,
+    services: &[DhcpServiceView],
 ) -> Vec<(String, usize)> {
-    let mut counts = Vec::with_capacity(plan.desired.dhcp.len());
-    for dhcp in &plan.desired.dhcp {
-        let count = match client
+    let mut counts = Vec::with_capacity(services.len());
+    for dhcp in services {
+        if let Ok(Response::Leases { interface, leases }) = client
             .request(&Request::ListLeases {
                 interface: dhcp.interface.clone(),
             })
             .await
         {
-            Ok(Response::Leases { leases, .. }) => leases.len(),
-            _ => 0,
-        };
-        counts.push((dhcp.interface.clone(), count));
+            if interface == dhcp.interface {
+                counts.push((interface, leases.len()));
+            }
+        }
     }
     counts
 }
@@ -443,7 +443,7 @@ pub(crate) async fn open_router_plan(app: &mut TuiApp, client: &ApiClient) {
     let proposal = current_router_proposal(app);
     match client.request(&Request::RouterPlan { proposal }).await {
         Ok(Response::RouterPlan { plan }) => {
-            app.router.lease_counts = lease_counts_for_plan(client, &plan).await;
+            app.router.lease_counts = lease_counts_for_plan(client, &plan.desired.dhcp).await;
             app.router.plan = Some(plan);
             app.router.plan_scroll = 0;
             app.router.plan_max_scroll = 0;

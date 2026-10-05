@@ -477,7 +477,7 @@ pub(crate) async fn load_router_data(app: &mut TuiApp, client: &ApiClient) {
     }
     match client.request(&Request::RouterPlan { proposal }).await {
         Ok(Response::RouterPlan { plan }) => {
-            app.router.lease_counts = lease_counts_for_plan(client, &plan).await;
+            app.router.lease_counts = lease_counts_for_plan(client, &plan.desired.dhcp).await;
             app.router.plan = Some(plan);
         }
         Ok(Response::RouterError { detail }) => {
