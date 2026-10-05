@@ -223,6 +223,17 @@ pub(crate) fn render_dhcp_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
         };
         Line::styled(format!("{marker}{label}"), style)
     };
+    let offline = editor.offline_intent.is_some();
+    let save_label = if offline {
+        "Save DHCP for device return"
+    } else {
+        DHCP_SAVE_LABEL
+    };
+    let disable_label = if offline {
+        "Remove saved DHCP settings"
+    } else {
+        DHCP_DISABLE_LABEL
+    };
     let mut lines = vec![
         Line::from(format!("Interface: {}", editor.interface)),
         field(
@@ -247,7 +258,11 @@ pub(crate) fn render_dhcp_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
             editor.field == DhcpField::LeaseSeconds,
         ),
         Line::styled(
-            "Applies immediately; no automatic rollback timer.",
+            if offline {
+                "Device missing: saves settings for when it returns."
+            } else {
+                "Applies immediately; no automatic rollback timer."
+            },
             Style::default().fg(theme::MUTED),
         ),
         Line::styled(
@@ -259,17 +274,14 @@ pub(crate) fn render_dhcp_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
 
     let mut button_rows: Vec<(u16, &str, usize)> = Vec::new();
 
-    button_rows.push((lines.len() as u16, DHCP_SAVE_LABEL, 0));
-    lines.push(action(DHCP_SAVE_LABEL, editor.field == DhcpField::Save));
+    button_rows.push((lines.len() as u16, save_label, 0));
+    lines.push(action(save_label, editor.field == DhcpField::Save));
 
     button_rows.push((lines.len() as u16, DHCP_LEASES_LABEL, 1));
     lines.push(action(DHCP_LEASES_LABEL, editor.field == DhcpField::Leases));
 
-    button_rows.push((lines.len() as u16, DHCP_DISABLE_LABEL, 2));
-    lines.push(action(
-        DHCP_DISABLE_LABEL,
-        editor.field == DhcpField::Disable,
-    ));
+    button_rows.push((lines.len() as u16, disable_label, 2));
+    lines.push(action(disable_label, editor.field == DhcpField::Disable));
 
     let block = panel("DHCP editor");
     let inner = block.inner(area);

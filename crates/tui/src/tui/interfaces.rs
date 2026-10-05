@@ -592,16 +592,20 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
     ));
     lines.push(Line::from(""));
 
-    const SAVE_LABEL: &str = "[Plan / Apply]";
+    let save_label = if editor.offline_revision.is_some() {
+        "[Save for device return]"
+    } else {
+        "[Plan / Apply]"
+    };
     let button_row_index = lines.len() as u16;
-    lines.push(action_row(SAVE_LABEL, InterfaceEditorField::Save));
+    lines.push(action_row(save_label, InterfaceEditorField::Save));
 
     let block = panel("Interface editor");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let offset = super::layout::focused_lines_offset(&lines, inner.height);
     for (row, width, slot) in [
-        (button_row_index, SAVE_LABEL.len(), 0),
+        (button_row_index, save_label.len() + 2, 0),
         (
             remove_row_index,
             REMOVE_IPV4_LABEL.len() + 2,
