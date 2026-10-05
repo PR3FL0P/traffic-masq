@@ -132,6 +132,100 @@ async fn changing_device_password_revokes_existing_sessions() {
 }
 
 #[tokio::test]
+async fn password_reset_rejects_a_login_verified_before_the_reset() {
+    let (_temp_dir, service) = service().await;
+    service
+        .initialize_device_password("a secure password")
+        .await
+        .unwrap();
+    // The same password still gets a new salted hash, and must revoke an
+    // in-flight verification just as a reset to a different password does.
+    for password in ["a secure password", "a newer secure password"] {
+        let verified = service
+            .verify_device_password("a secure password")
+            .await
+            .unwrap();
+        service.reset_device_password(password).await.unwrap();
+        assert!(matches!(
+            service.create_session(verified, None, None).await,
+            Err(AuthError::InvalidCredentials)
+        ));
+    }
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+        .fetch_one(&service.inner.pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
+}
+
+#[tokio::test]
+async fn password_change_cannot_overwrite_a_concurrent_reset() {
+    let (_temp_dir, service) = service().await;
+    service
+        .initialize_device_password("a secure password")
+        .await
+        .unwrap();
+    let verified = service
+        .verify_device_password("a secure password")
+        .await
+        .unwrap();
+    service
+        .reset_device_password("a recovery password")
+        .await
+        .unwrap();
+    let session = service
+        .login_device("a recovery password", None, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        service
+            .replace_device_password("a stale replacement", Some(&verified))
+            .await,
+        Err(AuthError::InvalidCredentials)
+    ));
+    // A rejected change neither replaces the recovered password nor revokes
+    // sessions created with it.
+    service.authenticate(&session.token).await.unwrap();
+    service
+        .login_device("a recovery password", None, None)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn login_rejects_user_changes_after_password_verification() {
+    let (_temp_dir, service) = service().await;
+    service
+        .initialize_device_password("a secure password")
+        .await
+        .unwrap();
+    let verified = service
+        .verify_device_password("a secure password")
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET role = 'viewer'")
+        .execute(&service.inner.pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        service.create_session(verified, None, None).await,
+        Err(AuthError::InvalidCredentials)
+    ));
+    let verified = service
+        .verify_device_password("a secure password")
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET enabled = 0")
+        .execute(&service.inner.pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        service.create_session(verified, None, None).await,
+        Err(AuthError::InvalidCredentials)
+    ));
+}
+
+#[tokio::test]
 async fn rejects_wrong_password_and_uninitialized_login_identically() {
     let (_temp_dir, service) = service().await;
     assert!(matches!(
@@ -196,6 +290,74 @@ async fn expires_idle_sessions() {
             .await,
         Err(AuthError::InvalidSession)
     ));
+}
+
+#[tokio::test]
+async fn short_idle_sessions_stay_active_and_still_expire_without_activity() {
+    for idle_seconds in [2, 30, 60] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut config = test_config(&temp_dir);
+        config.session_idle_seconds = idle_seconds;
+        let service = AuthService::open(&config).await.unwrap();
+        service
+            .initialize_device_password("a secure password")
+            .await
+            .unwrap();
+        let session = service
+            .login_device("a secure password", None, None)
+            .await
+            .unwrap();
+        let created_at = session.idle_expires_at - idle_seconds as i64;
+        for elapsed in [
+            idle_seconds / 2,
+            idle_seconds,
+            idle_seconds * 3 / 2,
+            idle_seconds * 2,
+        ] {
+            service
+                .authenticate_at(&session.token, created_at + elapsed as i64)
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            service
+                .authenticate_at(&session.token, created_at + (idle_seconds * 3) as i64)
+                .await,
+            Err(AuthError::InvalidSession)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn longer_idle_sessions_keep_the_existing_write_throttle() {
+    let (_temp_dir, service) = service().await;
+    service
+        .initialize_device_password("a secure password")
+        .await
+        .unwrap();
+    let session = service
+        .login_device("a secure password", None, None)
+        .await
+        .unwrap();
+    let created_at = session.idle_expires_at - service.inner.session_idle_seconds;
+    service
+        .authenticate_at(&session.token, created_at + 59)
+        .await
+        .unwrap();
+    let last_seen: i64 = sqlx::query_scalar("SELECT last_seen_at FROM sessions")
+        .fetch_one(&service.inner.pool)
+        .await
+        .unwrap();
+    assert_eq!(last_seen, created_at);
+    service
+        .authenticate_at(&session.token, created_at + 60)
+        .await
+        .unwrap();
+    let last_seen: i64 = sqlx::query_scalar("SELECT last_seen_at FROM sessions")
+        .fetch_one(&service.inner.pool)
+        .await
+        .unwrap();
+    assert_eq!(last_seen, created_at + 60);
 }
 
 #[tokio::test]

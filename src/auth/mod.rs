@@ -144,6 +144,11 @@ struct AuthServiceInner {
     session_absolute_seconds: i64,
 }
 
+struct VerifiedDeviceCredentials {
+    principal: Principal,
+    password_hash: String,
+}
+
 impl AuthService {
     /// Validate authentication settings and open the private SQLite session store.
     /// Initialize the schema, password-hashing parameters, and bounded login workers.
@@ -281,23 +286,49 @@ impl AuthService {
     /// Replace or create the device administrator password and revoke every session atomically.
     /// This recovery entry point does not verify the previous password.
     pub async fn reset_device_password(&self, password: &str) -> Result<Principal, AuthError> {
+        self.replace_device_password(password, None).await
+    }
+
+    async fn replace_device_password(
+        &self,
+        password: &str,
+        expected: Option<&VerifiedDeviceCredentials>,
+    ) -> Result<Principal, AuthError> {
         validate_password(password)?;
         let password_hash =
             hash_password(self.inner.argon2_params.clone(), password.to_owned()).await?;
         let now = unix_timestamp()?;
         let mut transaction = self.inner.pool.begin().await?;
-        sqlx::query(
-            "INSERT INTO users (username, password_hash, role, enabled, created_at) \
+        if let Some(expected) = expected {
+            // Verification runs outside the database. Reject a concurrent reset
+            // rather than replace credentials that were never verified.
+            let updated = sqlx::query(
+                "UPDATE users SET password_hash = ?, role = 'administrator', enabled = 1 \
+                 WHERE id = ? AND username = ? AND password_hash = ? AND enabled = 1",
+            )
+            .bind(&password_hash)
+            .bind(expected.principal.user_id)
+            .bind(DEVICE_USERNAME)
+            .bind(&expected.password_hash)
+            .execute(&mut *transaction)
+            .await?;
+            if updated.rows_affected() != 1 {
+                return Err(AuthError::InvalidCredentials);
+            }
+        } else {
+            sqlx::query(
+                "INSERT INTO users (username, password_hash, role, enabled, created_at) \
              VALUES (?, ?, 'administrator', 1, ?) \
              ON CONFLICT(username) DO UPDATE SET \
                  password_hash = excluded.password_hash, \
                  role = 'administrator', enabled = 1",
-        )
-        .bind(DEVICE_USERNAME)
-        .bind(password_hash)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await?;
+            )
+            .bind(DEVICE_USERNAME)
+            .bind(password_hash)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await?;
+        }
         sqlx::query("UPDATE users SET enabled = 0 WHERE username != ?")
             .bind(DEVICE_USERNAME)
             .execute(&mut *transaction)
@@ -328,21 +359,16 @@ impl AuthService {
     }
 
     /// Verify the current password, replace it, and revoke existing sessions.
-    /// If replacement fails, remove the temporary verification session.
     pub async fn change_device_password(
         &self,
         current_password: &str,
         new_password: &str,
     ) -> Result<(), AuthError> {
         validate_password(new_password)?;
-        let verification = self
-            .login_device(current_password, Some("password-change"), None)
-            .await?;
-        let result = self.reset_device_password(new_password).await.map(|_| ());
-        if result.is_err() {
-            let _ = self.logout(&verification.token).await;
-        }
-        result
+        let verified = self.verify_device_password(current_password).await?;
+        self.replace_device_password(new_password, Some(&verified))
+            .await
+            .map(|_| ())
     }
 
     /// Apply the login budget, verify the password off the runtime, and store a token hash.
@@ -353,6 +379,14 @@ impl AuthService {
         client_name: Option<&str>,
         peer: Option<&str>,
     ) -> Result<LoginSession, AuthError> {
+        let verified = self.verify_device_password(password).await?;
+        self.create_session(verified, client_name, peer).await
+    }
+
+    async fn verify_device_password(
+        &self,
+        password: &str,
+    ) -> Result<VerifiedDeviceCredentials, AuthError> {
         self.inner.login_budget.lock().await.take()?;
         let user = sqlx::query(
             "SELECT id, username, password_hash, role, enabled \
@@ -386,6 +420,18 @@ impl AuthService {
             username: user.get("username"),
             role: user.get::<String, _>("role").parse()?,
         };
+        Ok(VerifiedDeviceCredentials {
+            principal,
+            password_hash: user.get("password_hash"),
+        })
+    }
+
+    async fn create_session(
+        &self,
+        verified: VerifiedDeviceCredentials,
+        client_name: Option<&str>,
+        peer: Option<&str>,
+    ) -> Result<LoginSession, AuthError> {
         let token = generate_token();
         let token_hash = hash_token(&token);
         let now = unix_timestamp()?;
@@ -397,26 +443,38 @@ impl AuthService {
             .ok_or_else(|| AuthError::InvalidConfig("session expiration overflows".into()))?
             .min(absolute_expires_at);
 
-        sqlx::query(
+        // The INSERT and credential check share one SQLite write statement.
+        // A reset either revokes this session or prevents its creation.
+        let inserted = sqlx::query(
             "INSERT INTO sessions \
              (token_hash, user_id, client_name, peer, created_at, last_seen_at, \
               idle_expires_at, absolute_expires_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             SELECT ?, id, ?, ?, ?, ?, ?, ? FROM users \
+             WHERE id = ? AND password_hash = ? AND enabled = 1 AND role = ?",
         )
         .bind(token_hash.as_slice())
-        .bind(principal.user_id)
         .bind(client_name)
         .bind(peer)
         .bind(now)
         .bind(now)
         .bind(idle_expires_at)
         .bind(absolute_expires_at)
+        .bind(verified.principal.user_id)
+        .bind(&verified.password_hash)
+        .bind(match verified.principal.role {
+            Role::Viewer => "viewer",
+            Role::Operator => "operator",
+            Role::Administrator => "administrator",
+        })
         .execute(&self.inner.pool)
         .await?;
+        if inserted.rows_affected() != 1 {
+            return Err(AuthError::InvalidCredentials);
+        }
 
         Ok(LoginSession {
             token,
-            principal,
+            principal: verified.principal,
             idle_expires_at,
             absolute_expires_at,
         })
@@ -457,7 +515,9 @@ impl AuthService {
             return Err(AuthError::InvalidSession);
         }
 
-        if now.saturating_sub(last_seen_at) >= LAST_SEEN_UPDATE_INTERVAL_SECONDS {
+        let refresh_interval =
+            LAST_SEEN_UPDATE_INTERVAL_SECONDS.min((self.inner.session_idle_seconds / 2).max(1));
+        if now.saturating_sub(last_seen_at) >= refresh_interval {
             let refreshed_idle_expiry = now
                 .saturating_add(self.inner.session_idle_seconds)
                 .min(absolute_expires_at);
