@@ -71,8 +71,11 @@ impl VpnPolicyFirewallDesired {
     }
 }
 
+/// Async operations retain their shared executor reservation until the blocking
+/// worker finishes. Synchronous entry points require caller serialization.
 pub struct VpnPolicyFirewallBackend<E> {
     pub(crate) executor: E,
+    operations: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 impl<E> VpnPolicyFirewallBackend<E>
@@ -80,7 +83,11 @@ where
     E: NftExecutor,
 {
     pub fn new(executor: E) -> Self {
-        Self { executor }
+        let operations = executor.operation_gate().unwrap_or_default();
+        Self {
+            executor,
+            operations,
+        }
     }
 
     #[cfg(feature = "test-support")]
@@ -89,26 +96,41 @@ where
     }
 
     pub async fn observe_async(self: &std::sync::Arc<Self>) -> Result<VpnFirewallObservation> {
+        let reservation = self.operations.clone().lock_owned().await;
         let backend = self.clone();
-        tokio::task::spawn_blocking(move || backend.observe()).await?
+        tokio::task::spawn_blocking(move || {
+            let _reservation = reservation;
+            backend.observe()
+        })
+        .await?
     }
 
     pub async fn apply_async(
         self: &std::sync::Arc<Self>,
         desired: &VpnPolicyFirewallDesired,
     ) -> Result<()> {
+        let reservation = self.operations.clone().lock_owned().await;
         let backend = self.clone();
         let desired = desired.clone();
-        tokio::task::spawn_blocking(move || backend.apply(&desired)).await?
+        tokio::task::spawn_blocking(move || {
+            let _reservation = reservation;
+            backend.apply(&desired)
+        })
+        .await?
     }
 
     pub async fn restore_async(
         self: &std::sync::Arc<Self>,
         snapshot: Option<&VpnPolicyFirewallDesired>,
     ) -> Result<()> {
+        let reservation = self.operations.clone().lock_owned().await;
         let backend = self.clone();
         let snapshot = snapshot.cloned();
-        tokio::task::spawn_blocking(move || backend.restore(snapshot.as_ref())).await?
+        tokio::task::spawn_blocking(move || {
+            let _reservation = reservation;
+            backend.restore(snapshot.as_ref())
+        })
+        .await?
     }
 
     pub fn observe(&self) -> Result<VpnFirewallObservation> {

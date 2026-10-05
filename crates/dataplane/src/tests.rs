@@ -168,6 +168,189 @@ impl NftExecutor for FakeNftExecutor {
     }
 }
 
+/// A real blocking worker pauses before publishing its first firewall batch.
+/// Subsequent observations read the published state instead of canned replies.
+pub(super) struct SuspendedNftExecutor {
+    operations: Arc<Mutex<()>>,
+    started: StdMutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: StdMutex<std::sync::mpsc::Receiver<()>>,
+    ruleset: StdMutex<Vec<u8>>,
+    applied_ruleset: Vec<u8>,
+    writes: StdMutex<Vec<&'static str>>,
+}
+
+impl SuspendedNftExecutor {
+    pub(super) fn new(
+        applied_ruleset: Vec<u8>,
+    ) -> (
+        Arc<Self>,
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        (
+            Arc::new(Self {
+                operations: Arc::default(),
+                started: StdMutex::new(Some(started_tx)),
+                release: StdMutex::new(release_rx),
+                ruleset: StdMutex::new(br#"{"nftables":[]}"#.to_vec()),
+                applied_ruleset,
+                writes: StdMutex::default(),
+            }),
+            started_rx,
+            release_tx,
+        )
+    }
+
+    pub(super) fn writes(&self) -> Vec<&'static str> {
+        self.writes.lock().unwrap().clone()
+    }
+}
+
+impl NftExecutor for SuspendedNftExecutor {
+    fn operation_gate(&self) -> Option<Arc<Mutex<()>>> {
+        Some(self.operations.clone())
+    }
+
+    fn execute(&self, arguments: &[&str], input: &[u8]) -> Result<Vec<u8>> {
+        if arguments == ["--json", "list", "ruleset"] {
+            return Ok(self.ruleset.lock().unwrap().clone());
+        }
+        assert_eq!(arguments, ["-f", "-"]);
+        if let Some(started) = self.started.lock().unwrap().take() {
+            started.send(()).unwrap();
+            self.release.lock().unwrap().recv()?;
+        }
+        let creates_table = input.contains(&b'{');
+        *self.ruleset.lock().unwrap() = if creates_table {
+            self.applied_ruleset.clone()
+        } else {
+            br#"{"nftables":[]}"#.to_vec()
+        };
+        self.writes
+            .lock()
+            .unwrap()
+            .push(if creates_table { "apply" } else { "restore" });
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn cancelled_firewall_apply_cannot_overtake_rollback() {
+    let (executor, started, release) = SuspendedNftExecutor::new(nft_ruleset(Some(&desired())));
+    let backend = Arc::new(NftablesBackend::new(
+        executor.clone() as Arc<dyn NftExecutor>
+    ));
+    let applying = {
+        let backend = backend.clone();
+        tokio::spawn(async move { backend.apply_async(&desired()).await })
+    };
+    started.await.unwrap();
+    applying.abort();
+    assert!(applying.await.unwrap_err().is_cancelled());
+    let mut restoring = {
+        let backend = backend.clone();
+        tokio::spawn(async move { backend.restore_async(None).await })
+    };
+    let early = tokio::time::timeout(std::time::Duration::from_millis(20), &mut restoring).await;
+    let completed_early = early.is_ok();
+    release.send(()).unwrap();
+    match early {
+        Ok(result) => result,
+        Err(_) => restoring.await,
+    }
+    .unwrap()
+    .unwrap();
+    assert!(
+        !completed_early,
+        "rollback must wait for the cancelled worker"
+    );
+    assert_eq!(executor.writes(), ["apply", "restore"]);
+    assert!(backend.observe_async().await.unwrap().desired.is_none());
+}
+
+#[tokio::test]
+async fn cancelled_firewall_apply_cannot_overtake_removal_only_cleanup() {
+    let (executor, started, release) = SuspendedNftExecutor::new(nft_ruleset(Some(&desired())));
+    let backend = Arc::new(NftablesBackend::new(
+        executor.clone() as Arc<dyn NftExecutor>
+    ));
+    let applying = {
+        let backend = backend.clone();
+        tokio::spawn(async move { backend.apply_async(&desired()).await })
+    };
+    started.await.unwrap();
+    applying.abort();
+    let _ = applying.await;
+    let mut cleanup = {
+        let backend = backend.clone();
+        tokio::spawn(async move {
+            backend
+                .cleanup_removed_async(&RouterDataplaneTarget::Disabled)
+                .await
+        })
+    };
+    let early = tokio::time::timeout(std::time::Duration::from_millis(20), &mut cleanup).await;
+    let completed_early = early.is_ok();
+    release.send(()).unwrap();
+    match early {
+        Ok(result) => result,
+        Err(_) => cleanup.await,
+    }
+    .unwrap()
+    .unwrap();
+    assert!(
+        !completed_early,
+        "cleanup must wait for the cancelled worker"
+    );
+    assert_eq!(executor.writes(), ["apply", "restore"]);
+    assert!(backend.observe_async().await.unwrap().desired.is_none());
+}
+
+#[test]
+fn cancellation_while_the_blocking_pool_is_full_keeps_firewall_ordering() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (blocker_started_tx, blocker_started_rx) = tokio::sync::oneshot::channel();
+        let (unblock_tx, unblock_rx) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            blocker_started_tx.send(()).unwrap();
+            unblock_rx.recv().unwrap();
+        });
+        blocker_started_rx.await.unwrap();
+        let (executor, started, release) = SuspendedNftExecutor::new(nft_ruleset(Some(&desired())));
+        let backend = Arc::new(NftablesBackend::new(
+            executor.clone() as Arc<dyn NftExecutor>
+        ));
+        let applying = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.apply_async(&desired()).await })
+        };
+        // The worker is queued, but its admission must already be reserved.
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while executor.operations.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued work must reserve admission before cancellation");
+        applying.abort();
+        let _ = applying.await;
+        let restoring = tokio::spawn(async move { backend.restore_async(None).await });
+        unblock_tx.send(()).unwrap();
+        blocker.await.unwrap();
+        started.await.unwrap();
+        release.send(()).unwrap();
+        restoring.await.unwrap().unwrap();
+        assert_eq!(executor.writes(), ["apply", "restore"]);
+    });
+}
+
 struct FakeProvider {
     state: Mutex<RouterDataplaneSnapshot>,
     foreign_state: Mutex<Vec<String>>,

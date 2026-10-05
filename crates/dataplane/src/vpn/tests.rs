@@ -1,6 +1,43 @@
 use super::test_support::{nft_ruleset, FakeNftExecutor};
 use super::*;
 
+#[tokio::test]
+async fn rebuilt_vpn_backend_waits_for_a_cancelled_apply_worker() {
+    use crate::tests::SuspendedNftExecutor;
+    use std::sync::Arc;
+    let (executor, started, release) = SuspendedNftExecutor::new(nft_ruleset(Some(&desired())));
+    let backend = Arc::new(VpnPolicyFirewallBackend::new(
+        executor.clone() as Arc<dyn NftExecutor>
+    ));
+    let applying = tokio::spawn(async move { backend.apply_async(&desired()).await });
+    started.await.unwrap();
+    applying.abort();
+    let _ = applying.await;
+    // Production VPN chain operations rebuild this backend for each hop.
+    let recovery = Arc::new(VpnPolicyFirewallBackend::new(
+        executor.clone() as Arc<dyn NftExecutor>
+    ));
+    let mut restoring = {
+        let recovery = recovery.clone();
+        tokio::spawn(async move { recovery.restore_async(None).await })
+    };
+    let early = tokio::time::timeout(std::time::Duration::from_millis(20), &mut restoring).await;
+    let completed_early = early.is_ok();
+    release.send(()).unwrap();
+    match early {
+        Ok(result) => result,
+        Err(_) => restoring.await,
+    }
+    .unwrap()
+    .unwrap();
+    assert!(
+        !completed_early,
+        "a rebuilt backend must wait for the old worker"
+    );
+    assert_eq!(executor.writes(), ["apply", "restore"]);
+    assert!(recovery.observe_async().await.unwrap().desired.is_none());
+}
+
 fn desired() -> VpnPolicyFirewallDesired {
     VpnPolicyFirewallDesired {
         protected_subnets: vec![

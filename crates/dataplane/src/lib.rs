@@ -236,17 +236,31 @@ fn retained_firewall(
 
 pub trait NftExecutor: Send + Sync + 'static {
     fn execute(&self, arguments: &[&str], input: &[u8]) -> Result<Vec<u8>>;
+
+    /// Share admission across backends that operate on the same ruleset.
+    /// A reservation is transferred into the blocking worker, so cancellation
+    /// cannot allow a later observation or rollback to overtake an old write.
+    fn operation_gate(&self) -> Option<std::sync::Arc<tokio::sync::Mutex<()>>> {
+        None
+    }
 }
 
 impl NftExecutor for std::sync::Arc<dyn NftExecutor> {
     fn execute(&self, arguments: &[&str], input: &[u8]) -> Result<Vec<u8>> {
         (**self).execute(arguments, input)
     }
+
+    fn operation_gate(&self) -> Option<std::sync::Arc<tokio::sync::Mutex<()>>> {
+        (**self).operation_gate()
+    }
 }
 
+/// Synchronous entry points require caller serialization. Async entry points
+/// keep operation admission inside their blocking workers, including on cancellation.
 #[derive(Debug)]
 pub struct NftablesBackend<E> {
     executor: E,
+    operations: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 impl<E> NftablesBackend<E>
@@ -254,36 +268,69 @@ where
     E: NftExecutor,
 {
     pub fn new(executor: E) -> Self {
-        Self { executor }
+        let operations = executor.operation_gate().unwrap_or_default();
+        Self {
+            executor,
+            operations,
+        }
     }
 
     pub async fn observe_async(self: &std::sync::Arc<Self>) -> Result<OwnedFirewallObservation> {
+        let reservation = self.operations.clone().lock_owned().await;
         let backend = self.clone();
-        tokio::task::spawn_blocking(move || backend.observe()).await?
+        tokio::task::spawn_blocking(move || {
+            let _reservation = reservation;
+            backend.observe()
+        })
+        .await?
     }
 
     /// Run the synchronous backend on the blocking pool. Dropping/timing out this
-    /// future does not stop work already running; callers must serialize mutations
-    /// and retain snapshots until the durable/kernel outcome is known.
+    /// future does not stop work already running. The worker retains admission
+    /// until it finishes; subsequent observation and compensation wait for it.
     pub async fn apply_async(
         self: &std::sync::Arc<Self>,
         desired: &RouterDataplaneDesired,
     ) -> Result<()> {
+        let reservation = self.operations.clone().lock_owned().await;
         let backend = self.clone();
         let desired = desired.clone();
-        tokio::task::spawn_blocking(move || backend.apply(&desired)).await?
+        tokio::task::spawn_blocking(move || {
+            let _reservation = reservation;
+            backend.apply(&desired)
+        })
+        .await?
     }
 
     /// Run the synchronous backend on the blocking pool. Dropping/timing out this
-    /// future does not stop work already running; callers must serialize mutations
-    /// and retain snapshots until the durable/kernel outcome is known.
+    /// future does not stop work already running. The worker retains admission
+    /// until it finishes, including when the caller's recovery budget expires.
     pub async fn restore_async(
         self: &std::sync::Arc<Self>,
         snapshot: Option<&RouterDataplaneDesired>,
     ) -> Result<()> {
+        let reservation = self.operations.clone().lock_owned().await;
         let backend = self.clone();
         let snapshot = snapshot.cloned();
-        tokio::task::spawn_blocking(move || backend.restore(snapshot.as_ref())).await?
+        tokio::task::spawn_blocking(move || {
+            let _reservation = reservation;
+            backend.restore(snapshot.as_ref())
+        })
+        .await?
+    }
+
+    pub async fn cleanup_removed_async(
+        self: &std::sync::Arc<Self>,
+        target: &RouterDataplaneTarget,
+    ) -> Result<()> {
+        let reservation = self.operations.clone().lock_owned().await;
+        let backend = self.clone();
+        let target = target.clone();
+        tokio::task::spawn_blocking(move || {
+            let _reservation = reservation;
+            backend.cleanup_removed(&target)
+        })
+        .await?
     }
 
     pub fn observe(&self) -> Result<OwnedFirewallObservation> {
@@ -1047,9 +1094,7 @@ where
     }
 
     async fn cleanup_removed(&self, target: &RouterDataplaneTarget) -> Result<()> {
-        let backend = self.nftables.clone();
-        let target = target.clone();
-        tokio::task::spawn_blocking(move || backend.cleanup_removed(&target)).await?
+        self.nftables.cleanup_removed_async(target).await
     }
 
     async fn restore_owned(&self, snapshot: &RouterDataplaneSnapshot) -> Result<()> {
