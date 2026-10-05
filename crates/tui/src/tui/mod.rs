@@ -919,11 +919,7 @@ async fn navigate_to_section(app: &mut TuiApp, section: Section, client: &ApiCli
                     "DHCP Client management requires the daemon API",
                 );
             } else {
-                app.dhcp_client_selected = app
-                    .dashboard
-                    .interfaces
-                    .get(app.selected_interface)
-                    .map(|status| status.interface.name.clone());
+                app.dhcp_client_selected = interfaces::selected_interface_name(app);
                 app.dhcp_client_scroll = 0;
                 app.screen = Screen::DhcpClient;
                 dhcp_client::refresh(app, client).await;

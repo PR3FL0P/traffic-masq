@@ -20,13 +20,29 @@ fn row_names(app: &TuiApp) -> Vec<String> {
         .iter()
         .map(|status| status.interface.clone())
         .collect::<Vec<_>>();
+    if let Some(entries) = &app.dashboard.inventory {
+        for entry in entries {
+            if entry
+                .configured
+                .as_ref()
+                .is_some_and(|config| config.dhcp_client.is_some())
+                && !names.contains(&entry.name)
+            {
+                names.push(entry.name.clone());
+            }
+        }
+    }
     if let Some(selected) = app.dhcp_client_selected.as_ref() {
-        let present = app
-            .dashboard
-            .interfaces
-            .iter()
-            .any(|status| status.interface.name.as_str() == selected.as_str());
-        if present && !names.iter().any(|name| name == selected) {
+        let known = app.dashboard.inventory.as_ref().map_or_else(
+            || {
+                app.dashboard
+                    .interfaces
+                    .iter()
+                    .any(|status| &status.interface.name == selected)
+            },
+            |entries| entries.iter().any(|entry| &entry.name == selected),
+        );
+        if known && !names.iter().any(|name| name == selected) {
             names.push(selected.clone());
         }
     }
@@ -74,15 +90,25 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
 
+    frame.render_widget(
+        Paragraph::new("Actions apply immediately; no rollback timer. [c] overwrites DHCP policy.")
+            .style(Style::default().fg(theme::WARN)),
+        Rect::new(
+            inner.x,
+            inner.y.saturating_add(1),
+            inner.width,
+            inner.height.saturating_sub(1).min(1),
+        ),
+    );
     let list_area = Rect::new(
         inner.x,
-        inner.y.saturating_add(1),
+        inner.y.saturating_add(2),
         inner.width,
-        inner.height.saturating_sub(1),
+        inner.height.saturating_sub(2),
     );
     let names = row_names(app);
     let selected = selected_row(app, &names);
-    let visible_items = (list_area.height / 3).max(1) as usize;
+    let visible_items = (list_area.height / 4).max(1) as usize;
     if selected < app.dhcp_client_scroll {
         app.dhcp_client_scroll = selected;
     } else if selected >= app.dhcp_client_scroll.saturating_add(visible_items) {
@@ -92,7 +118,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
     app.dhcp_client_scroll = app.dhcp_client_scroll.min(max_scroll);
 
     app.ui.list_area = Some(list_area);
-    app.ui.list_row_height = 3;
+    app.ui.list_row_height = 4;
     app.ui.list_count = names.len();
     app.ui.list_scroll_offset = app.dhcp_client_scroll;
 
@@ -113,7 +139,20 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
         .skip(app.dhcp_client_scroll)
         .take(visible_items)
     {
-        let is_selected = app.dhcp_client_selected.as_deref() == Some(name.as_str());
+        let is_selected = names.get(selected) == Some(name);
+        let entry = app
+            .dashboard
+            .inventory
+            .as_ref()
+            .and_then(|entries| entries.iter().find(|entry| &entry.name == name));
+        let saved = entry
+            .and_then(|entry| entry.configured.as_ref())
+            .and_then(|config| config.dhcp_client.as_ref());
+        let presence = match entry.map(|entry| entry.presence) {
+            Some(traffic_masq_protocol::InterfacePresence::Missing) => " (Missing)",
+            Some(traffic_masq_protocol::InterfacePresence::Unknown) => " (observation unavailable)",
+            _ => "",
+        };
         let status = app
             .dhcp_clients
             .iter()
@@ -139,7 +178,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
                 DhcpClientOperationalState::Degraded => theme::BAD,
             };
             lines.push(Line::from(vec![
-                Span::styled(format!("{marker} {:<12}", name), name_style),
+                Span::styled(format!("{marker} {name:<12}{presence} "), name_style),
                 Span::styled(state, Style::default().fg(state_color)),
                 Span::raw(format!(
                     "  address {}  server {}",
@@ -171,22 +210,49 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
                 }
             )));
             lines.push(Line::styled(
-                "  [c] configure defaults  [r] renew/revalidate  [x] release/reacquire  [d] delete",
+                status
+                    .degraded_reason
+                    .as_ref()
+                    .map(|reason| format!("  {reason}"))
+                    .unwrap_or_else(|| {
+                        format!(
+                            "  metric {}  default route {}  request DNS {}",
+                            status.config.route_metric,
+                            status.config.install_default_route,
+                            status.config.request_dns
+                        )
+                    }),
+                Style::default().fg(if status.degraded_reason.is_some() {
+                    theme::BAD
+                } else {
+                    theme::MUTED
+                }),
+            ));
+            lines.push(Line::styled(
+                "  [c] reset defaults  [r] renew  [x] release/reacquire  [d] disable",
                 Style::default().fg(theme::ACCENT),
             ));
         } else {
             lines.push(Line::from(vec![
-                Span::styled(format!("{marker} {:<12}", name), name_style),
-                Span::styled("not configured", Style::default().fg(theme::MUTED)),
+                Span::styled(format!("{marker} {name:<12}{presence} "), name_style),
+                Span::styled(
+                    match saved {
+                        Some(config) if config.enabled => "configured; runtime unavailable",
+                        Some(_) => "disabled",
+                        None => "not configured",
+                    },
+                    Style::default().fg(theme::MUTED),
+                ),
             ]));
             lines.push(Line::styled(
-                "  Selected on Interfaces; no managed DHCP client exists yet.",
+                "  Requires managed Input without static IPv4 (set in Interfaces).",
                 Style::default().fg(theme::MUTED),
             ));
             lines.push(Line::styled(
-                "  [c] configure sensible defaults",
+                "  [c] enable with defaults",
                 Style::default().fg(theme::ACCENT),
             ));
+            lines.push(Line::from(""));
         }
     }
     frame.render_widget(Paragraph::new(lines), list_area);
@@ -243,7 +309,8 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClien
         _ => {}
     }
 
-    let Some(interface) = app.dhcp_client_selected.clone() else {
+    let names = row_names(app);
+    let Some(interface) = names.get(selected_row(app, &names)).cloned() else {
         if matches!(
             key,
             KeyCode::Char('c') | KeyCode::Char('r') | KeyCode::Char('x') | KeyCode::Char('d')
@@ -252,6 +319,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClien
         }
         return;
     };
+    app.dhcp_client_selected = Some(interface.clone());
     let configured = app
         .dhcp_clients
         .iter()
@@ -276,10 +344,30 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClien
             LogLevel::Error,
             format!("Uplink DHCP action failed: {detail:?}"),
         ),
-        Ok(_) => {
-            app.push_message(LogLevel::Info, "Uplink DHCP action applied");
+        Ok(Response::DhcpClientInterface { status })
+            if status.interface == interface
+                && !matches!(request, Request::DisableDhcpClient { .. }) =>
+        {
+            app.push_message(
+                LogLevel::Info,
+                format!("Uplink DHCP action accepted on {interface}; check lease status"),
+            );
             refresh(app, client).await;
         }
+        Ok(Response::DhcpClientDisabled {
+            interface: disabled,
+        }) if disabled == interface && matches!(request, Request::DisableDhcpClient { .. }) => {
+            app.push_message(
+                LogLevel::Info,
+                format!("DHCP client disabled on {interface}"),
+            );
+            refresh(app, client).await;
+        }
+        Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
+        Ok(response) => app.push_message(
+            LogLevel::Error,
+            format!("Unexpected uplink DHCP action response: {response:?}"),
+        ),
         Err(error) => app.push_message(
             LogLevel::Error,
             format!("Uplink DHCP action failed: {error}"),
