@@ -9,7 +9,6 @@ use ratatui::widgets::{Cell, Gauge, Paragraph, Row, Table};
 
 use crate::tui::api::client::ApiClient;
 use crate::tui::api::model::{Request, Response, RouterErrorDetail, RouterRecoveryNotice};
-#[cfg(test)]
 use traffic_masq_protocol::DhcpServiceView;
 use traffic_masq_protocol::RecoveryAction;
 use traffic_masq_protocol::{CoordinatorStatus, RouterHealthReport};

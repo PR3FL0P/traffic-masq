@@ -114,6 +114,13 @@ pub(crate) fn displayed_rules(router: &RouterData) -> Option<Vec<ForwardingConfi
 async fn load_rules(app: &mut TuiApp, client: &ApiClient) -> Option<Vec<ForwardingConfig>> {
     if !app.router.staged {
         super::router::load_router_data(app, client).await;
+        if !app.router.topology.loaded {
+            app.push_message(
+                LogLevel::Error,
+                "Could not refresh saved sharing configuration; refresh and try again",
+            );
+            return None;
+        }
     }
     if !app.router.proposed_router_config.vpn_chain.is_empty() {
         app.push_message(LogLevel::Warn, "The global VPN chain uses legacy forwarding. Configure its tunnel routing before switching to per-interface sharing.");
@@ -239,7 +246,7 @@ fn preferred_new_connection_endpoints(
                     .filter_map(|route| {
                         let name = route.output_interface.as_ref()?;
                         let index = interfaces.iter().position(|candidate| candidate == name)?;
-                        Some((route.table != 254, route.metric.unwrap_or(u32::MAX), index))
+                        Some((route.table != 254, route.metric.unwrap_or(0), index))
                     })
                     .min()
                     .map(|(_, _, index)| index)

@@ -112,7 +112,8 @@ Both links must be up when you apply a sharing connection.
    appropriate for your network. Keep static device addresses outside the pool.
 3. In **Router → Internet sharing**, add a connection with **Traffic from** set
    to `lan0`, **Internet through** set to `wan0`, and **Masquerade** enabled.
-   Review and apply it.
+   Save the connection. If routing is disabled, switch to **Routes** and choose
+   **Enable routing**. Review and apply the draft.
 4. Check that a device on `lan0` receives an address and can reach the Internet,
    then choose **Commit** before the confirmation timer expires.
 

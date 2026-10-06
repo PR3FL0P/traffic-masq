@@ -362,6 +362,9 @@ pub(crate) async fn load_router_data(app: &mut TuiApp, client: &ApiClient) {
     // Saved inventory remains usable even when execution status is unavailable.
     let _ = load_router_status(app, client).await;
     if !app.router.staged {
+        // Cached rows may remain visible, but failed refreshes must not make
+        // them look like a freshly loaded configuration safe for editing.
+        app.router.topology.loaded = false;
         let selected = app
             .router
             .route_rows()

@@ -1215,6 +1215,35 @@ fn intent_preview(
     }
 }
 
+#[tokio::test]
+async fn sharing_refresh_requires_inventory_even_when_router_status_succeeds() {
+    let mut app = TuiApp::default();
+    app.router.topology.loaded = true;
+    app.router.proposed_router_config.forwarding = Some(vec![ForwardingConfigView {
+        from: "lan0".into(),
+        to: "wan0".into(),
+        masquerade: true,
+        source_subnet: None,
+    }]);
+    let before = app.router.proposed_router_config.clone();
+    // The connection closes after status; inventory cannot be refreshed.
+    let (_directory, client, server) = router_mock_api(vec![Response::RouterStatus {
+        desired_revision: Some(1),
+        last_applied_revision: Some(1),
+        enabled: true,
+        ready: true,
+        coordinator_status: CoordinatorStatus::Idle,
+        health: None,
+        recovery: None,
+    }])
+    .await;
+    super::super::forwarding::handle_list_key(&mut app, KeyCode::Delete, &client).await;
+    assert_eq!(server.await.unwrap().len(), 1);
+    assert!(!app.router.topology.loaded);
+    assert!(!app.router.staged);
+    assert_eq!(app.router.proposed_router_config, before);
+}
+
 fn missing_route_row(config: OwnedIpv4RouteConfig) -> traffic_masq_protocol::RouteInventoryEntry {
     traffic_masq_protocol::RouteInventoryEntry {
         configured: Some(config),

@@ -357,6 +357,10 @@ Routes and sharing use the same draft. **Review / Apply** (or **Plan / Apply**
 in Routes) previews all pending edits before applying them with a confirmation
 timer. Refresh keeps your draft.
 
+Saving a sharing connection does not enable disabled routing. To activate it,
+switch to **Routes**, choose **Enable routing**, then review, apply and commit
+the draft.
+
 Connections refer to existing interfaces, including externally managed Ethernet
 and VPN interfaces. Both must be up when applying. Creating a connection does
 not take ownership of interface addresses, set up Wi-Fi, or configure DHCP.

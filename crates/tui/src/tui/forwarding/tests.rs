@@ -84,6 +84,53 @@ async fn new_sharing_prefills_managed_lan_to_observed_default_route() {
     assert_eq!(rules, vec![connection("wlp1s0", "wlp5s0f3u2")]);
 }
 
+#[test]
+fn default_route_without_metric_has_zero_priority_cost() {
+    let mut app = TuiApp::default();
+    let interfaces = vec!["lan0".into(), "wan0".into(), "wan1".into()];
+    let route = |interface: &str, metric| traffic_masq_protocol::RouteStatusView {
+        destination: "0.0.0.0/0".parse().unwrap(),
+        gateway: None,
+        output_interface: Some(interface.into()),
+        output_interface_index: None,
+        table: 254,
+        metric,
+        protocol: 4,
+        scope: 0,
+        owner: traffic_masq_protocol::RouteOwnerView::Static,
+    };
+    app.dashboard.routes = Some(vec![route("wan1", Some(600)), route("wan0", None)]);
+    let (_, to) = preferred_new_connection_endpoints(&app, &interfaces, None);
+    assert_eq!(interfaces[to], "wan0");
+    let (_, to) = preferred_new_connection_endpoints(&app, &interfaces, Some("wan1"));
+    assert_eq!(interfaces[to], "wan1", "explicit route selection wins");
+}
+
+#[tokio::test]
+async fn failed_refresh_cannot_edit_or_delete_cached_sharing_rules() {
+    for edit in [false, true] {
+        let mut app = TuiApp::default();
+        app.screen = Screen::Router;
+        app.router.topology.loaded = true;
+        app.router.proposed_router_config.forwarding = Some(vec![connection("lan0", "wan0")]);
+        app.dashboard.interfaces = vec![
+            interface_status("lan0", false),
+            interface_status("wan0", true),
+        ];
+        let before = app.router.proposed_router_config.clone();
+        let client = ApiClient::new("/must-not-exist-sharing.sock");
+        if edit {
+            open(&mut app, &client, true, None).await;
+        } else {
+            delete(&mut app, &client).await;
+        }
+        assert!(app.forwarding.is_none());
+        assert_eq!(app.screen, Screen::Router);
+        assert!(!app.router.staged);
+        assert_eq!(app.router.proposed_router_config, before);
+    }
+}
+
 #[tokio::test]
 async fn editing_replaces_the_selected_connection_and_preserves_route_intent() {
     let mut app = TuiApp::default();

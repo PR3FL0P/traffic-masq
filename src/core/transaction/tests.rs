@@ -199,6 +199,62 @@ async fn a_global_convergence_failure_is_not_success_for_an_interface() {
 }
 
 #[tokio::test]
+async fn shutdown_preserves_cancelled_apply_without_a_prior_pending_query() {
+    for restore_baselines in [false, true] {
+        let directory = tempdir().unwrap();
+        let desired = desired_state(directory.path()).await;
+        desired.attach_converger();
+        let provider = fake_network();
+        let manager = NetworkTransactionManager::new(
+            InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory()),
+            Duration::from_secs(60),
+            desired.clone(),
+        );
+        let worker = manager.clone();
+        let applying = tokio::spawn(async move {
+            worker
+                .apply(
+                    "test0",
+                    InterfaceChange {
+                        config: &interface_config(PROPOSED),
+                        previous: None,
+                        current_role: None,
+                        allow_management_change: false,
+                        passphrase: WifiPassphraseUpdate::Keep,
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !desired.is_tentative("test0").await {
+                desired.changed().await;
+            }
+        })
+        .await
+        .unwrap();
+        // Model a partially applied runtime change before cancellation.
+        provider.interface.lock().await.is_up = true;
+        applying.abort();
+        assert!(applying.await.unwrap_err().is_cancelled());
+        assert!(recovery_control::stopped(&manager.journal_path("test0")));
+
+        // No status request has imported the interrupted journal into pending.
+        let result = if restore_baselines {
+            manager.restore_baselines().await
+        } else {
+            manager.rollback_all_pending().await
+        };
+        assert!(result.is_err(), "shutdown must report unresolved recovery");
+        assert!(provider.interface.lock().await.is_up);
+        assert!(manager.journal_path("test0").exists());
+        assert!(desired.is_tentative("test0").await);
+        let pending = manager.pending().await;
+        assert_eq!(pending.len(), 1);
+        assert!(!pending[0].can_commit());
+    }
+}
+
+#[tokio::test]
 async fn a_failed_converger_is_rejected_without_waiting_for_the_deadline() {
     let directory = tempdir().unwrap();
     let desired = desired_state(directory.path()).await;
@@ -573,6 +629,52 @@ async fn timeout_waits_for_admitted_confirmation() {
         desired.committed_interface("test0").await.unwrap(),
         Some(interface_config(PROPOSED))
     );
+}
+
+#[tokio::test]
+async fn replaced_timer_cannot_rollback_after_waiting_for_operation_lock() {
+    let directory = tempdir().unwrap();
+    let desired = desired_state(directory.path()).await;
+    let manager = NetworkTransactionManager::new(
+        InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory()),
+        Duration::from_secs(3600),
+        desired.clone(),
+    );
+    let pending = manager
+        .apply(
+            "test0",
+            InterfaceChange {
+                config: &interface_config(PROPOSED),
+                previous: None,
+                current_role: None,
+                allow_management_change: false,
+                passphrase: WifiPassphraseUpdate::Keep,
+            },
+        )
+        .await
+        .unwrap();
+    let epoch = manager.inner.timer_epochs.lock().unwrap()[&pending.token];
+    let operation = manager.inner.operation_lock.lock().await;
+    let rollback = manager.rollback_for_epoch(&pending.token, epoch);
+    tokio::pin!(rollback);
+    // Poll the timer until it is queued behind a manual operation.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut rollback)
+            .await
+            .is_err()
+    );
+    manager
+        .inner
+        .timer_epochs
+        .lock()
+        .unwrap()
+        .insert(pending.token.clone(), epoch + 1);
+    drop(operation);
+
+    assert!(rollback.await.unwrap().is_none());
+    assert!(desired.is_tentative("test0").await);
+    assert_eq!(manager.pending().await, vec![pending.clone()]);
+    manager.rollback(&pending.token).await.unwrap();
 }
 
 #[tokio::test(start_paused = true)]

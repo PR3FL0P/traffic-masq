@@ -1051,6 +1051,32 @@ impl NetworkTransactionManager {
 
     async fn rollback_inner(&self, token: &str, manual: bool) -> Result<PendingNetworkChange> {
         let _operation = self.inner.operation_lock.lock().await;
+        self.rollback_locked(token, manual).await
+    }
+
+    async fn rollback_for_epoch(
+        &self,
+        token: &str,
+        epoch: u64,
+    ) -> Result<Option<PendingNetworkChange>> {
+        let _operation = self.inner.operation_lock.lock().await;
+        // An explicit retry may replace this timer while it waits for the
+        // operation lock. Only the current timer may start another attempt.
+        if self
+            .inner
+            .timer_epochs
+            .lock()
+            .expect("interface timer epoch lock")
+            .get(token)
+            != Some(&epoch)
+        {
+            return Ok(None);
+        }
+        self.rollback_locked(token, false).await.map(Some)
+    }
+
+    // The caller holds operation_lock throughout restoration and bookkeeping.
+    async fn rollback_locked(&self, token: &str, manual: bool) -> Result<PendingNetworkChange> {
         self.import_stopped_journals().await?;
         crate::core::recovery::check_commit(self.desired().state_dir())?;
         let pending = {
@@ -1180,7 +1206,13 @@ impl NetworkTransactionManager {
 
     /// Attempt every pending rollback and return all restoration failures together.
     pub async fn rollback_all_pending(&self) -> Result<()> {
-        let tokens: Vec<_> = self.inner.pending.lock().await.keys().cloned().collect();
+        let tokens: Vec<_> = {
+            let _operation = self.inner.operation_lock.lock().await;
+            // Cancelled applies and stopped startup recovery may exist only
+            // in the journal; shutdown must not depend on a prior status query.
+            self.import_stopped_journals().await?;
+            self.inner.pending.lock().await.keys().cloned().collect()
+        };
         let mut errors = Vec::new();
         for token in tokens {
             if let Err(error) = self.rollback_inner(&token, false).await {
@@ -1470,11 +1502,12 @@ impl NetworkTransactionManager {
                 if !manager.inner.pending.lock().await.contains_key(&token) {
                     return;
                 }
-                match manager.rollback_inner(&token, false).await {
-                    Ok(_) => {
+                match manager.rollback_for_epoch(&token, epoch).await {
+                    Ok(Some(_)) => {
                         tracing::warn!(%token, "network change automatically rolled back after timeout");
                         return;
                     }
+                    Ok(None) => return,
                     Err(error) => {
                         tracing::error!(%token, %error, "automatic network rollback failed; will retry");
                     }
