@@ -1251,20 +1251,20 @@ async fn shutdown_with_restore_interfaces_stops_hostapd_and_clears_its_record() 
 #[test]
 fn backoff_doubles_up_to_the_five_minute_ceiling() {
     assert_eq!(
-        crate::wifi::lifecycle::backoff_duration(5, 1),
+        crate::wifi::retry::backoff_duration(5, 1),
         Duration::from_secs(5)
     );
     assert_eq!(
-        crate::wifi::lifecycle::backoff_duration(5, 2),
+        crate::wifi::retry::backoff_duration(5, 2),
         Duration::from_secs(10)
     );
     assert_eq!(
-        crate::wifi::lifecycle::backoff_duration(5, 3),
+        crate::wifi::retry::backoff_duration(5, 3),
         Duration::from_secs(20)
     );
     assert_eq!(
-        crate::wifi::lifecycle::backoff_duration(5, 20),
-        crate::wifi::lifecycle::BACKOFF_CEILING
+        crate::wifi::retry::backoff_duration(5, 20),
+        crate::wifi::retry::BACKOFF_CEILING
     );
 }
 
@@ -1365,10 +1365,10 @@ async fn disabled_acs_ap_keeps_backoff_after_a_successful_spawn() {
         assert!(error.contains("fixed channel"));
         let mut tasks = supervisor.inner.tasks.lock().await;
         let task = tasks.get_mut("wlan0").unwrap();
-        assert_eq!(task.retry.consecutive_failures, attempt);
-        assert!(task.retry.next_restart_earliest.unwrap() > Instant::now());
+        assert_eq!(task.retry.attempts(), attempt);
+        assert!(task.retry.next_restart().unwrap() > Instant::now());
         // Advance the supervisor's retry deadline without a wall-clock sleep.
-        task.retry.next_restart_earliest = Some(Instant::now());
+        task.retry.retry_now();
     }
     let pid = supervisor.status("wlan0").await.unwrap().pid;
     process.kill_externally(pid);
@@ -1380,7 +1380,7 @@ async fn disabled_acs_ap_keeps_backoff_after_a_successful_spawn() {
         .get_mut("wlan0")
         .unwrap()
         .retry
-        .next_restart_earliest = Some(Instant::now() + Duration::from_secs(60));
+        .await_health(60);
     let count = process.spawn_count();
     supervisor.configure(ap).await.unwrap();
     assert_eq!(
@@ -1396,7 +1396,7 @@ async fn disabled_acs_ap_keeps_backoff_after_a_successful_spawn() {
         .get_mut("wlan0")
         .unwrap()
         .retry
-        .next_restart_earliest = Some(Instant::now());
+        .retry_now();
     process.set_spawn_profile("ENABLED");
     assert!(supervisor.ensure_alive().await.unwrap());
     supervisor
@@ -1407,12 +1407,12 @@ async fn disabled_acs_ap_keeps_backoff_after_a_successful_spawn() {
         .get_mut("wlan0")
         .unwrap()
         .retry
-        .next_restart_earliest = Some(Instant::now());
+        .retry_now();
     assert!(!supervisor.ensure_alive().await.unwrap());
     assert_eq!(
         supervisor.inner.tasks.lock().await["wlan0"]
             .retry
-            .consecutive_failures,
+            .attempts(),
         0
     );
     assert!(matches!(
@@ -1481,11 +1481,9 @@ async fn deterministic_acs_failure_suspends_retry_until_config_changes() {
         2,
         "changing config must restart even though the previous hostapd is dead"
     );
-    assert!(
-        !supervisor.inner.tasks.lock().await["wlan0"]
-            .retry
-            .retry_suspended
-    );
+    assert!(!supervisor.inner.tasks.lock().await["wlan0"]
+        .retry
+        .is_suspended());
 }
 
 #[tokio::test]
@@ -1512,11 +1510,10 @@ async fn deterministic_startup_failure_is_suspended_immediately() {
         "reapplying unchanged desired state must not bypass suspension"
     );
     let task = supervisor.inner.tasks.lock().await["wlan0"].clone();
-    assert!(task.retry.retry_suspended);
+    assert!(task.retry.is_suspended());
     assert!(task
         .retry
-        .last_failure
-        .as_deref()
+        .failure()
         .unwrap()
         .contains("automatic retry suspended"));
 }
@@ -1540,11 +1537,9 @@ async fn interface_identity_change_resumes_a_suspended_retry() {
     let pid = supervisor.status("lo").await.unwrap().pid;
     process.set_diagnostics(pid, &["ACS: All study options have failed"]);
     assert!(!supervisor.ensure_alive().await.unwrap());
-    assert!(
-        supervisor.inner.tasks.lock().await["lo"]
-            .retry
-            .retry_suspended
-    );
+    assert!(supervisor.inner.tasks.lock().await["lo"]
+        .retry
+        .is_suspended());
 
     // Model the observation that the old interface disappeared. When the same
     // configured name now resolves again, it is a new interface identity and
@@ -1557,15 +1552,13 @@ async fn interface_identity_change_resumes_a_suspended_retry() {
         .get_mut("lo")
         .unwrap()
         .retry
-        .suspended_ifindex = None;
+        .resume_for_interface(None);
     process.set_spawn_profile("ENABLED");
     assert!(supervisor.ensure_alive().await.unwrap());
     assert_eq!(process.spawn_count(), 2);
-    assert!(
-        !supervisor.inner.tasks.lock().await["lo"]
-            .retry
-            .retry_suspended
-    );
+    assert!(!supervisor.inner.tasks.lock().await["lo"]
+        .retry
+        .is_suspended());
 }
 
 #[test]
@@ -1664,8 +1657,8 @@ async fn transient_channel_failure_keeps_retrying() {
     assert!(supervisor.ensure_alive().await.unwrap());
     assert_eq!(process.spawn_count(), 2);
     let task = supervisor.inner.tasks.lock().await["wlan0"].clone();
-    assert!(!task.retry.retry_suspended);
-    assert!(task.retry.next_restart_earliest.is_some());
+    assert!(!task.retry.is_suspended());
+    assert!(task.retry.next_restart().is_some());
 }
 
 #[test]
@@ -1707,11 +1700,9 @@ async fn changing_credentials_resumes_a_suspended_startup_with_the_same_spec() {
         .unwrap();
     supervisor.configure(ap).await.unwrap();
     assert_eq!(process.spawn_count(), 1);
-    assert!(
-        !supervisor.inner.tasks.lock().await["wlan0"]
-            .retry
-            .retry_suspended
-    );
+    assert!(!supervisor.inner.tasks.lock().await["wlan0"]
+        .retry
+        .is_suspended());
 }
 
 #[tokio::test]
@@ -1732,13 +1723,8 @@ async fn background_render_failure_is_recorded_and_backs_off() {
     assert!(supervisor.ensure_alive().await.unwrap());
     assert!(!supervisor.ensure_alive().await.unwrap());
     let task = supervisor.inner.tasks.lock().await["wlan0"].clone();
-    assert!(task
-        .retry
-        .last_failure
-        .as_deref()
-        .unwrap()
-        .contains("passphrase"));
-    assert!(task.retry.next_restart_earliest.unwrap() > Instant::now());
+    assert!(task.retry.failure().unwrap().contains("passphrase"));
+    assert!(task.retry.next_restart().unwrap() > Instant::now());
     assert_eq!(process.spawn_count(), 1);
 }
 
@@ -1765,7 +1751,7 @@ async fn resumed_retry_does_not_reuse_diagnostics_from_the_old_process() {
         .get_mut("lo")
         .unwrap()
         .retry
-        .suspended_ifindex = None;
+        .resume_for_interface(None);
     process.fail_spawn.store(true, Ordering::Relaxed);
     assert!(supervisor.ensure_alive().await.unwrap());
     let status = supervisor.status("lo").await.unwrap();
@@ -1781,14 +1767,12 @@ async fn resumed_retry_does_not_reuse_diagnostics_from_the_old_process() {
         .get_mut("lo")
         .unwrap()
         .retry
-        .next_restart_earliest = Some(Instant::now());
+        .retry_now();
     assert!(supervisor.ensure_alive().await.unwrap());
     assert_eq!(process.spawn_count(), 3);
-    assert!(
-        !supervisor.inner.tasks.lock().await["lo"]
-            .retry
-            .retry_suspended
-    );
+    assert!(!supervisor.inner.tasks.lock().await["lo"]
+        .retry
+        .is_suspended());
 }
 
 #[test]

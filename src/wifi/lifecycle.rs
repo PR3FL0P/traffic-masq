@@ -10,7 +10,6 @@ use crate::wifi::render::WifiDigest;
 
 pub(crate) const STARTUP_READY_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(20);
-pub(crate) const BACKOFF_CEILING: Duration = Duration::from_secs(300);
 
 const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const GRACEFUL_STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -29,51 +28,6 @@ pub enum WifiHealth {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         advice: Option<String>,
     },
-}
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct RetryState {
-    pub(crate) consecutive_failures: u32,
-    pub(crate) next_restart_earliest: Option<Instant>,
-    pub(crate) last_failure: Option<String>,
-    pub(crate) retry_suspended: bool,
-    pub(crate) suspended_ifindex: Option<u32>,
-}
-
-impl RetryState {
-    pub(crate) fn failed_startup(base_seconds: u64, error: &str) -> Self {
-        Self {
-            consecutive_failures: 1,
-            next_restart_earliest: Some(Instant::now() + backoff_duration(base_seconds, 1)),
-            last_failure: Some(error.to_string()),
-            retry_suspended: false,
-            suspended_ifindex: None,
-        }
-    }
-
-    pub(crate) fn is_waiting(&self) -> bool {
-        self.next_restart_earliest
-            .is_some_and(|earliest| Instant::now() < earliest)
-    }
-
-    pub(crate) fn respawn_failed(&mut self, base_seconds: u64, error: &str) {
-        self.last_failure = Some(error.to_string());
-        self.retry_suspended = false;
-        self.suspended_ifindex = None;
-        self.next_restart_earliest =
-            Some(Instant::now() + backoff_duration(base_seconds, self.consecutive_failures));
-    }
-
-    pub(crate) fn suspend(&mut self, error: &str, ifindex: Option<u32>) {
-        self.last_failure = Some(error.to_string());
-        self.next_restart_earliest = None;
-        self.retry_suspended = true;
-        self.suspended_ifindex = ifindex;
-    }
-
-    pub(crate) fn clear(&mut self) {
-        *self = Self::default();
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -433,32 +387,6 @@ pub(crate) async fn persist_owned_ctrl_node(
     Ok(record)
 }
 
-pub(crate) async fn retry_health(
-    error: &str,
-    attempts: u32,
-    next_restart_earliest: Option<Instant>,
-    interface: &str,
-) -> WifiHealth {
-    let retry_in_secs = next_restart_earliest
-        .map(|earliest| earliest.saturating_duration_since(Instant::now()).as_secs());
-    let competing_managers = crate::wifi::process::find_competing_network_managers().await;
-    let advice = if competing_managers.is_empty() {
-        None
-    } else {
-        Some(crate::wifi::process::format_competing_manager_advice(
-            &competing_managers,
-            interface,
-        ))
-    };
-    WifiHealth::Retrying {
-        error: error.to_string(),
-        attempts,
-        retry_in_secs,
-        competing_managers,
-        advice,
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum BinaryPreflightError {
     #[error("binary {binary} does not exist")]
@@ -536,15 +464,6 @@ pub(crate) async fn graceful_stop<P: SupervisedProcess + ?Sized>(
             true => tokio::time::sleep(GRACEFUL_STOP_POLL_INTERVAL).await,
         }
     }
-}
-
-/// Compute a bounded exponential restart delay from the consecutive failure count.
-pub(crate) fn backoff_duration(base_seconds: u64, consecutive_failures: u32) -> Duration {
-    let multiplier = 1u64.checked_shl(consecutive_failures.saturating_sub(1));
-    let seconds = multiplier
-        .and_then(|multiplier| base_seconds.checked_mul(multiplier))
-        .unwrap_or(u64::MAX);
-    Duration::from_secs(seconds).min(BACKOFF_CEILING)
 }
 
 /// Atomically write a runtime configuration with private file permissions off the async executor.

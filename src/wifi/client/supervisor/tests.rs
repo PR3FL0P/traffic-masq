@@ -1,3 +1,4 @@
+use crate::wifi::client::render::scan_config_path;
 use std::os::unix::net::UnixDatagram as StdUnixDatagram;
 use std::sync::atomic::{AtomicBool, Ordering};
 
