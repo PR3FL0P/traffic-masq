@@ -28,6 +28,7 @@ use traffic_masq_protocol::{InterfaceStatusView as InterfaceStatus, Ipv4AddressI
 
 mod access;
 pub(crate) mod api;
+pub mod connections;
 mod dashboard;
 mod dhcp;
 mod dhcp_client;
@@ -241,6 +242,7 @@ struct ViewIdentity {
 
 struct TuiApp {
     screen: Screen,
+    connected_endpoint: Option<String>,
     last_drawn_view: Option<ViewIdentity>,
     dashboard: DashboardData,
     selected_interface: usize,
@@ -295,6 +297,7 @@ impl Default for TuiApp {
     fn default() -> Self {
         Self {
             screen: Screen::Dashboard,
+            connected_endpoint: None,
             last_drawn_view: None,
             dashboard: DashboardData::default(),
             selected_interface: 0,
@@ -370,7 +373,10 @@ impl TuiApp {
 
 /// Prompt for the current and replacement passwords, update the daemon, and clear cached credentials.
 pub async fn change_device_password(socket_path: PathBuf) -> Result<()> {
-    let client = ApiClient::new(socket_path);
+    change_device_password_with_client(ApiClient::new(socket_path)).await
+}
+
+pub async fn change_device_password_with_client(client: ApiClient) -> Result<()> {
     client
         .request(&Request::Ping)
         .await
@@ -428,7 +434,13 @@ impl Drop for TerminalGuard {
 /// Initialize the terminal and run the interactive UI in daemon or direct-observation mode.
 /// Restore terminal settings when the session ends or an error unwinds the terminal guard.
 pub async fn run_tui(socket_path: PathBuf, direct: bool) -> Result<()> {
-    let client = ApiClient::new(socket_path);
+    run_tui_with_client(ApiClient::new(socket_path), direct).await
+}
+
+pub async fn run_tui_with_client(client: ApiClient, direct: bool) -> Result<()> {
+    if direct && client.socket_path().is_none() {
+        anyhow::bail!("direct mode cannot use an HTTPS server");
+    }
     if !direct {
         client
             .request(&Request::Ping)
@@ -447,6 +459,11 @@ pub async fn run_tui(socket_path: PathBuf, direct: bool) -> Result<()> {
                 Err(error) => eprintln!("Session storage unavailable: {error}"),
             }
         } else {
+            if client.socket_path().is_none() {
+                anyhow::bail!(
+                    "Initialize the device password locally on the server before using HTTPS"
+                );
+            }
             if !nix::unistd::Uid::effective().is_root() {
                 anyhow::bail!("Initial password setup requires root. Run sudo traffic-masqd auth set-password while the daemon is stopped, then restart it and run this TUI as your authorized user.");
             }
@@ -472,6 +489,9 @@ pub async fn run_tui(socket_path: PathBuf, direct: bool) -> Result<()> {
         }
     }
 
+    if !direct {
+        println!("Connecting to {}", client.endpoint_label());
+    }
     enable_raw_mode()?;
     let terminal_guard = TerminalGuard;
     let mut stdout = io::stdout();
@@ -516,7 +536,12 @@ async fn run_loop(
     } else {
         None
     };
-    let mut app = TuiApp::default();
+    let mut app = TuiApp {
+        connected_endpoint: client
+            .remote_session_identity()
+            .map(|_| client.endpoint_label()),
+        ..Default::default()
+    };
     if !direct {
         if let Ok(store) = session::SessionStore::for_client(client) {
             if let Ok(preferences) = store.preferences() {
@@ -810,7 +835,10 @@ async fn reauthenticate(
         let snapshot = terminal
             .draw(|frame| {
                 let mut spans = vec![Span::styled(
-                    format!("{message}\n\nDevice password: "),
+                    format!(
+                        "Server: {}\n{message}\n\nDevice password: ",
+                        client.endpoint_label()
+                    ),
                     Style::default(),
                 )];
                 spans.extend(input::render_masked_with_cursor(

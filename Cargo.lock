@@ -3065,6 +3065,7 @@ dependencies = [
  "ipnet",
  "nix 0.29.0",
  "ratatui",
+ "rcgen",
  "rpassword",
  "serde",
  "serde_json",

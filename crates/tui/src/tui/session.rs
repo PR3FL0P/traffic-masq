@@ -1,4 +1,4 @@
-//! Per-user preferences and short-lived credentials for one daemon socket.
+//! Per-user preferences and short-lived credentials for one daemon endpoint.
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
@@ -60,6 +60,30 @@ pub(crate) struct SessionStore {
 
 impl SessionStore {
     pub(crate) fn for_client(client: &ApiClient) -> Result<Self> {
+        let key = if let Some(identity) = client.remote_session_identity() {
+            format!("{:x}", Sha256::digest(identity.as_bytes()))
+        } else {
+            let path = client.socket_path().context("local socket unavailable")?;
+            let socket = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            if !socket.is_absolute() {
+                bail!("cannot identify the daemon socket for session storage");
+            }
+            format!("{:x}", Sha256::digest(socket.as_os_str().as_bytes()))
+        };
+        Ok(Self {
+            directory: Self::directory()?,
+            key,
+        })
+    }
+
+    pub(crate) fn connections() -> Result<Self> {
+        Ok(Self {
+            directory: Self::directory()?,
+            key: "connections".into(),
+        })
+    }
+
+    fn directory() -> Result<PathBuf> {
         let uid = Uid::effective();
         let home = User::from_uid(uid)?
             .context("cannot find the current user's home directory")?
@@ -68,15 +92,7 @@ impl SessionStore {
             .map(PathBuf::from)
             .filter(|p| p.is_absolute())
             .unwrap_or_else(|| home.join(".local/state"));
-        let socket = fs::canonicalize(client.socket_path())
-            .unwrap_or_else(|_| client.socket_path().to_path_buf());
-        if !socket.is_absolute() {
-            bail!("cannot identify the daemon socket for session storage");
-        }
-        Ok(Self {
-            directory: state.join("traffic-masq/client"),
-            key: format!("{:x}", Sha256::digest(socket.as_os_str().as_bytes())),
-        })
+        Ok(state.join("traffic-masq/client"))
     }
 
     fn path(&self, suffix: &str) -> PathBuf {
@@ -98,7 +114,7 @@ impl SessionStore {
         Ok(())
     }
 
-    fn read<T: serde::de::DeserializeOwned>(&self, suffix: &str) -> Result<Option<T>> {
+    pub(crate) fn read<T: serde::de::DeserializeOwned>(&self, suffix: &str) -> Result<Option<T>> {
         self.check_directory()?;
         let path = self.path(suffix);
         let file = match OpenOptions::new()
@@ -127,10 +143,13 @@ impl SessionStore {
         ))
     }
 
-    fn write<T: Serialize>(&self, suffix: &str, value: &T) -> Result<()> {
+    pub(crate) fn write<T: Serialize>(&self, suffix: &str, value: &T) -> Result<()> {
         self.check_directory()?;
         atomic_file::ensure_private_dir(&self.directory, 0o700)?;
         let bytes = Zeroizing::new(serde_json::to_vec(value)?);
+        if bytes.len() > 16_384 {
+            bail!("saved client data exceeds the 16 KiB file limit");
+        }
         atomic_file::replace(&self.path(suffix), &bytes, 0o600)?;
         Ok(())
     }

@@ -101,7 +101,7 @@ pub(crate) fn render_header(
     let mode_label = if direct {
         "direct/recovery mode"
     } else {
-        "daemon"
+        app.connected_endpoint.as_deref().unwrap_or("daemon")
     };
     let block = Block::default()
         .borders(Borders::ALL)

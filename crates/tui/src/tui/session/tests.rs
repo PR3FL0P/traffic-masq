@@ -8,6 +8,19 @@ fn store(directory: &std::path::Path) -> SessionStore {
     }
 }
 
+#[test]
+fn oversized_saved_data_preserves_the_previous_readable_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = store(temp.path());
+    store.write("profiles", &"previous").unwrap();
+    let error = store.write("profiles", &"x".repeat(16_384)).unwrap_err();
+    assert!(error.to_string().contains("16 KiB"));
+    assert_eq!(
+        store.read::<String>("profiles").unwrap().as_deref(),
+        Some("previous")
+    );
+}
+
 fn credential(now: u64) -> ClientAuthentication {
     ClientAuthentication {
         token: Zeroizing::new("secret-token".into()),
@@ -226,4 +239,49 @@ fn preferences_defaults_to_hidden_dhcp_client_tab_when_unspecified() {
     assert!(!prefs.show_dhcp_client);
     assert!(prefs.remember);
     assert_eq!(prefs.minutes, 10);
+}
+
+#[test]
+fn named_connections_are_private_and_contain_no_authentication_data() {
+    use super::super::connections::{save_in, SavedConnection};
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let ca = dir.path().join("ca.pem");
+    fs::write(&ca, cert.cert.pem()).unwrap();
+    save_in(
+        &store,
+        "pi",
+        SavedConnection {
+            server: "https://LOCALHOST:8443/".into(),
+            ca_cert: Some(ca.clone()),
+        },
+    )
+    .unwrap();
+    let saved: std::collections::BTreeMap<String, SavedConnection> =
+        store.read("profiles").unwrap().unwrap();
+    assert_eq!(saved["pi"].server, "https://localhost:8443");
+    assert_eq!(saved["pi"].ca_cert, Some(fs::canonicalize(&ca).unwrap()));
+    assert_eq!(
+        fs::metadata(store.path("profiles"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert!(!fs::read_to_string(store.path("profiles"))
+        .unwrap()
+        .contains("token"));
+    assert!(save_in(&store, "../escape", saved["pi"].clone()).is_err());
+    let a = ApiClient::https("https://localhost:8443", Some(&ca)).unwrap();
+    let b = ApiClient::https("https://localhost:8444", Some(&ca)).unwrap();
+    assert_ne!(
+        SessionStore::for_client(&a).unwrap().key,
+        SessionStore::for_client(&b).unwrap().key
+    );
+    assert_eq!(
+        SessionStore::for_client(&a).unwrap().key,
+        SessionStore::for_client(&a.clone()).unwrap().key
+    );
 }
