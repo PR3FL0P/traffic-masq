@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Result};
-use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::config::{InterfaceConfig, InterfaceRole};
@@ -17,9 +16,18 @@ use crate::core::interface::{
 use crate::core::mutation::NetworkMutationGate;
 use crate::core::recovery_control;
 use crate::dhcp::supervisor::{DhcpServiceSpec, DhcpSupervisor};
-use crate::wifi::{
-    secret::{WifiPassphrase, WifiPassphraseUpdate},
-    store::{PassphraseStore, WifiCredentialRole},
+use crate::wifi::secret::WifiPassphraseUpdate;
+
+mod credentials;
+mod journal;
+mod recovery;
+use credentials::{PreparedCredentialChange, SecretSnapshot};
+use journal::{InterfaceJournal, InterfaceJournalStore};
+pub(crate) use recovery::retry_interface_recovery;
+pub use recovery::{
+    block_interface_transactions_without_commit_proof, recover_interface_transactions,
+    recover_interface_transactions_with_commit_tokens,
+    recover_interface_transactions_with_commit_tokens_excluding,
 };
 pub use traffic_masq_protocol::{NetworkChangePhase, PendingNetworkChange};
 
@@ -34,380 +42,6 @@ pub use traffic_masq_protocol::{NetworkChangePhase, PendingNetworkChange};
 const CONVERGENCE_DEADLINE: Duration = crate::wifi::lifecycle::STARTUP_READY_TIMEOUT
     .saturating_add(crate::dhcp::client::supervisor::LEASE_READY_TIMEOUT)
     .saturating_add(Duration::from_secs(5));
-
-#[derive(Deserialize)]
-struct InterfaceJournalHeader {
-    token: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct InterfaceJournal {
-    version: u32,
-    token: String,
-    snapshot: InterfaceSnapshot,
-    #[serde(default)]
-    secret: Option<SecretSnapshot>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-struct SecretSnapshot {
-    #[serde(default)]
-    role: Option<WifiCredentialRole>,
-    previous: Option<zeroize::Zeroizing<String>>,
-}
-
-impl SecretSnapshot {
-    fn restore(&self, state_dir: &std::path::Path, interface: &str) -> Result<()> {
-        let store = match self.role {
-            Some(role) => PassphraseStore::for_role(state_dir, role),
-            None => PassphraseStore::new(state_dir.join("wifi/psk")), // v1/v2 journal
-        };
-        match &self.previous {
-            Some(secret) => store.set(interface, &WifiPassphrase::new(secret.to_string())?)?,
-            None => store.clear(interface)?,
-        }
-        Ok(())
-    }
-}
-
-const INTERFACE_RECOVERY_STORE_ATTEMPTS: usize = 3;
-const INTERFACE_RECOVERY_RETRY_DELAY: Duration = Duration::from_millis(100);
-
-fn retryable_interface_store_error(error: &crate::state::private_store::PrivateStoreError) -> bool {
-    matches!(
-        error,
-        crate::state::private_store::PrivateStoreError::Io(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::Interrupted
-                    | std::io::ErrorKind::WouldBlock
-                    | std::io::ErrorKind::TimedOut
-            )
-    )
-}
-
-fn interface_recovery_store_error(
-    state_dir: &std::path::Path,
-    operation: &'static str,
-    error: crate::state::private_store::PrivateStoreError,
-) -> anyhow::Error {
-    anyhow::Error::new(error).context(
-        crate::core::recovery::RecoveryDiagnostic::fatal(
-            crate::core::recovery::StartupRecoveryCode::AccessibleInterfaceRecoveryStore,
-            operation,
-            crate::core::recovery::RecoveryAction::RepairStorageAccess,
-        )
-        .path(state_dir.join("interface-transactions"))
-        .object("interface-transactions")
-        .detail("expected_type", "directory")
-        .detail(
-            "expected_mode",
-            format!("{:04o}", crate::atomic_file::PRIVATE_DIR_MODE),
-        )
-        .detail("symlink_allowed", false),
-    )
-}
-
-async fn open_interface_recovery_store(
-    state_dir: &std::path::Path,
-) -> Result<crate::state::private_store::PrivateJsonDirectory> {
-    for attempt in 1..=INTERFACE_RECOVERY_STORE_ATTEMPTS {
-        let root = state_dir.to_path_buf();
-        let opened = tokio::task::spawn_blocking(move || {
-            crate::state::private_store::PrivateJsonDirectory::open(root, "interface-transactions")
-        })
-        .await?;
-
-        match opened {
-            Ok(store) => return Ok(store),
-            Err(error)
-                if attempt < INTERFACE_RECOVERY_STORE_ATTEMPTS
-                    && retryable_interface_store_error(&error) =>
-            {
-                tracing::warn!(
-                    attempt,
-                    max_attempts = INTERFACE_RECOVERY_STORE_ATTEMPTS,
-                    operation = "open_interface_recovery_store",
-                    error = %error,
-                    "transient interface recovery store error; retrying"
-                );
-                tokio::time::sleep(INTERFACE_RECOVERY_RETRY_DELAY).await;
-            }
-            Err(error) => return Err(interface_recovery_store_error(state_dir, "open", error)),
-        }
-    }
-    unreachable!("interface recovery retry loop always returns on its final attempt")
-}
-
-async fn enumerate_interface_recovery_journals(
-    state_dir: &std::path::Path,
-    store: &crate::state::private_store::PrivateJsonDirectory,
-) -> Result<Vec<String>> {
-    for attempt in 1..=INTERFACE_RECOVERY_STORE_ATTEMPTS {
-        let store = store.clone();
-        let names = tokio::task::spawn_blocking(move || store.keys()).await?;
-        match names {
-            Ok(names) => return Ok(names),
-            Err(error)
-                if attempt < INTERFACE_RECOVERY_STORE_ATTEMPTS
-                    && retryable_interface_store_error(&error) =>
-            {
-                tracing::warn!(
-                    attempt,
-                    max_attempts = INTERFACE_RECOVERY_STORE_ATTEMPTS,
-                    operation = "enumerate_interface_recovery_journals",
-                    error = %error,
-                    "transient interface recovery store error; retrying"
-                );
-                tokio::time::sleep(INTERFACE_RECOVERY_RETRY_DELAY).await;
-            }
-            Err(error) => {
-                return Err(interface_recovery_store_error(
-                    state_dir,
-                    "enumerate",
-                    error,
-                ));
-            }
-        }
-    }
-    unreachable!("interface recovery retry loop always returns on its final attempt")
-}
-
-/// Restore unconfirmed interface snapshots before applying startup configuration.
-/// In particular, startup otherwise skips interfaces that were previously unmanaged.
-pub async fn recover_interface_transactions(
-    state_dir: &std::path::Path,
-    manager: &InterfaceManager,
-    committed: &crate::state::overrides::RuntimeOverrides,
-    wifi_runtime_dirs: &crate::wifi::WifiRuntimeDirs,
-) -> Result<()> {
-    recover_interface_transactions_with_tokens(
-        state_dir,
-        manager,
-        &committed.committed_interface_transactions,
-        &std::collections::BTreeSet::new(),
-        wifi_runtime_dirs,
-    )
-    .await
-}
-
-/// Early-startup recovery variant that consumes only independently parsed
-/// commit tokens, before the full override document is semantically validated.
-pub async fn recover_interface_transactions_with_commit_tokens(
-    state_dir: &std::path::Path,
-    manager: &InterfaceManager,
-    committed: &std::collections::BTreeMap<String, String>,
-    wifi_runtime_dirs: &crate::wifi::WifiRuntimeDirs,
-) -> Result<()> {
-    recover_interface_transactions_with_commit_tokens_excluding(
-        state_dir,
-        manager,
-        committed,
-        &std::collections::BTreeSet::new(),
-        wifi_runtime_dirs,
-    )
-    .await
-}
-
-/// Recover interface transactions except scopes already fenced by independent recovery metadata.
-pub async fn recover_interface_transactions_with_commit_tokens_excluding(
-    state_dir: &std::path::Path,
-    manager: &InterfaceManager,
-    committed: &std::collections::BTreeMap<String, String>,
-    excluded: &std::collections::BTreeSet<String>,
-    wifi_runtime_dirs: &crate::wifi::WifiRuntimeDirs,
-) -> Result<()> {
-    recover_interface_transactions_with_tokens(
-        state_dir,
-        manager,
-        committed,
-        excluded,
-        wifi_runtime_dirs,
-    )
-    .await
-}
-
-/// Preserve every pending interface journal when its independent commit proof is untrusted.
-///
-/// Enumeration itself remains a global invariant: if the directory cannot be listed, startup
-/// cannot know which interfaces must be fenced. Once names are known, each scope is blocked and
-/// unrelated router recovery may continue without guessing whether rollback would destroy a
-/// committed interface change.
-pub async fn block_interface_transactions_without_commit_proof(
-    state_dir: &std::path::Path,
-    reason: &str,
-) -> Result<()> {
-    let store = open_interface_recovery_store(state_dir).await?;
-    let names = enumerate_interface_recovery_journals(state_dir, &store).await?;
-    for name in names {
-        let path = store.directory().join(format!("{name}.json"));
-        crate::core::recovery::block_interface(
-            state_dir,
-            &name,
-            format!(
-                "journal={}; commit_proof=untrusted; {reason}",
-                path.display()
-            ),
-        );
-    }
-    Ok(())
-}
-
-async fn recover_interface_transactions_with_tokens(
-    state_dir: &std::path::Path,
-    manager: &InterfaceManager,
-    committed: &std::collections::BTreeMap<String, String>,
-    excluded: &std::collections::BTreeSet<String>,
-    wifi_runtime_dirs: &crate::wifi::WifiRuntimeDirs,
-) -> Result<()> {
-    crate::core::recovery::check_commit(state_dir)?;
-    let store = open_interface_recovery_store(state_dir).await?;
-    let names = enumerate_interface_recovery_journals(state_dir, &store)
-        .await?
-        .into_iter()
-        .filter(|name| {
-            if !excluded.contains(name) {
-                return true;
-            }
-            tracing::error!(
-                interface = %name,
-                invariant = "restore_before_mutation",
-                operation = "recover_interface",
-                metadata_safe_to_remove = false,
-                "interface transaction recovery deferred because another recovery record for this interface is untrusted"
-            );
-            false
-        })
-        .collect();
-    recover_interface_journals(
-        state_dir,
-        manager,
-        committed,
-        &store,
-        names,
-        wifi_runtime_dirs,
-        true,
-    )
-    .await;
-    Ok(())
-}
-
-/// Retry only failed startup journals, never live unconfirmed transactions.
-pub(crate) async fn retry_interface_recovery(
-    state_dir: &std::path::Path,
-    manager: &InterfaceManager,
-    committed: &crate::state::overrides::RuntimeOverrides,
-    wifi_runtime_dirs: &crate::wifi::WifiRuntimeDirs,
-) -> Result<()> {
-    crate::core::recovery::check_commit(state_dir)?;
-    let names = crate::core::recovery::retryable_blocked_interfaces(state_dir);
-    if names.is_empty() {
-        return Ok(());
-    }
-    let store = open_interface_recovery_store(state_dir).await?;
-    recover_interface_journals(
-        state_dir,
-        manager,
-        &committed.committed_interface_transactions,
-        &store,
-        names,
-        wifi_runtime_dirs,
-        false,
-    )
-    .await;
-    Ok(())
-}
-
-async fn recover_interface_journals(
-    state_dir: &std::path::Path,
-    manager: &InterfaceManager,
-    committed: &std::collections::BTreeMap<String, String>,
-    store: &crate::state::private_store::PrivateJsonDirectory,
-    names: Vec<String>,
-    wifi_runtime_dirs: &crate::wifi::WifiRuntimeDirs,
-    new_session: bool,
-) {
-    for name in names {
-        let recovery_path = state_dir
-            .join("interface-transactions")
-            .join(format!("{name}.json"));
-        if !new_session && recovery_control::stopped(&recovery_path) {
-            continue;
-        }
-        let path = store.directory().join(format!("{name}.json"));
-        let result: Result<()> =
-            async {
-                let bytes = store.read(&name)?.ok_or_else(|| {
-                    anyhow::anyhow!("recovery journal disappeared before restoration")
-                })?;
-                if crate::core::recovery::completed(&path, &bytes).await? {
-                    return crate::core::recovery::retire(&path).await;
-                }
-                let committed_token = committed.get(&name);
-                let committed_proof = serde_json::from_slice::<InterfaceJournalHeader>(&bytes)
-                    .ok()
-                    .is_some_and(|header| Some(&header.token) == committed_token);
-                if committed_proof {
-                    tracing::warn!(
-                        interface = %name,
-                        journal = %path.display(),
-                        operation = "retire_committed_interface_journal",
-                        invariant = "committed_token_proof",
-                        metadata_safe_to_remove = true,
-                        "retiring interface recovery metadata proven obsolete by committed token"
-                    );
-                    return crate::core::recovery::retire(&path).await;
-                }
-                // A daemon restart starts a new bounded restoration attempt.
-                // Historical failures are evidence, not proof that the current
-                // environment still prevents cancellation. Background retries
-                // retain the existing attempt budget.
-                recovery_control::run(&path, new_session, async {
-                let record: InterfaceJournal = serde_json::from_slice(&bytes)?;
-                anyhow::ensure!(
-                matches!(record.version, 1..=3) && record.snapshot.name == name,
-                recovery_control::failure(recovery_control::FailureKind::Incompatible,
-                    "invariant=valid_interface_snapshot: unsupported schema or interface mismatch")
-            );
-                anyhow::ensure!(
-                    record.version < 3
-                        || record
-                            .secret
-                            .as_ref()
-                            .is_none_or(|secret| secret.role.is_some()),
-                    recovery_control::failure(
-                        recovery_control::FailureKind::Incompatible,
-                        "role missing from Wi-Fi secret snapshot"
-                    )
-                );
-                if committed.get(&name) != Some(&record.token) {
-                    if let Some(secret) = &record.secret {
-                        secret.restore(state_dir, &name)?;
-                    }
-                    crate::wifi::lifecycle::stop_recorded_interface(
-                        state_dir,
-                        wifi_runtime_dirs,
-                        &name,
-                    )
-                    .await?;
-                    manager.rollback_transaction_snapshot(&record.snapshot).await?;
-                    tracing::warn!(interface = %name, "restored interrupted interface transaction");
-                }
-                crate::core::recovery::retire(&path).await
-            })
-            .await
-            }
-            .await;
-        match result {
-            Ok(()) => crate::core::recovery::unblock_interface(state_dir, &name),
-            Err(error) => crate::core::recovery::block_interface(
-                state_dir,
-                &name,
-                format!("journal={}; {error:#}", path.display()),
-            ),
-        }
-    }
-}
 
 /// Applies interface changes by proposing them as desired state.
 ///
@@ -711,59 +345,14 @@ impl NetworkTransactionManager {
         let token = self.next_token();
         let desired = self.desired();
         let previous_config = desired.committed_interface(interface).await?;
-        let role = WifiCredentialRole::from_config(config);
-        let previous_role = previous_config
-            .as_ref()
-            .and_then(WifiCredentialRole::from_config);
-        let protected = config
-            .wifi
-            .as_ref()
-            .is_some_and(|wifi| wifi.security.requires_passphrase())
-            || config
-                .wifi_client
-                .as_ref()
-                .is_some_and(|wifi| wifi.security.requires_passphrase());
-        let explicit_file = config
-            .wifi
-            .as_ref()
-            .and_then(|wifi| wifi.passphrase_file.as_ref())
-            .or_else(|| {
-                config
-                    .wifi_client
-                    .as_ref()
-                    .and_then(|wifi| wifi.passphrase_file.as_ref())
-            });
-        let passphrase_update = match passphrase_update {
-            WifiPassphraseUpdate::Keep if role.is_some() && role != previous_role => {
-                anyhow::ensure!(!protected || explicit_file.is_some(),
-                    "changing Wi-Fi credential role requires an explicit passphrase or passphrase_file");
-                // A newly selected external file must not be shadowed by an
-                // older credential left in the target role's store.
-                WifiPassphraseUpdate::Clear
-            }
-            update => update,
-        };
-        // A pure Wi-Fi role removal has no target credential role, but an
-        // explicit Clear still needs to address the role being removed so the
-        // old secret can be journaled and restored on rollback.
-        let secret_role = match (&passphrase_update, role) {
-            (WifiPassphraseUpdate::Clear, None) => previous_role,
-            _ => role,
-        };
-        let store = secret_role.map(|role| PassphraseStore::for_role(desired.state_dir(), role));
-        let secret = if matches!(&passphrase_update, WifiPassphraseUpdate::Keep) {
-            None
-        } else {
-            let store = store.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("a Wi-Fi secret update requires an unambiguous AP or client role")
-            })?;
-            Some(SecretSnapshot {
-                role: secret_role,
-                previous: store
-                    .get(interface)?
-                    .map(|value| zeroize::Zeroizing::new(value.expose().to_owned())),
-            })
-        };
+        let credentials = PreparedCredentialChange::prepare(
+            desired.state_dir(),
+            interface,
+            config,
+            previous_config.as_ref(),
+            passphrase_update,
+        )?;
+        let secret = credentials.snapshot.clone();
         self.write_journal_record(&token, snapshot.clone(), secret.clone())
             .await?;
         let (apply_guard, stage_error) =
@@ -773,16 +362,7 @@ impl NetworkTransactionManager {
             };
         let staged = match stage_error {
             Some(error) => Err(error),
-            None => match (&passphrase_update, store.as_ref()) {
-                (WifiPassphraseUpdate::Keep, _) => Ok(()),
-                (WifiPassphraseUpdate::Set(passphrase), Some(store)) => store
-                    .set(interface, passphrase)
-                    .map_err(anyhow::Error::from),
-                (WifiPassphraseUpdate::Clear, Some(store)) => {
-                    store.clear(interface).map_err(anyhow::Error::from)
-                }
-                _ => unreachable!("secret role checked before journaling"),
-            },
+            None => credentials.apply(interface),
         };
         if staged.is_ok() {
             desired
@@ -1278,11 +858,12 @@ impl NetworkTransactionManager {
         }
     }
 
+    fn journal_store(&self) -> InterfaceJournalStore {
+        InterfaceJournalStore::new(self.desired().state_dir())
+    }
+
     fn journal_path(&self, interface: &str) -> std::path::PathBuf {
-        self.desired()
-            .state_dir()
-            .join("interface-transactions")
-            .join(format!("{interface}.json"))
+        self.journal_store().path(interface)
     }
 
     /// Reconstruct tokens for stopped startup journals so the existing rollback API
@@ -1397,43 +978,11 @@ impl NetworkTransactionManager {
         snapshot: InterfaceSnapshot,
         secret: Option<SecretSnapshot>,
     ) -> Result<()> {
-        let root = self.desired().state_dir().to_path_buf();
-        crate::core::recovery::before_write(
-            &root
-                .join("interface-transactions")
-                .join(format!("{}.json", snapshot.name)),
-        )
-        .await?;
-        let record = InterfaceJournal {
-            version: 3,
-            token: token.to_owned(),
-            snapshot,
-            secret,
-        };
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let store = crate::state::private_store::PrivateJsonDirectory::open(
-                root,
-                "interface-transactions",
-            )?;
-            anyhow::ensure!(
-                store.read(&record.snapshot.name)?.is_none(),
-                "interface has an unresolved recovery journal; restart the daemon to recover it"
-            );
-            store.write(&record.snapshot.name, &serde_json::to_vec(&record)?)?;
-            Ok(())
-        })
-        .await??;
-        Ok(())
+        self.journal_store().write(token, snapshot, secret).await
     }
 
-    /// Durably remove an interface recovery record on the blocking thread pool.
     async fn clear_journal(&self, interface: &str) -> Result<()> {
-        let path = self
-            .desired()
-            .state_dir()
-            .join("interface-transactions")
-            .join(format!("{interface}.json"));
-        crate::core::recovery::retire(&path).await
+        self.journal_store().retire(interface).await
     }
 
     fn spawn_rollback_timer(&self, token: String) {

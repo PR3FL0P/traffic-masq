@@ -13,7 +13,9 @@ use crate::core::ownership::AddressOwnershipJournal;
 use crate::netlink::{Ipv4AddressInfo, NetworkInterface, NetworkProvider};
 use crate::wifi::{PassphraseStore, WifiPassphrase, WifiPassphraseUpdate, WifiRuntimeDirs};
 
+use super::journal::{interface_recovery_store_error, retryable_interface_store_error};
 use super::*;
+use crate::wifi::store::WifiCredentialRole;
 
 fn wifi_runtime_dirs() -> WifiRuntimeDirs {
     WifiRuntimeDirs::new(
