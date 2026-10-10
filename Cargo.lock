@@ -2953,6 +2953,7 @@ dependencies = [
  "traffic-masq-atomic-file",
  "traffic-masq-dataplane",
  "traffic-masq-dhcp-core",
+ "traffic-masq-host-observation",
  "traffic-masq-netlink",
  "traffic-masq-protocol",
  "traffic-masq-wireguard",
@@ -3011,6 +3012,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "traffic-masq-host-observation"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "traffic-masq-netlink"
 version = "0.1.0"
 dependencies = [
@@ -3060,6 +3069,7 @@ dependencies = [
  "tracing",
  "traffic-masq-api-client",
  "traffic-masq-atomic-file",
+ "traffic-masq-host-observation",
  "traffic-masq-netlink",
  "traffic-masq-protocol",
  "unicode-segmentation",

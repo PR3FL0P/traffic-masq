@@ -32,6 +32,7 @@ zeroize = { version = "1", features = ["serde"] }
 traffic-masq-api-client = { path = "../api-client" }
 traffic-masq-atomic-file = { path = "../atomic-file" }
 traffic-masq-netlink = { path = "../netlink" }
+traffic-masq-host-observation = { path = "../host-observation" }
 traffic-masq-protocol = { path = "../protocol" }
 
 [dev-dependencies]

@@ -4,7 +4,6 @@ mod dhcp_pool;
 mod interface;
 mod interface_plan;
 mod network;
-mod network_manager_advice;
 mod recovery_action;
 mod route;
 mod router;
@@ -19,10 +18,6 @@ pub use interface::{
 pub use interface_plan::{DhcpChangeActionView, InterfaceChangePlanView};
 pub use network::{
     AddressOwnerView, InterfaceStatusView, Ipv4AddressInfoView, NetworkInterfaceView,
-};
-pub use network_manager_advice::{
-    detect_init_system, format_competing_manager_advice, format_competing_manager_advice_for_init,
-    InitSystem,
 };
 pub use recovery_action::RecoveryAction;
 pub use route::{RouteInventoryEntry, RouteOwnerView, RouteStatusView};

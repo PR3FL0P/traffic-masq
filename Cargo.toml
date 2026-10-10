@@ -1,6 +1,6 @@
 
 [workspace]
-members = ["crates/netlink", "crates/protocol", "crates/api-client", "crates/atomic-file", "crates/tui", "crates/dataplane", "crates/dhcp-core", "crates/wireguard"]
+members = ["crates/netlink", "crates/protocol", "crates/api-client", "crates/atomic-file", "crates/tui", "crates/dataplane", "crates/dhcp-core", "crates/wireguard", "crates/host-observation"]
 default-members = [".", "crates/tui"]
 resolver = "2"
 
@@ -58,6 +58,7 @@ traffic-masq-atomic-file = { path = "crates/atomic-file" }
 traffic-masq-dataplane = { path = "crates/dataplane" }
 traffic-masq-dhcp-core = { path = "crates/dhcp-core" }
 traffic-masq-netlink = { path = "crates/netlink" }
+traffic-masq-host-observation = { path = "crates/host-observation" }
 traffic-masq-protocol = { path = "crates/protocol" }
 traffic-masq-wireguard = { path = "crates/wireguard" }
 zeroize = { version = "1", features = ["serde"] }

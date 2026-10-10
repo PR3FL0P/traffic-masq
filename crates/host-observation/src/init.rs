@@ -1,4 +1,4 @@
-//! Shared operator guidance for competing network managers.
+//! Linux init-system observation and operator guidance.
 
 /// Detected init system used to tailor service management commands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,7 +11,11 @@ pub enum InitSystem {
 
 /// Detects the active init system on Linux.
 pub fn detect_init_system() -> InitSystem {
-    if let Ok(comm) = std::fs::read_to_string("/proc/1/comm") {
+    detect_init_system_at(std::path::Path::new("/"))
+}
+
+fn detect_init_system_at(root: &std::path::Path) -> InitSystem {
+    if let Ok(comm) = std::fs::read_to_string(root.join("proc/1/comm")) {
         let comm = comm.trim();
         if comm == "runit" {
             return InitSystem::Runit;
@@ -20,13 +24,13 @@ pub fn detect_init_system() -> InitSystem {
             return InitSystem::Systemd;
         }
     }
-    if std::path::Path::new("/run/systemd/system").exists() {
+    if root.join("run/systemd/system").exists() {
         return InitSystem::Systemd;
     }
-    if std::path::Path::new("/run/runit").exists() {
+    if root.join("run/runit").exists() {
         return InitSystem::Runit;
     }
-    if std::path::Path::new("/run/openrc").exists() {
+    if root.join("run/openrc").exists() {
         return InitSystem::OpenRc;
     }
     InitSystem::Unknown
@@ -237,3 +241,6 @@ pub fn format_competing_manager_advice_for_init(
 
     lines.join("\n")
 }
+
+#[cfg(test)]
+mod tests;

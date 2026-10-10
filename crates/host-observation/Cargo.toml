@@ -1,0 +1,14 @@
+[package]
+name = "traffic-masq-host-observation"
+version = "0.1.0"
+edition = "2021"
+license-file = "../../LICENSE"
+rust-version = "1.95"
+description = "Linux host observations and network-manager guidance for traffic-masq"
+
+[dependencies]
+tokio = { version = "1", features = ["fs"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt"] }
