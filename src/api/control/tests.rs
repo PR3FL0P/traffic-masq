@@ -694,8 +694,20 @@ async fn removing_an_interface_override_falls_back_to_the_file_configuration() {
     let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
         addresses: Vec::new(),
     });
-    let service = ControlService::new(effective, network, dhcp, overrides.clone())
-        .with_base_config(base.clone());
+    let service = ControlService::from_runtime(
+        ControlRuntime {
+            active_config: effective,
+            base_config: base.clone(),
+            network,
+            dhcp,
+            overrides: overrides.clone(),
+            baselines: Vec::new(),
+            ownership_journal: AddressOwnershipJournal::in_memory(),
+            desired_state: DesiredNetworkState::new(base.clone(), overrides.clone()),
+            mutation_gate: Arc::new(NetworkMutationGate::default()),
+        },
+        ControlSubsystems::default(),
+    );
 
     let candidate = overrides
         .build_candidate(&RouterIntentProposal::new().remove_interface("lan0"))
@@ -5500,6 +5512,28 @@ impl RouterSubsystems for FakeProvisioningSubsystems {
         }
         Ok(())
     }
+    async fn quiesce_uplink_dhcp(
+        &self,
+        _desired: Option<&crate::dhcp::client::DhcpClientSpec>,
+    ) -> Result<()> {
+        Ok(())
+    }
+    async fn apply_uplink_dhcp_candidate(
+        &self,
+        desired: Option<&crate::dhcp::client::DhcpClientSpec>,
+    ) -> Result<bool> {
+        Ok(desired.is_some())
+    }
+    async fn rollback_candidate_uplink_dhcp(&self) -> Result<()> {
+        Ok(())
+    }
+    async fn rollback_dhcp_clients(
+        &self,
+        _snapshots: &[crate::core::router::DhcpClientSnapshot],
+        _legacy: Option<&crate::dhcp::client::DhcpClientSpec>,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -7346,7 +7380,23 @@ async fn client_configuration_converges_before_reply_and_rollback_restores_runti
         fixture.service.overrides.clone(),
     );
     desired.attach_converger();
-    let service = fixture.service.with_desired_state(desired.clone());
+    let service = ControlService::from_runtime(
+        ControlRuntime {
+            active_config: fixture.service.config.clone(),
+            base_config: fixture.service.base_config.clone(),
+            network: fixture.service.network.clone(),
+            dhcp: fixture.service.dhcp.clone(),
+            overrides: fixture.service.overrides.clone(),
+            baselines: Vec::new(),
+            ownership_journal: AddressOwnershipJournal::in_memory(),
+            desired_state: desired.clone(),
+            mutation_gate: Arc::new(NetworkMutationGate::default()),
+        },
+        ControlSubsystems {
+            wifi_client: fixture.service.wifi_client.clone(),
+            ..ControlSubsystems::default()
+        },
+    );
     let runtime = service.wifi_client.as_ref().unwrap().clone();
     let gate = service.network_mutations.clone();
     let worker_desired = desired.clone();

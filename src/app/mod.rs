@@ -28,7 +28,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior};
 
-use crate::api::control::ControlService;
+use crate::api::control::{ControlRuntime, ControlService, ControlSubsystems};
 use crate::api::server::HttpApiBindings;
 use crate::auth::{AuthService, Principal};
 use crate::config::{AppConfig, ShutdownPolicy};
@@ -642,32 +642,6 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
     )
     .await;
 
-    // The service is constructed with the effective configuration, because the
-    // runtime values it derives (rollback timeout, state directory) have to be
-    // the ones actually in force. The merge base is the file config, so that
-    // removing an override takes effect and so that the service and the runtime
-    // reconcile loop agree on what the effective configuration is.
-    let mut control = ControlService::new_with_baselines(
-        effective_config.clone(),
-        network_provider.clone(),
-        dhcp.clone(),
-        overrides.clone(),
-        startup_baselines,
-        ownership_journal.clone(),
-    )
-    .with_base_config(config.clone())
-    .with_network_mutation_gate(network_mutations.clone());
-    if let Some(coordinator) = router_coordinator.clone() {
-        control = control.with_router_coordinator(coordinator);
-    }
-
-    if let Some(wifi) = &wifi_supervisor {
-        control = control.with_wifi_supervisor(wifi.clone());
-    }
-    if let Some(wifi_client) = &wifi_client_supervisor {
-        control = control.with_wifi_client_supervisor(wifi_client.clone());
-    }
-    control = control.with_dhcp_client_supervisor(dhcp_client.clone());
     let vpn_policy_manager = vpn_manager.as_ref().map(|vpn| {
         let firewall_executor: Arc<dyn NftExecutor> = Arc::new(NftCommandExecutor);
         Arc::new(build_vpn_policy_manager(
@@ -676,17 +650,31 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
             vpn.clone(),
         ))
     });
-    if let Some(vpn) = &vpn_manager {
-        control = control.with_vpn_manager(vpn.clone());
-    }
-    if let Some(policy) = &vpn_policy_manager {
-        control = control.with_vpn_policy_manager(policy.clone());
-    }
-    // One desired state for both halves. The transaction manager proposes into
-    // it and the converger drives it; two instances would mean proposals nobody
-    // converges and a converger that never sees them.
+    // Construct control and convergence with one desired state and gate. Active
+    // settings come from the merged configuration; override removal merges
+    // against the original file configuration.
     let desired_state = DesiredNetworkState::new(config.clone(), overrides.clone());
-    control = control.with_desired_state(desired_state.clone());
+    let control = ControlService::from_runtime(
+        ControlRuntime {
+            active_config: effective_config.clone(),
+            base_config: config.clone(),
+            network: network_provider.clone(),
+            dhcp: dhcp.clone(),
+            overrides: overrides.clone(),
+            baselines: startup_baselines,
+            ownership_journal: ownership_journal.clone(),
+            desired_state: desired_state.clone(),
+            mutation_gate: network_mutations.clone(),
+        },
+        ControlSubsystems {
+            router: router_coordinator.clone(),
+            dhcp_client: Some(dhcp_client.clone()),
+            vpn: vpn_manager.clone(),
+            vpn_policy: vpn_policy_manager.clone(),
+            wifi: wifi_supervisor.clone(),
+            wifi_client: wifi_client_supervisor.clone(),
+        },
+    );
 
     let transactions = control.transactions();
     let socket_path = bindings.socket_path().to_path_buf();

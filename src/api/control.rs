@@ -124,10 +124,90 @@ pub struct ControlService {
     pending_wifi_client_deactivations: Arc<Mutex<BTreeMap<String, String>>>,
 }
 
+/// Required shared dependencies for a control service driven by reconciliation.
+/// The daemon supplies its file configuration separately from active settings,
+/// and the same desired state and mutation gate used by its runtime workers.
+pub struct ControlRuntime {
+    pub active_config: AppConfig,
+    pub base_config: AppConfig,
+    pub network: Arc<dyn NetworkProvider>,
+    pub dhcp: DhcpSupervisor,
+    pub overrides: RuntimeOverrideManager,
+    pub baselines: Vec<InterfaceSnapshot>,
+    pub ownership_journal: AddressOwnershipJournal,
+    pub desired_state: DesiredNetworkState,
+    pub mutation_gate: Arc<NetworkMutationGate>,
+}
+
+/// Optional runtimes, selected explicitly when assembling the daemon.
+#[derive(Default)]
+pub struct ControlSubsystems {
+    pub router: Option<RouterTransactionCoordinator>,
+    pub dhcp_client: Option<DhcpClientSupervisor>,
+    pub vpn: Option<Arc<ProductionVpnManager>>,
+    pub vpn_policy: Option<Arc<VpnPolicyManager<WireGuardVpnDriver, Arc<dyn NftExecutor>>>>,
+    pub wifi: Option<HostapdSupervisor>,
+    pub wifi_client: Option<WifiClientSupervisor>,
+}
+
 impl ControlService {
+    /// Assemble the service with its final shared state before exposing it.
+    pub fn from_runtime(runtime: ControlRuntime, subsystems: ControlSubsystems) -> Self {
+        let ControlRuntime {
+            active_config: config,
+            base_config,
+            network,
+            dhcp,
+            overrides,
+            baselines,
+            ownership_journal,
+            desired_state,
+            mutation_gate: network_mutations,
+        } = runtime;
+        let transactions = NetworkTransactionManager::new_with_services(
+            InterfaceManager::new(network.clone(), ownership_journal),
+            Duration::from_secs(config.security.rollback_timeout_seconds),
+            baselines,
+            dhcp.clone(),
+            config.dhcp.default_lease_seconds,
+            desired_state,
+        );
+        transactions.set_runtime_gate(network_mutations.clone());
+        if let Some(router) = &subsystems.router {
+            router.set_timeout_mutation_gate(network_mutations.clone());
+        }
+        let wifi_client_profiles =
+            WifiClientProfileStore::new(config.runtime.state_dir.join("wifi/client-profiles"));
+
+        Self {
+            operations: Default::default(),
+            base_config,
+            config,
+            network,
+            transactions,
+            interface_observation: Default::default(),
+            network_mutations,
+            dhcp,
+            overrides,
+            dhcp_mutations: Arc::new(Mutex::new(())),
+            dhcp_client: subsystems.dhcp_client,
+            dhcp_client_mutations: Arc::new(Mutex::new(())),
+            router: subsystems.router,
+            vpn: subsystems.vpn,
+            vpn_policy: subsystems.vpn_policy,
+            wifi: subsystems.wifi,
+            wifi_mutations: Arc::new(Mutex::new(())),
+            wifi_client: subsystems.wifi_client,
+            wifi_client_profiles,
+            wifi_client_mutations: Arc::new(Mutex::new(())),
+            wifi_autoconnect: Default::default(),
+            pending_wifi_client_deactivations: Default::default(),
+        }
+    }
+
     /// A service with an ownership journal of its own, which is to say one that
     /// is not written down. For tests and tooling; the daemon shares the
-    /// journal it opened at startup through [`Self::new_with_baselines`].
+    /// journal it opened at startup through [`Self::from_runtime`].
     pub fn new(
         config: AppConfig,
         network: Arc<dyn NetworkProvider>,
@@ -144,6 +224,8 @@ impl ControlService {
         )
     }
 
+    /// Standalone construction for tests and tooling without a runtime worker.
+    /// Daemon startup uses [`Self::from_runtime`] instead.
     pub fn new_with_baselines(
         config: AppConfig,
         network: Arc<dyn NetworkProvider>,
@@ -152,53 +234,26 @@ impl ControlService {
         baselines: Vec<InterfaceSnapshot>,
         journal: AddressOwnershipJournal,
     ) -> Self {
-        let network_mutations = Arc::new(NetworkMutationGate::default());
-        let transactions = NetworkTransactionManager::new_with_services(
-            InterfaceManager::new(network.clone(), journal),
-            Duration::from_secs(config.security.rollback_timeout_seconds),
-            baselines,
-            dhcp.clone(),
-            config.dhcp.default_lease_seconds,
-            // Replaced by `with_desired_state` once the converger exists. On
-            // its own this one answers what the desired configuration is and
-            // takes proposals; nobody converges it.
-            DesiredNetworkState::new(config.clone(), overrides.clone()),
-        );
-
-        transactions.set_runtime_gate(network_mutations.clone());
-        let wifi_client_profiles =
-            WifiClientProfileStore::new(config.runtime.state_dir.join("wifi/client-profiles"));
-
-        Self {
-            operations: Default::default(),
-            base_config: config.clone(),
-            config,
-            network,
-            transactions,
-            interface_observation: Default::default(),
-            network_mutations,
-            dhcp,
-            overrides,
-            dhcp_mutations: Arc::new(Mutex::new(())),
-            dhcp_client: None,
-            dhcp_client_mutations: Arc::new(Mutex::new(())),
-            router: None,
-            vpn: None,
-            vpn_policy: None,
-            wifi: None,
-            wifi_mutations: Arc::new(Mutex::new(())),
-            wifi_client: None,
-            wifi_client_profiles,
-            wifi_client_mutations: Arc::new(Mutex::new(())),
-            wifi_autoconnect: Default::default(),
-            pending_wifi_client_deactivations: Default::default(),
-        }
+        let desired_state = DesiredNetworkState::new(config.clone(), overrides.clone());
+        Self::from_runtime(
+            ControlRuntime {
+                active_config: config.clone(),
+                base_config: config,
+                network,
+                dhcp,
+                overrides,
+                baselines,
+                ownership_journal: journal,
+                desired_state,
+                mutation_gate: Arc::new(NetworkMutationGate::default()),
+            },
+            ControlSubsystems::default(),
+        )
     }
 
-    /// Set the on-disk configuration that runtime overrides are merged onto.
+    /// Set the merge base for a standalone service built by tests or tooling.
+    /// Daemon startup supplies its file configuration through [`ControlRuntime`].
     ///
-    /// Without this the service merges onto whatever it was constructed with,
-    /// which for the daemon is the already-merged startup configuration.
     pub fn with_base_config(mut self, base_config: AppConfig) -> Self {
         self.base_config = base_config;
         self
@@ -206,23 +261,15 @@ impl ControlService {
 
     /// Share the desired state that the convergence loop is driving.
     ///
-    /// Like `with_base_config`, the daemon has to call this: the service is
-    /// built before the converger exists, so it starts with a desired state of
-    /// its own. Applying a change against that one would propose it where
-    /// nothing is converging — the change would be reported as applied without
-    /// anything having reached the machine.
+    /// For standalone tests and tooling. Daemon construction supplies this
+    /// dependency through [`ControlRuntime`] without replacing live state.
     pub fn with_desired_state(self, desired: DesiredNetworkState) -> Self {
         self.transactions.set_desired_state(desired);
         self
     }
 
-    pub(crate) fn with_network_mutation_gate(mut self, gate: Arc<NetworkMutationGate>) -> Self {
-        self.transactions.set_runtime_gate(gate.clone());
-        self.network_mutations = gate;
-        self
-    }
-
     pub fn with_router_coordinator(mut self, coordinator: RouterTransactionCoordinator) -> Self {
+        coordinator.set_timeout_mutation_gate(self.network_mutations.clone());
         self.router = Some(coordinator);
         self
     }
