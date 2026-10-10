@@ -189,6 +189,7 @@ fn build_router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(current_principal))
+        .route("/logs", get(daemon_logs))
         .route("/auth/password", post(change_password))
         .route(
             "/access/https",
@@ -594,7 +595,13 @@ async fn status() -> Json<StatusResponse> {
         version: env!("CARGO_PKG_VERSION"),
         api_version: 1,
         authentication_required: true,
-        capabilities: &["interfaces", "dhcp", "network_transactions", "vpn"],
+        capabilities: &[
+            "interfaces",
+            "dhcp",
+            "network_transactions",
+            "vpn",
+            "daemon_logs",
+        ],
     })
 }
 
@@ -1063,6 +1070,27 @@ async fn routes_list(
         Request::ListRoutes {
             include_local_table: query.include_local_table,
         },
+    )
+    .await
+}
+
+#[derive(Deserialize)]
+struct LogQuery {
+    #[serde(default = "default_log_limit")]
+    limit: usize,
+}
+fn default_log_limit() -> usize {
+    500
+}
+async fn daemon_logs(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Query(query): Query<LogQuery>,
+) -> Result<Json<Response>, ApiError> {
+    dispatch_control(
+        &state,
+        &principal,
+        Request::DaemonLogs { limit: query.limit },
     )
     .await
 }
@@ -1666,7 +1694,8 @@ fn authorize_control_request(principal: &Principal, request: &Request) -> Result
 fn control_request_requires_administrator(request: &Request) -> bool {
     matches!(
         request,
-        Request::SaveRouterIntent { .. }
+        Request::DaemonLogs { .. }
+            | Request::SaveRouterIntent { .. }
             | Request::SaveWifiClientProfile { .. }
             | Request::SaveWifiInterface { .. }
             | Request::SaveInterfaceConfig { .. }

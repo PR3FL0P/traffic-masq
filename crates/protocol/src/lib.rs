@@ -47,6 +47,13 @@ use std::net::Ipv4Addr;
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonLogSnapshot {
+    pub lines: Vec<String>,
+    pub sources: Vec<String>,
+    pub truncated: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpnProfileSummary {
     pub name: String,
@@ -1142,6 +1149,9 @@ pub struct WifiInventoryEntry {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request<Interface, Proposal> {
     Ping,
+    DaemonLogs {
+        limit: usize,
+    },
     GetApiHttpsConfig,
     ConfigureApiHttpsSettings {
         settings: ApiHttpsSettings,
@@ -1435,6 +1445,9 @@ pub enum Response<
     WifiClientSpec,
 > {
     Pong,
+    DaemonLogs {
+        snapshot: DaemonLogSnapshot,
+    },
     ApiHttpsConfig {
         active: ApiHttpsSettings,
         desired: ApiHttpsSettings,

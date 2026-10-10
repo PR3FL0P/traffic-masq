@@ -2611,3 +2611,78 @@ async fn ap_profiles_roundtrip_over_http_without_disclosing_credentials() -> Res
     Ok(())
 }
 
+#[tokio::test]
+async fn verified_https_client_reads_daemon_logs_only_as_administrator() -> Result<()> {
+    let directory = tempdir()?;
+    let CertifiedKey { cert, key_pair } = generate_simple_self_signed(vec!["localhost".into()])?;
+    let ca = directory.path().join("server.pem");
+    let key = directory.path().join("server-key.pem");
+    std::fs::write(&ca, cert.pem())?;
+    std::fs::write(&key, key_pair.serialize_pem())?;
+    let mut config = AppConfig::default();
+    config.runtime.socket_path = directory.path().join("daemon.sock");
+    config.runtime.pid_path = directory.path().join("daemon.pid");
+    config.runtime.state_dir = directory.path().join("state");
+    config.runtime.log_dir = directory.path().join("logs");
+    config.dhcp.leases_dir = directory.path().join("leases");
+    config.auth.database_path = directory.path().join("auth.sqlite3");
+    config.auth.argon2_memory_kib = 1024;
+    config.auth.argon2_iterations = 1;
+    config.api.tcp = Some(TcpApiConfig {
+        enabled: true,
+        listen: "127.0.0.1:0".parse()?,
+        certificate_path: Some(ca.clone()),
+        private_key_path: Some(key),
+    });
+    std::fs::create_dir_all(&config.runtime.log_dir)?;
+    std::fs::write(config.runtime.log_dir.join("traffic-masqd.log.2026-10-09"), "2026-10-09T00:00:00Z INFO traffic_masq: ready\n2026-10-09T00:00:01Z WARN traffic_masq::wifi: retry\n")?;
+    let overrides = RuntimeOverrideManager::load(&config.runtime.state_dir, &config).await?;
+    let dhcp = DhcpSupervisor::start(&config).await?;
+    let control = ControlService::new(
+        config.clone(),
+        Arc::new(FakeNetwork),
+        dhcp.clone(),
+        overrides,
+    );
+    let auth = AuthService::open(&config.auth).await?;
+    auth.initialize_device_password("correct horse battery")
+        .await?;
+    let server = HttpApiServer::bind(&config, control, auth)?;
+    let port = server.tcp_local_addr()?.unwrap().port();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let task = tokio::spawn(server.run(shutdown_rx));
+    let client = ApiClient::https(&format!("https://localhost:{port}"), Some(&ca))?;
+    assert!(client
+        .request(&Request::DaemonLogs { limit: 1 })
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("401"));
+    client.login("correct horse battery").await?;
+    let Response::DaemonLogs { snapshot } =
+        client.request(&Request::DaemonLogs { limit: 1 }).await?
+    else {
+        panic!("expected logs");
+    };
+    assert_eq!(
+        snapshot.lines,
+        ["2026-10-09T00:00:01Z WARN traffic_masq::wifi: retry"]
+    );
+    assert!(snapshot.truncated);
+    let pool =
+        sqlx::SqlitePool::connect(&format!("sqlite://{}", config.auth.database_path.display()))
+            .await?;
+    sqlx::query("UPDATE users SET role = 'viewer' WHERE username = 'device'")
+        .execute(&pool)
+        .await?;
+    assert!(client
+        .request(&Request::DaemonLogs { limit: 500 })
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("403"));
+    shutdown_tx.send(true)?;
+    task.await??;
+    dhcp.shutdown().await;
+    Ok(())
+}

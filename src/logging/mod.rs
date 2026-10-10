@@ -1,4 +1,5 @@
 use std::fs;
+pub mod recent;
 
 use anyhow::Result;
 use tracing_subscriber::fmt::writer::MakeWriterExt;
@@ -22,6 +23,7 @@ pub fn init_logging(
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
+                .with_ansi(false)
                 .with_writer(std::io::stderr.and(non_blocking))
                 .init();
             Ok(Some(guard))
@@ -33,6 +35,7 @@ pub fn init_logging(
             );
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
+                .with_ansi(false)
                 .with_writer(std::io::stderr)
                 .init();
             Ok(None)

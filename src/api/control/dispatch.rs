@@ -156,6 +156,18 @@ impl ControlService {
 
         match request {
             Request::Ping => Response::Pong,
+            Request::DaemonLogs { limit } => {
+                let directory = self.config.runtime.log_dir.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::logging::recent::read_recent(&directory, limit)
+                })
+                .await
+                {
+                    Ok(Ok(snapshot)) => Response::DaemonLogs { snapshot },
+                    Ok(Err(error)) => error_response(error),
+                    Err(error) => error_response(error),
+                }
+            }
             Request::GetApiHttpsConfig => match self.api_https_config_response().await {
                 Ok(response) => response,
                 Err(error) => error_response(error),

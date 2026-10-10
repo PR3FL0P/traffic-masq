@@ -61,6 +61,12 @@ pub fn map_request<Interface: Serialize, Proposal: Serialize>(
     use traffic_masq_protocol::Request;
 
     let mapped = match request {
+        Request::DaemonLogs { limit } => RestRequest {
+            method: Method::GET,
+            path: format!("{API_PREFIX}/logs?limit={limit}"),
+            body: None,
+            synthesize_pong: false,
+        },
         Request::Ping => RestRequest {
             method: Method::GET,
             path: format!("{API_PREFIX}/status"),

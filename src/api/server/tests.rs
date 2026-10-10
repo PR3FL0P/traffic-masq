@@ -456,3 +456,12 @@ fn documented_ap_and_offline_intent_examples_match_request_contracts() {
     let config: InterfaceConfig = intent.config.into();
     config.validate("wlan0").unwrap();
 }
+
+#[test]
+fn daemon_log_access_is_administrator_only() {
+    let request = Request::DaemonLogs { limit: 500 };
+    for role in [Role::Viewer, Role::Operator] {
+        assert!(authorize_control_request(&principal(role), &request).is_err());
+    }
+    assert!(authorize_control_request(&principal(Role::Administrator), &request).is_ok());
+}
