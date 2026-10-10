@@ -15,7 +15,7 @@ pub(super) fn format_owner_badge(owner: RouteOwner) -> Span<'static> {
     }
 }
 
-pub(super) fn router_action_buttons(router: &RouterData) -> [(RouterAction, &'static str); 8] {
+pub(super) fn router_action_buttons(router: &RouterData) -> [(RouterAction, &'static str); 10] {
     let manual_delete = router
         .route_rows()
         .get(router.selected_route)
@@ -52,6 +52,8 @@ pub(super) fn router_action_buttons(router: &RouterData) -> [(RouterAction, &'st
                 "[Enable routing: e]"
             },
         ),
+        (RouterAction::Setup, "[Wi-Fi setup: w]"),
+        (RouterAction::Settings, "[Uplink / VPN: u]"),
     ]
 }
 

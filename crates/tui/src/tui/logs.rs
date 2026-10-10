@@ -153,7 +153,7 @@ pub(crate) fn render_log(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
     if app.logs.is_empty() {
         app.logs_scroll = 0;
         app.logs_max_scroll = 0;
-        let block = panel("Session log");
+        let block = panel("Session log | 2: daemon logs");
         let inner = block.inner(area);
         frame.render_widget(block, area);
         frame.render_widget(
@@ -195,7 +195,7 @@ pub(crate) fn render_log(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
             offset + visible
         )
     } else {
-        "Session log".to_string()
+        "Session log | 2: daemon logs".to_string()
     };
     let block = panel(&title);
     let inner = block.inner(area);
@@ -213,7 +213,7 @@ pub(crate) fn render_log(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
     );
 }
 
-fn wrap_log_message(message: &str, width: usize) -> Vec<String> {
+pub(super) fn wrap_log_message(message: &str, width: usize) -> Vec<String> {
     use unicode_segmentation::UnicodeSegmentation;
     use unicode_width::UnicodeWidthStr;
 

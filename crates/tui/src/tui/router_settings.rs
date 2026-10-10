@@ -1,0 +1,545 @@
+//! Uplink and global VPN-chain editor. Changes join the existing router draft.
+use super::{
+    api::{
+        client::ApiClient,
+        model::{Request, Response},
+    },
+    input,
+    layout::panel,
+    logs::LogLevel,
+    theme, Screen, TuiApp,
+};
+use crossterm::event::KeyCode;
+use ratatui::{
+    layout::Rect,
+    style::Style,
+    text::{Line, Span},
+    widgets::Paragraph,
+};
+use traffic_masq_protocol::{RouterConfigView, UplinkConfigView, UplinkMode, VpnHopConfigView};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Field {
+    Uplink,
+    Mode,
+    Forwarding,
+    Profile,
+    Add,
+    Hop,
+    Earlier,
+    Later,
+    Remove,
+    DefaultRoute,
+    Review,
+    Cancel,
+}
+const FIELDS: [Field; 12] = [
+    Field::Uplink,
+    Field::Mode,
+    Field::Forwarding,
+    Field::Profile,
+    Field::Add,
+    Field::Hop,
+    Field::Earlier,
+    Field::Later,
+    Field::Remove,
+    Field::DefaultRoute,
+    Field::Review,
+    Field::Cancel,
+];
+
+pub(crate) struct Editor {
+    config: RouterConfigView,
+    uplink: String,
+    mode: UplinkMode,
+    global: bool,
+    profiles: Vec<String>,
+    profile: usize,
+    hop: usize,
+    field: Field,
+    cursor: usize,
+    scroll: usize,
+}
+impl Editor {
+    fn new(config: RouterConfigView, profiles: Vec<String>) -> Self {
+        let uplink = config
+            .uplink
+            .as_ref()
+            .map(|u| u.interface.clone())
+            .unwrap_or_default();
+        Self {
+            mode: config
+                .uplink
+                .as_ref()
+                .map(|u| u.mode)
+                .unwrap_or(UplinkMode::External),
+            global: config.forwarding.is_none(),
+            config,
+            cursor: input::grapheme_count(&uplink),
+            uplink,
+            profiles,
+            profile: 0,
+            hop: 0,
+            field: Field::Uplink,
+            scroll: 0,
+        }
+    }
+    fn candidate(&self) -> Result<RouterConfigView, &'static str> {
+        if !self.global && !self.config.vpn_chain.is_empty() {
+            return Err("VPN chains require Global uplink sharing. Remove the chain or explicitly select that mode.");
+        }
+        if self.uplink.trim().is_empty() && !self.config.vpn_chain.is_empty() {
+            return Err("VPN chain requires a physical uplink");
+        }
+        let mut config = self.config.clone();
+        config.uplink = if self.uplink.trim().is_empty() {
+            None
+        } else {
+            Some(UplinkConfigView {
+                interface: self.uplink.trim().into(),
+                mode: self.mode,
+            })
+        };
+        config.forwarding = if self.global {
+            None
+        } else {
+            Some(config.forwarding.unwrap_or_default())
+        };
+        Ok(config)
+    }
+    fn move_hop(&mut self, later: bool) {
+        if self.hop >= self.config.vpn_chain.len() {
+            return;
+        }
+        let next = if later {
+            (self.hop + 1).min(self.config.vpn_chain.len() - 1)
+        } else {
+            self.hop.saturating_sub(1)
+        };
+        self.config.vpn_chain.swap(self.hop, next);
+        self.hop = next;
+    }
+    fn remove_hop(&mut self) {
+        if self.hop < self.config.vpn_chain.len() {
+            self.config.vpn_chain.remove(self.hop);
+            self.hop = self.hop.min(self.config.vpn_chain.len().saturating_sub(1));
+        }
+    }
+    fn label(&self, field: Field) -> String {
+        match field {
+            Field::Uplink => "Physical uplink (blank = none): ".into(),
+            Field::Mode => format!("Uplink addressing: {:?}", self.mode),
+            Field::Forwarding => format!(
+                "Sharing mode: {}",
+                if self.global {
+                    "Global uplink / VPN chain"
+                } else {
+                    "Explicit Internet sharing rules"
+                }
+            ),
+            Field::Profile => format!(
+                "Profile to add: {}",
+                self.profiles
+                    .get(self.profile)
+                    .map(String::as_str)
+                    .unwrap_or("none; import in VPN first")
+            ),
+            Field::Add => "Add profile at LAN end of chain".into(),
+            Field::Hop => format!(
+                "Selected hop {}/{}: {}",
+                if self.config.vpn_chain.is_empty() {
+                    0
+                } else {
+                    self.hop + 1
+                },
+                self.config.vpn_chain.len(),
+                self.config
+                    .vpn_chain
+                    .get(self.hop)
+                    .map(|h| h.profile_name.as_str())
+                    .unwrap_or("none")
+            ),
+            Field::Earlier => "Move selected hop toward physical uplink".into(),
+            Field::Later => "Move selected hop toward LAN".into(),
+            Field::Remove => "Remove selected hop".into(),
+            Field::DefaultRoute => format!(
+                "Permit default-route changes: {}",
+                self.config.allow_default_route_change
+            ),
+            Field::Review => "Stage settings and review complete router plan".into(),
+            Field::Cancel => "Cancel editor (keep previous router draft)".into(),
+        }
+    }
+}
+
+pub(crate) async fn open(app: &mut TuiApp, client: &ApiClient) {
+    if !app.router.staged {
+        super::router::load_router_data(app, client).await;
+    }
+    if app.router.recovery_blocks_mutations()
+        || app.router.coordinator_status == Some(traffic_masq_protocol::CoordinatorStatus::Pending)
+    {
+        app.push_message(
+            LogLevel::Warn,
+            "Finish router confirmation or recovery before editing",
+        );
+        return;
+    }
+    if app.router.saved_router_config.is_none()
+        || (!app.router.staged && !app.router.topology.loaded)
+    {
+        app.push_message(
+            LogLevel::Error,
+            "Could not load saved router configuration; refresh and retry",
+        );
+        return;
+    }
+    let profiles = match client.request(&Request::VpnListProfiles).await {
+        Ok(Response::VpnProfiles { profiles }) => profiles.into_iter().map(|p| p.name).collect(),
+        Ok(_) | Err(_) => {
+            app.push_message(
+                LogLevel::Warn,
+                "VPN profile library unavailable; existing hops can still be reordered or removed",
+            );
+            Vec::new()
+        }
+    };
+    app.router_settings = Some(Editor::new(
+        app.router.proposed_router_config.clone(),
+        profiles,
+    ));
+    app.screen = Screen::RouterSettings;
+}
+pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
+    if let (Some(editor), Some(field)) = (app.router_settings.as_mut(), FIELDS.get(slot)) {
+        editor.field = *field;
+    }
+}
+pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
+    let Some(e) = &mut app.router_settings else {
+        return;
+    };
+    let block = panel("Router uplink and VPN chain");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let note = if e.global && e.config.forwarding.is_some() {
+        "Global mode REPLACES explicit sharing rules; managed NAT outputs use uplink."
+    } else if !e.global && e.config.forwarding.is_none() {
+        "Explicit mode starts with NO sharing rules; add rules in Internet sharing."
+    } else {
+        "External: unmanaged Input. DHCP: managed Input with DHCP client enabled."
+    };
+    let heading = vec![
+        Line::styled(note, Style::default().fg(theme::WARN)),
+        Line::from("Chain order: physical uplink -> hop 1 -> ... -> last hop -> LAN."),
+        Line::from("Enter cycles choices; Left/Right selects profile/hop. Esc cancels editor."),
+    ];
+    frame.render_widget(
+        Paragraph::new(heading),
+        Rect::new(inner.x, inner.y, inner.width, inner.height.min(3)),
+    );
+    let body = Rect::new(
+        inner.x,
+        inner.y + 3,
+        inner.width,
+        inner.height.saturating_sub(3),
+    );
+    let visible = body.height.max(1) as usize;
+    let selected = FIELDS.iter().position(|f| *f == e.field).unwrap_or(0);
+    e.scroll = e.scroll.min(selected);
+    if selected >= e.scroll + visible {
+        e.scroll = selected + 1 - visible;
+    }
+    let mut lines = Vec::new();
+    for (slot, field) in FIELDS.iter().enumerate().skip(e.scroll).take(visible) {
+        let active = e.field == *field;
+        let style = Style::default().fg(if active { theme::ACCENT } else { theme::TEXT });
+        let mut spans = vec![Span::styled(
+            format!("{} {}", if active { "▶" } else { " " }, e.label(*field)),
+            style,
+        )];
+        if *field == Field::Uplink {
+            spans.extend(input::render_value_with_cursor(
+                &e.uplink, e.cursor, active, style,
+            ));
+        }
+        app.ui.buttons.push((
+            Rect::new(body.x, body.y + lines.len() as u16, body.width, 1),
+            slot,
+        ));
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines), body);
+}
+pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
+    let Some(e) = &mut app.router_settings else {
+        return;
+    };
+    match key {
+        KeyCode::Esc => {
+            app.router_settings = None;
+            app.screen = Screen::Router;
+        }
+        KeyCode::Up | KeyCode::Down => {
+            e.field = input::move_clamped(&FIELDS, e.field, key == KeyCode::Down)
+        }
+        KeyCode::Left | KeyCode::Right if e.field == Field::Profile || e.field == Field::Hop => {
+            let (index, count) = if e.field == Field::Profile {
+                (&mut e.profile, e.profiles.len())
+            } else {
+                (&mut e.hop, e.config.vpn_chain.len())
+            };
+            *index = if key == KeyCode::Right {
+                (*index + 1).min(count.saturating_sub(1))
+            } else {
+                index.saturating_sub(1)
+            };
+        }
+        KeyCode::Enter => match e.field {
+            Field::Mode => {
+                e.mode = if e.mode == UplinkMode::External {
+                    UplinkMode::Dhcp
+                } else {
+                    UplinkMode::External
+                }
+            }
+            Field::Forwarding => e.global = !e.global,
+            Field::Profile => {
+                if !e.profiles.is_empty() {
+                    e.profile = (e.profile + 1) % e.profiles.len();
+                }
+            }
+            Field::Hop => {
+                if !e.config.vpn_chain.is_empty() {
+                    e.hop = (e.hop + 1) % e.config.vpn_chain.len();
+                }
+            }
+            Field::Add => {
+                if !e.global {
+                    app.push_message(
+                        LogLevel::Warn,
+                        "Select Global uplink sharing explicitly before adding a VPN chain",
+                    );
+                    return;
+                }
+                if let Some(name) = e.profiles.get(e.profile) {
+                    e.config.vpn_chain.push(VpnHopConfigView {
+                        profile_name: name.clone(),
+                    });
+                    e.hop = e.config.vpn_chain.len() - 1;
+                }
+            }
+            Field::Earlier => e.move_hop(false),
+            Field::Later => e.move_hop(true),
+            Field::Remove => e.remove_hop(),
+            Field::DefaultRoute => {
+                e.config.allow_default_route_change = !e.config.allow_default_route_change
+            }
+            Field::Review => {
+                let candidate = match e.candidate() {
+                    Ok(c) => c,
+                    Err(message) => {
+                        app.push_message(LogLevel::Error, message);
+                        return;
+                    }
+                };
+                app.router.proposed_router_config = candidate;
+                app.router.staged = true;
+                app.router_settings = None;
+                app.screen = Screen::Router;
+                super::router::open_router_plan(app, client).await;
+            }
+            Field::Cancel => {
+                app.router_settings = None;
+                app.screen = Screen::Router;
+            }
+            Field::Uplink => e.field = Field::Mode,
+        },
+        other if e.field == Field::Uplink => {
+            input::TextEditor::new(&mut e.uplink, &mut e.cursor).handle_key(other);
+        }
+        _ => {}
+    }
+}
+
+/// Include this exact draft configuration in the shared plan review, including removed hops/rules.
+pub(crate) fn plan_lines(
+    current: &RouterConfigView,
+    previous: Option<&RouterConfigView>,
+) -> Vec<String> {
+    let uplink = |c: &RouterConfigView| {
+        c.uplink
+            .as_ref()
+            .map(|u| format!("{} ({:?})", u.interface, u.mode))
+            .unwrap_or_else(|| "none".into())
+    };
+    let mut lines = vec![
+        format!("Configured physical uplink: {}", uplink(current)),
+        format!(
+            "Sharing policy: {}",
+            if current.forwarding.is_some() {
+                "explicit rules"
+            } else {
+                "global uplink / VPN chain"
+            }
+        ),
+    ];
+    if let Some(previous) = previous {
+        if previous.uplink != current.uplink {
+            lines.push(format!("Previous physical uplink: {}", uplink(previous)));
+        }
+        if previous.forwarding.is_some() && current.forwarding.is_none() {
+            lines.push(
+                "REPLACE explicit sharing with global sharing for managed NAT outputs:".into(),
+            );
+            for rule in previous.forwarding.iter().flatten() {
+                lines.push(format!(
+                    "  Removed share: {} -> {} ({:?})",
+                    rule.from, rule.to, rule.source_subnet
+                ));
+            }
+        }
+        for (i, hop) in previous.vpn_chain.iter().enumerate() {
+            lines.push(format!("Previous VPN hop {}: {}", i + 1, hop.profile_name));
+        }
+    }
+    if current.vpn_chain.is_empty() {
+        lines.push("New VPN chain: none".into());
+    }
+    for (i, hop) in current.vpn_chain.iter().enumerate() {
+        lines.push(format!(
+            "New VPN hop {} (uplink -> LAN order): {}",
+            i + 1,
+            hop.profile_name
+        ));
+    }
+    lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn chain_requires_explicit_mode_choice_and_preserves_other_configuration() {
+        let config = RouterConfigView {
+            forwarding: Some(vec![]),
+            allow_default_route_change: true,
+            vpn_chain: vec![
+                VpnHopConfigView {
+                    profile_name: "a".into(),
+                },
+                VpnHopConfigView {
+                    profile_name: "b".into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let mut e = Editor::new(config, vec![]);
+        e.uplink = "wan0".into();
+        assert!(e.candidate().is_err());
+        e.global = true;
+        e.move_hop(true);
+        assert_eq!(e.config.vpn_chain[0].profile_name, "b");
+        e.remove_hop();
+        assert_eq!(e.config.vpn_chain.len(), 1);
+        let candidate = e.candidate().unwrap();
+        assert!(candidate.forwarding.is_none());
+        assert!(candidate.allow_default_route_change);
+        assert_eq!(candidate.uplink.unwrap().interface, "wan0");
+    }
+    #[tokio::test]
+    async fn cancel_retains_the_preexisting_router_draft() {
+        let config = RouterConfigView {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut app = TuiApp {
+            screen: Screen::RouterSettings,
+            router_settings: Some(Editor::new(config.clone(), vec![])),
+            ..Default::default()
+        };
+        app.router.proposed_router_config = config.clone();
+        app.router.staged = true;
+        app.router_settings.as_mut().unwrap().uplink = "changed".into();
+        handle_key(&mut app, KeyCode::Esc, &ApiClient::new("/unused")).await;
+        assert_eq!(app.router.proposed_router_config, config);
+        assert!(app.router.staged);
+    }
+    #[tokio::test]
+    async fn stage_uses_shared_plan_api_and_retains_draft_on_preview_error() {
+        let mock = super::super::test_api::mock(vec![Response::Error {
+            message: "missing radio".into(),
+        }])
+        .await;
+        let config = RouterConfigView {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut e = Editor::new(config, vec!["vpn1".into(), "vpn2".into()]);
+        e.uplink = "wan0".into();
+        e.mode = UplinkMode::Dhcp;
+        e.config.vpn_chain = vec![
+            VpnHopConfigView {
+                profile_name: "vpn2".into(),
+            },
+            VpnHopConfigView {
+                profile_name: "vpn1".into(),
+            },
+        ];
+        e.field = Field::Review;
+        let mut app = TuiApp {
+            screen: Screen::RouterSettings,
+            router_settings: Some(e),
+            ..Default::default()
+        };
+        handle_key(&mut app, KeyCode::Enter, &mock.client).await;
+        assert!(app.router.staged);
+        assert_eq!(
+            app.router.proposed_router_config.vpn_chain[0].profile_name,
+            "vpn2"
+        );
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].path, "/api/v1/router/intent/preview");
+        assert_eq!(calls[0].body["set_router"]["uplink"]["interface"], "wan0");
+        assert_eq!(
+            calls[0].body["set_router"]["vpn_chain"][1]["profile_name"],
+            "vpn1"
+        );
+    }
+
+    #[test]
+    fn minimum_terminal_shows_focused_actions_and_review_lists_removed_rules() {
+        let mut app = TuiApp {
+            screen: Screen::RouterSettings,
+            router_settings: Some(Editor::new(RouterConfigView::default(), vec![])),
+            ..Default::default()
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        for field in FIELDS {
+            app.router_settings.as_mut().unwrap().field = field;
+            terminal
+                .draw(|f| super::super::render(f, &mut app, false))
+                .unwrap();
+            let slot = FIELDS.iter().position(|f| *f == field).unwrap();
+            assert!(app.ui.buttons.iter().any(|(_, i)| *i == slot));
+        }
+        let previous = RouterConfigView {
+            forwarding: Some(vec![traffic_masq_protocol::ForwardingConfigView {
+                from: "lan0".into(),
+                to: "wan0".into(),
+                source_subnet: None,
+                masquerade: true,
+            }]),
+            vpn_chain: vec![VpnHopConfigView {
+                profile_name: "old".into(),
+            }],
+            ..Default::default()
+        };
+        let text = plan_lines(&RouterConfigView::default(), Some(&previous)).join("\n");
+        assert!(text.contains("Removed share: lan0 -> wan0"));
+        assert!(text.contains("Previous VPN hop 1: old"));
+        assert!(text.contains("New VPN chain: none"));
+    }
+}

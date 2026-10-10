@@ -29,21 +29,29 @@ use traffic_masq_protocol::{InterfaceStatusView as InterfaceStatus, Ipv4AddressI
 mod access;
 pub(crate) mod api;
 pub mod connections;
+mod daemon_logs;
 mod dashboard;
 mod dhcp;
 mod dhcp_client;
+mod dhcp_client_editor;
 mod forwarding;
 mod input;
 mod interfaces;
 mod layout;
 mod logs;
+mod provisioning;
 mod router;
+mod router_health;
+mod router_settings;
 mod router_topology;
 mod session;
 mod settings;
+#[cfg(test)]
+mod test_api;
 mod vpn;
 mod vpn_policy;
 mod wifi;
+mod wifi_stations;
 
 use access::AccessEditor;
 use dashboard::DashboardData;
@@ -81,10 +89,15 @@ enum Screen {
     DhcpEditor,
     DhcpLeases,
     DhcpClient,
+    DhcpClientEditor,
+    WifiStations,
     Preview,
     PendingChange,
     Router,
+    RouterSettings,
+    RouterHealth,
     RouterPlan,
+    Provisioning,
     RouterPending,
     RouteEditor,
     Forwarding,
@@ -101,6 +114,7 @@ enum Screen {
     Settings,
     SettingsPassword,
     Log,
+    DaemonLogs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,14 +182,18 @@ fn section_of(screen: Screen) -> Section {
         Screen::Dashboard | Screen::PendingChange => Section::Dashboard,
         Screen::InterfaceList | Screen::InterfaceEditor | Screen::Preview => Section::Interfaces,
         Screen::DhcpInterfaceList | Screen::DhcpEditor | Screen::DhcpLeases => Section::Dhcp,
-        Screen::DhcpClient => Section::DhcpClient,
+        Screen::DhcpClient | Screen::DhcpClientEditor => Section::DhcpClient,
         Screen::Router
         | Screen::RouteEditor
+        | Screen::Provisioning
+        | Screen::RouterHealth
+        | Screen::RouterSettings
         | Screen::RouterPlan
         | Screen::RouterPending
         | Screen::Forwarding => Section::Router,
         Screen::Vpn | Screen::VpnImport | Screen::VpnPolicy => Section::Vpn,
         Screen::Wifi
+        | Screen::WifiStations
         | Screen::WifiEditor
         | Screen::WifiScan
         | Screen::WifiProfiles
@@ -183,7 +201,7 @@ fn section_of(screen: Screen) -> Section {
         | Screen::WifiProfileEditor
         | Screen::WifiConnectPrompt => Section::Wifi,
         Screen::Settings | Screen::SettingsPassword | Screen::Access => Section::Settings,
-        Screen::Log => Section::Log,
+        Screen::Log | Screen::DaemonLogs => Section::Log,
     }
 }
 
@@ -258,12 +276,17 @@ struct TuiApp {
     dhcp_interfaces: Vec<String>,
     dhcp_client_selected: Option<String>,
     dhcp_client_scroll: usize,
+    dhcp_client_editor: Option<dhcp_client_editor::Editor>,
+    wifi_stations: Option<wifi_stations::View>,
     preview: Option<InterfaceChangePlanView>,
     preview_scroll: usize,
     preview_max_scroll: usize,
     pending: Option<PendingNetworkChange>,
     pending_return_screen: Screen,
     router: RouterData,
+    router_settings: Option<router_settings::Editor>,
+    router_health: router_health::View,
+    provisioning: Option<provisioning::Wizard>,
     router_pending: Option<RouterPendingView>,
     forwarding: Option<forwarding::ForwardingEditor>,
     router_rollback_timeout_seconds: u64,
@@ -291,6 +314,7 @@ struct TuiApp {
     logs_scroll: usize,
     logs_max_scroll: usize,
     logs_focus: logs::LogFocus,
+    daemon_logs: daemon_logs::View,
 }
 
 impl Default for TuiApp {
@@ -312,12 +336,17 @@ impl Default for TuiApp {
             dhcp_interfaces: Vec::new(),
             dhcp_client_selected: None,
             dhcp_client_scroll: 0,
+            dhcp_client_editor: None,
+            wifi_stations: None,
             preview: None,
             preview_scroll: 0,
             preview_max_scroll: 0,
             pending: None,
             pending_return_screen: Screen::Dashboard,
             router: RouterData::default(),
+            router_settings: None,
+            router_health: router_health::View::default(),
+            provisioning: None,
             router_pending: None,
             forwarding: None,
             router_rollback_timeout_seconds: 60,
@@ -345,6 +374,7 @@ impl Default for TuiApp {
             logs_scroll: 0,
             logs_max_scroll: 0,
             logs_focus: logs::LogFocus::default(),
+            daemon_logs: daemon_logs::View::default(),
         }
     }
 }
@@ -620,6 +650,12 @@ async fn run_loop(
                 }
                 if !direct && app.screen == Screen::Access {
                     access::refresh_access_status(&mut app, client).await;
+                }
+                if !direct && app.screen == Screen::WifiStations {
+                    wifi_stations::refresh(&mut app, client).await;
+                }
+                if !direct && app.screen == Screen::DaemonLogs {
+                    daemon_logs::tick(&mut app, client).await;
                 }
                 if !direct && app.screen == Screen::Wifi {
                     wifi::load_wifi_data(&mut app, client).await;
@@ -1127,6 +1163,7 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                             Screen::InterfaceList | Screen::DhcpInterfaceList => {
                                 interfaces::set_interface_selection(app, index);
                             }
+                            Screen::WifiStations => wifi_stations::select_row(app, index),
                             Screen::DhcpClient => {
                                 dhcp_client::select_row(app, index);
                             }
@@ -1206,6 +1243,10 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                     interfaces::interface_selection(app).saturating_sub(1),
                 );
             }
+            Screen::WifiStations => wifi_stations::handle_key(app, KeyCode::Up, client).await,
+            Screen::Provisioning => provisioning::handle_key(app, KeyCode::Up, client).await,
+            Screen::RouterHealth => router_health::handle_key(app, KeyCode::Up, client).await,
+            Screen::DaemonLogs => daemon_logs::handle_key(app, KeyCode::Up, client).await,
             Screen::DhcpClient => dhcp_client::move_selection(app, false),
             Screen::Router => router::handle_router_key(app, KeyCode::Up, client).await,
             Screen::RouterPlan => {
@@ -1219,9 +1260,7 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                 app.vpn.selected_profile = app.vpn.selected_profile.saturating_sub(1);
             }
             Screen::DhcpLeases => {
-                if let Some(view) = app.dhcp_leases.as_mut() {
-                    view.scroll = view.scroll.saturating_sub(1);
-                }
+                dhcp::handle_dhcp_leases_key(app, KeyCode::Up, client).await;
             }
             _ => {}
         },
@@ -1243,6 +1282,10 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
             {
                 interfaces::set_interface_selection(app, interfaces::interface_selection(app) + 1);
             }
+            Screen::WifiStations => wifi_stations::handle_key(app, KeyCode::Down, client).await,
+            Screen::Provisioning => provisioning::handle_key(app, KeyCode::Down, client).await,
+            Screen::RouterHealth => router_health::handle_key(app, KeyCode::Down, client).await,
+            Screen::DaemonLogs => daemon_logs::handle_key(app, KeyCode::Down, client).await,
             Screen::DhcpClient => dhcp_client::move_selection(app, true),
             Screen::Router => router::handle_router_key(app, KeyCode::Down, client).await,
             Screen::RouterPlan => {
@@ -1256,11 +1299,7 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                 app.vpn.selected_profile += 1;
             }
             Screen::DhcpLeases => {
-                if let Some(view) = app.dhcp_leases.as_mut() {
-                    if view.scroll + 1 < view.leases.len() {
-                        view.scroll += 1;
-                    }
-                }
+                dhcp::handle_dhcp_leases_key(app, KeyCode::Down, client).await;
             }
             _ => {}
         },
@@ -1487,9 +1526,14 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp, direct: bool) {
         Screen::DhcpEditor => dhcp::render_dhcp_editor(frame, chunks[1], app),
         Screen::DhcpLeases => dhcp::render_dhcp_leases(frame, chunks[1], app),
         Screen::DhcpClient => dhcp_client::render(frame, chunks[1], app),
+        Screen::DhcpClientEditor => dhcp_client_editor::render(frame, chunks[1], app),
+        Screen::WifiStations => wifi_stations::render(frame, chunks[1], app),
         Screen::Preview => interfaces::render_preview(frame, chunks[1], app),
         Screen::PendingChange => interfaces::render_pending(frame, chunks[1], app),
         Screen::Router => router::render_router(frame, chunks[1], app),
+        Screen::RouterHealth => router_health::render(frame, chunks[1], app),
+        Screen::RouterSettings => router_settings::render(frame, chunks[1], app),
+        Screen::Provisioning => provisioning::render(frame, chunks[1], app),
         Screen::RouteEditor => router::render_route_editor(frame, chunks[1], app),
         Screen::RouterPlan => router::render_router_plan(frame, chunks[1], app),
         Screen::RouterPending => router::render_router_pending(frame, chunks[1], app),
@@ -1507,6 +1551,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp, direct: bool) {
         Screen::Settings => settings::render_settings(frame, chunks[1], app),
         Screen::SettingsPassword => settings::render_settings_password(frame, chunks[1], app),
         Screen::Log => logs::render_log(frame, chunks[1], app),
+        Screen::DaemonLogs => daemon_logs::render(frame, chunks[1], app),
     }
 
     // Mouse geometry is a derived view of what is actually visible. Never let
@@ -1521,7 +1566,11 @@ fn focus_action_slot(app: &mut TuiApp, slot: usize) {
         Screen::Access => access::focus_action(app, slot),
         Screen::InterfaceEditor => interfaces::focus_action(app, slot),
         Screen::DhcpEditor => dhcp::focus_action(app, slot),
+        Screen::DhcpClientEditor => dhcp_client_editor::focus_action(app, slot),
+        Screen::WifiStations => wifi_stations::focus_action(app, slot),
         Screen::Router => router::focus_action(app, slot),
+        Screen::RouterSettings => router_settings::focus_action(app, slot),
+        Screen::Provisioning => provisioning::focus_action(app, slot),
         Screen::Forwarding => forwarding::focus_action(app, slot),
         Screen::RouteEditor => router::focus_route_editor_action(app, slot),
         Screen::Vpn => vpn::focus_action(app, slot),
@@ -1584,6 +1633,7 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
             | Screen::Log
             | Screen::Router
             | Screen::Forwarding
+            | Screen::WifiStations
             | Screen::Wifi,
             _,
         ) => key,
@@ -1641,9 +1691,14 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
         Screen::DhcpEditor => dhcp::handle_dhcp_editor_key(app, key, client).await,
         Screen::DhcpLeases => dhcp::handle_dhcp_leases_key(app, key, client).await,
         Screen::DhcpClient => dhcp_client::handle_key(app, key, client).await,
+        Screen::DhcpClientEditor => dhcp_client_editor::handle_key(app, key, client).await,
+        Screen::WifiStations => wifi_stations::handle_key(app, key, client).await,
         Screen::Preview => interfaces::handle_preview_key(app, key, client).await,
         Screen::PendingChange => interfaces::handle_pending_key(app, key, client).await,
         Screen::Router => router::handle_router_key(app, key, client).await,
+        Screen::RouterHealth => router_health::handle_key(app, key, client).await,
+        Screen::RouterSettings => router_settings::handle_key(app, key, client).await,
+        Screen::Provisioning => provisioning::handle_key(app, key, client).await,
         Screen::RouteEditor => router::handle_route_editor_key(app, key, client).await,
         Screen::RouterPlan => router::handle_router_plan_key(app, key, client).await,
         Screen::RouterPending => router::handle_router_pending_key(app, key, client).await,
@@ -1660,7 +1715,15 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
         Screen::WifiConnectPrompt => wifi::handle_wifi_connect_prompt_key(app, key, client).await,
         Screen::Settings => settings::handle_settings_key(app, key, client).await,
         Screen::SettingsPassword => settings::handle_settings_password_key(app, key, client).await,
+        Screen::Log if key == KeyCode::Char('2') => {
+            if direct {
+                app.push_message(LogLevel::Warn, "Daemon logs require a daemon connection");
+            } else {
+                daemon_logs::open(app, client).await;
+            }
+        }
         Screen::Log => logs::handle_log_key(app, key),
+        Screen::DaemonLogs => daemon_logs::handle_key(app, key, client).await,
     }
 }
 

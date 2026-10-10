@@ -1,7 +1,7 @@
 use std::net::Ipv4Addr;
 
 use crossterm::event::KeyCode;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -111,12 +111,68 @@ impl DhcpEditor {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum LeaseFilter {
+    #[default]
+    All,
+    Active,
+    Expired,
+}
+impl LeaseFilter {
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Active => "active",
+            Self::Expired => "expired",
+        }
+    }
+}
 #[derive(Debug, Clone)]
 pub(crate) struct DhcpLeasesView {
     pub(crate) interface: String,
     pub(crate) leases: Vec<DhcpLeaseView>,
     pub(crate) scroll: usize,
     pub(crate) return_screen: Screen,
+    query: String,
+    cursor: usize,
+    searching: bool,
+    filter: LeaseFilter,
+    sort_expiration: bool,
+    error: Option<String>,
+    updated_at: u64,
+    viewport_rows: usize,
+}
+impl DhcpLeasesView {
+    fn filtered(&self, now: u64) -> Vec<&DhcpLeaseView> {
+        let query = self.query.to_ascii_lowercase();
+        let mut leases = self
+            .leases
+            .iter()
+            .filter(|lease| {
+                let state_matches = match self.filter {
+                    LeaseFilter::All => true,
+                    LeaseFilter::Active => !lease.is_expired_at(now),
+                    LeaseFilter::Expired => lease.is_expired_at(now),
+                };
+                state_matches
+                    && (lease.ip.to_string().contains(&query)
+                        || format_mac_address(lease.mac)
+                            .to_ascii_lowercase()
+                            .contains(&query))
+            })
+            .collect::<Vec<_>>();
+        if self.sort_expiration {
+            leases.sort_by_key(|lease| (lease.expires_at_unix, u32::from(lease.ip), lease.mac));
+        } else {
+            leases.sort_by_key(|lease| (u32::from(lease.ip), lease.mac));
+        }
+        leases
+    }
+    fn max_scroll(&self) -> usize {
+        self.filtered(current_unix_time())
+            .len()
+            .saturating_sub(self.viewport_rows.max(1))
+    }
 }
 
 pub(crate) fn render_dhcp_interface_list(
@@ -300,41 +356,78 @@ pub(crate) fn render_dhcp_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-pub(crate) fn render_dhcp_leases(frame: &mut ratatui::Frame<'_>, area: Rect, app: &TuiApp) {
-    let Some(view) = &app.dhcp_leases else {
+pub(crate) fn render_dhcp_leases(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
+    let Some(view) = &mut app.dhcp_leases else {
         return;
     };
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(3)])
-        .split(area);
+    let chunks = Layout::vertical([Constraint::Length(6), Constraint::Min(3)]).split(area);
+    let now = current_unix_time();
+    let filtered = view.filtered(now);
+    let count = filtered.len();
+    let active = view
+        .leases
+        .iter()
+        .filter(|lease| !lease.is_expired_at(now))
+        .count();
+    let mut search = vec![Span::raw("Search IP/MAC: ")];
+    search.extend(super::input::render_value_with_cursor(
+        &view.query,
+        view.cursor,
+        view.searching,
+        Style::default().fg(theme::ACCENT),
+    ));
+    let status = match &view.error {
+        Some(error) => Line::styled(format!("STALE: {error}"), Style::default().fg(theme::WARN)),
+        None => Line::from(format!(
+            "Updated {}s ago",
+            now.saturating_sub(view.updated_at)
+        )),
+    };
     frame.render_widget(
-        Paragraph::new(format!(
-            "Interface: {} | Active leases: {}",
-            view.interface,
-            view.leases.len()
-        ))
+        Paragraph::new(vec![
+            Line::from(format!(
+                "{} | Showing {count}/{} | Active {active} | Expired {}",
+                view.interface,
+                view.leases.len(),
+                view.leases.len() - active
+            )),
+            Line::from(format!(
+                "Filter: {} | Sort: {} | / search · f filter · s sort · r refresh",
+                view.filter.label(),
+                if view.sort_expiration {
+                    "expiration"
+                } else {
+                    "IP"
+                }
+            )),
+            Line::from(search),
+            status,
+        ])
         .block(panel("DHCP leases")),
         chunks[0],
     );
-
-    let now = current_unix_time();
-    let lines = if view.leases.is_empty() {
+    let block = panel("IPv4             MAC                Expiration");
+    let inner = block.inner(chunks[1]);
+    let lines = if filtered.is_empty() {
         vec![Line::styled(
-            "No active DHCP leases",
+            if view.leases.is_empty() {
+                "No DHCP leases in this snapshot"
+            } else {
+                "No matching DHCP leases"
+            },
             Style::default().fg(theme::MUTED),
         )]
     } else {
-        view.leases
-            .iter()
+        filtered
+            .into_iter()
             .map(|lease| {
                 let expiration = format_lease_expiration(lease.expires_at_unix, now);
-                let style = if lease.is_expired_at(now) {
-                    Style::default().fg(theme::BAD)
+                let color = if lease.is_expired_at(now) {
+                    theme::BAD
                 } else if lease.expires_at_unix.saturating_sub(now) <= 60 {
-                    Style::default().fg(theme::WARN)
+                    theme::WARN
                 } else {
-                    Style::default()
+                    theme::ACCENT
                 };
                 Line::styled(
                     format!(
@@ -342,16 +435,25 @@ pub(crate) fn render_dhcp_leases(frame: &mut ratatui::Frame<'_>, area: Rect, app
                         lease.ip,
                         format_mac_address(lease.mac)
                     ),
-                    style,
+                    Style::default().fg(color),
                 )
             })
             .collect()
     };
+    view.viewport_rows = inner.height as usize;
+    view.scroll = view
+        .scroll
+        .min(count.saturating_sub(view.viewport_rows.max(1)));
+    frame.render_widget(block, chunks[1]);
     frame.render_widget(
-        Paragraph::new(lines)
-            .scroll((view.scroll.min(u16::MAX as usize) as u16, 0))
-            .block(panel("IPv4             MAC                Expiration")),
-        chunks[1],
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(view.scroll)
+                .take(view.viewport_rows)
+                .collect::<Vec<_>>(),
+        ),
+        inner,
     );
 }
 
@@ -575,6 +677,14 @@ pub(crate) async fn open_dhcp_leases(
                 leases,
                 scroll: 0,
                 return_screen,
+                query: String::new(),
+                cursor: 0,
+                searching: false,
+                filter: LeaseFilter::All,
+                sort_expiration: false,
+                error: None,
+                updated_at: current_unix_time(),
+                viewport_rows: 1,
             });
             app.push_message(LogLevel::Info, format!("Loaded {count} DHCP lease(s)"));
             app.screen = Screen::DhcpLeases;
@@ -601,22 +711,26 @@ pub(crate) async fn refresh_dhcp_leases(app: &mut TuiApp, client: &ApiClient) {
     let Some(view) = app.dhcp_leases.as_mut() else {
         return;
     };
-    let interface = view.interface.clone();
-    if let Ok(Response::Leases {
-        interface: response_interface,
-        mut leases,
-    }) = client
+    match client
         .request(&Request::ListLeases {
-            interface: interface.clone(),
+            interface: view.interface.clone(),
         })
         .await
     {
-        if response_interface == interface {
-            leases.sort_by_key(|lease| u32::from(lease.ip));
-            if let Some(view) = app.dhcp_leases.as_mut() {
-                view.leases = leases;
-            }
+        Ok(Response::Leases { interface, leases }) if interface == view.interface => {
+            view.leases = leases;
+            view.error = None;
+            view.updated_at = current_unix_time();
+            view.scroll = view.scroll.min(view.max_scroll());
         }
+        Ok(Response::Leases { interface, .. }) => {
+            view.error = Some(format!(
+                "Unexpected lease response for interface {interface}"
+            ))
+        }
+        Ok(Response::Error { message }) => view.error = Some(message),
+        Ok(_) => view.error = Some("Unexpected lease response".into()),
+        Err(error) => view.error = Some(error.to_string()),
     }
 }
 
@@ -625,27 +739,46 @@ pub(crate) async fn handle_dhcp_leases_key(app: &mut TuiApp, key: KeyCode, clien
         app.screen = Screen::DhcpInterfaceList;
         return;
     };
-
+    if view.searching {
+        match key {
+            KeyCode::Esc | KeyCode::Enter => view.searching = false,
+            other => {
+                super::input::TextEditor::new(&mut view.query, &mut view.cursor).handle_key(other);
+                view.scroll = 0;
+            }
+        }
+        return;
+    }
     match key {
         KeyCode::Esc => app.screen = view.return_screen,
-        KeyCode::Up => view.scroll = view.scroll.saturating_sub(1),
-        KeyCode::Down if view.scroll + 1 < view.leases.len() => {
-            view.scroll += 1;
+        KeyCode::Char('/') => {
+            view.searching = true;
+            view.cursor = super::input::grapheme_count(&view.query);
         }
-        KeyCode::PageUp => view.scroll = view.scroll.saturating_sub(10),
+        KeyCode::Char('f') => {
+            view.filter = match view.filter {
+                LeaseFilter::All => LeaseFilter::Active,
+                LeaseFilter::Active => LeaseFilter::Expired,
+                LeaseFilter::Expired => LeaseFilter::All,
+            };
+            view.scroll = 0;
+        }
+        KeyCode::Char('s') => {
+            view.sort_expiration = !view.sort_expiration;
+            view.scroll = 0;
+        }
+        KeyCode::Up => view.scroll = view.scroll.saturating_sub(1),
+        KeyCode::Down => view.scroll = view.scroll.saturating_add(1).min(view.max_scroll()),
+        KeyCode::PageUp => view.scroll = view.scroll.saturating_sub(view.viewport_rows.max(1)),
         KeyCode::PageDown => {
             view.scroll = view
                 .scroll
-                .saturating_add(10)
-                .min(view.leases.len().saturating_sub(1));
+                .saturating_add(view.viewport_rows.max(1))
+                .min(view.max_scroll())
         }
         KeyCode::Home => view.scroll = 0,
-        KeyCode::End => view.scroll = view.leases.len().saturating_sub(1),
-        KeyCode::Enter => {
-            let interface = view.interface.clone();
-            let return_screen = view.return_screen;
-            open_dhcp_leases(app, client, interface, return_screen).await;
-        }
+        KeyCode::End => view.scroll = view.max_scroll(),
+        KeyCode::Enter | KeyCode::Char('r') => refresh_dhcp_leases(app, client).await,
         _ => {}
     }
 }

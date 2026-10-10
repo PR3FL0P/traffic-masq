@@ -337,3 +337,158 @@ async fn missing_dhcp_editor_saves_revision_checked_intent_without_live_apply() 
     server.await.unwrap();
     assert_eq!(app.screen, Screen::DhcpInterfaceList);
 }
+
+fn lease(ip: &str, mac: [u8; 6], expires_at_unix: u64) -> DhcpLeaseView {
+    DhcpLeaseView {
+        ip: ip.parse().unwrap(),
+        mac,
+        expires_at_unix,
+    }
+}
+
+fn lease_view(leases: Vec<DhcpLeaseView>) -> DhcpLeasesView {
+    DhcpLeasesView {
+        interface: "lan0".into(),
+        leases,
+        scroll: 0,
+        return_screen: Screen::DhcpEditor,
+        query: String::new(),
+        cursor: 0,
+        searching: false,
+        filter: LeaseFilter::All,
+        sort_expiration: false,
+        error: None,
+        updated_at: 100,
+        viewport_rows: 3,
+    }
+}
+
+#[test]
+fn lease_search_sort_and_expiration_boundary_are_consistent() {
+    let mut view = lease_view(vec![
+        lease("10.0.0.10", [0xaa, 0xbb, 0, 0, 0, 2], 200),
+        lease("10.0.0.2", [0xaa, 0xbb, 0, 0, 0, 1], 100),
+    ]);
+    assert_eq!(view.filtered(100)[0].ip.to_string(), "10.0.0.2");
+    view.query = "AA:BB".into();
+    assert_eq!(view.filtered(100).len(), 2);
+    view.query = "10.0.0.10".into();
+    assert_eq!(view.filtered(100).len(), 1);
+    view.query.clear();
+    view.filter = LeaseFilter::Active;
+    assert_eq!(view.filtered(100)[0].ip.to_string(), "10.0.0.10");
+    view.filter = LeaseFilter::Expired;
+    assert_eq!(view.filtered(100)[0].ip.to_string(), "10.0.0.2");
+    view.filter = LeaseFilter::All;
+    view.leases[0].expires_at_unix = 50;
+    view.sort_expiration = true;
+    assert_eq!(view.filtered(100)[0].ip.to_string(), "10.0.0.10");
+}
+
+#[tokio::test]
+async fn failed_and_mismatched_lease_refreshes_retain_snapshot_then_recover() {
+    let old = lease("10.0.0.2", [0; 6], u64::MAX);
+    let mock = super::super::test_api::mock(vec![
+        Response::Error {
+            message: "DHCP unavailable".into(),
+        },
+        Response::Leases {
+            interface: "other0".into(),
+            leases: vec![],
+        },
+        Response::Leases {
+            interface: "lan0".into(),
+            leases: vec![],
+        },
+    ])
+    .await;
+    let mut app = TuiApp {
+        dhcp_leases: Some(lease_view(vec![old.clone()])),
+        ..Default::default()
+    };
+    {
+        let view = app.dhcp_leases.as_mut().unwrap();
+        view.query = "10.".into();
+        view.filter = LeaseFilter::Active;
+        view.sort_expiration = true;
+        view.scroll = 20;
+    }
+    for _ in 0..2 {
+        refresh_dhcp_leases(&mut app, &mock.client).await;
+        let view = app.dhcp_leases.as_ref().unwrap();
+        assert_eq!(view.leases, vec![old.clone()]);
+        assert!(view.error.is_some());
+        assert_eq!(view.updated_at, 100);
+    }
+    handle_dhcp_leases_key(&mut app, KeyCode::Char('r'), &mock.client).await;
+    let view = app.dhcp_leases.as_ref().unwrap();
+    assert!(view.error.is_none());
+    assert!(view.leases.is_empty());
+    assert_eq!(view.scroll, 0);
+    assert_eq!(view.query, "10.");
+    assert_eq!(view.filter, LeaseFilter::Active);
+    assert!(view.sort_expiration);
+    assert!(mock
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|call| call.method == "GET"));
+}
+
+#[tokio::test]
+async fn lease_search_treats_shortcuts_as_text_and_esc_first_exits_search() {
+    let client = ApiClient::new("/nonexistent/lease-test.sock");
+    let mut app = TuiApp {
+        screen: Screen::DhcpLeases,
+        dhcp_leases: Some(lease_view(vec![])),
+        ..Default::default()
+    };
+    handle_dhcp_leases_key(&mut app, KeyCode::Char('/'), &client).await;
+    for ch in ['f', 's', 'r'] {
+        handle_dhcp_leases_key(&mut app, KeyCode::Char(ch), &client).await;
+    }
+    let view = app.dhcp_leases.as_ref().unwrap();
+    assert_eq!(view.query, "fsr");
+    assert_eq!(view.filter, LeaseFilter::All);
+    assert!(!view.sort_expiration);
+    assert!(view.error.is_none());
+    handle_dhcp_leases_key(&mut app, KeyCode::Esc, &client).await;
+    assert_eq!(app.screen, Screen::DhcpLeases);
+    handle_dhcp_leases_key(&mut app, KeyCode::Esc, &client).await;
+    assert_eq!(app.screen, Screen::DhcpEditor);
+}
+
+#[tokio::test]
+async fn lease_end_scroll_fills_the_page_and_filtering_clamps_it() {
+    let client = ApiClient::new("/nonexistent/lease-test.sock");
+    let leases = (1..=30)
+        .map(|i| lease(&format!("10.0.0.{i}"), [0; 6], u64::MAX))
+        .collect();
+    let mut app = TuiApp {
+        dhcp_leases: Some(lease_view(leases)),
+        ..Default::default()
+    };
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| render_dhcp_leases(frame, frame.area(), &mut app))
+        .unwrap();
+    handle_dhcp_leases_key(&mut app, KeyCode::End, &client).await;
+    assert_eq!(app.dhcp_leases.as_ref().unwrap().scroll, 14);
+    app.dhcp_leases.as_mut().unwrap().query = "10.0.0.30".into();
+    app.dhcp_leases.as_mut().unwrap().error = Some("test refresh failure".into());
+    terminal
+        .draw(|frame| render_dhcp_leases(frame, frame.area(), &mut app))
+        .unwrap();
+    assert_eq!(app.dhcp_leases.as_ref().unwrap().scroll, 0);
+    let text = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(text.contains("STALE: test refresh failure"));
+    assert!(text.contains("Showing 1/30"));
+    assert!(text.contains("10.0.0.30"));
+}

@@ -346,13 +346,36 @@ pub(crate) fn screen_help_pairs(screen: Screen) -> Vec<(&'static str, &'static s
             ("Enter", "select"),
             ("Esc", "back"),
         ],
+        Screen::WifiStations => vec![
+            ("↑/↓", "client"),
+            ("Tab", "actions"),
+            ("r", "refresh"),
+            ("d", "disconnect"),
+            ("Esc", "back"),
+        ],
         Screen::DhcpClient => vec![
+            ("e/Enter", "edit settings"),
             ("↑/↓", "interface"),
             ("c/r/x/d", "action"),
             ("←/→", "section"),
             ("Esc", "back"),
         ],
+        Screen::Provisioning => vec![
+            ("↑/↓", "move/scroll"),
+            ("PgUp/Dn", "review"),
+            ("Enter", "activate"),
+            ("Esc", "back"),
+        ],
+        Screen::RouterHealth => vec![
+            ("r", "refresh"),
+            ("f", "repair"),
+            ("↑/↓", "scroll"),
+            ("Esc", "back"),
+        ],
         Screen::Router => vec![
+            ("h", "health / repair"),
+            ("w", "Wi-Fi setup"),
+            ("u", "uplink / VPN chain"),
             ("1/2/3", "router section"),
             ("n", "share via route"),
             ("↑/↓", "move"),
@@ -365,7 +388,9 @@ pub(crate) fn screen_help_pairs(screen: Screen) -> Vec<(&'static str, &'static s
         Screen::Access
         | Screen::InterfaceEditor
         | Screen::DhcpEditor
+        | Screen::DhcpClientEditor
         | Screen::RouteEditor
+        | Screen::RouterSettings
         | Screen::VpnPolicy => vec![
             ("↑/↓", "move"),
             ("Enter", "activate"),
@@ -386,9 +411,12 @@ pub(crate) fn screen_help_pairs(screen: Screen) -> Vec<(&'static str, &'static s
             ("Esc", "cancel"),
         ],
         Screen::DhcpLeases => vec![
+            ("/", "search IP/MAC"),
+            ("f", "filter state"),
+            ("s", "sort"),
             ("↑/↓", "scroll"),
             ("PgUp/PgDn", "page"),
-            ("Enter", "refresh"),
+            ("r/Enter", "refresh"),
             ("Esc", "back"),
         ],
         Screen::Preview | Screen::RouterPlan => vec![
@@ -411,7 +439,16 @@ pub(crate) fn screen_help_pairs(screen: Screen) -> Vec<(&'static str, &'static s
             ("Enter", "commit"),
             ("Esc", "rollback"),
         ],
+        Screen::DaemonLogs => vec![
+            ("/", "search"),
+            ("l", "level"),
+            ("r", "refresh"),
+            ("e", "export"),
+            ("End", "follow"),
+            ("Esc", "session"),
+        ],
         Screen::Log => vec![
+            ("2", "daemon logs"),
             ("↑/↓", "scroll"),
             ("PgUp/PgDn", "page"),
             ("←/→", "section"),

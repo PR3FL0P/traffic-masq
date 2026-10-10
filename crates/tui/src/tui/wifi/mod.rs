@@ -656,6 +656,7 @@ impl WifiConnectPrompt {
 
 #[derive(Clone, Copy)]
 enum PrimaryAction {
+    Stations,
     ConfigureAp,
     ApProfiles,
     Scan,
@@ -674,6 +675,7 @@ fn actions(role: WifiRole) -> &'static [(PrimaryAction, &'static str)] {
             (PrimaryAction::Reload, "Reload access point"),
             (PrimaryAction::Deactivate, "Deactivate access point"),
             (PrimaryAction::Refresh, "Refresh"),
+            (PrimaryAction::Stations, "Connected devices"),
         ],
         WifiRole::Client => &[
             (PrimaryAction::Scan, "Scan networks"),
@@ -809,7 +811,10 @@ pub(crate) fn render_wifi(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
                 Style::default().fg(theme::TEXT),
             ));
             let advice_text = advice_opt.map(|s| s.to_string()).unwrap_or_else(|| {
-                traffic_masq_protocol::format_competing_manager_advice(competing, &row.interface)
+                traffic_masq_host_observation::format_competing_manager_advice(
+                    competing,
+                    &row.interface,
+                )
             });
             for line in advice_text.lines() {
                 lines.push(Line::styled(
@@ -944,7 +949,10 @@ async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
     if row.presence != traffic_masq_protocol::InterfacePresence::Present
         && matches!(
             action,
-            PrimaryAction::Scan | PrimaryAction::Reconnect | PrimaryAction::Reload
+            PrimaryAction::Scan
+                | PrimaryAction::Reconnect
+                | PrimaryAction::Reload
+                | PrimaryAction::Stations
         )
     {
         app.push_message(
@@ -954,6 +962,7 @@ async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
         return;
     }
     match action {
+        PrimaryAction::Stations => super::wifi_stations::open(app, client, row.interface).await,
         PrimaryAction::ConfigureAp => {
             if row.presence == traffic_masq_protocol::InterfacePresence::Missing
                 || !subsystem_disabled(app, WifiRole::AccessPoint)

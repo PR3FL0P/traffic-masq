@@ -78,9 +78,9 @@ fn router_action_cycles_forward_and_backward() {
         RouterAction::ToggleEnabled
     );
 
-    assert_eq!(action.prev(), RouterAction::ToggleEnabled);
-    assert_eq!(action.prev().prev(), RouterAction::Topology);
-    assert_eq!(action.prev().prev().prev(), RouterAction::Refresh);
+    assert_eq!(action.prev(), RouterAction::Settings);
+    assert_eq!(action.prev().prev(), RouterAction::Setup);
+    assert_eq!(action.prev().prev().prev(), RouterAction::ToggleEnabled);
 }
 
 #[test]
@@ -622,7 +622,7 @@ async fn empty_router_actions_require_tab_and_clamp_at_the_last() {
         handle_router_key(&mut app, KeyCode::Down, &client).await;
         assert_eq!(app.router.focus, RouterFocus::Actions);
     }
-    assert_eq!(app.router.action, RouterAction::ToggleEnabled);
+    assert_eq!(app.router.action, RouterAction::Settings);
 
     handle_router_key(&mut app, KeyCode::Tab, &client).await;
     assert_eq!(app.router.focus, RouterFocus::RouteTable);
@@ -649,10 +649,10 @@ fn router_buttons_wrap_and_remain_visible_at_supported_sizes() {
                 .draw(|frame| super::super::render(frame, &mut app, false))
                 .unwrap();
             let action_buttons = if width >= 112 {
-                assert_eq!(app.ui.buttons.len(), 9, "{width}x{height}");
+                assert_eq!(app.ui.buttons.len(), 11, "{width}x{height}");
                 &app.ui.buttons[1..]
             } else {
-                assert_eq!(app.ui.buttons.len(), 8, "{width}x{height}");
+                assert_eq!(app.ui.buttons.len(), 10, "{width}x{height}");
                 &app.ui.buttons[..]
             };
             let buffer = terminal.backend().buffer();
@@ -1233,7 +1233,7 @@ async fn sharing_refresh_requires_inventory_even_when_router_status_succeeds() {
         enabled: true,
         ready: true,
         coordinator_status: CoordinatorStatus::Idle,
-        health: None,
+        health: Default::default(),
         recovery: None,
     }])
     .await;

@@ -229,7 +229,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
                 }),
             ));
             lines.push(Line::styled(
-                "  [c] reset defaults  [r] renew  [x] release/reacquire  [d] disable",
+                "  [e] edit  [c] reset defaults  [r] renew  [x] release/reacquire  [d] disable",
                 Style::default().fg(theme::ACCENT),
             ));
         } else {
@@ -249,7 +249,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
                 Style::default().fg(theme::MUTED),
             ));
             lines.push(Line::styled(
-                "  [c] enable with defaults",
+                "  [e] configure  [c] enable with defaults",
                 Style::default().fg(theme::ACCENT),
             ));
             lines.push(Line::from(""));
@@ -320,6 +320,10 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClien
         return;
     };
     app.dhcp_client_selected = Some(interface.clone());
+    if matches!(key, KeyCode::Char('e') | KeyCode::Enter) {
+        super::dhcp_client_editor::open(app, client, interface).await;
+        return;
+    }
     let configured = app
         .dhcp_clients
         .iter()

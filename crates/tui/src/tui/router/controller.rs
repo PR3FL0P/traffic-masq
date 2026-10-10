@@ -16,6 +16,8 @@ pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
         4 => RouterAction::ShareViaRoute,
         6 => RouterAction::Topology,
         7 => RouterAction::ToggleEnabled,
+        8 => RouterAction::Setup,
+        9 => RouterAction::Settings,
         _ => RouterAction::Refresh,
     };
 }
@@ -23,6 +25,18 @@ pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
 /// Dispatch router-screen input to editing, planning, apply, confirmation, and rollback actions.
 pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
     match key {
+        KeyCode::Char('h') => {
+            super::super::router_health::open(app, client).await;
+            return;
+        }
+        KeyCode::Char('u') => {
+            super::super::router_settings::open(app, client).await;
+            return;
+        }
+        KeyCode::Char('w') => {
+            super::super::provisioning::open(app, client).await;
+            return;
+        }
         KeyCode::Char('r') if app.router.recovery_blocks_mutations() => {
             handle_router_recovery_action(app, client).await;
             return;
@@ -140,7 +154,7 @@ pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &A
                     app.router.warning_message = None;
                 }
                 KeyCode::Down => {
-                    if app.router.action != RouterAction::ToggleEnabled {
+                    if app.router.action != RouterAction::Settings {
                         app.router.action = app.router.action.next();
                     }
                     app.router.warning_message = None;
@@ -176,6 +190,10 @@ pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &A
                     }
                     RouterAction::Refresh => refresh_router_data(app, client).await,
                     RouterAction::Topology => select_pane(app, RouterPane::Topology),
+                    RouterAction::Settings => {
+                        super::super::router_settings::open(app, client).await
+                    }
+                    RouterAction::Setup => super::super::provisioning::open(app, client).await,
                 },
                 _ => {}
             },

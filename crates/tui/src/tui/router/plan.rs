@@ -183,6 +183,19 @@ pub(crate) fn render_router_plan(frame: &mut ratatui::Frame<'_>, area: Rect, app
     for line in summarize_dhcp(&plan.desired.dhcp, &app.router.lease_counts) {
         lines.push(Line::from(format!("DHCP: {line}")));
     }
+    for line in super::super::router_settings::plan_lines(
+        &app.router.proposed_router_config,
+        app.router.saved_router_config.as_ref(),
+    ) {
+        lines.extend(
+            super::super::logs::wrap_log_message(
+                &line,
+                area.width.saturating_sub(2).max(1) as usize,
+            )
+            .into_iter()
+            .map(Line::from),
+        );
+    }
     lines.push(Line::from(format!(
         "Interface changes: {}",
         plan.interfaces.len()
@@ -577,10 +590,9 @@ async fn router_apply_current_plan(app: &mut TuiApp, client: &ApiClient) {
     }
     let proposal = current_router_proposal(app);
     match client.request(&Request::RouterApply { proposal }).await {
-        Ok(Response::RouterTransactionPending { token, plan }) => {
+        Ok(Response::RouterTransactionPending { token, .. }) => {
             app.router_pending = Some(RouterPendingView {
                 token,
-                plan,
                 applied_at_unix: current_unix_time(),
                 rollback_failure: None,
                 recovery: None,

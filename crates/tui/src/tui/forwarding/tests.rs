@@ -109,8 +109,10 @@ fn default_route_without_metric_has_zero_priority_cost() {
 #[tokio::test]
 async fn failed_refresh_cannot_edit_or_delete_cached_sharing_rules() {
     for edit in [false, true] {
-        let mut app = TuiApp::default();
-        app.screen = Screen::Router;
+        let mut app = TuiApp {
+            screen: Screen::Router,
+            ..TuiApp::default()
+        };
         app.router.topology.loaded = true;
         app.router.proposed_router_config.forwarding = Some(vec![connection("lan0", "wan0")]);
         app.dashboard.interfaces = vec![

@@ -218,6 +218,8 @@ pub(crate) enum RouterAction {
     Refresh,
     Topology,
     ToggleEnabled,
+    Setup,
+    Settings,
 }
 
 impl RouterAction {
@@ -230,13 +232,17 @@ impl RouterAction {
             Self::ShareViaRoute => Self::Refresh,
             Self::Refresh => Self::Topology,
             Self::Topology => Self::ToggleEnabled,
-            Self::ToggleEnabled => Self::AddRoute,
+            Self::ToggleEnabled => Self::Setup,
+            Self::Setup => Self::Settings,
+            Self::Settings => Self::AddRoute,
         }
     }
 
     pub(crate) fn prev(self) -> Self {
         match self {
-            Self::AddRoute => Self::ToggleEnabled,
+            Self::AddRoute => Self::Settings,
+            Self::Settings => Self::Setup,
+            Self::Setup => Self::ToggleEnabled,
             Self::EditRoute => Self::AddRoute,
             Self::DeleteRoute => Self::EditRoute,
             Self::PlanApply => Self::DeleteRoute,
@@ -332,8 +338,6 @@ impl RouteEditor {
 #[derive(Debug, Clone)]
 pub(crate) struct RouterPendingView {
     pub(crate) token: String,
-    #[allow(dead_code)]
-    pub(crate) plan: RouterPlanView,
     pub(crate) applied_at_unix: u64,
     pub(crate) rollback_failure: Option<Vec<String>>,
     pub(crate) recovery: Option<RouterRecoveryNotice>,
