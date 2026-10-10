@@ -7,7 +7,8 @@ interface state itself and cannot make changes.
 | Module | Responsibility |
 | --- | --- |
 | `api` | HTTP, authorization and control-operation limits |
-| `crates/protocol` (`traffic-masq-protocol`) | API wire DTOs independent of daemon internals |
+| `crates/protocol` (`traffic-masq-protocol`) | API wire DTOs and pure shared intent validation, independent of daemon internals |
+| `crates/host-observation` (`traffic-masq-host-observation`) | Init-system observation, competing network-manager discovery and operator guidance |
 | `crates/api-client` (`traffic-masq-api-client`) | Unix-socket HTTP transport, auth/session, request mapping and response decoding |
 | `crates/tui` (`traffic-masq-tui`) | Standalone terminal client and read-only direct-mode observation |
 | `core` | Configuration, ownership, plans, transactions and reconciliation |
@@ -30,6 +31,16 @@ The DHCP core contains no socket, store, or supervisor code. The daemon's DHCP
 module re-exports its packet, lease, server, and client state-machine APIs.
 The WireGuard crate owns the profile parser and kernel provider; the daemon
 keeps profile storage, activation policy, and ownership recovery.
+Host observation is a leaf shared by the daemon and terminal client. It owns
+the `/proc` scan and init detection; protocol performs no host discovery.
+
+Daemon startup constructs `ControlService::from_runtime` with a complete
+`ControlRuntime` and explicit `ControlSubsystems`. The context supplies active
+settings, the original file configuration, ownership baselines, and the same
+desired state and mutation gate used by reconciliation. Construction also wires
+transaction timers to that gate. Standalone constructors and service builders
+remain available for tests and tooling without a converger; production does not
+replace shared state after constructing the service.
 
 `RouterManager` orders router apply and rollback stages. Its subsystem boundary
 captures one router-scoped `RouterSnapshot` with `snapshot_for`, including
@@ -48,6 +59,11 @@ integrity workers. After those workers stop and pending rollback is attempted,
 resources. An uncertain commit keeps recovery evidence and prevents baseline
 restoration.
 
+DHCP client apply, quiesce, rollback and health hooks are required by
+`RouterSubsystems`; adapters without an embedded client must explicitly reject
+nonempty intent and recovery state. Production preflight rejects missing DHCP
+and Wi-Fi runtimes before a plan can enter transaction execution.
+
 `api::model` re-exports the protocol DTOs for current callers. The request
 envelope now lives in protocol. Interface changes and router proposals use
 protocol-owned DTOs converted to daemon configuration at the control boundary.
@@ -56,7 +72,7 @@ The response envelope also lives in protocol. VPN views, router health,
 coordinator and pending-change status, DHCP lease views, interface status and
 plans, routes, Wi-Fi status, and the complete router plan are protocol DTOs.
 The response alias `ControlResponse` contains no daemon model types. The TUI
-crate depends on protocol, API client, netlink and atomic file storage without
+crate depends on protocol, API client, netlink, host observation and atomic file storage without
 depending on the daemon crate. Its binary provides the operator interface.
 `config` re-exports shared interface, Wi-Fi and VPN enum values from protocol;
 `core::router_provisioning` similarly re-exports downstream overrides.
@@ -77,6 +93,20 @@ one, the daemon persists the rollback state it needs; router transactions keep a
 full snapshot until the user commits the change or rollback succeeds. A commit
 saves the requested configuration, and reconciliation then corrects differences
 between committed intent and the running system.
+
+Interface transaction ordering stays in `core::transaction`. Its `journal`
+module owns the snapshot schema and durable storage, `credentials` prepares
+role-specific secret edits and compensation, and `recovery` restores interrupted
+transactions. Credential preparation is observational: the coordinator writes
+the snapshot before applying a credential edit. Journal versions and legacy
+credential recovery semantics remain unchanged.
+
+Wi-Fi supervisors share an encapsulated `wifi::retry` policy. Only that module
+updates attempt counters, backoff and interface-bound suspension. AP diagnostic
+classification lives in `wifi::supervisor::health`; temporary STA scans and
+their ownership cleanup live in `wifi::client::supervisor::scan`. AP and STA
+readiness remain distinct: AP respawn keeps backoff until health reports
+`ENABLED`, while STA preserves its existing control-endpoint readiness policy.
 
 Router provisioning rollback restores journaled Wi-Fi credentials before
 restoring runtime services, so reconnecting the previous uplink can obtain a

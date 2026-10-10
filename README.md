@@ -125,6 +125,88 @@ Internet yet.
 For a Wi-Fi LAN, configure an access point in **Wi-Fi** as well. Assigning an
 address and a DHCP pool to a wireless interface alone does not create an AP.
 
+## Wi-Fi router setup wizard
+
+In **Router**, choose **Wi-Fi setup** or press **w** to configure a Wi-Fi uplink
+and a local access point on two separate radios. Enter the upstream network,
+AP settings, and LAN/DHCP settings, then review the complete setup. Blank LAN
+address/pool fields let the daemon choose a non-overlapping subnet; the review
+shows the selected values. Enter DNS servers explicitly if clients need them.
+Blank passwords retain credentials already saved for the same Wi-Fi role.
+
+**This wizard replaces the selected interface configurations and the router
+policy, including existing owned static routes, sharing rules and the VPN
+chain.** The review lists the replaced router settings. Scroll to the end before
+applying, verify connectivity, then Commit before the rollback deadline. Esc
+from the pending screen rolls back the whole setup.
+
+## Connected devices and DHCP client settings
+
+In **Wi-Fi**, select an output/AP radio and choose **Connected devices**. The
+list combines associated client MAC addresses with active DHCP leases from that
+interface; devices using static addresses may have no known IP. Available
+hostapd counters appear below each client. Press **r** to refresh, or **d** to
+request disconnection and then Enter to confirm. Disconnection is temporary;
+a client can reconnect. Tab moves between the list and clickable actions.
+
+In **DHCP Client**, select an interface and press **e** or Enter to edit route
+metric, default-route installation, DNS requests and Release on shutdown.
+The form loads saved settings and applies immediately, without a rollback timer.
+The existing **c** shortcut still enables/resets the client to defaults. Enable
+the DHCP Client tab in Settings if it is hidden.
+
+In **Router**, press **h** for readiness diagnostics and confirmed repair of saved
+state. Repair applies immediately and has no commit-confirm timer.
+
+## Uplink and VPN chains
+
+Open **Router → Uplink / VPN** or press **u**. Set the physical uplink and
+addressing mode: **External** uses an unmanaged Input interface; **DHCP** uses a
+managed Input with the DHCP client enabled. Import WireGuard profiles in VPN,
+then add, reorder or remove hops. The order is physical uplink → first hop →
+last hop → LAN.
+
+The global VPN chain requires **Global uplink sharing**. Switching to that mode
+replaces explicit Internet sharing rules; the editor and plan show this change.
+Switching back starts with no explicit rules when none were previously present.
+Changes enter the router draft and use the existing Plan → Apply → Commit flow.
+
+## Daemon logs
+
+In **Log**, press **2** for recent daemon logs (administrator access). Press
+**/** to search by text or subsystem name, **l** to cycle severity, **r** to
+refresh and **e** to export a private local log report. Up/PgUp pauses following;
+End resumes it. Esc returns to the session log. This is a bounded recent window,
+not a complete log archive; unavailable data is marked stale.
+
+## Remote terminal client
+
+Configure the daemon's HTTPS listener in Settings → Remote access and restart
+the daemon. Initialize its device password locally first. The client verifies
+both certificate trust and the server hostname:
+
+```sh
+./target/debug/traffic-masq --server https://router.example:8443 --ca-cert /path/to/ca.pem
+```
+
+For a self-signed server, use its trusted certificate as the CA file. If omitted,
+the client reads `SSL_CERT_FILE` or a system CA bundle. The name/address in the
+URL must be covered by the certificate. There is no insecure TLS bypass.
+
+Save destinations without storing passwords in the connection profile:
+
+```sh
+traffic-masq --server https://router.example:8443 --ca-cert /path/to/ca.pem --save-connection home
+traffic-masq --connection home
+traffic-masq --list-connections
+traffic-masq --delete-connection home
+```
+
+Saving/deleting a connection only changes local profiles and exits. Login uses
+the normal device password. Cached sessions are isolated by HTTPS origin and
+trusted CA bundle; the selected server appears in the TUI header. The existing
+Unix-socket and `--direct` modes remain available.
+
 ## Saved access-point profiles
 
 In **Wi-Fi**, open **Saved AP profiles**, then **Create new profile** or

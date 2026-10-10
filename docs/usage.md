@@ -396,6 +396,110 @@ Once `forwarding` is present it is authoritative: `forwarding = []` removes all
 owned connection rules and never resurrects the old implicit NAT rules.
 The legacy `uplink` may remain to preserve its Wi-Fi/DHCP client services.
 
+### Physical uplink and global VPN chain
+
+**Router → Uplink / VPN** (**u**) edits the current router draft. Set the uplink
+interface name and choose External (unmanaged Input) or DHCP (managed Input with
+an enabled DHCP client). Those interface prerequisites are configured in
+Interfaces/DHCP Client; this editor preserves their settings.
+
+Select imported VPN profiles, add them at the LAN end, select a hop and move it
+closer to the physical uplink or LAN, or remove it. The first hop connects through
+the physical uplink; each later hop connects through the preceding tunnel. The
+last hop protects LAN traffic. The daemon validates chain size and profiles.
+
+Choose Global uplink sharing explicitly to use a VPN chain. It replaces explicit
+sharing rules with the backend's global policy for managed NAT outputs. Switching
+from global to explicit mode starts with an empty rule list if no explicit rules
+existed in the draft. Review those consequences before Apply. The shared plan
+shows both old and new hops and removed sharing rules. Esc from the editor
+preserves the pre-existing draft; staging uses the usual confirmed router flow.
+Uplink/chain changes require a live transaction, not an offline intent save.
+
+### Daemon log viewer
+
+The Log tab still contains the local session log. **2** opens the authenticated
+daemon log viewer, **1/Esc** returns. **/** edits a case-insensitive substring
+filter (including subsystem names); Enter finishes editing. **l** cycles an exact
+severity filter. **r** refreshes the snapshot. Up/PgUp/Home pauses automatic
+refresh so the displayed history stays stable; End resumes following. The viewer
+marks stale snapshots and limited history explicitly. **e** exports the filtered
+snapshot, source filenames, destination and observation status to a local file
+with mode 0600. It does not clear or change daemon log files.
+
+### HTTPS connections and saved destinations
+
+Use `traffic-masq --server https://host:port [--ca-cert /path/to/ca.pem]` after
+enabling HTTPS on the daemon and restarting it. Initialize the device password
+locally before connecting remotely. The CA file belongs to the client machine;
+the certificate/key configured in Remote access belong to the daemon machine.
+The URL hostname or IP must match the server certificate's subject alternative
+names. TLS verification is mandatory; redirects are not followed.
+
+Without `--ca-cert`, trust is loaded from `SSL_CERT_FILE` when set, otherwise the
+first available standard Linux CA bundle under `/etc/ssl` or `/etc/pki/tls`.
+For a private/self-signed server, supply its CA/certificate explicitly.
+
+Add `--save-connection NAME` to save the destination and exit. Use
+`--connection NAME`, `--list-connections`, or `--delete-connection NAME` later.
+Names use 1–64 ASCII letters, digits, dots, underscores or hyphens. Saving an
+existing name updates it. CA file paths are saved as absolute paths; connection
+profiles contain no passwords or tokens. Profiles use a private JSON file under
+the same per-user state directory as session preferences. Deleting a destination
+removes the local profile; it does not revoke server sessions.
+
+The regular remembered-session policy also applies over HTTPS. Each origin and
+trusted CA bundle has its own cache key, so changing trust requires authentication
+again. The server is shown on the login screen and TUI header. `--change-password`
+works with either `--server` or `--connection`. Direct recovery mode always
+observes the local host and cannot be combined with a remote destination.
+
+### Whole-router Wi-Fi setup
+
+**Router → Wi-Fi setup** (**w**) opens three steps: Wi-Fi uplink, local AP, and
+LAN/DHCP. Enter cycles available radio names; names and SSIDs can also be typed.
+Use two different wireless PHYs. The daemon validates radio capabilities and
+subnet conflicts during preview/apply. AP setup defaults to visible SSID and
+32 clients; these can subsequently be changed in the AP editor.
+
+Blank LAN address and pool fields request automatic selection. Custom pools
+require both endpoints and an explicit LAN address/prefix. DNS is explicit;
+leaving it empty advertises no DNS servers. Passwords are masked; blank retains
+only credentials already saved for that same role. Management-interface changes
+require the explicit option on the final step.
+
+Review the complete replacement before applying: this replaces the two selected
+interface configurations and the router's owned routes, forwarding rules and VPN
+chain. The chosen LAN values are held for Apply. Editing the draft requires a
+new preview. The wizard refuses to open over a staged router draft or known
+pending/recovery state. Esc asks before discarding the setup draft.
+
+Apply uses a whole-router transaction. Verify connectivity and Commit, or Esc
+to roll back. If the response is unknown, Apply is disabled; leave the wizard
+and inspect Router status before retrying. It never automatically resubmits.
+
+### Connected AP clients
+
+**Wi-Fi → output/AP radio → Connected devices** lists associated stations and
+joins active DHCP leases by MAC on that interface. DHCP IP/expiry are unknown
+when the device uses a static IP or leases are unavailable. Hostapd signal,
+connected time and RX/TX byte counters are shown when provided. Refresh preserves
+selection by MAC; failed observations retain rows with a stale/unavailable label.
+
+**r** refreshes, **d** asks to disconnect the selected client, Enter confirms,
+and Esc cancels. This is deauthentication, not a persistent block. The selected
+MAC is held during confirmation and background refresh is paused for that dialog.
+Tab selects the refresh/disconnect/back buttons; scrolling selects the list.
+
+### DHCP client policy editor
+
+Enable the DHCP Client tab in Settings if hidden. Select an interface and press
+**e** or Enter to load its saved DHCP policy. Edit the route metric and toggle
+installation of the default route, requesting DNS, and sending Release on
+shutdown. Apply uses the existing immediate DHCP client operation; there is no
+rollback timer. Errors retain the draft. Esc discards it. **c** on the list
+continues to enable/reset the client to defaults.
+
 ### Settings and running operations
 
 Changes in **Settings** also require confirmation. The first Enter shows an
@@ -739,3 +843,33 @@ errors retain previous intent and require resolving the reported problem.
 A DELETE AP/client request also saves intent without a pending token when its
 adapter is absent and its role is saved. See the
 [offline API contract](api.md#offline-intent-and-inventory).
+
+### Router readiness and repair
+
+In **Router**, press **h** to inspect the saved configuration's readiness, transaction
+coordinator, interface/route/DHCP/dataplane blockers and recovery failures. Press
+**r** to refresh. A failed read retains the previous snapshot, marks it stale and
+blocks repair. These checks do not test Internet connectivity.
+
+Press **f** to fetch fresh status and review the repair confirmation, then **y** to
+reconcile the saved router configuration. **n** or **Esc** cancels. Repair immediately
+reapplies saved state and may interrupt traffic; it has no commit-confirm timer.
+It is offered only for degraded, enabled routing with an idle coordinator and no
+TUI draft. Resolve pending transactions or recovery through Router first. The daemon
+also rejects repair while an interface transaction is pending. A failed or uncertain
+repair requires a fresh status read before retrying.
+
+### Finding DHCP leases
+
+Open **DHCP → View leases**. Press **/** to search by an IPv4 address or MAC
+substring (case-insensitive), then **Enter** or **Esc** to finish typing. Press
+**f** to cycle all/active/expired leases, **s** to sort by numeric IPv4 address or
+expiration (earliest first), and **r** or **Enter** to refresh. Refresh preserves
+the search, filter and sorting. **Home/End**, page keys and the mouse wheel scroll
+the filtered results.
+
+The header shows matching, active and expired counts plus the age of the last
+successful snapshot. Failed refreshes retain the previous data with a **STALE**
+warning until a successful read. The expired filter covers only the current
+snapshot; the daemon may already have removed expired leases, so it is not a
+lease history.

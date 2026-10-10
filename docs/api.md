@@ -140,6 +140,7 @@ Body names in the tables refer to the [request schemas](#request-schemas).
 
 | Method | Path | Body | Result or purpose | Access |
 | --- | --- | --- | --- | --- |
+| `GET` | `/logs?limit=500` | — | Recent daemon log snapshot; limit 1–1000 | Administrator |
 | `GET` | `/status` | — | Service version, API version, and capabilities | Public |
 | `GET` | `/auth/status` | — | `{ "initialized": bool }` | Public |
 | `POST` | `/auth/initialize` | `{ "password": string }` | Initialize password and return a session | Local root only |
@@ -321,6 +322,20 @@ transition.
 | `PUT` | `/wifi-client/{interface}/active-profile` | `{ "profile_id": string }` | Tentatively activate a saved profile | Administrator |
 | `DELETE` | `/wifi-client/{interface}/active-profile` | — | Deactivate current profile; present: pending change, absent: intent saved after cleanup | Administrator |
 
+### Daemon log snapshots
+
+`GET /logs?limit=500` returns `{"type":"daemon_logs","snapshot":{...}}`.
+The snapshot contains chronological `lines`, source filenames in `sources`, and
+`truncated`, which indicates an incomplete recent window. Limits outside 1–1000
+return a domain error. The endpoint requires administrator authentication.
+
+The reader examines only `traffic-masqd.log` and daily `traffic-masqd.log.YYYY-MM-DD`
+files in the configured log directory, skips symlinks, and reads at most 256 KiB
+from up to three recent files. Long lines are capped at 2048 characters and marked
+truncated. Terminal escape sequences are removed. No client-supplied path is
+accepted. Missing/unreadable log files return an error rather than claiming an
+empty healthy log. This endpoint is read-only and remains usable during recovery.
+
 ## Request schemas
 
 JSON enum values use `snake_case`. CIDRs are strings such as
@@ -443,8 +458,9 @@ Changing these desired settings does not rebind the running listener. Restart
 the daemon after saving them. Use certificate files and a private key readable
 by the daemon.
 
-The terminal client currently connects only through a Unix socket; use an
-HTTP client for HTTPS access. Initial password setup still requires local root.
+The terminal client supports `--server https://host:port` with `--ca-cert` for
+an explicit CA/server certificate, or a system CA bundle. Certificate trust and
+hostname validation are required. Initial password setup still requires local root.
 
 `SecuritySettings`
 
