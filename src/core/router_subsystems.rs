@@ -439,6 +439,18 @@ where
     E: RouterDataplaneEventSink + Send + Sync,
 {
     async fn preflight(&self, desired: &RouterDesired) -> Result<()> {
+        anyhow::ensure!(
+            desired.uplink_dhcp.is_none() || self.dhcp_client.is_some(),
+            "embedded DHCP client runtime is unavailable"
+        );
+        anyhow::ensure!(
+            desired.uplink_wifi.is_none() || self.stations.is_some(),
+            "uplink Wi-Fi runtime is unavailable"
+        );
+        anyhow::ensure!(
+            desired.output_wifi.is_empty() || self.access_points.is_some(),
+            "output Wi-Fi runtime is unavailable"
+        );
         let missing = self
             .interfaces
             .missing_interfaces(&desired.required_existing_interfaces())

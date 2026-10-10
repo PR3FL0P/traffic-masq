@@ -457,6 +457,8 @@ pub struct RouterSnapshot {
 /// callers must journal the snapshot before applying and recover on failure.
 /// Rollback restores only proved owned resources and must refuse foreign
 /// replacements. Retry rollback using the retained snapshot until it succeeds.
+/// DHCP client hooks are required: implementations without a client must reject
+/// nonempty intent and recovery snapshots, never report a successful no-op.
 pub trait RouterSubsystems: Send + Sync {
     /// Reject unavailable dependencies before opening a journal or mutating
     /// any subsystem. Recovery of an existing snapshot must bypass this check.
@@ -535,14 +537,10 @@ pub trait RouterSubsystems: Send + Sync {
     async fn apply_dataplane(&self, plan: &RouterDataplanePlan) -> Result<()>;
     /// Stop DHCP clients whose ownership must disappear before interface
     /// configuration is mutated.
-    async fn quiesce_uplink_dhcp(&self, _desired: Option<&DhcpClientSpec>) -> Result<()> {
-        Ok(())
-    }
+    async fn quiesce_uplink_dhcp(&self, desired: Option<&DhcpClientSpec>) -> Result<()>;
     /// Apply candidate DHCP intent and report whether rollback should quiesce
     /// candidate runtime before restoring interfaces.
-    async fn apply_uplink_dhcp_candidate(&self, _desired: Option<&DhcpClientSpec>) -> Result<bool> {
-        Ok(true)
-    }
+    async fn apply_uplink_dhcp_candidate(&self, desired: Option<&DhcpClientSpec>) -> Result<bool>;
     /// Activate hops 0..N in order. On any hop's failure, must roll back
     /// N..0 internally before returning `Err` — the outer `RouterManager`
     /// rollback only ever calls `rollback_vpn_chain` once, against the
@@ -582,23 +580,14 @@ pub trait RouterSubsystems: Send + Sync {
     async fn rollback_dataplane(&self, snapshot: &RouterDataplaneSnapshot) -> Result<()>;
     /// Stop DHCP runtime installed by the candidate before interface rollback.
     /// Previous DHCP intent is restored by `rollback_dhcp_clients` afterwards.
-    async fn rollback_candidate_uplink_dhcp(&self) -> Result<()> {
-        Ok(())
-    }
+    async fn rollback_candidate_uplink_dhcp(&self) -> Result<()>;
     /// Restore captured client leases/configuration, with legacy uplink compatibility.
     /// Keep durable lease ownership on cleanup failure.
     async fn rollback_dhcp_clients(
         &self,
         snapshots: &[DhcpClientSnapshot],
         legacy: Option<&DhcpClientSpec>,
-    ) -> Result<()> {
-        anyhow::ensure!(
-            snapshots.is_empty(),
-            "scoped DHCP client restoration is unavailable"
-        );
-        let _ = legacy;
-        Ok(())
-    }
+    ) -> Result<()>;
     /// Restore the captured chain using recorded launch ownership; refuse foreign links.
     async fn rollback_vpn_chain(&self, snapshot: &VpnChainSnapshot) -> Result<()> {
         if !snapshot.hops.is_empty() {
@@ -622,9 +611,7 @@ pub trait RouterSubsystems: Send + Sync {
     }
     async fn health_routes(&self, desired: &RouterDesired) -> Result<()>;
     async fn health_dhcp(&self, desired: &RouterDesired) -> Result<()>;
-    async fn health_uplink_dhcp(&self, _desired: &RouterDesired) -> Option<RouterDhcpHealthReason> {
-        None
-    }
+    async fn health_uplink_dhcp(&self, desired: &RouterDesired) -> Option<RouterDhcpHealthReason>;
     async fn health_dataplane(&self, desired: &RouterDesired) -> Result<()>;
     async fn health_vpn_chain(&self, desired: &RouterDesired) -> Result<()> {
         if !desired.vpn_chain.is_empty() {

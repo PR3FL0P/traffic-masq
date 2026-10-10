@@ -556,6 +556,50 @@ impl RouterSubsystems for FakeRouterSubsystems {
         }
         Ok(())
     }
+    async fn quiesce_uplink_dhcp(
+        &self,
+        desired: Option<&crate::dhcp::client::DhcpClientSpec>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            desired.is_none(),
+            "embedded DHCP client runtime is unavailable"
+        );
+        Ok(())
+    }
+    async fn apply_uplink_dhcp_candidate(
+        &self,
+        desired: Option<&crate::dhcp::client::DhcpClientSpec>,
+    ) -> Result<bool> {
+        anyhow::ensure!(
+            desired.is_none(),
+            "embedded DHCP client runtime is unavailable"
+        );
+        Ok(false)
+    }
+    async fn rollback_candidate_uplink_dhcp(&self) -> Result<()> {
+        Ok(())
+    }
+    async fn rollback_dhcp_clients(
+        &self,
+        snapshots: &[crate::core::router::DhcpClientSnapshot],
+        legacy: Option<&crate::dhcp::client::DhcpClientSpec>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            snapshots.is_empty() && legacy.is_none(),
+            "DHCP client restoration is unavailable"
+        );
+        Ok(())
+    }
+    async fn health_uplink_dhcp(
+        &self,
+        desired: &RouterDesired,
+    ) -> Option<crate::core::router::RouterDhcpHealthReason> {
+        desired.uplink_dhcp.as_ref().map(|spec| {
+            crate::core::router::RouterDhcpHealthReason::IntentMissing {
+                interface: spec.interface.clone(),
+            }
+        })
+    }
 }
 
 fn router_base_config() -> AppConfig {

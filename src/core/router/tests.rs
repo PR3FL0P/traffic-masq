@@ -531,6 +531,12 @@ impl RouterSubsystems for FakeSubsystems {
     async fn health_dataplane(&self, _: &RouterDesired) -> Result<()> {
         self.event("health_dataplane")
     }
+    async fn health_uplink_dhcp(
+        &self,
+        _desired: &RouterDesired,
+    ) -> Option<crate::core::router::RouterDhcpHealthReason> {
+        None
+    }
 }
 
 #[tokio::test]

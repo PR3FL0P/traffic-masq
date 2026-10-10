@@ -159,6 +159,35 @@ async fn subsystems_for(
 }
 
 #[tokio::test]
+async fn planning_rejects_missing_dhcp_client_before_changing_runtime() {
+    let mut config = enabled_config();
+    let uplink = config.network.interfaces.get_mut("wan0").unwrap();
+    uplink.managed = true;
+    uplink.dhcp_client = Some(crate::config::DhcpClientInterfaceConfig::default());
+    config.router.uplink.as_mut().unwrap().mode = UplinkMode::Dhcp;
+    let desired = RouterDesired::from_effective_config(&config).unwrap();
+    assert!(desired.uplink_dhcp.is_some());
+
+    let (subsystems, provider) = subsystems_for(&config).await;
+    let manager = crate::core::router::RouterManager::new(Arc::new(subsystems));
+    let error = manager.plan(desired).await.unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("DHCP client runtime is unavailable"));
+    assert!(provider
+        .list_ipv4_addresses("lan0")
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(provider
+        .list_interfaces()
+        .await
+        .unwrap()
+        .iter()
+        .any(|interface| { interface.name == "lan0" && !interface.is_up }));
+}
+
+#[tokio::test]
 async fn wired_router_snapshot_rolls_back_without_wifi_runtimes() {
     let mut config = enabled_config();
     config.network.interfaces.insert(

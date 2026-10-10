@@ -577,6 +577,7 @@ async fn optional_tcp_listener_serves_http_only_after_tls_handshake() -> Result<
 
 #[derive(Default)]
 struct FakeRouterSubsystems {
+    dhcp_client: std::sync::Mutex<Option<traffic_masq::dhcp::client::DhcpClientSpec>>,
     unhealthy_interfaces: std::sync::Mutex<bool>,
     unhealthy_routes: std::sync::Mutex<bool>,
     unhealthy_dhcp: std::sync::Mutex<bool>,
@@ -675,12 +676,29 @@ impl RouterSubsystems for FakeRouterSubsystems {
             requires_apply: true,
         })
     }
-    async fn snapshot_for(&self, _: &RouterDesired) -> Result<RouterSnapshot> {
+    async fn snapshot_for(&self, desired: &RouterDesired) -> Result<RouterSnapshot> {
+        let current = self.dhcp_client.lock().unwrap().clone();
+        let interfaces = current
+            .iter()
+            .chain(desired.uplink_dhcp.iter())
+            .map(|spec| spec.interface.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let dhcp_clients = interfaces
+            .into_iter()
+            .map(|interface| traffic_masq::core::router::DhcpClientSnapshot {
+                spec: current
+                    .as_ref()
+                    .filter(|spec| spec.interface == interface)
+                    .cloned(),
+                interface,
+                lease: None,
+            })
+            .collect();
         Ok(RouterSnapshot {
             interfaces: Vec::new(),
             uplink_wifi: Vec::new(),
-            uplink_dhcp: None,
-            dhcp_clients: Vec::new(),
+            uplink_dhcp: current,
+            dhcp_clients,
             output_wifi: Vec::new(),
             dhcp: Vec::new(),
             dhcp_absent_interfaces: Vec::new(),
@@ -736,6 +754,60 @@ impl RouterSubsystems for FakeRouterSubsystems {
             anyhow::bail!("injected dataplane health failure");
         }
         Ok(())
+    }
+    async fn quiesce_uplink_dhcp(
+        &self,
+        desired: Option<&traffic_masq::dhcp::client::DhcpClientSpec>,
+    ) -> Result<()> {
+        let mut current = self.dhcp_client.lock().unwrap();
+        if current.as_ref() != desired {
+            *current = None;
+        }
+        Ok(())
+    }
+    async fn apply_uplink_dhcp_candidate(
+        &self,
+        desired: Option<&traffic_masq::dhcp::client::DhcpClientSpec>,
+    ) -> Result<bool> {
+        let mut current = self.dhcp_client.lock().unwrap();
+        let changed = current.as_ref() != desired;
+        *current = desired.cloned();
+        Ok(changed)
+    }
+    async fn rollback_candidate_uplink_dhcp(&self) -> Result<()> {
+        *self.dhcp_client.lock().unwrap() = None;
+        Ok(())
+    }
+    async fn rollback_dhcp_clients(
+        &self,
+        snapshots: &[traffic_masq::core::router::DhcpClientSnapshot],
+        legacy: Option<&traffic_masq::dhcp::client::DhcpClientSpec>,
+    ) -> Result<()> {
+        *self.dhcp_client.lock().unwrap() = snapshots
+            .iter()
+            .find_map(|entry| entry.spec.clone())
+            .or_else(|| legacy.cloned());
+        Ok(())
+    }
+    async fn health_uplink_dhcp(
+        &self,
+        desired: &RouterDesired,
+    ) -> Option<traffic_masq::core::router::RouterDhcpHealthReason> {
+        let spec = desired.uplink_dhcp.as_ref()?;
+        let current = self.dhcp_client.lock().unwrap();
+        match current.as_ref() {
+            Some(current) if current == spec => None,
+            Some(_) => Some(
+                traffic_masq::core::router::RouterDhcpHealthReason::IntentMismatch {
+                    interface: spec.interface.clone(),
+                },
+            ),
+            None => Some(
+                traffic_masq::core::router::RouterDhcpHealthReason::IntentMissing {
+                    interface: spec.interface.clone(),
+                },
+            ),
+        }
     }
 }
 
@@ -2538,3 +2610,4 @@ async fn ap_profiles_roundtrip_over_http_without_disclosing_credentials() -> Res
     dhcp.shutdown().await;
     Ok(())
 }
+
