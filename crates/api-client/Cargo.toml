@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license-file = "../../LICENSE"
 rust-version = "1.95"
-description = "Unix-socket HTTP transport for the traffic-masq API"
+description = "Unix-socket and verified HTTPS transports for the traffic-masq API"
 
 [dependencies]
 anyhow = "1"
@@ -12,6 +12,10 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 ipnet = { version = "2", features = ["serde"] }
+rustls = "0.23"
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
@@ -19,4 +23,5 @@ traffic-masq-protocol = { path = "../protocol" }
 zeroize = { version = "1", features = ["serde"] }
 
 [dev-dependencies]
+rcgen = "0.13"
 tempfile = "3"

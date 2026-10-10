@@ -1,4 +1,4 @@
-//! Authenticated typed control client for the Unix-socket API.
+//! Authenticated typed control client for local Unix sockets and verified HTTPS.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -46,7 +46,7 @@ impl ClientAuthentication {
 
 pub struct ApiClient<Response> {
     _response: std::marker::PhantomData<fn() -> Response>,
-    socket_path: PathBuf,
+    endpoint: crate::endpoint::Endpoint,
     session: Arc<RwLock<Option<ClientAuthentication>>>,
 }
 
@@ -54,16 +54,16 @@ impl<Response> Clone for ApiClient<Response> {
     fn clone(&self) -> Self {
         Self {
             _response: std::marker::PhantomData,
-            socket_path: self.socket_path.clone(),
+            endpoint: self.endpoint.clone(),
             session: self.session.clone(),
         }
     }
 }
 
-impl<Response> std::fmt::Debug for ApiClient<Response> {
+impl<Response: serde::de::DeserializeOwned> std::fmt::Debug for ApiClient<Response> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ApiClient")
-            .field("socket_path", &self.socket_path)
+            .field("endpoint", &self.endpoint_label())
             .finish_non_exhaustive()
     }
 }
@@ -72,7 +72,7 @@ impl<Response: serde::de::DeserializeOwned> ApiClient<Response> {
     /// Create an unauthenticated Unix-socket client; clones share authentication state.
     pub fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
-            socket_path: socket_path.into(),
+            endpoint: crate::endpoint::Endpoint::Unix(socket_path.into()),
             _response: std::marker::PhantomData,
             session: Arc::new(RwLock::new(None)),
         }
@@ -92,8 +92,37 @@ impl<Response: serde::de::DeserializeOwned> ApiClient<Response> {
         *self.session.write().await = Some(session);
     }
 
-    pub fn socket_path(&self) -> &Path {
-        &self.socket_path
+    pub fn socket_path(&self) -> Option<&Path> {
+        match &self.endpoint {
+            crate::endpoint::Endpoint::Unix(path) => Some(path),
+            _ => None,
+        }
+    }
+
+    /// Use certificate and hostname verification with an explicit or system CA bundle.
+    pub fn https(url: &str, ca_file: Option<&Path>) -> Result<Self> {
+        Ok(Self {
+            endpoint: crate::endpoint::Endpoint::Https(Arc::new(
+                crate::endpoint::HttpsEndpoint::new(url, ca_file)?,
+            )),
+            _response: std::marker::PhantomData,
+            session: Arc::new(RwLock::new(None)),
+        })
+    }
+
+    pub fn endpoint_label(&self) -> String {
+        match &self.endpoint {
+            crate::endpoint::Endpoint::Unix(path) => path.display().to_string(),
+            crate::endpoint::Endpoint::Https(remote) => format!("https://{}", remote.authority),
+        }
+    }
+
+    /// Remote sessions are scoped to both origin and the trusted CA bundle.
+    pub fn remote_session_identity(&self) -> Option<&str> {
+        match &self.endpoint {
+            crate::endpoint::Endpoint::Https(remote) => Some(&remote.identity),
+            _ => None,
+        }
     }
 
     /// Query whether the daemon has an initialized device password.
@@ -109,6 +138,9 @@ impl<Response: serde::de::DeserializeOwned> ApiClient<Response> {
 
     /// Initialize the device password and cache the returned authenticated session.
     pub async fn initialize(&self, password: &str) -> Result<LoginSession> {
+        if self.socket_path().is_none() {
+            bail!("initialize the device password locally over the Unix socket first");
+        }
         let body = serialize_json(&PasswordRequest { password })?;
         let response = self
             .send(
@@ -248,7 +280,7 @@ impl<Response: serde::de::DeserializeOwned> ApiClient<Response> {
             .await
             .as_ref()
             .map(|session| session.token.to_string());
-        crate::send(&self.socket_path, method, path, body, token.as_deref()).await
+        crate::send_endpoint(&self.endpoint, method, path, body, token.as_deref()).await
     }
 }
 

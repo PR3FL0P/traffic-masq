@@ -1,4 +1,5 @@
-//! Unix-socket HTTP transport shared by API clients.
+//! Unix-socket and verified HTTPS transports shared by API clients.
+mod endpoint;
 
 mod control;
 pub use control::{encode_path_segment, map_request, RestRequest};
@@ -51,6 +52,44 @@ pub async fn send(
     let stream = UnixStream::connect(socket_path)
         .await
         .with_context(|| format!("failed to connect to API socket {}", socket_path.display()))?;
+    send_stream(stream, HOST_VALUE, method, path, body, token).await
+}
+
+async fn send_endpoint(
+    endpoint: &endpoint::Endpoint,
+    method: Method,
+    path: &str,
+    body: Option<Vec<u8>>,
+    token: Option<&str>,
+) -> Result<RawResponse> {
+    match endpoint {
+        endpoint::Endpoint::Unix(pathname) => send(pathname, method, path, body, token).await,
+        endpoint::Endpoint::Https(remote) => {
+            let tcp = tokio::net::TcpStream::connect((remote.host.as_str(), remote.port))
+                .await
+                .context("failed to connect to HTTPS server")?;
+            let stream = tokio_rustls::TlsConnector::from(remote.tls.clone())
+                .connect(remote.server_name.clone(), tcp)
+                .await
+                .context(
+                    "TLS verification/handshake failed; check the server name and trusted CA",
+                )?;
+            send_stream(stream, &remote.authority, method, path, body, token).await
+        }
+    }
+}
+
+async fn send_stream<S>(
+    stream: S,
+    authority: &str,
+    method: Method,
+    path: &str,
+    body: Option<Vec<u8>>,
+    token: Option<&str>,
+) -> Result<RawResponse>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let (mut sender, connection) = http1::handshake(TokioIo::new(stream))
         .await
         .context("failed to establish HTTP/1 connection to the API")?;
@@ -61,7 +100,7 @@ pub async fn send(
     let mut builder = Request::builder()
         .method(method)
         .uri(path)
-        .header(HOST, HOST_VALUE)
+        .header(HOST, authority)
         .header(CONNECTION, "close");
     if has_json_body {
         builder = builder.header(CONTENT_TYPE, "application/json");
@@ -140,3 +179,6 @@ mod tests {
         server.await.unwrap();
     }
 }
+
+#[cfg(test)]
+mod tls_tests;
