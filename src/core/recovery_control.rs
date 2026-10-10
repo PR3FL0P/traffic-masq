@@ -276,6 +276,21 @@ impl ApplyGuard {
     }
 }
 
+/// Transfer a cancelled, locally owned apply to compensation. Only the apply
+/// owner may call this after releasing its runtime work and taking the scope
+/// lock. Never renew a recovery attempt or clear a storage/conflict stop.
+pub(crate) async fn compensate_cancelled_apply(journal: &Path) -> Result<()> {
+    if let Some(control) = load(journal).await? {
+        anyhow::ensure!(
+            control.attempts == 0 && control.failure_kind == FailureKind::Unknown,
+            "cancelled apply cannot resume an existing recovery failure"
+        );
+        remove_control(journal).await?;
+        forget(journal);
+    }
+    Ok(())
+}
+
 pub fn progress(journal: &Path) -> Option<traffic_masq_protocol::RecoveryProgress> {
     let mut progress = controls()
         .lock()
@@ -537,7 +552,6 @@ pub async fn run<T, F: Future<Output = Result<T>>>(
     };
     if control.phase != Phase::Ready
         || control.attempts >= MAX_ATTEMPTS
-        || now() >= control.deadline_unix
         || tokio::time::Instant::now() >= cycle_deadline
     {
         control.phase = Phase::Stopped;
@@ -566,11 +580,9 @@ pub async fn run<T, F: Future<Output = Result<T>>>(
             .insert(journal.to_owned(), control);
         return Err(error);
     }
-    let remaining = cycle_deadline
-        .saturating_duration_since(tokio::time::Instant::now())
-        .min(Duration::from_secs(
-            control.deadline_unix.saturating_sub(now()),
-        ));
+    // Wall time reconstructs a budget only when loading a previous process's
+    // record. A live cycle is governed exclusively by its monotonic deadline.
+    let remaining = cycle_deadline.saturating_duration_since(tokio::time::Instant::now());
     let result = if remaining.is_zero() {
         Err(failure(
             FailureKind::Transient,
@@ -596,7 +608,6 @@ pub async fn run<T, F: Future<Output = Result<T>>>(
             control.last_error = format!("{error:#}");
             control.phase = if automatic(control.failure_kind)
                 && control.attempts < MAX_ATTEMPTS
-                && now() < control.deadline_unix
                 && tokio::time::Instant::now() < cycle_deadline
             {
                 Phase::Ready

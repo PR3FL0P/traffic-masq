@@ -1086,6 +1086,52 @@ async fn timeout_rolls_back_uncommitted_transaction() {
     assert_eq!(overrides.committed_revision().await, 0);
 }
 
+#[tokio::test]
+async fn router_timeout_does_not_wait_for_unrelated_admission() {
+    let fake = FakeSubsystems::new();
+    let (coordinator, overrides, _directory) =
+        coordinator_with_timeout(fake, Duration::from_millis(100)).await;
+    let gate = Arc::new(NetworkMutationGate::default());
+    coordinator.set_timeout_mutation_gate(gate.clone());
+    let plan = coordinator
+        .plan(build_candidate(&overrides).await)
+        .await
+        .unwrap();
+    coordinator.apply(plan).await.unwrap();
+    let _admission = gate.admit().await;
+    tokio::time::timeout(Duration::from_secs(2), coordinator.wait_until_idle())
+        .await
+        .unwrap();
+    assert_eq!(overrides.committed_revision().await, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn router_commit_checks_deadline_even_before_timer_gets_state_lock() {
+    let fake = FakeSubsystems::new();
+    let (coordinator, overrides, _directory) =
+        coordinator_with_timeout(fake, Duration::from_secs(60)).await;
+    let plan = coordinator
+        .plan(build_candidate(&overrides).await)
+        .await
+        .unwrap();
+    let token = coordinator.apply(plan).await.unwrap();
+    // Expire the transaction's monotonic deadline without relying on the timer
+    // being scheduled; the commit path itself must refuse stale confirmation.
+    if let CoordinatorState::Pending(pending) = &mut *coordinator.inner.state.lock().await {
+        pending.confirmation_deadline = Some(tokio::time::Instant::now());
+    } else {
+        panic!("expected pending transaction");
+    }
+    assert!(coordinator
+        .commit(&token)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("deadline expired"));
+    assert_eq!(overrides.committed_revision().await, 0);
+    assert!(coordinator.inner.journal.exists());
+}
+
 #[tokio::test(start_paused = true)]
 async fn timeout_does_not_roll_back_an_already_committed_transaction() {
     let fake = FakeSubsystems::new();

@@ -602,6 +602,33 @@ pub(crate) fn fence_commit(root: &Path, reason: String) {
         .insert(root.to_owned(), reason);
 }
 
+// Settings-only writes can leave the document revision uncertain while both
+// possible documents carry identical network intent and commit proof. Keep all
+// further persistence fenced, without disabling compensation of that network.
+fn uncertain_settings() -> &'static Mutex<BTreeMap<PathBuf, String>> {
+    static SETTINGS: OnceLock<Mutex<BTreeMap<PathBuf, String>>> = OnceLock::new();
+    SETTINGS.get_or_init(Default::default)
+}
+
+pub(crate) fn fence_settings(root: &Path, reason: String) {
+    uncertain_settings()
+        .lock()
+        .expect("settings fence lock")
+        .insert(root.to_owned(), reason);
+}
+
+pub(crate) fn check_persistence(root: &Path) -> Result<()> {
+    check_commit(root)?;
+    if let Some(reason) = uncertain_settings()
+        .lock()
+        .expect("settings fence lock")
+        .get(root)
+    {
+        anyhow::bail!("state=settings_commit_indeterminate; configuration writes blocked; network recovery remains available; restart to reload settings: {reason}");
+    }
+    Ok(())
+}
+
 pub(crate) fn commit_uncertainty(root: &Path) -> Option<String> {
     uncertain_commits()
         .lock()

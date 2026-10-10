@@ -17,6 +17,8 @@ use super::journal::{interface_recovery_store_error, retryable_interface_store_e
 use super::*;
 use crate::wifi::store::WifiCredentialRole;
 
+mod regressions;
+
 fn wifi_runtime_dirs() -> WifiRuntimeDirs {
     WifiRuntimeDirs::new(
         "/run/traffic-masq/hostapd",
@@ -144,19 +146,39 @@ fn spawn_converger(
     desired: DesiredNetworkState,
     provider: Arc<FakeNetwork>,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_converger_with_interfaces(
+        desired,
+        InterfaceManager::new(provider, AddressOwnershipJournal::in_memory()),
+    )
+}
+
+fn spawn_converger_with_interfaces(
+    desired: DesiredNetworkState,
+    interfaces: InterfaceManager,
+) -> tokio::task::JoinHandle<()> {
     desired.attach_converger();
     tokio::spawn(async move {
-        let interfaces = InterfaceManager::new(provider, AddressOwnershipJournal::in_memory());
         loop {
             let version = desired.version();
             let mut failures = BTreeMap::new();
             let effective = desired.effective().await.expect("effective config");
             let allowed = desired.management_allowlist().await;
+            let restorations = desired.restorations().await;
             for (name, config) in &effective.network.interfaces {
-                if let Err(error) = interfaces
-                    .apply_interface(name, config, Some(config.role), allowed.contains(name))
-                    .await
-                {
+                let result = match restorations.get(name) {
+                    Some(snapshot) => interfaces.rollback_transaction_snapshot(snapshot).await,
+                    None => {
+                        interfaces
+                            .apply_interface(
+                                name,
+                                config,
+                                Some(config.role),
+                                allowed.contains(name),
+                            )
+                            .await
+                    }
+                };
+                if let Err(error) = result {
                     failures.insert(name.clone(), error.to_string());
                 }
             }
@@ -201,7 +223,7 @@ async fn a_global_convergence_failure_is_not_success_for_an_interface() {
 }
 
 #[tokio::test]
-async fn shutdown_preserves_cancelled_apply_without_a_prior_pending_query() {
+async fn shutdown_preserves_cancelled_apply_when_converger_cannot_restore_it() {
     for restore_baselines in [false, true] {
         let directory = tempdir().unwrap();
         let desired = desired_state(directory.path()).await;
@@ -236,11 +258,11 @@ async fn shutdown_preserves_cancelled_apply_without_a_prior_pending_query() {
         .unwrap();
         // Model a partially applied runtime change before cancellation.
         provider.interface.lock().await.is_up = true;
+        desired.fail_converger("injected failure prevents compensation");
         applying.abort();
         assert!(applying.await.unwrap_err().is_cancelled());
-        assert!(recovery_control::stopped(&manager.journal_path("test0")));
 
-        // No status request has imported the interrupted journal into pending.
+        // No prior status request is needed to make shutdown aware of recovery.
         let result = if restore_baselines {
             manager.restore_baselines().await
         } else {
@@ -249,7 +271,7 @@ async fn shutdown_preserves_cancelled_apply_without_a_prior_pending_query() {
         assert!(result.is_err(), "shutdown must report unresolved recovery");
         assert!(provider.interface.lock().await.is_up);
         assert!(manager.journal_path("test0").exists());
-        assert!(desired.is_tentative("test0").await);
+        assert!(desired.has_pending().await);
         let pending = manager.pending().await;
         assert_eq!(pending.len(), 1);
         assert!(!pending[0].can_commit());
@@ -594,7 +616,7 @@ async fn failed_commit_persistence_keeps_change_pending_for_rollback() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn timeout_waits_for_admitted_confirmation() {
+async fn admission_does_not_extend_confirmation_deadline() {
     let directory = tempdir().unwrap();
     let desired = desired_state(directory.path()).await;
     let manager = NetworkTransactionManager::new(
@@ -618,18 +640,16 @@ async fn timeout_waits_for_admitted_confirmation() {
         .await
         .unwrap();
 
-    // A confirmation already admitted must not be overtaken by the timer
-    // while it performs validation before acquiring the operation lock.
+    // Admission is not commit ownership. Only a commit that actually started
+    // under operation_lock before the deadline may finish after it.
     let admission = gate.admit().await;
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_millis(100)).await;
-    assert_eq!(manager.pending().await, vec![pending.clone()]);
-    assert!(desired.is_tentative("test0").await);
-    manager.commit(&pending.token).await.unwrap();
+    assert!(manager.commit(&pending.token).await.is_err());
     drop(admission);
     assert_eq!(
         desired.committed_interface("test0").await.unwrap(),
-        Some(interface_config(PROPOSED))
+        Some(interface_config(COMMITTED))
     );
 }
 

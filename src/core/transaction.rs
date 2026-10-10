@@ -88,11 +88,67 @@ struct Inner {
 #[derive(Clone)]
 struct PendingTransaction {
     info: PendingNetworkChange,
+    confirmation_deadline: Option<tokio::time::Instant>,
     target: InterfaceConfig,
     allow_management_change: bool,
     snapshot: InterfaceSnapshot,
     previous_config: Option<InterfaceConfig>,
     secret: Option<SecretSnapshot>,
+}
+
+/// Keep compensation owned across every await between the first proposal and
+/// the confirmation timer. The pending snapshot is registered before mutation.
+struct ApplyRecoveryGuard {
+    manager: NetworkTransactionManager,
+    token: String,
+    armed: bool,
+}
+
+impl Drop for ApplyRecoveryGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let manager = self.manager.clone();
+        let token = self.token.clone();
+        tokio::spawn(async move {
+            let _operation = manager.inner.operation_lock.lock().await;
+            let interface = manager
+                .inner
+                .pending
+                .lock()
+                .await
+                .get(&token)
+                .map(|pending| pending.info.interface.clone());
+            let Some(interface) = interface else {
+                return;
+            };
+            let path = manager.journal_path(&interface);
+            let prepared = async {
+                crate::core::recovery::check_rollback_scope(
+                    manager.desired().state_dir(),
+                    Some(&interface),
+                    &path,
+                )?;
+                recovery_control::compensate_cancelled_apply(&path).await
+            }
+            .await;
+            if let Err(error) = prepared {
+                tracing::error!(%token, %error, "cancelled apply requires explicit recovery");
+                if let Some(pending) = manager.inner.pending.lock().await.get_mut(&token) {
+                    pending.info.phase = NetworkChangePhase::RecoveryRequired;
+                    pending.info.last_error = Some(format!("{error:#}"));
+                }
+                return;
+            }
+            if let Err(error) = manager.rollback_locked(&token, false).await {
+                tracing::error!(%token, %error, "cancelled apply compensation failed");
+                if !recovery_control::stopped(&path) {
+                    manager.spawn_timer(token, false);
+                }
+            }
+        });
+    }
 }
 
 impl NetworkTransactionManager {
@@ -355,6 +411,33 @@ impl NetworkTransactionManager {
         let secret = credentials.snapshot.clone();
         self.write_journal_record(&token, snapshot.clone(), secret.clone())
             .await?;
+        // Expose rollback-only ownership before changing credentials or intent.
+        // Cancellation can no longer strand a journal outside pending status.
+        self.inner.pending.lock().await.insert(
+            token.clone(),
+            PendingTransaction {
+                info: PendingNetworkChange {
+                    recovery_progress: None,
+                    token: token.clone(),
+                    interface: interface.to_owned(),
+                    rollback_timeout_seconds: self.inner.rollback_timeout.as_secs(),
+                    expires_at_unix: 0,
+                    phase: NetworkChangePhase::RollbackRequired,
+                    last_error: None,
+                },
+                confirmation_deadline: None,
+                target: config.clone(),
+                allow_management_change,
+                snapshot: snapshot.clone(),
+                previous_config: previous_config.clone(),
+                secret: secret.clone(),
+            },
+        );
+        let mut cancellation = ApplyRecoveryGuard {
+            manager: self.clone(),
+            token: token.clone(),
+            armed: true,
+        };
         let (apply_guard, stage_error) =
             match recovery_control::begin_apply(&self.journal_path(interface)).await {
                 Ok(guard) => (Some(guard), None),
@@ -435,6 +518,7 @@ impl NetworkTransactionManager {
                     token.clone(),
                     PendingTransaction {
                         info,
+                        confirmation_deadline: None,
                         target: config.clone(),
                         allow_management_change,
                         snapshot: snapshot.clone(),
@@ -443,11 +527,14 @@ impl NetworkTransactionManager {
                     },
                 );
                 self.spawn_timer(token.clone(), false);
+                cancellation.armed = false;
                 bail!(
                     "network change failed to converge: {error}; rollback also failed: {rollback_error}; recovery remains pending as token {token}"
                 );
             }
             desired.withdraw(&token).await;
+            self.inner.pending.lock().await.remove(&token);
+            cancellation.armed = false;
             return Err(error);
         }
 
@@ -469,6 +556,9 @@ impl NetworkTransactionManager {
             info.token.clone(),
             PendingTransaction {
                 info: info.clone(),
+                confirmation_deadline: Some(
+                    tokio::time::Instant::now() + self.inner.rollback_timeout,
+                ),
                 target: config.clone(),
                 allow_management_change,
                 snapshot,
@@ -486,6 +576,7 @@ impl NetworkTransactionManager {
         );
 
         self.spawn_rollback_timer(info.token.clone());
+        cancellation.armed = false;
         Ok(info)
     }
 
@@ -572,6 +663,12 @@ impl NetworkTransactionManager {
             anyhow::ensure!(
                 pending.info.can_commit(),
                 "network change {token} failed during apply and is rollback-only"
+            );
+            anyhow::ensure!(
+                pending
+                    .confirmation_deadline
+                    .is_some_and(|deadline| tokio::time::Instant::now() < deadline),
+                "network change {token} confirmation deadline expired"
             );
             (
                 pending.info.interface.clone(),
@@ -695,13 +792,11 @@ impl NetworkTransactionManager {
             }
             return Ok(pending.info);
         }
-        if manual {
-            crate::core::recovery::check_rollback_scope(
-                self.desired().state_dir(),
-                Some(&pending.info.interface),
-                &path,
-            )?;
-        }
+        crate::core::recovery::check_rollback_scope(
+            self.desired().state_dir(),
+            Some(&pending.info.interface),
+            &path,
+        )?;
         let restoration = recovery_control::run(&path, manual, async {
             // Startup transaction blocks are retryable. Ownership blocks remain fenced.
             if crate::core::recovery::retryable_blocked_interfaces(self.desired().state_dir())
@@ -718,6 +813,9 @@ impl NetworkTransactionManager {
                 Some(gate) => Some(gate.execute().await),
                 None => None,
             };
+            // A different persistence operation may have fenced the network
+            // while compensation was waiting for exclusive runtime access.
+            crate::core::recovery::check_commit(desired.state_dir())?;
             let secret_restored = match &pending.secret {
                 Some(secret) => secret.restore(desired.state_dir(), &pending.info.interface),
                 None => Ok(()),
@@ -912,6 +1010,7 @@ impl NetworkTransactionManager {
             pending
                 .entry(record.token.clone())
                 .or_insert(PendingTransaction {
+                    confirmation_deadline: None,
                     info: PendingNetworkChange {
                         recovery_progress: None,
                         token: record.token,
@@ -1002,8 +1101,15 @@ impl NetworkTransactionManager {
             *epoch
         };
         tokio::spawn(async move {
-            let timeout = if confirmation {
-                manager.inner.rollback_timeout
+            let deadline = if confirmation {
+                let pending = manager.inner.pending.lock().await;
+                let Some(deadline) = pending
+                    .get(&token)
+                    .and_then(|entry| entry.confirmation_deadline)
+                else {
+                    return;
+                };
+                deadline
             } else {
                 let interface = manager
                     .inner
@@ -1012,11 +1118,12 @@ impl NetworkTransactionManager {
                     .await
                     .get(&token)
                     .map(|entry| entry.info.interface.clone());
-                interface.map_or(Duration::from_secs(1), |interface| {
-                    recovery_control::retry_delay(&manager.journal_path(&interface))
-                })
+                tokio::time::Instant::now()
+                    + interface.map_or(Duration::from_secs(1), |interface| {
+                        recovery_control::retry_delay(&manager.journal_path(&interface))
+                    })
             };
-            tokio::time::sleep(timeout).await;
+            tokio::time::sleep_until(deadline).await;
             loop {
                 if manager
                     .inner
@@ -1028,23 +1135,9 @@ impl NetworkTransactionManager {
                 {
                     return;
                 }
-                // Admission precedes operation_lock; execution must remain available
-                // to the converger. Release admission before the retry delay.
-                let gate = manager.runtime_gate();
-                let admission = match &gate {
-                    Some(gate) => Some(gate.admit().await),
-                    None => None,
-                };
-                if manager
-                    .inner
-                    .timer_epochs
-                    .lock()
-                    .expect("interface timer epoch lock")
-                    .get(&token)
-                    != Some(&epoch)
-                {
-                    return;
-                }
+                // Compensation is autonomous runtime work. It serializes on
+                // operation_lock and execution, but must not queue behind an
+                // unrelated request holding admission while awaiting convergence.
                 if crate::core::recovery::check_commit(manager.desired().state_dir()).is_err() {
                     return;
                 }
@@ -1061,7 +1154,6 @@ impl NetworkTransactionManager {
                         tracing::error!(%token, %error, "automatic network rollback failed; will retry");
                     }
                 }
-                drop(admission);
                 let interface = manager
                     .inner
                     .pending

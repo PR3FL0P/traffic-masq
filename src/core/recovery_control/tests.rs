@@ -10,6 +10,59 @@ async fn journal() -> (tempfile::TempDir, PathBuf) {
     (root, path)
 }
 
+/// Model a forward wall-clock correction by aging only the civil deadline.
+/// The live monotonic budget and attempt count remain unchanged. This avoids
+/// changing the host clock or adding a production clock-injection hook.
+#[tokio::test]
+async fn regression_wall_clock_jump_must_not_exhaust_live_monotonic_recovery_budget() {
+    let (_root, path) = journal().await;
+    run::<(), _>(&path, false, async {
+        Err(failure(FailureKind::Transient, "temporary netlink failure"))
+    })
+    .await
+    .unwrap_err();
+    let monotonic_deadline = deadlines().lock().unwrap()[&path];
+    assert!(monotonic_deadline > tokio::time::Instant::now() + Duration::from_secs(60));
+
+    let mut control = controls().lock().unwrap()[&path].clone();
+    assert_eq!(control.phase, Phase::Ready);
+    assert_eq!(control.attempts, 1);
+    control.deadline_unix = now().saturating_sub(1);
+    save(&path, &control).await.unwrap();
+
+    let mutations = AtomicUsize::new(0);
+    let result = run(&path, false, async {
+        mutations.fetch_add(1, Ordering::SeqCst);
+        crate::core::recovery::retire(&path).await
+    })
+    .await;
+    assert!(result.is_ok(), "wall time exhausted a still-live monotonic recovery budget before compensation could execute: {result:?}");
+    assert_eq!(mutations.load(Ordering::SeqCst), 1);
+    assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn cancelled_apply_handoff_cannot_clear_storage_or_recovery_failures() {
+    for kind in [FailureKind::Storage, FailureKind::Unknown] {
+        let (_root, path) = journal().await;
+        run::<(), _>(&path, false, async {
+            Err(failure(kind, "injected recovery failure"))
+        })
+        .await
+        .unwrap_err();
+        let before = tokio::fs::read(control_path(&path)).await.unwrap();
+        assert!(compensate_cancelled_apply(&path).await.is_err());
+        assert_eq!(tokio::fs::read(control_path(&path)).await.unwrap(), before);
+        assert_eq!(progress(&path).unwrap().attempts, 1);
+    }
+    let (_root, path) = journal().await;
+    stop(&path, FailureKind::Storage, "failed before first attempt")
+        .await
+        .unwrap();
+    assert!(compensate_cancelled_apply(&path).await.is_err());
+    assert!(stopped(&path));
+}
+
 #[test]
 fn classification_uses_types_instead_of_error_text() {
     assert_eq!(

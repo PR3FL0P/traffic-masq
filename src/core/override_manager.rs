@@ -26,15 +26,23 @@ use crate::state::overrides::{InterfaceOverride, RuntimeOverrideStore, RuntimeOv
 struct CommitPersistenceGuard<'a> {
     root: &'a std::path::Path,
     armed: bool,
+    settings_only: bool,
+}
+
+impl CommitPersistenceGuard<'_> {
+    fn fence(&self, reason: String) {
+        if self.settings_only {
+            crate::core::recovery::fence_settings(self.root, reason);
+        } else {
+            crate::core::recovery::fence_commit(self.root, reason);
+        }
+    }
 }
 
 impl Drop for CommitPersistenceGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            crate::core::recovery::fence_commit(
-                self.root,
-                "commit persistence was interrupted; durable outcome is unknown".into(),
-            );
+            self.fence("commit persistence was interrupted; durable outcome is unknown".into());
         }
     }
 }
@@ -227,19 +235,34 @@ impl RuntimeOverrideManager {
             .path()
             .parent()
             .expect("override state directory");
-        crate::core::recovery::check_commit(root)?;
+        crate::core::recovery::check_persistence(root)?;
         let mut candidate = candidate.normalized()?;
         validate_candidate(&candidate, &self.base)?;
         candidate.revision = state
             .revision
             .checked_add(1)
             .context("runtime override revision overflow")?;
-        let mut guard = CommitPersistenceGuard { root, armed: true };
+        // Compare the entire document with only the explicitly non-network
+        // fields restored. New schema fields therefore default to full fencing.
+        let mut network_candidate = candidate.clone();
+        network_candidate.revision = state.revision;
+        network_candidate.api = state.api.clone();
+        network_candidate.security = state.security.clone();
+        let settings_only = network_candidate == *state
+            && (candidate.api != state.api || candidate.security != state.security);
+        let mut guard = CommitPersistenceGuard {
+            root,
+            armed: true,
+            settings_only,
+        };
         let persisted = self.store.save(&candidate).await;
         guard.armed = false; // A returned result is known; errors below carry their own proof.
         if let Err(error) = persisted {
             if crate::atomic_file::is_indeterminate_write(&error) {
-                crate::core::recovery::fence_commit(root, format!("{error:#}"));
+                guard.fence(format!("{error:#}"));
+                if settings_only {
+                    return Err(error.context("settings_commit_indeterminate: configuration writes are blocked until restart; network recovery remains available"));
+                }
                 return Err(error.context("commit_indeterminate: repair storage access and restart the daemon; confirmation and rollback are blocked"));
             }
             return Err(error);

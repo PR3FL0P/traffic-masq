@@ -122,6 +122,7 @@ pub struct RollbackFailure {
 #[derive(Debug, Clone)]
 struct PendingTransaction {
     token: String,
+    confirmation_deadline: Option<tokio::time::Instant>,
     candidate: RouterCandidate,
     snapshot: RouterSnapshot,
 }
@@ -288,6 +289,7 @@ impl RouterTransactionCoordinator {
         // Cancellation must leave an inspectable token and original snapshot.
         *state = CoordinatorState::Pending(PendingTransaction {
             token: token.clone(),
+            confirmation_deadline: None,
             candidate: plan.candidate.clone(),
             snapshot: current_snapshot.clone(),
         });
@@ -351,6 +353,7 @@ impl RouterTransactionCoordinator {
 
         *state = CoordinatorState::Pending(PendingTransaction {
             token: token.clone(),
+            confirmation_deadline: Some(tokio::time::Instant::now() + self.inner.rollback_timeout),
             candidate: plan.candidate,
             snapshot: current_snapshot,
         });
@@ -569,6 +572,12 @@ impl RouterTransactionCoordinator {
         anyhow::ensure!(
             pending.token == token,
             "router transaction token does not match pending transaction"
+        );
+        anyhow::ensure!(
+            pending
+                .confirmation_deadline
+                .is_some_and(|deadline| tokio::time::Instant::now() < deadline),
+            "router transaction confirmation deadline expired"
         );
         let revision = self
             .inner
@@ -937,7 +946,7 @@ impl RouterTransactionCoordinator {
             .expect("router timeout mutation-gate lock poisoned")
             .clone();
         let _network_mutation = match &gate {
-            Some(gate) => Some(gate.write().await),
+            Some(gate) => Some(gate.execute().await),
             None => None,
         };
         let mut state = self.inner.state.lock().await;
@@ -982,8 +991,9 @@ impl RouterTransactionCoordinator {
         } else {
             recovery_control::retry_delay(&self.inner.journal)
         };
+        let deadline = tokio::time::Instant::now() + timeout;
         tokio::spawn(async move {
-            tokio::time::sleep(timeout).await;
+            tokio::time::sleep_until(deadline).await;
             while coordinator.inner.timer_epoch.load(Ordering::SeqCst) == epoch
                 && coordinator
                     .rollback_timeout_fired_for_epoch(&token, Some(epoch))

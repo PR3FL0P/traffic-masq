@@ -16,6 +16,31 @@ fn base_config() -> AppConfig {
     AppConfig::default()
 }
 
+#[tokio::test]
+async fn settings_write_with_changed_commit_proof_still_fences_network_recovery() {
+    let directory = tempdir().unwrap();
+    let base = base_config();
+    let manager = RuntimeOverrideManager::load(directory.path(), &base)
+        .await
+        .unwrap();
+    manager
+        .save_committed(RuntimeOverrides::default())
+        .await
+        .unwrap();
+    let before = manager.snapshot().await;
+    let mut candidate = before.clone();
+    candidate.security = Some(base.security);
+    candidate
+        .committed_interface_transactions
+        .insert("lan0".into(), "new-proof".into());
+    crate::atomic_file::fail_replacement_and_compensation(manager.path());
+    let error = manager.save_committed(candidate).await.unwrap_err();
+    assert!(crate::atomic_file::is_indeterminate_write(&error));
+    assert!(crate::core::recovery::check_commit(directory.path()).is_err());
+    assert!(crate::core::recovery::check_persistence(directory.path()).is_err());
+    assert_eq!(manager.snapshot().await, before);
+}
+
 /// The converger has no timer any more, so a change that does not announce
 /// itself is a change that never gets applied.
 

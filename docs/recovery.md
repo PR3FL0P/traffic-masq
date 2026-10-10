@@ -483,6 +483,13 @@ change; an uncommitted journal is rolled back. Unreadable or invalid proof conti
 to block the affected recovery scope. A failed commit response in this state does
 not establish whether the configuration was committed.
 
+An uncertain API/security-only write reports `settings_commit_indeterminate`
+when both possible documents have exactly the same network intent and transaction
+tokens. All further configuration writes remain blocked until restart reloads
+the document, but network convergence and rollback remain available. This
+exception does not apply to writes that change network intent, commit tokens,
+or any other persisted field apart from API/security settings and the revision.
+
 ## Bounded automatic recovery
 
 Interface and router recovery share a bounded cycle: at most **three attempts**,
@@ -493,8 +500,21 @@ confirmation window. Background retries consume the same persisted cycle.
 A new daemon startup rechecks interface snapshots in a new bounded recovery
 session, including previously stopped attempts; it validates the journal and
 ownership again before changing resources. Router recovery retains its explicit
-retry policy. A monotonic deadline prevents wall-clock changes from extending a
-running cycle.
+retry policy. Live recovery budgets use only monotonic time, so clock corrections
+cannot extend or prematurely stop a cycle. Wall time reconstructs the remaining
+budget when loading recovery records after restart.
+
+Confirmation is checked when commit acquires transaction ownership; waiting in
+the request admission queue does not extend the confirmation window. A commit
+already persisting before expiry is allowed to finish. Automatic rollback does
+not wait for request admission, but still serializes with transaction ownership
+and exclusive runtime writes.
+
+An interrupted interface apply retains a rollback-only pending token before its
+first runtime mutation. Its in-process owner transfers compensation to a
+background task, including cancellation during confirmation bookkeeping. That
+handoff cannot renew a recovery attempt or clear a storage/conflict stop. If the
+process exits, the original journal remains the startup recovery authority.
 
 Failures are classified by error types and kernel error codes, not message text:
 
