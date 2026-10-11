@@ -179,6 +179,10 @@ impl VpnPolicyResourceObservation {
         self.conflicts.is_empty()
     }
 
+    pub fn conflict_diagnostics(&self) -> String {
+        format!("{:?}. Inspect `ip -4 rule show` and `ip -4 -details route show table all`; reconfigure the service using the conflicting table, rule priority or mark before retrying. Kernel routing objects do not identify their creating PID. traffic-masq will not delete foreign rules or routes", self.conflicts)
+    }
+
     pub fn is_fully_present(&self) -> bool {
         self.missing_rules.is_empty()
             && self.missing_routes.is_empty()

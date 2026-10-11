@@ -370,7 +370,7 @@ where
         }
         anyhow::ensure!(
             current.integrity == OwnedFirewallIntegrity::Intact,
-            "cannot retire firewall permissions: owned structure is drifted"
+            "cannot retire firewall permissions: owned structure is drifted; inspect `sudo nft list table inet traffic_masq` and the recorded ownership metadata; reconfigure the competing firewall writer manually; rule drift alone does not identify its author"
         );
         let batch = render_nftables_batch(current.desired.is_some(), retained.as_ref())?;
         self.executor
@@ -502,15 +502,16 @@ fn parse_owned_nftables_state(output: &[u8]) -> Result<OwnedFirewallObservation>
         let comment = table
             .get("comment")
             .and_then(Value::as_str)
-            .context("owned nftables table has no traffic-masq metadata comment")?;
-        let (encoded, chunked_metadata) =
-            if let Some(legacy) = comment.strip_prefix(NFT_LEGACY_COMMENT_PREFIX) {
-                (legacy.to_string(), false)
-            } else if comment == NFT_TABLE_COMMENT {
-                (collect_metadata_chunks(entries)?, true)
-            } else {
-                bail!("owned nftables table has unsupported metadata");
-            };
+            .context("owned nftables table has no traffic-masq metadata comment; inspect `sudo nft list table inet traffic_masq` and identify/reconfigure the table owner manually before retrying")?;
+        let (encoded, chunked_metadata) = if let Some(legacy) =
+            comment.strip_prefix(NFT_LEGACY_COMMENT_PREFIX)
+        {
+            (legacy.to_string(), false)
+        } else if comment == NFT_TABLE_COMMENT {
+            (collect_metadata_chunks(entries)?, true)
+        } else {
+            bail!("owned nftables table has unsupported metadata; inspect `sudo nft list table inet traffic_masq`; verify the table owner and reconfigure its service manually before retrying; traffic-masq will not overwrite an unverified table");
+        };
         let desired: RouterDataplaneDesired = serde_json::from_slice(&hex_decode(&encoded)?)
             .context("owned nftables metadata is invalid")?;
         desired

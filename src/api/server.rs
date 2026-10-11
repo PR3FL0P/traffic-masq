@@ -1802,8 +1802,14 @@ fn bind_tls_listener(
     })?;
     let tls_acceptor = load_tls_acceptor(certificate_path, private_key_path)?;
 
-    let listener = StdTcpListener::bind(tcp.listen)
-        .with_context(|| format!("failed to bind HTTPS listener on {}", tcp.listen))?;
+    let listener = StdTcpListener::bind(tcp.listen).map_err(|error| {
+        let advice = match error.kind() {
+            std::io::ErrorKind::AddrInUse => traffic_masq_host_observation::tcp_bind_conflict_diagnostics(tcp.listen),
+            std::io::ErrorKind::PermissionDenied => "Check the daemon's service user and permission to bind this port; permission denial does not prove another service owns it.".into(),
+            _ => "Check that the configured listen address exists in the daemon's network namespace.".into(),
+        };
+        anyhow::Error::new(error).context(format!("failed to bind HTTPS listener on {}: {advice}", tcp.listen))
+    })?;
     listener
         .set_nonblocking(true)
         .context("failed to make the HTTPS listener nonblocking")?;
@@ -2082,7 +2088,7 @@ fn prepare_socket_path(path: &Path) -> Result<()> {
     let expected = SocketIdentity::from_metadata(&metadata);
 
     match StdUnixStream::connect(path) {
-        Ok(_) => bail!("HTTP API socket {} is already in use", path.display()),
+        Ok(_) => bail!("HTTP API socket {} is already in use. Inspect `sudo ss -xlpn` for this exact path and `ps -p <confirmed-pid> -o pid,ppid,comm,args`; stop or reconfigure its verified owner manually, or choose another runtime.socket_path. traffic-masq will not replace the active socket.", path.display()),
         Err(error) if error.raw_os_error() == Some(Errno::ECONNREFUSED as i32) => {}
         Err(error) => {
             return Err(error).with_context(|| {

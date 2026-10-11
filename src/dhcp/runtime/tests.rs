@@ -59,3 +59,34 @@ fn default_runtime_config_uses_dhcp_ports() {
     assert_eq!(config.response_address, Ipv4Addr::BROADCAST);
     assert!(config.interface.is_none());
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn occupied_udp_port_reports_its_owner_without_stopping_it() {
+    let listener = StdUdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let config = DhcpRuntimeConfig {
+        bind_address: Ipv4Addr::LOCALHOST,
+        server_port: listener.local_addr().unwrap().port(),
+        ..DhcpRuntimeConfig::default()
+    };
+    let error = create_dhcp_socket(&config).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains(&format!("PID {}", std::process::id())));
+    assert!(message.contains("sudo ss -lunp"));
+    assert!(message.contains("will not stop another service"));
+    assert!(error.chain().any(|cause| cause
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse)));
+    assert!(listener.local_addr().is_ok());
+}
+
+#[test]
+fn bind_permission_and_address_failures_do_not_claim_a_foreign_listener() {
+    let config = DhcpRuntimeConfig::default();
+    let permission = super::dhcp_bind_advice(&config, Some(nix::libc::EACCES));
+    assert!(permission.contains("permission denial does not prove"));
+    assert!(!permission.contains("systemctl stop"));
+    let address = super::dhcp_bind_advice(&config, Some(nix::libc::EADDRNOTAVAIL));
+    assert!(address.contains("network namespace"));
+    assert!(!address.contains("listener candidates"));
+}

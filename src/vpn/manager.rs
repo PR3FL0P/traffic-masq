@@ -48,7 +48,7 @@ pub enum ManagerError {
 
     #[error(
         "cannot activate: interface '{0}' already exists and is not owned by this daemon \
-         (refusing to touch a possibly-foreign interface)"
+         (refusing to touch a possibly-foreign interface); inspect `ip -details link show dev {0}` and `sudo wg show {0}`; identify and reconfigure its owning service manually before retrying; traffic-masq will not delete or take over the interface"
     )]
     ForeignInterfaceConflict(String),
 
@@ -64,7 +64,7 @@ pub enum ManagerError {
     #[error(
         "refusing to modify interface '{0}': it no longer matches the recorded ownership proof \
          (observed value differs from what this daemon created it with, or the interface is \
-         missing) — treating it as foreign"
+         missing) — treating it as foreign; inspect `ip -details link show dev {0}` and `sudo wg show {0}` and reconcile the owning service/configuration manually"
     )]
     OwnershipProofFailed(String),
 

@@ -287,7 +287,7 @@ fn startup_attempt_lock_serializes_start_commands() {
 
     let first = acquire_startup_attempt(&config).expect("first startup attempt");
     let second = acquire_startup_attempt(&config).expect_err("second attempt must be rejected");
-    assert!(format!("{second:#}").contains("another traffic-masqd start attempt"));
+    assert!(format!("{second:#}").contains("another startup operation holds the lock"));
     drop(first);
     acquire_startup_attempt(&config).expect("lock released after first attempt");
 }

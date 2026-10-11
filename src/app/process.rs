@@ -34,8 +34,8 @@ impl ProcessGuard {
             .with_context(|| format!("failed to open process lock {}", lock_path.display()))?;
         lock.try_lock_exclusive().with_context(|| {
             format!(
-                "another traffic-masqd instance already owns {}",
-                lock_path.display()
+                "failed to acquire exclusive daemon lock: {}",
+                traffic_masq_host_observation::file_lock_diagnostics(&lock, &lock_path)
             )
         })?;
 

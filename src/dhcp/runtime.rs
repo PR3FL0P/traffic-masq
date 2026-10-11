@@ -143,11 +143,31 @@ impl DhcpRuntime {
     }
 }
 
+fn dhcp_bind_advice(config: &DhcpRuntimeConfig, errno: Option<i32>) -> String {
+    match errno {
+        Some(code) if code == nix::libc::EADDRINUSE => traffic_masq_host_observation::udp_bind_conflict_diagnostics(config.bind_address, config.server_port),
+        Some(code) if code == nix::libc::EACCES || code == nix::libc::EPERM => "Check the daemon's service user, bind-port privileges and security policy; permission denial does not prove another service owns the port.".into(),
+        Some(code) if code == nix::libc::EADDRNOTAVAIL => "Check that the configured bind address exists in the daemon's network namespace.".into(),
+        _ => "Inspect the underlying bind error; no foreign owner has been established.".into(),
+    }
+}
+
 /// Bind a reusable, broadcast-capable nonblocking IPv4 UDP socket. Requires a
 /// Tokio runtime and permission to bind the configured port; I/O errors propagate.
 /// The interface field is not used to bind this socket to a device; this helper
 /// is separate from the shared Linux per-interface packet-info runtime.
 pub fn create_dhcp_socket(config: &DhcpRuntimeConfig) -> Result<UdpSocket> {
+    if let Some(diagnostics) = traffic_masq_host_observation::foreign_ipv4_udp_listener_diagnostics(
+        config.bind_address,
+        config.server_port,
+    ) {
+        anyhow::bail!(
+            "refusing to bind DHCP socket to {}:{}: {}",
+            config.bind_address,
+            config.server_port,
+            diagnostics
+        );
+    }
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
         .context("failed to create DHCP UDP socket")?;
     socket
@@ -157,11 +177,12 @@ pub fn create_dhcp_socket(config: &DhcpRuntimeConfig) -> Result<UdpSocket> {
         .set_broadcast(true)
         .context("failed to set SO_BROADCAST")?;
     let address = SockAddr::from(SocketAddrV4::new(config.bind_address, config.server_port));
-    socket.bind(&address).with_context(|| {
-        format!(
-            "failed to bind DHCP socket to {}:{}",
+    socket.bind(&address).map_err(|error| {
+        let advice = dhcp_bind_advice(config, error.raw_os_error());
+        anyhow::Error::new(error).context(format!(
+            "failed to bind DHCP socket to {}:{}; {advice}",
             config.bind_address, config.server_port
-        )
+        ))
     })?;
     socket
         .set_nonblocking(true)
@@ -248,6 +269,19 @@ pub(crate) struct SharedDhcpRuntime {
 #[cfg(target_os = "linux")]
 impl SharedDhcpRuntime {
     pub fn bind(config: DhcpRuntimeConfig, services: SharedDhcpServices) -> Result<Self> {
+        if let Some(diagnostics) =
+            traffic_masq_host_observation::foreign_ipv4_udp_listener_diagnostics(
+                config.bind_address,
+                config.server_port,
+            )
+        {
+            anyhow::bail!(
+                "refusing to bind DHCP socket to {}:{}: {}",
+                config.bind_address,
+                config.server_port,
+                diagnostics
+            );
+        }
         let fd = socket(
             AddressFamily::Inet,
             SockType::Datagram,
@@ -259,11 +293,12 @@ impl SharedDhcpRuntime {
         setsockopt(&fd, sockopt::Broadcast, &true).context("failed to set SO_BROADCAST")?;
         setsockopt(&fd, sockopt::Ipv4PacketInfo, &true).context("failed to set IP_PKTINFO")?;
         let address = SockaddrIn::from(SocketAddrV4::new(config.bind_address, config.server_port));
-        bind(fd.as_raw_fd(), &address).with_context(|| {
-            format!(
-                "failed to bind shared DHCP socket to {}:{}",
+        bind(fd.as_raw_fd(), &address).map_err(|error| {
+            let advice = dhcp_bind_advice(&config, Some(error as i32));
+            anyhow::Error::new(error).context(format!(
+                "failed to bind shared DHCP socket to {}:{}; {advice}",
                 config.bind_address, config.server_port
-            )
+            ))
         })?;
         Ok(Self {
             socket: AsyncFd::new(fd).context("failed to register shared DHCP socket")?,

@@ -83,7 +83,10 @@ pub fn acquire_startup_attempt(config: &AppConfig) -> Result<StartupAttemptGuard
         })?;
     lock.try_lock_exclusive().map_err(|error| {
         if error.kind() == std::io::ErrorKind::WouldBlock {
-            anyhow::anyhow!("another traffic-masqd start attempt is already in progress")
+            anyhow::Error::new(error).context(format!(
+                "another startup operation holds the lock: {}",
+                traffic_masq_host_observation::file_lock_diagnostics(&lock, &lock_path)
+            ))
         } else {
             anyhow::Error::new(error).context(format!(
                 "failed to lock startup-attempt file {}",

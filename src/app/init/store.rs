@@ -53,9 +53,13 @@ impl ServiceStore {
             .read(true)
             .write(true)
             .mode(0o600)
-            .open(path)?;
-        file.try_lock_exclusive()
-            .context("another traffic-masq service administration operation is in progress")?;
+            .open(&path)?;
+        file.try_lock_exclusive().with_context(|| {
+            format!(
+                "failed to acquire service administration lock: {}",
+                traffic_masq_host_observation::file_lock_diagnostics(&file, &path)
+            )
+        })?;
         Ok(ServiceMutationGuard { lock: file })
     }
     pub fn ensure_unchanged(&self, expected: Option<&Registration>) -> Result<()> {
@@ -113,7 +117,7 @@ impl ServiceStore {
                     });
                     if !owned {
                         bail!(
-                            "refusing to replace unowned or edited service file {}",
+                            "refusing to replace unowned or edited service file {}; compare it with the persisted service receipt and restore its verified contents or choose a different installation; traffic-masq will not overwrite an unverified service file",
                             path.display()
                         );
                     }
@@ -129,7 +133,7 @@ impl ServiceStore {
                     if previous.and_then(Registration::runit_link).as_ref() == Some(&link)
                         && fs::read_link(&path).ok().as_deref() == Some(Path::new(RUNIT_DIR)) => {}
                 Ok(_) => bail!(
-                    "refusing to replace unowned runit activation path {}",
+                    "refusing to replace unowned runit activation path {}; inspect its symlink target and owning service manually before retrying",
                     path.display()
                 ),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),

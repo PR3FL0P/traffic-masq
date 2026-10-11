@@ -9,7 +9,7 @@ use crate::config::{OwnedIpv4RouteConfig, RouterConfig};
 use crate::netlink::{Ipv4RouteInfo, Ipv4RouteSpec, NetworkProvider, TRAFFIC_MASQ_ROUTE_PROTOCOL};
 
 #[derive(Debug, thiserror::Error)]
-#[error("blocked/degraded dataplane: destination prefix {destination} in table {table} collides with existing route owned by {owner} with identical metric {metric}; invariant=preserve_foreign_route; operation=plan_route; metadata_safe_to_remove=false")]
+#[error("blocked/degraded dataplane: destination prefix {destination} in table {table} collides with existing route owned by {owner} with identical metric {metric}; invariant=preserve_foreign_route; operation=plan_route; metadata_safe_to_remove=false; inspect `ip -4 -details route show table {table}`; use an unused metric for the requested route or reconfigure the service that installed the existing route; ownership tags do not identify a PID; traffic-masq will not replace the foreign route")]
 pub struct ForeignRouteConflict {
     pub destination: ipnet::Ipv4Net,
     pub table: u32,

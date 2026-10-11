@@ -156,8 +156,8 @@ impl<D: VpnDriver, E: NftExecutor> VpnPolicyManager<D, E> {
         if !observation.is_conflict_free() {
             bail!(
                 "refusing to observe VPN policy state: foreign objects occupy the reserved \
-                 namespace: {:?}",
-                observation.conflicts
+                 namespace: {}",
+                observation.conflict_diagnostics()
             );
         }
         let firewall = self
@@ -185,8 +185,8 @@ impl<D: VpnDriver, E: NftExecutor> VpnPolicyManager<D, E> {
         let observation = self.conflicts.observe(&expected).await?;
         if !observation.is_conflict_free() {
             bail!(
-                "VPN policy reserved namespace contains foreign state: {:?}",
-                observation.conflicts
+                "VPN policy reserved namespace contains foreign state: {}",
+                observation.conflict_diagnostics()
             );
         }
         if !observation.is_fully_present() {
@@ -243,8 +243,8 @@ impl<D: VpnDriver, E: NftExecutor> VpnPolicyManager<D, E> {
         if !observation.is_conflict_free() {
             bail!(
                 "refusing to activate VPN policy: foreign objects occupy the reserved \
-                 namespace: {:?}",
-                observation.conflicts
+                 namespace: {}",
+                observation.conflict_diagnostics()
             );
         }
 

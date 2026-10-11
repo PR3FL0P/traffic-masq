@@ -1129,7 +1129,7 @@ where
             Ok(())
         } else {
             bail!(
-                "router dataplane drifted from desired state: {:?}",
+                "router dataplane drifted from desired state: {:?}; inspect `sysctl net.ipv4.ip_forward` and `sudo nft list ruleset`; another service or a manual change may have modified forwarding/firewall state, but these kernel values do not identify the author; reconfigure competing firewall/forwarding policy manually",
                 health.drift
             )
         }

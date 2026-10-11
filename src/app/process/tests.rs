@@ -28,7 +28,13 @@ fn prevents_second_owner_and_cleans_only_pid_file() {
     let first = ProcessGuard::acquire(&pid_path).expect("first owner");
     assert!(pid_path.exists());
     assert!(lock_path.exists());
-    assert!(ProcessGuard::acquire(&pid_path).is_err());
+    let error = ProcessGuard::acquire(&pid_path)
+        .err()
+        .expect("lock conflict");
+    let message = format!("{error:#}");
+    assert!(message.contains(&format!("kernel lock holder PID {}", std::process::id())));
+    assert!(message.contains("Do not delete the lock file"));
+    assert!(error.downcast_ref::<std::io::Error>().is_some());
 
     drop(first);
     assert!(!pid_path.exists());
