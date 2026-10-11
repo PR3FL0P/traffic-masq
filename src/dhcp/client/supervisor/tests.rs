@@ -170,7 +170,8 @@ impl DhcpClientLauncher for FakeLauncher {
     async fn launch(&self, launch: DhcpClientLaunch) -> Result<RunningDhcpClient> {
         if self.fail_next.load(Ordering::SeqCst) > 0 {
             self.fail_next.fetch_sub(1, Ordering::SeqCst);
-            anyhow::bail!("injected launch failure");
+            return Err(anyhow::anyhow!("injected launch failure")
+                .context("failed to create DHCP packet socket"));
         }
         self.launches.lock().unwrap().push(launch.interface.clone());
         self.hostnames.lock().unwrap().push(launch.hostname.clone());
@@ -356,7 +357,11 @@ async fn launch_failure_degrades_and_retries_under_bounded_backoff() {
 
     assert_eq!(launcher.launch_count(), 0);
     let status = supervisor.status("wan0").await.expect("status");
-    assert!(matches!(status.state, DhcpClientRunState::Degraded { .. }));
+    let DhcpClientRunState::Degraded { reason } = status.state else {
+        panic!("expected degraded client");
+    };
+    assert!(reason.contains("failed to create DHCP packet socket"));
+    assert!(reason.contains("injected launch failure"));
 
     assert!(!supervisor.ensure_alive().await.expect("ensure alive"));
     assert_eq!(launcher.launch_count(), 0);

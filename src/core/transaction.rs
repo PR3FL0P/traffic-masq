@@ -139,7 +139,7 @@ impl Drop for ApplyRecoveryGuard {
             }
             .await;
             if let Err(error) = prepared {
-                tracing::error!(%token, %error, "cancelled apply requires explicit recovery");
+                tracing::error!(%token, error = %format!("{error:#}"), "cancelled apply requires explicit recovery");
                 if let Some(pending) = manager.inner.pending.lock().await.get_mut(&token) {
                     pending.info.phase = NetworkChangePhase::RecoveryRequired;
                     pending.info.last_error = Some(format!("{error:#}"));
@@ -147,7 +147,7 @@ impl Drop for ApplyRecoveryGuard {
                 return;
             }
             if let Err(error) = manager.rollback_locked(&token, false).await {
-                tracing::error!(%token, %error, "cancelled apply compensation failed");
+                tracing::error!(%token, error = %format!("{error:#}"), "cancelled apply compensation failed");
                 if !recovery_control::stopped(&path) {
                     manager.spawn_timer(token, false);
                 }
@@ -780,7 +780,7 @@ impl NetworkTransactionManager {
                 &interface,
                 format!("committed journal cleanup pending: {error:#}"),
             );
-            tracing::warn!(%error, "failed to remove committed interface journal");
+            tracing::warn!(error = %format!("{error:#}"), "failed to remove committed interface journal");
         }
         tracing::info!(
             interface = %interface,
@@ -968,7 +968,7 @@ impl NetworkTransactionManager {
             // later retry only needs to verify convergence; reporting success
             // here would falsely claim the runtime had been restored.
             bail!(
-                "failed to complete rollback for interface {}: {error}",
+                "failed to complete rollback for interface {}: {error:#}",
                 pending.info.interface
             );
         }
@@ -997,7 +997,7 @@ impl NetworkTransactionManager {
         let mut errors = Vec::new();
         for token in tokens {
             if let Err(error) = self.rollback_inner(&token, false).await {
-                errors.push(format!("{token}: {error}"));
+                errors.push(format!("{token}: {error:#}"));
             }
         }
         anyhow::ensure!(
@@ -1026,7 +1026,7 @@ impl NetworkTransactionManager {
         baselines.sort_by(|left, right| left.name.cmp(&right.name));
         let mut errors: Vec<String> = rollback_error
             .into_iter()
-            .map(|error| error.to_string())
+            .map(|error| format!("{error:#}"))
             .collect();
         for snapshot in baselines.into_iter().rev() {
             if crate::core::recovery::check_scope(self.desired().state_dir(), Some(&snapshot.name))
@@ -1046,7 +1046,7 @@ impl NetworkTransactionManager {
                 continue;
             }
             if let Err(error) = self.inner.interface_manager.rollback(&snapshot).await {
-                errors.push(format!("{}: {error}", snapshot.name));
+                errors.push(format!("{}: {error:#}", snapshot.name));
             }
         }
         if errors.is_empty() {
@@ -1140,7 +1140,7 @@ impl NetworkTransactionManager {
     pub async fn pending(&self) -> Vec<PendingNetworkChange> {
         // Read failures remain fenced; listing must not mutate the network.
         if let Err(error) = self.import_stopped_journals().await {
-            tracing::error!(%error, "failed to expose stopped interface recovery");
+            tracing::error!(error = %format!("{error:#}"), "failed to expose stopped interface recovery");
         }
         let mut pending: Vec<_> = self
             .inner
@@ -1255,7 +1255,7 @@ impl NetworkTransactionManager {
                     }
                     Ok(None) => return,
                     Err(error) => {
-                        tracing::error!(%token, %error, "automatic network rollback failed; will retry");
+                        tracing::error!(%token, error = %format!("{error:#}"), "automatic network rollback failed; will retry");
                     }
                 }
                 let interface = manager

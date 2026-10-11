@@ -1695,3 +1695,15 @@ async fn ephemeral_scan_cleans_up_when_start_identity_is_unavailable() {
             .is_none()
     );
 }
+
+#[test]
+fn configuration_error_preserves_underlying_failure() {
+    let error = ClientSupervisorError::Configuration(
+        anyhow::anyhow!("Permission denied (os error 13)")
+            .context("failed to inspect control socket"),
+    );
+    assert_eq!(
+        error.to_string(),
+        "failed to inspect control socket: Permission denied (os error 13)"
+    );
+}

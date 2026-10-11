@@ -424,7 +424,7 @@ impl DhcpSupervisor {
         let runtime = SharedDhcpRuntime::bind(runtime_config(), services.clone())?;
         let task = tokio::spawn(async move {
             if let Err(error) = runtime.run().await {
-                tracing::error!(%error, "shared DHCP runtime stopped with an error");
+                tracing::error!(error = %format!("{error:#}"), "shared DHCP runtime stopped with an error");
             }
         });
         Ok(RuntimeTask { services, task })

@@ -1210,10 +1210,14 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
         }
         request.execute().await.with_context(|| {
             format!(
-                "RTM_NEWROUTE while adding {}/{} in table {}",
+                "RTM_NEWROUTE while adding {}/{} in table {} (gateway={:?}, ifindex={:?}, metric={:?}, protocol={})",
                 route.destination.network(),
                 route.destination.prefix_len(),
-                route.table
+                route.table,
+                route.gateway,
+                route.output_interface_index,
+                route.metric,
+                route.protocol
             )
         })?;
         Ok(())

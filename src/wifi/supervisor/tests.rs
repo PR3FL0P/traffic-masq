@@ -1796,3 +1796,29 @@ fn compact_diagnostic_summary_preserves_a_permanent_cause_in_the_middle() {
     assert!(hostapd_failure_text_should_suspend_retry(&summary));
     assert_eq!(summary.split(" | ").count(), 8);
 }
+
+#[test]
+fn configuration_error_preserves_underlying_failure() {
+    let error = SupervisorError::Configuration(
+        anyhow::anyhow!("Permission denied (os error 13)")
+            .context("failed to inspect control socket"),
+    );
+    assert_eq!(
+        error.to_string(),
+        "failed to inspect control socket: Permission denied (os error 13)"
+    );
+}
+
+#[test]
+fn binary_preflight_error_preserves_underlying_failure() {
+    let error = SupervisorError::BinaryPreflight(
+        crate::wifi::lifecycle::BinaryPreflightError::ProbeFailed {
+            binary: PathBuf::from("/usr/sbin/hostapd"),
+            source: anyhow::anyhow!("Permission denied (os error 13)")
+                .context("failed to start /usr/sbin/hostapd"),
+        },
+    );
+    let message = error.to_string();
+    assert!(message.contains("failed to start /usr/sbin/hostapd"));
+    assert!(message.contains("Permission denied (os error 13)"));
+}

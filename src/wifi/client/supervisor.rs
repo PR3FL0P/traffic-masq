@@ -80,7 +80,7 @@ pub enum ClientSupervisorError {
     #[error(transparent)]
     Ctrl(#[from] CtrlError),
 
-    #[error(transparent)]
+    #[error("{0:#}")]
     Configuration(#[from] anyhow::Error),
 }
 

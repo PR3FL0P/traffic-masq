@@ -117,7 +117,7 @@ impl DhcpRuntime {
             Ok(response) => response,
             Err(error) => {
                 self.handler = before;
-                tracing::warn!(%source, %error, "failed to handle DHCP packet");
+                tracing::warn!(%source, error = %format!("{error:#}"), "failed to handle DHCP packet");
                 return Ok(());
             }
         };
@@ -129,7 +129,7 @@ impl DhcpRuntime {
         if let Some(store) = &self.lease_store {
             if let Err(error) = store.save(&self.handler.lease_snapshot()).await {
                 self.handler = before;
-                tracing::warn!(%source, %error, "failed to persist DHCP leases; response suppressed and lease state rolled back");
+                tracing::warn!(%source, error = %format!("{error:#}"), "failed to persist DHCP leases; response suppressed and lease state rolled back");
                 return Ok(());
             }
         }
@@ -327,7 +327,7 @@ impl SharedDhcpRuntime {
         let response = match service.handle_and_persist(packet).await {
             Ok(response) => response,
             Err(error) => {
-                tracing::warn!(ifindex, %error, "failed to commit DHCP packet transaction; response suppressed");
+                tracing::warn!(ifindex, error = %format!("{error:#}"), "failed to commit DHCP packet transaction; response suppressed");
                 return;
             }
         };
@@ -335,7 +335,7 @@ impl SharedDhcpRuntime {
         if let Some(response) = response {
             let server_ip = service.server_ip;
             if let Err(error) = self.send(ifindex, server_ip, &response).await {
-                tracing::warn!(ifindex, %error, "failed to send DHCP response");
+                tracing::warn!(ifindex, error = %format!("{error:#}"), "failed to send DHCP response");
             }
         }
     }

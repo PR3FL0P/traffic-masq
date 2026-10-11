@@ -716,11 +716,11 @@ impl RouterManager {
     pub async fn health(&self, desired: &RouterDesired) -> RouterHealthReport {
         RouterHealthReport {
             interfaces: if let Err(error) = self.subsystems.health_interfaces(desired).await {
-                Some(error.to_string())
+                Some(format!("{error:#}"))
             } else if let Err(error) = self.subsystems.health_uplink_wifi(desired).await {
-                Some(format!("uplink Wi-Fi: {error}"))
+                Some(format!("uplink Wi-Fi: {error:#}"))
             } else if let Err(error) = self.subsystems.health_output_wifi(desired).await {
-                Some(format!("output Wi-Fi: {error}"))
+                Some(format!("output Wi-Fi: {error:#}"))
             } else {
                 None
             },
@@ -729,20 +729,20 @@ impl RouterManager {
                 .health_routes(desired)
                 .await
                 .err()
-                .map(|error| error.to_string()),
+                .map(|error| format!("{error:#}")),
             dhcp: self
                 .subsystems
                 .health_dhcp(desired)
                 .await
                 .err()
-                .map(|error| error.to_string()),
+                .map(|error| format!("{error:#}")),
             uplink_dhcp: self.subsystems.health_uplink_dhcp(desired).await,
             dataplane: self
                 .subsystems
                 .health_dataplane(desired)
                 .await
                 .err()
-                .map(|error| error.to_string()),
+                .map(|error| format!("{error:#}")),
         }
     }
 
@@ -938,7 +938,7 @@ impl RouterManager {
         started: &[Stage],
     ) -> RouterApplyError {
         RouterApplyError {
-            original: original.to_string(),
+            original: format!("{original:#}"),
             rollback_failures: self.rollback_stages(snapshot, started).await,
         }
     }

@@ -52,7 +52,7 @@ pub enum OwnershipError {
     Store(#[from] LeaseStoreError),
     #[error(transparent)]
     Conflict(#[from] OwnershipConflict),
-    #[error("network operation failed: {0}")]
+    #[error("network operation failed: {0:#}")]
     Network(#[source] anyhow::Error),
     #[error("apply failed and cleanup remains necessary: {0}")]
     CleanupNeeded(String),
@@ -198,6 +198,17 @@ impl DhcpClientOwnershipApplier {
             let cleaned = self
                 .rollback_added(&lease, added_address, &added_routes)
                 .await;
+            tracing::warn!(
+                interface = %lease.interface,
+                ifindex = lease.interface_index,
+                address = %lease.address,
+                prefix_len = lease.prefix_len,
+                server = %lease.server_identifier,
+                error = %error,
+                rollback_succeeded = cleaned.is_ok(),
+                rollback_error = ?cleaned.as_ref().err(),
+                "Failed to apply DHCP lease; attempted rollback"
+            );
             if cleaned.is_ok() {
                 // Compensation removes only this attempt's additions. A
                 // renewal may have reused the prior address/routes, whose

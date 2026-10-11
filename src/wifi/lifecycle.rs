@@ -391,7 +391,7 @@ pub(crate) async fn persist_owned_ctrl_node(
 pub enum BinaryPreflightError {
     #[error("binary {binary} does not exist")]
     NotFound { binary: std::path::PathBuf },
-    #[error("binary {binary} is not runnable: {source}")]
+    #[error("binary {binary} is not runnable: {source:#}")]
     ProbeFailed {
         binary: std::path::PathBuf,
         source: anyhow::Error,

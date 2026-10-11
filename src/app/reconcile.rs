@@ -932,7 +932,7 @@ pub(super) fn spawn_runtime_network_reconcile_with_recovery_events(
             };
             if let Some(result) = result {
                 if let Err(error) = &result {
-                    tracing::warn!(%error, "runtime interface reconcile pass failed");
+                    tracing::warn!(error = %format!("{error:#}"), "runtime interface reconcile pass failed");
                 }
                 desired.report_result(version, result);
             } else {
@@ -1005,7 +1005,7 @@ pub(super) async fn check_process_liveness<D, W, C, L>(
     L: DhcpClientRuntimeReconciler,
 {
     if let Err(error) = dhcp.ensure_runtime_alive().await {
-        tracing::warn!(%error, "failed to restart the shared DHCP runtime");
+        tracing::warn!(error = %format!("{error:#}"), "failed to restart the shared DHCP runtime");
     }
     if let Some(wifi) = wifi {
         let result = match desired_config {
@@ -1013,7 +1013,7 @@ pub(super) async fn check_process_liveness<D, W, C, L>(
             None => wifi.ensure_alive().await,
         };
         if let Err(error) = result {
-            tracing::warn!(%error, "failed to check Wi-Fi access point liveness");
+            tracing::warn!(error = %format!("{error:#}"), "failed to check Wi-Fi access point liveness");
         }
     }
     if let Some(wifi_client) = wifi_client {
@@ -1022,7 +1022,7 @@ pub(super) async fn check_process_liveness<D, W, C, L>(
             None => wifi_client.ensure_alive().await,
         };
         if let Err(error) = result {
-            tracing::warn!(%error, "failed to check Wi-Fi client liveness");
+            tracing::warn!(error = %format!("{error:#}"), "failed to check Wi-Fi client liveness");
         }
     }
     if let (Some(wifi_client), Some(dhcp_client)) = (wifi_client, dhcp_client) {
@@ -1051,7 +1051,7 @@ pub(super) async fn check_process_liveness<D, W, C, L>(
             };
             if let Some(link_ready) = link_ready {
                 if let Err(error) = dhcp_client.reconcile(spec, link_ready).await {
-                    tracing::warn!(%error, "DHCP client liveness reconcile failed");
+                    tracing::warn!(error = %format!("{error:#}"), "DHCP client liveness reconcile failed");
                 }
             }
         }
@@ -1062,7 +1062,7 @@ pub(super) async fn check_process_liveness<D, W, C, L>(
             None => dhcp_client.ensure_alive().await,
         };
         if let Err(error) = result {
-            tracing::warn!(%error, "failed to check DHCP client liveness");
+            tracing::warn!(error = %format!("{error:#}"), "failed to check DHCP client liveness");
         }
     }
 }
@@ -1146,12 +1146,12 @@ pub(super) fn spawn_process_liveness_checks(
                     }
                     let config = match desired.effective().await {
                         Ok(config) => config,
-                        Err(error) => { tracing::warn!(%error, "process restart blocked by invalid desired state"); continue; }
+                        Err(error) => { tracing::warn!(error = %format!("{error:#}"), "process restart blocked by invalid desired state"); continue; }
                     };
                     let wifi_admitted = match crate::wifi::policy::WifiRadioPolicy::validate_system(&config.network) {
                             Ok(()) => true,
                             Err(error) => {
-                                tracing::warn!(%error, "Wi-Fi process restart blocked by radio policy");
+                                tracing::warn!(error = %format!("{error:#}"), "Wi-Fi process restart blocked by radio policy");
                                 false
                             }
                         };
@@ -1253,7 +1253,7 @@ pub(super) fn spawn_router_dataplane_integrity_checks(
                         if missing_router_dataplane_interface(&error).is_some() {
                             log_router_dataplane_convergence_error(&error);
                         } else {
-                            tracing::warn!(%error, "network integrity audit failed");
+                            tracing::warn!(error = %format!("{error:#}"), "network integrity audit failed");
                         }
                     }
                 }

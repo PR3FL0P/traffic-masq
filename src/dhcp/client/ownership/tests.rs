@@ -14,6 +14,17 @@ use crate::{
     },
 };
 
+#[test]
+fn network_error_preserves_underlying_failure_in_status_text() {
+    let error = OwnershipError::Network(
+        anyhow::anyhow!("Network is unreachable (os error 101)")
+            .context("RTM_NEWROUTE while adding 0.0.0.0/0 in table 254"),
+    );
+    let text = error.to_string();
+    assert!(text.contains("RTM_NEWROUTE"));
+    assert!(text.contains("Network is unreachable (os error 101)"));
+}
+
 #[derive(Default)]
 struct FakeNetwork {
     index: Mutex<u32>,

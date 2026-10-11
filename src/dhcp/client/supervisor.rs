@@ -389,7 +389,7 @@ impl DhcpClientSupervisor {
             self.inner.applier.state_dir(),
             Some(&spec.interface),
         ) {
-            tracing::error!(interface = %spec.interface, %error, "DHCP client blocked by interface recovery");
+            tracing::error!(interface = %spec.interface, error = %format!("{error:#}"), "DHCP client blocked by interface recovery");
             return;
         }
         let _operation = self.inner.operation_lock.read().await;
@@ -456,7 +456,7 @@ impl DhcpClientSupervisor {
         let _interface_operation = self.inner.interface_operations.lock(interface).await;
         if !self.inner.tasks.lock().await.contains_key(interface) {
             if let Err(error) = self.inner.applier.cleanup(interface).await {
-                tracing::warn!(%interface, %error, "failed to release owned DHCP client state while disabling it; cleanup will be retried");
+                tracing::warn!(%interface, error = %format!("{error:#}"), "failed to release owned DHCP client state while disabling it; cleanup will be retried");
                 return Err(error.into());
             }
             return Ok(None);
@@ -464,7 +464,7 @@ impl DhcpClientSupervisor {
         let previous_lease = self.status(interface).await.and_then(|status| status.lease);
         self.stop_task(interface).await;
         if let Err(error) = self.inner.applier.cleanup(interface).await {
-            tracing::warn!(%interface, %error, "failed to release owned DHCP client state while disabling it; restoring the client runtime");
+            tracing::warn!(%interface, error = %format!("{error:#}"), "failed to release owned DHCP client state while disabling it; restoring the client runtime");
             let restoration = self
                 .restore_runtime_after_interrupted_stop(interface, previous_lease)
                 .await;
@@ -650,7 +650,7 @@ impl DhcpClientSupervisor {
             self.record_waiting(interface).await;
         }
         if let Some(error) = release_error {
-            tracing::warn!(%interface, %error, "DHCP RELEASE could not be delivered; owned state was still cleaned up");
+            tracing::warn!(%interface, error = %format!("{error:#}"), "DHCP RELEASE could not be delivered; owned state was still cleaned up");
         }
         self.status_after_manual_restart(interface, "release/reacquire")
             .await
@@ -846,12 +846,12 @@ impl DhcpClientSupervisor {
                     if let Err(error) =
                         send_release(transport.as_ref(), lease, spec.hostname.as_deref()).await
                     {
-                        tracing::warn!(%interface, %error, "failed to send DHCP RELEASE during shutdown");
+                        tracing::warn!(%interface, error = %format!("{error:#}"), "failed to send DHCP RELEASE during shutdown");
                     }
                 }
             }
             if let Err(error) = self.inner.applier.cleanup(&interface).await {
-                tracing::warn!(%interface, %error, "failed to clean up owned DHCP client state during shutdown");
+                tracing::warn!(%interface, error = %format!("{error:#}"), "failed to clean up owned DHCP client state during shutdown");
             }
         }
         self.inner.tasks.lock().await.clear();
@@ -901,8 +901,8 @@ impl DhcpClientSupervisor {
         let remembered = match self.adopt_persisted_lease(interface, &spec).await {
             Ok(remembered) => remembered,
             Err(error) => {
-                tracing::error!(%interface, %error, "unresolved persisted DHCP ownership blocks client start");
-                self.record_failure(interface, error.to_string()).await;
+                tracing::error!(%interface, error = %format!("{error:#}"), "unresolved persisted DHCP ownership blocks client start");
+                self.record_failure(interface, format!("{error:#}")).await;
                 return;
             }
         };
@@ -945,8 +945,8 @@ impl DhcpClientSupervisor {
                 );
             }
             Err(error) => {
-                tracing::error!(%interface, %error, "failed to start the DHCP client");
-                self.record_failure(interface, error.to_string()).await;
+                tracing::error!(%interface, error = %format!("{error:#}"), "failed to start the DHCP client");
+                self.record_failure(interface, format!("{error:#}")).await;
             }
         }
     }
@@ -980,7 +980,7 @@ impl DhcpClientSupervisor {
             Err(error) => {
                 tracing::warn!(
                     %interface,
-                    %error,
+                    error = %format!("{error:#}"),
                     "persisted DHCP lease could not be adopted; releasing any state it still proves"
                 );
                 match self.inner.applier.cleanup(interface).await {
@@ -1027,9 +1027,9 @@ impl DhcpClientSupervisor {
                 }
             }
             Err(error) => {
-                tracing::warn!(%interface, %error, "failed to suspend traffic-masq-owned DHCP state while link is not ready");
+                tracing::warn!(%interface, error = %format!("{error:#}"), "failed to suspend traffic-masq-owned DHCP state while link is not ready");
                 if let Some(shared) = shared {
-                    shared.lock().await.failure = Some(error.to_string());
+                    shared.lock().await.failure = Some(format!("{error:#}"));
                 }
             }
         }
@@ -1044,7 +1044,7 @@ impl DhcpClientSupervisor {
         }?;
         let reason = match running.task.await {
             Ok(Ok(())) => "client task exited".to_string(),
-            Ok(Err(error)) => error.to_string(),
+            Ok(Err(error)) => format!("{error:#}"),
             Err(error) => format!("client task panicked: {error}"),
         };
         self.record_failure(interface, reason.clone()).await;
@@ -1102,7 +1102,7 @@ impl DhcpClientActionSink for OwnershipSink {
                 Ok(())
             }
             Err(error) => {
-                let reason = error.to_string();
+                let reason = format!("{error:#}");
                 self.shared.lock().await.failure = Some(reason.clone());
                 Err(anyhow::anyhow!(
                     "failed to apply DHCP lease ownership on {}: {reason}",
@@ -1139,7 +1139,7 @@ impl DhcpClientActionSink for OwnershipSink {
         match result {
             Ok(_) => Ok(()),
             Err(error) => {
-                let reason = error.to_string();
+                let reason = format!("{error:#}");
                 shared.failure = Some(reason.clone());
                 Err(anyhow::anyhow!(
                     "failed to release DHCP lease ownership on {}: {reason}",
@@ -1319,12 +1319,12 @@ async fn stop_running(running: RunningDhcpClient) {
         Ok(Ok(Ok(()))) => {}
         Ok(Ok(Err(error))) => {
             // The actor returned an error, but it is conclusively stopped.
-            tracing::debug!(%error, "DHCP client task returned an error while stopping")
+            tracing::debug!(error = %format!("{error:#}"), "DHCP client task returned an error while stopping")
         }
         Ok(Err(error)) => {
             // A completed JoinHandle (including panic/cancellation) cannot keep
             // mutating network state, so it is safe to continue cleanup.
-            tracing::debug!(%error, "DHCP client task did not join cleanly")
+            tracing::debug!(error = %format!("{error:#}"), "DHCP client task did not join cleanly")
         }
         Err(_) => {
             // Dropping a JoinHandle detaches the task.  A renew/rollback must
@@ -1335,11 +1335,11 @@ async fn stop_running(running: RunningDhcpClient) {
             match task.await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
-                    tracing::debug!(%error, "aborted DHCP client task returned an error")
+                    tracing::debug!(error = %format!("{error:#}"), "aborted DHCP client task returned an error")
                 }
                 Err(error) if error.is_cancelled() => {}
                 Err(error) => {
-                    tracing::debug!(%error, "aborted DHCP client task did not join cleanly")
+                    tracing::debug!(error = %format!("{error:#}"), "aborted DHCP client task did not join cleanly")
                 }
             }
         }
