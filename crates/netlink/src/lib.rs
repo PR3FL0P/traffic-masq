@@ -375,6 +375,16 @@ pub trait NetworkProvider: Send + Sync {
         anyhow::bail!("hardware-address observation is not supported by this network provider")
     }
 
+    /// Observe an Ethernet MAC; interfaces without Ethernet addressing return None.
+    async fn mac_address(&self, _interface: &str) -> Result<Option<[u8; 6]>> {
+        Ok(None)
+    }
+
+    /// Write a MAC on a link already taken down by the caller.
+    async fn set_mac_address(&self, _interface: &str, _address: [u8; 6]) -> Result<()> {
+        anyhow::bail!("MAC address changes are not supported by this network provider")
+    }
+
     /// Observe address/prefix and available protocol tags on this interface.
     async fn list_ipv4_addresses(&self, interface: &str) -> Result<Vec<Ipv4AddressInfo>>;
     /// Request administrative link up; repeated requests do not imply carrier readiness.
@@ -487,6 +497,14 @@ where
 
     async fn hardware_address(&self, interface: &str) -> Result<Vec<u8>> {
         (**self).hardware_address(interface).await
+    }
+
+    async fn mac_address(&self, interface: &str) -> Result<Option<[u8; 6]>> {
+        (**self).mac_address(interface).await
+    }
+
+    async fn set_mac_address(&self, interface: &str, address: [u8; 6]) -> Result<()> {
+        (**self).set_mac_address(interface, address).await
     }
 
     async fn list_ipv4_addresses(&self, interface: &str) -> Result<Vec<Ipv4AddressInfo>> {
@@ -873,8 +891,55 @@ fn parse_ipv4_rule(message: &RuleMessage) -> Result<Option<Ipv4RuleInfo>> {
     Ok(Some(info))
 }
 
+fn ethernet_mac(attributes: &[LinkAttribute]) -> Option<[u8; 6]> {
+    attributes.iter().find_map(|attribute| {
+        let LinkAttribute::Address(bytes) = attribute else {
+            return None;
+        };
+        let address: [u8; 6] = bytes.as_slice().try_into().ok()?;
+        (address != [0; 6] && address[0] & 1 == 0).then_some(address)
+    })
+}
+
 #[async_trait]
 impl NetworkProvider for RtnetlinkNetworkProvider {
+    async fn mac_address(&self, interface: &str) -> Result<Option<[u8; 6]>> {
+        let _request = self.request_lock.lock().await;
+        let mut links = self
+            .handle
+            .link()
+            .get()
+            .match_name(interface.to_string())
+            .execute();
+        let link = links
+            .try_next()
+            .await
+            .with_context(|| format!("RTM_GETLINK while reading MAC for {interface}"))?
+            .ok_or_else(|| {
+                anyhow::Error::new(MissingInterface {
+                    interface: interface.to_owned(),
+                })
+            })?;
+        Ok(ethernet_mac(&link.attributes))
+    }
+
+    async fn set_mac_address(&self, interface: &str, address: [u8; 6]) -> Result<()> {
+        anyhow::ensure!(
+            address != [0; 6] && address[0] & 1 == 0,
+            "MAC must be a nonzero unicast address"
+        );
+        let _request = self.request_lock.lock().await;
+        let index = self.link_index_unlocked(interface).await?;
+        self.handle
+            .link()
+            .set(index)
+            .address(address.to_vec())
+            .execute()
+            .await
+            .with_context(|| format!("RTM_NEWLINK while setting MAC on {interface}"))?;
+        Ok(())
+    }
+
     fn supports_ipv4_address_protocol(&self) -> bool {
         // Optimistic until proven otherwise: the first tagged write reads the
         // address back and flips this to `false` if the kernel dropped the tag.

@@ -399,3 +399,16 @@ async fn ipv4_address_read_uses_single_serialized_netlink_sequence() {
     .expect("nested RTM_GETLINK/RTM_GETADDR sequence deadlocked")
     .expect("IPv4 address read failed");
 }
+
+#[test]
+fn ethernet_mac_allows_interfaces_without_ethernet_addresses() {
+    assert_eq!(ethernet_mac(&[]), None);
+    assert_eq!(ethernet_mac(&[LinkAttribute::Address(vec![])]), None);
+    assert_eq!(ethernet_mac(&[LinkAttribute::Address(vec![0; 6])]), None);
+    assert_eq!(ethernet_mac(&[LinkAttribute::Address(vec![0xff; 6])]), None);
+    let mac = [2, 1, 2, 3, 4, 5];
+    assert_eq!(
+        ethernet_mac(&[LinkAttribute::Address(mac.to_vec())]),
+        Some(mac)
+    );
+}
