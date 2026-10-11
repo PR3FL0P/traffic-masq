@@ -124,6 +124,7 @@ fn editor_recovers_only_proven_static_addresses_after_settings_are_removed() {
 fn editor_keeps_explicit_saved_configuration_and_does_not_choose_between_owned_addresses() {
     let mut status = observed_address(Some(201), Some(true));
     let config = traffic_masq_protocol::InterfaceConfigView {
+        mac_address: None,
         managed: false,
         role: InterfaceRole::None,
         ipv4: None,
@@ -172,6 +173,7 @@ async fn keyboard_ip_edit_previews_applies_and_confirms_the_typed_address() {
         },
         Response::InterfacePlan {
             plan: traffic_masq_protocol::InterfaceChangePlanView {
+                mac_address: None,
                 interface: "wlp1s0".into(),
                 delete_ipv4: vec![],
                 retag_ipv4: None,
@@ -260,6 +262,7 @@ async fn keyboard_ip_edit_previews_applies_and_confirms_the_typed_address() {
 
 fn default_route_editor(allow_management_change: bool) -> InterfaceEditor {
     InterfaceEditor {
+        mac_address: None,
         saved_config: None,
         offline_revision: None,
         intent_confirmation: None,
@@ -478,4 +481,23 @@ async fn unmanaged_ip_edit_attempt_points_to_managed_mode() {
 
     let message = app.message.as_deref().unwrap_or_default();
     assert!(message.contains("Enable Configure with traffic-masq"));
+}
+
+#[tokio::test]
+async fn random_mac_is_local_unicast_and_kept_in_the_apply_request() {
+    let mut editor = default_route_editor(true);
+    editor.field = InterfaceEditorField::RandomizeMac;
+    editor.allow_management_change = true;
+    let mut app = TuiApp {
+        editor: Some(editor),
+        ..Default::default()
+    };
+    let client = ApiClient::new(std::path::PathBuf::from("/unused-mac-test.sock"));
+    handle_editor_key(&mut app, KeyCode::Enter, &client).await;
+    let editor = app.editor.as_ref().unwrap();
+    let mac = editor.mac_address.unwrap();
+    assert_eq!(mac.octets()[0] & 3, 2);
+    assert_eq!(editor.edit_request().unwrap().mac_address, Some(mac));
+    handle_editor_key(&mut app, KeyCode::Enter, &client).await;
+    assert_ne!(app.editor.as_ref().unwrap().mac_address, Some(mac));
 }

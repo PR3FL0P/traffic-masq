@@ -74,6 +74,7 @@ fn enabled_config() -> AppConfig {
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             role: InterfaceRole::Input,
             managed: false,
             ipv4: None,
@@ -93,6 +94,7 @@ fn enabled_config() -> AppConfig {
         config.network.interfaces.insert(
             name.to_string(),
             InterfaceConfig {
+                mac_address: None,
                 role: InterfaceRole::Output,
                 managed: true,
                 ipv4: Some(ipv4),
@@ -342,6 +344,7 @@ fn plan() -> RouterPlan {
     RouterPlan {
         desired: desired.clone(),
         interfaces: vec![InterfaceChangePlan {
+            mac_address: None,
             interface: "lan0".into(),
             delete_ipv4: Vec::new(),
             retag_ipv4: None,

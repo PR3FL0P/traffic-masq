@@ -557,7 +557,7 @@ async fn reconcile_interface_runtime_once(
                 config,
                 effective.dhcp.default_lease_seconds,
             )?;
-            let current_dhcp = dhcp.spec(name).await;
+            let mut current_dhcp = dhcp.spec(name).await;
             let Some(observed_interface) = observed_interfaces.get(name) else {
                 apply_dhcp_reconcile_action(
                     dhcp,
@@ -571,6 +571,7 @@ async fn reconcile_interface_runtime_once(
                     // completing cancellation; committed intent can be edited
                     // or applied normally if the device returns later.
                     let disabled = InterfaceConfig {
+                        mac_address: None,
                         managed: false,
                         ipv4: None,
                         dhcp: None,
@@ -614,6 +615,46 @@ async fn reconcile_interface_runtime_once(
                 ));
             };
 
+            ensure_current()?;
+            // Hardware identity changes precede consumers: DHCP captures the MAC
+            // when opening its runtime, and Wi-Fi daemons require a stable identity.
+            let target_mac = restorations
+                .get(name)
+                .map_or(config.mac_address, |snapshot| snapshot.mac_address);
+            if let Some(mac) = target_mac {
+                if network.mac_address(name).await? != Some(mac.octets()) {
+                    if !restoring {
+                        interface_manager
+                            .plan_interface(
+                                name,
+                                config,
+                                Some(config.role),
+                                management_allowlist.contains(name),
+                            )
+                            .await?;
+                    }
+                    let mut stopped = config.clone();
+                    stopped.mac_address = None;
+                    stopped.ipv4 = None;
+                    stopped.dhcp = None;
+                    stopped.dhcp_client = None;
+                    stopped.wifi = None;
+                    stopped.wifi_client = None;
+                    if let Some(client) = dhcp_client {
+                        client.disable(name).await?;
+                    }
+                    apply_dhcp_reconcile_action(dhcp, name, DhcpReconcileAction::Disable).await?;
+                    current_dhcp = None;
+                    if let Some(client) = wifi_client {
+                        client.reconcile_interface(name, &stopped).await?;
+                    }
+                    if let Some(access_point) = wifi {
+                        access_point.reconcile_interface(name, &stopped).await?;
+                    }
+                    ensure_current()?;
+                    interface_manager.apply_mac_address(name, mac).await?;
+                }
+            }
             ensure_current()?;
             // Release AP ownership before starting a station on the same radio.
             // Starting an AP still waits until after station teardown and IPv4.

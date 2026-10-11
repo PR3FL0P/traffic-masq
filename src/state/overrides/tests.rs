@@ -10,6 +10,7 @@ fn base_config() -> AppConfig {
 /// itself is a change that never gets applied.
 fn interface_config(address: &str) -> InterfaceConfig {
     InterfaceConfig {
+        mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some(address.parse().expect("network")),
@@ -61,6 +62,7 @@ fn effective_config_revalidates_router_against_interface_overrides() {
     base.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             role: InterfaceRole::Input,
             managed: false,
             ipv4: None,
@@ -85,6 +87,7 @@ fn effective_config_revalidates_router_against_interface_overrides() {
         "wan0".to_string(),
         InterfaceOverride {
             config: InterfaceConfig {
+                mac_address: None,
                 role: InterfaceRole::None,
                 managed: false,
                 ipv4: None,

@@ -107,6 +107,7 @@ impl WifiApSpec {
         crate::config::validate_interface_name(&self.interface)?;
 
         let config = InterfaceConfig {
+            mac_address: None,
             role: InterfaceRole::Output,
             managed: true,
             ipv4: None,

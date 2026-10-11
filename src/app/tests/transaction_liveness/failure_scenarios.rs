@@ -16,6 +16,7 @@ fn edit_lan(cidr: &str) -> Request {
     Request::ApplyInterfaceEdit {
         interface: "eth0".into(),
         edit: InterfaceEditRequest {
+            mac_address: None,
             cidr: cidr.into(),
             role: InterfaceRole::Output,
             managed: true,

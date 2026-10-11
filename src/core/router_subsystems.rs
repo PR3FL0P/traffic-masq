@@ -232,6 +232,73 @@ where
         self.router_interfaces.read().await.clone()
     }
 
+    /// Pause consumers only for the hardware identity mutation. The router's
+    /// later stages still own any changes to their configuration or IPv4 state.
+    async fn change_mac_with_consumers(
+        &self,
+        name: &str,
+        mac: traffic_masq_protocol::MacAddr,
+    ) -> Result<()> {
+        if self.interfaces.current_mac_address(name).await? == Some(mac) {
+            return Ok(());
+        }
+        let station = match &self.stations {
+            Some(runtime) => runtime.status(name).await.map(|(spec, _)| spec),
+            None => None,
+        };
+        let ap = match &self.access_points {
+            Some(runtime) => runtime.status(name).await.map(|(spec, _)| spec),
+            None => None,
+        };
+        let client = match &self.dhcp_client {
+            Some(runtime) => runtime.status(name).await.map(|status| status.spec),
+            None => None,
+        };
+        let server = self.dhcp.spec(name).await;
+        let result: Result<()> = async {
+            if client.is_some() {
+                self.dhcp_client.as_ref().unwrap().disable(name).await?;
+            }
+            if server.is_some() {
+                self.dhcp.disable(name).await?;
+            }
+            if station.is_some() {
+                self.stations.as_ref().unwrap().disable(name).await?;
+            }
+            if ap.is_some() {
+                self.access_points.as_ref().unwrap().disable(name).await?;
+            }
+            self.interfaces.apply_mac_address(name, mac).await
+        }
+        .await;
+        // A rejected driver write still needs its original consumers back.
+        let mut errors = Vec::new();
+        if let Err(error) = result {
+            errors.push(error);
+        }
+        if let Some(spec) = station {
+            if let Err(error) = self.stations.as_ref().unwrap().configure(spec).await {
+                errors.push(error);
+            }
+        }
+        if let Some(spec) = ap {
+            if let Err(error) = self.access_points.as_ref().unwrap().configure(spec).await {
+                errors.push(error);
+            }
+        }
+        if let Some(spec) = server {
+            if let Err(error) = self.dhcp.configure(spec).await {
+                errors.push(error);
+            }
+        }
+        if let Some(spec) = client {
+            if let Err(error) = self.dhcp_client.as_ref().unwrap().configure(spec).await {
+                errors.push(error);
+            }
+        }
+        crate::core::recovery_control::aggregate(errors, "MAC change or consumer restart failed")
+    }
+
     /// Narrow ownership to exactly `interfaces`.
     ///
     /// The counterpart to [`Self::adopt`]: ownership widens when an intent is
@@ -601,7 +668,12 @@ where
 
     async fn apply_interfaces(&self, plan: &[InterfaceChangePlan]) -> Result<()> {
         for item in plan {
-            self.interfaces.apply_plan(item).await?;
+            if let Some(mac) = item.mac_address {
+                self.change_mac_with_consumers(&item.interface, mac).await?;
+            }
+            let mut address_plan = item.clone();
+            address_plan.mac_address = None;
+            self.interfaces.apply_plan(&address_plan).await?;
         }
         Ok(())
     }
@@ -739,6 +811,12 @@ where
     async fn rollback_interfaces(&self, snapshot: &[InterfaceSnapshot]) -> Result<()> {
         let mut errors = Vec::new();
         for entry in snapshot {
+            if let Some(mac) = entry.mac_address {
+                if let Err(error) = self.change_mac_with_consumers(&entry.name, mac).await {
+                    errors.push(error.context(entry.name.clone()));
+                    continue;
+                }
+            }
             if let Err(error) = self.interfaces.rollback(entry).await {
                 errors.push(error.context(entry.name.clone()));
             }
@@ -890,6 +968,13 @@ where
         for entry in &desired.interfaces {
             if !entry.config.managed {
                 continue;
+            }
+            if let Some(mac) = entry.config.mac_address {
+                anyhow::ensure!(
+                    self.interfaces.current_mac_address(&entry.name).await? == Some(mac),
+                    "configured MAC {mac} is not present on interface {}",
+                    entry.name
+                );
             }
             self.interfaces
                 .verify_configured_ipv4(&entry.name, &entry.config)

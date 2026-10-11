@@ -20,19 +20,22 @@ pub(crate) enum InterfaceEditorField {
     RemoveIpv4,
     Role,
     Managed,
+    RandomizeMac,
     Save,
 }
 
-const INTERFACE_EDITOR_FIELDS: [InterfaceEditorField; 5] = [
+const INTERFACE_EDITOR_FIELDS: [InterfaceEditorField; 6] = [
     InterfaceEditorField::Cidr,
     InterfaceEditorField::RemoveIpv4,
     InterfaceEditorField::Role,
     InterfaceEditorField::Managed,
+    InterfaceEditorField::RandomizeMac,
     InterfaceEditorField::Save,
 ];
 
 #[derive(Debug, Clone)]
 pub(crate) struct InterfaceEditor {
+    pub(crate) mac_address: Option<traffic_masq_protocol::MacAddr>,
     pub(crate) interface: String,
     pub(crate) saved_config: Option<traffic_masq_protocol::InterfaceConfigView>,
     pub(crate) offline_revision: Option<u64>,
@@ -77,6 +80,9 @@ impl InterfaceEditor {
     pub(crate) fn edit_request(&self) -> Result<InterfaceEditRequest> {
         // Router participation is independent of address ownership.
         // Address edits require traffic-masq configuration to be enabled.
+        if self.mac_address.is_some() && !self.managed {
+            anyhow::bail!("MAC address requires Configure with traffic-masq");
+        }
         if !self.managed {
             // Taking an address off is still writing to the interface, and an
             // unmanaged interface is one we do not write to. Say which switch
@@ -124,6 +130,7 @@ impl InterfaceEditor {
             );
         }
         Ok(InterfaceEditRequest {
+            mac_address: self.mac_address,
             cidr: if self.managed {
                 self.cidr.trim().to_string()
             } else {
@@ -564,6 +571,13 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
             InterfaceEditorField::Managed,
         ),
     ]);
+    lines.push(row(
+        "Generate random MAC",
+        editor
+            .mac_address
+            .map_or_else(|| "Enter to generate".into(), |mac| mac.to_string()),
+        InterfaceEditorField::RandomizeMac,
+    ));
     lines.push(Line::styled(
         "None: outside the router. Review changes before applying.",
         Style::default().fg(theme::MUTED),
@@ -662,6 +676,11 @@ pub(crate) fn render_preview(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
         Line::from(format!("Delete IPv4: {delete}")),
         Line::from(format!("Claim existing IPv4: {retag}")),
         Line::from(format!("Add IPv4: {add}")),
+        Line::from(format!(
+            "Set MAC: {}",
+            plan.mac_address
+                .map_or_else(|| "unchanged".into(), |mac| mac.to_string())
+        )),
         Line::from(format!("Set link up: {}", plan.set_link_up)),
         Line::from(format!(
             "Outside-router interface affected: {}",
@@ -971,6 +990,7 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
                 .map(|dhcp| format!("DHCP pool {}-{}", dhcp.pool_start, dhcp.pool_end));
             let cursor = super::input::grapheme_count(&cidr);
             app.editor = Some(InterfaceEditor {
+                mac_address: config.as_ref().and_then(|config| config.mac_address),
                 interface: name,
                 saved_config: config.clone(),
                 offline_revision,
@@ -1134,7 +1154,21 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
                 }
             }
             InterfaceEditorField::Role => editor.role = next_role(editor.role),
-            InterfaceEditorField::Managed => editor.managed = !editor.managed,
+            InterfaceEditorField::Managed => {
+                editor.managed = !editor.managed;
+                if !editor.managed {
+                    editor.mac_address = None;
+                }
+            }
+            InterfaceEditorField::RandomizeMac => {
+                if editor.managed {
+                    use rand::RngCore;
+                    let mut octets = [0; 6];
+                    rand::rngs::OsRng.fill_bytes(&mut octets);
+                    octets[0] = (octets[0] & 0xfc) | 0x02;
+                    editor.mac_address = Some(traffic_masq_protocol::MacAddr::new(octets));
+                }
+            }
             InterfaceEditorField::Save => submit_dry_run(app, client).await,
         },
         other if editor.field == InterfaceEditorField::Cidr && editor.managed => {
@@ -1196,6 +1230,7 @@ pub(crate) async fn submit_dry_run(app: &mut TuiApp, client: &ApiClient) {
         };
         config.role = edit.role;
         config.managed = edit.managed;
+        config.mac_address = edit.mac_address;
         if config.role != InterfaceRole::Output || !config.managed {
             config.dhcp = None;
             config.wifi = None;

@@ -10,6 +10,7 @@ use super::*;
 
 fn input_interface() -> InterfaceConfig {
     InterfaceConfig {
+        mac_address: None,
         nat: true,
         role: InterfaceRole::Input,
         managed: false,
@@ -25,6 +26,7 @@ fn output_interface(address: &str, pool_start: u8, pool_end: u8) -> InterfaceCon
     let ipv4: ipnet::Ipv4Net = address.parse().expect("IPv4 network");
     let octet = ipv4.addr().octets()[2];
     InterfaceConfig {
+        mac_address: None,
         nat: true,
         role: InterfaceRole::Output,
         managed: true,
@@ -81,6 +83,7 @@ fn committed() -> RuntimeOverrides {
 
 fn management_interface() -> InterfaceConfig {
     InterfaceConfig {
+        mac_address: None,
         nat: true,
         role: InterfaceRole::None,
         managed: false,
@@ -105,6 +108,7 @@ fn base_config_with_management() -> AppConfig {
 fn rejects_relabelling_a_management_interface_without_confirmation() {
     let base = base_config_with_management();
     let relabelled = InterfaceConfig {
+        mac_address: None,
         nat: true,
         role: InterfaceRole::Output,
         managed: true,

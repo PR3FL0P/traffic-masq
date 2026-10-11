@@ -15,6 +15,8 @@ pub enum DhcpChangeActionView {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterfaceChangePlanView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac_address: Option<crate::MacAddr>,
     pub interface: String,
     pub delete_ipv4: Vec<Ipv4AddressInfoView>,
     #[serde(default)]

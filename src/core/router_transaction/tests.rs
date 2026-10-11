@@ -21,6 +21,7 @@ fn output_interface(address: &str, pool_start: u8, pool_end: u8) -> InterfaceCon
     let ipv4: ipnet::Ipv4Net = address.parse().expect("IPv4 network");
     let octet = ipv4.addr().octets()[2];
     InterfaceConfig {
+        mac_address: None,
         nat: true,
         role: InterfaceRole::Output,
         managed: true,
@@ -43,6 +44,7 @@ fn base_config() -> AppConfig {
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             nat: true,
             role: InterfaceRole::Input,
             managed: false,
@@ -154,6 +156,7 @@ impl RouterSubsystems for FakeSubsystems {
     ) -> Result<crate::core::router::RouterSubsystemPlan> {
         self.record("plan_interfaces")?;
         let interfaces = vec![InterfaceChangePlan {
+            mac_address: None,
             interface: "lan0".into(),
             delete_ipv4: Vec::new(),
             retag_ipv4: None,

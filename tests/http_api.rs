@@ -182,6 +182,7 @@ async fn authenticated_http_client_controls_daemon_over_unix_socket() -> Result<
     config.network.interfaces.insert(
         "test0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             nat: true,
             role: InterfaceRole::Output,
             managed: true,
@@ -327,6 +328,7 @@ async fn authenticated_http_client_controls_daemon_over_unix_socket() -> Result<
     assert!(overrides.snapshot().await.security.is_none());
 
     let interface_config = InterfaceConfig {
+        mac_address: None,
         nat: true,
         role: InterfaceRole::Output,
         managed: true,
@@ -337,6 +339,7 @@ async fn authenticated_http_client_controls_daemon_over_unix_socket() -> Result<
         wifi_client: None,
     };
     let interface_edit = traffic_masq::api::model::InterfaceEditRequest {
+        mac_address: None,
         cidr: "192.168.100.1/24".to_string(),
         role: InterfaceRole::Output,
         managed: true,
@@ -418,6 +421,7 @@ async fn authenticated_http_client_controls_daemon_over_unix_socket() -> Result<
         .request(&Request::DryRunInterfaceEdit {
             interface: "test0".to_string(),
             edit: traffic_masq::api::model::InterfaceEditRequest {
+                mac_address: None,
                 cidr: String::new(),
                 role: InterfaceRole::Output,
                 managed: true,
@@ -450,6 +454,7 @@ async fn authenticated_http_client_controls_daemon_over_unix_socket() -> Result<
         ..interface_config.clone()
     };
     let managed_false_edit = traffic_masq::api::model::InterfaceEditRequest {
+        mac_address: None,
         cidr: String::new(),
         role: InterfaceRole::Output,
         managed: false,
@@ -609,6 +614,7 @@ fn fake_dataplane_snapshot() -> RouterDataplaneSnapshot {
 impl RouterSubsystems for FakeRouterSubsystems {
     async fn plan_for(&self, desired: &RouterDesired) -> Result<RouterSubsystemPlan> {
         let interfaces = vec![InterfaceChangePlan {
+            mac_address: None,
             interface: "lan0".into(),
             delete_ipv4: Vec::new(),
             retag_ipv4: None,
@@ -829,6 +835,7 @@ fn router_proposal() -> RouterProposalRequest {
             "lan0".to_string(),
             InterfaceOverrideRequest {
                 config: InterfaceConfig {
+                    mac_address: None,
                     nat: true,
                     role: InterfaceRole::Output,
                     managed: true,
@@ -859,6 +866,7 @@ async fn router_enabled_test_server() -> Result<(
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             nat: true,
             role: InterfaceRole::Input,
             managed: false,
@@ -886,6 +894,7 @@ async fn router_status_test_server(
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             nat: true,
             role: InterfaceRole::Input,
             managed: false,
@@ -899,6 +908,7 @@ async fn router_status_test_server(
     config.network.interfaces.insert(
         "lan0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             nat: true,
             role: InterfaceRole::Output,
             managed: true,
@@ -1784,6 +1794,7 @@ async fn vpn_policy_status_set_mode_clear_mode_over_http() -> Result<()> {
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             nat: true,
             role: InterfaceRole::Input,
             managed: false,
@@ -1797,6 +1808,7 @@ async fn vpn_policy_status_set_mode_clear_mode_over_http() -> Result<()> {
     config.network.interfaces.insert(
         "lan0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             nat: true,
             role: InterfaceRole::Output,
             managed: true,

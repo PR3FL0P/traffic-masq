@@ -151,6 +151,7 @@ fn spec_with_security(
     use crate::config::{InterfaceConfig, InterfaceRole, WifiApConfig, WifiBand, WifiChannelWidth};
 
     let config = InterfaceConfig {
+        mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some("192.168.101.1/24".parse().expect("network")),

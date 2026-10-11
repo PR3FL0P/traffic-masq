@@ -72,6 +72,7 @@ fn interface_list_keeps_selected_row_visible_and_click_offset_correct() {
 fn preview_buttons_are_visible_and_cancel_has_a_click_target() {
     let mut app = TuiApp {
         preview: Some(traffic_masq_protocol::InterfaceChangePlanView {
+            mac_address: None,
             interface: "eth0".into(),
             delete_ipv4: vec![],
             retag_ipv4: None,

@@ -43,6 +43,7 @@ impl WifiRuntimeReconciler for StartingWifi {
 
 fn ethernet(cidr: &str) -> InterfaceConfig {
     InterfaceConfig {
+        mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some(cidr.parse().unwrap()),

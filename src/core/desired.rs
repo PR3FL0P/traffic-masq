@@ -535,6 +535,7 @@ impl DesiredNetworkState {
     ) {
         let interface = snapshot.name.clone();
         let config = config.unwrap_or(InterfaceConfig {
+            mac_address: None,
             role: crate::config::InterfaceRole::Output,
             managed: false,
             ipv4: None,

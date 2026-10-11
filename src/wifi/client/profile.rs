@@ -459,6 +459,7 @@ fn validate_fields(
     security: WifiClientSecurity,
 ) -> Result<(), WifiClientProfileError> {
     let config = InterfaceConfig {
+        mac_address: None,
         role: InterfaceRole::Input,
         managed: true,
         ipv4: None,

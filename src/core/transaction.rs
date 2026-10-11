@@ -1095,6 +1095,7 @@ impl NetworkTransactionManager {
             }
             let previous_config = desired.committed_interface(name).await?;
             let target = previous_config.clone().unwrap_or(InterfaceConfig {
+                mac_address: None,
                 role: InterfaceRole::Output,
                 managed: false,
                 ipv4: None,

@@ -316,6 +316,7 @@ impl<R: Send + 'static> SupervisedProcess for FakeSupervisedProcess<R> {
 pub(crate) struct FakeNetworkProvider {
     pub(crate) wireless_phys: StdMutex<HashMap<String, String>>,
     pub(crate) interfaces: Mutex<HashMap<String, NetworkInterface>>,
+    pub(crate) macs: Mutex<HashMap<String, [u8; 6]>>,
     pub(crate) addresses: Mutex<HashMap<String, Vec<Ipv4AddressInfo>>>,
     pub(crate) routes: Mutex<Vec<Ipv4RouteInfo>>,
     pub(crate) rules: Mutex<Vec<Ipv4RuleInfo>>,
@@ -330,6 +331,7 @@ impl Default for FakeNetworkProvider {
         Self {
             wireless_phys: StdMutex::new(HashMap::new()),
             interfaces: Mutex::new(HashMap::new()),
+            macs: Mutex::new(HashMap::new()),
             addresses: Mutex::new(HashMap::new()),
             routes: Mutex::new(Vec::new()),
             rules: Mutex::new(Vec::new()),
@@ -382,6 +384,18 @@ impl FakeNetworkProvider {
 
 #[async_trait]
 impl NetworkProvider for FakeNetworkProvider {
+    async fn mac_address(&self, name: &str) -> Result<Option<[u8; 6]>> {
+        Ok(self.macs.lock().await.get(name).copied())
+    }
+    async fn set_mac_address(&self, name: &str, mac: [u8; 6]) -> Result<()> {
+        anyhow::ensure!(
+            !self.interfaces.lock().await[name].is_up,
+            "MAC change requires link down"
+        );
+        self.macs.lock().await.insert(name.into(), mac);
+        Ok(())
+    }
+
     fn wireless_phy(&self, interface: &str) -> Option<String> {
         self.wireless_phys.lock().unwrap().get(interface).cloned()
     }

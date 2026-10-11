@@ -29,6 +29,7 @@ impl From<DhcpChangeActionView> for DhcpChangeAction {
 impl From<InterfaceChangePlan> for InterfaceChangePlanView {
     fn from(value: InterfaceChangePlan) -> Self {
         Self {
+            mac_address: value.mac_address,
             interface: value.interface,
             delete_ipv4: value.delete_ipv4.into_iter().map(address_to_view).collect(),
             retag_ipv4: value.retag_ipv4.map(address_to_view),
@@ -44,6 +45,7 @@ impl From<InterfaceChangePlan> for InterfaceChangePlanView {
 impl From<InterfaceChangePlanView> for InterfaceChangePlan {
     fn from(value: InterfaceChangePlanView) -> Self {
         Self {
+            mac_address: value.mac_address,
             interface: value.interface,
             delete_ipv4: value
                 .delete_ipv4

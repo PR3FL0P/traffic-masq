@@ -317,6 +317,7 @@ async fn legacy_sharing_can_be_read_and_edited_from_saved_settings_without_devic
         name: "unplugged_lan".into(),
         observed: None,
         configured: Some(InterfaceConfigView {
+            mac_address: None,
             role: InterfaceRole::Output,
             managed: true,
             ipv4: Some("192.168.50.1/24".parse().unwrap()),

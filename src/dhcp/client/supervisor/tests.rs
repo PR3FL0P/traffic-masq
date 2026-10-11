@@ -220,6 +220,7 @@ fn config(state_dir: &TempDir, interface: Option<DhcpClientInterfaceConfig>) -> 
     network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             role: InterfaceRole::Input,
             managed: interface.is_some(),
             ipv4: None,
@@ -277,6 +278,7 @@ async fn supervisor_with(
 #[test]
 fn spec_is_derived_only_from_an_enabled_block() {
     let mut interface = InterfaceConfig {
+        mac_address: None,
         role: InterfaceRole::Input,
         managed: true,
         ipv4: None,

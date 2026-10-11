@@ -199,6 +199,7 @@ impl PhysicalWifiFixture {
         self.config.network.interfaces.insert(
             self.uplink_interface.clone(),
             InterfaceConfig {
+                mac_address: None,
                 nat: true,
                 role: InterfaceRole::Input,
                 managed: true,
@@ -217,6 +218,7 @@ impl PhysicalWifiFixture {
         self.config.network.interfaces.insert(
             self.output_interface.clone(),
             InterfaceConfig {
+                mac_address: None,
                 nat: true,
                 role: InterfaceRole::Output,
                 managed: true,

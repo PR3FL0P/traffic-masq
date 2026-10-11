@@ -54,6 +54,7 @@ fn principal(role: Role) -> Principal {
 
 fn interface_config() -> InterfaceConfig {
     InterfaceConfig {
+        mac_address: None,
         nat: true,
         role: InterfaceRole::Output,
         managed: true,
@@ -67,6 +68,7 @@ fn interface_config() -> InterfaceConfig {
 
 fn interface_edit() -> InterfaceEditRequest {
     InterfaceEditRequest {
+        mac_address: None,
         cidr: "192.0.2.1/24".to_owned(),
         role: InterfaceRole::Output,
         managed: true,

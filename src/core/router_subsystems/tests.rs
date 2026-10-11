@@ -64,6 +64,7 @@ fn output_interface(address: &str, pool_start: u8, pool_end: u8) -> InterfaceCon
     let ipv4: ipnet::Ipv4Net = address.parse().expect("IPv4 network");
     let octet = ipv4.addr().octets()[2];
     InterfaceConfig {
+        mac_address: None,
         nat: true,
         role: InterfaceRole::Output,
         managed: true,
@@ -86,6 +87,7 @@ fn enabled_config() -> AppConfig {
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             nat: true,
             role: InterfaceRole::Input,
             managed: false,
@@ -116,6 +118,7 @@ fn enabled_config() -> AppConfig {
 
 fn dhcp_less_output_interface(address: &str) -> InterfaceConfig {
     InterfaceConfig {
+        mac_address: None,
         nat: true,
         role: InterfaceRole::Output,
         managed: true,
@@ -537,11 +540,13 @@ async fn rollback_interfaces_is_best_effort_and_reports_every_failure() {
     let (subsystems, _provider) = subsystems_for(&config).await;
     let snapshot = vec![
         InterfaceSnapshot {
+            mac_address: None,
             name: "wan0".to_string(),
             was_up: true,
             ipv4_addresses: Vec::new(),
         },
         InterfaceSnapshot {
+            mac_address: None,
             name: "missing0".to_string(),
             was_up: true,
             ipv4_addresses: Vec::new(),
@@ -1271,5 +1276,59 @@ async fn host_policy_uses_live_kernel_endpoints_instead_of_resolving_profiles_ag
             .unwrap()
             .host_endpoints,
         vec!["198.51.100.27".parse::<Ipv4Addr>().unwrap()]
+    );
+}
+
+#[tokio::test]
+async fn router_mac_change_pauses_station_and_restarts_it_with_the_new_identity() {
+    struct StationRuntime {
+        provider: Arc<FakeNetworkProvider>,
+        spec: WifiClientSpec,
+        calls: Mutex<Vec<(&'static str, [u8; 6])>>,
+    }
+    #[async_trait]
+    impl RouterStaRuntime for StationRuntime {
+        async fn status(&self, _: &str) -> Option<(WifiClientSpec, bool)> {
+            Some((self.spec.clone(), true))
+        }
+        async fn configure(&self, _: WifiClientSpec) -> Result<()> {
+            let mac = self.provider.mac_address("wan0").await?.unwrap();
+            self.calls.lock().await.push(("start", mac));
+            Ok(())
+        }
+        async fn disable(&self, _: &str) -> Result<()> {
+            let mac = self.provider.mac_address("wan0").await?.unwrap();
+            self.calls.lock().await.push(("stop", mac));
+            Ok(())
+        }
+    }
+    let (subsystems, provider) = subsystems_for(&enabled_config()).await;
+    let previous = [0, 1, 2, 3, 4, 5];
+    let next = [2, 6, 7, 8, 9, 10];
+    provider.macs.lock().await.insert("wan0".into(), previous);
+    let runtime = Arc::new(StationRuntime {
+        provider: provider.clone(),
+        spec: WifiClientSpec {
+            interface: "wan0".into(),
+            ssid: "upstream".into(),
+            country_code: None,
+            security: crate::config::WifiClientSecurity::Open,
+            passphrase_file: None,
+        },
+        calls: Mutex::new(Vec::new()),
+    });
+    let subsystems = subsystems.with_station_runtime(runtime.clone());
+    let mac = traffic_masq_protocol::MacAddr::new(next);
+    subsystems
+        .change_mac_with_consumers("wan0", mac)
+        .await
+        .unwrap();
+    subsystems
+        .change_mac_with_consumers("wan0", mac)
+        .await
+        .unwrap();
+    assert_eq!(
+        *runtime.calls.lock().await,
+        vec![("stop", previous), ("start", next)]
     );
 }

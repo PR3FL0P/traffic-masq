@@ -123,6 +123,7 @@ fn vpn_directory_validation_does_not_require_daemon_permissions() {
 
 fn input_interface() -> InterfaceConfig {
     InterfaceConfig {
+        mac_address: None,
         nat: true,
         role: InterfaceRole::Input,
         managed: false,
@@ -136,6 +137,7 @@ fn input_interface() -> InterfaceConfig {
 
 fn output_interface(ipv4: &str, pool_start: Ipv4Addr, pool_end: Ipv4Addr) -> InterfaceConfig {
     InterfaceConfig {
+        mac_address: None,
         nat: true,
         role: InterfaceRole::Output,
         managed: true,
@@ -456,6 +458,7 @@ fn rejects_route_ownership_violations() {
     config.network.interfaces.insert(
         "disabled0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             nat: true,
             role: InterfaceRole::Disabled,
             managed: false,
@@ -478,6 +481,7 @@ fn rejects_route_ownership_violations() {
     config.network.interfaces.insert(
         "unmanaged0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             nat: true,
             role: InterfaceRole::None,
             managed: false,
@@ -1006,6 +1010,7 @@ fn client_association(ssid: &str) -> WifiClientConfig {
 
 fn client_interface(wifi_client: WifiClientConfig) -> InterfaceConfig {
     InterfaceConfig {
+        mac_address: None,
         nat: true,
         role: InterfaceRole::Input,
         managed: true,

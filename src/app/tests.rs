@@ -100,6 +100,7 @@ impl ReconcileRetryFixture {
             config.network.interfaces.insert(
                 "wan0".into(),
                 InterfaceConfig {
+                    mac_address: None,
                     role: InterfaceRole::Input,
                     managed: true,
                     ipv4: None,
@@ -547,6 +548,7 @@ fn vpn_policy_startup_config() -> AppConfig {
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             nat: true,
             role: InterfaceRole::Input,
             managed: false,
@@ -560,6 +562,7 @@ fn vpn_policy_startup_config() -> AppConfig {
     config.network.interfaces.insert(
         "lan0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             nat: true,
             role: InterfaceRole::Output,
             managed: true,
@@ -657,6 +660,7 @@ fn hotplug_reconcile_config() -> AppConfig {
     config.network.interfaces.insert(
         "lan0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             nat: true,
             role: InterfaceRole::Output,
             managed: true,
@@ -909,6 +913,7 @@ async fn a_proposal_carries_its_own_permission_to_touch_a_management_interface()
     config.network.interfaces.insert(
         "mgmt0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             nat: true,
             role: InterfaceRole::None,
             managed: true,
@@ -996,6 +1001,7 @@ async fn convergence_takes_our_addresses_off_an_unmanaged_interface() {
     config.network.interfaces.insert(
         "lan0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             nat: true,
             role: InterfaceRole::Output,
             managed: false,
@@ -1172,6 +1178,7 @@ fn dhcp_client_reconcile_config() -> AppConfig {
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             nat: true,
             role: InterfaceRole::Input,
             managed: true,
@@ -1332,6 +1339,7 @@ async fn managed_wifi_dhcp_tracks_completed_while_wired_stays_ready() {
     config.network.interfaces.insert(
         "eth0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             nat: true,
             role: InterfaceRole::Input,
             managed: true,
@@ -1440,6 +1448,7 @@ async fn runtime_reconcile_disables_a_dhcp_client_whose_intent_was_removed() {
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             nat: true,
             role: InterfaceRole::Input,
             managed: false,
@@ -1512,6 +1521,7 @@ fn desired_with_route_and_dataplane() -> RouterDesired {
     config.network.interfaces.insert(
         "wan0".to_string(),
         crate::config::InterfaceConfig {
+            mac_address: None,
             nat: true,
             role: crate::config::InterfaceRole::Input,
             managed: false,
@@ -1525,6 +1535,7 @@ fn desired_with_route_and_dataplane() -> RouterDesired {
     config.network.interfaces.insert(
         "lan0".to_string(),
         crate::config::InterfaceConfig {
+            mac_address: None,
             nat: true,
             role: crate::config::InterfaceRole::Output,
             managed: true,
@@ -1900,6 +1911,7 @@ fn sharing_config() -> AppConfig {
         config.network.interfaces.insert(
             name.into(),
             InterfaceConfig {
+                mac_address: None,
                 role,
                 managed: true,
                 ipv4: ipv4.map(|ip| ip.parse().unwrap()),
@@ -2120,6 +2132,7 @@ async fn startup_cancels_removed_device_transaction_without_replaying_it_after_r
     config.network.interfaces.insert(
         "eth0".into(),
         InterfaceConfig {
+            mac_address: None,
             role: InterfaceRole::None,
             managed: false,
             ipv4: None,
@@ -2143,6 +2156,7 @@ async fn startup_cancels_removed_device_transaction_without_replaying_it_after_r
     )
     .unwrap();
     let snapshot = crate::core::interface::InterfaceSnapshot {
+        mac_address: None,
         name: "eth0".into(),
         was_up: true,
         ipv4_addresses: Vec::new(),
@@ -2323,6 +2337,7 @@ async fn rollback_without_external_connectivity(device_present: bool) {
     let mut config = AppConfig::default();
     config.runtime.state_dir = directory.path().to_path_buf();
     let previous = InterfaceConfig {
+        mac_address: None,
         role: InterfaceRole::Input,
         managed: true,
         ipv4: None,
@@ -2440,3 +2455,59 @@ async fn rollback_completes_after_device_removal_and_releases_the_interface() {
 }
 
 mod transaction_liveness;
+
+#[tokio::test]
+async fn mac_change_restarts_an_existing_dhcp_server_and_then_settles() {
+    let mut config = hotplug_reconcile_config();
+    let mac = traffic_masq_protocol::MacAddr::new([2, 7, 8, 9, 10, 11]);
+    config
+        .network
+        .interfaces
+        .get_mut("lan0")
+        .unwrap()
+        .mac_address = Some(mac);
+    let directory = tempdir().unwrap();
+    let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+        .await
+        .unwrap();
+    let desired = DesiredNetworkState::new(config.clone(), overrides);
+    let network = Arc::new(FakeNetworkProvider::default());
+    network
+        .add_interface_with_state("lan0", 7, true, vec![])
+        .await;
+    network
+        .macs
+        .lock()
+        .await
+        .insert("lan0".into(), [0, 1, 2, 3, 4, 5]);
+    let dhcp = FakeDhcpReconciler::default();
+    let spec = DhcpServiceSpec::from_interface_config(
+        "lan0",
+        &config.network.interfaces["lan0"],
+        config.dhcp.default_lease_seconds,
+    )
+    .unwrap()
+    .unwrap();
+    dhcp.specs.lock().await.insert("lan0".into(), spec.clone());
+    for _ in 0..2 {
+        let failures = reconcile_network_runtime_once(
+            &desired,
+            &AddressOwnershipJournal::in_memory(),
+            network.clone(),
+            &dhcp,
+            Some(&FakeWifiReconciler::default()),
+            None::<&FakeWifiReconciler>,
+            None::<&FakeDhcpClientReconciler>,
+        )
+        .await
+        .unwrap();
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+    assert_eq!(
+        network.mac_address("lan0").await.unwrap(),
+        Some(mac.octets())
+    );
+    assert_eq!(*dhcp.disable_calls.lock().await, vec!["lan0"]);
+    assert_eq!(dhcp.configure_calls.lock().await.len(), 1);
+    assert_eq!(dhcp.spec("lan0").await, Some(spec));
+}

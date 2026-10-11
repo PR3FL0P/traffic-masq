@@ -11,6 +11,8 @@ use crate::netlink::{AddressOwner, AddressOwnership, Ipv4AddressInfo, NetworkPro
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterfaceSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac_address: Option<traffic_masq_protocol::MacAddr>,
     pub name: String,
     pub was_up: bool,
     pub ipv4_addresses: Vec<Ipv4AddressInfo>,
@@ -27,6 +29,8 @@ pub enum DhcpChangeAction {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterfaceChangePlan {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac_address: Option<traffic_masq_protocol::MacAddr>,
     pub interface: String,
     pub delete_ipv4: Vec<Ipv4AddressInfo>,
     /// The desired address is already on the link but carries no ownership
@@ -196,6 +200,11 @@ impl InterfaceManager {
             .collect();
 
         Ok(Some(InterfaceSnapshot {
+            mac_address: self
+                .provider
+                .mac_address(name)
+                .await?
+                .map(traffic_masq_protocol::MacAddr::new),
             name: name.to_string(),
             was_up: interface.is_up,
             ipv4_addresses,
@@ -444,6 +453,7 @@ impl InterfaceManager {
                 ours
             };
             return Ok(InterfaceChangePlan {
+                mac_address: None,
                 interface: name.to_string(),
                 delete_ipv4,
                 retag_ipv4: None,
@@ -455,8 +465,21 @@ impl InterfaceManager {
             });
         }
 
+        let mac_address = match config.mac_address {
+            Some(desired) => {
+                let current = self
+                    .provider
+                    .mac_address(name)
+                    .await?
+                    .context("interface does not support Ethernet MAC addressing")?;
+                (current != desired.octets()).then_some(desired)
+            }
+            None => None,
+        };
+
         if owns_dynamic_ipv4(config) {
             return Ok(InterfaceChangePlan {
+                mac_address,
                 interface: name.to_string(),
                 delete_ipv4: Vec::new(),
                 retag_ipv4: None,
@@ -517,6 +540,7 @@ impl InterfaceManager {
                 });
 
         Ok(InterfaceChangePlan {
+            mac_address,
             interface: name.to_string(),
             delete_ipv4,
             retag_ipv4,
@@ -638,9 +662,84 @@ impl InterfaceManager {
         self.apply_plan(&plan).await
     }
 
+    /// Change hardware identity with compensation if a driver rejects the update.
+    /// Callers hold the interface mutation lock and have stopped link consumers.
+    async fn change_mac(&self, name: &str, desired: traffic_masq_protocol::MacAddr) -> Result<()> {
+        let interface = self
+            .provider
+            .list_interfaces()
+            .await?
+            .into_iter()
+            .find(|link| link.name == name)
+            .context("interface disappeared before MAC change")?;
+        let previous = self
+            .provider
+            .mac_address(name)
+            .await?
+            .context("interface does not support Ethernet MAC addressing")?;
+        if previous == desired.octets() {
+            return Ok(());
+        }
+        self.provider.set_link_down(name).await?;
+        let result: Result<()> = async {
+            self.provider
+                .set_mac_address(name, desired.octets())
+                .await?;
+            anyhow::ensure!(
+                self.provider.mac_address(name).await? == Some(desired.octets()),
+                "driver did not retain the requested MAC address on {name}"
+            );
+            if interface.is_up {
+                self.provider.set_link_up(name).await?;
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            let restore: Result<()> = async {
+                self.provider.set_link_down(name).await?;
+                self.provider.set_mac_address(name, previous).await?;
+                if interface.is_up {
+                    self.provider.set_link_up(name).await?;
+                }
+                Ok(())
+            }
+            .await;
+            return match restore {
+                Ok(()) => Err(error),
+                Err(restore) => Err(error.context(format!("MAC restoration failed: {restore:#}"))),
+            };
+        }
+        tracing::info!(interface = %name, mac = %desired, "changed interface MAC address");
+        Ok(())
+    }
+
+    pub(crate) async fn current_mac_address(
+        &self,
+        name: &str,
+    ) -> Result<Option<traffic_masq_protocol::MacAddr>> {
+        Ok(self
+            .provider
+            .mac_address(name)
+            .await?
+            .map(traffic_masq_protocol::MacAddr::new))
+    }
+
+    pub(crate) async fn apply_mac_address(
+        &self,
+        name: &str,
+        address: traffic_masq_protocol::MacAddr,
+    ) -> Result<()> {
+        let _mutation = self.mutation_locks.lock(name).await;
+        self.change_mac(name, address).await
+    }
+
     /// Revalidate and execute planned link/address changes while journaling daemon ownership.
     pub async fn apply_plan(&self, plan: &InterfaceChangePlan) -> Result<()> {
         let _mutation = self.mutation_locks.lock(&plan.interface).await;
+        if let Some(mac) = plan.mac_address {
+            self.change_mac(&plan.interface, mac).await?;
+        }
         if plan.delete_ipv4.is_empty() && plan.retag_ipv4.is_none() && plan.add_ipv4.is_none() {
             tracing::info!(
                 interface = %plan.interface,
@@ -788,6 +887,9 @@ impl InterfaceManager {
 
     pub async fn rollback(&self, snapshot: &InterfaceSnapshot) -> Result<()> {
         let _mutation = self.mutation_locks.lock(&snapshot.name).await;
+        if let Some(mac) = snapshot.mac_address {
+            self.change_mac(&snapshot.name, mac).await?;
+        }
         let current = self.provider.list_ipv4_addresses(&snapshot.name).await?;
         let can_tag = self.provider.supports_ipv4_address_protocol();
         let same_address = |left: &Ipv4AddressInfo, right: &Ipv4AddressInfo| {

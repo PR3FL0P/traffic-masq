@@ -1877,6 +1877,7 @@ fn ap_profile_actions_fit_small_terminal_and_mouse_skips_header() {
 fn configured_network_role_determines_wifi_role_before_activation() {
     use traffic_masq_protocol::{InterfaceConfigView, InterfaceRole};
     let mut config = InterfaceConfigView {
+        mac_address: None,
         role: InterfaceRole::Input,
         managed: true,
         ipv4: None,

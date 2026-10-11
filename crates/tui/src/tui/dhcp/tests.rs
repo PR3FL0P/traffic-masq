@@ -308,6 +308,7 @@ async fn missing_dhcp_editor_saves_revision_checked_intent_without_live_apply() 
         })).await.unwrap();
     });
     let config = traffic_masq_protocol::InterfaceConfigView {
+        mac_address: None,
         role: traffic_masq_protocol::InterfaceRole::Output,
         managed: true,
         ipv4: Some("192.168.50.1/24".parse().unwrap()),

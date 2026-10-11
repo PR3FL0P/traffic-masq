@@ -98,6 +98,7 @@ fn dhcp_config() -> DhcpInterfaceConfig {
 #[test]
 fn interface_edit_preserves_client_and_nat_settings() {
     let existing = InterfaceConfig {
+        mac_address: None,
         role: InterfaceRole::Input,
         managed: true,
         ipv4: None,
@@ -114,6 +115,7 @@ fn interface_edit_preserves_client_and_nat_settings() {
     };
     let (config, _) = interface_edit_request_to_config(
         InterfaceEditRequest {
+            mac_address: None,
             cidr: String::new(),
             role: InterfaceRole::Input,
             managed: true,
@@ -132,6 +134,7 @@ fn interface_edit_preserves_client_and_nat_settings() {
 fn interface_edit_request_preserves_existing_dhcp_settings() {
     let existing_dhcp = dhcp_config();
     let existing = InterfaceConfig {
+        mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some("192.168.50.1/24".parse().expect("valid cidr")),
@@ -142,6 +145,7 @@ fn interface_edit_request_preserves_existing_dhcp_settings() {
         nat: true,
     };
     let edit = InterfaceEditRequest {
+        mac_address: None,
         cidr: "192.168.60.1/24".to_string(),
         role: InterfaceRole::Output,
         managed: true,
@@ -178,6 +182,7 @@ fn wifi_ap_config_fixture(ssid: &str) -> crate::config::WifiApConfig {
 fn interface_edit_request_preserves_existing_wifi_settings_while_managed() {
     let existing_wifi = wifi_ap_config_fixture("home-net");
     let existing = InterfaceConfig {
+        mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some("192.168.50.1/24".parse().expect("valid cidr")),
@@ -188,6 +193,7 @@ fn interface_edit_request_preserves_existing_wifi_settings_while_managed() {
         nat: true,
     };
     let edit = InterfaceEditRequest {
+        mac_address: None,
         cidr: "192.168.60.1/24".to_string(),
         role: InterfaceRole::Output,
         managed: true,
@@ -207,6 +213,7 @@ fn interface_edit_request_preserves_existing_wifi_settings_while_managed() {
 #[test]
 fn interface_edit_request_drops_wifi_settings_when_unmanaged() {
     let existing = InterfaceConfig {
+        mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some("192.168.50.1/24".parse().expect("valid cidr")),
@@ -217,6 +224,7 @@ fn interface_edit_request_drops_wifi_settings_when_unmanaged() {
         nat: true,
     };
     let edit = InterfaceEditRequest {
+        mac_address: None,
         cidr: String::new(),
         role: InterfaceRole::Output,
         managed: false,
@@ -232,6 +240,7 @@ fn interface_edit_request_drops_wifi_settings_when_unmanaged() {
 #[test]
 fn unmanaging_an_interface_with_a_running_ap_requires_explicit_confirmation() {
     let current = InterfaceConfig {
+        mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some("192.168.50.1/24".parse().expect("valid cidr")),
@@ -266,6 +275,7 @@ fn unmanaging_an_interface_with_a_running_ap_requires_explicit_confirmation() {
 #[test]
 fn unmanaging_an_interface_with_no_router_services_needs_no_confirmation() {
     let current = InterfaceConfig {
+        mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some("192.168.50.1/24".parse().expect("valid cidr")),
@@ -290,6 +300,7 @@ fn unmanaging_an_interface_with_no_router_services_needs_no_confirmation() {
 #[test]
 fn an_empty_cidr_removes_the_configured_address() {
     let existing = InterfaceConfig {
+        mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some("192.168.50.1/24".parse().expect("valid cidr")),
@@ -300,6 +311,7 @@ fn an_empty_cidr_removes_the_configured_address() {
         nat: true,
     };
     let edit = InterfaceEditRequest {
+        mac_address: None,
         cidr: String::new(),
         role: InterfaceRole::Output,
         managed: true,
@@ -319,6 +331,7 @@ fn an_empty_cidr_removes_the_configured_address() {
 #[test]
 fn removing_the_address_under_a_dhcp_server_says_what_to_disable_first() {
     let existing = InterfaceConfig {
+        mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some("192.168.50.1/24".parse().expect("valid cidr")),
@@ -329,6 +342,7 @@ fn removing_the_address_under_a_dhcp_server_says_what_to_disable_first() {
         nat: true,
     };
     let edit = InterfaceEditRequest {
+        mac_address: None,
         cidr: String::new(),
         role: InterfaceRole::Output,
         managed: true,
@@ -464,6 +478,7 @@ impl RouterSubsystems for FakeRouterSubsystems {
 
     async fn plan_for(&self, desired: &RouterDesired) -> Result<RouterSubsystemPlan> {
         let interfaces = vec![InterfaceChangePlan {
+            mac_address: None,
             interface: "lan0".into(),
             delete_ipv4: Vec::new(),
             retag_ipv4: None,
@@ -607,6 +622,7 @@ fn router_base_config() -> AppConfig {
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             role: InterfaceRole::Input,
             managed: false,
             ipv4: None,
@@ -621,6 +637,7 @@ fn router_base_config() -> AppConfig {
     config.network.interfaces.insert(
         "lan0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             role: InterfaceRole::Output,
             managed: true,
             ipv4: Some("192.168.10.1/24".parse().unwrap()),
@@ -667,6 +684,7 @@ async fn removing_an_interface_override_falls_back_to_the_file_configuration() {
         .expect("overrides");
 
     let overridden = InterfaceConfig {
+        mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some("10.9.9.1/24".parse().unwrap()),
@@ -1078,6 +1096,7 @@ async fn dhcp_uplink_plan_preserves_explicit_interface_override_while_enabling_d
         .get("wan0")
         .map(|request| request.config.clone())
         .unwrap_or_else(|| InterfaceConfig {
+            mac_address: None,
             role: InterfaceRole::Input,
             managed: true,
             ipv4: None,
@@ -2332,6 +2351,7 @@ fn wifi_base_config(directory: &std::path::Path) -> AppConfig {
     config.network.interfaces.insert(
         "wlan0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             role: InterfaceRole::Output,
             managed: true,
             ipv4: Some("192.168.101.1/24".parse().unwrap()),
@@ -2530,6 +2550,7 @@ async fn get_wifi_config_reports_none_for_an_interface_without_a_wifi_block() {
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             role: InterfaceRole::Input,
             managed: false,
             ipv4: None,
@@ -3078,6 +3099,7 @@ async fn wifi_set_passphrase_applies_live_via_reload() {
     config.network.interfaces.insert(
         "wlan0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             role: InterfaceRole::Output,
             managed: true,
             ipv4: Some("192.168.101.1/24".parse().unwrap()),
@@ -3154,6 +3176,7 @@ async fn wifi_configured_response_never_serializes_the_passphrase_that_was_just_
     config.network.interfaces.insert(
         "wlan0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             role: InterfaceRole::Output,
             managed: true,
             ipv4: Some("192.168.101.1/24".parse().unwrap()),
@@ -3500,6 +3523,7 @@ fn wifi_client_base_config(directory: &std::path::Path) -> AppConfig {
     config.network.interfaces.insert(
         "wlan1".to_string(),
         InterfaceConfig {
+            mac_address: None,
             role: InterfaceRole::Input,
             managed: true,
             ipv4: None,
@@ -3961,6 +3985,7 @@ async fn autoconnect_is_blocked_by_pending_transaction_on_another_interface() {
     assert!(matches!(created, Response::WifiClientProfile { .. }));
 
     let target = InterfaceConfig {
+        mac_address: None,
         role: InterfaceRole::Input,
         managed: true,
         ipv4: None,
@@ -4307,6 +4332,7 @@ async fn configuring_a_client_on_an_output_interface_is_an_invalid_spec() {
     config.network.interfaces.insert(
         "wlan2".to_string(),
         InterfaceConfig {
+            mac_address: None,
             role: InterfaceRole::Output,
             managed: true,
             ipv4: Some("192.168.9.1/24".parse().unwrap()),
@@ -4625,6 +4651,7 @@ async fn dhcp_client_control_fixture_with_router(
         config.network.interfaces.insert(
             "lan0".to_string(),
             InterfaceConfig {
+                mac_address: None,
                 role: InterfaceRole::Output,
                 managed: true,
                 ipv4: Some("10.9.0.1/24".parse().expect("output subnet")),
@@ -4639,6 +4666,7 @@ async fn dhcp_client_control_fixture_with_router(
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             role: InterfaceRole::Input,
             managed: true,
             ipv4: None,
@@ -5904,6 +5932,7 @@ async fn provisioning_rejects_a_management_interface_without_confirmation() {
     config.network.interfaces.insert(
         "wlan-up".to_string(),
         InterfaceConfig {
+            mac_address: None,
             role: InterfaceRole::None,
             managed: false,
             ipv4: Some("192.168.1.20/24".parse().unwrap()),
@@ -6650,6 +6679,7 @@ async fn unrelated_recovery_does_not_block_interface_commit_or_rollback() {
     config.runtime.state_dir = directory.path().to_path_buf();
     config.dhcp.leases_dir = directory.path().join("leases");
     let interface = InterfaceConfig {
+        mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some("192.168.77.1/24".parse().unwrap()),

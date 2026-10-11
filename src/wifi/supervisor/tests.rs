@@ -183,6 +183,7 @@ fn ap_config(ssid: &str) -> WifiApConfig {
 
 fn spec(interface: &str, ssid: &str) -> WifiApSpec {
     let config = InterfaceConfig {
+        mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some("192.168.101.1/24".parse().expect("network")),
@@ -268,6 +269,7 @@ async fn effective_specs_derives_one_spec_per_access_point_interface() {
     config.network.interfaces.insert(
         "wlan0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             role: InterfaceRole::Output,
             managed: true,
             ipv4: Some("192.168.101.1/24".parse().unwrap()),
@@ -281,6 +283,7 @@ async fn effective_specs_derives_one_spec_per_access_point_interface() {
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             role: InterfaceRole::Input,
             managed: false,
             ipv4: None,

@@ -96,6 +96,7 @@ const PROPOSED: &str = "192.168.50.1/24";
 
 fn interface_config(cidr: &str) -> InterfaceConfig {
     InterfaceConfig {
+        mac_address: None,
         nat: true,
         role: InterfaceRole::Output,
         managed: true,

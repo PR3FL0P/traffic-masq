@@ -128,6 +128,8 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterfaceConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac_address: Option<traffic_masq_protocol::MacAddr>,
     pub role: InterfaceRole,
     #[serde(default)]
     pub managed: bool,
@@ -793,6 +795,17 @@ impl OwnedIpv4RouteConfig {
 impl InterfaceConfig {
     /// Validate role/management, IPv4 and role-specific DHCP/AP/STA compatibility; no device probing.
     pub fn validate(&self, name: &str) -> Result<()> {
+        if let Some(mac) = self.mac_address {
+            anyhow::ensure!(self.managed, "MAC address requires a managed interface");
+            anyhow::ensure!(
+                self.role != InterfaceRole::Middle,
+                "MAC address cannot be configured on a WireGuard interface"
+            );
+            anyhow::ensure!(
+                mac.octets() != [0; 6] && mac.octets()[0] & 1 == 0,
+                "MAC address must be a nonzero unicast address"
+            );
+        }
         if self.role == InterfaceRole::Disabled && self.managed {
             bail!("disabled interface cannot be managed");
         }

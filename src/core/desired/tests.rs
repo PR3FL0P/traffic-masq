@@ -8,6 +8,7 @@ use super::*;
 
 fn interface(address: &str) -> InterfaceConfig {
     InterfaceConfig {
+        mac_address: None,
         nat: true,
         role: InterfaceRole::Output,
         managed: true,

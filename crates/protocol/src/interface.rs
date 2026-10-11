@@ -21,6 +21,8 @@ fn default_max_stations() -> u16 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterfaceConfigView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac_address: Option<crate::MacAddr>,
     pub role: InterfaceRole,
     #[serde(default)]
     pub managed: bool,

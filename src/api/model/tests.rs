@@ -9,6 +9,7 @@ fn interface_request_view_preserves_nested_config_json() {
     };
 
     let config = InterfaceConfig {
+        mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some("192.0.2.1/24".parse().unwrap()),
@@ -90,6 +91,7 @@ fn router_proposal_view_preserves_nested_config_json() {
             "lan0".into(),
             InterfaceOverrideRequest {
                 config: InterfaceConfig {
+                    mac_address: None,
                     role: InterfaceRole::Output,
                     managed: true,
                     ipv4: Some("192.0.2.1/24".parse().unwrap()),
@@ -356,6 +358,7 @@ fn router_plan_view_preserves_complete_wire_shape() {
             interfaces: vec![RouterInterfaceDesired {
                 name: "lan0".into(),
                 config: InterfaceConfig {
+                    mac_address: None,
                     role: crate::config::InterfaceRole::Output,
                     managed: true,
                     ipv4: Some("192.0.2.1/24".parse().unwrap()),
@@ -424,6 +427,7 @@ fn validated_ap_config_derives_the_same_client_spec() {
     use crate::config::{InterfaceRole, WifiApConfig};
 
     let config = InterfaceConfig {
+        mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some("192.0.2.1/24".parse().unwrap()),
@@ -541,6 +545,7 @@ fn interface_plan_view_preserves_json() {
         protocol: Some(201),
     };
     let plan = InterfaceChangePlan {
+        mac_address: None,
         interface: "lan0".into(),
         delete_ipv4: vec![address.clone()],
         retag_ipv4: Some(address.clone()),

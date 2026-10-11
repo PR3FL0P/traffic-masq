@@ -3065,6 +3065,7 @@ dependencies = [
  "hyper-util",
  "ipnet",
  "nix 0.29.0",
+ "rand",
  "ratatui",
  "rcgen",
  "rpassword",

@@ -48,6 +48,7 @@ async fn owned_addresses_remain_editable_after_restart_without_saved_interface_s
         assert!(manager.owns_address("eth0", &observed[1]).await);
         assert!(!manager.owns_address("eth0", &external).await);
         let target = InterfaceConfig {
+            mac_address: None,
             managed: true,
             role: InterfaceRole::None,
             ipv4: None,
@@ -90,6 +91,8 @@ struct FakeNetworkProvider {
     interfaces: Mutex<HashMap<String, NetworkInterface>>,
     addresses: Mutex<HashMap<String, Vec<Ipv4AddressInfo>>>,
     fail_address_read: Mutex<Option<String>>,
+    macs: Mutex<HashMap<String, [u8; 6]>>,
+    fail_mac_write: Mutex<bool>,
 }
 
 impl FakeNetworkProvider {
@@ -114,6 +117,24 @@ impl FakeNetworkProvider {
 
 #[async_trait]
 impl NetworkProvider for FakeNetworkProvider {
+    async fn mac_address(&self, name: &str) -> Result<Option<[u8; 6]>> {
+        Ok(self.macs.lock().await.get(name).copied())
+    }
+
+    async fn set_mac_address(&self, name: &str, mac: [u8; 6]) -> Result<()> {
+        anyhow::ensure!(
+            !self.interfaces.lock().await[name].is_up,
+            "MAC must be changed while down"
+        );
+        let mut fail = self.fail_mac_write.lock().await;
+        if *fail {
+            *fail = false;
+            anyhow::bail!("injected MAC write failure");
+        }
+        self.macs.lock().await.insert(name.into(), mac);
+        Ok(())
+    }
+
     fn supports_ipv4_address_protocol(&self) -> bool {
         true
     }
@@ -214,6 +235,7 @@ impl NetworkProvider for FakeNetworkProvider {
 
 fn config(role: InterfaceRole, address: &str) -> InterfaceConfig {
     InterfaceConfig {
+        mac_address: None,
         nat: true,
         role,
         managed: true,
@@ -607,6 +629,7 @@ async fn a_leftover_owned_address_is_cleaned_up_after_the_release_transition() {
     // Both sides already unmanaged: the managed -> unmanaged edge is long
     // gone, but our address is still sitting on the link.
     let unmanaged = InterfaceConfig {
+        mac_address: None,
         nat: true,
         role: InterfaceRole::Output,
         managed: false,
@@ -651,6 +674,7 @@ async fn applying_a_retag_honours_the_ownership_the_plan_carries() {
     // Not a plan the planner currently produces, which is the point: apply
     // must read the tag out of the plan instead of assuming Static.
     let plan = InterfaceChangePlan {
+        mac_address: None,
         interface: "eth0".to_string(),
         delete_ipv4: Vec::new(),
         retag_ipv4: Some(address_with_protocol(
@@ -964,6 +988,7 @@ async fn rollback_never_replays_dhcp_addresses_from_legacy_snapshots() {
         .await;
     let manager = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
     let legacy_snapshot = InterfaceSnapshot {
+        mac_address: None,
         name: "wan0".into(),
         was_up: true,
         ipv4_addresses: vec![Ipv4AddressInfo {
@@ -1121,4 +1146,76 @@ async fn apply_network_still_rolls_back_on_a_real_failure_after_success() {
         .await
         .expect("addresses");
     assert!(restored.is_empty());
+}
+
+#[tokio::test]
+async fn mac_change_is_previewed_idempotent_and_rolled_back() {
+    let provider = Arc::new(FakeNetworkProvider::default());
+    provider.add_interface("eth0", true, vec![]).await;
+    let original = [0x00, 1, 2, 3, 4, 5];
+    provider.macs.lock().await.insert("eth0".into(), original);
+    let manager = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
+    let snapshot = manager.snapshot("eth0").await.unwrap();
+    let mut target = config(InterfaceRole::Output, "192.168.50.1/24");
+    let generated = traffic_masq_protocol::MacAddr::new([0x02, 6, 7, 8, 9, 10]);
+    target.mac_address = Some(generated);
+    let plan = manager
+        .plan_interface("eth0", &target, Some(target.role), false)
+        .await
+        .unwrap();
+    assert_eq!(plan.mac_address, Some(generated));
+    assert_eq!(provider.mac_address("eth0").await.unwrap(), Some(original));
+    manager.apply_plan(&plan).await.unwrap();
+    assert_eq!(
+        provider.mac_address("eth0").await.unwrap(),
+        Some(generated.octets())
+    );
+    assert!(provider.interfaces.lock().await["eth0"].is_up);
+    assert_eq!(
+        manager
+            .plan_interface("eth0", &target, Some(target.role), false)
+            .await
+            .unwrap()
+            .mac_address,
+        None
+    );
+    manager.rollback(&snapshot).await.unwrap();
+    assert_eq!(provider.mac_address("eth0").await.unwrap(), Some(original));
+    assert!(provider.interfaces.lock().await["eth0"].is_up);
+}
+
+#[tokio::test]
+async fn rejected_mac_change_restores_identity_and_link_state() {
+    let provider = Arc::new(FakeNetworkProvider::default());
+    provider.add_interface("eth0", true, vec![]).await;
+    let original = [0x00, 1, 2, 3, 4, 5];
+    provider.macs.lock().await.insert("eth0".into(), original);
+    *provider.fail_mac_write.lock().await = true;
+    let manager = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
+    let mut target = config(InterfaceRole::Output, "192.168.50.1/24");
+    target.mac_address = Some(traffic_masq_protocol::MacAddr::new([0x02, 6, 7, 8, 9, 10]));
+    manager
+        .apply_interface("eth0", &target, Some(target.role), false)
+        .await
+        .unwrap_err();
+    assert_eq!(provider.mac_address("eth0").await.unwrap(), Some(original));
+    assert!(provider.interfaces.lock().await["eth0"].is_up);
+    assert!(provider
+        .list_ipv4_addresses("eth0")
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn invalid_mac_configuration_is_rejected() {
+    let mut target = config(InterfaceRole::Output, "192.168.50.1/24");
+    for bytes in [[0; 6], [0xff; 6], [1, 2, 3, 4, 5, 6]] {
+        target.mac_address = Some(traffic_masq_protocol::MacAddr::new(bytes));
+        assert!(target.validate("eth0").is_err());
+    }
+    target.mac_address = Some(traffic_masq_protocol::MacAddr::new([2, 1, 2, 3, 4, 5]));
+    assert!(target.validate("eth0").is_ok());
+    target.managed = false;
+    assert!(target.validate("eth0").is_err());
 }

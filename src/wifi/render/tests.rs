@@ -5,6 +5,7 @@ use crate::config::{InterfaceConfig, InterfaceRole, WifiApConfig};
 
 fn spec(security: WifiSecurity) -> WifiApSpec {
     let config = InterfaceConfig {
+        mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some("192.168.101.1/24".parse().expect("network")),

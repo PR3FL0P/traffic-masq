@@ -868,6 +868,7 @@ fn summarizes_only_output_interfaces_with_subnet() {
         RouterInterfaceDesiredView {
             name: "wan0".to_string(),
             config: InterfaceConfigView {
+                mac_address: None,
                 role: InterfaceRole::Input,
                 managed: false,
                 ipv4: None,
@@ -881,6 +882,7 @@ fn summarizes_only_output_interfaces_with_subnet() {
         RouterInterfaceDesiredView {
             name: "lan0".to_string(),
             config: InterfaceConfigView {
+                mac_address: None,
                 role: InterfaceRole::Output,
                 managed: true,
                 ipv4: Some("192.168.10.1/24".parse().unwrap()),

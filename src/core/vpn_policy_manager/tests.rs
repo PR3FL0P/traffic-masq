@@ -20,6 +20,7 @@ fn config_with_managed_output_and_uplink() -> AppConfig {
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             role: InterfaceRole::Input,
             managed: false,
             ipv4: None,
@@ -33,6 +34,7 @@ fn config_with_managed_output_and_uplink() -> AppConfig {
     config.network.interfaces.insert(
         "lan0".to_string(),
         InterfaceConfig {
+            mac_address: None,
             role: InterfaceRole::Output,
             managed: true,
             ipv4: Some("192.168.10.1/24".parse().expect("network")),
