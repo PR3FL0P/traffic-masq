@@ -341,6 +341,19 @@ pub(super) async fn open_route_editor_for_selected(app: &mut TuiApp, client: &Ap
     let Some(row) = rows.get(app.router.selected_route) else {
         return;
     };
+    // DHCP routes are configured through the client policy, rather than by
+    // replacing the observed kernel route with a static route.
+    if let Some(interface) = row
+        .observed
+        .as_ref()
+        .filter(|route| {
+            route.owner == RouteOwner::TrafficMasqDhcp && route.destination.prefix_len() == 0
+        })
+        .and_then(|route| route.output_interface.clone())
+    {
+        super::super::dhcp_client_editor::open(app, client, interface).await;
+        return;
+    }
     let Some(orig) = row.configured.clone() else {
         app.router.warning_message =
             Some("Observed route is read-only; it has no saved intent".into());

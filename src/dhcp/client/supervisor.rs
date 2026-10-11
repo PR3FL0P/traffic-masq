@@ -1222,7 +1222,20 @@ fn persisted_lease_matches_spec(lease: &DhcpClientLease, spec: &DhcpClientSpec) 
             install_default_route: spec.install_default_route,
             request_dns: spec.request_dns,
         })
-        && lease.owned_routes == expected_owned_routes(lease, spec)
+        && {
+            let mut expected = expected_owned_routes(lease, spec);
+            for route in &mut expected {
+                if route.destination.prefix_len() == 0 {
+                    if let Some(effective) = lease.owned_routes.iter().find(|owned| {
+                        owned.destination == route.destination
+                            && owned.metric.unwrap_or(0) >= spec.route_metric
+                    }) {
+                        route.metric = effective.metric;
+                    }
+                }
+            }
+            lease.owned_routes == expected
+        }
 }
 
 fn expected_owned_routes(

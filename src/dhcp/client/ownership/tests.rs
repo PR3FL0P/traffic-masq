@@ -252,7 +252,7 @@ async fn unrecorded_identical_and_different_prefix_addresses_are_refused() {
 }
 
 #[tokio::test]
-async fn foreign_route_blocks_apply_and_is_not_deleted() {
+async fn foreign_default_route_adjusts_metric_and_is_not_deleted() {
     let network = FakeNetwork::new();
     let owned = route("0.0.0.0/0");
     network.routes.lock().unwrap().push(Ipv4RouteInfo {
@@ -265,10 +265,9 @@ async fn foreign_route_blocks_apply_and_is_not_deleted() {
         scope: owned.scope,
     });
     let (_dir, _store, applier) = fixture(network.clone());
-    assert!(matches!(
-        applier.apply(lease()).await,
-        Err(OwnershipError::Conflict(OwnershipConflict::ForeignRoute))
-    ));
+    let applied = applier.apply(lease()).await.unwrap();
+    assert_eq!(applied.owned_routes[0].metric, Some(101));
+    applier.cleanup("eth0").await.unwrap();
     assert_eq!(
         network.routes.lock().unwrap()[0].protocol,
         TRAFFIC_MASQ_ROUTE_PROTOCOL
@@ -609,4 +608,100 @@ async fn missing_cleanup_preserves_proof_when_device_or_route_observation_fails(
         assert!(applier.cleanup("eth0").await.is_err());
         assert_eq!(store.load("eth0").unwrap(), Some(bound));
     }
+}
+
+#[tokio::test]
+async fn same_metric_default_selects_free_metric_and_preserves_it_on_renewal() {
+    let network = FakeNetwork::new();
+    network
+        .extra_interfaces
+        .lock()
+        .unwrap()
+        .push(NetworkInterface {
+            index: 9,
+            name: "other0".into(),
+            is_up: true,
+            rx_bytes: 0,
+            tx_bytes: 0,
+            is_wireless: false,
+        });
+    let desired = route("0.0.0.0/0");
+    let foreign = Ipv4RouteInfo {
+        destination: desired.destination,
+        gateway: Some(Ipv4Addr::new(192, 168, 112, 1)),
+        output_interface_index: Some(9),
+        table: 254,
+        metric: Some(100),
+        protocol: 16,
+        scope: 0,
+    };
+    network.routes.lock().unwrap().push(foreign.clone());
+    let (_dir, store, applier) = fixture(network.clone());
+    let mut occupied = foreign.clone();
+    occupied.metric = Some(101);
+    network.routes.lock().unwrap().push(occupied.clone());
+    let applied = applier.apply(lease()).await.unwrap();
+    assert_eq!(applied.owned_routes[0].metric, Some(102));
+    assert_eq!(store.load("eth0").unwrap(), Some(applied.clone()));
+    assert_eq!(
+        applier.apply(lease()).await.unwrap().owned_routes,
+        applied.owned_routes
+    );
+    assert_eq!(network.routes.lock().unwrap().len(), 3);
+    assert_eq!(applier.adopt("eth0", 1).await.unwrap(), Some(applied));
+    applier.cleanup("eth0").await.unwrap();
+    assert_eq!(
+        network.routes.lock().unwrap().as_slice(),
+        &[foreign, occupied]
+    );
+    assert!(network.addresses.lock().unwrap().is_empty());
+    assert!(store.load("eth0").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn different_metric_default_coexists_without_replacing_foreign_route() {
+    let network = FakeNetwork::new();
+    let foreign = Ipv4RouteInfo {
+        destination: "0.0.0.0/0".parse().unwrap(),
+        gateway: Some(Ipv4Addr::new(192, 168, 112, 1)),
+        output_interface_index: Some(9),
+        table: 254,
+        metric: Some(100),
+        protocol: 16,
+        scope: 0,
+    };
+    network.routes.lock().unwrap().push(foreign.clone());
+    let (_dir, _store, applier) = fixture(network.clone());
+    let mut requested = lease();
+    requested.owned_routes[0].metric = Some(200);
+    applier.apply(requested).await.unwrap();
+    applier.cleanup("eth0").await.unwrap();
+    assert_eq!(network.routes.lock().unwrap().as_slice(), &[foreign]);
+}
+
+#[tokio::test]
+async fn exhausted_default_metric_fails_without_mutation() {
+    let network = FakeNetwork::new();
+    let mut requested = lease();
+    requested.owned_routes[0].metric = Some(u32::MAX);
+    let owned = &requested.owned_routes[0];
+    network.routes.lock().unwrap().push(Ipv4RouteInfo {
+        destination: owned.destination,
+        gateway: owned.gateway,
+        output_interface_index: Some(9),
+        table: owned.table,
+        metric: owned.metric,
+        protocol: 16,
+        scope: owned.scope,
+    });
+    let (_dir, store, applier) = fixture(network.clone());
+    assert!(applier
+        .apply(requested)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("no lower-priority metric"));
+    assert!(network.addresses.lock().unwrap().is_empty());
+    assert!(store.load("eth0").unwrap().is_none());
+    assert_eq!(network.routes.lock().unwrap().len(), 1);
 }

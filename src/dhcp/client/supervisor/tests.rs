@@ -1272,3 +1272,56 @@ async fn changing_hostname_restarts_the_client_and_clearing_it_stops_advertising
         .shutdown(ShutdownPolicy::PreserveInterfaces)
         .await;
 }
+
+#[tokio::test]
+async fn an_adjusted_default_metric_is_adopted_on_restart() {
+    let state_dir = TempDir::new().expect("state dir");
+    let network = FakeNetwork::present(7).await;
+    network.routes.lock().await.push(Ipv4RouteInfo {
+        destination: "0.0.0.0/0".parse().unwrap(),
+        gateway: Some(Ipv4Addr::new(192, 168, 112, 1)),
+        output_interface_index: Some(9),
+        table: 254,
+        metric: Some(100),
+        protocol: 16,
+        scope: 0,
+    });
+    let launcher = Arc::new(FakeLauncher::default());
+    let supervisor = supervisor_with(&state_dir, network.clone(), launcher.clone()).await;
+    let mut sink = launcher.take_sink();
+    sink.lease_acquired(lease(Ipv4Addr::new(192, 0, 2, 42)))
+        .await
+        .expect("lease applied");
+
+    let store = DhcpClientLeaseStore::new(state_dir.path()).unwrap();
+    assert!(store
+        .load("wan0")
+        .unwrap()
+        .unwrap()
+        .owned_routes
+        .iter()
+        .any(|route| route.metric == Some(101)));
+    let restarted = supervisor_with(&state_dir, network.clone(), launcher.clone()).await;
+    assert_eq!(
+        launcher
+            .remembered
+            .lock()
+            .unwrap()
+            .last()
+            .copied()
+            .flatten(),
+        Some(Ipv4Addr::new(192, 0, 2, 42)),
+        "a valid persisted lease must be adopted into INIT-REBOOT"
+    );
+    assert_eq!(
+        restarted
+            .status("wan0")
+            .await
+            .expect("status")
+            .lease
+            .expect("lease")
+            .address,
+        Ipv4Addr::new(192, 0, 2, 42)
+    );
+    drop(supervisor);
+}

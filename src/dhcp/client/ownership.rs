@@ -26,7 +26,7 @@ pub enum OwnershipConflict {
         observed_index: u32,
         observed_mac: Vec<u8>,
     },
-    #[error("address {address} already exists without exact ownership proof")]
+    #[error("address {address} already exists without exact ownership proof; inspect `ip -4 -details address show` and reconfigure the DHCP client or service managing that address manually; traffic-masq will not adopt or delete it")]
     ForeignAddress { address: std::net::Ipv4Addr },
     #[error(
         "address {address} exists with prefix /{observed_prefix}, requested /{requested_prefix}"
@@ -36,8 +36,8 @@ pub enum OwnershipConflict {
         observed_prefix: u8,
         requested_prefix: u8,
     },
-    #[error("route conflicts with foreign or unrecorded kernel state")]
-    ForeignRoute,
+    #[error("route conflicts with foreign or unrecorded kernel state: {diagnostics}")]
+    ForeignRoute { diagnostics: String },
     #[error("persisted lease has expired")]
     Expired,
     #[error("persisted and observed kernel state do not match exactly")]
@@ -144,17 +144,77 @@ impl DhcpClientOwnershipApplier {
             .list_ipv4_routes()
             .await
             .map_err(OwnershipError::Network)?;
+        // Keep the effective metric stable across renewals, while retaining the
+        // requested metric in policy so explicit configuration changes take effect.
+        for desired in &mut lease.owned_routes {
+            if desired.destination.prefix_len() != 0 {
+                continue;
+            }
+            let requested_metric = desired.metric.unwrap_or(0);
+            if let Some(previous) = prior
+                .as_ref()
+                .filter(|record| {
+                    record.interface == lease.interface
+                        && record.interface_index == lease.interface_index
+                        && record.hardware_address == lease.hardware_address
+                        && record.client_identifier == lease.client_identifier
+                        && record.policy == lease.policy
+                })
+                .and_then(|record| {
+                    record.owned_routes.iter().find(|route| {
+                        route.destination == desired.destination
+                            && route.gateway == desired.gateway
+                            && route.table == desired.table
+                            && route.output_interface_index == desired.output_interface_index
+                            && route.metric.unwrap_or(0) >= requested_metric
+                    })
+                })
+            {
+                desired.metric = previous.metric;
+            }
+            loop {
+                let collision = routes.iter().find(|observed| {
+                    route_collision_matches(observed, desired)
+                        && !(route_complete_matches(observed, desired)
+                            && prior.as_ref().is_some_and(|record| {
+                                record.interface == lease.interface
+                                    && record.interface_index == lease.interface_index
+                                    && record.hardware_address == lease.hardware_address
+                                    && record.client_identifier == lease.client_identifier
+                                    && record.owned_routes.contains(desired)
+                            }))
+                });
+                if collision.is_none() {
+                    break;
+                }
+                let Some(metric) = desired.metric.unwrap_or(0).checked_add(1) else {
+                    return Err(OwnershipConflict::ForeignRoute {
+                        diagnostics: format!("no lower-priority metric is available for DHCP default route on {} in table {}; requested metric {}. Open Router to inspect routes, then DHCP Client > {} > e (edit) > Route metric > Apply DHCP client settings now", lease.interface, desired.table, requested_metric, lease.interface),
+                    }.into());
+                };
+                desired.metric = Some(metric);
+            }
+            if desired.metric.unwrap_or(0) != requested_metric {
+                tracing::warn!(
+                    interface = %lease.interface,
+                    requested_metric,
+                    effective_metric = desired.metric.unwrap_or(0),
+                    table = desired.table,
+                    "DHCP default route metric adjusted to a free value with lower priority. Existing routes are preserved. To change it: 1) Open Router; 2) Select this interface's default route (0.0.0.0/0, traffic-masq (dhcp)); 3) Press e to open DHCP Client settings; 4) Set Route metric to an unused value; 5) Select Apply DHCP client settings now and press Enter. Higher metric means lower priority. The saved setting remains the requested value; the effective metric is stored with the lease."
+                );
+            }
+        }
         for desired in &lease.owned_routes {
             let same_key = routes
                 .iter()
-                .filter(|route| route_key_matches(route, desired));
+                .filter(|route| route_collision_matches(route, desired));
             for observed in same_key {
                 if !route_complete_matches(observed, desired)
                     || !prior.as_ref().is_some_and(|record| {
                         same_identity(record, &lease) && record.owned_routes.contains(desired)
                     })
                 {
-                    return Err(OwnershipConflict::ForeignRoute.into());
+                    return Err(self.route_conflict(&lease, desired, observed).await);
                 }
             }
         }
@@ -181,10 +241,19 @@ impl DhcpClientOwnershipApplier {
                     .iter()
                     .any(|observed| route_complete_matches(observed, route))
                 {
-                    self.network
-                        .add_ipv4_route(&route_spec(route))
-                        .await
-                        .map_err(OwnershipError::Network)?;
+                    if let Err(error) = self.network.add_ipv4_route(&route_spec(route)).await {
+                        // Another manager may have installed a route since the preflight.
+                        // Observe again for useful diagnostics; never adopt or replace it.
+                        if let Ok(current) = self.network.list_ipv4_routes().await {
+                            if let Some(observed) = current
+                                .iter()
+                                .find(|observed| route_collision_matches(observed, route))
+                            {
+                                return Err(self.route_conflict(&lease, route, observed).await);
+                            }
+                        }
+                        return Err(OwnershipError::Network(error));
+                    }
                     added_routes.push(route.clone());
                 }
             }
@@ -226,6 +295,30 @@ impl DhcpClientOwnershipApplier {
         lease.state = DhcpClientLeaseState::Bound;
         self.store.save(&lease)?;
         Ok(lease)
+    }
+
+    async fn route_conflict(
+        &self,
+        lease: &DhcpClientLease,
+        desired: &DhcpClientOwnedRoute,
+        observed: &Ipv4RouteInfo,
+    ) -> OwnershipError {
+        let interfaces = self.network.list_interfaces().await.unwrap_or_default();
+        let output = observed
+            .output_interface_index
+            .and_then(|index| interfaces.iter().find(|item| item.index == index))
+            .map(|item| item.name.clone())
+            .unwrap_or_else(|| format!("ifindex={:?}", observed.output_interface_index));
+        OwnershipConflict::ForeignRoute {
+                        diagnostics: format!(
+                            "requested {} via {:?} dev {} metric {} table {}; existing {} via {:?} dev {} metric {} protocol {} ({}) table {}. The route protocol is not proof of its creating process. To keep the existing route, change DHCP route_metric on {} to an unused value (higher means lower preference), then retry. To remove the conflict, inspect `ip -4 -details route show table {}` and change the configuration of the manager that installed the existing route. traffic-masq will not replace or delete it",
+                            desired.destination, desired.gateway, lease.interface,
+                            desired.metric.unwrap_or(0), desired.table,
+                            observed.destination, observed.gateway, output,
+                            observed.metric.unwrap_or(0), observed.protocol, observed.owner(), observed.table,
+                            lease.interface, observed.table,
+                        ),
+                    }.into()
     }
 
     pub async fn adopt(
@@ -637,6 +730,14 @@ fn same_identity(left: &DhcpClientLease, right: &DhcpClientLease) -> bool {
         && left.interface_index == right.interface_index
         && left.hardware_address == right.hardware_address
         && left.client_identifier == right.client_identifier
+}
+
+// Linux exclusive route creation collides on prefix/table/priority even
+// when the nexthop points at another interface or gateway.
+fn route_collision_matches(route: &Ipv4RouteInfo, owned: &DhcpClientOwnedRoute) -> bool {
+    route.destination == owned.destination
+        && route.table == owned.table
+        && route.metric.unwrap_or(0) == owned.metric.unwrap_or(0)
 }
 
 fn route_key_matches(route: &Ipv4RouteInfo, owned: &DhcpClientOwnedRoute) -> bool {

@@ -1449,3 +1449,25 @@ async fn plan_distinguishes_unavailable_lease_counts_from_an_empty_lease_list() 
     assert!(summary[0].contains("lease count unavailable"));
     assert!(summary[1].contains("0 lease(s)"));
 }
+
+#[tokio::test]
+async fn editing_dhcp_default_route_opens_client_metric_settings() {
+    let (_directory, client, server) = router_mock_api(vec![Response::InterfaceConfig {
+        interface: "eth0".into(),
+        config: None,
+        allow_management_change: false,
+    }])
+    .await;
+    let mut app = TuiApp::default();
+    app.screen = Screen::Router;
+    app.router.routes = vec![route_status(
+        &route_config("0.0.0.0/0"),
+        RouteOwner::TrafficMasqDhcp,
+    )];
+    super::editor::open_route_editor_for_selected(&mut app, &client).await;
+    assert_eq!(app.screen, Screen::DhcpClientEditor);
+    assert!(app.dhcp_client_editor.is_some());
+    assert!(app.router.editor.is_none());
+    assert!(!app.router.staged);
+    server.await.unwrap();
+}

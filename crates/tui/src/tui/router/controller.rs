@@ -128,7 +128,7 @@ pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &A
                     }
                     app.router.warning_message = None;
                 }
-                KeyCode::Enter => {
+                KeyCode::Enter | KeyCode::Char('e') => {
                     open_route_editor_for_selected(app, client).await;
                 }
                 KeyCode::Delete => {
