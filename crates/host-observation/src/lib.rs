@@ -9,3 +9,12 @@ pub use init::{
     InitSystem,
 };
 pub use managers::find_competing_network_managers;
+
+mod ports;
+pub use ports::{
+    foreign_ipv4_udp_listener_diagnostics, tcp_bind_conflict_diagnostics,
+    udp_bind_conflict_diagnostics,
+};
+
+mod locks;
+pub use locks::file_lock_diagnostics;
