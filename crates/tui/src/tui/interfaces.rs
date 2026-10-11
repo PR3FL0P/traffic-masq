@@ -20,22 +20,24 @@ pub(crate) enum InterfaceEditorField {
     RemoveIpv4,
     Role,
     Managed,
+    MacAddress,
     RandomizeMac,
     Save,
 }
 
-const INTERFACE_EDITOR_FIELDS: [InterfaceEditorField; 6] = [
+const INTERFACE_EDITOR_FIELDS: [InterfaceEditorField; 7] = [
     InterfaceEditorField::Cidr,
     InterfaceEditorField::RemoveIpv4,
     InterfaceEditorField::Role,
     InterfaceEditorField::Managed,
+    InterfaceEditorField::MacAddress,
     InterfaceEditorField::RandomizeMac,
     InterfaceEditorField::Save,
 ];
 
 #[derive(Debug, Clone)]
 pub(crate) struct InterfaceEditor {
-    pub(crate) mac_address: Option<traffic_masq_protocol::MacAddr>,
+    pub(crate) mac_address: String,
     pub(crate) interface: String,
     pub(crate) saved_config: Option<traffic_masq_protocol::InterfaceConfigView>,
     pub(crate) offline_revision: Option<u64>,
@@ -63,11 +65,11 @@ pub(crate) struct InterfaceEditor {
 
 impl InterfaceEditor {
     pub(crate) fn reset_cursor(&mut self) {
-        if self.field == InterfaceEditorField::Cidr {
-            self.cursor = super::input::grapheme_count(&self.cidr);
-        } else {
-            self.cursor = 0;
-        }
+        self.cursor = match self.field {
+            InterfaceEditorField::Cidr => super::input::grapheme_count(&self.cidr),
+            InterfaceEditorField::MacAddress => super::input::grapheme_count(&self.mac_address),
+            _ => 0,
+        };
     }
 
     /// Ask for the address to be taken off. An empty CIDR field is the request:
@@ -77,10 +79,28 @@ impl InterfaceEditor {
         self.cursor = 0;
     }
 
+    fn parsed_mac_address(&self) -> Result<Option<traffic_masq_protocol::MacAddr>> {
+        if self.mac_address.trim().is_empty() {
+            return Ok(None);
+        }
+        let mac: traffic_masq_protocol::MacAddr =
+            self.mac_address.trim().parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "Invalid MAC address — expected six hex pairs, e.g. 02:11:22:33:44:55"
+                )
+            })?;
+        anyhow::ensure!(
+            mac.octets() != [0; 6] && mac.octets()[0] & 1 == 0,
+            "MAC address must be a non-zero unicast address"
+        );
+        Ok(Some(mac))
+    }
+
     pub(crate) fn edit_request(&self) -> Result<InterfaceEditRequest> {
+        let mac_address = self.parsed_mac_address()?;
         // Router participation is independent of address ownership.
         // Address edits require traffic-masq configuration to be enabled.
-        if self.mac_address.is_some() && !self.managed {
+        if mac_address.is_some() && !self.managed {
             anyhow::bail!("MAC address requires Configure with traffic-masq");
         }
         if !self.managed {
@@ -130,7 +150,7 @@ impl InterfaceEditor {
             );
         }
         Ok(InterfaceEditRequest {
-            mac_address: self.mac_address,
+            mac_address,
             cidr: if self.managed {
                 self.cidr.trim().to_string()
             } else {
@@ -571,12 +591,35 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
             InterfaceEditorField::Managed,
         ),
     ]);
-    lines.push(row(
-        "Generate random MAC",
-        editor
-            .mac_address
-            .map_or_else(|| "Enter to generate".into(), |mac| mac.to_string()),
+    let mac_active = editor.field == InterfaceEditorField::MacAddress;
+    let mac_style = Style::default().fg(theme::ACCENT);
+    let mut mac_spans = vec![Span::styled(
+        format!(
+            "{}MAC address (manual): ",
+            if mac_active { "▶ " } else { "  " }
+        ),
+        mac_style,
+    )];
+    mac_spans.extend(super::input::render_value_with_cursor(
+        &editor.mac_address,
+        editor.cursor,
+        mac_active && editor.managed,
+        mac_style,
+    ));
+    lines.push(Line::from(mac_spans));
+    if let Err(error) = editor.parsed_mac_address() {
+        lines.push(Line::styled(
+            format!("  {error}"),
+            Style::default().fg(theme::BAD),
+        ));
+    }
+    lines.push(action_row(
+        "Generate random MAC (Enter)",
         InterfaceEditorField::RandomizeMac,
+    ));
+    lines.push(Line::styled(
+        "  Type MAC manually or generate above; empty MAC keeps the current address",
+        Style::default().fg(theme::MUTED),
     ));
     lines.push(Line::styled(
         "None: outside the router. Review changes before applying.",
@@ -597,7 +640,7 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         ));
     }
     lines.push(Line::styled(
-        "j/k or arrows: move | Enter/Space: activate | type digits, '.', '/' to edit CIDR (e.g. 192.168.1.10/24)",
+        "Tab or up/down: move | Enter/Space: activate | type to edit IPv4 CIDR or MAC",
         Style::default().fg(theme::MUTED),
     ));
     lines.push(Line::styled(
@@ -990,7 +1033,11 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
                 .map(|dhcp| format!("DHCP pool {}-{}", dhcp.pool_start, dhcp.pool_end));
             let cursor = super::input::grapheme_count(&cidr);
             app.editor = Some(InterfaceEditor {
-                mac_address: config.as_ref().and_then(|config| config.mac_address),
+                mac_address: config
+                    .as_ref()
+                    .and_then(|config| config.mac_address)
+                    .map(|mac| mac.to_string())
+                    .unwrap_or_default(),
                 interface: name,
                 saved_config: config.clone(),
                 offline_revision,
@@ -1119,6 +1166,7 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
     }
 
     let mut unmanaged_ip_attempt = false;
+    let mut unmanaged_mac_attempt = false;
 
     match key {
         KeyCode::F(5) if editor.offline_revision.is_some() => {
@@ -1132,7 +1180,7 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
             editor.field = previous_editor_field(editor.field);
             editor.reset_cursor();
         }
-        KeyCode::Up => {
+        KeyCode::Up | KeyCode::BackTab => {
             editor.field = previous_editor_field(editor.field);
             editor.reset_cursor();
         }
@@ -1140,12 +1188,12 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
             editor.field = next_editor_field(editor.field);
             editor.reset_cursor();
         }
-        KeyCode::Down => {
+        KeyCode::Down | KeyCode::Tab => {
             editor.field = next_editor_field(editor.field);
             editor.reset_cursor();
         }
         KeyCode::Enter | KeyCode::Char(' ') => match editor.field {
-            InterfaceEditorField::Cidr => {}
+            InterfaceEditorField::Cidr | InterfaceEditorField::MacAddress => {}
             InterfaceEditorField::RemoveIpv4 => {
                 if editor.managed {
                     editor.remove_ipv4();
@@ -1157,7 +1205,7 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
             InterfaceEditorField::Managed => {
                 editor.managed = !editor.managed;
                 if !editor.managed {
-                    editor.mac_address = None;
+                    editor.mac_address.clear();
                 }
             }
             InterfaceEditorField::RandomizeMac => {
@@ -1166,11 +1214,28 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
                     let mut octets = [0; 6];
                     rand::rngs::OsRng.fill_bytes(&mut octets);
                     octets[0] = (octets[0] & 0xfc) | 0x02;
-                    editor.mac_address = Some(traffic_masq_protocol::MacAddr::new(octets));
+                    editor.mac_address = traffic_masq_protocol::MacAddr::new(octets).to_string();
+                } else {
+                    unmanaged_mac_attempt = true;
                 }
             }
             InterfaceEditorField::Save => submit_dry_run(app, client).await,
         },
+        other if editor.field == InterfaceEditorField::MacAddress && editor.managed => {
+            super::input::TextEditor::new(&mut editor.mac_address, &mut editor.cursor)
+                .handle_key_filtered(other, |c| c.is_ascii_hexdigit() || c == ':');
+        }
+        KeyCode::Char(c)
+            if editor.field == InterfaceEditorField::MacAddress
+                && (c.is_ascii_hexdigit() || c == ':') =>
+        {
+            unmanaged_mac_attempt = true;
+        }
+        KeyCode::Backspace | KeyCode::Delete
+            if editor.field == InterfaceEditorField::MacAddress =>
+        {
+            unmanaged_mac_attempt = true;
+        }
         other if editor.field == InterfaceEditorField::Cidr && editor.managed => {
             let cursor = &mut editor.cursor;
             super::input::TextEditor::new(&mut editor.cidr, cursor)
@@ -1188,6 +1253,12 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
         _ => {}
     }
 
+    if unmanaged_mac_attempt {
+        app.push_message(
+            LogLevel::Warn,
+            "MAC editing requires managed mode. Enable Configure with traffic-masq first.",
+        );
+    }
     if unmanaged_ip_attempt {
         app.push_message(
             LogLevel::Warn,

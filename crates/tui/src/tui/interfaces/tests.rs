@@ -149,7 +149,7 @@ fn editor_keeps_explicit_saved_configuration_and_does_not_choose_between_owned_a
 }
 
 #[tokio::test]
-async fn keyboard_ip_edit_previews_applies_and_confirms_the_typed_address() {
+async fn keyboard_ip_and_mac_edit_previews_applies_and_confirms_the_typed_addresses() {
     use http_body_util::{BodyExt, Full};
     use hyper::{body::Bytes, server::conn::http1, service::service_fn};
     use hyper_util::rt::TokioIo;
@@ -173,7 +173,7 @@ async fn keyboard_ip_edit_previews_applies_and_confirms_the_typed_address() {
         },
         Response::InterfacePlan {
             plan: traffic_masq_protocol::InterfaceChangePlanView {
-                mac_address: None,
+                mac_address: Some("02:11:22:33:44:55".parse().unwrap()),
                 interface: "wlp1s0".into(),
                 delete_ipv4: vec![],
                 retag_ipv4: None,
@@ -230,6 +230,7 @@ async fn keyboard_ip_edit_previews_applies_and_confirms_the_typed_address() {
     });
     let client = ApiClient::new(socket);
     let mut app = TuiApp::default();
+    app.ui.input_enabled = true;
     let mut status = observed_address(None, Some(false));
     status.ipv4_addresses.clear();
     app.dashboard.interfaces.push(status);
@@ -238,6 +239,16 @@ async fn keyboard_ip_edit_previews_applies_and_confirms_the_typed_address() {
     assert!(app.editor.as_ref().unwrap().managed);
     for character in "198.18.0.1/24".chars() {
         handle_editor_key(&mut app, KeyCode::Char(character), &client).await;
+    }
+    for _ in 0..4 {
+        super::super::handle_key(&mut app, KeyCode::Tab, &client, false).await;
+    }
+    assert_eq!(
+        app.editor.as_ref().unwrap().field,
+        InterfaceEditorField::MacAddress
+    );
+    for character in "02:11:22:33:44:55".chars() {
+        super::super::handle_key(&mut app, KeyCode::Char(character), &client, false).await;
     }
     submit_dry_run(&mut app, &client).await;
     assert_eq!(app.screen, Screen::Preview);
@@ -255,6 +266,7 @@ async fn keyboard_ip_edit_previews_applies_and_confirms_the_typed_address() {
     for (_, body) in &requests[..2] {
         assert_eq!(body["cidr"], "198.18.0.1/24");
         assert_eq!(body["managed"], true);
+        assert_eq!(body["mac_address"], "02:11:22:33:44:55");
     }
     assert_eq!(requests[2].0, "/api/v1/network-transactions/commit");
     assert_eq!(requests[2].1["token"], "ip-test-token");
@@ -262,7 +274,7 @@ async fn keyboard_ip_edit_previews_applies_and_confirms_the_typed_address() {
 
 fn default_route_editor(allow_management_change: bool) -> InterfaceEditor {
     InterfaceEditor {
-        mac_address: None,
+        mac_address: String::new(),
         saved_config: None,
         offline_revision: None,
         intent_confirmation: None,
@@ -495,9 +507,116 @@ async fn random_mac_is_local_unicast_and_kept_in_the_apply_request() {
     let client = ApiClient::new(std::path::PathBuf::from("/unused-mac-test.sock"));
     handle_editor_key(&mut app, KeyCode::Enter, &client).await;
     let editor = app.editor.as_ref().unwrap();
-    let mac = editor.mac_address.unwrap();
+    let mac: traffic_masq_protocol::MacAddr = editor.mac_address.parse().unwrap();
     assert_eq!(mac.octets()[0] & 3, 2);
     assert_eq!(editor.edit_request().unwrap().mac_address, Some(mac));
     handle_editor_key(&mut app, KeyCode::Enter, &client).await;
-    assert_ne!(app.editor.as_ref().unwrap().mac_address, Some(mac));
+    assert_ne!(app.editor.as_ref().unwrap().mac_address, mac.to_string());
+}
+
+#[tokio::test]
+async fn manual_mac_can_be_typed_edited_and_cleared() {
+    let mut editor = default_route_editor(true);
+    editor.field = InterfaceEditorField::MacAddress;
+    let mut app = TuiApp {
+        editor: Some(editor),
+        ..Default::default()
+    };
+    let client = ApiClient::new("/unused-mac-test.sock");
+    for c in "02:AB:22:33:44:55".chars() {
+        handle_editor_key(&mut app, KeyCode::Char(c), &client).await;
+    }
+    let mac = "02:ab:22:33:44:55".parse().unwrap();
+    assert_eq!(
+        app.editor
+            .as_ref()
+            .unwrap()
+            .edit_request()
+            .unwrap()
+            .mac_address,
+        Some(mac)
+    );
+
+    handle_editor_key(&mut app, KeyCode::Left, &client).await;
+    handle_editor_key(&mut app, KeyCode::Backspace, &client).await;
+    handle_editor_key(&mut app, KeyCode::Char('6'), &client).await;
+    assert_eq!(
+        app.editor.as_ref().unwrap().mac_address,
+        "02:AB:22:33:44:65"
+    );
+    handle_editor_key(&mut app, KeyCode::Home, &client).await;
+    handle_editor_key(&mut app, KeyCode::Delete, &client).await;
+    assert!(app.editor.as_ref().unwrap().edit_request().is_err());
+    handle_editor_key(&mut app, KeyCode::End, &client).await;
+    for _ in 0..16 {
+        handle_editor_key(&mut app, KeyCode::Backspace, &client).await;
+    }
+    assert_eq!(
+        app.editor
+            .as_ref()
+            .unwrap()
+            .edit_request()
+            .unwrap()
+            .mac_address,
+        None
+    );
+}
+
+#[test]
+fn manual_mac_rejects_invalid_zero_and_multicast_addresses() {
+    let mut editor = default_route_editor(true);
+    for invalid in [
+        "02:11:22",
+        "gg:11:22:33:44:55",
+        "00:00:00:00:00:00",
+        "01:11:22:33:44:55",
+        "ff:ff:ff:ff:ff:ff",
+    ] {
+        editor.mac_address = invalid.into();
+        assert!(editor.edit_request().is_err(), "accepted {invalid}");
+    }
+    // A manually supplied address need not have the locally administered bit set.
+    editor.mac_address = "00:11:22:33:44:55".into();
+    assert!(editor.edit_request().is_ok());
+}
+
+#[tokio::test]
+async fn mac_controls_require_management_and_switching_it_off_clears_the_mac() {
+    let mut editor = unmanaged_editor();
+    editor.field = InterfaceEditorField::MacAddress;
+    let mut app = TuiApp {
+        editor: Some(editor),
+        ..Default::default()
+    };
+    let client = ApiClient::new("/unused-mac-test.sock");
+    handle_editor_key(&mut app, KeyCode::Char('0'), &client).await;
+    assert!(app.editor.as_ref().unwrap().mac_address.is_empty());
+    assert!(app
+        .message
+        .as_deref()
+        .unwrap()
+        .contains("MAC editing requires managed mode"));
+    app.editor.as_mut().unwrap().field = InterfaceEditorField::RandomizeMac;
+    handle_editor_key(&mut app, KeyCode::Enter, &client).await;
+    assert!(app.editor.as_ref().unwrap().mac_address.is_empty());
+    app.editor.as_mut().unwrap().managed = true;
+    handle_editor_key(&mut app, KeyCode::Enter, &client).await;
+    assert!(!app.editor.as_ref().unwrap().mac_address.is_empty());
+    // Navigate to the manual field and modify the generated value.
+    handle_editor_key(&mut app, KeyCode::BackTab, &client).await;
+    assert_eq!(
+        app.editor.as_ref().unwrap().field,
+        InterfaceEditorField::MacAddress
+    );
+    assert_eq!(app.editor.as_ref().unwrap().cursor, 17);
+    handle_editor_key(&mut app, KeyCode::Backspace, &client).await;
+    assert_eq!(app.editor.as_ref().unwrap().mac_address.len(), 16);
+    handle_editor_key(&mut app, KeyCode::Up, &client).await;
+    assert_eq!(
+        app.editor.as_ref().unwrap().field,
+        InterfaceEditorField::Managed
+    );
+    handle_editor_key(&mut app, KeyCode::Enter, &client).await;
+    assert!(!app.editor.as_ref().unwrap().managed);
+    assert!(app.editor.as_ref().unwrap().mac_address.is_empty());
 }
