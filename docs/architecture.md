@@ -1,15 +1,15 @@
 # Architecture
 
 `traffic-masqd` runs network operations. The terminal client, `traffic-masq`,
-talks to it through the local HTTP API. In direct mode, the client reads
-interface state itself and cannot make changes.
+talks to it through HTTP over a Unix socket or verified HTTPS. In direct mode,
+the client reads interface state itself and cannot make changes.
 
 | Module | Responsibility |
 | --- | --- |
 | `api` | HTTP, authorization and control-operation limits |
 | `crates/protocol` (`traffic-masq-protocol`) | API wire DTOs and pure shared intent validation, independent of daemon internals |
 | `crates/host-observation` (`traffic-masq-host-observation`) | Init-system observation, competing network-manager discovery and operator guidance |
-| `crates/api-client` (`traffic-masq-api-client`) | Unix-socket HTTP transport, auth/session, request mapping and response decoding |
+| `crates/api-client` (`traffic-masq-api-client`) | Unix-socket HTTP and verified HTTPS transport, auth/session, request mapping and response decoding |
 | `crates/tui` (`traffic-masq-tui`) | Standalone terminal client and read-only direct-mode observation |
 | `core` | Configuration, ownership, plans, transactions and reconciliation |
 | `crates/netlink` (`traffic-masq-netlink`) | Kernel interfaces, IPv4 addresses, routes, rules and change events |
@@ -99,7 +99,14 @@ module owns the snapshot schema and durable storage, `credentials` prepares
 role-specific secret edits and compensation, and `recovery` restores interrupted
 transactions. Credential preparation is observational: the coordinator writes
 the snapshot before applying a credential edit. Journal versions and legacy
-credential recovery semantics remain unchanged.
+credential recovery semantics remain unchanged. A rollback-only pending token
+and cancellation guard exist before the first runtime mutation. Cancellation
+hands compensation to a background owner that reacquires the per-interface
+transaction lock and participates in the shared convergence reservation.
+Blocking credential writes retain their runtime, interface-lane and credential
+reservations until the worker finishes, so compensation cannot race a late
+write. The handoff does not reset an existing recovery budget or erase a stopped
+recovery decision.
 
 Wi-Fi supervisors share an encapsulated `wifi::retry` policy. Only that module
 updates attempt counters, backoff and interface-bound suspension. AP diagnostic
@@ -113,7 +120,12 @@ restoring runtime services, so reconnecting the previous uplink can obtain a
 fresh DHCP lease. The secret journal remains until runtime restoration succeeds;
 secret I/O or runtime failures keep the transaction in rollback recovery and
 prevent confirmation. This ordering also applies to timeout, shutdown and
-failed-apply compensation.
+failed-apply compensation. The provisioning timeout worker stays alive across
+automatic coordinator retries, releases mutation admission while waiting for
+Idle, and rechecks the committed token before restoring secrets. A matching
+commit retires the secret journal instead. If fallback secret restoration was
+needed, it repairs committed router runtime before retiring the journal; errors
+retain recovery evidence.
 
 Operator AP/client configuration, saved profile activation, and operator-triggered
 AP/client deactivation use the same commit-confirm interface transactions as
@@ -126,9 +138,15 @@ write-ahead process records, and WireGuard activation uses a durable intent plus
 an interface launch marker. Startup recovery compares those proofs with
 committed intent and only removes state whose ownership can still be verified.
 
-The global mutation gate serializes admitted network mutations with transaction
-execution. Desired-state convergence uses the compatible read side so an
-interface transaction can wait for its worker; autonomous background writers
+The mutation gate separates serialized control admission from runtime execution.
+Desired-state convergence holds a shared runtime reservation so an interface
+transaction can wait for its worker. Compensation can join that reservation
+even while an exclusive writer is queued. Per-interface transaction/runtime
+locks and per-PHY radio locks serialize conflicting work; unrelated interfaces
+converge concurrently and report completion independently. Intent changes
+schedule new work while other lanes are still running. Queued jobs re-read
+current intent after acquiring their lane, and in-flight kernel/process writes
+are drained before global errors are returned. Autonomous background writers
 (such as supervised-process liveness repair) take exclusive runtime execution so
 they cannot replay stale state across a convergence pass. Accepted control
 operations keep running if the HTTP client disconnects. The executor
@@ -185,7 +203,8 @@ potentially obsolete in-memory revision. Interface pending responses expose
 `last_error`. Confirmation is available only in `awaiting_commit`; rollback is
 blocked in `commit_indeterminate`. In `recovery_required`, bounded automatic
 recovery has stopped; inspect optional `recovery_progress` and explicitly retry
-rollback. Device events can separately resume recovery; see
+rollback. Device events do not resume a stopped cycle. Startup rechecks interface
+journals in a fresh bounded cycle; router recovery requires explicit retry. See
 [bounded automatic recovery](recovery.md#bounded-automatic-recovery).
 
 Confirmation timers schedule rollback after the configured interval; they do

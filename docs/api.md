@@ -1,8 +1,8 @@
 # HTTP API
 
 `traffic-masqd` exposes a versioned JSON API for the terminal client and other
-local automation. Version 1 is mounted at `/api/v1` and is served over the Unix
-socket configured by `runtime.socket_path` (default
+local or remote automation. Version 1 is mounted at `/api/v1` and is served
+over the Unix socket configured by `runtime.socket_path` (default
 `/run/traffic-masq/traffic-masqd.sock`). Optional remote access uses HTTPS; the
 daemon never exposes an unencrypted TCP listener.
 
@@ -210,8 +210,8 @@ Body names in the tables refer to the [request schemas](#request-schemas).
 
 `/router/intent/preview` works without router execution or present adapters. It
 returns the candidate's base `revision`, effective router `config` (including
-saved routes when disabled), derived `desired`, `execution_available`, and
-`device_readiness` with sorted missing-interface blockers. Observation failure
+saved routes whose devices are missing), derived `desired`,
+`execution_available`, and `device_readiness` with sorted missing-interface blockers. Observation failure
 returns `unknown` with an observation blocker rather than claiming missing
 devices. `ready` describes only device presence; it does not certify binaries,
 route conflicts, ownership, or runtime readiness. Structural validation and
@@ -224,7 +224,8 @@ or candidate dependencies are missing, or router execution is unavailable.
 It requires the current revision from preview and retains structural validation.
 Present dependencies require a confirmed live transaction; failed observation
 rejects Save. Changing uplink, VPN chain, or derived interface policy requires a
-live transaction too. Router enable/disable is allowed only without a VPN chain.
+live transaction too. There is no router enable/disable field: activity is
+derived from uplink, forwarding, owned routes and VPN-chain intent.
 
 `RouterIntentSaved` reports the committed revision, `deferred`, missing
 interfaces, execution availability, and `cleanup_blockers`. A nonempty cleanup
@@ -382,6 +383,8 @@ use the same shape as [`examples/config.toml`](../examples/config.toml).
 
 An empty `cidr` requests no owned static address.
 
+Interface configuration objects and `InterfaceEdit` accept optional `mac_address` as a colon-separated MAC string, for example `"02:1a:7c:90:33:bf"`. The interface must be managed and support Ethernet addressing; zero and multicast addresses are rejected. Interface plans return `mac_address` only when a MAC change is needed. The TUI generates the random address before requesting a plan, so planning and applying use the same address. Changes use the existing confirmation and rollback flow, and committed addresses persist across daemon restarts.
+
 `DhcpInterfaceConfig` and `DhcpEdit` share this shape:
 
 ```json
@@ -404,6 +407,7 @@ services.
 
 ```json
 {
+  "hostname": "travel-router",
   "route_metric": 100,
   "install_default_route": true,
   "request_dns": true,
@@ -411,19 +415,26 @@ services.
 }
 ```
 
+`hostname` is optional; omitted or `null` means no Host Name option is sent.
+It accepts ASCII DNS names of 1 to 253 characters with labels of 1 to 63
+letters, digits or hyphens, starting and ending with a letter or digit.
+The same field is available in `config.dhcp_client`, DHCP client status
+configuration and router plan DHCP client specifications. Changing the name
+restarts the client; existing role, management and static IPv4 restrictions apply.
+
 `RouterProposal`
 
 ```json
 {
   "set_router": {
-    "enabled": true,
     "uplink": null,
     "forwarding": [
       { "from": "lan0", "to": "wan0", "masquerade": true }
     ],
     "owned_routes": [],
     "allow_default_route_change": false,
-    "vpn_chain": []
+    "vpn_chain": [],
+    "route_host_traffic": false
   },
   "clear_router": false,
   "set_interfaces": {},
@@ -689,7 +700,9 @@ confirm a later or different transaction. For network changes, `phase` is
 `awaiting_commit`, `rollback_required`, `recovery_required`, or
 `commit_indeterminate`. In `recovery_required` the bounded automatic recovery
 cycle has stopped; inspect `recovery_progress` and explicitly request rollback
-to retry. A device event may separately resume automatic recovery. The optional
+to retry. Device events do not resume a stopped recovery cycle. A new daemon
+startup rechecks interface journals in a fresh bounded cycle; router recovery
+retains its explicit retry requirement. The optional
 `recovery_progress` contains `failure_kind`, `attempts`, `max_attempts`,
 `deadline_unix`, `automatic_recovery`, and `last_error`; see
 [bounded recovery](recovery.md#bounded-automatic-recovery). Commit is

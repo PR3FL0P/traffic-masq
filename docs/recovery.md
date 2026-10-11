@@ -511,10 +511,14 @@ not wait for request admission, but still serializes with transaction ownership
 and exclusive runtime writes.
 
 An interrupted interface apply retains a rollback-only pending token before its
-first runtime mutation. Its in-process owner transfers compensation to a
-background task, including cancellation during confirmation bookkeeping. That
-handoff cannot renew a recovery attempt or clear a storage/conflict stop. If the
-process exits, the original journal remains the startup recovery authority.
+first runtime mutation. Its in-process owner transfers compensation to a background task, including
+cancellation during confirmation bookkeeping. The task reacquires transaction
+ownership for that interface and joins the shared runtime reservation. Blocking
+credential writes keep their reservations until completion, preventing recovery
+from racing a late write. Unrelated interfaces can finish convergence while
+this lane recovers; work on the same interface or PHY remains serialized. The
+handoff cannot renew a recovery attempt or clear a storage/conflict stop. If
+the process exits, the original journal remains the startup recovery authority.
 
 Failures are classified by error types and kernel error codes, not message text:
 

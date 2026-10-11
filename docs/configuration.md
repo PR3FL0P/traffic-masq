@@ -98,6 +98,16 @@ DHCP enabled by Wi-Fi activation; leave it at its default `false`. `request_dns`
 requests and records lease DNS servers; the client does not update the host's
 resolver or `/etc/resolv.conf`.
 
+The optional DHCP-client `hostname = "travel-router"` setting sends that name
+as [DHCP option 12](https://www.rfc-editor.org/rfc/rfc2132.html#section-3.14).
+Use an ASCII DNS name of up to 253 characters, with labels of 1 to 63 letters,
+digits or hyphens; each label must start and end with a letter or digit.
+Names such as `travel-router` and `router.home.example` are accepted. Omitting
+`hostname` sends no name. In **DHCP Client settings**, edit **Hostname** and apply;
+leaving the field empty removes it. The value persists across daemon restarts.
+Changing it restarts the client so the next DHCP request carries the new name.
+The DHCP server controls how the name is displayed or used for local DNS.
+
 For a DHCP server, see the example's `[network.interfaces.wlan0.dhcp]` table.
 `pool_start`, `pool_end` and `router` are required. The pool must stay within the
 interface subnet and exclude its address, network and broadcast addresses.
@@ -252,13 +262,17 @@ implemented; the existing router traffic policy manages protected LAN traffic.
 `[vpn] enabled` defaults to `false`; enabling it allows profile activation.
 `[vpn.policy] default_mode` defaults to `direct` and also accepts `vpn`.
 `protected_subnets` currently accepts only `all_managed_output_subnets`.
-VPN policy mode requires VPN and routing enabled, and no explicit forwarding.
+VPN policy mode requires `vpn.enabled = true`, active router intent, and no
+explicit forwarding. Router activity is derived from its settings, not a switch.
 
 `[api.tcp]` defaults to disabled at `127.0.0.1:8443`. To enable HTTPS, provide
 `enabled = true`, a numeric `listen` socket address, and distinct PEM
 `certificate_path` and `private_key_path`. Startup loads the certificate chain
-and key. The Unix socket remains available; the TUI has no HTTPS connection
-option. See [API access settings](api.md#request-schemas).
+and key. The Unix socket remains available. Connect the TUI with
+`--server https://host:port` and optionally `--ca-cert /path/to/ca.pem`, or use
+a saved `--connection`. Certificate trust and hostname verification are required.
+See [remote client setup](usage.md#https-connections-and-saved-destinations)
+and [API access settings](api.md#request-schemas).
 
 `[security] rollback_timeout_seconds` is required in a file, defaults to `60`
 in the built-in configuration, and must be positive.
@@ -276,3 +290,18 @@ All numeric auth settings must be positive; idle expiry must not exceed absolute
 expiry. Authentication uses the independently configured database path above.
 There is no TOML device-password field: initialize it with a local root client
 or the installer, or use `traffic-masqd auth set-password` while stopped.
+
+### Interface MAC address
+
+Managed Ethernet and Wi-Fi interfaces accept an optional `mac_address`, for example:
+
+```toml
+[network.interfaces.eth0]
+role = "input"
+managed = true
+mac_address = "02:1a:7c:90:33:bf"
+```
+
+In the TUI, open **Interfaces**, edit an interface, enable **Configure with traffic-masq**, and select **Generate random MAC**. Each activation generates a locally administered unicast address. Review and apply the change, then confirm it using the usual network transaction confirmation. The selected address is saved and reused after daemon restarts; generating another address is an explicit action.
+
+Changing a MAC briefly takes the link down and restarts its traffic-masq Wi-Fi and DHCP services. A canceled transaction restores the previous MAC and link state. The driver must support MAC changes. Unmanaged interfaces and WireGuard interfaces cannot have a configured MAC. Omitting the setting leaves the current MAC unchanged; it does not reset the hardware address.

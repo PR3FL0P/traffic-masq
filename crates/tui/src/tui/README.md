@@ -33,7 +33,7 @@ The TUI serves as the primary operational console for the `traffic-masq` network
 | [`mod.rs`](mod.rs) | Application lifecycle, main event loop (`run_loop`), async UI driver (`drive_ui`), key/mouse dispatch, terminal initialization & RAII cleanup. | `TuiApp`, `Screen`, `Section`, `TerminalGuard`, `run_tui`, `drive_ui` |
 | [`layout.rs`](layout.rs) | Layout partitioning, panel wrappers, top header tab bar, bottom status & key hint footer, mouse hit testing primitives. | `UiLayout`, `panel`, `render_header`, `render_footer`, `point_in_rect`, `section_at` |
 | [`input.rs`](input.rs) | Unicode-safe interactive text editing, shared clamped/wrapped focus navigation, blinking phase calculation, masked password span formatting. | `TextEditor`, `move_clamped`, `move_wrapped`, `render_value_with_cursor`, `render_masked_with_cursor` |
-| [`session.rs`](session.rs) | Per-endpoint persistent session caching, XDG state management, strict file permissions (`0700`/`0600`, `O_NOFOLLOW`), zeroization. | `SessionStore`, `SessionPreferences`, `remember`, `restore` |
+| [`session.rs`](session.rs) | Per-endpoint persistent session caching, XDG state management, strict file permissions (`0700`/`0600`, `O_NOFOLLOW`), zeroization. | `SessionStore`, `SessionPreferences`, `remember`, `SessionStore::restore` |
 | [`dashboard.rs`](dashboard.rs) | Original Overview cards (mode, interfaces, pending, VPN); full-width interface list with per-interface RX/TX graphs and scrollable numeric statistics. No DHCP cards or sidebar. | `DashboardData`, `DashboardPane`, `TrafficHistory`, `TrafficSample` |
 | [`interfaces.rs`](interfaces.rs) | Network interface list and editor; address ownership tags (`[ext]`, `[?]`), default route risk warnings, dry-run change plan previews. | `InterfaceEditor`, `InterfaceEditorField`, `render_interface_list`, `render_preview` |
 | [`dhcp.rs`](dhcp.rs) | Downstream DHCP server configuration per interface, pool range validation, DNS settings, active lease viewer. | `DhcpEditor`, `DhcpField`, `DhcpLeasesView` |
@@ -67,7 +67,7 @@ flowchart TD
     InputRouter -->|Key / Mouse| KeyHandler[handle_key / handle_mouse]
     KeyHandler --> StateMutation[Mutate TuiApp State]
 
-    StateMutation --> ApiRequest[ApiClient Unix Socket]
+    StateMutation --> ApiRequest[ApiClient Unix Socket / HTTPS]
     ApiRequest --> DriveUI["drive_ui (Async Background / Progress)"]
     DriveUI --> Redraw[terminal.draw]
 
@@ -105,6 +105,13 @@ Because misconfiguring an IP address or firewall rule can sever SSH access, inte
 3. **Disconnect Handling:** If the daemon becomes unreachable while on a pending screen, the TUI retains the pending change state and warns the operator that the outcome is unverified rather than falsely claiming success.
 
 Standalone DHCP, Wi-Fi runtime controls such as reconnect/reload/passphrase updates, and VPN actions do not enter these pending screens and do not expose a commit timer. Live operator-triggered AP/client deactivation enters the pending-change screen. For an absent adapter, cleanup and durable intent saving return without a timer. Immediate mutations rely on the daemon's durable ownership/recovery mechanisms rather than TUI rollback state.
+
+Missing-device interface edits use revision-checked Save rather than the live
+preview/pending flow; F5 Forget suppresses base intent and F6 Reset restores it.
+Router routes/sharing use saved inventory and latch the editor revision. Their
+offline preview scrolls to **Save intent** and reports cleanup blockers separately
+from persistence success. Unknown observation or a stale revision retains the
+draft. Uplink/VPN-chain edits still require live router execution.
 
 ### 3.3. Screen and Section State Machine
 
@@ -151,7 +158,11 @@ Never manipulate UTF-8 strings by raw byte indexing. The helper `input::TextEdit
 
 1. **Zeroization:** Structs storing sensitive passphrases (for example `PasswordChangeEditor`, Wi-Fi editors, and authentication buffers) implement `Drop` to call `.zeroize()` on underlying strings.
 2. **Session Persistence (`session.rs`):**
-   - Stored under `$XDG_STATE_HOME/traffic-masq/client/<sha256-of-socket-path>.session.json`.
+   - Stored under `$XDG_STATE_HOME/traffic-masq/client/<endpoint-hash>.session.json`.
+   - Local keys hash the canonical socket path (or absolute path if unavailable);
+     HTTPS keys hash the normalized origin and SHA-256 of the trusted CA PEM bundle.
+   - Named destinations live in `connections.profiles.json` in that directory
+     and contain only the origin and optional absolute CA path.
    - File and directory permissions must be strictly verified: owner UID match, directory mode `0700`, file mode `0600`.
    - Must reject symlinks and open files with `O_NOFOLLOW`.
    - Writes are performed atomically using temporary files and directory fsyncs.
@@ -304,7 +315,7 @@ async fn resize_clears_hit_regions() {
 ## 6. Common Pitfalls & Troubleshooting
 
 - **Terminal Left in Raw Mode on Crash:** If developing outside the standard harness, ensure `TerminalGuard` dropped cleanly. If a test or development binary panics before teardown, run `reset` in your shell.
-- **Lost Rollback Context:** If the daemon restarts while a rollback timer is running, the TUI detects the token invalidation and resets the pending screen with an explicit warning. Never assume an expired transaction succeeded.
+- **Lost Rollback Context:** After a daemon restart, a cached session may no longer authenticate and the pending token may have been recovered or retired. Reauthenticate and inspect pending/current state; a lost response or expired timer does not prove success. Stopped recovery requires explicit retry, and device events do not renew its budget.
 - **Double-Draw Artifacts:** Do not invoke `terminal.draw` inside sub-functions. All rendering must originate from the top-level `run_loop` or the snapshot callback in `drive_ui`.
 - **UTF-8 Panic on Slicing:** Avoid `&str[..cursor]`. Use `input::TextEditor` for editing; a grapheme cursor cannot safely be treated as a byte or Unicode scalar index.
 

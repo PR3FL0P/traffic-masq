@@ -1,6 +1,8 @@
-# Safe example for a router with an externally configured uplink (wan0), an
-# interface outside the router (eth0), and a traffic-masq LAN (wlan0). Replace interface
-# names and addresses before use.
+# Internet-sharing example with an externally configured uplink (wan0), an
+# interface outside the router (eth0), and a traffic-masq LAN (wlan0). This manages
+# wlan0 and activates routing; it is not the built-in safe configuration.
+# Replace interface names and addresses before use. No AP is created until a
+# wlan0.wifi block or saved AP profile is configured.
 
 [runtime]
 state_dir = "/var/lib/traffic-masq"

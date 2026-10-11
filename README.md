@@ -173,8 +173,8 @@ Changes enter the router draft and use the existing Plan → Apply → Commit fl
 
 Tick **Route router's own traffic through VPN** to send the router's own traffic
 (DNS, updates, the daemon's outbound connections) through the chain as well. It
-adds a host kill switch and blocks the router's IPv6. Tunnel endpoints and local
-networks stay direct. If a plan fails or you do not Commit in time, it rolls back
+adds a host kill switch and blocks the router's IPv6 except loopback, link-local
+and multicast traffic. Tunnel endpoints and local networks stay direct. If a plan fails or you do not Commit in time, it rolls back
 like any other router change.
 
 ## Daemon logs
@@ -298,8 +298,13 @@ connectivity test.
 Interface, router, Wi-Fi Connect/hotspot changes, saved-profile activation, and
 operator-triggered Wi-Fi deactivation use **Apply → Commit**. Apply changes the
 running network and starts a timer, normally 60 seconds. Commit keeps the change.
-If you lose access and cannot confirm, the daemon rolls it back when time runs
-out.
+If you lose access and cannot confirm, expiry schedules daemon rollback.
+Restoration can take longer while admitted operations finish or recovery retries
+run. Inspect pending state after a timeout; an indeterminate commit requires
+storage repair and restart. See the [recovery runbook](docs/recovery.md).
+
+For an absent saved adapter, intent edits and Wi-Fi deactivation instead save
+settings after verified ownership cleanup, without a confirmation timer.
 
 Standalone DHCP, Wi-Fi runtime controls such as reconnect/reload/passphrase
 updates, and VPN operations apply immediately and do not use the

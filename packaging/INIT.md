@@ -93,8 +93,10 @@ sudo traffic-masqd --config /etc/traffic-masq/config.toml uninstall --yes
 
 Uninstall verifies ownership, disables boot activation and stops the manager,
 waits for the daemon lock to be released, removes owned service files and then
-the binaries. Configuration, passwords, network state, group memberships and
-packages are preserved. Runit's supervisor is shut down; its generated runtime
+the binaries. Configuration, passwords, persistent network intent, group memberships and
+packages are preserved. Runtime cleanup follows the configured shutdown policy;
+uninstall does not reset saved settings. Use [reset](../docs/usage.md#reset-all-settings)
+for that separate operation. Runit's supervisor is shut down; its generated runtime
 files are not recursively deleted. Custom prefixes/configuration paths must
 match the receipt and be supplied when uninstalling.
 
@@ -124,3 +126,6 @@ For service-manager behavior, see the [systemd service documentation](https://gi
 [OpenRC service guide](https://github.com/OpenRC/openrc/blob/master/service-script-guide.md),
 [runit sv manual](https://smarden.org/runit/sv.8), and
 [Debian update-rc.d manual](https://manpages.debian.org/bookworm/init-system-helpers/update-rc.d.8.en.html).
+
+For archive contents, checksum verification and CI build behavior, see the
+[release procedure](../docs/release.md).

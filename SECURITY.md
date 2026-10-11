@@ -81,6 +81,15 @@ links to one matching procedure in the
 [operator recovery runbook](docs/recovery.md). Do not delete or hand-edit an
 unresolved router or provisioning journal merely to make startup continue.
 
+Automatic rollback is bounded to three attempts, 60 seconds per attempt and
+180 seconds per cycle. Exhaustion or a non-retryable failure stops the cycle;
+device events do not restart it. Explicit rollback retry starts a new cycle
+only after the previous one has stopped. Daemon startup rechecks interface
+journals in a fresh cycle, while router
+recovery retains its explicit retry policy. Cancellation preserves the journal
+and recovery guard until compensation completes. See
+[bounded recovery](docs/recovery.md#bounded-automatic-recovery).
+
 A corrupt per-interface journal is scoped to that interface. Repair or restore
 that interface's journal while leaving the daemon and unaffected interfaces
 running. Router rollback failures and foreign-route conflicts similarly keep the
