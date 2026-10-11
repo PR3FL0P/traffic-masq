@@ -48,7 +48,9 @@ configuration.
 Wi-Fi configuration, AP/STA provisioning and profile activation, and live
 operator deactivation use commit-confirm. Editing an absent adapter instead
 saves durable intent after verified cleanup, without a confirmation timer.
-Standalone DHCP and VPN actions, Wi-Fi runtime commands, passphrase updates and
+DHCP route metric and default-route policy changes on enabled clients also use
+the interface commit-confirm transaction. Other standalone DHCP and VPN actions,
+Wi-Fi runtime commands, passphrase updates and
 profile-library edits apply immediately.
 Their runtime effects are protected by write-ahead ownership records: DHCP
 leases record the route policy under which they were applied, Wi-Fi daemon

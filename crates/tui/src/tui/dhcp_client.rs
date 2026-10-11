@@ -91,7 +91,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
     );
 
     frame.render_widget(
-        Paragraph::new("Actions apply immediately; no rollback timer. [c] overwrites DHCP policy.")
+        Paragraph::new("Route policy changes require confirmation. Other actions are immediate. [c] resets DHCP policy.")
             .style(Style::default().fg(theme::WARN)),
         Rect::new(
             inner.x,
@@ -345,6 +345,14 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClien
     };
 
     match client.request(&request).await {
+        Ok(Response::NetworkChangePending { change })
+            if change.interface == interface
+                && matches!(request, Request::ConfigureDhcpClient { .. }) =>
+        {
+            app.pending = Some(change);
+            app.pending_return_screen = Screen::DhcpClient;
+            app.screen = Screen::PendingChange;
+        }
         Ok(Response::DhcpClientError { detail }) => app.push_message(
             LogLevel::Error,
             format!("Uplink DHCP action failed: {detail:?}"),

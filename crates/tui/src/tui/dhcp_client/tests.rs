@@ -207,6 +207,33 @@ async fn successful_disable_refreshes_status_and_preserves_selection() {
 }
 
 #[tokio::test]
+async fn resetting_route_policy_opens_network_confirmation() {
+    let change = traffic_masq_protocol::PendingNetworkChange {
+        recovery_progress: None,
+        phase: Default::default(),
+        last_error: None,
+        token: "dhcp-reset".into(),
+        interface: "wan0".into(),
+        rollback_timeout_seconds: 60,
+        expires_at_unix: super::super::current_unix_time() + 60,
+    };
+    let (_dir, client, server) = mock_api(vec![Response::NetworkChangePending {
+        change: change.clone(),
+    }])
+    .await;
+    let mut app = TuiApp {
+        dhcp_client_selected: Some("wan0".into()),
+        dhcp_clients: vec![status(DhcpClientOperationalState::Running)],
+        ..Default::default()
+    };
+    handle_key(&mut app, KeyCode::Char('c'), &client).await;
+    assert_eq!(app.screen, Screen::PendingChange);
+    assert_eq!(app.pending_return_screen, Screen::DhcpClient);
+    assert_eq!(app.pending.as_ref().unwrap().token, "dhcp-reset");
+    assert_eq!(server.await.unwrap(), vec!["PUT /api/v1/dhcp-client/wan0"]);
+}
+
+#[tokio::test]
 async fn section_navigation_uses_inventory_selection_including_missing_devices() {
     let (_dir, client, server) =
         mock_api(vec![Response::DhcpClientStatus { interfaces: vec![] }]).await;

@@ -1,5 +1,6 @@
 use super::runtime::compensation_message;
 use super::*;
+use crate::core::transaction::InterfaceChange;
 
 impl ControlService {
     pub(super) async fn dhcp_client_status(&self) -> Response {
@@ -61,7 +62,7 @@ impl ControlService {
         else {
             return dhcp_client_error(DhcpClientErrorDetail::InterfaceNotFound);
         };
-        // This immediate operation only edits DHCP policy. Role, ownership and
+        // This operation only edits DHCP policy. Role, ownership and
         // static-address transitions belong to the confirmed interface path.
         if interface_config.role != InterfaceRole::Input
             || !interface_config.managed
@@ -73,7 +74,16 @@ impl ControlService {
                 ),
             });
         }
+        let previous_config = interface_config.clone();
+        let changes_route_policy = previous_config.dhcp_client.as_ref().is_some_and(|policy| {
+            policy.enabled
+                && (policy.route_metric != request.route_metric
+                    || policy.install_default_route != request.install_default_route)
+        });
         interface_config.dhcp_client = Some(dhcp_client_request_to_config(&request, true));
+        if let Some(previous) = &previous_config.dhcp_client {
+            interface_config.dhcp_client.as_mut().unwrap().wifi_owned = previous.wifi_owned;
+        }
         let spec = match DhcpClientSpec::from_interface_config(&interface, &interface_config) {
             Ok(Some(spec)) => spec,
             Ok(None) => return dhcp_client_error(DhcpClientErrorDetail::Disabled),
@@ -93,6 +103,28 @@ impl ControlService {
                 message: error.to_string(),
             });
         }
+        if changes_route_policy {
+            return match self
+                .transactions
+                .apply(
+                    &interface,
+                    InterfaceChange {
+                        config: &interface_config,
+                        previous: Some(&previous_config),
+                        current_role: Some(previous_config.role),
+                        allow_management_change: true,
+                        passphrase: crate::wifi::WifiPassphraseUpdate::Keep,
+                    },
+                )
+                .await
+            {
+                Ok(change) => Response::NetworkChangePending { change },
+                Err(error) => super::runtime::error_response(error),
+            };
+        }
+        // Dispatch retains admission but releases execution for the confirmed
+        // path above. Immediate DHCP writes must reserve execution themselves.
+        let _execution = self.network_mutations.execute().await;
         let previous = supervisor.spec(&interface).await;
         let link_ready = match &self.wifi_client {
             Some(wifi) => match wifi.status(&interface).await {

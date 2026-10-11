@@ -344,6 +344,15 @@ changes the proposed configuration for that route. After running it, choose
 change belongs in the configuration that creates it. Deleting a traffic-masq
 static route continues to stage the change for **Plan / Apply**.
 
+For traffic-masq DHCP routes, the manual deletion dialog also explains the
+supported configuration path. For a default route, use **Edit route** or
+**DHCP Client → interface → e / Enter**, turn **Install default route** off,
+and Apply and confirm the change. **Route metric** changes its priority instead.
+The local subnet route follows the leased address and has no separate disable
+switch; changing away from DHCP belongs in the confirmed Interfaces editor.
+Manual deletion changes only the live kernel state, has no automatic rollback,
+and may be undone by the DHCP client.
+
 The **Router** tab has three sections, selected with **1 / 2 / 3** or by clicking
 its section labels:
 
@@ -516,8 +525,12 @@ Tab selects the refresh/disconnect/back buttons; scrolling selects the list.
 Enable the DHCP Client tab in Settings if hidden. Select an interface and press
 **e** or Enter to load its saved DHCP policy. Edit the route metric and toggle
 installation of the default route, requesting DNS, and sending Release on
-shutdown. Apply uses the existing immediate DHCP client operation; there is no
-rollback timer. Errors retain the draft. Esc discards it. **c** on the list
+shutdown. Changing the route metric or default-route installation on an enabled
+client uses the interface transaction and requires confirmation before its
+rollback timer expires. Cancel or timeout restores the previous DHCP policy
+through convergence; lease state is managed by the DHCP supervisor. Initial
+enablement and changes to other options remain immediate. Errors retain the
+draft. Esc discards it. **c** on the list
 continues to enable/reset the client to defaults.
 
 ### Settings and running operations

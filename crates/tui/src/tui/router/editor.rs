@@ -254,9 +254,42 @@ pub(super) fn delete_selected_route(app: &mut TuiApp) {
         let Some(route) = row.observed.as_ref() else {
             return;
         };
+        let dhcp_advice = if route.owner == RouteOwner::TrafficMasqDhcp {
+            let interface = route
+                .output_interface
+                .as_deref()
+                .unwrap_or("the route's interface");
+            if route.destination.prefix_len() == 0 {
+                format!(
+                    "This route is managed by the traffic-masq DHCP client.\n\
+                     For a lasting change in the TUI: Router -> select this route -> Edit route, \
+                     or DHCP Client -> select {interface} -> e / Enter \
+                     (enable the DHCP Client tab in Settings if hidden).\n\
+                     Set Install default route to false, choose Apply, then confirm the network change \
+                     before its rollback timer expires. To change priority instead, edit Route metric.\n\n\
+                     Manual deletion below changes only the live kernel route, not saved DHCP policy. \
+                     It can disconnect you, has no automatic rollback, and the DHCP client may recreate it.\n\n"
+                )
+            } else {
+                format!(
+                    "This route is managed by the traffic-masq DHCP client.\n\
+                     It is the local subnet route for the leased address; \
+                     Install default route does not control it and there is no separate switch to disable it.\n\
+                     For a lasting change, use Interfaces -> {interface} to configure a static IPv4 \
+                     address (which disables DHCP), or turn Configure with traffic-masq off. \
+                     Review Plan / Apply and confirm the network change. \
+                     This also changes the leased address and can disconnect you.\n\n\
+                     Manual deletion below changes only the live kernel route, not saved DHCP policy. \
+                     It can disconnect you, has no automatic rollback, and the DHCP client may recreate it.\n\n"
+                )
+            }
+        } else {
+            String::new()
+        };
         let message = match manual_route_delete_command(route) {
             Ok(command) => format!(
                 "Delete route manually: {}\n\n\
+                 {dhcp_advice}\
                  Run this command in a terminal on the machine running traffic-masqd:\n\n\
                  {command}\n\n\
                  To copy, hold down Shift\n\n\
@@ -268,7 +301,7 @@ pub(super) fn delete_selected_route(app: &mut TuiApp) {
                  Esc: close",
                 route.destination,
             ),
-            Err(message) => message.to_string(),
+            Err(message) => format!("{dhcp_advice}{message}"),
         };
         app.push_message(LogLevel::Warn, message);
         app.message_scroll = 0;

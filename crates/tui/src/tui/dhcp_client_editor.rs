@@ -139,7 +139,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
     let mut lines = vec![
         Line::from(format!("Interface: {}", editor.interface)),
         Line::styled(
-            "Apply changes the running client immediately; no rollback timer.",
+            "Route policy changes on an enabled client require confirmation with a rollback timer.",
             Style::default().fg(theme::WARN),
         ),
         Line::from(""),
@@ -230,6 +230,12 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClien
                 };
                 let interface = editor.interface.clone();
                 match client.request(&request).await {
+                    Ok(Response::NetworkChangePending { change }) if change.interface == interface => {
+                        app.dhcp_client_editor = None;
+                        app.pending = Some(change);
+                        app.pending_return_screen = Screen::DhcpClient;
+                        app.screen = Screen::PendingChange;
+                    }
                     Ok(Response::DhcpClientInterface { status }) if status.interface == interface => {
                         app.dhcp_client_editor = None;
                         app.screen = Screen::DhcpClient;
@@ -294,6 +300,41 @@ mod tests {
             assert!(editor.request().is_err());
         }
     }
+    #[tokio::test]
+    async fn route_policy_apply_opens_confirmation_and_can_rollback() {
+        let change = traffic_masq_protocol::PendingNetworkChange {
+            recovery_progress: None,
+            phase: Default::default(),
+            last_error: None,
+            token: "dhcp-policy".into(),
+            interface: "wan0".into(),
+            rollback_timeout_seconds: 60,
+            expires_at_unix: super::super::current_unix_time() + 60,
+        };
+        let mock = super::super::test_api::mock(vec![
+            Response::NetworkChangePending {
+                change: change.clone(),
+            },
+            Response::NetworkChangeRolledBack {
+                change: change.clone(),
+            },
+        ])
+        .await;
+        let mut app = TuiApp::default();
+        let mut editor = Editor::new("wan0".into(), DhcpClientConfigRequest::default());
+        editor.config.install_default_route = false;
+        editor.field = Field::Apply;
+        app.dhcp_client_editor = Some(editor);
+        handle_key(&mut app, KeyCode::Enter, &mock.client).await;
+        assert_eq!(app.screen, Screen::PendingChange);
+        assert_eq!(app.pending.as_ref().unwrap().token, "dhcp-policy");
+        assert_eq!(app.pending_return_screen, Screen::DhcpClient);
+        super::super::interfaces::handle_pending_key(&mut app, KeyCode::Esc, &mock.client).await;
+        assert_eq!(app.screen, Screen::DhcpClient);
+        assert!(app.pending.is_none());
+        assert!(mock.calls.lock().unwrap()[1].path.contains("rollback"));
+    }
+
     #[tokio::test]
     async fn loads_saved_policy_and_keeps_draft_on_rejected_apply() {
         let config = serde_json::from_value(serde_json::json!({"role":"input","managed":true,"ipv4":null,"dhcp":null,"dhcp_client":{"hostname":"saved-router","route_metric":777,"install_default_route":false,"request_dns":false,"send_release_on_shutdown":true}})).unwrap();

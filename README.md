@@ -312,7 +312,9 @@ storage repair and restart. See the [recovery runbook](docs/recovery.md).
 For an absent saved adapter, intent edits and Wi-Fi deactivation instead save
 settings after verified ownership cleanup, without a confirmation timer.
 
-Standalone DHCP, Wi-Fi runtime controls such as reconnect/reload/passphrase
+DHCP route metric and default-route policy changes on enabled clients use the
+interface confirmation timer. Other standalone DHCP actions, Wi-Fi runtime
+controls such as reconnect/reload/passphrase
 updates, and VPN operations apply immediately and do not use the
 interface/router confirmation timer. They instead persist ownership information
 before creating durable runtime state and reconcile it on restart. The timer

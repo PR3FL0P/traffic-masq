@@ -4822,6 +4822,317 @@ async fn dhcp_client_control_configure_preserves_wifi_client() {
     assert_eq!(persisted.role, InterfaceRole::Input);
 }
 
+// Exercise real admission/execution gates, interface journals and the DHCP
+// supervisor. DHCP sees a detached device so these tests never open raw sockets;
+// the transaction observer sees the device to allow a confirmed policy edit.
+async fn dhcp_route_policy_fixture(
+    timeout_seconds: u64,
+) -> (DhcpClientControlFixture, tokio::task::JoinHandle<()>) {
+    let mut fixture = dhcp_client_control_fixture(true).await;
+    let mut config = fixture.service.base_config.clone();
+    config.security.rollback_timeout_seconds = timeout_seconds;
+    config
+        .network
+        .interfaces
+        .get_mut("wan0")
+        .unwrap()
+        .wifi_client = None;
+    let network = Arc::new(crate::test_support::FakeNetworkProvider::default());
+    network.add_interface("wan0", 1).await;
+    let desired = DesiredNetworkState::new(config.clone(), fixture.overrides.clone());
+    desired.attach_converger();
+    fixture.service = ControlService::from_runtime(
+        ControlRuntime {
+            active_config: config.clone(),
+            base_config: config,
+            network,
+            dhcp: fixture.service.dhcp.clone(),
+            overrides: fixture.overrides.clone(),
+            baselines: Vec::new(),
+            ownership_journal: AddressOwnershipJournal::in_memory(),
+            desired_state: desired.clone(),
+            mutation_gate: Arc::new(NetworkMutationGate::default()),
+        },
+        ControlSubsystems {
+            dhcp_client: Some(fixture.supervisor.clone()),
+            ..ControlSubsystems::default()
+        },
+    );
+    let gate = fixture.service.network_mutations.clone();
+    let supervisor = fixture.supervisor.clone();
+    let worker = tokio::spawn(async move {
+        loop {
+            let version = desired.version();
+            {
+                let _execution = gate.read().await;
+                let config = desired.effective().await.unwrap();
+                let spec = DhcpClientSpec::from_interface_config(
+                    "wan0",
+                    &config.network.interfaces["wan0"],
+                )
+                .unwrap()
+                .unwrap();
+                supervisor.configure(spec).await;
+                desired.report_result(version, Ok(BTreeMap::new()));
+            }
+            desired.changed().await;
+        }
+    });
+    (fixture, worker)
+}
+
+#[tokio::test]
+async fn dhcp_route_policy_requires_commit_and_rollback_restores_runtime() {
+    for install_default_route in [true, false] {
+        let (fixture, worker) = dhcp_route_policy_fixture(30).await;
+        let previous = fixture.overrides.snapshot().await;
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            fixture.service.dispatch(Request::ConfigureDhcpClient {
+                interface: "wan0".into(),
+                config: DhcpClientConfigRequest {
+                    route_metric: 777,
+                    install_default_route,
+                    ..Default::default()
+                },
+            }),
+        )
+        .await
+        .expect("DHCP transaction must release execution for convergence");
+        let Response::NetworkChangePending { change } = response else {
+            worker.abort();
+            panic!("{response:?}");
+        };
+        assert_eq!(fixture.overrides.snapshot().await, previous);
+        let runtime = fixture.supervisor.spec("wan0").await.unwrap();
+        assert_eq!(runtime.route_metric, 777);
+        assert_eq!(runtime.install_default_route, install_default_route);
+        assert!(fixture
+            .directory
+            .path()
+            .join("interface-transactions/wan0.json")
+            .exists());
+        let blocked = fixture
+            .service
+            .dispatch(Request::RenewDhcpClient {
+                interface: "wan0".into(),
+            })
+            .await;
+        assert!(matches!(blocked, Response::Error { message } if message.contains("pending")));
+        let rollback = fixture
+            .service
+            .dispatch(Request::RollbackNetworkChange {
+                token: change.token,
+            })
+            .await;
+        assert!(
+            matches!(rollback, Response::NetworkChangeRolledBack { .. }),
+            "{rollback:?}"
+        );
+        assert_eq!(fixture.overrides.snapshot().await, previous);
+        let runtime = fixture.supervisor.spec("wan0").await.unwrap();
+        assert_eq!(
+            runtime.route_metric,
+            DhcpClientConfigRequest::default().route_metric
+        );
+        assert!(runtime.install_default_route);
+        assert!(!fixture
+            .directory
+            .path()
+            .join("interface-transactions/wan0.json")
+            .exists());
+        worker.abort();
+    }
+}
+
+#[tokio::test]
+async fn dhcp_default_route_policy_is_persisted_only_after_confirmation() {
+    let (fixture, worker) = dhcp_route_policy_fixture(30).await;
+    let response = fixture
+        .service
+        .dispatch(Request::ConfigureDhcpClient {
+            interface: "wan0".into(),
+            config: DhcpClientConfigRequest {
+                install_default_route: false,
+                ..Default::default()
+            },
+        })
+        .await;
+    let Response::NetworkChangePending { change } = response else {
+        worker.abort();
+        panic!("{response:?}");
+    };
+    assert!(
+        fixture
+            .overrides
+            .effective_interface("wan0")
+            .await
+            .unwrap()
+            .unwrap()
+            .dhcp_client
+            .unwrap()
+            .install_default_route
+    );
+    let response = fixture
+        .service
+        .dispatch(Request::CommitNetworkChange {
+            token: change.token,
+        })
+        .await;
+    assert!(
+        matches!(response, Response::NetworkChangeCommitted { .. }),
+        "{response:?}"
+    );
+    assert!(
+        !fixture
+            .overrides
+            .effective_interface("wan0")
+            .await
+            .unwrap()
+            .unwrap()
+            .dhcp_client
+            .unwrap()
+            .install_default_route
+    );
+    assert!(
+        !fixture
+            .supervisor
+            .spec("wan0")
+            .await
+            .unwrap()
+            .install_default_route
+    );
+    assert!(fixture.service.transactions.pending().await.is_empty());
+    worker.abort();
+}
+
+#[tokio::test]
+async fn dhcp_route_policy_refuses_changes_without_a_running_converger() {
+    let fixture = dhcp_client_control_fixture(true).await;
+    fixture.service.transactions.require_converger(true);
+    let before = fixture.overrides.snapshot().await;
+    let response = fixture
+        .service
+        .dispatch(Request::ConfigureDhcpClient {
+            interface: "wan0".into(),
+            config: DhcpClientConfigRequest {
+                install_default_route: false,
+                ..Default::default()
+            },
+        })
+        .await;
+    assert!(
+        matches!(response, Response::Error { message } if message.contains("converger unavailable"))
+    );
+    assert_eq!(fixture.overrides.snapshot().await, before);
+    assert!(
+        fixture
+            .supervisor
+            .spec("wan0")
+            .await
+            .unwrap()
+            .install_default_route
+    );
+    assert!(fixture.service.transactions.pending().await.is_empty());
+}
+
+#[tokio::test]
+async fn dhcp_route_policy_timeout_restores_committed_policy() {
+    let (fixture, worker) = dhcp_route_policy_fixture(1).await;
+    let previous = fixture.overrides.snapshot().await;
+    let response = fixture
+        .service
+        .dispatch(Request::ConfigureDhcpClient {
+            interface: "wan0".into(),
+            config: DhcpClientConfigRequest {
+                install_default_route: false,
+                ..Default::default()
+            },
+        })
+        .await;
+    assert!(
+        matches!(response, Response::NetworkChangePending { .. }),
+        "{response:?}"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !fixture.service.transactions.pending().await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("confirmation timer must finish rollback");
+    assert_eq!(fixture.overrides.snapshot().await, previous);
+    assert!(
+        fixture
+            .supervisor
+            .spec("wan0")
+            .await
+            .unwrap()
+            .install_default_route
+    );
+    assert!(!fixture
+        .directory
+        .path()
+        .join("interface-transactions/wan0.json")
+        .exists());
+    worker.abort();
+}
+
+#[tokio::test]
+async fn interrupted_dhcp_route_policy_is_recovered_from_committed_intent() {
+    let (fixture, worker) = dhcp_route_policy_fixture(30).await;
+    let response = fixture
+        .service
+        .dispatch(Request::ConfigureDhcpClient {
+            interface: "wan0".into(),
+            config: DhcpClientConfigRequest {
+                install_default_route: false,
+                ..Default::default()
+            },
+        })
+        .await;
+    assert!(
+        matches!(response, Response::NetworkChangePending { .. }),
+        "{response:?}"
+    );
+    worker.abort();
+    let committed = fixture.overrides.snapshot().await;
+    let manager = crate::core::interface::InterfaceManager::new(
+        fixture.service.network.clone(),
+        AddressOwnershipJournal::in_memory(),
+    );
+    // Startup restores the interface journal before DHCP ownership recovery
+    // and reconfiguration from the last committed policy.
+    crate::core::transaction::recover_interface_transactions(
+        fixture.directory.path(),
+        &manager,
+        &committed,
+        &crate::wifi::WifiRuntimeDirs::new(
+            fixture.directory.path().join("hostapd"),
+            fixture.directory.path().join("wpa_supplicant"),
+        ),
+    )
+    .await
+    .unwrap();
+    let restarted = DhcpClientSupervisor::start(
+        &committed
+            .effective_config(&fixture.service.base_config)
+            .unwrap(),
+        Arc::new(FakeNetwork {
+            addresses: Vec::new(),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(restarted.spec("wan0").await.unwrap().install_default_route);
+    assert_eq!(fixture.overrides.snapshot().await, committed);
+    assert!(!fixture
+        .directory
+        .path()
+        .join("interface-transactions/wan0.json")
+        .exists());
+}
+
 #[tokio::test]
 async fn dhcp_client_control_configure_compensates_runtime_when_persistence_fails() {
     let fixture = dhcp_client_control_fixture(false).await;

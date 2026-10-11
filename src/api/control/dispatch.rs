@@ -847,6 +847,7 @@ fn is_converged_network_transaction_request(request: &Request) -> bool {
     matches!(
         request,
         Request::ConfigureWifi { .. }
+            | Request::ConfigureDhcpClient { .. }
             | Request::DisableWifi { .. }
             | Request::ConfigureWifiClient { .. }
             | Request::DisableWifiClient { .. }

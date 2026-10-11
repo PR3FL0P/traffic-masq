@@ -183,7 +183,7 @@ Body names in the tables refer to the [request schemas](#request-schemas).
 | `GET` | `/dhcp/{interface}/leases` | — | Active leases | Authenticated |
 | `GET` | `/dhcp-client` | — | DHCP client status for all configured interfaces | Authenticated |
 | `GET` | `/dhcp-client/{interface}` | — | One DHCP client status | Authenticated |
-| `PUT` | `/dhcp-client/{interface}` | `DhcpClientConfig` | Configure DHCP client immediately | Administrator |
+| `PUT` | `/dhcp-client/{interface}` | `DhcpClientConfig` | Configure DHCP client; enabled-client route policy changes require confirmation | Administrator |
 | `DELETE` | `/dhcp-client/{interface}` | — | Disable DHCP client immediately | Administrator |
 | `POST` | `/dhcp-client/{interface}/renew` | — | Renew the lease | Administrator |
 | `POST` | `/dhcp-client/{interface}/release` | — | Release the lease | Administrator |
@@ -404,6 +404,14 @@ no static IPv4 address. Apply and commit interface role, management or address
 changes through the interface transaction endpoints first. The DHCP endpoint
 changes only DHCP policy; it does not convert the interface or remove other
 services.
+
+Changing `route_metric` or `install_default_route` on an enabled client returns
+`NetworkChangePending` through the existing interface transaction. Confirm with
+`CommitNetworkChange` or cancel with `RollbackNetworkChange`; timeout restores
+the previous policy. Saved configuration changes only on commit. Recovery uses
+the interface transaction journal and DHCP supervisor, without replaying an
+expired lease. Initial enablement and changes to other options remain immediate
+and return `DhcpClientInterface`.
 
 ```json
 {

@@ -500,6 +500,52 @@ fn manual_delete_preserves_route_selectors_and_quotes_interface_names() {
     assert!(manual_route_delete_command(&route).is_err());
 }
 
+#[test]
+fn manual_dhcp_delete_explains_policy_and_never_changes_intent() {
+    for destination in ["0.0.0.0/0", "192.0.2.0/24"] {
+        let mut app = TuiApp::default();
+        let mut route = route_status(&route_config(destination), RouteOwner::TrafficMasqDhcp);
+        route.protocol = 202;
+        route.output_interface = Some("wan0".into());
+        app.router.routes = vec![route.clone()];
+        let before = app.router.proposed_router_config.clone();
+        delete_selected_route(&mut app);
+        let message = app.message.as_deref().unwrap();
+        assert!(message.contains("managed by the traffic-masq DHCP client"));
+        assert!(message.contains("no automatic rollback"));
+        assert!(message.contains("not saved DHCP policy"));
+        assert!(message.contains(&manual_route_delete_command(&route).unwrap()));
+        if destination == "0.0.0.0/0" {
+            assert!(message.contains("DHCP Client -> select wan0 -> e / Enter"));
+            assert!(message.contains("Install default route to false"));
+            assert!(message.contains("rollback timer"));
+        } else {
+            assert!(message.contains("no separate switch"));
+            assert!(message.contains("Interfaces -> wan0"));
+            assert!(message.contains("static IPv4"));
+        }
+        assert_eq!(app.router.proposed_router_config, before);
+        assert_eq!(app.router.routes, vec![route]);
+        assert!(!app.router.staged);
+    }
+}
+
+#[test]
+fn manual_dhcp_delete_keeps_policy_advice_when_interface_name_is_unavailable() {
+    let mut app = TuiApp::default();
+    let mut route = route_status(&route_config("0.0.0.0/0"), RouteOwner::TrafficMasqDhcp);
+    route.protocol = 202;
+    route.output_interface = None;
+    route.output_interface_index = Some(7);
+    app.router.routes = vec![route];
+    delete_selected_route(&mut app);
+    let message = app.message.as_deref().unwrap();
+    assert!(message.contains("Install default route to false"));
+    assert!(message.contains("Cannot generate the command"));
+    assert!(!message.contains("sudo ip"));
+    assert!(!app.router.staged);
+}
+
 #[tokio::test]
 async fn router_plan_requires_reaching_the_end_before_apply() {
     let mut app = TuiApp {

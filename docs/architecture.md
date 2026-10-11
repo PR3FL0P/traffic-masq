@@ -131,7 +131,8 @@ retain recovery evidence.
 Operator AP/client configuration, saved profile activation, and operator-triggered
 AP/client deactivation use the same commit-confirm interface transactions as
 provisioning. Internal autoconnect activation and timeout cleanup remain
-immediate. DHCP and VPN controls plus Wi-Fi passphrase/reconnect/reload runtime
+immediate. DHCP route metric and default-route policy edits on enabled clients
+use interface transactions; other DHCP and VPN controls plus Wi-Fi passphrase/reconnect/reload runtime
 controls also remain immediate. Since runtime
 effects can survive a daemon crash, subsystems establish durable ownership
 proof before persistent runtime state is created: DHCP lease records include the applied route policy, Wi-Fi launches use
