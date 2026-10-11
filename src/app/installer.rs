@@ -694,13 +694,8 @@ fn dependency_plan(
             "Kernel nftables support",
         ));
     }
-    if presets.contains(&DependencyPreset::WifiAp) {
-        if !is_executable(&config.wifi.hostapd_binary) {
-            missing.push("hostapd");
-        }
-        if !is_executable(&config.wifi.iw_binary) {
-            missing.push("iw");
-        }
+    if presets.contains(&DependencyPreset::WifiAp) && !is_executable(&config.wifi.hostapd_binary) {
+        missing.push("hostapd");
     }
     if presets.contains(&DependencyPreset::WifiClient)
         && !is_executable(&config.wifi_client.wpa_supplicant_binary)

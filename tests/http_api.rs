@@ -2066,7 +2066,6 @@ async fn provisioning_test_server() -> Result<ProvisioningServer> {
     config.wifi = WifiConfig {
         enabled: true,
         hostapd_binary: std::path::PathBuf::from("/usr/sbin/hostapd"),
-        iw_binary: std::path::PathBuf::from("/usr/sbin/iw"),
         runtime_dir: directory.path().join("hostapd"),
         restart_backoff_seconds: 1,
     };

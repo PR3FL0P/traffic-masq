@@ -48,7 +48,7 @@ You need Linux, Rust 1.95.0 and a C compiler. The toolchain is pinned in
 `rust-toolchain.toml`. Some build targets also need CMake.
 
 The daemon needs `nft` with JSON support and kernel support for the features you
-use. For Wi-Fi, install `hostapd` and `iw` for AP mode or `wpa_supplicant` for client mode.
+use. For Wi-Fi, install `hostapd` for AP mode or `wpa_supplicant` for client mode.
 DHCP server and client are built in. WireGuard uses the kernel's netlink API;
 `wireguard-tools` is not needed to run the application.
 

@@ -49,7 +49,8 @@ collects a full plan; route, VPN, and dataplane planning remain available for
 targeted drift repair. The production adapter delegates VPN hop ownership,
 relay routing, policy, and compensation to a concrete VPN chain runtime while
 `RouterManager` retains the transaction order. Wi-Fi startup checks for
-hostapd, iw, and wpa_supplicant live with the Wi-Fi supervisors. The app's
+hostapd and wpa_supplicant live with the Wi-Fi supervisors. AP radio capabilities
+and regulatory domains are read directly through nl80211. The app's
 `startup_recovery` module validates durable proofs before normal admission or
 API binding; `router_startup` wires the production coordinator and restores
 temporary route/dataplane baselines; `vpn_startup` prepares VPN control and

@@ -18,7 +18,7 @@ use crate::wifi::lifecycle::{
 };
 use crate::wifi::process::{ProcessError, SupervisedProcess, TokioSupervisedProcess};
 use crate::wifi::radio::{
-    CapabilitiesRadioValidator, IwCapabilitiesProvider, RadioError, RadioValidator,
+    CapabilitiesRadioValidator, Nl80211CapabilitiesProvider, RadioError, RadioValidator,
 };
 use crate::wifi::record::{PersistedWifiRecord, WifiProcessKind, WifiRecordError, WifiRecordStore};
 use crate::wifi::render::{
@@ -155,7 +155,7 @@ impl HostapdSupervisor {
                 ctrl_timeout: DEFAULT_CTRL_TIMEOUT,
                 process,
                 radio: Arc::new(CapabilitiesRadioValidator::new(Arc::new(
-                    IwCapabilitiesProvider::new(config.wifi.iw_binary.clone()),
+                    Nl80211CapabilitiesProvider,
                 ))),
                 tasks: Mutex::new(HashMap::new()),
                 operation_lock: RwLock::new(()),

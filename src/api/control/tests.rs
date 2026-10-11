@@ -2344,7 +2344,6 @@ fn wifi_base_config(directory: &std::path::Path) -> AppConfig {
     config.wifi = WifiConfig {
         enabled: true,
         hostapd_binary: PathBuf::from("/usr/sbin/hostapd"),
-        iw_binary: PathBuf::from("/usr/sbin/iw"),
         runtime_dir: directory.join("hostapd"),
         restart_backoff_seconds: 1,
     };
@@ -5691,7 +5690,6 @@ fn provisioning_base_config(directory: &std::path::Path) -> AppConfig {
     config.wifi = WifiConfig {
         enabled: true,
         hostapd_binary: PathBuf::from("/usr/sbin/hostapd"),
-        iw_binary: PathBuf::from("/usr/sbin/iw"),
         runtime_dir: directory.join("hostapd"),
         restart_backoff_seconds: 1,
     };

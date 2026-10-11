@@ -957,10 +957,6 @@ fn rejects_a_global_wifi_section_that_cannot_work() {
     relative_binary.wifi.hostapd_binary = PathBuf::from("hostapd");
     assert!(relative_binary.validate().is_err());
 
-    let mut relative_iw = AppConfig::default();
-    relative_iw.wifi.iw_binary = PathBuf::from("iw");
-    assert!(relative_iw.validate().is_err());
-
     let mut relative_runtime = AppConfig::default();
     relative_runtime.wifi.runtime_dir = PathBuf::from("hostapd");
     assert!(relative_runtime.validate().is_err());
@@ -1439,4 +1435,20 @@ fn legacy_router_enabled_key_is_ignored_on_deserialization() {
     );
     let encoded = toml::to_string(&router).unwrap();
     assert!(!encoded.contains("enabled"));
+}
+
+#[test]
+fn legacy_iw_binary_is_ignored_and_not_written_back() {
+    let mut document = toml::Value::try_from(AppConfig::default()).expect("default config");
+    document["wifi"]
+        .as_table_mut()
+        .expect("wifi section")
+        .insert("iw_binary".into(), toml::Value::String("iw".into()));
+    let config: AppConfig = document.try_into().expect("legacy config");
+    config
+        .validate()
+        .expect("unused iw path does not need validation");
+    assert!(!toml::to_string(&config)
+        .expect("serialize")
+        .contains("iw_binary"));
 }

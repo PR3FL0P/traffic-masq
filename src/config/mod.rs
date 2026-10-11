@@ -256,8 +256,6 @@ pub struct WifiConfig {
 
     pub hostapd_binary: PathBuf,
 
-    pub iw_binary: PathBuf,
-
     pub runtime_dir: PathBuf,
 
     pub restart_backoff_seconds: u64,
@@ -268,7 +266,6 @@ impl Default for WifiConfig {
         Self {
             enabled: false,
             hostapd_binary: PathBuf::from("/usr/sbin/hostapd"),
-            iw_binary: PathBuf::from("/usr/sbin/iw"),
             runtime_dir: PathBuf::from("/run/traffic-masq/hostapd"),
             restart_backoff_seconds: 5,
         }
@@ -962,15 +959,6 @@ impl WifiConfig {
             bail!(
                 "wifi.hostapd_binary must be an absolute path, got {}",
                 self.hostapd_binary.display()
-            );
-        }
-        if self.iw_binary.as_os_str().is_empty() {
-            bail!("wifi.iw_binary must not be empty");
-        }
-        if !self.iw_binary.is_absolute() {
-            bail!(
-                "wifi.iw_binary must be an absolute path, got {}",
-                self.iw_binary.display()
             );
         }
         if self.runtime_dir.as_os_str().is_empty() {

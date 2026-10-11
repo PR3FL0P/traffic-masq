@@ -47,7 +47,6 @@ default_lease_seconds = 86400
 [wifi]
 enabled = false
 hostapd_binary = "/usr/sbin/hostapd"
-iw_binary = "/usr/sbin/iw"
 runtime_dir = "/run/traffic-masq/hostapd"
 restart_backoff_seconds = 5
 

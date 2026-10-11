@@ -22,19 +22,22 @@ The supported build toolchain is Rust 1.95.0, pinned in `rust-toolchain.toml`.
 - kernel support for nftables when using routing/firewall features, and WireGuard when using VPN
 - `nft` in `PATH`, built with JSON support
 - two or more network interfaces for router operation
-- `hostapd` and `iw` for Wi-Fi access point mode
+- `hostapd` for Wi-Fi access point mode
 - `wpa_supplicant` for Wi-Fi client mode
 
 The firewall is read back as JSON (`nft --json list ruleset`), so an nftables
 built without libjansson fails at the first firewall change rather than at
 startup.
 
-`hostapd`, `iw` and `wpa_supplicant` are looked up at absolute paths, not through
-`PATH`. The defaults are `/usr/sbin/hostapd`, `/usr/sbin/iw` and
-`/usr/sbin/wpa_supplicant`; distributions that ship them elsewhere need
-`wifi.hostapd_binary`, `wifi.iw_binary` and `wifi_client.wpa_supplicant_binary`
-set in the configuration file. `iw` is used to validate AP channel/width against
-the selected PHY and the kernel's effective regulatory restrictions before hostapd is changed.
+`hostapd` and `wpa_supplicant` are looked up at absolute paths, not through
+`PATH`. The defaults are `/usr/sbin/hostapd` and `/usr/sbin/wpa_supplicant`;
+`wifi.hostapd_binary` and `wifi_client.wpa_supplicant_binary` can be set in the
+configuration file. AP channel/width validation reads PHY capabilities and
+global/device-specific regulatory domains directly through the kernel nl80211
+Netlink API. `iw` is optional for diagnostics and physical test harnesses.
+Incomplete or interrupted probes reject AP validation instead of assuming
+channels are usable. Regulatory dumps require a kernel supporting
+`NL80211_CMD_GET_REG` with `NLM_F_DUMP`.
 
 WireGuard is configured over netlink, and both DHCP server and DHCP client are
 part of the daemon, so `wireguard-tools`, `dhcpcd` and `dhclient` are not used.
@@ -88,6 +91,14 @@ blocked direct uplink traffic, tunnel teardown and reconnection. The runner
 excludes Wi-Fi simulation and physical hardware tests.
 
 Wi-Fi namespace tests also need `modprobe`, `modinfo` and `mac80211_hwsim`.
+To compare the native AP capability probe against `iw` on a selected radio
+without changing its state:
+
+```sh
+TRAFFIC_MASQ_NL80211_INTERFACE=wlp1s0 TRAFFIC_MASQ_IW_BINARY=/usr/bin/iw \
+  cargo test --locked -p traffic-masq --lib native_probe_matches_iw_on_selected_radio -- --ignored
+```
+
 Physical tests use `TRAFFIC_MASQ_*` variables for interfaces, SSIDs and PSK files.
 The physical runner accepts an explicit adapter. Inspect its kernel identity
 through the daemon's network provider without changing the connection:

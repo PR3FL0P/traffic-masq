@@ -205,8 +205,9 @@ Global settings have these defaults:
 | `runtime_dir` | `/run/traffic-masq/hostapd` | `/run/traffic-masq/wpa_supplicant` |
 | `restart_backoff_seconds` | `5` | `5` |
 
-`[wifi] iw_binary` defaults to `/usr/sbin/iw`. Binary and runtime paths must be
-absolute; backoff must be positive. Global `enabled` is a startup binary-check
+AP capabilities are read directly via nl80211; legacy `[wifi] iw_binary` is
+ignored and omitted when configuration is serialized. Binary and runtime paths
+must be absolute; backoff must be positive. Global `enabled` is a startup binary-check
 hint, not a runtime off switch: supervisors are available even when it is
 `false`, and interface configuration/profile activation can start Wi-Fi later.
 Remove or deactivate the interface's Wi-Fi configuration to stop it.

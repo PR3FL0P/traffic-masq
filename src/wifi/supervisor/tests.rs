@@ -217,7 +217,6 @@ fn app_config(state_dir: &Path, runtime_dir: &Path) -> AppConfig {
         wifi: WifiConfig {
             enabled: true,
             hostapd_binary: PathBuf::from("/usr/sbin/hostapd"),
-            iw_binary: PathBuf::from("/usr/sbin/iw"),
             runtime_dir: runtime_dir.to_path_buf(),
             restart_backoff_seconds: 1,
         },

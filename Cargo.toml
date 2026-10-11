@@ -64,6 +64,7 @@ traffic-masq-netlink = { path = "crates/netlink" }
 traffic-masq-host-observation = { path = "crates/host-observation" }
 traffic-masq-protocol = { path = "crates/protocol" }
 traffic-masq-wireguard = { path = "crates/wireguard" }
+wl-nl80211 = "=0.8.0"
 zeroize = { version = "1", features = ["serde"] }
 
 [dev-dependencies]

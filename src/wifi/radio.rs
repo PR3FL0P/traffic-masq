@@ -1,9 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config::{vht80_center_channel, WifiBand, WifiChannelWidth};
-use crate::netlink::wireless_phy;
 use crate::wifi::WifiApSpec;
 use async_trait::async_trait;
 use thiserror::Error;
@@ -41,41 +39,8 @@ pub(crate) trait WifiCapabilitiesProvider: Send + Sync {
     async fn regulatory_domain(&self) -> Result<RegulatoryDomain, RadioError>;
 }
 
-pub(crate) struct IwCapabilitiesProvider {
-    iw_binary: PathBuf,
-}
-
-impl IwCapabilitiesProvider {
-    pub(crate) fn new(iw_binary: PathBuf) -> Self {
-        Self { iw_binary }
-    }
-
-    async fn output(&self, args: &[&str]) -> Result<String, RadioError> {
-        let output =
-            crate::command::run(&self.iw_binary, args, &[], crate::command::COMMAND_TIMEOUT)
-                .await
-                .map_err(|error| RadioError::ProbeFailed {
-                    message: format!("{error:#}"),
-                })?;
-        Ok(String::from_utf8_lossy(&output).into_owned())
-    }
-}
-
-#[async_trait]
-impl WifiCapabilitiesProvider for IwCapabilitiesProvider {
-    async fn phy(&self, interface: &str) -> Result<WifiPhyCapabilities, RadioError> {
-        let phy = wireless_phy(interface).ok_or_else(|| RadioError::NotWireless {
-            interface: interface.to_string(),
-        })?;
-        let phy_text = self.output(&["phy", &phy, "info"]).await?;
-        parse_phy_info(&phy, &phy_text)
-    }
-
-    async fn regulatory_domain(&self) -> Result<RegulatoryDomain, RadioError> {
-        let text = self.output(&["reg", "get"]).await?;
-        Ok(parse_reg_domains(&text))
-    }
-}
+mod nl80211;
+pub(crate) use nl80211::Nl80211CapabilitiesProvider;
 
 pub(crate) struct CapabilitiesRadioValidator {
     provider: Arc<dyn WifiCapabilitiesProvider>,
@@ -338,6 +303,7 @@ impl WifiPhyCapabilities {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct RawBand {
     ht40: bool,
@@ -345,6 +311,7 @@ struct RawBand {
     frequencies: Vec<WifiChannel>,
 }
 
+#[cfg(test)]
 fn parse_phy_info(phy: &str, text: &str) -> Result<WifiPhyCapabilities, RadioError> {
     let mut supports_ap = false;
     let mut wiphy_index = None;
@@ -416,6 +383,7 @@ fn parse_phy_info(phy: &str, text: &str) -> Result<WifiPhyCapabilities, RadioErr
     })
 }
 
+#[cfg(test)]
 fn parse_frequency_line(line: &str) -> Option<WifiChannel> {
     let rest = line.strip_prefix('*')?.trim_start();
     let mut fields = rest.split_whitespace();
@@ -451,6 +419,7 @@ fn parse_frequency_line(line: &str) -> Option<WifiChannel> {
     })
 }
 
+#[cfg(test)]
 fn parse_reg_domains(text: &str) -> RegulatoryDomain {
     enum Scope {
         Global,
@@ -504,7 +473,7 @@ mod tests {
     use super::*;
     use crate::config::WifiSecurity;
 
-    const PHY: &str = r#"
+    pub(super) const PHY: &str = r#"
 Wiphy phy0
     wiphy index: 0
     Supported interface modes:

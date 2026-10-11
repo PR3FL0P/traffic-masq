@@ -17,16 +17,6 @@ async fn preflight_hostapd_binary(binary: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn preflight_iw_binary(binary: &Path) -> Result<()> {
-    crate::command::probe(binary).await.with_context(|| {
-        format!(
-            "iw binary {} is not runnable — install iw or fix wifi.iw_binary",
-            binary.display()
-        )
-    })?;
-    Ok(())
-}
-
 async fn preflight_wpa_supplicant_binary(binary: &Path) -> Result<()> {
     crate::command::probe(binary).await.with_context(|| {
         format!(
@@ -42,7 +32,6 @@ async fn preflight_wpa_supplicant_binary(binary: &Path) -> Result<()> {
 pub(crate) async fn start_ap(config: &AppConfig) -> Result<HostapdSupervisor> {
     if config.wifi.enabled {
         preflight_hostapd_binary(&config.wifi.hostapd_binary).await?;
-        preflight_iw_binary(&config.wifi.iw_binary).await?;
     }
     Ok(HostapdSupervisor::start(config).await?)
 }
@@ -104,29 +93,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enabled_ap_checks_hostapd_before_iw() {
+    async fn enabled_ap_checks_hostapd() {
         let mut config = AppConfig::default();
         config.wifi.enabled = true;
         config.wifi.hostapd_binary = "/definitely/not/a/real/hostapd".into();
-        config.wifi.iw_binary = "/definitely/not/a/real/iw".into();
 
         let error = start_ap(&config).await.err().expect("hostapd must fail");
         assert!(error.to_string().contains("hostapd"), "{error:#}");
     }
 
     #[tokio::test]
-    async fn enabled_ap_checks_iw() {
+    async fn enabled_ap_startup_requires_no_iw_or_radio_probe() {
+        let directory = tempdir().expect("tempdir");
         let mut config = AppConfig::default();
+        config.runtime.state_dir = directory.path().join("state");
         config.wifi.enabled = true;
-        config.wifi.hostapd_binary = if Path::new("/bin/true").exists() {
-            "/bin/true".into()
-        } else {
-            "/bin/sh".into()
-        };
-        config.wifi.iw_binary = "/definitely/not/a/real/iw".into();
-
-        let error = start_ap(&config).await.err().expect("iw must fail");
-        assert!(error.to_string().contains("iw binary"), "{error:#}");
+        config.wifi.hostapd_binary = "/bin/true".into();
+        start_ap(&config)
+            .await
+            .expect("only hostapd is probed at startup");
     }
 
     #[tokio::test]
