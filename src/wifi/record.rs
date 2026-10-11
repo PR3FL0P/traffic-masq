@@ -33,6 +33,9 @@ pub enum WifiRecordError {
 
     #[error("persisted Wi-Fi process record {0} does not match its namespace or expected paths")]
     MismatchedContext(PathBuf),
+
+    #[error("cannot clean Wi-Fi control socket {0}: saved file identity is missing or changed, or the socket is still active; ownership record retained")]
+    UnprovenCtrlSocket(PathBuf),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

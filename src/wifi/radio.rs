@@ -55,7 +55,7 @@ impl IwCapabilitiesProvider {
             crate::command::run(&self.iw_binary, args, &[], crate::command::COMMAND_TIMEOUT)
                 .await
                 .map_err(|error| RadioError::ProbeFailed {
-                    message: error.to_string(),
+                    message: format!("{error:#}"),
                 })?;
         Ok(String::from_utf8_lossy(&output).into_owned())
     }

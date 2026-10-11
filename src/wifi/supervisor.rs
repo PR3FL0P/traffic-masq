@@ -42,10 +42,11 @@ pub enum SupervisorError {
     #[error("Wi-Fi access point on {interface} is not configured")]
     NotConfigured { interface: String },
 
-    #[error(
-        "refusing to manage hostapd on {interface}: process/control-socket ownership could not be verified"
-    )]
-    NotOwned { interface: String },
+    #[error("refusing to manage hostapd on {interface}: {diagnostics}")]
+    NotOwned {
+        interface: String,
+        diagnostics: String,
+    },
 
     #[error("hostapd for {interface} did not become ready within {timeout:?}{diagnostics}")]
     StartupTimeout {
@@ -84,7 +85,7 @@ impl SupervisorError {
     pub fn interface(&self) -> &str {
         match self {
             SupervisorError::NotConfigured { interface }
-            | SupervisorError::NotOwned { interface }
+            | SupervisorError::NotOwned { interface, .. }
             | SupervisorError::StartupTimeout { interface, .. } => interface,
             _ => "",
         }
@@ -419,6 +420,7 @@ impl HostapdSupervisor {
         let _operation = self.inner.operation_lock.read().await;
         let interface = spec.interface.clone();
         let _interface_operation = self.inner.interface_operations.lock(&interface).await;
+        crate::wifi::process::check_radio_unblocked(&interface).await?;
         self.validate_radio(&spec).await?;
         let ctrl_path = self.ctrl_path(&interface);
         let rendered = self.render_for(&spec).await?;
@@ -520,6 +522,11 @@ impl HostapdSupervisor {
         if !self.task_ctrl_is_owned(task).await? {
             return Err(SupervisorError::NotOwned {
                 interface: task.spec.interface.clone(),
+                diagnostics: crate::wifi::process::wifi_conflict_diagnostics(
+                    &task.spec.interface,
+                    &self.ctrl_path(&task.spec.interface),
+                )
+                .await,
             });
         }
         let client =
@@ -530,6 +537,11 @@ impl HostapdSupervisor {
         if !self.task_ctrl_is_owned(task).await? {
             return Err(SupervisorError::NotOwned {
                 interface: task.spec.interface.clone(),
+                diagnostics: crate::wifi::process::wifi_conflict_diagnostics(
+                    &task.spec.interface,
+                    &self.ctrl_path(&task.spec.interface),
+                )
+                .await,
             });
         }
         Ok(client)
@@ -560,6 +572,11 @@ impl HostapdSupervisor {
         if task.record.ctrl_path != ctrl_path {
             return Err(SupervisorError::NotOwned {
                 interface: spec.interface.clone(),
+                diagnostics: crate::wifi::process::wifi_conflict_diagnostics(
+                    &spec.interface,
+                    &self.ctrl_path(&spec.interface),
+                )
+                .await,
             });
         }
         let client = self.owned_ctrl_client(task).await?;
@@ -624,6 +641,11 @@ impl HostapdSupervisor {
             OwnershipOutcome::ForeignPresent => {
                 return Err(SupervisorError::NotOwned {
                     interface: spec.interface.clone(),
+                    diagnostics: crate::wifi::process::wifi_conflict_diagnostics(
+                        &spec.interface,
+                        &self.ctrl_path(&spec.interface),
+                    )
+                    .await,
                 })
             }
         };
@@ -748,6 +770,7 @@ impl HostapdSupervisor {
         rendered: &RenderedApConfig,
         ctrl_path: &Path,
     ) -> Result<PersistedWifiRecord, SupervisorError> {
+        crate::wifi::process::check_radio_unblocked(&spec.interface).await?;
         write_config_file(rendered).await?;
         let store = self.record_store(&spec.interface);
         let launch_boot_id = self
@@ -852,6 +875,11 @@ impl HostapdSupervisor {
         if !self.task_process_identity_matches(task).await? {
             return Err(SupervisorError::NotOwned {
                 interface: task.spec.interface.clone(),
+                diagnostics: crate::wifi::process::wifi_conflict_diagnostics(
+                    &task.spec.interface,
+                    &self.ctrl_path(&task.spec.interface),
+                )
+                .await,
             });
         }
         self.inner
@@ -884,6 +912,11 @@ impl HostapdSupervisor {
             {
                 return Err(SupervisorError::NotOwned {
                     interface: interface.to_owned(),
+                    diagnostics: crate::wifi::process::wifi_conflict_diagnostics(
+                        interface,
+                        &self.ctrl_path(interface),
+                    )
+                    .await,
                 });
             }
         }
@@ -1363,6 +1396,11 @@ impl HostapdSupervisor {
             if !self.task_process_identity_matches(&task).await? {
                 return Err(SupervisorError::NotOwned {
                     interface: interface.to_string(),
+                    diagnostics: crate::wifi::process::wifi_conflict_diagnostics(
+                        interface,
+                        &self.ctrl_path(interface),
+                    )
+                    .await,
                 });
             }
             self.stop_task(&task).await?;
@@ -1386,6 +1424,11 @@ impl HostapdSupervisor {
             Ok(_) => {
                 return Err(SupervisorError::NotOwned {
                     interface: interface.to_string(),
+                    diagnostics: crate::wifi::process::wifi_conflict_diagnostics(
+                        interface,
+                        &self.ctrl_path(interface),
+                    )
+                    .await,
                 })
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1516,12 +1559,16 @@ async fn wait_for_ready(
     timeout: Duration,
     interface: &str,
 ) -> Result<(), SupervisorError> {
-    let binary_path = record
-        .binary_path
-        .as_deref()
-        .ok_or_else(|| SupervisorError::NotOwned {
+    let Some(binary_path) = record.binary_path.as_deref() else {
+        return Err(SupervisorError::NotOwned {
             interface: interface.to_string(),
-        })?;
+            diagnostics: crate::wifi::process::wifi_conflict_diagnostics(
+                interface,
+                &record.ctrl_path,
+            )
+            .await,
+        });
+    };
     let ready = wait_until_ready(timeout, || async {
         let owned = process
             .identity_matches_record(record, WifiProcessKind::AccessPoint, binary_path)

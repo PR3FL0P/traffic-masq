@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,10 +16,10 @@ use crate::wifi::client::render::{
     RenderedClientConfig,
 };
 use crate::wifi::lifecycle::{
-    classify_ownership, cleanup_unconfigured_records, graceful_stop, persist_owned_ctrl_node,
-    preflight_binary as preflight_daemon_binary, save_launch_intent, save_spawned_record, unix_now,
-    write_private_config, OwnershipOutcome, WifiHealth, STARTUP_POLL_INTERVAL,
-    STARTUP_READY_TIMEOUT,
+    classify_ownership, cleanup_owned_ctrl_node, cleanup_unconfigured_records, clear_owned_record,
+    graceful_stop, persist_owned_ctrl_node, preflight_binary as preflight_daemon_binary,
+    save_launch_intent, save_spawned_record, unix_now, write_private_config, OwnershipOutcome,
+    WifiHealth, STARTUP_POLL_INTERVAL, STARTUP_READY_TIMEOUT,
 };
 use crate::wifi::process::{ProcessError, SupervisedProcess, TokioSupervisedProcess};
 use crate::wifi::record::{PersistedWifiRecord, WifiProcessKind, WifiRecordError, WifiRecordStore};
@@ -42,10 +41,11 @@ pub enum ClientSupervisorError {
     #[error("Wi-Fi client on {interface} is not configured")]
     NotConfigured { interface: String },
 
-    #[error(
-        "refusing to manage wpa_supplicant on {interface}: a process not started by this daemon already occupies its control socket"
-    )]
-    NotOwned { interface: String },
+    #[error("refusing to manage wpa_supplicant on {interface}: {diagnostics}")]
+    NotOwned {
+        interface: String,
+        diagnostics: String,
+    },
 
     #[error("wpa_supplicant for {interface} did not become ready within {timeout:?}")]
     StartupTimeout {
@@ -89,7 +89,7 @@ impl ClientSupervisorError {
     pub fn interface(&self) -> &str {
         match self {
             ClientSupervisorError::NotConfigured { interface }
-            | ClientSupervisorError::NotOwned { interface }
+            | ClientSupervisorError::NotOwned { interface, .. }
             | ClientSupervisorError::StartupTimeout { interface, .. } => interface,
             _ => "",
         }
@@ -152,21 +152,6 @@ struct OwnedWpaCtrlIdentity {
     kind: WifiProcessKind,
     record: PersistedWifiRecord,
     require_current_record: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CtrlSocketNode {
-    dev: u64,
-    ino: u64,
-}
-
-impl CtrlSocketNode {
-    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
-        Self {
-            dev: metadata.dev(),
-            ino: metadata.ino(),
-        }
-    }
 }
 
 impl OwnedWpaCtrlIdentity {
@@ -233,34 +218,6 @@ struct OwnedWpaCtrlSession {
 }
 
 impl OwnedWpaCtrlSession {
-    async fn capture_ctrl_node(&self) -> Result<CtrlSocketNode, ClientSupervisorError> {
-        if !self.identity.prove(&self.inner).await? {
-            return Err(ClientSupervisorError::NotOwned {
-                interface: self.identity.interface.clone(),
-            });
-        }
-
-        let metadata = match tokio::fs::symlink_metadata(&self.identity.record.ctrl_path).await {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(ClientSupervisorError::NotOwned {
-                    interface: self.identity.interface.clone(),
-                })
-            }
-            Err(error) => return Err(anyhow::Error::from(error).into()),
-        };
-        let node = CtrlSocketNode::from_metadata(&metadata);
-
-        // Bind the captured dev/inode to the same ownership proof. If the
-        // pathname changed while it was being inspected, do not trust it.
-        if !self.identity.prove(&self.inner).await? {
-            return Err(ClientSupervisorError::NotOwned {
-                interface: self.identity.interface.clone(),
-            });
-        }
-        Ok(node)
-    }
-
     async fn attach_events(
         &self,
     ) -> Result<
@@ -273,6 +230,11 @@ impl OwnedWpaCtrlSession {
         if !self.identity.prove(&self.inner).await? {
             return Err(ClientSupervisorError::NotOwned {
                 interface: self.identity.interface.clone(),
+                diagnostics: crate::wifi::process::wifi_conflict_diagnostics(
+                    &self.identity.interface,
+                    &self.identity.record.ctrl_path,
+                )
+                .await,
             });
         }
         let connection = WpaSupplicantEventClient::connect(
@@ -285,6 +247,11 @@ impl OwnedWpaCtrlSession {
         if !self.identity.prove(&self.inner).await? {
             return Err(ClientSupervisorError::NotOwned {
                 interface: self.identity.interface.clone(),
+                diagnostics: crate::wifi::process::wifi_conflict_diagnostics(
+                    &self.identity.interface,
+                    &self.identity.record.ctrl_path,
+                )
+                .await,
             });
         }
         Ok(connection.attach().await?)
@@ -508,6 +475,7 @@ impl WifiClientSupervisor {
         let _operation = self.inner.operation_lock.read().await;
         let interface = spec.interface.clone();
         let _interface_operation = self.inner.interface_operations.lock(&interface).await;
+        crate::wifi::process::check_radio_unblocked(&interface).await?;
         let ctrl_path = self.ctrl_path(&interface);
         let rendered = self.render_for(&spec).await?;
 
@@ -649,6 +617,11 @@ impl WifiClientSupervisor {
         if !identity.prove(&self.inner).await? {
             return Err(ClientSupervisorError::NotOwned {
                 interface: identity.interface.clone(),
+                diagnostics: crate::wifi::process::wifi_conflict_diagnostics(
+                    &identity.interface,
+                    &identity.record.ctrl_path,
+                )
+                .await,
             });
         }
 
@@ -662,6 +635,11 @@ impl WifiClientSupervisor {
         if !identity.prove(&self.inner).await? {
             return Err(ClientSupervisorError::NotOwned {
                 interface: identity.interface.clone(),
+                diagnostics: crate::wifi::process::wifi_conflict_diagnostics(
+                    &identity.interface,
+                    &identity.record.ctrl_path,
+                )
+                .await,
             });
         }
 
@@ -746,11 +724,17 @@ impl WifiClientSupervisor {
                     .process
                     .stop_recorded(&record, WifiProcessKind::Client, "wpa_supplicant")
                     .await?;
+                self.cleanup_recorded_ctrl(&spec.interface, &record).await?;
                 self.spawn_and_record(spec, rendered, ctrl_path).await?
             }
             OwnershipOutcome::ForeignPresent => {
                 return Err(ClientSupervisorError::NotOwned {
                     interface: spec.interface.clone(),
+                    diagnostics: crate::wifi::process::wifi_conflict_diagnostics(
+                        &spec.interface,
+                        &self.ctrl_path(&spec.interface),
+                    )
+                    .await,
                 })
             }
         };
@@ -895,12 +879,18 @@ impl WifiClientSupervisor {
         rendered: &RenderedClientConfig,
         ctrl_path: &Path,
     ) -> Result<PersistedWifiRecord, ClientSupervisorError> {
+        crate::wifi::process::check_radio_unblocked(&spec.interface).await?;
         // Stopping our process does not reserve its pathname. A foreign
         // endpoint appearing before restart must block every spawn path.
         match tokio::fs::symlink_metadata(ctrl_path).await {
             Ok(_) => {
                 return Err(ClientSupervisorError::NotOwned {
                     interface: spec.interface.clone(),
+                    diagnostics: crate::wifi::process::wifi_conflict_diagnostics(
+                        &spec.interface,
+                        &self.ctrl_path(&spec.interface),
+                    )
+                    .await,
                 })
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -975,18 +965,18 @@ impl WifiClientSupervisor {
                 &spec.ssid,
             )
             .await?;
-            self.wait_for_ready(
-                OwnedWpaCtrlIdentity {
-                    interface: spec.interface.clone(),
-                    kind: WifiProcessKind::Client,
-                    record: record.clone(),
-                    require_current_record: true,
-                },
-                self.inner.ctrl_timeout,
-            )
-            .await?;
-            let record =
-                persist_owned_ctrl_node(&store, self.inner.process.as_ref(), record).await?;
+            let session = self
+                .wait_for_ready(
+                    OwnedWpaCtrlIdentity {
+                        interface: spec.interface.clone(),
+                        kind: WifiProcessKind::Client,
+                        record: record.clone(),
+                        require_current_record: true,
+                    },
+                    self.inner.ctrl_timeout,
+                )
+                .await?;
+            let record = session.identity.record;
             store.clear_transition().await?;
             Ok(record)
         }
@@ -997,7 +987,7 @@ impl WifiClientSupervisor {
             Err(error) => {
                 tracing::warn!(interface = %spec.interface, pid, error = %format!("{error:#}"), "wpa_supplicant startup failed; stopping process");
                 match self.graceful_stop(pid).await {
-                Ok(()) => match store.clear().await {
+                Ok(()) => match clear_owned_record(&store).await {
                     Ok(()) => {
                         let _ = tokio::fs::remove_file(&rendered.path).await;
                         Err(error)
@@ -1020,11 +1010,21 @@ impl WifiClientSupervisor {
     /// Refuse an existing socket with foreign identity rather than adopting it.
     async fn wait_for_ready(
         &self,
-        identity: OwnedWpaCtrlIdentity,
+        mut identity: OwnedWpaCtrlIdentity,
         timeout: Duration,
     ) -> Result<OwnedWpaCtrlSession, ClientSupervisorError> {
         let deadline = Instant::now() + STARTUP_READY_TIMEOUT.max(timeout);
         loop {
+            // Persist ownership as soon as the socket can be tied to our
+            // recorded process, even if connect or PING subsequently fails.
+            if identity.record.ctrl_dev.is_none() && identity.prove(&self.inner).await? {
+                identity.record = persist_owned_ctrl_node(
+                    &identity.store(&self.inner),
+                    self.inner.process.as_ref(),
+                    identity.record.clone(),
+                )
+                .await?;
+            }
             match self.open_owned_ctrl_session(identity.clone()).await {
                 Ok(session) if session.client.ping().await.is_ok() => return Ok(session),
                 Ok(_) | Err(ClientSupervisorError::Ctrl(_)) => {}
@@ -1036,6 +1036,11 @@ impl WifiClientSupervisor {
                         Ok(_) => {
                             return Err(ClientSupervisorError::NotOwned {
                                 interface: identity.interface.clone(),
+                                diagnostics: crate::wifi::process::wifi_conflict_diagnostics(
+                                    &identity.interface,
+                                    &identity.record.ctrl_path,
+                                )
+                                .await,
                             })
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1061,11 +1066,18 @@ impl WifiClientSupervisor {
         reason: &'static str,
     ) -> Result<(), ClientSupervisorError> {
         if task.record.pid == 0 || !self.inner.process.is_alive(task.record.pid).await? {
-            return Ok(());
+            return self
+                .cleanup_recorded_ctrl(&task.spec.interface, &task.record)
+                .await;
         }
         if !self.task_identity_matches(task).await? {
             return Err(ClientSupervisorError::NotOwned {
                 interface: task.spec.interface.clone(),
+                diagnostics: crate::wifi::process::wifi_conflict_diagnostics(
+                    &task.spec.interface,
+                    &task.record.ctrl_path,
+                )
+                .await,
             });
         }
         tracing::info!(interface = %task.spec.interface, pid = task.record.pid, reason, "stopping configured wpa_supplicant");
@@ -1073,7 +1085,26 @@ impl WifiClientSupervisor {
             .process
             .stop_recorded(&task.record, WifiProcessKind::Client, "wpa_supplicant")
             .await?;
-        Ok(())
+        self.cleanup_recorded_ctrl(&task.spec.interface, &task.record)
+            .await
+    }
+
+    async fn cleanup_recorded_ctrl(
+        &self,
+        interface: &str,
+        record: &PersistedWifiRecord,
+    ) -> Result<(), ClientSupervisorError> {
+        match cleanup_owned_ctrl_node(record).await {
+            Err(WifiRecordError::UnprovenCtrlSocket(_)) => Err(ClientSupervisorError::NotOwned {
+                interface: interface.to_owned(),
+                diagnostics: crate::wifi::process::wifi_conflict_diagnostics(
+                    interface,
+                    &record.ctrl_path,
+                )
+                .await,
+            }),
+            result => result.map_err(Into::into),
+        }
     }
 
     async fn graceful_stop(&self, pid: u32) -> Result<(), ClientSupervisorError> {
@@ -1102,6 +1133,11 @@ impl WifiClientSupervisor {
             {
                 return Err(ClientSupervisorError::NotOwned {
                     interface: interface.to_owned(),
+                    diagnostics: crate::wifi::process::wifi_conflict_diagnostics(
+                        interface,
+                        &self.ctrl_path(interface),
+                    )
+                    .await,
                 });
             }
         }
@@ -1122,7 +1158,7 @@ impl WifiClientSupervisor {
 
         self.stop_task(&task, "Wi-Fi client configuration removed")
             .await?;
-        self.record_store(interface).clear().await?;
+        clear_owned_record(&self.record_store(interface)).await?;
         let runtime_config = config_path(&self.inner.runtime_dir, interface);
         match tokio::fs::remove_file(&runtime_config).await {
             Ok(()) => {}
@@ -1422,27 +1458,7 @@ impl WifiClientSupervisor {
             .await?;
         }
 
-        // Do not probe an endpoint after the owned process has stopped. At
-        // this point any remaining pathname is unproven and therefore blocks
-        // replacement rather than being treated as an endpoint we may query.
-        match tokio::fs::symlink_metadata(&ctrl_path).await {
-            Ok(metadata)
-                if task.record.ctrl_dev == Some(metadata.dev())
-                    && task.record.ctrl_ino == Some(metadata.ino())
-                    && crate::wifi::lifecycle::ctrl_socket_is_stale(&ctrl_path) =>
-            {
-                tokio::fs::remove_file(&ctrl_path)
-                    .await
-                    .map_err(anyhow::Error::from)?;
-            }
-            Ok(_) => {
-                return Err(ClientSupervisorError::NotOwned {
-                    interface: interface.to_string(),
-                })
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(anyhow::Error::from(error).into()),
-        }
+        self.cleanup_recorded_ctrl(interface, &task.record).await?;
 
         task.retry.record_attempt();
         match self
@@ -1483,7 +1499,7 @@ impl WifiClientSupervisor {
                     tracing::error!(%interface, %error, "failed to stop wpa_supplicant during shutdown; ownership record retained");
                     continue;
                 }
-                if let Err(error) = self.record_store(&interface).clear().await {
+                if let Err(error) = clear_owned_record(&self.record_store(&interface)).await {
                     tracing::error!(%interface, %error, "wpa_supplicant stopped but ownership record cleanup failed");
                 }
                 let path = config_path(&self.inner.runtime_dir, &interface);

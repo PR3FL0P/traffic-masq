@@ -2,56 +2,21 @@
 //! Temporary scans retain their own launch proof and compensate before returning.
 
 use super::{
-    ClientSupervisorError, CtrlSocketNode, OwnedWpaCtrlIdentity, OwnedWpaCtrlSession,
-    WifiClientSupervisor,
+    ClientSupervisorError, OwnedWpaCtrlIdentity, OwnedWpaCtrlSession, WifiClientSupervisor,
 };
 use crate::wifi::client::ctrl::{CtrlError, WpaSupplicantEvent, WpaSupplicantScanResult};
 use crate::wifi::client::render::{render_scan_config, scan_config_path};
-use crate::wifi::lifecycle::{save_launch_intent, save_spawned_record, write_private_config};
+use crate::wifi::lifecycle::{
+    clear_owned_record, save_launch_intent, save_spawned_record, write_private_config,
+};
 use crate::wifi::process::ProcessError;
 use crate::wifi::record::{WifiProcessKind, WifiRecordStore};
 use crate::wifi::render::WifiDigest;
-use std::path::Path;
 use std::time::Duration;
 
 const SCAN_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl WifiClientSupervisor {
-    async fn remove_ctrl_node_if_same(
-        &self,
-        interface: &str,
-        ctrl_path: &Path,
-        trusted: Option<CtrlSocketNode>,
-    ) -> Result<(), ClientSupervisorError> {
-        let Some(trusted) = trusted else {
-            return Ok(());
-        };
-
-        match tokio::fs::symlink_metadata(ctrl_path).await {
-            Ok(metadata) if CtrlSocketNode::from_metadata(&metadata) == trusted => {
-                tokio::fs::remove_file(ctrl_path).await.map_err(|error| {
-                    ClientSupervisorError::Configuration(anyhow::Error::from(error).context(
-                        format!(
-                            "failed to remove stale owned wpa_supplicant control socket {}",
-                            ctrl_path.display()
-                        ),
-                    ))
-                })?;
-                Ok(())
-            }
-            Ok(_) => Err(ClientSupervisorError::NotOwned {
-                interface: interface.to_string(),
-            }),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(ClientSupervisorError::Configuration(
-                anyhow::Error::from(error).context(format!(
-                    "failed to inspect wpa_supplicant control socket {}",
-                    ctrl_path.display()
-                )),
-            )),
-        }
-    }
-
     /// Scan through an available supplicant, starting a temporary process when necessary.
     /// Validate the interface name and serialize scanning with configuration changes.
     pub async fn scan(
@@ -59,6 +24,7 @@ impl WifiClientSupervisor {
         interface: &str,
     ) -> Result<Vec<WpaSupplicantScanResult>, ClientSupervisorError> {
         crate::config::validate_interface_name(interface)?;
+        crate::wifi::process::check_radio_unblocked(interface).await?;
         let _operation = self.inner.operation_lock.read().await;
         let _interface_operation = self.inner.interface_operations.lock(interface).await;
         let ctrl_path = self.ctrl_path(interface);
@@ -75,6 +41,11 @@ impl WifiClientSupervisor {
             Ok(_) => {
                 return Err(ClientSupervisorError::NotOwned {
                     interface: interface.into(),
+                    diagnostics: crate::wifi::process::wifi_conflict_diagnostics(
+                        interface,
+                        &self.ctrl_path(interface),
+                    )
+                    .await,
                 })
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -120,8 +91,10 @@ impl WifiClientSupervisor {
         {
             Ok(pid) => pid,
             Err(err) => {
-                let cleanup = store.clear().await;
-                let _ = tokio::fs::remove_file(&scan_config_path).await;
+                let cleanup = clear_owned_record(&store).await;
+                if cleanup.is_ok() {
+                    let _ = tokio::fs::remove_file(&scan_config_path).await;
+                }
                 if let Err(cleanup) = cleanup {
                     return Err(ClientSupervisorError::Configuration(anyhow::anyhow!(
                         "Wi-Fi scan spawn failed: {err}; launch-intent cleanup also failed: {cleanup}; recovery required"
@@ -167,8 +140,10 @@ impl WifiClientSupervisor {
                 tracing::warn!(%interface, pid, error = %format!("{error:#}"), "failed to record temporary wpa_supplicant ownership; stopping process");
                 return match self.graceful_stop(pid).await {
                     Ok(()) => {
-                        let cleanup = store.clear().await;
-                        let _ = tokio::fs::remove_file(&scan_config_path).await;
+                        let cleanup = clear_owned_record(&store).await;
+                        if cleanup.is_ok() {
+                            let _ = tokio::fs::remove_file(&scan_config_path).await;
+                        }
                         // No durable spawned record exists, so there is no
                         // ownership-bound node identity to authorize unlink.
                         // Leave any surviving pathname untouched.
@@ -197,12 +172,9 @@ impl WifiClientSupervisor {
                 self.inner.ctrl_timeout,
             )
             .await;
-        let (scan_result, trusted_ctrl_node) = match ready {
-            Ok(session) => match session.capture_ctrl_node().await {
-                Ok(node) => (self.perform_scan(&session, interface).await, Some(node)),
-                Err(error) => (Err(error), None),
-            },
-            Err(error) => (Err(error), None),
+        let scan_result = match ready {
+            Ok(session) => self.perform_scan(&session, interface).await,
+            Err(error) => Err(error),
         };
 
         match &scan_result {
@@ -217,21 +189,15 @@ impl WifiClientSupervisor {
         }
         match self.graceful_stop(pid).await {
             Ok(()) => {
-                let clear_result = store.clear().await;
-                let _ = tokio::fs::remove_file(&scan_config_path).await;
-                let ctrl_cleanup = self
-                    .remove_ctrl_node_if_same(interface, &ctrl_path, trusted_ctrl_node)
-                    .await;
-                let cleanup_result = match (clear_result, ctrl_cleanup) {
-                    (Ok(()), Ok(())) => Ok(()),
-                    (Err(error), Ok(())) => Err(ClientSupervisorError::from(error)),
-                    (Ok(()), Err(error)) => Err(error),
-                    (Err(record_error), Err(ctrl_error)) => {
-                        Err(ClientSupervisorError::Configuration(anyhow::anyhow!(
-                            "ownership record cleanup failed: {record_error}; control-socket cleanup also failed: {ctrl_error}; recovery required"
-                        )))
+                let cleanup_result = async {
+                    if let Some(record) = store.load().await? {
+                        self.cleanup_recorded_ctrl(interface, &record).await?;
                     }
-                };
+                    // Keep both the record and configuration if socket cleanup fails.
+                    store.clear().await?;
+                    let _ = tokio::fs::remove_file(&scan_config_path).await;
+                    Ok::<(), ClientSupervisorError>(())
+                }.await;
 
                 match (scan_result, cleanup_result) {
                     (Ok(results), Ok(())) => Ok(results),

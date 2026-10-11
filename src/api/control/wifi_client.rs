@@ -1256,7 +1256,9 @@ pub(super) fn classify_wifi_client_error(error: ClientSupervisorError) -> Respon
     tracing::warn!(error = %error, "Wi-Fi client request failed");
     let detail = match error {
         ClientSupervisorError::NotConfigured { .. } => WifiClientErrorDetail::InterfaceNotFound,
-        ClientSupervisorError::NotOwned { .. } => WifiClientErrorDetail::NotOwned,
+        ClientSupervisorError::NotOwned { diagnostics, .. } => WifiClientErrorDetail::Other {
+            message: diagnostics,
+        },
         ClientSupervisorError::BinaryPreflight(
             crate::wifi::lifecycle::BinaryPreflightError::NotFound { .. },
         ) => WifiClientErrorDetail::WpaSupplicantMissing,
@@ -1318,5 +1320,26 @@ pub(super) fn wifi_client_edit_request_to_config(
         country_code: settings.country_code,
         security: settings.security,
         passphrase_file: None,
+    }
+}
+
+#[cfg(test)]
+mod ownership_diagnostics_tests {
+    use super::*;
+
+    #[test]
+    fn ownership_diagnostics_are_returned_to_the_user() {
+        let response = classify_wifi_client_error(ClientSupervisorError::NotOwned {
+            interface: "wlan0".into(),
+            diagnostics: "Socket /run/wpa_supplicant/wlan0 is held by wpa_supplicant PID 42; inspect its service".into(),
+        });
+        let Response::WifiClientError {
+            detail: WifiClientErrorDetail::Other { message },
+        } = response
+        else {
+            panic!("expected actionable ownership diagnostics");
+        };
+        assert!(message.contains("PID 42"));
+        assert!(message.contains("inspect its service"));
     }
 }

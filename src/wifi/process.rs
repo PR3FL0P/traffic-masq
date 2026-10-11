@@ -1,3 +1,8 @@
+mod rfkill;
+pub(crate) use rfkill::check_radio_unblocked;
+mod conflict;
+pub use conflict::wifi_conflict_diagnostics;
+
 use std::collections::{HashMap, VecDeque};
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};

@@ -9,7 +9,7 @@ pub enum WifiRadioRole {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("AP {ap_interface} and client {client_interface} share wireless PHY {phy}; concurrent AP/STA on one radio is unsupported")]
+#[error("AP {ap_interface} and client {client_interface} share wireless PHY {phy}; concurrent AP/STA on one radio is unsupported; inspect `iw dev`; disable one configured role or select a separate physical radio before retrying")]
 pub struct WifiRadioConflict {
     pub phy: String,
     pub ap_interface: String,

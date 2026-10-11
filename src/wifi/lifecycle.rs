@@ -90,12 +90,11 @@ where
         match process.boot_id().await {
             Ok(Some(current_boot)) if current_boot.as_str() == expected_boot => {}
             Ok(Some(_)) => {
+                if ctrl_reachable {
+                    return Ok(OwnershipOutcome::ForeignPresent);
+                }
                 store.clear().await?;
-                return Ok(if ctrl_reachable {
-                    OwnershipOutcome::ForeignPresent
-                } else {
-                    OwnershipOutcome::Absent
-                });
+                return Ok(OwnershipOutcome::Absent);
             }
             Ok(None) | Err(_) => return Ok(OwnershipOutcome::ForeignPresent),
         }
@@ -109,10 +108,13 @@ where
             )
             .await
         {
-            Ok(pids) if pids.is_empty() => {
-                store.clear().await?;
-                record = None;
-            }
+            Ok(pids) if pids.is_empty() => match clear_owned_record(store).await {
+                Ok(()) => record = None,
+                Err(WifiRecordError::UnprovenCtrlSocket(_)) => {
+                    return Ok(OwnershipOutcome::ForeignPresent)
+                }
+                Err(error) => return Err(error),
+            },
             Ok(pids) if pids.len() == 1 => {
                 let mut recovered = pending;
                 recovered.pid = pids[0];
@@ -208,6 +210,16 @@ where
                     record.binary_path = Some(expected_binary.to_path_buf());
                     store.save(&record).await?;
                 }
+                if record.ctrl_dev.is_none()
+                    && record.process_start_ticks.is_some()
+                    && record.boot_id.is_some()
+                    && process
+                        .owns_unix_socket(record.pid, &record.ctrl_path)
+                        .await
+                        .unwrap_or(false)
+                {
+                    record = persist_owned_ctrl_node(store, process, record).await?;
+                }
                 Ok(OwnershipOutcome::UnreachableOwned(record))
             }
             Ok(false) => {
@@ -240,6 +252,17 @@ where
     if record.binary_path.is_none() {
         record.binary_path = Some(expected_binary.to_path_buf());
         store.save(&record).await?;
+    }
+
+    if record.ctrl_dev.is_none()
+        && record.process_start_ticks.is_some()
+        && record.boot_id.is_some()
+        && process
+            .owns_unix_socket(record.pid, &record.ctrl_path)
+            .await
+            .unwrap_or(false)
+    {
+        record = persist_owned_ctrl_node(store, process, record).await?;
     }
 
     if record.binary_path.as_deref() != Some(expected_binary) {
@@ -330,6 +353,46 @@ pub(crate) fn ctrl_socket_is_stale(path: &Path) -> bool {
     std::os::unix::net::UnixDatagram::unbound()
         .and_then(|socket| socket.connect(path))
         .is_err_and(|error| error.kind() == std::io::ErrorKind::ConnectionRefused)
+}
+
+/// Call only after stopping the recorded process or proving it has exited.
+/// Retain durable evidence until its socket is absent or safely removed.
+pub(crate) async fn clear_owned_record(store: &WifiRecordStore) -> Result<(), WifiRecordError> {
+    if let Some(record) = store.load().await? {
+        cleanup_owned_ctrl_node(&record).await?;
+    }
+    store.clear().await
+}
+
+pub(crate) async fn cleanup_owned_ctrl_node(
+    record: &PersistedWifiRecord,
+) -> Result<(), WifiRecordError> {
+    let path = &record.ctrl_path;
+    let node = match tokio::fs::symlink_metadata(path).await {
+        Ok(node) => node,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(WifiRecordError::Read(path.clone(), error)),
+    };
+    if !node.file_type().is_socket()
+        || record.ctrl_dev != Some(node.dev())
+        || record.ctrl_ino != Some(node.ino())
+        || !ctrl_socket_is_stale(path)
+    {
+        return Err(WifiRecordError::UnprovenCtrlSocket(path.clone()));
+    }
+    // Recheck after probing: a replacement pathname must not be removed.
+    let current = tokio::fs::symlink_metadata(path)
+        .await
+        .map_err(|error| WifiRecordError::Read(path.clone(), error))?;
+    if !current.file_type().is_socket()
+        || current.dev() != node.dev()
+        || current.ino() != node.ino()
+    {
+        return Err(WifiRecordError::UnprovenCtrlSocket(path.clone()));
+    }
+    tokio::fs::remove_file(path)
+        .await
+        .map_err(|error| WifiRecordError::Write(path.clone(), error))
 }
 
 pub(crate) async fn persist_owned_ctrl_node(
@@ -582,9 +645,18 @@ pub(crate) async fn cleanup_unconfigured_records(
                     anyhow::bail!("cannot signal legacy Wi-Fi process record for {interface}: exact process lifetime identity is missing");
                 }
                 owned.binary_path = Some(binary_path.to_path_buf());
+                if process.owns_unix_socket(pid, &owned.ctrl_path).await? {
+                    match persist_owned_ctrl_node(&store, process, owned.clone()).await {
+                        Ok(record) => owned = record,
+                        // A process can exist before creating its control socket.
+                        Err(WifiRecordError::Read(_, error))
+                            if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
                 process.stop_recorded(&owned, kind, "Wi-Fi startup recovery").await?;
             }
-            store.clear().await?;
+            clear_owned_record(&store).await?;
             Ok(())
         }
         .await;
@@ -681,11 +753,20 @@ pub(crate) async fn stop_recorded_interface(
                 } else if owned.process_start_ticks.is_none() || owned.boot_id.is_none() {
                     anyhow::bail!("cannot signal legacy Wi-Fi process record for {interface}: exact process lifetime identity is missing");
                 }
+                if process.owns_unix_socket(pid, &owned.ctrl_path).await? {
+                    match persist_owned_ctrl_node(&store, &process, owned.clone()).await {
+                        Ok(record) => owned = record,
+                        // A process can exist before creating its control socket.
+                        Err(WifiRecordError::Read(_, error))
+                            if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
                 process
                     .stop_recorded(&owned, kind, "Wi-Fi recovery")
                     .await?;
             }
-            store.clear().await?;
+            clear_owned_record(&store).await?;
         }
     }
     Ok(())

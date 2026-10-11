@@ -466,7 +466,9 @@ pub(super) fn classify_wifi_error(error: SupervisorError) -> Response {
     tracing::warn!(error = %error, "Wi-Fi request failed");
     let detail = match error {
         SupervisorError::NotConfigured { .. } => WifiErrorDetail::InterfaceNotFound,
-        SupervisorError::NotOwned { .. } => WifiErrorDetail::NotOwned,
+        SupervisorError::NotOwned { diagnostics, .. } => WifiErrorDetail::Other {
+            message: diagnostics,
+        },
         SupervisorError::BinaryPreflight(
             crate::wifi::lifecycle::BinaryPreflightError::NotFound { .. },
         ) => WifiErrorDetail::HostapdMissing,
@@ -526,5 +528,26 @@ pub(super) fn wifi_edit_request_to_config(settings: WifiEditRequest) -> WifiApCo
         client_isolation: settings.client_isolation,
         max_stations: settings.max_stations,
         passphrase_file: None,
+    }
+}
+
+#[cfg(test)]
+mod ownership_diagnostics_tests {
+    use super::*;
+
+    #[test]
+    fn ap_socket_owner_and_manual_action_reach_the_user() {
+        let response = classify_wifi_error(SupervisorError::NotOwned {
+            interface: "wlan0".into(),
+            diagnostics: "hostapd PID 42 holds the control socket; inspect its service before stopping it manually".into(),
+        });
+        let Response::WifiError {
+            detail: WifiErrorDetail::Other { message },
+        } = response
+        else {
+            panic!("expected ownership diagnostics");
+        };
+        assert!(message.contains("hostapd PID 42"));
+        assert!(message.contains("manually"));
     }
 }

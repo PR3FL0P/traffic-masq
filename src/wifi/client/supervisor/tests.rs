@@ -36,6 +36,7 @@ struct FakeSupplicantCtrl {
     shutdown: Arc<AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
     ctrl_path: PathBuf,
+    unlink_on_drop: bool,
 }
 
 impl FakeSupplicantCtrl {
@@ -119,6 +120,7 @@ impl FakeSupplicantCtrl {
             shutdown,
             join: Some(join),
             ctrl_path,
+            unlink_on_drop: true,
         }
     }
 
@@ -147,6 +149,7 @@ impl FakeSupplicantCtrl {
             shutdown,
             join: Some(join),
             ctrl_path,
+            unlink_on_drop: true,
         }
     }
 }
@@ -157,7 +160,9 @@ impl Drop for FakeSupplicantCtrl {
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
-        let _ = std::fs::remove_file(&self.ctrl_path);
+        if self.unlink_on_drop {
+            let _ = std::fs::remove_file(&self.ctrl_path);
+        }
     }
 }
 
@@ -173,7 +178,13 @@ fn fake_process() -> Arc<FakeProcess> {
                 .parent()
                 .unwrap_or_else(|| Path::new(""))
                 .join(interface);
-            FakeSupplicantCtrl::spawn(ctrl_path, state, config_path)
+            let mut responder = if state == "SILENT_LEAVE_SOCKET" {
+                FakeSupplicantCtrl::spawn_silent(ctrl_path)
+            } else {
+                FakeSupplicantCtrl::spawn(ctrl_path, state, config_path)
+            };
+            responder.unlink_on_drop = !matches!(state, "LEAVE_SOCKET" | "SILENT_LEAVE_SOCKET");
+            responder
         },
     )
 }
@@ -1194,13 +1205,13 @@ async fn ephemeral_scan_cleanup_preserves_rebound_foreign_socket() {
     ));
 
     assert!(runtime.join("wlan0").exists());
-    assert!(!runtime.join("wlan0-scan.conf").exists());
+    assert!(runtime.join("wlan0-scan.conf").exists());
     assert!(
         WifiRecordStore::for_scan(temp.path().join("wifi"), &runtime, "wlan0")
             .load()
             .await
             .expect("load scan record")
-            .is_none()
+            .is_some()
     );
 
     drop(foreign.lock().expect("foreign responder lock").take());
@@ -1706,4 +1717,162 @@ fn configuration_error_preserves_underlying_failure() {
         error.to_string(),
         "failed to inspect control socket: Permission denied (os error 13)"
     );
+}
+
+#[tokio::test]
+async fn disable_cleans_socket_left_by_owned_process() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("run");
+    let process = fake_process();
+    process.set_spawn_profile("LEAVE_SOCKET");
+    let supervisor = supervisor(temp.path(), &runtime, process).await;
+    supervisor
+        .configure(spec("wlan0", "upstream"))
+        .await
+        .unwrap();
+    supervisor.disable("wlan0").await.unwrap();
+    assert!(!runtime.join("wlan0").exists());
+    assert!(supervisor
+        .record_store("wlan0")
+        .load()
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn reconfigure_cleans_socket_left_by_owned_process() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("run");
+    let process = fake_process();
+    process.set_spawn_profile("LEAVE_SOCKET");
+    let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
+    supervisor
+        .configure(spec("wlan0", "upstream"))
+        .await
+        .unwrap();
+    supervisor
+        .configure(spec("wlan0", "another-network"))
+        .await
+        .unwrap();
+    assert_eq!(process.spawn_count(), 2);
+    supervisor.disable("wlan0").await.unwrap();
+}
+
+#[tokio::test]
+async fn ephemeral_scan_cleans_socket_left_by_owned_process() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("run");
+    let process = fake_process();
+    process.set_spawn_profile("LEAVE_SOCKET");
+    let supervisor = supervisor(temp.path(), &runtime, process).await;
+    supervisor.scan("wlan0").await.unwrap();
+    assert!(!runtime.join("wlan0").exists());
+    assert!(
+        WifiRecordStore::for_scan(temp.path().join("wifi"), &runtime, "wlan0")
+            .load()
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_readiness_cleans_socket_captured_before_ping() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("run");
+    let process = fake_process();
+    process.set_spawn_profile("SILENT_LEAVE_SOCKET");
+    let supervisor = supervisor(temp.path(), &runtime, process).await;
+    assert!(supervisor
+        .configure(spec("wlan0", "upstream"))
+        .await
+        .is_err());
+    assert!(!runtime.join("wlan0").exists());
+    assert!(supervisor
+        .record_store("wlan0")
+        .load()
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn shutdown_cleans_socket_left_by_owned_process() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("run");
+    let process = fake_process();
+    process.set_spawn_profile("LEAVE_SOCKET");
+    let supervisor = supervisor(temp.path(), &runtime, process).await;
+    supervisor
+        .configure(spec("wlan0", "upstream"))
+        .await
+        .unwrap();
+    supervisor
+        .shutdown(ConfigShutdownPolicy::RestoreInterfaces)
+        .await;
+    assert!(!runtime.join("wlan0").exists());
+    assert!(supervisor
+        .record_store("wlan0")
+        .load()
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn startup_cleans_stale_socket_before_discarding_unconfigured_record() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("run");
+    let process = fake_process();
+    process.set_spawn_profile("LEAVE_SOCKET");
+    let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
+    supervisor
+        .configure(spec("wlan0", "upstream"))
+        .await
+        .unwrap();
+    process.kill_externally(2000);
+    assert!(runtime.join("wlan0").exists());
+    cleanup_unconfigured_records(
+        &temp.path().join("wifi"),
+        &runtime,
+        WifiProcessKind::Client,
+        &HashSet::new(),
+        process.as_ref(),
+        Path::new("/usr/sbin/wpa_supplicant"),
+    )
+    .await
+    .unwrap();
+    assert!(!runtime.join("wlan0").exists());
+    assert!(supervisor
+        .record_store("wlan0")
+        .load()
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn cleanup_retains_record_when_socket_identity_was_not_captured() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("run");
+    let process = fake_process();
+    process.set_spawn_profile("LEAVE_SOCKET");
+    let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
+    supervisor
+        .configure(spec("wlan0", "upstream"))
+        .await
+        .unwrap();
+    let store = supervisor.record_store("wlan0");
+    let mut record = store.load().await.unwrap().unwrap();
+    record.ctrl_dev = None;
+    record.ctrl_ino = None;
+    store.save(&record).await.unwrap();
+    process.kill_externally(2000);
+    assert!(matches!(
+        clear_owned_record(&store).await,
+        Err(WifiRecordError::UnprovenCtrlSocket(_))
+    ));
+    assert!(runtime.join("wlan0").exists());
+    assert_eq!(store.load().await.unwrap(), Some(record));
 }
