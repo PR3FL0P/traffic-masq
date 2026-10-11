@@ -31,6 +31,44 @@ fn vpn_chain_requires_enabled_vpn_runtime() {
     );
 }
 
+#[test]
+fn route_host_traffic_reaches_only_the_exit_hop_policy() {
+    use crate::core::vpn_chain::VpnHopKind;
+    let mut config = enabled_config();
+    config.vpn.enabled = true;
+    config.router.vpn_chain = vec![
+        crate::config::VpnHopConfig {
+            profile_name: "first.conf".into(),
+        },
+        crate::config::VpnHopConfig {
+            profile_name: "second.conf".into(),
+        },
+    ];
+
+    let off = RouterDesired::from_effective_config(&config).unwrap();
+    let VpnHopKind::Exit { policy } = &off.vpn_chain[1].kind else {
+        panic!("last hop is the exit");
+    };
+    assert!(!policy.route_host_traffic);
+    assert!(policy.chain_profiles.is_empty());
+
+    config.router.route_host_traffic = true;
+    let on = RouterDesired::from_effective_config(&config).unwrap();
+    let VpnHopKind::Exit { policy } = &on.vpn_chain[1].kind else {
+        panic!("last hop is the exit");
+    };
+    assert!(policy.route_host_traffic);
+    assert_eq!(policy.chain_profiles, ["first.conf", "second.conf"]);
+    assert!(
+        policy.host_endpoints.is_empty(),
+        "endpoints are resolved at apply time"
+    );
+    assert_ne!(
+        off.vpn_chain, on.vpn_chain,
+        "toggling the flag must change the plan"
+    );
+}
+
 fn enabled_config() -> AppConfig {
     let mut config = AppConfig::default();
     config.network.interfaces.insert(
@@ -75,7 +113,6 @@ fn enabled_config() -> AppConfig {
     config.router = RouterConfig {
         forwarding: None,
         vpn_chain: Vec::new(),
-        enabled: true,
         uplink: Some(UplinkConfig {
             interface: "wan0".to_string(),
             mode: UplinkMode::External,
@@ -88,6 +125,7 @@ fn enabled_config() -> AppConfig {
             metric: Some(100),
         }],
         allow_default_route_change: false,
+        route_host_traffic: false,
     };
     config
 }
@@ -187,7 +225,7 @@ fn switching_to_connections_preserves_existing_uplink_services() {
 #[test]
 fn disabled_router_does_not_claim_routes_or_dataplane() {
     let mut config = enabled_config();
-    config.router.enabled = false;
+    config.router = RouterConfig::default();
     let desired = RouterDesired::from_effective_config(&config).expect("desired");
     assert!(!desired.enabled);
     assert!(desired.uplink_wifi.is_none());

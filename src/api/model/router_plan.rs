@@ -144,6 +144,7 @@ impl From<VpnPolicyDesired> for VpnPolicyDesiredView {
             protected_subnets: value.protected_subnets,
             vpn_interface: value.vpn_interface,
             physical_uplink: value.physical_uplink,
+            route_host_traffic: value.route_host_traffic,
         }
     }
 }

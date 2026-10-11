@@ -1,7 +1,6 @@
 #[test]
 fn explicit_forwarding_accepts_unmanaged_and_vpn_interfaces_without_a_global_uplink() {
     let mut config = AppConfig::default();
-    config.router.enabled = true;
     config.router.forwarding = Some(vec![
         ForwardingConfig {
             source_subnet: None,
@@ -184,7 +183,6 @@ fn valid_router_config() -> AppConfig {
     config.router = RouterConfig {
         forwarding: None,
         vpn_chain: Vec::new(),
-        enabled: true,
         uplink: Some(UplinkConfig {
             interface: "wan0".to_string(),
             mode: UplinkMode::External,
@@ -197,6 +195,7 @@ fn valid_router_config() -> AppConfig {
             metric: Some(100),
         }],
         allow_default_route_change: false,
+        route_host_traffic: false,
     };
     config
 }
@@ -264,7 +263,10 @@ fn example_config_describes_a_complete_working_router() {
     let config: AppConfig = toml::from_str(include_str!("../../examples/config.toml"))
         .expect("example config should parse");
 
-    assert!(config.router.enabled, "example should demonstrate routing");
+    assert!(
+        config.router.is_active(),
+        "example should demonstrate routing"
+    );
     assert!(config.router.uplink.is_none());
     assert_eq!(
         config.router.forwarding,
@@ -319,7 +321,7 @@ fn default_config_does_not_manage_any_interface() {
     let config = AppConfig::default();
     assert!(config.network.interfaces.is_empty());
     assert_eq!(config.router, RouterConfig::default());
-    assert!(!config.router.enabled);
+    assert!(!config.router.is_active());
     assert_eq!(config.vpn.policy.default_mode, VpnPolicyMode::Direct);
     assert_eq!(
         config.vpn.policy.protected_subnets,
@@ -372,7 +374,7 @@ fn vpn_policy_vpn_mode_requires_router_baseline() {
         .expect_err("VPN mode requires router baseline");
     assert!(error
         .to_string()
-        .contains("vpn.policy.default_mode = \"vpn\" requires router.enabled = true"));
+        .contains("vpn.policy.default_mode = \"vpn\" requires router intent"));
 }
 
 #[test]
@@ -1333,6 +1335,30 @@ fn vpn_chain_longer_than_the_cap_is_rejected() {
 }
 
 #[test]
+fn route_host_traffic_requires_a_vpn_chain_and_defaults_off() {
+    let mut config = valid_router_config();
+    assert!(!config.router.route_host_traffic);
+
+    config.router.route_host_traffic = true;
+    config.router.vpn_chain.clear();
+    let error = config.validate().expect_err("flag without a chain");
+    assert!(error
+        .to_string()
+        .contains("requires a configured vpn_chain"));
+
+    config.router.vpn_chain = vec![VpnHopConfig {
+        profile_name: "hop.conf".into(),
+    }];
+    config.validate().expect("flag with a chain is valid");
+}
+
+#[test]
+fn router_config_without_route_host_traffic_key_loads_disabled() {
+    let router: RouterConfig = toml::from_str("allow_default_route_change = false").unwrap();
+    assert!(!router.route_host_traffic);
+}
+
+#[test]
 fn unvalidated_load_preserves_recovery_paths_when_unrelated_admission_fails() {
     let directory = tempfile::tempdir().expect("tempdir");
     let path = directory.path().join("config.toml");
@@ -1362,4 +1388,50 @@ fn router_recovery_validation_ignores_unrelated_auth_and_api_settings() {
     config
         .validate_router_recovery()
         .expect("unrelated auth/API admission must not suppress router recovery");
+}
+
+#[test]
+fn router_intent_is_derived_without_a_global_toggle() {
+    let mut router = RouterConfig::default();
+    assert!(!router.is_active());
+    router.forwarding = Some(vec![]);
+    assert!(
+        !router.is_active(),
+        "an empty explicit rule list must not enable routing"
+    );
+    router.forwarding = Some(vec![ForwardingConfig {
+        source_subnet: None,
+        from: "lan0".into(),
+        to: "wan0".into(),
+        masquerade: true,
+    }]);
+    assert!(router.is_active());
+    assert!(serde_json::to_value(&router)
+        .unwrap()
+        .get("enabled")
+        .is_none());
+
+    router.forwarding = Some(vec![]);
+    router.uplink = Some(UplinkConfig {
+        interface: "wan0".into(),
+        mode: UplinkMode::External,
+    });
+    assert!(
+        router.is_active(),
+        "legacy uplink mode must remain configurable"
+    );
+}
+
+#[test]
+fn legacy_router_enabled_key_is_ignored_on_deserialization() {
+    let router: RouterConfig = toml::from_str(
+        "enabled = false\nforwarding = [{ from = 'lan0', to = 'wan0', masquerade = true }]\n",
+    )
+    .expect("legacy config parses");
+    assert!(
+        router.is_active(),
+        "forwarding rules, not the legacy switch, govern intent"
+    );
+    let encoded = toml::to_string(&router).unwrap();
+    assert!(!encoded.contains("enabled"));
 }

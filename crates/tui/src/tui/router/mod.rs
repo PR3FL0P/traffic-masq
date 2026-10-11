@@ -217,7 +217,6 @@ pub(crate) enum RouterAction {
     ShareViaRoute,
     Refresh,
     Topology,
-    ToggleEnabled,
     Setup,
     Settings,
 }
@@ -231,8 +230,7 @@ impl RouterAction {
             Self::PlanApply => Self::ShareViaRoute,
             Self::ShareViaRoute => Self::Refresh,
             Self::Refresh => Self::Topology,
-            Self::Topology => Self::ToggleEnabled,
-            Self::ToggleEnabled => Self::Setup,
+            Self::Topology => Self::Setup,
             Self::Setup => Self::Settings,
             Self::Settings => Self::AddRoute,
         }
@@ -242,14 +240,13 @@ impl RouterAction {
         match self {
             Self::AddRoute => Self::Settings,
             Self::Settings => Self::Setup,
-            Self::Setup => Self::ToggleEnabled,
+            Self::Setup => Self::Topology,
             Self::EditRoute => Self::AddRoute,
             Self::DeleteRoute => Self::EditRoute,
             Self::PlanApply => Self::DeleteRoute,
             Self::ShareViaRoute => Self::PlanApply,
             Self::Refresh => Self::ShareViaRoute,
             Self::Topology => Self::Refresh,
-            Self::ToggleEnabled => Self::Topology,
         }
     }
 }

@@ -44,7 +44,6 @@ fn config_with_managed_output_and_uplink() -> AppConfig {
         },
     );
     config.router = RouterConfig {
-        enabled: true,
         uplink: Some(UplinkConfig {
             interface: "wan0".to_string(),
             mode: UplinkMode::External,
@@ -53,6 +52,7 @@ fn config_with_managed_output_and_uplink() -> AppConfig {
         allow_default_route_change: false,
         forwarding: None,
         vpn_chain: Vec::new(),
+        route_host_traffic: false,
     };
     config
 }
@@ -220,6 +220,9 @@ fn desired() -> VpnPolicyDesired {
         protected_subnets: vec!["192.168.10.0/24".parse().expect("subnet")],
         vpn_interface: OWNED_INTERFACE_NAME.to_string(),
         physical_uplink: "eth0".to_string(),
+        chain_profiles: Vec::new(),
+        host_endpoints: Vec::new(),
+        route_host_traffic: false,
     }
 }
 

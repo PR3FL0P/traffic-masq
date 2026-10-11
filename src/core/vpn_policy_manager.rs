@@ -9,7 +9,7 @@ use crate::core::vpn_policy::{
     VpnPolicyDesiredState, VpnPolicyReservedIds, VpnPolicyResourceConflictDetector,
 };
 use crate::firewall::vpn::{
-    VpnFirewallIntegrity, VpnPolicyFirewallBackend, VpnPolicyFirewallDesired,
+    VpnFirewallIntegrity, VpnHostTrafficDesired, VpnPolicyFirewallBackend, VpnPolicyFirewallDesired,
 };
 use crate::firewall::NftExecutor;
 use crate::netlink::{
@@ -26,6 +26,16 @@ pub struct VpnPolicyDesired {
     pub protected_subnets: Vec<Ipv4Net>,
     pub vpn_interface: String,
     pub physical_uplink: String,
+    /// Also route the router's own traffic through the tunnel.
+    #[serde(default)]
+    pub route_host_traffic: bool,
+    /// Profiles of every hop in the chain, whose endpoints must bypass the tunnel.
+    #[serde(default)]
+    pub chain_profiles: Vec<String>,
+    /// Endpoint addresses observed in the kernel at apply/health time;
+    /// never part of persisted intent.
+    #[serde(default, skip_serializing)]
+    pub host_endpoints: Vec<std::net::Ipv4Addr>,
 }
 
 /// The VPN policy this configuration calls for, or `None` if there is nothing
@@ -55,6 +65,9 @@ pub fn vpn_policy_desired(config: &AppConfig) -> Option<VpnPolicyDesired> {
         protected_subnets,
         vpn_interface: OWNED_INTERFACE_NAME.to_string(),
         physical_uplink: uplink.interface.clone(),
+        route_host_traffic: false,
+        chain_profiles: Vec::new(),
+        host_endpoints: Vec::new(),
     })
 }
 
@@ -65,6 +78,9 @@ pub fn vpn_policy_teardown_target() -> VpnPolicyDesired {
         protected_subnets: Vec::new(),
         vpn_interface: OWNED_INTERFACE_NAME.to_string(),
         physical_uplink: String::new(),
+        route_host_traffic: false,
+        chain_profiles: Vec::new(),
+        host_endpoints: Vec::new(),
     }
 }
 
@@ -74,6 +90,9 @@ impl VpnPolicyDesired {
             protected_subnets: self.protected_subnets.clone(),
             vpn_interface: self.vpn_interface.clone(),
             physical_uplink: self.physical_uplink.clone(),
+            host_traffic: self.route_host_traffic.then(|| VpnHostTrafficDesired {
+                vpn_endpoints: self.host_endpoints.clone(),
+            }),
         }
     }
 }

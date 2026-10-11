@@ -64,13 +64,13 @@ fn enabled_router() -> RouterConfig {
     RouterConfig {
         forwarding: None,
         vpn_chain: Vec::new(),
-        enabled: true,
         uplink: Some(UplinkConfig {
             interface: "wan0".to_string(),
             mode: UplinkMode::External,
         }),
         owned_routes: Vec::new(),
         allow_default_route_change: false,
+        route_host_traffic: false,
     }
 }
 

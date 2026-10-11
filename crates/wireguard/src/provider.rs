@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -97,6 +97,14 @@ pub trait VpnProvider: Send + Sync {
     /// Read the link's public key, returning None if not configured; no private key is returned.
     async fn public_key(&self, name: &str) -> Result<Option<WireGuardKey>, ProviderError>;
 
+    /// Read current kernel peer endpoints, including addresses learned by roaming.
+    /// No DNS lookup occurs; these are the destinations the tunnel actually uses.
+    async fn peer_endpoints(&self, name: &str) -> Result<Vec<SocketAddr>, ProviderError> {
+        Err(ProviderError::Netlink(format!(
+            "peer endpoint observation is unavailable for {name}"
+        )))
+    }
+
     /// Observe administrative up, not peer connectivity or handshake freshness.
     async fn is_up(&self, name: &str) -> Result<bool, ProviderError>;
 }
@@ -159,6 +167,10 @@ impl VpnProvider for Arc<dyn VpnProvider> {
 
     async fn public_key(&self, name: &str) -> Result<Option<WireGuardKey>, ProviderError> {
         (**self).public_key(name).await
+    }
+
+    async fn peer_endpoints(&self, name: &str) -> Result<Vec<SocketAddr>, ProviderError> {
+        (**self).peer_endpoints(name).await
     }
 
     async fn is_up(&self, name: &str) -> Result<bool, ProviderError> {
@@ -260,6 +272,10 @@ impl VpnProvider for LazyNetlinkVpnProvider {
 
     async fn public_key(&self, name: &str) -> Result<Option<WireGuardKey>, ProviderError> {
         self.provider().await?.public_key(name).await
+    }
+
+    async fn peer_endpoints(&self, name: &str) -> Result<Vec<SocketAddr>, ProviderError> {
+        self.provider().await?.peer_endpoints(name).await
     }
 
     async fn is_up(&self, name: &str) -> Result<bool, ProviderError> {
@@ -549,10 +565,50 @@ impl VpnProvider for NetlinkVpnProvider {
             }))
     }
 
+    async fn peer_endpoints(&self, name: &str) -> Result<Vec<SocketAddr>, ProviderError> {
+        let attributes = self.get_device(name).await.ok_or_else(|| {
+            ProviderError::Netlink(format!("failed to observe WireGuard endpoints on {name}"))
+        })?;
+        Ok(device_endpoints(&attributes))
+    }
+
     async fn is_up(&self, name: &str) -> Result<bool, ProviderError> {
         Ok(self
             .get_link(name)
             .await
             .is_some_and(|link| link.header.flags.contains(&LinkFlag::Up)))
+    }
+}
+
+fn device_endpoints(attributes: &[WireguardAttribute]) -> Vec<SocketAddr> {
+    attributes
+        .iter()
+        .filter_map(|attribute| match attribute {
+            WireguardAttribute::Peers(peers) => Some(peers),
+            _ => None,
+        })
+        .flatten()
+        .flat_map(|peer| peer.0.iter())
+        .filter_map(|attribute| match attribute {
+            WireguardPeerAttribute::Endpoint(endpoint) => Some(*endpoint),
+            _ => None,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::*;
+
+    #[test]
+    fn collects_endpoints_across_multipart_peer_attributes() {
+        let first: SocketAddr = "203.0.113.8:51820".parse().unwrap();
+        let second: SocketAddr = "[2001:db8::1]:51820".parse().unwrap();
+        let peer = |endpoint| WireguardPeer(vec![WireguardPeerAttribute::Endpoint(endpoint)]);
+        let attributes = vec![
+            WireguardAttribute::Peers(vec![peer(first)]),
+            WireguardAttribute::Peers(vec![peer(second)]),
+        ];
+        assert_eq!(device_endpoints(&attributes), vec![first, second]);
     }
 }

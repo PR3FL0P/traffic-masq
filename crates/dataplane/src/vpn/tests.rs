@@ -46,6 +46,16 @@ fn desired() -> VpnPolicyFirewallDesired {
         ],
         vpn_interface: "tm-wg0".to_string(),
         physical_uplink: "eth0".to_string(),
+        host_traffic: None,
+    }
+}
+
+fn desired_with_host() -> VpnPolicyFirewallDesired {
+    VpnPolicyFirewallDesired {
+        host_traffic: Some(VpnHostTrafficDesired {
+            vpn_endpoints: vec!["203.0.113.1".parse().expect("endpoint")],
+        }),
+        ..desired()
     }
 }
 
@@ -128,6 +138,7 @@ fn nft_apply_replaces_only_owned_vpn_table_in_one_atomic_batch() {
             protected_subnets: vec!["10.0.0.0/24".parse().expect("subnet")],
             vpn_interface: "tm-wg0".to_string(),
             physical_uplink: "old0".to_string(),
+            host_traffic: None,
         }))),
         Ok(Vec::new()),
     ]);
@@ -283,4 +294,155 @@ fn nft_observe_detects_missing_or_changed_owned_objects_and_rules() {
         assert_eq!(observed.desired.as_ref(), Some(&wanted));
         assert_eq!(observed.integrity, VpnFirewallIntegrity::Drifted);
     }
+}
+
+#[test]
+fn host_traffic_is_absent_from_metadata_and_rules_by_default() {
+    let rendered = render_vpn_nftables_batch(false, Some(&desired())).expect("render");
+    assert!(!rendered.contains("host_mark"));
+    assert!(!rendered.contains("host_killswitch"));
+    assert!(!rendered.contains("vpn_endpoints"));
+    let metadata = serde_json::to_string(&desired()).expect("serialize");
+    assert!(!metadata.contains("host_traffic"));
+    let legacy: VpnPolicyFirewallDesired = serde_json::from_str(&metadata).expect("legacy");
+    assert_eq!(legacy, desired());
+}
+
+#[test]
+fn host_traffic_render_excludes_endpoints_and_blocks_leaks() {
+    let rendered = render_vpn_nftables_batch(false, Some(&desired_with_host())).expect("render");
+    assert!(rendered.contains("set vpn_endpoints { type ipv4_addr; elements = { 203.0.113.1 } }"));
+    let exclusion = rendered
+        .find("ip daddr @vpn_endpoints return")
+        .expect("endpoint exclusion");
+    let mark = rendered
+        .find("meta nfproto ipv4 meta mark set 0x54000000\n  }\n  chain host_killswitch")
+        .expect("host mark");
+    assert!(exclusion < mark, "endpoint exclusion must precede marking");
+    assert!(rendered.contains("type route hook output priority mangle"));
+    assert!(rendered.contains(
+        "meta nfproto ipv4 meta mark and 0xff000000 == 0x54000000 oifname != \"tm-wg0\" drop"
+    ));
+    assert!(rendered.contains("ip6 daddr != { fe80::/10, ff00::/8 } drop"));
+}
+
+#[test]
+fn host_traffic_validation_rejects_unsafe_endpoints() {
+    for endpoints in [
+        vec![],
+        vec!["0.0.0.0".parse().unwrap()],
+        vec!["127.0.0.1".parse().unwrap()],
+        vec!["224.0.0.1".parse().unwrap()],
+        vec![
+            "203.0.113.1".parse().unwrap(),
+            "203.0.113.1".parse().unwrap(),
+        ],
+    ] {
+        let candidate = VpnPolicyFirewallDesired {
+            host_traffic: Some(VpnHostTrafficDesired {
+                vpn_endpoints: endpoints,
+            }),
+            ..desired()
+        };
+        assert!(candidate.validate().is_err());
+    }
+    assert!(desired_with_host().validate().is_ok());
+}
+
+#[test]
+fn host_traffic_structure_is_intact_and_detects_drift() {
+    let wanted = desired_with_host();
+    let observed = parse_owned_vpn_firewall_state(&nft_ruleset(Some(&wanted))).expect("observe");
+    assert_eq!(observed.desired.as_ref(), Some(&wanted));
+    assert_eq!(observed.integrity, VpnFirewallIntegrity::Intact);
+
+    let mut ruleset: Value = serde_json::from_slice(&nft_ruleset(Some(&wanted))).unwrap();
+    let entries = ruleset["nftables"].as_array_mut().unwrap();
+    let position = entries
+        .iter()
+        .position(|entry| {
+            entry
+                .get("rule")
+                .and_then(|rule| rule.get("chain"))
+                .and_then(Value::as_str)
+                == Some("host_killswitch")
+        })
+        .expect("host killswitch rule");
+    entries.remove(position);
+    let drifted = parse_owned_vpn_firewall_state(&serde_json::to_vec(&ruleset).unwrap()).unwrap();
+    assert_eq!(drifted.integrity, VpnFirewallIntegrity::Drifted);
+
+    let without_host = parse_owned_vpn_firewall_state(&nft_ruleset(Some(&desired()))).unwrap();
+    assert_eq!(without_host.integrity, VpnFirewallIntegrity::Intact);
+}
+
+#[test]
+fn host_killswitch_drift_checks_operators_exclusions_and_rule_order() {
+    let wanted = desired_with_host();
+    let original: Value = serde_json::from_slice(&nft_ruleset(Some(&wanted))).unwrap();
+    for fault in [
+        "reverse_killswitch",
+        "permit_all_udp",
+        "remove_ipv4_guard",
+        "reverse_ipv6",
+        "reorder_mark",
+    ] {
+        let mut ruleset = original.clone();
+        let entries = ruleset["nftables"].as_array_mut().unwrap();
+        let chain = if matches!(fault, "reverse_killswitch" | "reverse_ipv6") {
+            "host_killswitch"
+        } else {
+            "host_mark"
+        };
+        let mut rules: Vec<_> = entries
+            .iter_mut()
+            .filter_map(|entry| entry.get_mut("rule"))
+            .filter(|rule| rule["chain"] == chain)
+            .collect();
+        match fault {
+            "reverse_killswitch" => rules[0]["expr"][2]["match"]["op"] = serde_json::json!("=="),
+            "permit_all_udp" => {
+                rules[4]["expr"][0]["match"]["right"] = serde_json::json!({"set": [53, 67, 68]})
+            }
+            "remove_ipv4_guard" => {
+                rules[5]["expr"].as_array_mut().unwrap().remove(0);
+            }
+            "reverse_ipv6" => rules[1]["expr"][1]["match"]["op"] = serde_json::json!("=="),
+            "reorder_mark" => {
+                let old = rules[0]["expr"].clone();
+                rules[0]["expr"] = rules[1]["expr"].clone();
+                rules[1]["expr"] = old;
+            }
+            _ => unreachable!(),
+        }
+        let observed =
+            parse_owned_vpn_firewall_state(&serde_json::to_vec(&ruleset).unwrap()).unwrap();
+        assert_eq!(observed.integrity, VpnFirewallIntegrity::Drifted, "{fault}");
+    }
+}
+
+#[test]
+fn host_integrity_accepts_nft_prefix_objects_and_set_order() {
+    let wanted = desired_with_host();
+    let mut ruleset: Value = serde_json::from_slice(&nft_ruleset(Some(&wanted))).unwrap();
+    let rule = ruleset["nftables"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .filter_map(|entry| entry.get_mut("rule"))
+        .find(|rule| {
+            rule["chain"] == "host_killswitch"
+                && rule["expr"][1]["match"]["left"]["payload"]["protocol"] == "ip6"
+        })
+        .unwrap();
+    rule["expr"][1]["match"]["right"] = serde_json::json!({"set": [
+        {"prefix": {"addr": "ff00::", "len": 8}},
+        {"prefix": {"addr": "fe80::", "len": 10}},
+    ]});
+    assert_eq!(
+        parse_owned_vpn_firewall_state(&serde_json::to_vec(&ruleset).unwrap())
+            .unwrap()
+            .integrity,
+        VpnFirewallIntegrity::Intact
+    );
 }

@@ -851,7 +851,8 @@ mod tests {
         assert_eq!(mapped.path, "/api/v1/router/intent");
         let body: serde_json::Value = serde_json::from_slice(&mapped.body.unwrap()).unwrap();
         assert_eq!(body["expected_revision"], 19);
-        assert_eq!(body["config"]["enabled"], false);
+        assert!(body["config"].get("enabled").is_none());
+        assert_eq!(body["config"]["route_host_traffic"], false);
     }
 
     #[test]

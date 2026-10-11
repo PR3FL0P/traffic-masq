@@ -112,8 +112,8 @@ Both links must be up when you apply a sharing connection.
    appropriate for your network. Keep static device addresses outside the pool.
 3. In **Router → Internet sharing**, add a connection with **Traffic from** set
    to `lan0`, **Internet through** set to `wan0`, and **Masquerade** enabled.
-   Save the connection. If routing is disabled, switch to **Routes** and choose
-   **Enable routing**. Review and apply the draft.
+   Save the connection, then review and apply the draft. Routing activates
+   automatically when a sharing rule is configured.
 4. Check that a device on `lan0` receives an address and can reach the Internet,
    then choose **Commit** before the confirmation timer expires.
 
@@ -170,6 +170,12 @@ The global VPN chain requires **Global uplink sharing**. Switching to that mode
 replaces explicit Internet sharing rules; the editor and plan show this change.
 Switching back starts with no explicit rules when none were previously present.
 Changes enter the router draft and use the existing Plan → Apply → Commit flow.
+
+Tick **Route router's own traffic through VPN** to send the router's own traffic
+(DNS, updates, the daemon's outbound connections) through the chain as well. It
+adds a host kill switch and blocks the router's IPv6. Tunnel endpoints and local
+networks stay direct. If a plan fails or you do not Commit in time, it rolls back
+like any other router change.
 
 ## Daemon logs
 
@@ -253,7 +259,7 @@ versions; they are omitted from API summaries and redacted from debug output.
 | **Interfaces** | Interface roles, managed IPv4 addresses and address removal |
 | **DHCP Server** | Address pools for local devices and leases |
 | **DHCP Client** | Obtaining an address from an upstream DHCP server |
-| **Router** | Enable/disable routing, static routes, Internet sharing and topology |
+| **Router** | Static routes, Internet sharing and topology |
 | **Wi-Fi** | Access points, client connections and saved profiles |
 | **VPN** | Enable/disable VPN, WireGuard profiles and VPN traffic policy |
 | **Settings** | Application and session preferences |
@@ -275,8 +281,9 @@ bring up its tunnel; **Traffic policy** controls routing through it. Disconnect
 and select Direct policy before disabling VPN. A configured router VPN chain
 must also be removed before disabling VPN.
 
-In **Router**, **e** or **Enable/Disable routing** opens a plan for review. Apply
-and commit it to save the routing change, using the normal rollback timer.
+In **Router**, configure a sharing connection or uplink and use **Plan / Apply**.
+Apply and commit the change using the normal rollback timer. There is no global
+routing toggle.
 
 In the Router tab, **1 / 2 / 3** selects Routes, Internet sharing or Topology.
 Use arrows to select items and Tab/Shift+Tab to move focus forward/backward

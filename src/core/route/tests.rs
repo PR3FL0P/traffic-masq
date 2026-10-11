@@ -12,7 +12,6 @@ fn router_with_one_owned_route() -> RouterConfig {
     RouterConfig {
         forwarding: None,
         vpn_chain: Vec::new(),
-        enabled: true,
         uplink: None,
         owned_routes: vec![OwnedIpv4RouteConfig {
             destination: "203.0.113.0/24".parse().expect("route destination"),
@@ -22,6 +21,7 @@ fn router_with_one_owned_route() -> RouterConfig {
             metric: Some(100),
         }],
         allow_default_route_change: false,
+        route_host_traffic: false,
     }
 }
 
@@ -34,11 +34,10 @@ fn router_config_builds_effective_route_desired_state() {
     assert_eq!(desired[0].destination, router.owned_routes[0].destination);
     assert_eq!(desired[0].output_interface.as_deref(), Some("wan0"));
 
-    // A disabled router owns nothing, but the configuration it would use if
-    // re-enabled is left untouched.
-    router.enabled = false;
+    // Removing the last owned route leaves no route intent to apply.
+    router.owned_routes.clear();
+    assert!(!router.is_active());
     assert!(desired_owned_routes(&router).is_empty());
-    assert_eq!(router.owned_routes.len(), 1);
 }
 
 #[derive(Default)]

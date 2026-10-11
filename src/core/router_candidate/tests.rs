@@ -59,13 +59,13 @@ fn enabled_router() -> RouterConfig {
     RouterConfig {
         forwarding: None,
         vpn_chain: Vec::new(),
-        enabled: true,
         uplink: Some(UplinkConfig {
             interface: "wan0".to_string(),
             mode: UplinkMode::External,
         }),
         owned_routes: Vec::new(),
         allow_default_route_change: false,
+        route_host_traffic: false,
     }
 }
 
@@ -173,21 +173,24 @@ fn builds_validated_candidate_bound_to_committed_revision() {
     assert_eq!(candidate.base_revision(), 4);
     assert!(candidate.desired().enabled);
     assert_eq!(candidate.desired().dhcp.len(), 2);
-    assert!(candidate.effective_config().router.enabled);
+    assert!(candidate.effective_config().router.is_active());
     assert_eq!(candidate.document().revision, 4);
 }
 
 #[test]
-fn rejects_activating_an_unconfigured_router_candidate() {
+fn rejects_activating_a_vpn_chain_without_router_intent() {
     let mut router = enabled_router();
     router.uplink = None;
+    router.vpn_chain = vec![crate::config::VpnHopConfig {
+        profile_name: "hop1".to_string(),
+    }];
 
     let error = RouterCandidate::build(
         &base_config(),
         &committed(),
         &RouterIntentProposal::new().set_router(router),
     )
-    .expect_err("activation must require a complete router intent");
+    .expect_err("a VPN chain must require a complete router intent");
 
     assert!(error.to_string().contains("router.uplink is required"));
 }

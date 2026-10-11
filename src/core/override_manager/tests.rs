@@ -350,7 +350,6 @@ async fn vpn_mode_defaults_to_base_config_and_can_be_overridden_and_cleared() {
         .insert("lan0".into(), interface_config("192.168.10.1/24"));
     base.vpn.enabled = true;
     base.router = RouterConfig {
-        enabled: true,
         uplink: Some(UplinkConfig {
             interface: "wan0".into(),
             mode: UplinkMode::External,
@@ -474,7 +473,6 @@ async fn router_and_interface_conflict_is_rejected_without_state_change() {
         .unwrap();
     let mut candidate = manager.snapshot().await;
     candidate.router = Some(RouterConfig {
-        enabled: true,
         uplink: Some(UplinkConfig {
             interface: "wan0".into(),
             mode: UplinkMode::External,
@@ -627,7 +625,6 @@ async fn candidate_commit_advances_revision_and_rejects_a_stale_candidate() {
         .unwrap();
 
     let router = RouterConfig {
-        enabled: true,
         uplink: Some(UplinkConfig {
             interface: "wan0".into(),
             mode: UplinkMode::External,

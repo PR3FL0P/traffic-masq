@@ -7,11 +7,10 @@ fn reset_config_removes_user_intent_but_preserves_installation_paths() {
     current.runtime.state_dir = "/srv/traffic-masq/state".into();
     current.runtime.log_dir = "/srv/traffic-masq/log".into();
     current.runtime.socket_group = Some("traffic-masq".into());
-    current.router.enabled = true;
     current.vpn.enabled = true;
 
     let reset = reset_config(&current);
-    assert!(!reset.router.enabled);
+    assert!(!reset.router.is_active());
     assert!(!reset.vpn.enabled);
     assert!(reset.network.interfaces.is_empty());
     assert_eq!(reset.runtime.state_dir, current.runtime.state_dir);
@@ -52,7 +51,6 @@ fn offline_fixture() -> (tempfile::TempDir, PathBuf, AppConfig) {
     config.dhcp.leases_dir = config.runtime.state_dir.join("dhcp/leases");
     config.vpn.wireguard_config_dir = config.runtime.state_dir.join("vpn/wireguard");
     config.auth.database_path = config.runtime.state_dir.join("auth.sqlite3");
-    config.router.enabled = true;
     config.vpn.enabled = true;
     config.validate().unwrap();
 
@@ -96,7 +94,7 @@ async fn offline_reset_requires_explicit_force_and_then_clears_state() {
         .expect("forced offline reset");
 
     let reset = AppConfig::load(&config_path).unwrap();
-    assert!(!reset.router.enabled);
+    assert!(!reset.router.is_active());
     assert!(!reset.vpn.enabled);
     assert_eq!(reset.runtime.state_dir, original.runtime.state_dir);
     assert!(reset.runtime.state_dir.is_dir());

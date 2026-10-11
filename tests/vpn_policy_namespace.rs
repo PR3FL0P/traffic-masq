@@ -504,13 +504,13 @@ fn build_config(temp: &tempfile::TempDir, lan_if: &str, uplink_if: &str) -> AppC
     config.router = RouterConfig {
         forwarding: None,
         vpn_chain: Vec::new(),
-        enabled: true,
         uplink: Some(UplinkConfig {
             interface: uplink_if.to_string(),
             mode: UplinkMode::External,
         }),
         owned_routes: Vec::new(),
         allow_default_route_change: false,
+        route_host_traffic: false,
     };
 
     config.vpn.enabled = true;

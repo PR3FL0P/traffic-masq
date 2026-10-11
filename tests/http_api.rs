@@ -816,13 +816,13 @@ fn router_proposal() -> RouterProposalRequest {
         set_router: Some(RouterConfig {
             forwarding: None,
             vpn_chain: Vec::new(),
-            enabled: true,
             uplink: Some(UplinkConfig {
                 interface: "wan0".to_string(),
                 mode: UplinkMode::External,
             }),
             owned_routes: Vec::new(),
             allow_default_route_change: false,
+            route_host_traffic: false,
         }),
         clear_router: false,
         set_interfaces: [(
@@ -912,13 +912,13 @@ async fn router_status_test_server(
     config.router = RouterConfig {
         forwarding: None,
         vpn_chain: Vec::new(),
-        enabled: true,
         uplink: Some(UplinkConfig {
             interface: "wan0".to_string(),
             mode: UplinkMode::External,
         }),
         owned_routes: Vec::new(),
         allow_default_route_change: false,
+        route_host_traffic: false,
     };
     router_test_server_with(fake, config).await
 }
@@ -1810,13 +1810,13 @@ async fn vpn_policy_status_set_mode_clear_mode_over_http() -> Result<()> {
     config.router = RouterConfig {
         forwarding: None,
         vpn_chain: Vec::new(),
-        enabled: true,
         uplink: Some(UplinkConfig {
             interface: "wan0".to_string(),
             mode: UplinkMode::External,
         }),
         owned_routes: Vec::new(),
         allow_default_route_change: false,
+        route_host_traffic: false,
     };
     config.vpn.enabled = true;
     config.vpn.wireguard_config_dir = directory.path().join("wireguard");
@@ -2494,7 +2494,7 @@ async fn http_routes_list_and_router_config_endpoints_work() -> Result<()> {
     let config_resp = server.admin.request(&Request::GetRouterConfig).await?;
     match config_resp {
         Response::RouterConfig { config } => {
-            assert!(!config.enabled);
+            assert!(!config.is_active());
         }
         response => panic!("unexpected response: {response:?}"),
     }

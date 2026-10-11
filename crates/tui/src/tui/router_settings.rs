@@ -30,10 +30,11 @@ enum Field {
     Later,
     Remove,
     DefaultRoute,
+    HostTraffic,
     Review,
     Cancel,
 }
-const FIELDS: [Field; 12] = [
+const FIELDS: [Field; 13] = [
     Field::Uplink,
     Field::Mode,
     Field::Forwarding,
@@ -44,6 +45,7 @@ const FIELDS: [Field; 12] = [
     Field::Later,
     Field::Remove,
     Field::DefaultRoute,
+    Field::HostTraffic,
     Field::Review,
     Field::Cancel,
 ];
@@ -90,6 +92,9 @@ impl Editor {
         }
         if self.uplink.trim().is_empty() && !self.config.vpn_chain.is_empty() {
             return Err("VPN chain requires a physical uplink");
+        }
+        if self.config.route_host_traffic && self.config.vpn_chain.is_empty() {
+            return Err("Routing router traffic through the VPN requires a VPN chain");
         }
         let mut config = self.config.clone();
         config.uplink = if self.uplink.trim().is_empty() {
@@ -165,6 +170,14 @@ impl Editor {
             Field::DefaultRoute => format!(
                 "Permit default-route changes: {}",
                 self.config.allow_default_route_change
+            ),
+            Field::HostTraffic => format!(
+                "[{}] Route router's own traffic through VPN (kill switch, IPv6 blocked)",
+                if self.config.route_host_traffic {
+                    "x"
+                } else {
+                    " "
+                }
             ),
             Field::Review => "Stage settings and review complete router plan".into(),
             Field::Cancel => "Cancel editor (keep previous router draft)".into(),
@@ -335,6 +348,9 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClien
             Field::DefaultRoute => {
                 e.config.allow_default_route_change = !e.config.allow_default_route_change
             }
+            Field::HostTraffic => {
+                e.config.route_host_traffic = !e.config.route_host_traffic;
+            }
             Field::Review => {
                 let candidate = match e.candidate() {
                     Ok(c) => c,
@@ -359,6 +375,14 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClien
             input::TextEditor::new(&mut e.uplink, &mut e.cursor).handle_key(other);
         }
         _ => {}
+    }
+}
+
+fn on_off(value: bool) -> &'static str {
+    if value {
+        "on"
+    } else {
+        "off"
     }
 }
 
@@ -402,6 +426,15 @@ pub(crate) fn plan_lines(
         for (i, hop) in previous.vpn_chain.iter().enumerate() {
             lines.push(format!("Previous VPN hop {}: {}", i + 1, hop.profile_name));
         }
+    }
+    if previous.is_some_and(|previous| previous.route_host_traffic != current.route_host_traffic) {
+        lines.push(format!(
+            "Router's own traffic through VPN: {} (was {})",
+            on_off(current.route_host_traffic),
+            on_off(previous.is_some_and(|previous| previous.route_host_traffic)),
+        ));
+    } else if current.route_host_traffic {
+        lines.push("Router's own traffic through VPN: on (kill switch, IPv6 blocked)".into());
     }
     if current.vpn_chain.is_empty() {
         lines.push("New VPN chain: none".into());
@@ -450,7 +483,6 @@ mod tests {
     #[tokio::test]
     async fn cancel_retains_the_preexisting_router_draft() {
         let config = RouterConfigView {
-            enabled: true,
             ..Default::default()
         };
         let mut app = TuiApp {
@@ -472,7 +504,6 @@ mod tests {
         }])
         .await;
         let config = RouterConfigView {
-            enabled: true,
             ..Default::default()
         };
         let mut e = Editor::new(config, vec!["vpn1".into(), "vpn2".into()]);
@@ -505,6 +536,58 @@ mod tests {
         assert_eq!(
             calls[0].body["set_router"]["vpn_chain"][1]["profile_name"],
             "vpn1"
+        );
+    }
+
+    #[test]
+    fn host_traffic_requires_a_chain_and_is_staged_and_planned() {
+        let mut e = Editor::new(RouterConfigView::default(), vec![]);
+        e.uplink = "wan0".into();
+        e.config.route_host_traffic = true;
+        assert!(
+            e.candidate().is_err(),
+            "flag without a chain must be rejected"
+        );
+
+        e.config.vpn_chain = vec![VpnHopConfigView {
+            profile_name: "vpn1".into(),
+        }];
+        let candidate = e.candidate().unwrap();
+        assert!(candidate.route_host_traffic);
+
+        let previous = RouterConfigView::default();
+        let lines = plan_lines(&candidate, Some(&previous));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("own traffic through VPN: on (was off)")));
+        assert!(e.label(Field::HostTraffic).starts_with("[x]"));
+    }
+
+    #[tokio::test]
+    async fn enter_toggles_host_traffic() {
+        let mut e = Editor::new(RouterConfigView::default(), vec![]);
+        e.field = Field::HostTraffic;
+        let mut app = TuiApp {
+            screen: Screen::RouterSettings,
+            router_settings: Some(e),
+            ..Default::default()
+        };
+        let client = ApiClient::new("/unused");
+        handle_key(&mut app, KeyCode::Enter, &client).await;
+        assert!(
+            app.router_settings
+                .as_ref()
+                .unwrap()
+                .config
+                .route_host_traffic
+        );
+        handle_key(&mut app, KeyCode::Enter, &client).await;
+        assert!(
+            !app.router_settings
+                .as_ref()
+                .unwrap()
+                .config
+                .route_host_traffic
         );
     }
 

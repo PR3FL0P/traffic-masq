@@ -110,6 +110,8 @@ pub struct VpnPolicyDesiredView {
     pub protected_subnets: Vec<Ipv4Net>,
     pub vpn_interface: String,
     pub physical_uplink: String,
+    #[serde(default)]
+    pub route_host_traffic: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

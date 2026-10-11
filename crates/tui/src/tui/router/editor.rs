@@ -191,9 +191,6 @@ pub(super) fn save_route_editor(app: &mut TuiApp) {
         app.router.proposed_router_config.allow_default_route_change = true;
     }
 
-    if app.router.route_inventory.is_none() {
-        app.router.proposed_router_config.enabled = true;
-    }
     app.router
         .proposed_router_config
         .owned_routes
@@ -297,17 +294,6 @@ pub(super) fn delete_selected_route(app: &mut TuiApp) {
         })
     {
         app.router.proposed_router_config.owned_routes.remove(pos);
-    }
-    if app.router.proposed_router_config.owned_routes.is_empty()
-        && app.router.proposed_router_config.uplink.is_none()
-        && app
-            .router
-            .proposed_router_config
-            .forwarding
-            .as_ref()
-            .is_none_or(Vec::is_empty)
-    {
-        app.router.proposed_router_config.enabled = false;
     }
     if app.router.route_inventory.is_none() {
         app.router.routes.remove(app.router.selected_route);

@@ -294,9 +294,6 @@ fn stage(app: &mut TuiApp, rules: Vec<ForwardingConfig>) {
         .selected_connection
         .min(rules.len().saturating_sub(1));
     app.router.proposed_router_config.forwarding = Some(rules);
-    if app.router.route_inventory.is_none() {
-        app.router.proposed_router_config.enabled = true;
-    }
     app.router.staged = true;
     app.router.error = None;
 }

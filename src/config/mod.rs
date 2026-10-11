@@ -154,7 +154,6 @@ pub struct InterfaceConfig {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RouterConfig {
-    pub enabled: bool,
     pub uplink: Option<UplinkConfig>,
     /// Explicit ingress → egress rules. None preserves legacy uplink NAT;
     /// Some(empty) disables forwarding without restoring legacy rules.
@@ -166,6 +165,10 @@ pub struct RouterConfig {
     /// `reserved` fields of a hop are recomputed at runtime, not persisted.
     #[serde(default)]
     pub vpn_chain: Vec<VpnHopConfig>,
+    /// Also send the router's own locally generated traffic through the VPN
+    /// chain, with a kill switch and an IPv6 egress block. Requires `vpn_chain`.
+    #[serde(default)]
+    pub route_host_traffic: bool,
 }
 
 /// Validate interface names, distinct ingress/egress, network CIDRs without host
@@ -534,13 +537,13 @@ fn resolve_directory_path(path: &std::path::Path) -> Result<PathBuf> {
 }
 
 impl VpnTrafficPolicyConfig {
-    /// Require enabled VPN and enabled router for global VPN mode.
+    /// Require enabled VPN and configured router intent for global VPN mode.
     fn validate(&self, vpn_enabled: bool, router: &RouterConfig) -> Result<()> {
         if self.default_mode == VpnPolicyMode::Vpn && !vpn_enabled {
             bail!("vpn.policy.default_mode = \"vpn\" requires vpn.enabled = true");
         }
-        if self.default_mode == VpnPolicyMode::Vpn && !router.enabled {
-            bail!("vpn.policy.default_mode = \"vpn\" requires router.enabled = true");
+        if self.default_mode == VpnPolicyMode::Vpn && !router.is_active() {
+            bail!("vpn.policy.default_mode = \"vpn\" requires router intent");
         }
         Ok(())
     }
@@ -614,6 +617,17 @@ impl NetworkConfig {
 }
 
 impl RouterConfig {
+    /// Router intent is active when there is something to apply; no global enable switch.
+    pub fn is_active(&self) -> bool {
+        self.uplink.is_some()
+            || self
+                .forwarding
+                .as_ref()
+                .is_some_and(|rules| !rules.is_empty())
+            || !self.owned_routes.is_empty()
+            || !self.vpn_chain.is_empty()
+    }
+
     /// Validate forwarding/uplink roles, output addressing, route consent/conflicts and VPN chain length.
     fn validate(&self, network: &NetworkConfig) -> Result<()> {
         if let Some(rules) = &self.forwarding {
@@ -622,7 +636,7 @@ impl RouterConfig {
                 bail!("explicit forwarding cannot be combined with the legacy global vpn_chain; configure tunnel routing separately");
             }
         }
-        if self.enabled {
+        if self.is_active() {
             if let Some(uplink) = self.uplink.as_ref() {
                 validate_interface_name(&uplink.interface)
                     .map_err(|error| anyhow::anyhow!("router uplink: {error}"))?;
@@ -663,7 +677,7 @@ impl RouterConfig {
                     })
                     .collect::<Vec<_>>();
                 if outputs.is_empty() && self.forwarding.is_none() {
-                    bail!("enabled router mode requires at least one managed output interface");
+                    bail!("router uplink mode requires at least one managed output interface");
                 }
                 for (name, interface) in outputs {
                     if interface.ipv4.is_none() {
@@ -686,6 +700,10 @@ impl RouterConfig {
                     }
                 }
             }
+        }
+
+        if self.route_host_traffic && self.vpn_chain.is_empty() {
+            bail!("router.route_host_traffic requires a configured vpn_chain");
         }
 
         if self.vpn_chain.len() > MAX_VPN_CHAIN_LEN {

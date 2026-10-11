@@ -430,11 +430,9 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         return Ok(());
     }
 
-    // The coordinator is part of the control plane, so it is built regardless
-    // of whether the router carries an intent right now. Gating it on
-    // `router.enabled` made enabling the router a boot-time decision: with no
-    // coordinator every router request answers RouterDisabled, which is exactly
-    // the state you are in when you want to provision one. Building it is pure
+    // The coordinator must exist even when there is no router intent; otherwise
+    // every router request would answer RouterDisabled and provisioning would
+    // be impossible. Building it is pure
     // wiring — it reuses the already-open network provider and touches no data plane.
     let router_coordinator = match production_router_coordinator(
         &desired,

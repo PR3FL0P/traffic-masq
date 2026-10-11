@@ -15,7 +15,7 @@ pub(super) fn format_owner_badge(owner: RouteOwner) -> Span<'static> {
     }
 }
 
-pub(super) fn router_action_buttons(router: &RouterData) -> [(RouterAction, &'static str); 10] {
+pub(super) fn router_action_buttons(router: &RouterData) -> [(RouterAction, &'static str); 9] {
     let manual_delete = router
         .route_rows()
         .get(router.selected_route)
@@ -42,16 +42,6 @@ pub(super) fn router_action_buttons(router: &RouterData) -> [(RouterAction, &'st
         (RouterAction::ShareViaRoute, "[Share via: n]"),
         (RouterAction::Refresh, "[Refresh]"),
         (RouterAction::Topology, "[Topology: t]"),
-        (
-            RouterAction::ToggleEnabled,
-            if router.recovery_blocks_mutations() {
-                "[Routing change blocked]"
-            } else if router.proposed_router_config.enabled {
-                "[Disable routing: e]"
-            } else {
-                "[Enable routing: e]"
-            },
-        ),
         (RouterAction::Setup, "[Wi-Fi setup: w]"),
         (RouterAction::Settings, "[Uplink / VPN: u]"),
     ]
@@ -129,7 +119,7 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
             }),
         ),
         Span::raw(" | "),
-        Span::styled("Enabled: ", Style::default().fg(theme::MUTED)),
+        Span::styled("Routing: ", Style::default().fg(theme::MUTED)),
         Span::styled(
             format!("{:<6}", router.enabled),
             Style::default().fg(if router.enabled {
@@ -378,7 +368,7 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
             let badge = if row.configured.is_some() {
                 let state = if router.staged {
                     "staged"
-                } else if !router.proposed_router_config.enabled {
+                } else if !router.proposed_router_config.is_active() {
                     "disabled"
                 } else if router.observation_error.is_some()
                     || row.output_presence

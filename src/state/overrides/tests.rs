@@ -74,7 +74,6 @@ fn effective_config_revalidates_router_against_interface_overrides() {
     base.network
         .interfaces
         .insert("lan0".to_string(), interface_config("192.168.10.1/24"));
-    base.router.enabled = true;
     base.router.uplink = Some(UplinkConfig {
         interface: "wan0".to_string(),
         mode: UplinkMode::External,

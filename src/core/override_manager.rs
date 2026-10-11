@@ -447,8 +447,8 @@ fn validate_candidate(candidate: &RuntimeOverrides, base: &AppConfig) -> Result<
         if !effective.vpn.enabled {
             bail!("persisted vpn traffic policy mode \"vpn\" requires vpn.enabled = true");
         }
-        if !effective.router.enabled {
-            bail!("persisted vpn traffic policy mode \"vpn\" requires router.enabled = true");
+        if !effective.router.is_active() {
+            bail!("persisted vpn traffic policy mode \"vpn\" requires router intent");
         }
     }
     Ok(())

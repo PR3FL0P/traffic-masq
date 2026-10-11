@@ -37,7 +37,6 @@ copy_fields!(VpnHopConfig, VpnHopConfigView, profile_name);
 impl From<RouterConfigView> for RouterConfig {
     fn from(value: RouterConfigView) -> Self {
         Self {
-            enabled: value.enabled,
             uplink: value.uplink.map(Into::into),
             forwarding: value
                 .forwarding
@@ -45,6 +44,7 @@ impl From<RouterConfigView> for RouterConfig {
             owned_routes: value.owned_routes.into_iter().map(Into::into).collect(),
             allow_default_route_change: value.allow_default_route_change,
             vpn_chain: value.vpn_chain.into_iter().map(Into::into).collect(),
+            route_host_traffic: value.route_host_traffic,
         }
     }
 }
@@ -52,7 +52,6 @@ impl From<RouterConfigView> for RouterConfig {
 impl From<RouterConfig> for RouterConfigView {
     fn from(value: RouterConfig) -> Self {
         Self {
-            enabled: value.enabled,
             uplink: value.uplink.map(Into::into),
             forwarding: value
                 .forwarding
@@ -60,6 +59,7 @@ impl From<RouterConfig> for RouterConfigView {
             owned_routes: value.owned_routes.into_iter().map(Into::into).collect(),
             allow_default_route_change: value.allow_default_route_change,
             vpn_chain: value.vpn_chain.into_iter().map(Into::into).collect(),
+            route_host_traffic: value.route_host_traffic,
         }
     }
 }

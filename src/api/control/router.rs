@@ -252,8 +252,8 @@ impl ControlService {
             let current = self.effective_config().await.map_err(anyhow::Error::msg)?;
             anyhow::ensure!(config.uplink == current.router.uplink && config.vpn_chain == current.router.vpn_chain,
                 "offline router Save only changes sharing and owned routes; use a live transaction to change uplink or VPN chain");
-            anyhow::ensure!(config.enabled == current.router.enabled || current.router.vpn_chain.is_empty(),
-                "use a live transaction to change execution of a VPN router");
+            anyhow::ensure!(config.route_host_traffic == current.router.route_host_traffic,
+                "use a live transaction to change routing of the router's own traffic through VPN");
             let candidate = self.overrides.build_candidate(&RouterIntentProposal::new().set_router(config)).await?;
             anyhow::ensure!(candidate.effective_config().network.interfaces == current.network.interfaces,
                 "router candidate also changes interface policy; use a live transaction");
@@ -893,10 +893,6 @@ impl ControlService {
                 return provisioning_error(RouterProvisioningErrorDetail::Other { message })
             }
         };
-        let unconfigured = effective.router.enabled
-            && effective.router.uplink.is_none()
-            && effective.router.owned_routes.is_empty()
-            && effective.router.forwarding.is_none();
         let desired = match RouterDesired::from_effective_config(&effective) {
             Ok(desired) => desired,
             Err(error) => {
@@ -910,7 +906,7 @@ impl ControlService {
         let coordinator = router.view().await;
         let status = coordinator.status();
         let failures = coordinator.failures();
-        let ready = desired.enabled && readiness.ready() && !unconfigured;
+        let ready = desired.enabled && readiness.ready();
         let stage = match status {
             CoordinatorStatus::RollbackFailed | CoordinatorStatus::RecoveryRequired => {
                 ProvisioningStage::RollbackFailed
@@ -918,7 +914,6 @@ impl ControlService {
             CoordinatorStatus::RecoveredButJournalCleanupPending
             | CoordinatorStatus::CommitIndeterminate => ProvisioningStage::Degraded,
             CoordinatorStatus::Pending => ProvisioningStage::AwaitingConfirmation,
-            CoordinatorStatus::Idle if unconfigured => ProvisioningStage::Unconfigured,
             CoordinatorStatus::Idle if !desired.enabled => ProvisioningStage::Inactive,
             CoordinatorStatus::Idle if ready => ProvisioningStage::Ready,
             CoordinatorStatus::Idle => ProvisioningStage::Degraded,

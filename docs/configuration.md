@@ -108,12 +108,13 @@ provides no DNS resolver. `lease_seconds` is optional and otherwise uses
 
 ## Router
 
-`[router]` defaults to disabled, with no uplink, no explicit forwarding, no owned
-routes, `allow_default_route_change = false` and an empty `vpn_chain`.
+`[router]` has no global enabled switch. Routing intent is derived from an
+uplink, non-empty explicit forwarding rules, owned routes, or a VPN chain.
+With none of these, the router dataplane remains inactive. Old TOML files with
+`router.enabled` still deserialize, but the key is ignored; remove it when migrating.
 
 ```toml
 [router]
-enabled = true
 forwarding = [
   { from = "lan0", to = "wan0", masquerade = true, source_subnet = "192.168.50.0/24" }
 ]
@@ -153,6 +154,27 @@ bits; tables `0` and `255` are rejected. A default route requires
 selects up to eight WireGuard hops, nearest the physical uplink first. Explicit
 `forwarding` cannot coexist with a legacy VPN chain or global VPN mode `vpn`.
 Configure tunnel routing separately for explicit interface pairs.
+
+`route_host_traffic = true` (default `false`) additionally sends the router's own
+locally generated traffic through the VPN chain. It requires a non-empty
+`vpn_chain` and is part of the router intent, so it is planned, applied,
+confirmed and rolled back with the rest of the router transaction. While it is
+on:
+
+- Router-originated IPv4 is marked for the tunnel and dropped if it would leave
+  any interface other than the tunnel (a host kill switch).
+- Traffic to loopback, to the managed LAN subnets, multicast/broadcast, DHCP
+  (UDP 67/68) and to the resolved WireGuard endpoint of every hop stays direct.
+  Endpoints are read from the current WireGuard kernel configuration when the
+  policy is applied and checked; if they cannot be observed (or are IPv6), the
+  change is refused. Hostname endpoints are resolved once when activating the tunnel.
+- Router-originated IPv6 is blocked except loopback, link-local and multicast,
+  because IPv6 is not tunnelled.
+
+The router's DNS goes through the tunnel too. If the VPN does not provide a
+resolver the host can reach, name resolution on the router can stop working;
+`/etc/resolv.conf` is not changed. If WireGuard learns a new endpoint while the tunnel is up, the integrity check
+detects the drift and re-applies the policy using the current kernel address.
 
 ## Wi-Fi
 

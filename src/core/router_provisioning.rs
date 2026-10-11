@@ -322,7 +322,6 @@ pub fn derive_router_provisioning(
     };
 
     let router = RouterConfig {
-        enabled: true,
         uplink: Some(UplinkConfig {
             interface: desired.uplink.interface.clone(),
             mode: UplinkMode::Dhcp,
@@ -336,6 +335,7 @@ pub fn derive_router_provisioning(
             masquerade: true,
         }]),
         vpn_chain: Vec::new(),
+        route_host_traffic: false,
     };
 
     let mut effective_config = context.effective_config.clone();

@@ -183,7 +183,7 @@ fn apply_derived_router_requirements(
     let RouterOverrideChange::Set(router) = &proposal.router else {
         return Ok(());
     };
-    if !router.enabled {
+    if !router.is_active() {
         return Ok(());
     }
     let Some(uplink) = router
@@ -336,14 +336,12 @@ impl RouterCandidate {
         recovery: bool,
     ) -> Result<Self> {
         if let RouterOverrideChange::Set(router) = &proposal.router {
-            if router.enabled
+            if !router.vpn_chain.is_empty()
                 && router.uplink.is_none()
                 && router.owned_routes.is_empty()
                 && router.forwarding.is_none()
             {
-                bail!(
-                    "router.uplink is required before an enabled router candidate can be activated"
-                );
+                bail!("router.uplink is required before activating a router VPN chain");
             }
         }
         let committed_effective = if recovery {

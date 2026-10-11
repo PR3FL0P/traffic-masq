@@ -1,3 +1,5 @@
+use std::net::Ipv4Addr;
+
 use anyhow::{bail, Context, Result};
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
@@ -46,10 +48,48 @@ pub struct VpnPolicyFirewallDesired {
     pub protected_subnets: Vec<Ipv4Net>,
     pub vpn_interface: String,
     pub physical_uplink: String,
+    /// Also send the router's own locally generated traffic through the VPN.
+    /// Absent means only forwarded LAN traffic is protected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_traffic: Option<VpnHostTrafficDesired>,
+}
+
+/// Router-originated traffic policy. Everything except the exclusions below is
+/// marked for the VPN, dropped if it would leave via the physical uplink, and
+/// any non-link-local IPv6 egress is blocked (IPv6 is not tunnelled).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VpnHostTrafficDesired {
+    /// Resolved WireGuard endpoints of every hop. Traffic to them must stay
+    /// unmarked or the tunnel's own handshake would be routed into itself.
+    pub vpn_endpoints: Vec<Ipv4Addr>,
+}
+
+impl VpnHostTrafficDesired {
+    fn validate(&self) -> Result<()> {
+        if self.vpn_endpoints.is_empty() {
+            bail!("routing router traffic through the VPN requires at least one VPN endpoint");
+        }
+        for (index, endpoint) in self.vpn_endpoints.iter().enumerate() {
+            if endpoint.is_unspecified()
+                || endpoint.is_loopback()
+                || endpoint.is_multicast()
+                || endpoint.is_broadcast()
+            {
+                bail!("invalid VPN endpoint address: {endpoint}");
+            }
+            if self.vpn_endpoints[..index].contains(endpoint) {
+                bail!("duplicate VPN endpoint address: {endpoint}");
+            }
+        }
+        Ok(())
+    }
 }
 
 impl VpnPolicyFirewallDesired {
     pub fn validate(&self) -> Result<()> {
+        if let Some(host) = &self.host_traffic {
+            host.validate()?;
+        }
         if self.protected_subnets.is_empty() {
             bail!("VPN policy firewall requires at least one protected subnet");
         }
@@ -208,8 +248,27 @@ fn render_vpn_nftables_batch(
     let mark = format!("{:#010x}", VPN_POLICY_FWMARK.get());
     let mask = format!("{:#010x}", VPN_POLICY_FWMASK.get());
 
+    let (host_set, host_chains) = match &desired.host_traffic {
+        None => (String::new(), String::new()),
+        Some(host) => {
+            let endpoints = host
+                .vpn_endpoints
+                .iter()
+                .map(|endpoint| endpoint.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            (
+                format!("  set vpn_endpoints {{ type ipv4_addr; elements = {{ {endpoints} }} }}\n"),
+                format!(
+                    "  chain host_mark {{\n    type route hook output priority mangle; policy accept;\n    oifname \"lo\" return\n    ip daddr @vpn_endpoints return\n    ip daddr @protected_subnets return\n    ip daddr {{ 224.0.0.0/4, 255.255.255.255 }} return\n    udp dport {{ 67, 68 }} return\n    meta nfproto ipv4 meta mark set {mark}\n  }}\n  chain host_killswitch {{\n    type filter hook output priority filter; policy accept;\n    meta nfproto ipv4 meta mark and {mask} == {mark} oifname != \"{vpn_iface}\" drop\n    oifname != \"lo\" ip6 daddr != {{ fe80::/10, ff00::/8 }} drop\n  }}\n",
+                    vpn_iface = desired.vpn_interface,
+                ),
+            )
+        }
+    };
+
     batch.push_str(&format!(
-        "table inet {NFT_VPN_TABLE} {{\n  comment \"{NFT_VPN_TABLE_COMMENT}\"\n  chain metadata {{\n{metadata_rules}  }}\n  set protected_subnets {{ type ipv4_addr; flags interval; elements = {{ {subnets} }} }}\n  chain vpn_mark {{\n    type filter hook prerouting priority mangle; policy accept;\n    ip saddr @protected_subnets meta mark set {mark}\n  }}\n  chain postrouting {{\n    type nat hook postrouting priority srcnat; policy accept;\n    meta mark and {mask} == {mark} oifname \"{vpn_iface}\" masquerade\n  }}\n  chain killswitch {{\n    type filter hook forward priority filter; policy accept;\n    meta mark and {mask} == {mark} oifname \"{uplink}\" drop\n  }}\n}}\n",
+        "table inet {NFT_VPN_TABLE} {{\n  comment \"{NFT_VPN_TABLE_COMMENT}\"\n  chain metadata {{\n{metadata_rules}  }}\n  set protected_subnets {{ type ipv4_addr; flags interval; elements = {{ {subnets} }} }}\n{host_set}  chain vpn_mark {{\n    type filter hook prerouting priority mangle; policy accept;\n    ip saddr @protected_subnets meta mark set {mark}\n  }}\n  chain postrouting {{\n    type nat hook postrouting priority srcnat; policy accept;\n    meta mark and {mask} == {mark} oifname \"{vpn_iface}\" masquerade\n  }}\n  chain killswitch {{\n    type filter hook forward priority filter; policy accept;\n    meta mark and {mask} == {mark} oifname \"{uplink}\" drop\n  }}\n{host_chains}}}\n",
         vpn_iface = desired.vpn_interface,
         uplink = desired.physical_uplink,
     ));
@@ -324,6 +383,85 @@ fn value_contains_number(value: &Value, number: u64) -> bool {
     }
 }
 
+/// Canonical ordered expressions, including match operators and verdicts.
+fn host_rule_expressions(vpn_interface: &str) -> (Vec<Value>, Vec<Value>) {
+    use serde_json::json;
+    let meta = |key| json!({"meta": {"key": key}});
+    let payload = |protocol, field| json!({"payload": {"protocol": protocol, "field": field}});
+    let condition =
+        |op, left: Value, right: Value| json!({"match": {"op": op, "left": left, "right": right}});
+    let ret = json!({"return": null});
+    let ipv4 = condition("==", meta("nfproto"), json!("ipv4"));
+    let mark = VPN_POLICY_FWMARK.get();
+    let mask = VPN_POLICY_FWMASK.get();
+    (
+        vec![
+            json!([condition("==", meta("oifname"), json!("lo")), ret]),
+            json!([
+                condition("==", payload("ip", "daddr"), json!("@vpn_endpoints")),
+                ret
+            ]),
+            json!([
+                condition("==", payload("ip", "daddr"), json!("@protected_subnets")),
+                ret
+            ]),
+            json!([
+                condition(
+                    "==",
+                    payload("ip", "daddr"),
+                    json!({"set": ["224.0.0.0/4", "255.255.255.255"]})
+                ),
+                ret
+            ]),
+            json!([
+                condition("==", payload("udp", "dport"), json!({"set": [67, 68]})),
+                ret
+            ]),
+            json!([ipv4, {"mangle": {"key": meta("mark"), "value": mark}}]),
+        ],
+        vec![
+            json!([ipv4,
+                condition("==", json!({"&": [meta("mark"), mask]}), json!(mark)),
+                condition("!=", meta("oifname"), json!(vpn_interface)), {"drop": null}]),
+            json!([condition("!=", meta("oifname"), json!("lo")),
+                condition("!=", payload("ip6", "daddr"), json!({"set": ["fe80::/10", "ff00::/8"]})), {"drop": null}]),
+        ],
+    )
+}
+
+/// nft emits prefixes as objects and may reorder anonymous set elements.
+/// Preserve all other expression structure, especially operators and rule order.
+fn normalize_host_expression(value: &Value) -> Value {
+    if let Some(prefix) = value.get("prefix") {
+        if let (Some(address), Some(length)) = (
+            prefix.get("addr").and_then(Value::as_str),
+            prefix.get("len").and_then(Value::as_u64),
+        ) {
+            return Value::String(format!("{address}/{length}"));
+        }
+    }
+    match value {
+        Value::Array(values) => {
+            Value::Array(values.iter().map(normalize_host_expression).collect())
+        }
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| {
+                    let mut value = normalize_host_expression(value);
+                    if key == "set" {
+                        if let Value::Array(elements) = &mut value {
+                            elements.sort_by_key(Value::to_string);
+                        }
+                    }
+                    (key.clone(), value)
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 fn vpn_firewall_structure_is_intact(entries: &[Value], desired: &VpnPolicyFirewallDesired) -> bool {
     let owned = |value: &Value| -> bool {
         string_field(value, "family") == Some(NFT_FAMILY)
@@ -366,24 +504,76 @@ fn vpn_firewall_structure_is_intact(entries: &[Value], desired: &VpnPolicyFirewa
             && string_field(chain, "hook") == Some("forward")
             && string_field(chain, "policy") == Some("accept")
     });
+    let host = desired.host_traffic.as_ref();
+    let host_chains_ok = match host {
+        None => true,
+        Some(_) => {
+            chains.iter().any(|chain| {
+                string_field(chain, "name") == Some("host_mark")
+                    && chain.get("prio").and_then(Value::as_i64) == Some(-150)
+                    && string_field(chain, "type") == Some("route")
+                    && string_field(chain, "hook") == Some("output")
+                    && string_field(chain, "policy") == Some("accept")
+            }) && chains.iter().any(|chain| {
+                string_field(chain, "name") == Some("host_killswitch")
+                    && chain.get("prio").and_then(Value::as_i64) == Some(0)
+                    && string_field(chain, "type") == Some("filter")
+                    && string_field(chain, "hook") == Some("output")
+                    && string_field(chain, "policy") == Some("accept")
+            })
+        }
+    };
     let chains_ok = metadata_ok
         && mark_chain_ok
         && postrouting_chain_ok
         && killswitch_chain_ok
-        && chains.len() == 4;
+        && host_chains_ok
+        && chains.len() == if host.is_some() { 6 } else { 4 };
 
     let expected_subnets = desired
         .protected_subnets
         .iter()
         .map(|subnet| subnet.to_string())
         .collect::<Vec<_>>();
-    let subnets_ok = sets.len() == 1
+    let subnets_ok = sets.len() == if host.is_some() { 2 } else { 1 }
         && sets.iter().any(|set| {
             string_field(set, "name") == Some("protected_subnets")
                 && string_field(set, "type") == Some("ipv4_addr")
                 && value_contains_token(set.get("flags").unwrap_or(&Value::Null), "interval")
                 && exact_owned_elements(set, &expected_subnets)
         });
+    let endpoints_ok = host.is_none_or(|host| {
+        let expected = host
+            .vpn_endpoints
+            .iter()
+            .map(|endpoint| endpoint.to_string())
+            .collect::<Vec<_>>();
+        sets.iter().any(|set| {
+            string_field(set, "name") == Some("vpn_endpoints")
+                && string_field(set, "type") == Some("ipv4_addr")
+                && exact_owned_elements(set, &expected)
+        })
+    });
+    let host_rules_ok = host.is_none_or(|_| {
+        let host_mark = rules
+            .iter()
+            .filter(|rule| string_field(rule, "chain") == Some("host_mark"))
+            .collect::<Vec<_>>();
+        let host_kill = rules
+            .iter()
+            .filter(|rule| string_field(rule, "chain") == Some("host_killswitch"))
+            .collect::<Vec<_>>();
+        let (expected_mark, expected_kill) = host_rule_expressions(&desired.vpn_interface);
+        let matches = |rules: &[&&Value], expected: &[Value]| {
+            rules.len() == expected.len()
+                && rules.iter().zip(expected).all(|(rule, expression)| {
+                    rule.get("expr").is_some_and(|actual| {
+                        normalize_host_expression(actual) == normalize_host_expression(expression)
+                    })
+                })
+        };
+        matches(&host_mark, &expected_mark) && matches(&host_kill, &expected_kill)
+    });
 
     let mark_rules = rules
         .iter()
@@ -422,7 +612,13 @@ fn vpn_firewall_structure_is_intact(entries: &[Value], desired: &VpnPolicyFirewa
                 && value_contains_number(rule, fw_mask)
         });
 
-    chains_ok && subnets_ok && mark_ok && masquerade_ok && killswitch_ok
+    chains_ok
+        && subnets_ok
+        && endpoints_ok
+        && host_rules_ok
+        && mark_ok
+        && masquerade_ok
+        && killswitch_ok
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -545,6 +741,34 @@ pub mod test_support {
                     { "drop": null }
                 ])),
             ]);
+            if let Some(host) = &desired.host_traffic {
+                entries.extend([
+                    serde_json::json!({ "chain": {
+                        "family": NFT_FAMILY, "table": NFT_VPN_TABLE, "name": "host_mark",
+                        "type": "route", "hook": "output", "prio": -150, "policy": "accept"
+                    }}),
+                    serde_json::json!({ "chain": {
+                        "family": NFT_FAMILY, "table": NFT_VPN_TABLE, "name": "host_killswitch",
+                        "type": "filter", "hook": "output", "prio": 0, "policy": "accept"
+                    }}),
+                    serde_json::json!({ "set": {
+                        "family": NFT_FAMILY, "table": NFT_VPN_TABLE, "name": "vpn_endpoints",
+                        "type": "ipv4_addr",
+                        "elem": host.vpn_endpoints.iter().map(|endpoint| endpoint.to_string()).collect::<Vec<_>>()
+                    }}),
+                ]);
+                let (mark_rules, kill_rules) = host_rule_expressions(&desired.vpn_interface);
+                entries.extend(
+                    mark_rules
+                        .into_iter()
+                        .map(|expression| vpn_rule("host_mark", expression)),
+                );
+                entries.extend(
+                    kill_rules
+                        .into_iter()
+                        .map(|expression| vpn_rule("host_killswitch", expression)),
+                );
+            }
         }
         serde_json::to_vec(&serde_json::json!({ "nftables": entries })).expect("ruleset")
     }

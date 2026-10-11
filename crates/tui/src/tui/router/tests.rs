@@ -32,7 +32,7 @@ fn dhcp_spec(interface: &str) -> DhcpServiceView {
 }
 
 #[tokio::test]
-async fn routing_toggle_stages_configuration_for_plan_review() {
+async fn routing_has_no_global_keyboard_toggle() {
     let client = ApiClient::new("/socket-that-must-not-be-opened");
     let mut app = TuiApp {
         screen: Screen::Router,
@@ -40,19 +40,8 @@ async fn routing_toggle_stages_configuration_for_plan_review() {
     };
     app.router.topology.loaded = true;
     handle_router_key(&mut app, KeyCode::Char('e'), &client).await;
-    assert!(app.router.staged);
-    assert!(app.router.proposed_router_config.enabled);
-    assert!(
-        !app.router.enabled,
-        "toggle must not skip plan/apply/commit"
-    );
-    assert_eq!(
-        app.screen,
-        Screen::Router,
-        "failed preview must not proceed to apply"
-    );
-    handle_router_key(&mut app, KeyCode::Char('e'), &client).await;
-    assert!(!app.router.proposed_router_config.enabled);
+    assert!(!app.router.staged);
+    assert!(!app.router.proposed_router_config.is_active());
 }
 
 #[test]
@@ -75,12 +64,12 @@ fn router_action_cycles_forward_and_backward() {
     );
     assert_eq!(
         action.next().next().next().next().next().next().next(),
-        RouterAction::ToggleEnabled
+        RouterAction::Setup
     );
 
     assert_eq!(action.prev(), RouterAction::Settings);
     assert_eq!(action.prev().prev(), RouterAction::Setup);
-    assert_eq!(action.prev().prev().prev(), RouterAction::ToggleEnabled);
+    assert_eq!(action.prev().prev().prev(), RouterAction::Topology);
 }
 
 #[test]
@@ -89,7 +78,6 @@ fn staged_explicit_forwarding_requires_a_plan_even_when_committed_router_is_disa
         enabled: false,
         ..Default::default()
     };
-    router.proposed_router_config.enabled = true;
     router.proposed_router_config.forwarding =
         Some(vec![traffic_masq_protocol::ForwardingConfigView {
             source_subnet: None,
@@ -195,7 +183,7 @@ fn save_route_editor_validates_and_stages_route() {
     assert_eq!(app.screen, Screen::Router);
     assert!(app.router.editor.is_none());
     assert!(app.router.staged);
-    assert!(app.router.proposed_router_config.enabled);
+    assert!(app.router.proposed_router_config.is_active());
     assert_eq!(app.router.proposed_router_config.owned_routes.len(), 1);
     let route = &app.router.proposed_router_config.owned_routes[0];
     assert_eq!(route.destination, "192.168.100.0/24".parse().unwrap());
@@ -235,7 +223,7 @@ fn save_route_editor_auto_appends_slash_32_for_bare_ips() {
         app.router.proposed_router_config.owned_routes[0].destination,
         "10.5.0.1/32".parse().unwrap()
     );
-    assert!(app.router.proposed_router_config.enabled);
+    assert!(app.router.proposed_router_config.is_active());
 }
 
 #[test]
@@ -330,7 +318,6 @@ fn route_editor_retry_after_collision_replaces_original() {
             screen: Screen::RouteEditor,
             ..Default::default()
         };
-        app.router.proposed_router_config.enabled = true;
         app.router.proposed_router_config.owned_routes = vec![original.clone()];
         if owner.is_editable() {
             app.router
@@ -413,7 +400,6 @@ fn route_status(route: &OwnedIpv4RouteConfig, owner: RouteOwner) -> RouteStatus 
 fn deleting_last_default_route_preserves_permission_in_proposal() {
     let original = route_config("0.0.0.0/0");
     let config = RouterConfig {
-        enabled: true,
         allow_default_route_change: true,
         owned_routes: vec![original.clone()],
         ..Default::default()
@@ -438,7 +424,6 @@ fn delete_selected_route_shows_manual_command_for_external_and_stages_owned() {
         screen: Screen::Router,
         ..Default::default()
     };
-    app.router.proposed_router_config.enabled = true;
     let external_route = RouteStatus {
         destination: "10.0.0.0/8".parse().unwrap(),
         gateway: None,
@@ -494,7 +479,7 @@ fn delete_selected_route_shows_manual_command_for_external_and_stages_owned() {
     delete_selected_route(&mut app);
     assert_eq!(app.router.routes.len(), 1);
     assert!(app.router.proposed_router_config.owned_routes.is_empty());
-    assert!(!app.router.proposed_router_config.enabled);
+    assert!(!app.router.proposed_router_config.is_active());
     assert!(app.router.staged);
     assert_eq!(app.router.warning_message, None);
 }
@@ -649,10 +634,10 @@ fn router_buttons_wrap_and_remain_visible_at_supported_sizes() {
                 .draw(|frame| super::super::render(frame, &mut app, false))
                 .unwrap();
             let action_buttons = if width >= 112 {
-                assert_eq!(app.ui.buttons.len(), 11, "{width}x{height}");
+                assert_eq!(app.ui.buttons.len(), 10, "{width}x{height}");
                 &app.ui.buttons[1..]
             } else {
-                assert_eq!(app.ui.buttons.len(), 10, "{width}x{height}");
+                assert_eq!(app.ui.buttons.len(), 9, "{width}x{height}");
                 &app.ui.buttons[..]
             };
             let buffer = terminal.backend().buffer();
@@ -694,10 +679,7 @@ fn degraded_recovery_marks_router_mutations_as_blocked() {
         buttons[3],
         (RouterAction::PlanApply, "[Apply blocked: recovery]")
     );
-    assert_eq!(
-        buttons[7],
-        (RouterAction::ToggleEnabled, "[Routing change blocked]")
-    );
+    assert_eq!(buttons[7], (RouterAction::Setup, "[Wi-Fi setup: w]"));
 }
 
 #[tokio::test]
@@ -746,13 +728,13 @@ async fn periodic_router_status_refresh_does_not_request_a_plan() {
     });
 
     let mut app = TuiApp::default();
-    app.router.proposed_router_config.enabled = true;
+    app.router.proposed_router_config.owned_routes = vec![route_config("203.0.113.0/24")];
     app.router.error = Some(RouterErrorDetail::StalePlan);
     super::controller::refresh_router_status(&mut app, &ApiClient::new(socket)).await;
 
     assert!(app.router.enabled);
     assert!(app.router.ready);
-    assert!(app.router.proposed_router_config.enabled);
+    assert!(app.router.proposed_router_config.is_active());
     assert!(matches!(
         app.router.error,
         Some(RouterErrorDetail::StalePlan)
@@ -836,10 +818,7 @@ fn coordinator_status_blocks_mutations_without_structured_notice() {
             buttons[3],
             (RouterAction::PlanApply, "[Apply blocked: recovery]")
         );
-        assert_eq!(
-            buttons[7],
-            (RouterAction::ToggleEnabled, "[Routing change blocked]")
-        );
+        assert_eq!(buttons[7], (RouterAction::Setup, "[Wi-Fi setup: w]"));
     }
 }
 
@@ -1193,7 +1172,7 @@ fn intent_preview(
     Response::RouterIntentPreview {
         revision,
         desired: RouterDesiredView {
-            enabled: config.enabled,
+            enabled: config.is_active(),
             uplink_wifi: None,
             uplink_dhcp: None,
             output_wifi: vec![],
@@ -1424,7 +1403,7 @@ async fn saved_missing_route_editor_keeps_name_without_fabricating_runtime() {
         .contains(&"unplugged0".into()));
     app.router.editor.as_mut().unwrap().metric = "500".into();
     save_route_editor(&mut app);
-    assert!(!app.router.proposed_router_config.enabled);
+    assert!(app.router.proposed_router_config.is_active());
     assert!(app.router.routes.is_empty());
     assert!(app.router.route_rows()[0].observed.is_none());
     delete_selected_route(&mut app);

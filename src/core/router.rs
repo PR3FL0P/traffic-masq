@@ -96,13 +96,13 @@ impl RouterDesired {
     }
 
     fn from_validated_config(config: &AppConfig) -> Result<Self> {
-        if config.router.enabled && !config.vpn.enabled && !config.router.vpn_chain.is_empty() {
+        if config.router.is_active() && !config.vpn.enabled && !config.router.vpn_chain.is_empty() {
             anyhow::bail!("Enable VPN before enabling a router VPN chain");
         }
         let mut dhcp = DhcpSupervisor::service_specs(config)?;
         dhcp.sort_by(|left, right| left.interface.cmp(&right.interface));
 
-        if !config.router.enabled {
+        if !config.router.is_active() {
             return Ok(Self {
                 enabled: false,
                 uplink_wifi: None,
@@ -110,8 +110,8 @@ impl RouterDesired {
                 output_wifi: Vec::new(),
                 dhcp,
                 routes: Vec::new(),
-                // Disabling the router still removes its owned routes, so
-                // retain explicit permission to delete an owned default route.
+                // Removing routing intent still removes previously owned routes,
+                // so preserve permission to delete an owned default route.
                 allow_default_route_change: config.router.allow_default_route_change,
                 vpn_chain: Vec::new(),
                 dataplane: RouterDataplaneTarget::Disabled,
@@ -269,6 +269,18 @@ impl RouterDesired {
                         protected_subnets: protected_subnets.clone(),
                         vpn_interface: interface.clone(),
                         physical_uplink: upstream.clone(),
+                        route_host_traffic: config.router.route_host_traffic,
+                        chain_profiles: if config.router.route_host_traffic {
+                            config
+                                .router
+                                .vpn_chain
+                                .iter()
+                                .map(|hop| hop.profile_name.clone())
+                                .collect()
+                        } else {
+                            Vec::new()
+                        },
+                        host_endpoints: Vec::new(),
                     },
                 }
             } else {

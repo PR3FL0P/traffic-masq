@@ -30,7 +30,6 @@ dns_servers = ["1.1.1.1", "9.9.9.9"]
 lease_seconds = 86400
 
 [router]
-enabled = true
 # Existing routing on wan0 supplies the upstream gateway.
 forwarding = [{ from = "wlan0", to = "wan0", masquerade = true }]
 # Add independent pairs, e.g. lan1 -> wg0, after creating interfaces/routes.

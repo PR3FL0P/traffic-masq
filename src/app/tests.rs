@@ -571,7 +571,6 @@ fn vpn_policy_startup_config() -> AppConfig {
         },
     );
     config.router = RouterConfig {
-        enabled: true,
         uplink: Some(UplinkConfig {
             interface: "wan0".to_string(),
             mode: UplinkMode::External,
@@ -1538,7 +1537,6 @@ fn desired_with_route_and_dataplane() -> RouterDesired {
     config.router = RouterConfig {
         forwarding: None,
         vpn_chain: Vec::new(),
-        enabled: true,
         uplink: Some(UplinkConfig {
             interface: "wan0".to_string(),
             mode: UplinkMode::External,
@@ -1551,6 +1549,7 @@ fn desired_with_route_and_dataplane() -> RouterDesired {
             metric: Some(100),
         }],
         allow_default_route_change: false,
+        route_host_traffic: false,
     };
     RouterDesired::from_effective_config(&config).expect("desired")
 }
@@ -1831,6 +1830,7 @@ async fn apply_vpn_policy_startup_deactivates_leftover_policy_in_direct_mode() {
         protected_subnets: vec!["192.168.10.0/24".parse().unwrap()],
         vpn_interface: OWNED_INTERFACE_NAME.to_string(),
         physical_uplink: "wan0".to_string(),
+        host_traffic: None,
     };
 
     let firewall_executor = FakeNftExecutor::with_responses(vec![
@@ -1910,7 +1910,6 @@ fn sharing_config() -> AppConfig {
             },
         );
     }
-    config.router.enabled = true;
     config.router.forwarding = Some(
         ["lan0", "lan1"]
             .into_iter()
@@ -1964,8 +1963,8 @@ async fn sharing_repair_checks_all_forwarding_interfaces_without_legacy_uplink()
         .unwrap()
         .is_empty());
 
-    // Disabled forwarding must still permit removal of old firewall rules.
-    config.router.enabled = false;
+    // An empty forwarding list must still permit removal of old firewall rules.
+    config.router.forwarding = Some(vec![]);
     let desired = RouterDesired::from_effective_config(&config).unwrap();
     assert!(
         missing_router_repair_interfaces(&desired, &FakeNetworkProvider::default())

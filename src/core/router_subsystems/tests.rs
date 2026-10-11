@@ -103,13 +103,13 @@ fn enabled_config() -> AppConfig {
     config.router = RouterConfig {
         forwarding: None,
         vpn_chain: Vec::new(),
-        enabled: true,
         uplink: Some(UplinkConfig {
             interface: "wan0".to_string(),
             mode: UplinkMode::External,
         }),
         owned_routes: Vec::new(),
         allow_default_route_change: false,
+        route_host_traffic: false,
     };
     config
 }
@@ -597,6 +597,7 @@ fn valid_wg_config() -> String {
 struct FakeChainVpnProvider {
     links: StdMutex<HashMap<String, bool>>,
     launch_markers: StdMutex<HashMap<String, String>>,
+    endpoints: StdMutex<HashMap<String, Vec<std::net::SocketAddr>>>,
     fail_create: StdMutex<Option<String>>,
     fail_set_peers: StdMutex<Option<String>>,
     fail_delete: StdMutex<Option<String>>,
@@ -677,7 +678,7 @@ impl VpnProvider for FakeChainVpnProvider {
     async fn set_peers(
         &self,
         name: &str,
-        _peers: &[WireGuardPeerConfig],
+        peers: &[WireGuardPeerConfig],
     ) -> Result<(), ProviderError> {
         if self.fail_set_peers.lock().unwrap().as_deref() == Some(name) {
             return Err(ProviderError::CommandFailed {
@@ -686,6 +687,18 @@ impl VpnProvider for FakeChainVpnProvider {
                 stderr: format!("injected set_peers failure for {name}"),
             });
         }
+        self.endpoints.lock().unwrap().insert(
+            name.into(),
+            peers
+                .iter()
+                .filter_map(|peer| match &peer.endpoint {
+                    Some(crate::vpn::wireguard::WireGuardEndpoint::Address(address)) => {
+                        Some(*address)
+                    }
+                    _ => None,
+                })
+                .collect(),
+        );
         self.require(name)
     }
 
@@ -729,6 +742,17 @@ impl VpnProvider for FakeChainVpnProvider {
             .unwrap()
             .get(name)
             .map(|_| WireGuardKey::parse(VALID_PUBLIC_KEY, "test").unwrap()))
+    }
+
+    async fn peer_endpoints(&self, name: &str) -> Result<Vec<std::net::SocketAddr>, ProviderError> {
+        self.require(name)?;
+        Ok(self
+            .endpoints
+            .lock()
+            .unwrap()
+            .get(name)
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn is_up(&self, name: &str) -> Result<bool, ProviderError> {
@@ -1197,4 +1221,55 @@ async fn vpn_chain_crash_recovery_rolls_candidate_back_to_snapshot() {
         .expect("active profile restored");
     assert_eq!(persisted.profile_name, "chain.conf");
     assert!(vpn_provider.link_exists("tm-wg-0").await.expect("link"));
+}
+
+#[tokio::test]
+async fn host_policy_uses_live_kernel_endpoints_instead_of_resolving_profiles_again() {
+    let (subsystems, provider, _, dir) = chain_subsystems().await;
+    let plan = VpnChainPlan {
+        hops: vec![relay_hop(0, "tm-wg-0", "wan0")],
+    };
+    subsystems.apply_vpn_chain(&plan).await.unwrap();
+    let mut policy = crate::core::vpn_policy_manager::VpnPolicyDesired {
+        route_host_traffic: true,
+        chain_profiles: vec!["chain.conf".into()],
+        protected_subnets: vec!["192.0.2.0/24".parse().unwrap()],
+        vpn_interface: "tm-wg-0".into(),
+        physical_uplink: "wan0".into(),
+        host_endpoints: Vec::new(),
+    };
+    let first: std::net::SocketAddr = "203.0.113.45:51820".parse().unwrap();
+    provider
+        .endpoints
+        .lock()
+        .unwrap()
+        .insert("tm-wg-0".into(), vec![first]);
+    // Even an unavailable profile must not trigger a second resolution after
+    // WireGuard has already been configured and its actual endpoint is known.
+    std::fs::remove_file(dir.path().join("wireguard/chain.conf")).unwrap();
+    let observed = subsystems
+        .vpn_chain
+        .with_host_endpoints(&policy)
+        .await
+        .unwrap();
+    assert_eq!(
+        observed.host_endpoints,
+        vec!["203.0.113.45".parse::<Ipv4Addr>().unwrap()]
+    );
+    let roaming: std::net::SocketAddr = "198.51.100.27:51820".parse().unwrap();
+    provider
+        .endpoints
+        .lock()
+        .unwrap()
+        .insert("tm-wg-0".into(), vec![roaming]);
+    policy.host_endpoints = observed.host_endpoints;
+    assert_eq!(
+        subsystems
+            .vpn_chain
+            .with_host_endpoints(&policy)
+            .await
+            .unwrap()
+            .host_endpoints,
+        vec!["198.51.100.27".parse::<Ipv4Addr>().unwrap()]
+    );
 }

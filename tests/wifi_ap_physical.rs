@@ -131,7 +131,6 @@ impl PhysicalWifiFixture {
         self.config.auth.database_path = self.temp.path().join("auth.sqlite3");
         self.config.auth.argon2_memory_kib = 1_024;
         self.config.auth.argon2_iterations = 1;
-        self.config.router.enabled = false;
         self.config.vpn.enabled = false;
         self.config.wifi_client.enabled = false;
         self.config.wifi.enabled = true;

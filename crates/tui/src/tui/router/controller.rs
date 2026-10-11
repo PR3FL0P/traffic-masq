@@ -15,9 +15,8 @@ pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
         3 => RouterAction::PlanApply,
         4 => RouterAction::ShareViaRoute,
         6 => RouterAction::Topology,
-        7 => RouterAction::ToggleEnabled,
-        8 => RouterAction::Setup,
-        9 => RouterAction::Settings,
+        7 => RouterAction::Setup,
+        8 => RouterAction::Settings,
         _ => RouterAction::Refresh,
     };
 }
@@ -50,17 +49,6 @@ pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &A
                 LogLevel::Info,
                 "Router draft discarded; saved configuration reloaded",
             );
-            return;
-        }
-        KeyCode::Char('e') => {
-            if app.router.recovery_blocks_mutations() {
-                app.push_message(
-                    LogLevel::Warn,
-                    "Router changes are blocked until recovery completes; press r for recovery status/action",
-                );
-            } else {
-                toggle_router_enabled(app, client).await;
-            }
             return;
         }
         KeyCode::Char('1') => {
@@ -168,13 +156,6 @@ pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &A
                     app.router.warning_message = None;
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => match app.router.action {
-                    RouterAction::ToggleEnabled if app.router.recovery_blocks_mutations() => {
-                        app.push_message(
-                            LogLevel::Warn,
-                            "Router changes are blocked until recovery completes; press r for recovery status/action",
-                        );
-                    }
-                    RouterAction::ToggleEnabled => toggle_router_enabled(app, client).await,
                     RouterAction::AddRoute => open_route_editor_for_add(app, client).await,
                     RouterAction::EditRoute => open_route_editor_for_selected(app, client).await,
                     RouterAction::DeleteRoute => delete_selected_route(app),
@@ -281,22 +262,6 @@ async fn handle_router_recovery_action(app: &mut TuiApp, client: &ApiClient) {
     }
 }
 
-async fn toggle_router_enabled(app: &mut TuiApp, client: &ApiClient) {
-    if !app.router.topology.loaded {
-        load_router_data(app, client).await;
-        if !app.router.topology.loaded {
-            app.push_message(
-                LogLevel::Error,
-                "Load router configuration before changing routing",
-            );
-            return;
-        }
-    }
-    app.router.proposed_router_config.enabled = !app.router.proposed_router_config.enabled;
-    app.router.staged = true;
-    open_router_plan(app, client).await;
-}
-
 pub(crate) async fn refresh_router_data(app: &mut TuiApp, client: &ApiClient) {
     load_router_data(app, client).await;
 }
@@ -313,15 +278,7 @@ pub(crate) async fn refresh_router_status(app: &mut TuiApp, client: &ApiClient) 
 
 /// Report whether current editor state requires a new router preview.
 pub(super) fn router_plan_needed(router: &RouterData) -> bool {
-    router.enabled
-        || router.proposed_router_config.enabled
-        || router.proposed_router_config.uplink.is_some()
-        || !router.proposed_router_config.owned_routes.is_empty()
-        || router
-            .proposed_router_config
-            .forwarding
-            .as_ref()
-            .is_some_and(|rules| !rules.is_empty())
+    router.enabled || router.proposed_router_config.is_active()
 }
 
 async fn load_router_status(app: &mut TuiApp, client: &ApiClient) -> bool {

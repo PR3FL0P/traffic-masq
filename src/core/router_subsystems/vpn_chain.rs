@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 use crate::core::router::{RouterDesired, VpnChainPlan, VpnChainSnapshot};
 use crate::core::vpn_chain::{VpnHopDesired, VpnHopKind, VpnHopRoutingDesired};
 use crate::core::vpn_policy::VpnPolicyReservedIds;
-use crate::core::vpn_policy_manager::VpnPolicyManager;
+use crate::core::vpn_policy_manager::{VpnPolicyDesired, VpnPolicyManager};
 use crate::firewall::vpn::VpnPolicyFirewallBackend;
 use crate::firewall::NftExecutor;
 use crate::netlink::{Ipv4RouteSpec, Ipv4RuleSpec, NetworkProvider, TRAFFIC_MASQ_ROUTE_PROTOCOL};
@@ -102,6 +102,51 @@ impl VpnChainRuntime {
             tunnel,
             reserved,
         ))
+    }
+
+    /// Use the kernel's current destinations, never a second DNS answer that
+    /// could differ from the address installed at activation (or after roaming).
+    pub(super) async fn with_host_endpoints(
+        &self,
+        policy: &VpnPolicyDesired,
+    ) -> Result<VpnPolicyDesired> {
+        let mut observed = policy.clone();
+        if !policy.route_host_traffic {
+            return Ok(observed);
+        }
+        let deps = self.require_vpn_chain_deps()?;
+        let mut endpoints: Vec<Ipv4Addr> = Vec::new();
+        for (index, profile) in policy.chain_profiles.iter().enumerate() {
+            let interface = crate::vpn::manager::hop_interface_name(index as u32);
+            let addresses = deps
+                .vpn_provider
+                .peer_endpoints(&interface)
+                .await
+                .with_context(|| {
+                    format!("failed to observe endpoints of VPN profile '{profile}' on {interface}")
+                })?;
+            anyhow::ensure!(
+                !addresses.is_empty(),
+                "no VPN endpoint is configured on {interface}"
+            );
+            for address in addresses {
+                match address.ip() {
+                    std::net::IpAddr::V4(ip) => {
+                        if !endpoints.contains(&ip) { endpoints.push(ip); }
+                    }
+                    std::net::IpAddr::V6(ip) => bail!(
+                        "VPN profile '{profile}' endpoint {ip} is IPv6; routing router traffic through the VPN supports IPv4 endpoints only"
+                    ),
+                }
+            }
+        }
+        anyhow::ensure!(
+            !endpoints.is_empty(),
+            "no VPN endpoint could be determined for routing router traffic"
+        );
+        endpoints.sort();
+        observed.host_endpoints = endpoints;
+        Ok(observed)
     }
 
     /// Route-only setup for a relay hop: send its own outbound tunnel
@@ -479,7 +524,10 @@ impl VpnChainRuntime {
             VpnHopKind::Relay { own_route } => self.install_relay_route(hop, own_route).await,
             VpnHopKind::Exit { policy } => {
                 match self.vpn_policy_manager_for_hop(hop.reserved, tunnel.clone()) {
-                    Ok(policy_manager) => policy_manager.activate(policy).await.map(|_| ()),
+                    Ok(policy_manager) => match self.with_host_endpoints(policy).await {
+                        Ok(policy) => policy_manager.activate(&policy).await.map(|_| ()),
+                        Err(error) => Err(error),
+                    },
                     Err(error) => Err(error),
                 }
             }
@@ -773,8 +821,9 @@ impl VpnChainRuntime {
                     self.health_relay_route(expected, own_route).await?;
                 }
                 VpnHopKind::Exit { policy } => {
+                    let policy = self.with_host_endpoints(policy).await?;
                     self.vpn_policy_manager_for_hop(expected.reserved, tunnel)?
-                        .health(policy)
+                        .health(&policy)
                         .await?;
                 }
             }

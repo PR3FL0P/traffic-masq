@@ -192,7 +192,6 @@ impl PhysicalWifiFixture {
         self.config.wifi_client.runtime_dir = self.temp.path().join("wpa_supplicant");
         self.config.wifi_client.restart_backoff_seconds = 1;
         self.config.dhcp.leases_dir = self.temp.path().join("dhcp-leases");
-        self.config.router.enabled = true;
         self.config.router.uplink = Some(UplinkConfig {
             interface: self.uplink_interface.clone(),
             mode: UplinkMode::Dhcp,
@@ -893,15 +892,9 @@ impl PhysicalWifiFixture {
         }
         verify_lease_evidence(&self.load_bound_lease()?, address, prefix, gateway)?;
 
-        self.commit_router(
-            &client,
-            RouterConfig {
-                enabled: false,
-                ..self.config.router.clone()
-            },
-        )
-        .await
-        .context("failed to retire router mode before the survival proof")?;
+        self.commit_router(&client, RouterConfig::default())
+            .await
+            .context("failed to retire router mode before the survival proof")?;
         timeout(WAIT_TIMEOUT, async {
             loop {
                 ensure_child_running(self.daemon.as_mut(), "traffic-masqd")?;

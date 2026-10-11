@@ -45,9 +45,6 @@ impl From<&OwnedIpv4RouteConfig> for ManagedIpv4Route {
 /// made `config` — the module almost everything else depends on — depend on
 /// `core` in return, which is a cycle at the very bottom of the stack.
 pub fn desired_owned_routes(router: &RouterConfig) -> Vec<ManagedIpv4Route> {
-    if !router.enabled {
-        return Vec::new();
-    }
     router.owned_routes.iter().map(Into::into).collect()
 }
 

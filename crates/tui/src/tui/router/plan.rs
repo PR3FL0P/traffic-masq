@@ -58,7 +58,7 @@ pub(crate) fn render_router_plan(frame: &mut ratatui::Frame<'_>, area: Rect, app
         }
         lines.push(Line::from(format!(
             "Routing: {}",
-            if preview.config.enabled {
+            if preview.config.is_active() {
                 "enabled"
             } else {
                 "disabled"

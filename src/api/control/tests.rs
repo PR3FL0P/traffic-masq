@@ -639,13 +639,13 @@ fn router_proposal() -> RouterProposalRequest {
         set_router: Some(RouterConfig {
             forwarding: None,
             vpn_chain: Vec::new(),
-            enabled: true,
             uplink: Some(UplinkConfig {
                 interface: "wan0".to_string(),
                 mode: UplinkMode::External,
             }),
             owned_routes: Vec::new(),
             allow_default_route_change: false,
+            route_host_traffic: false,
         }),
         clear_router: false,
         set_interfaces: Default::default(),
@@ -869,13 +869,13 @@ fn router_base_config_with_router_enabled() -> AppConfig {
     config.router = RouterConfig {
         forwarding: None,
         vpn_chain: Vec::new(),
-        enabled: true,
         uplink: Some(UplinkConfig {
             interface: "wan0".to_string(),
             mode: UplinkMode::External,
         }),
         owned_routes: Vec::new(),
         allow_default_route_change: false,
+        route_host_traffic: false,
     };
     config
 }
@@ -945,7 +945,7 @@ async fn router_requests_are_rejected_when_router_mode_is_disabled() {
 }
 
 #[tokio::test]
-async fn enabled_router_without_uplink_reports_unconfigured_provisioning_state() {
+async fn router_without_intent_reports_inactive_provisioning_state() {
     let mut config = router_base_config_with_router_enabled();
     config.router.uplink = None;
     let (service, _directory) =
@@ -953,8 +953,8 @@ async fn enabled_router_without_uplink_reports_unconfigured_provisioning_state()
 
     match service.dispatch(Request::RouterProvisioningStatus).await {
         Response::RouterProvisioningStatus { status } => {
-            assert_eq!(status.stage, ProvisioningStage::Unconfigured);
-            assert!(status.enabled);
+            assert_eq!(status.stage, ProvisioningStage::Inactive);
+            assert!(!status.enabled);
             assert!(!status.ready);
             assert_eq!(status.coordinator, CoordinatorStatus::Idle);
         }
@@ -1603,6 +1603,7 @@ fn vpn_policy_firewall_desired() -> VpnPolicyFirewallDesired {
         protected_subnets: vec!["192.168.10.1/24".parse().unwrap()],
         vpn_interface: OWNED_INTERFACE_NAME.to_string(),
         physical_uplink: "wan0".to_string(),
+        host_traffic: None,
     }
 }
 
@@ -1815,6 +1816,31 @@ async fn vpn_policy_fixture_with_router_chain(
         network,
         _directory: directory,
     }
+}
+
+#[tokio::test]
+async fn offline_router_save_cannot_change_host_vpn_routing() {
+    let fixture = vpn_policy_fixture_with_router_chain(false, true).await;
+    let current = fixture.service.effective_config().await.unwrap();
+    let mut proposed = current.router.clone();
+    proposed.route_host_traffic = true;
+    let revision = fixture.overrides.committed_revision().await;
+    let response = fixture
+        .service
+        .dispatch(Request::SaveRouterIntent {
+            config: proposed.into(),
+            expected_revision: revision,
+        })
+        .await;
+    assert!(
+        matches!(response, Response::RouterError { .. }),
+        "{response:?}"
+    );
+    assert_eq!(fixture.overrides.committed_revision().await, revision);
+    assert_eq!(
+        fixture.service.effective_config().await.unwrap().router,
+        current.router
+    );
 }
 
 #[tokio::test]
@@ -4592,7 +4618,6 @@ async fn dhcp_client_control_fixture_with_router(
     config.runtime.state_dir = directory.path().to_path_buf();
     config.dhcp.leases_dir = directory.path().join("leases");
     if router_uplink {
-        config.router.enabled = true;
         config.router.uplink = Some(UplinkConfig {
             interface: "wan0".to_string(),
             mode: UplinkMode::Dhcp,
@@ -6605,7 +6630,7 @@ async fn list_routes_and_get_router_config_dispatch() {
     let cfg_resp = service.dispatch(Request::GetRouterConfig).await;
     match cfg_resp {
         Response::RouterConfig { config: router_cfg } => {
-            assert_eq!(router_cfg.enabled, config.router.enabled);
+            assert_eq!(router_cfg.is_active(), config.router.is_active());
         }
         other => panic!("unexpected response: {other:?}"),
     }
@@ -9126,7 +9151,7 @@ async fn router_intent_preview_with_missing_dependencies_is_observational() {
             execution_available,
         } => {
             assert_eq!(preview_revision, revision);
-            assert!(config.enabled && desired.enabled && execution_available);
+            assert!(config.is_active() && desired.enabled && execution_available);
             assert_eq!(device_readiness, InterfaceReadiness::WaitingDevice);
             assert_eq!(
                 blockers,
@@ -9148,7 +9173,7 @@ async fn router_intent_preview_with_missing_dependencies_is_observational() {
         response => panic!("{response:?}"),
     }
     assert_eq!(service.overrides.committed_revision().await, revision);
-    assert!(!service.effective_config().await.unwrap().router.enabled);
+    assert!(!service.effective_config().await.unwrap().router.is_active());
     assert!(matches!(
         service.dispatch(Request::RouterPendingTransaction).await,
         Response::RouterPendingTransaction { token: None, .. }
@@ -9157,7 +9182,7 @@ async fn router_intent_preview_with_missing_dependencies_is_observational() {
 }
 
 #[tokio::test]
-async fn router_intent_preview_without_execution_preserves_disabled_saved_routes() {
+async fn router_intent_preview_without_execution_preserves_saved_routes() {
     let directory = tempdir().unwrap();
     let mut config = router_base_config();
     config.runtime.state_dir = directory.path().into();
@@ -9194,13 +9219,13 @@ async fn router_intent_preview_without_execution_preserves_disabled_saved_routes
             ..
         } => {
             assert!(!execution_available);
-            assert!(!config.enabled);
+            assert!(config.is_active());
             assert_eq!(config.owned_routes.len(), 1);
             assert_eq!(
                 config.owned_routes[0].output_interface.as_deref(),
                 Some("lan0")
             );
-            assert!(desired.routes.is_empty());
+            assert_eq!(desired.routes.len(), 1);
         }
         response => panic!("{response:?}"),
     }
@@ -9596,7 +9621,7 @@ async fn route_inventory_keeps_missing_saved_routes_and_does_not_adopt_foreign_r
             observation_error,
         } => {
             assert_eq!(revision, 0);
-            assert!(!config.enabled);
+            assert!(config.is_active());
             assert_eq!(routes.len(), 2);
             assert!(routes[0].configured.is_some());
             assert!(routes[0].observed.is_none());

@@ -354,5 +354,5 @@ async fn legacy_sharing_can_be_read_and_edited_from_saved_settings_without_devic
     )
     .await;
     assert_eq!(app.router.proposed_router_config.forwarding, Some(rules));
-    assert!(!app.router.proposed_router_config.enabled);
+    assert!(app.router.proposed_router_config.is_active());
 }

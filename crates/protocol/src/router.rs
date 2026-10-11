@@ -34,13 +34,27 @@ pub struct RouterProposalRequestView {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RouterConfigView {
-    pub enabled: bool,
     pub uplink: Option<UplinkConfigView>,
     pub forwarding: Option<Vec<ForwardingConfigView>>,
     pub owned_routes: Vec<OwnedIpv4RouteConfigView>,
     pub allow_default_route_change: bool,
     #[serde(default)]
     pub vpn_chain: Vec<VpnHopConfigView>,
+    /// Route the router's own traffic through the VPN chain (with kill switch).
+    #[serde(default)]
+    pub route_host_traffic: bool,
+}
+
+impl RouterConfigView {
+    pub fn is_active(&self) -> bool {
+        self.uplink.is_some()
+            || self
+                .forwarding
+                .as_ref()
+                .is_some_and(|rules| !rules.is_empty())
+            || !self.owned_routes.is_empty()
+            || !self.vpn_chain.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

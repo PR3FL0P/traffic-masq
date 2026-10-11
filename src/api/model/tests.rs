@@ -62,7 +62,6 @@ fn router_proposal_view_preserves_nested_config_json() {
 
     let proposal = RouterProposalRequest {
         set_router: Some(RouterConfig {
-            enabled: true,
             uplink: Some(UplinkConfig {
                 interface: "wan0".into(),
                 mode: UplinkMode::External,
@@ -84,6 +83,7 @@ fn router_proposal_view_preserves_nested_config_json() {
             vpn_chain: vec![VpnHopConfig {
                 profile_name: "exit".into(),
             }],
+            route_host_traffic: false,
         }),
         clear_router: false,
         set_interfaces: BTreeMap::from([(
