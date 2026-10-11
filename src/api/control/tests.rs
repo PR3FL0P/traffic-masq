@@ -5406,6 +5406,7 @@ struct FakeProvisioningSubsystems {
     applied_output_wifi: StdMutex<Vec<WifiApSpec>>,
     uplink_dhcp_unready: StdMutex<bool>,
     unhealthy_dataplane: StdMutex<bool>,
+    rollback_unavailable: StdMutex<bool>,
 }
 
 #[async_trait]
@@ -5504,6 +5505,12 @@ impl RouterSubsystems for FakeProvisioningSubsystems {
         Ok(())
     }
     async fn rollback_dataplane(&self, _: &RouterDataplaneSnapshot) -> Result<()> {
+        if *self.rollback_unavailable.lock().unwrap() {
+            return Err(crate::core::recovery_control::failure(
+                crate::core::recovery_control::FailureKind::Transient,
+                "injected temporary dataplane rollback failure",
+            ));
+        }
         Ok(())
     }
     async fn health_interfaces(&self, _: &RouterDesired) -> Result<()> {
@@ -9805,4 +9812,76 @@ async fn vpn_source_import_copies_profile_without_exposing_keys_or_changing_sour
             .await,
         Response::Error { .. }
     ));
+}
+
+// Exercise both production timers through an accepted provisioning request.
+// A transient router failure must not orphan the other half of the transaction.
+#[tokio::test]
+async fn regression_provisioning_secrets_follow_successful_automatic_router_retry() {
+    let directory = tempdir().unwrap();
+    let mut config = provisioning_base_config(directory.path());
+    config.security.rollback_timeout_seconds = 1;
+    let mut fixture = provisioning_fixture_with(
+        Arc::new(FakeProvisioningSubsystems::default()),
+        config,
+        ProvisioningNetwork::with_wireless(&["wlan-up", "wlan-out"]),
+        Duration::from_millis(200),
+    )
+    .await;
+    fixture.service = fixture
+        .service
+        .with_router_coordinator(RouterTransactionCoordinator::new(
+            RouterManager::new(fixture.subsystems.clone()),
+            fixture.overrides.clone(),
+            Duration::from_secs(1),
+        ));
+    let response = fixture
+        .service
+        .dispatch(apply_request(provisioning_request()))
+        .await;
+    assert!(
+        matches!(response, Response::RouterProvisioningApplied { .. }),
+        "{response:?}"
+    );
+    *fixture.subsystems.rollback_unavailable.lock().unwrap() = true;
+
+    // Both timers fire at one second. Keep the dependency unavailable until
+    // both first attempts have had time to run, then let the router retry.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let router = fixture.service.router.as_ref().unwrap();
+    assert_eq!(router.status().await, CoordinatorStatus::RollbackFailed);
+    *fixture.subsystems.rollback_unavailable.lock().unwrap() = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while router.status().await != CoordinatorStatus::Idle {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("transient router failure must recover automatically");
+    assert_eq!(fixture.overrides.committed_revision().await, 0);
+
+    let restored = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let uplink = fixture
+                .wifi_client
+                .stored_passphrase("wlan-up")
+                .await
+                .unwrap();
+            let output = fixture.wifi.stored_passphrase("wlan-out").await.unwrap();
+            if uplink.is_none()
+                && output.is_none()
+                && !fixture
+                    ._directory
+                    .path()
+                    .join("router-provisioning-secrets.json")
+                    .exists()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(restored.is_ok(),
+        "router recovered automatically, but uncommitted provisioning secrets/journal remain; ordinary network mutations stay blocked");
 }

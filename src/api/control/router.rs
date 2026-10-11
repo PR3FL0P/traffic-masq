@@ -1101,76 +1101,83 @@ impl ControlService {
         let network_mutations = self.network_mutations.clone();
         tokio::spawn(async move {
             tokio::time::sleep(timeout).await;
-            let _network_mutation = network_mutations.write().await;
+            loop {
+                let _network_mutation = network_mutations.write().await;
 
-            if crate::core::recovery::check_commit(&state_dir).is_err() {
-                return;
-            }
-            // Race safely with the coordinator's own timer/commit path. Both
-            // router operations serialize on the coordinator state lock.
-            let committed = overrides
-                .snapshot()
-                .await
-                .committed_router_transaction
-                .as_deref()
-                == Some(token.as_str());
-            let secrets = ProvisioningSecretTransactionStore::in_state_dir(&state_dir);
-            if committed {
-                if let Err(error) = secrets.finish(Some(&token)).await {
-                    tracing::warn!(%error, %token, "failed to clean committed provisioning secret journal");
-                }
-                return;
-            }
-
-            if router.status().await == CoordinatorStatus::Pending {
-                if let Err(error) = router.rollback_for_shutdown().await {
-                    tracing::error!(%error, %token, "router provisioning timeout rollback failed; secret journal retained");
+                if crate::core::recovery::check_commit(&state_dir).is_err() {
                     return;
                 }
-            }
-            if router.status().await != CoordinatorStatus::Idle {
-                return;
-            }
-
-            let committed = overrides
-                .snapshot()
-                .await
-                .committed_router_transaction
-                .as_deref()
-                == Some(token.as_str());
-            if committed {
-                if let Err(error) = secrets.finish(Some(&token)).await {
-                    tracing::warn!(%error, %token, "failed to clean committed provisioning secret journal");
+                // Race safely with the coordinator's own timer/commit path. Both
+                // router operations serialize on the coordinator state lock.
+                let committed = overrides
+                    .snapshot()
+                    .await
+                    .committed_router_transaction
+                    .as_deref()
+                    == Some(token.as_str());
+                let secrets = ProvisioningSecretTransactionStore::in_state_dir(&state_dir);
+                if committed {
+                    if let Err(error) = secrets.finish(Some(&token)).await {
+                        tracing::warn!(%error, %token, "failed to clean committed provisioning secret journal");
+                    }
+                    return;
                 }
-                return;
-            }
 
-            match secrets.restore(Some(&token)).await {
-                Ok(true) => {
-                    let snapshot = overrides.snapshot().await;
-                    match snapshot
-                        .effective_config(&base_config)
-                        .and_then(|effective| RouterDesired::from_effective_config(&effective))
-                    {
-                        Ok(desired) => match router.repair(desired).await {
-                            Ok(()) => {
-                                if let Err(error) = secrets.finish(Some(&token)).await {
-                                    tracing::error!(%error, %token, "provisioning timeout recovery converged but journal cleanup failed; recovery remains blocked");
-                                }
-                            }
-                            Err(error) => {
-                                tracing::error!(%error, %token, "provisioning secrets restored after timeout but router re-convergence failed; recovery journal retained");
-                            }
-                        },
-                        Err(error) => {
-                            tracing::error!(%error, %token, "could not derive committed router state after provisioning timeout; recovery journal retained")
-                        }
+                if router.status().await == CoordinatorStatus::Pending {
+                    if let Err(error) = router.rollback_for_shutdown().await {
+                        tracing::error!(%error, %token, "router provisioning timeout rollback failed; secret journal retained");
                     }
                 }
-                Ok(false) => {}
-                Err(error) => {
-                    tracing::error!(%error, %token, "failed to restore provisioning secrets after timeout")
+                if router.status().await != CoordinatorStatus::Idle {
+                    // The coordinator retries transient rollback failures itself.
+                    // Keep the secret recovery alive until that retry completes,
+                    // releasing admission so the retry can acquire the same gate.
+                    drop(_network_mutation);
+                    router.wait_until_idle().await;
+                    continue;
                 }
+
+                let committed = overrides
+                    .snapshot()
+                    .await
+                    .committed_router_transaction
+                    .as_deref()
+                    == Some(token.as_str());
+                if committed {
+                    if let Err(error) = secrets.finish(Some(&token)).await {
+                        tracing::warn!(%error, %token, "failed to clean committed provisioning secret journal");
+                    }
+                    return;
+                }
+
+                match secrets.restore(Some(&token)).await {
+                    Ok(true) => {
+                        let snapshot = overrides.snapshot().await;
+                        match snapshot
+                            .effective_config(&base_config)
+                            .and_then(|effective| RouterDesired::from_effective_config(&effective))
+                        {
+                            Ok(desired) => match router.repair(desired).await {
+                                Ok(()) => {
+                                    if let Err(error) = secrets.finish(Some(&token)).await {
+                                        tracing::error!(%error, %token, "provisioning timeout recovery converged but journal cleanup failed; recovery remains blocked");
+                                    }
+                                }
+                                Err(error) => {
+                                    tracing::error!(%error, %token, "provisioning secrets restored after timeout but router re-convergence failed; recovery journal retained");
+                                }
+                            },
+                            Err(error) => {
+                                tracing::error!(%error, %token, "could not derive committed router state after provisioning timeout; recovery journal retained")
+                            }
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::error!(%error, %token, "failed to restore provisioning secrets after timeout")
+                    }
+                }
+                break;
             }
         });
     }
