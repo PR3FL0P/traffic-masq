@@ -78,6 +78,14 @@ pub struct DesiredNetworkState {
     /// convergence pass had already seen its change when it ran.
     version: Arc<AtomicU64>,
     passes: watch::Sender<ConvergencePass>,
+    interface_passes: watch::Sender<BTreeMap<String, ConvergencePass>>,
+    intent_changes: watch::Sender<u64>,
+    interface_revisions: Arc<std::sync::Mutex<BTreeMap<String, u64>>>,
+    /// Runtime work and credential/snapshot publication share one interface lane.
+    pub(crate) credential_updates: Arc<tokio::sync::RwLock<()>>,
+    pub(crate) transaction_locks: crate::core::mutation::InterfaceMutationLocks,
+    pub(crate) runtime_locks: crate::core::mutation::InterfaceMutationLocks,
+    pub(crate) radio_locks: crate::core::mutation::InterfaceMutationLocks,
     failure_kinds:
         Arc<std::sync::Mutex<BTreeMap<(u64, String), crate::core::recovery_control::FailureKind>>>,
     /// Lifecycle of the convergence loop driving this state.
@@ -98,6 +106,13 @@ impl DesiredNetworkState {
             missing_interfaces: Default::default(),
             version: Arc::new(AtomicU64::new(0)),
             passes: watch::Sender::new(ConvergencePass::default()),
+            interface_passes: watch::Sender::new(BTreeMap::new()),
+            intent_changes: watch::Sender::new(0),
+            interface_revisions: Default::default(),
+            credential_updates: Default::default(),
+            transaction_locks: Default::default(),
+            runtime_locks: Default::default(),
+            radio_locks: Default::default(),
             failure_kinds: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
             converger: watch::Sender::new(ConvergerState::Detached),
         }
@@ -274,6 +289,89 @@ impl DesiredNetworkState {
         }
     }
 
+    /// Independent notification stream: workers must not consume the main
+    /// converger's retained wakeup while a previous pass is still running.
+    pub(crate) fn intent_changes(&self) -> watch::Receiver<u64> {
+        self.intent_changes.subscribe()
+    }
+
+    pub(crate) fn interface_revision(&self, interface: &str) -> u64 {
+        self.interface_revisions
+            .lock()
+            .expect("interface revisions")
+            .get(interface)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn report_interface_result(
+        &self,
+        interface: &str,
+        version: u64,
+        result: &Result<()>,
+    ) {
+        let mut pass = ConvergencePass {
+            version,
+            ..Default::default()
+        };
+        if let Err(error) = result {
+            pass.failures
+                .insert(interface.to_owned(), format!("{error:#}"));
+            pass.failure_kinds.insert(
+                interface.to_owned(),
+                crate::core::recovery_control::classify(error),
+            );
+        }
+        self.interface_passes.send_modify(|passes| {
+            if passes
+                .get(interface)
+                .is_none_or(|previous| previous.version <= version)
+            {
+                passes.insert(interface.to_owned(), pass);
+            }
+        });
+    }
+
+    /// A completed interface can answer without waiting for unrelated radios.
+    /// Full-pass reports remain supported for global errors and simple consumers.
+    pub(crate) async fn interface_pass_covering(
+        &self,
+        interface: &str,
+        version: u64,
+    ) -> ConvergencePass {
+        let mut interfaces = self.interface_passes.subscribe();
+        loop {
+            if let Some(pass) = interfaces
+                .borrow_and_update()
+                .get(interface)
+                .filter(|pass| pass.version >= version)
+                .cloned()
+            {
+                if matches!(
+                    self.converger_state(),
+                    ConvergerState::Running | ConvergerState::Detached
+                ) {
+                    return pass;
+                }
+            }
+            tokio::select! {
+                biased;
+                result = self.pass_covering(version) => return result,
+                _ = interfaces.changed() => {}
+            }
+        }
+    }
+
+    fn interface_changed(&self, interface: &str) {
+        let version = self.version.fetch_add(1, Ordering::SeqCst) + 1;
+        self.interface_revisions
+            .lock()
+            .expect("interface revisions")
+            .insert(interface.to_owned(), version);
+        self.intent_changes.send_replace(version);
+        self.tentative_changed.notify_one();
+    }
+
     /// Return the directory containing durable override and recovery records.
     pub(crate) fn state_dir(&self) -> &std::path::Path {
         self.overrides
@@ -299,12 +397,16 @@ impl DesiredNetworkState {
     /// Merge base configuration, committed overrides, and tentative interface changes.
     /// Tentative entries take precedence; invalid committed configuration is an error.
     pub async fn effective(&self) -> Result<AppConfig> {
+        // Read the tentative layer before committed state and retain it while
+        // reading overrides. Commit persists first, then withdraws: this order
+        // cannot combine old overrides with an already withdrawn proposal.
+        let tentative = self.tentative.lock().await;
         let mut effective = self
             .overrides
             .snapshot()
             .await
             .effective_config(&self.base)?;
-        for (interface, pending) in self.tentative.lock().await.iter() {
+        for (interface, pending) in tentative.iter() {
             effective
                 .network
                 .interfaces
@@ -324,6 +426,7 @@ impl DesiredNetworkState {
     /// when they asked for the change, and until the change is committed there
     /// is no override to read it from.
     pub async fn management_allowlist(&self) -> BTreeSet<String> {
+        let tentative = self.tentative.lock().await;
         let mut allowed: BTreeSet<String> = self
             .overrides
             .snapshot()
@@ -334,9 +437,7 @@ impl DesiredNetworkState {
             .map(|(interface, _)| interface.clone())
             .collect();
         allowed.extend(
-            self.tentative
-                .lock()
-                .await
+            tentative
                 .iter()
                 .filter(|(_, pending)| pending.allow_management_change)
                 .map(|(interface, _)| interface.clone()),
@@ -375,8 +476,7 @@ impl DesiredNetworkState {
         );
         // Bumped after the layer is in place, never before: a converger that
         // reads this version has to be able to see what it stands for.
-        self.version.fetch_add(1, Ordering::SeqCst);
-        self.tentative_changed.notify_one();
+        self.interface_changed(interface);
     }
 
     /// Report whether any proposal or restoration still awaits completion.
@@ -445,7 +545,7 @@ impl DesiredNetworkState {
             nat: false,
         });
         self.tentative.lock().await.insert(
-            interface,
+            interface.clone(),
             TentativeInterface {
                 token: token.to_owned(),
                 config,
@@ -453,7 +553,7 @@ impl DesiredNetworkState {
                 restore: Some(snapshot),
             },
         );
-        self.request_convergence();
+        self.interface_changed(&interface);
     }
 
     /// Drop everything a transaction proposed.
@@ -473,9 +573,8 @@ impl DesiredNetworkState {
         }
         drop(tentative);
 
-        if !released.is_empty() {
-            self.version.fetch_add(1, Ordering::SeqCst);
-            self.tentative_changed.notify_one();
+        for interface in &released {
+            self.interface_changed(interface);
         }
         released
     }
@@ -486,7 +585,8 @@ impl DesiredNetworkState {
     /// waiting on the old version would otherwise immediately replay the
     /// previous failed convergence result.
     pub fn request_convergence(&self) {
-        self.version.fetch_add(1, Ordering::SeqCst);
+        let version = self.version.fetch_add(1, Ordering::SeqCst) + 1;
+        self.intent_changes.send_replace(version);
         self.tentative_changed.notify_one();
     }
 

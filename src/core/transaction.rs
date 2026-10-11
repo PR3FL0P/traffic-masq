@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Result};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::config::{InterfaceConfig, InterfaceRole};
 
@@ -73,8 +73,9 @@ struct Inner {
     /// restored on shutdown. Nothing to do with transactions: by then the
     /// converger is gone, so this is the one path that still writes directly.
     baselines: Mutex<HashMap<String, InterfaceSnapshot>>,
-    operation_lock: Mutex<()>,
+    operation_lock: RwLock<()>,
     runtime_gate: std::sync::Mutex<Option<Arc<NetworkMutationGate>>>,
+    require_converger: std::sync::atomic::AtomicBool,
     token_counter: AtomicU64,
     timer_epochs: std::sync::Mutex<HashMap<String, u64>>,
     dhcp: Option<DhcpSupervisor>,
@@ -112,7 +113,7 @@ impl Drop for ApplyRecoveryGuard {
         let manager = self.manager.clone();
         let token = self.token.clone();
         tokio::spawn(async move {
-            let _operation = manager.inner.operation_lock.lock().await;
+            let _operation = manager.inner.operation_lock.read().await;
             let interface = manager
                 .inner
                 .pending
@@ -123,6 +124,10 @@ impl Drop for ApplyRecoveryGuard {
             let Some(interface) = interface else {
                 return;
             };
+            let _interface_operation = manager.desired().transaction_locks.lock(&interface).await;
+            if !manager.inner.pending.lock().await.contains_key(&token) {
+                return;
+            }
             let path = manager.journal_path(&interface);
             let prepared = async {
                 crate::core::recovery::check_rollback_scope(
@@ -155,6 +160,12 @@ impl NetworkTransactionManager {
     /// Attach the shared gate used to serialize transaction state with runtime mutations.
     pub(crate) fn set_runtime_gate(&self, gate: Arc<NetworkMutationGate>) {
         *self.inner.runtime_gate.lock().expect("runtime gate lock") = Some(gate);
+    }
+
+    pub(crate) fn require_converger(&self, required: bool) {
+        self.inner
+            .require_converger
+            .store(required, Ordering::SeqCst);
     }
 
     fn runtime_gate(&self) -> Option<Arc<NetworkMutationGate>> {
@@ -241,8 +252,9 @@ impl NetworkTransactionManager {
                 rollback_timeout,
                 pending: Mutex::new(HashMap::new()),
                 baselines: Mutex::new(baselines),
-                operation_lock: Mutex::new(()),
+                operation_lock: RwLock::new(()),
                 runtime_gate: std::sync::Mutex::new(None),
+                require_converger: std::sync::atomic::AtomicBool::new(false),
                 token_counter: AtomicU64::new(0),
                 timer_epochs: std::sync::Mutex::new(HashMap::new()),
                 dhcp,
@@ -351,13 +363,22 @@ impl NetworkTransactionManager {
             passphrase: passphrase_update,
             allow_management_change,
         } = change;
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.read().await;
+        let _interface_operation = self.desired().transaction_locks.lock(interface).await;
+        let desired = self.desired();
         let gate = self.runtime_gate();
         let execution = match &gate {
-            Some(gate) => Some(gate.execute().await),
+            Some(gate) => Some(gate.participate().await),
             None => None,
         };
 
+        let lane = desired.runtime_locks.lock(interface).await;
+        if self.inner.require_converger.load(Ordering::SeqCst) {
+            anyhow::ensure!(
+                matches!(desired.converger_state(), ConvergerState::Running),
+                "network converger unavailable: runtime worker is not running"
+            );
+        }
         if self
             .inner
             .pending
@@ -401,13 +422,21 @@ impl NetworkTransactionManager {
         let token = self.next_token();
         let desired = self.desired();
         let previous_config = desired.committed_interface(interface).await?;
-        let credentials = PreparedCredentialChange::prepare(
-            desired.state_dir(),
-            interface,
-            config,
-            previous_config.as_ref(),
-            passphrase_update,
-        )?;
+        let credential_update = desired.credential_updates.clone().read_owned().await;
+        let root = desired.state_dir().to_path_buf();
+        let name = interface.to_owned();
+        let target = config.clone();
+        let previous = previous_config.clone();
+        let credentials = tokio::task::spawn_blocking(move || {
+            PreparedCredentialChange::prepare(
+                &root,
+                &name,
+                &target,
+                previous.as_ref(),
+                passphrase_update,
+            )
+        })
+        .await??;
         let secret = credentials.snapshot.clone();
         self.write_journal_record(&token, snapshot.clone(), secret.clone())
             .await?;
@@ -443,15 +472,24 @@ impl NetworkTransactionManager {
                 Ok(guard) => (Some(guard), None),
                 Err(error) => (None, Some(error)),
             };
-        let staged = match stage_error {
-            Some(error) => Err(error),
-            None => credentials.apply(interface),
-        };
+        // Blocking storage retains its reservations even if shutdown cancels
+        // the awaiting task. Compensation cannot race a late credential write.
+        let name = interface.to_owned();
+        let (lane, credential_update, execution, staged) = tokio::task::spawn_blocking(move || {
+            let result = match stage_error {
+                Some(error) => Err(error),
+                None => credentials.apply(&name),
+            };
+            (lane, credential_update, execution, result)
+        })
+        .await?;
         if staged.is_ok() {
             desired
                 .propose(&token, interface, config.clone(), allow_management_change)
                 .await;
         }
+        drop(credential_update);
+        drop(lane);
         drop(execution);
         let mut applied = match staged {
             Ok(()) => self.await_convergence(&desired, interface).await,
@@ -472,16 +510,28 @@ impl NetworkTransactionManager {
             let path = self.journal_path(interface);
             let rollback = recovery_control::run(&path, false, async {
                 let execution = match &gate {
-                    Some(gate) => Some(gate.execute().await),
+                    Some(gate) => Some(gate.participate().await),
                     None => None,
                 };
-                let secret_restored = match &secret {
-                    Some(secret) => secret.restore(desired.state_dir(), interface),
-                    None => Ok(()),
-                };
+                let lane = desired.runtime_locks.lock(interface).await;
+                let credential_update = desired.credential_updates.clone().read_owned().await;
+                let secret = secret.clone();
+                let root = desired.state_dir().to_path_buf();
+                let name = interface.to_owned();
+                let (lane, credential_update, execution, secret_restored) =
+                    tokio::task::spawn_blocking(move || {
+                        let result = match secret {
+                            Some(secret) => secret.restore(&root, &name),
+                            None => Ok(()),
+                        };
+                        (lane, credential_update, execution, result)
+                    })
+                    .await?;
                 desired
                     .restore(&token, snapshot.clone(), previous_config.clone())
                     .await;
+                drop(credential_update);
+                drop(lane);
                 drop(execution);
                 let restoration = match secret_restored {
                     Ok(()) => self.await_convergence(&desired, interface).await,
@@ -591,7 +641,12 @@ impl NetworkTransactionManager {
         interface: &str,
     ) -> Result<()> {
         match desired.converger_state() {
-            ConvergerState::Detached => return Ok(()),
+            ConvergerState::Detached if !self.inner.require_converger.load(Ordering::SeqCst) => {
+                return Ok(())
+            }
+            ConvergerState::Detached => {
+                bail!("network converger unavailable: runtime worker is not running")
+            }
             ConvergerState::Running => {}
             ConvergerState::Failed(error) => {
                 bail!("network converger unavailable: {error}")
@@ -599,8 +654,8 @@ impl NetworkTransactionManager {
             ConvergerState::Stopped => bail!("network converger unavailable: stopped"),
         }
 
-        let version = desired.version();
-        let pass = match tokio::time::timeout(CONVERGENCE_DEADLINE, desired.pass_covering(version))
+        let version = desired.interface_revision(interface);
+        let pass = match tokio::time::timeout(CONVERGENCE_DEADLINE, desired.interface_pass_covering(interface, version))
             .await
         {
             Ok(pass) => pass,
@@ -608,6 +663,10 @@ impl NetworkTransactionManager {
                 format!("timed out waiting for interface {interface} to be converged to the requested configuration"))),
         };
 
+        anyhow::ensure!(
+            desired.interface_revision(interface) == version,
+            "interface {interface} intent was superseded while awaiting convergence"
+        );
         if let Some(error) = pass.error {
             return Err(recovery_control::failure(
                 pass.error_kind
@@ -645,16 +704,20 @@ impl NetworkTransactionManager {
         F: FnOnce(String, InterfaceConfig, bool) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.read().await;
+        let interface = self.interface_for_token(token).await?;
+        let _interface_operation = self.desired().transaction_locks.lock(&interface).await;
         // Publish the committed layer and remove the proposal as one runtime
         // operation. Otherwise a pass can read the old overrides followed by
         // the newly empty tentative layer and briefly undo a confirmed change.
         let gate = self.runtime_gate();
         let _execution = match &gate {
-            Some(gate) => Some(gate.execute().await),
+            Some(gate) => Some(gate.participate().await),
             None => None,
         };
-        crate::core::recovery::check_commit(self.desired().state_dir())?;
+        let desired = self.desired();
+        let _lane = desired.runtime_locks.lock(&interface).await;
+        crate::core::recovery::check_commit(desired.state_dir())?;
         let (interface, target, allow_management_change) = {
             let pending = self.inner.pending.lock().await;
             let pending = pending
@@ -710,6 +773,13 @@ impl NetworkTransactionManager {
             .expect("interface timer epoch lock")
             .remove(token);
         if let Err(error) = self.clear_journal(&interface).await {
+            // Durable commit tokens prove this journal is obsolete. Let the
+            // normal recovery sweep retry retirement after storage recovers.
+            crate::core::recovery::block_interface(
+                desired.state_dir(),
+                &interface,
+                format!("committed journal cleanup pending: {error:#}"),
+            );
             tracing::warn!(%error, "failed to remove committed interface journal");
         }
         tracing::info!(
@@ -727,8 +797,21 @@ impl NetworkTransactionManager {
     }
 
     async fn rollback_inner(&self, token: &str, manual: bool) -> Result<PendingNetworkChange> {
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.read().await;
+        let interface = self.interface_for_token(token).await?;
+        let _interface_operation = self.desired().transaction_locks.lock(&interface).await;
         self.rollback_locked(token, manual).await
+    }
+
+    async fn interface_for_token(&self, token: &str) -> Result<String> {
+        self.import_stopped_journals().await?;
+        self.inner
+            .pending
+            .lock()
+            .await
+            .get(token)
+            .map(|pending| pending.info.interface.clone())
+            .ok_or_else(|| anyhow::anyhow!("pending network change not found: {token}"))
     }
 
     async fn rollback_for_epoch(
@@ -736,7 +819,11 @@ impl NetworkTransactionManager {
         token: &str,
         epoch: u64,
     ) -> Result<Option<PendingNetworkChange>> {
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.read().await;
+        let Ok(interface) = self.interface_for_token(token).await else {
+            return Ok(None);
+        };
+        let _interface_operation = self.desired().transaction_locks.lock(&interface).await;
         // An explicit retry may replace this timer while it waits for the
         // operation lock. Only the current timer may start another attempt.
         if self
@@ -752,7 +839,7 @@ impl NetworkTransactionManager {
         self.rollback_locked(token, false).await.map(Some)
     }
 
-    // The caller holds operation_lock throughout restoration and bookkeeping.
+    // The caller holds this interface's operation lock throughout restoration and bookkeeping.
     async fn rollback_locked(&self, token: &str, manual: bool) -> Result<PendingNetworkChange> {
         self.import_stopped_journals().await?;
         crate::core::recovery::check_commit(self.desired().state_dir())?;
@@ -779,7 +866,9 @@ impl NetworkTransactionManager {
             .map(String::as_str)
             == Some(token)
         {
-            self.desired().withdraw(token).await;
+            let desired = self.desired();
+            let _lane = desired.runtime_locks.lock(&pending.info.interface).await;
+            desired.withdraw(token).await;
             self.clear_journal(&pending.info.interface).await?;
             self.inner.pending.lock().await.remove(token);
             self.inner
@@ -810,16 +899,26 @@ impl NetworkTransactionManager {
             let desired = self.desired();
             let gate = self.runtime_gate();
             let execution = match &gate {
-                Some(gate) => Some(gate.execute().await),
+                Some(gate) => Some(gate.participate().await),
                 None => None,
             };
+            let lane = desired.runtime_locks.lock(&pending.info.interface).await;
             // A different persistence operation may have fenced the network
             // while compensation was waiting for exclusive runtime access.
             crate::core::recovery::check_commit(desired.state_dir())?;
-            let secret_restored = match &pending.secret {
-                Some(secret) => secret.restore(desired.state_dir(), &pending.info.interface),
-                None => Ok(()),
-            };
+            let credential_update = desired.credential_updates.clone().read_owned().await;
+            let secret = pending.secret.clone();
+            let root = desired.state_dir().to_path_buf();
+            let name = pending.info.interface.clone();
+            let (lane, credential_update, execution, secret_restored) =
+                tokio::task::spawn_blocking(move || {
+                    let result = match secret {
+                        Some(secret) => secret.restore(&root, &name),
+                        None => Ok(()),
+                    };
+                    (lane, credential_update, execution, result)
+                })
+                .await?;
             // Publishing rollback intent must not depend on secret-store I/O. If
             // restoring the passphrase fails, keep the transaction rollback-only
             // and journaled, but still stop converging toward the failed candidate.
@@ -830,6 +929,8 @@ impl NetworkTransactionManager {
                     pending.previous_config.clone(),
                 )
                 .await;
+            drop(credential_update);
+            drop(lane);
             drop(execution);
             match secret_restored {
                 Ok(()) => {
@@ -872,7 +973,9 @@ impl NetworkTransactionManager {
             );
         }
 
-        self.desired().withdraw(token).await;
+        let desired = self.desired();
+        let _lane = desired.runtime_locks.lock(&pending.info.interface).await;
+        desired.withdraw(token).await;
         self.inner.pending.lock().await.remove(token);
         self.inner
             .timer_epochs
@@ -885,7 +988,7 @@ impl NetworkTransactionManager {
     /// Attempt every pending rollback and return all restoration failures together.
     pub async fn rollback_all_pending(&self) -> Result<()> {
         let tokens: Vec<_> = {
-            let _operation = self.inner.operation_lock.lock().await;
+            let _operation = self.inner.operation_lock.write().await;
             // Cancelled applies and stopped startup recovery may exist only
             // in the journal; shutdown must not depend on a prior status query.
             self.import_stopped_journals().await?;
@@ -910,7 +1013,7 @@ impl NetworkTransactionManager {
     pub async fn restore_baselines(&self) -> Result<()> {
         crate::core::recovery::check_commit(self.desired().state_dir())?;
         let rollback_error = self.rollback_all_pending().await.err();
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.write().await;
         crate::core::recovery::check_commit(self.desired().state_dir())?;
         let mut baselines: Vec<_> = self
             .inner

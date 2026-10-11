@@ -6,6 +6,7 @@ use tokio::sync::{oneshot, Mutex};
 use tokio::task::JoinSet;
 
 const MAX_OPERATIONS: usize = 128;
+const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[derive(Clone, Default)]
 pub(crate) struct Operations(Arc<Mutex<State>>);
@@ -44,14 +45,30 @@ impl Operations {
         receiver.await.context("control operation failed")
     }
 
-    /// Stop accepting operations and wait for every accepted task to finish.
-    /// Log task panics while continuing to drain the remaining operations.
+    /// Stop admission and drain accepted tasks up to the shutdown deadline.
+    /// Stalled tasks are cancelled; mutation guards retain their recovery proof.
     pub(crate) async fn close(&self) {
         let mut state = self.0.lock().await;
         state.closed = true;
-        while let Some(result) = state.tasks.join_next().await {
-            if let Err(error) = result {
-                tracing::error!(%error, "control operation failed during shutdown");
+        let drain = async {
+            while let Some(result) = state.tasks.join_next().await {
+                if let Err(error) = result {
+                    tracing::error!(%error, "control operation failed during shutdown");
+                }
+            }
+        };
+        if tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, drain)
+            .await
+            .is_err()
+        {
+            tracing::warn!(remaining = state.tasks.len(), "control shutdown deadline reached; cancelling stalled operations and retaining recovery journals");
+            state.tasks.abort_all();
+            while let Some(result) = state.tasks.join_next().await {
+                if let Err(error) = result {
+                    if !error.is_cancelled() {
+                        tracing::error!(%error, "control operation failed during shutdown");
+                    }
+                }
             }
         }
     }

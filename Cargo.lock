@@ -2923,6 +2923,7 @@ dependencies = [
  "base64",
  "clap",
  "fs2",
+ "futures-util",
  "http-body-util",
  "hyper",
  "hyper-util",

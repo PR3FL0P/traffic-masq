@@ -1209,3 +1209,29 @@ async fn restart_with_persisted_old_index_starts_fresh_without_reporting_old_lea
         .is_none());
     restarted.shutdown(ShutdownPolicy::PreserveInterfaces).await;
 }
+
+#[tokio::test]
+async fn unrelated_interface_cleanup_does_not_wait_for_a_client_operation() {
+    let state_dir = TempDir::new().unwrap();
+    let supervisor = supervisor_with(
+        &state_dir,
+        FakeNetwork::detached(),
+        Arc::new(FakeLauncher::default()),
+    )
+    .await;
+    let operation = supervisor.inner.interface_operations.lock("wan0").await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), supervisor.disable("other0"))
+            .await
+            .expect("unrelated client operations must be independent")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), supervisor.disable("wan0"))
+            .await
+            .is_err()
+    );
+    drop(operation);
+    supervisor.shutdown(ShutdownPolicy::RestoreInterfaces).await;
+}

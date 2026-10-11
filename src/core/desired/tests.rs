@@ -227,3 +227,64 @@ async fn a_proposal_outranks_the_committed_configuration() {
     state.withdraw("token-1").await;
     assert_eq!(lan0_address(&state).await, "172.16.0.1/24");
 }
+
+#[tokio::test]
+async fn interface_completion_is_independent_and_cannot_acknowledge_a_newer_intent() {
+    let (state, _dir) = desired_state().await;
+    state.attach_converger();
+    state
+        .propose("first", "lan0", interface("10.0.0.1/24"), false)
+        .await;
+    let first = state.interface_revision("lan0");
+    state.report_interface_result("lan0", first, &Ok(()));
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        state.interface_pass_covering("lan0", first),
+    )
+    .await
+    .expect("another interface's unfinished pass must not block this one");
+    state
+        .propose("second", "lan0", interface("10.1.0.1/24"), false)
+        .await;
+    let second = state.interface_revision("lan0");
+    state.report_interface_result("lan0", first, &Ok(()));
+    state.report_interface_result("other0", second, &Ok(()));
+    assert!(tokio::time::timeout(
+        Duration::from_millis(20),
+        state.interface_pass_covering("lan0", second)
+    )
+    .await
+    .is_err());
+    state.report_interface_result("lan0", second, &Err(anyhow::anyhow!("DHCP unavailable")));
+    let result = state.interface_pass_covering("lan0", second).await;
+    assert!(result.failures["lan0"].contains("DHCP unavailable"));
+    // A slow old worker cannot replace the newer interface receipt.
+    state.report_interface_result("lan0", first, &Ok(()));
+    assert_eq!(state.interface_pass_covering("lan0", second).await, result);
+}
+
+#[tokio::test]
+async fn effective_read_does_not_mix_old_overrides_with_a_withdrawn_proposal() {
+    let (state, _dir) = desired_state().await;
+    let candidate = interface("10.7.0.1/24");
+    state
+        .propose("commit", "lan0", candidate.clone(), false)
+        .await;
+    let mut tentative = state.tentative.lock().await;
+    let mut reader = tokio::spawn({
+        let state = state.clone();
+        async move { state.effective().await.unwrap() }
+    });
+    assert!(tokio::time::timeout(Duration::from_millis(20), &mut reader)
+        .await
+        .is_err());
+    state
+        .commit_interface("commit", "lan0".into(), candidate.clone(), false)
+        .await
+        .unwrap();
+    // This is withdraw's map mutation, held at the exact interleaving where a
+    // reader that had already cloned old overrides would lose the candidate.
+    tentative.remove("lan0");
+    drop(tentative);
+    assert_eq!(reader.await.unwrap().network.interfaces["lan0"], candidate);
+}

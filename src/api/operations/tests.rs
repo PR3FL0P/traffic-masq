@@ -68,3 +68,30 @@ async fn saturated_executor_rejects_more_work() {
     }
     operations.close().await;
 }
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_cancels_stalled_operations_after_the_drain_deadline() {
+    let operations = Operations::default();
+    let (started_tx, started_rx) = oneshot::channel();
+    let caller = tokio::spawn({
+        let operations = operations.clone();
+        async move {
+            operations
+                .run(async move {
+                    started_tx.send(()).unwrap();
+                    std::future::pending::<()>().await;
+                })
+                .await
+        }
+    });
+    started_rx.await.unwrap();
+    tokio::time::timeout(
+        SHUTDOWN_DRAIN_TIMEOUT + std::time::Duration::from_secs(1),
+        operations.close(),
+    )
+    .await
+    .unwrap();
+    assert!(caller.await.unwrap().is_err());
+    operations.close().await;
+    assert!(operations.run(async {}).await.is_err());
+}

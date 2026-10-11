@@ -56,3 +56,30 @@ async fn queued_mutation_does_not_block_transaction_convergence() {
     drop(transaction);
     writer.await.unwrap();
 }
+
+#[tokio::test]
+async fn compensation_joins_convergence_ahead_of_a_queued_global_writer() {
+    let gate = Arc::new(NetworkMutationGate::default());
+    let pass = gate.converge().await;
+    let writer = tokio::spawn({
+        let gate = gate.clone();
+        async move {
+            let _guard = gate.execute().await;
+        }
+    });
+    tokio::task::yield_now().await;
+    assert!(!writer.is_finished());
+    let rollback = tokio::time::timeout(std::time::Duration::from_millis(100), gate.participate())
+        .await
+        .expect("compensation must not wait behind a writer blocked by its own converger");
+    drop(pass);
+    assert!(
+        !writer.is_finished(),
+        "global writes still exclude compensation"
+    );
+    drop(rollback);
+    tokio::time::timeout(std::time::Duration::from_secs(1), writer)
+        .await
+        .unwrap()
+        .unwrap();
+}

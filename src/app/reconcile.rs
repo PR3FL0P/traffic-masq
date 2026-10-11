@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use futures_util::{stream::FuturesUnordered, FutureExt, StreamExt};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior};
@@ -316,7 +317,7 @@ pub(super) fn plan_dhcp_reconcile(
     }
 }
 
-async fn apply_dhcp_reconcile_action<D: DhcpRuntimeReconciler>(
+async fn apply_dhcp_reconcile_action<D: DhcpRuntimeReconciler + ?Sized>(
     dhcp: &D,
     interface: &str,
     action: DhcpReconcileAction,
@@ -331,7 +332,7 @@ async fn apply_dhcp_reconcile_action<D: DhcpRuntimeReconciler>(
     Ok(())
 }
 
-async fn reconcile_dhcp_client<L: DhcpClientRuntimeReconciler>(
+async fn reconcile_dhcp_client<L: DhcpClientRuntimeReconciler + ?Sized>(
     client: &L,
     interface: &str,
     config: &InterfaceConfig,
@@ -373,18 +374,21 @@ pub(super) async fn reconcile_network_runtime_once<
     crate::wifi::policy::WifiRadioPolicy::validate(&effective.network, |name| {
         network.wireless_phy(name)
     })?;
-    let management_allowlist = desired.management_allowlist().await;
     let mut failures: BTreeMap<String, String> = BTreeMap::new();
     let interface_manager = InterfaceManager::new(network.clone(), journal.clone());
     let wifi_runtime_dirs = crate::wifi::WifiRuntimeDirs::new(
         &effective.wifi.runtime_dir,
         &effective.wifi_client.runtime_dir,
     );
+    // A recovered legacy secret must be migrated before a transaction can
+    // replace it. This reservation ends before any service readiness wait.
+    let migration = desired.credential_updates.write().await;
     crate::core::transaction::retry_interface_recovery(
         desired.state_dir(),
         &interface_manager,
         &desired.committed_overrides().await,
         &wifi_runtime_dirs,
+        desired,
     )
     .await?;
     // An old journal may just have restored a legacy secret. Use committed
@@ -394,6 +398,7 @@ pub(super) async fn reconcile_network_runtime_once<
     if crate::core::recovery_control::stopped_journals(desired.state_dir()).is_empty() {
         crate::wifi::store::migrate_legacy_passphrases(&desired.committed_config().await?).await?;
     }
+    drop(migration);
     let observed_interfaces: HashMap<_, _> = network
         .list_interfaces()
         .await?
@@ -405,8 +410,141 @@ pub(super) async fn reconcile_network_runtime_once<
         effective.network.interfaces.keys().cloned(),
         &observed_interfaces.keys().cloned().collect(),
     );
-    let restorations = desired.restorations().await;
-    for (name, config) in &effective.network.interfaces {
+    let mut observed_interfaces = Arc::new(observed_interfaces);
+    let mut observation_version = pass_version;
+    let mut changes = desired.intent_changes();
+    let mut running = std::collections::HashSet::new();
+    let mut completed = HashMap::new();
+    let mut jobs = FuturesUnordered::new();
+    let mut global_error = None;
+    let run = |name: String, version: u64, observed: Arc<HashMap<String, NetworkInterface>>| {
+        let network = network.clone();
+        async move {
+            let (version, result) = reconcile_interface_runtime_once(
+                desired,
+                journal,
+                network,
+                dhcp,
+                wifi.map(|runtime| runtime as &dyn WifiRuntimeReconciler),
+                wifi_client.map(|runtime| runtime as &dyn WifiRuntimeReconciler),
+                dhcp_client.map(|runtime| runtime as &dyn DhcpClientRuntimeReconciler),
+                &name,
+                version,
+                observed,
+            )
+            .await;
+            (name, version, result)
+        }
+        .boxed()
+    };
+    loop {
+        let version = desired.version();
+        // A rollback published while another radio starts must get its own
+        // worker immediately. Never cancel an in-flight process/kernel write.
+        if global_error.is_none() && observation_version != version {
+            match network.list_interfaces().await {
+                Ok(interfaces) => {
+                    observed_interfaces = Arc::new(
+                        interfaces
+                            .into_iter()
+                            .map(|interface| (interface.name.clone(), interface))
+                            .collect(),
+                    );
+                    observation_version = version;
+                }
+                Err(error) => global_error = Some(error),
+            }
+        }
+        if global_error.is_none() {
+            match desired.effective().await {
+                Ok(effective) => {
+                    for name in effective.network.interfaces.keys() {
+                        if !running.contains(name) && completed.get(name) != Some(&version) {
+                            running.insert(name.clone());
+                            jobs.push(run(name.clone(), version, observed_interfaces.clone()));
+                        }
+                    }
+                }
+                // Keep polling all owned runtime writes before returning an
+                // error; dropping their futures can strand a process launch.
+                Err(error) => global_error = Some(error),
+            }
+        }
+        if jobs.is_empty() {
+            break;
+        }
+        tokio::select! {
+            Some((name, version, result)) = jobs.next() => {
+                running.remove(&name);
+                if let Some(result) = result {
+                    completed.insert(name.clone(), version);
+                    match result {
+                        Ok(()) => { failures.remove(&name); }
+                        Err(error) => {
+                            desired.record_failure_kind(pass_version, &name, &error);
+                            failures.insert(name, format!("{error:#}"));
+                        }
+                    }
+                }
+                // Superseded work has no result: schedule its current intent.
+            }
+            _ = changes.changed() => {}
+        }
+    }
+    match global_error {
+        Some(error) => Err(error),
+        None => Ok(failures),
+    }
+}
+
+/// One lane owns all consumers of an interface. Radios are also serialized so
+/// AP/STA transitions cannot overlap on a shared PHY. Read intent only after
+/// acquiring those reservations; a queued job must never replay an old snapshot.
+#[allow(clippy::too_many_arguments)]
+async fn reconcile_interface_runtime_once(
+    desired: &DesiredNetworkState,
+    journal: &AddressOwnershipJournal,
+    network: Arc<dyn NetworkProvider>,
+    dhcp: &dyn DhcpRuntimeReconciler,
+    wifi: Option<&dyn WifiRuntimeReconciler>,
+    wifi_client: Option<&dyn WifiRuntimeReconciler>,
+    dhcp_client: Option<&dyn DhcpClientRuntimeReconciler>,
+    name: &str,
+    version: u64,
+    observed_interfaces: Arc<HashMap<String, NetworkInterface>>,
+) -> (u64, Option<Result<()>>) {
+    let phy = network.wireless_phy(name);
+    let _radio = match phy {
+        Some(phy) => Some(desired.radio_locks.lock(&phy).await),
+        None => None,
+    };
+    let _lane = desired.runtime_locks.lock(name).await;
+    if desired.version() != version {
+        // A queued radio/lane changed while we waited. Reschedule it with the
+        // current intent and a fresh shared device observation.
+        return (version, None);
+    }
+    let revision = desired.interface_revision(name);
+    let ensure_current = || -> Result<()> {
+        crate::core::recovery::check_scope(desired.state_dir(), Some(name))?;
+        anyhow::ensure!(
+            desired.interface_revision(name) == revision,
+            "interface intent superseded"
+        );
+        Ok(())
+    };
+    let outcome = async {
+        crate::core::recovery::check_commit(desired.state_dir())?;
+        let effective = desired.effective().await?;
+        crate::wifi::policy::WifiRadioPolicy::validate(&effective.network, |name| {
+            network.wireless_phy(name)
+        })?;
+        let Some(config) = effective.network.interfaces.get(name) else {
+            return Ok(());
+        };
+        let management_allowlist = desired.management_allowlist().await;
+        let restorations = desired.restorations().await;
+        let interface_manager = InterfaceManager::new(network.clone(), journal.clone());
         let result: Result<()> = async {
             crate::core::recovery::check_scope(&effective.runtime.state_dir, Some(name))?;
             // Applying a candidate requires connectivity before confirmation.
@@ -476,6 +614,7 @@ pub(super) async fn reconcile_network_runtime_once<
                 ));
             };
 
+            ensure_current()?;
             // Release AP ownership before starting a station on the same radio.
             // Starting an AP still waits until after station teardown and IPv4.
             if config.wifi.is_none() {
@@ -483,6 +622,7 @@ pub(super) async fn reconcile_network_runtime_once<
                     access_point.reconcile_interface(name, config).await?;
                 }
             }
+            ensure_current()?;
             if let Some(client) = wifi_client {
                 client.reconcile_interface(name, config).await?;
             } else {
@@ -491,6 +631,7 @@ pub(super) async fn reconcile_network_runtime_once<
                     "Wi-Fi client runtime is unavailable"
                 );
             }
+            ensure_current()?;
             let mut link_ready = true;
             if config.wifi_client.is_some() {
                 let deadline = time::Instant::now() + Duration::from_secs(5);
@@ -509,6 +650,7 @@ pub(super) async fn reconcile_network_runtime_once<
                     time::sleep(Duration::from_millis(20)).await;
                 }
             }
+            ensure_current()?;
             if let Some(client) = dhcp_client {
                 reconcile_dhcp_client(client, name, config, link_ready).await?;
             } else {
@@ -518,6 +660,7 @@ pub(super) async fn reconcile_network_runtime_once<
                 );
             }
 
+            ensure_current()?;
             if let Some(snapshot) = restorations.get(name) {
                 interface_manager
                     .rollback_transaction_snapshot(snapshot)
@@ -553,6 +696,7 @@ pub(super) async fn reconcile_network_runtime_once<
                         .await?;
                 }
             }
+            ensure_current()?;
             let (ipv4_ready, binding_stale) = if desired_dhcp.is_some() {
                 interface_manager
                     .verify_configured_ipv4(name, config)
@@ -565,6 +709,7 @@ pub(super) async fn reconcile_network_runtime_once<
                 let access_point = wifi.context("Wi-Fi access point runtime is unavailable")?;
                 access_point.reconcile_interface(name, config).await?;
             }
+            ensure_current()?;
             apply_dhcp_reconcile_action(
                 dhcp,
                 name,
@@ -579,20 +724,18 @@ pub(super) async fn reconcile_network_runtime_once<
             Ok(())
         }
         .await;
-        if let Err(error) = result {
-            if crate::core::recovery_control::classify(&error)
-                == crate::core::recovery_control::FailureKind::DeviceMissing
-            {
-                tracing::debug!(interface = %name, error = %format!("{error:#}"), "interface convergence waits for device");
-            } else {
-                tracing::warn!(interface = %name, error = %format!("{error:#}"), "interface convergence incomplete");
-            }
-            desired.record_failure_kind(pass_version, name, &error);
-            failures.insert(name.clone(), format!("{error:#}"));
-        }
-    }
 
-    Ok(failures)
+        result
+    }
+    .await;
+    if desired.interface_revision(name) != revision {
+        return (version, None);
+    }
+    if let Err(error) = &outcome {
+        tracing::debug!(interface = %name, error = %format!("{error:#}"), "interface convergence incomplete");
+    }
+    desired.report_interface_result(name, version, &outcome);
+    (version, Some(outcome))
 }
 
 /// Converge the machine towards the desired state, driven by events.
@@ -685,7 +828,7 @@ pub(super) fn spawn_runtime_network_reconcile_with_recovery_events(
                 // router mutations take the exclusive/write side. This keeps
                 // convergence alive for tentative interface state while
                 // preventing it from racing a direct mutation.
-                let _network_mutation = network_mutations.read().await;
+                let _network_mutation = network_mutations.converge().await;
                 let router_busy = match &router {
                     Some(router) => {
                         router.status().await

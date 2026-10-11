@@ -282,3 +282,56 @@ async fn commit_started_before_deadline_may_finish_persistence_after_it() {
     );
     assert!(manager.pending().await.is_empty());
 }
+
+#[tokio::test]
+async fn cancelled_credential_write_retains_lane_until_compensation_can_restore_secret() {
+    let directory = tempdir().unwrap();
+    let desired = desired_state(directory.path()).await;
+    let manager = manager_for(&desired, fake_network());
+    let store = PassphraseStore::for_role(directory.path(), WifiCredentialRole::Ap);
+    store
+        .set("test0", &WifiPassphrase::new("original-password").unwrap())
+        .unwrap();
+    let path = directory.path().join("wifi/psk-ap/test0");
+    let (entered, release) = crate::atomic_file::pause_next_replacement(&path);
+    let worker = manager.clone();
+    let applying = tokio::spawn(async move {
+        worker
+            .apply(
+                "test0",
+                InterfaceChange {
+                    config: &credential_config(WifiCredentialRole::Ap),
+                    previous: Some(&interface_config(COMMITTED)),
+                    current_role: Some(InterfaceRole::Output),
+                    passphrase: WifiPassphraseUpdate::Set(
+                        WifiPassphrase::new("replacement-password").unwrap(),
+                    ),
+                    allow_management_change: false,
+                },
+            )
+            .await
+    });
+    tokio::task::spawn_blocking(move || entered.recv_timeout(WATCHDOG).unwrap())
+        .await
+        .unwrap();
+    applying.abort();
+    assert!(applying.await.unwrap_err().is_cancelled());
+    assert!(
+        desired.runtime_locks.try_lock("test0").await.is_none(),
+        "cancelled await must not release the lane while storage is writing"
+    );
+    release.send(()).unwrap();
+    tokio::time::timeout(WATCHDOG, async {
+        while !manager.pending().await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        store.get("test0").unwrap().unwrap().expose(),
+        "original-password"
+    );
+    assert!(!desired.has_pending().await);
+    assert!(!manager.journal_path("test0").exists());
+}

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::config::{AppConfig, InterfaceConfig, ShutdownPolicy};
 use crate::dhcp::supervisor::resolve_interface_index;
@@ -142,7 +142,8 @@ struct Inner {
     process: Arc<dyn SupervisedProcess>,
     passphrase_store: PassphraseStore,
     tasks: Mutex<HashMap<String, ClientTask>>,
-    operation_lock: Mutex<()>,
+    operation_lock: RwLock<()>,
+    interface_operations: crate::core::mutation::InterfaceMutationLocks,
 }
 
 #[derive(Clone)]
@@ -317,7 +318,8 @@ impl WifiClientSupervisor {
                 ctrl_timeout: DEFAULT_CTRL_TIMEOUT,
                 process,
                 tasks: Mutex::new(HashMap::new()),
-                operation_lock: Mutex::new(()),
+                operation_lock: RwLock::new(()),
+                interface_operations: Default::default(),
             }),
         }
     }
@@ -503,8 +505,9 @@ impl WifiClientSupervisor {
             self.inner.records_dir.parent().expect("state directory"),
             Some(&spec.interface),
         )?;
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.read().await;
         let interface = spec.interface.clone();
+        let _interface_operation = self.inner.interface_operations.lock(&interface).await;
         let ctrl_path = self.ctrl_path(&interface);
         let rendered = self.render_for(&spec).await?;
 
@@ -1083,7 +1086,8 @@ impl WifiClientSupervisor {
         &self,
         interface: &str,
     ) -> Result<(), ClientSupervisorError> {
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.read().await;
+        let _interface_operation = self.inner.interface_operations.lock(interface).await;
         let store = self.record_store(interface);
         if store.transition_pending().await? {
             return Err(ClientSupervisorError::Configuration(anyhow::anyhow!(
@@ -1110,7 +1114,8 @@ impl WifiClientSupervisor {
         &self,
         interface: &str,
     ) -> Result<Option<WifiClientSpec>, ClientSupervisorError> {
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.read().await;
+        let _interface_operation = self.inner.interface_operations.lock(interface).await;
         let Some(task) = self.inner.tasks.lock().await.get(interface).cloned() else {
             return Ok(None);
         };
@@ -1155,7 +1160,8 @@ impl WifiClientSupervisor {
 
     /// Return configured service state and observed health; `None` means no supervised task exists.
     pub async fn status(&self, interface: &str) -> Option<WifiClientStatus> {
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.read().await;
+        let _interface_operation = self.inner.interface_operations.lock(interface).await;
         let task = self.inner.tasks.lock().await.get(interface).cloned()?;
 
         let (wpa_state, bssid, freq) = match self.owned_ctrl_session(&task).await {
@@ -1193,7 +1199,8 @@ impl WifiClientSupervisor {
 
     /// Ask a configured supplicant to reconnect to its selected network.
     pub async fn reconnect(&self, interface: &str) -> Result<(), ClientSupervisorError> {
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.read().await;
+        let _interface_operation = self.inner.interface_operations.lock(interface).await;
         let task = self
             .inner
             .tasks
@@ -1265,7 +1272,7 @@ impl WifiClientSupervisor {
         &self,
         desired: Option<&[WifiClientSpec]>,
     ) -> Result<bool, ClientSupervisorError> {
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.read().await;
         let interfaces: Vec<String> = self
             .inner
             .tasks
@@ -1278,6 +1285,19 @@ impl WifiClientSupervisor {
 
         let mut restarted_any = false;
         for interface in interfaces {
+            let _interface_operation = self.inner.interface_operations.lock(&interface).await;
+            if let Some(specs) = desired {
+                if self
+                    .inner
+                    .tasks
+                    .lock()
+                    .await
+                    .get(&interface)
+                    .is_none_or(|task| !specs.contains(&task.spec))
+                {
+                    continue;
+                }
+            }
             if self.ensure_interface_alive(&interface).await? {
                 restarted_any = true;
             }
@@ -1450,7 +1470,7 @@ impl WifiClientSupervisor {
 
     /// Apply the shutdown policy to supervised processes and their ownership records.
     pub async fn shutdown(&self, policy: ShutdownPolicy) {
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.write().await;
         self.inner.association_monitors.lock().await.clear();
         let tasks = std::mem::take(&mut *self.inner.tasks.lock().await);
 

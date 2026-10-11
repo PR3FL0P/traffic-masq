@@ -253,7 +253,8 @@ async fn test_supervisor(
         process,
         radio: Arc::new(crate::wifi::radio::AllowAllRadioValidator),
         tasks: Mutex::new(HashMap::new()),
-        operation_lock: Mutex::new(()),
+        operation_lock: RwLock::new(()),
+        interface_operations: Default::default(),
     };
     HostapdSupervisor {
         inner: Arc::new(inner),
@@ -1060,7 +1061,13 @@ async fn ctrl_operations_wait_for_the_supervisor_mutation_lock() {
         .await
         .expect("configure");
 
-    let guard = supervisor.inner.operation_lock.lock().await;
+    let guard = supervisor.inner.interface_operations.lock("wlan0").await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), supervisor.status("wlan1"))
+            .await
+            .expect("another interface's launch must not block status")
+            .is_none()
+    );
     let concurrent = supervisor.clone();
     let mut reload = tokio::spawn(async move { concurrent.reload("wlan0").await });
     assert!(

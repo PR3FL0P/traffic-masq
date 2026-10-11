@@ -11,6 +11,8 @@ edition = "2021"
 license-file = "LICENSE"
 rust-version = "1.95"
 description = "Linux router, Wi-Fi and VPN management with confirmed network changes"
+# The TUI binary belongs to crates/tui; never auto-discover stale src/bin copies.
+autobins = false
 repository = "https://github.com/bpseditor/traffic-masq"
 
 [lib]
@@ -29,6 +31,7 @@ axum = "0.8"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
+futures-util = "0.3"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "server", "service", "tokio"] }

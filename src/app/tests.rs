@@ -2436,3 +2436,5 @@ async fn rollback_completes_without_wifi_association_or_dhcp_lease() {
 async fn rollback_completes_after_device_removal_and_releases_the_interface() {
     rollback_without_external_connectivity(false).await;
 }
+
+mod transaction_liveness;

@@ -528,7 +528,7 @@ async fn confirmation_waits_for_an_active_convergence_pass() {
         )
         .await
         .unwrap();
-    let pass = gate.read().await;
+    let pass = desired.runtime_locks.lock("test0").await;
     let (persisted_tx, mut persisted_rx) = tokio::sync::oneshot::channel();
     let commit = tokio::spawn(async move {
         manager
@@ -676,7 +676,7 @@ async fn replaced_timer_cannot_rollback_after_waiting_for_operation_lock() {
         .await
         .unwrap();
     let epoch = manager.inner.timer_epochs.lock().unwrap()[&pending.token];
-    let operation = manager.inner.operation_lock.lock().await;
+    let operation = desired.transaction_locks.lock("test0").await;
     let rollback = manager.rollback_for_epoch(&pending.token, epoch);
     tokio::pin!(rollback);
     // Poll the timer until it is queued behind a manual operation.

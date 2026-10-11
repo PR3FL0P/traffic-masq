@@ -59,7 +59,8 @@ impl WifiClientSupervisor {
         interface: &str,
     ) -> Result<Vec<WpaSupplicantScanResult>, ClientSupervisorError> {
         crate::config::validate_interface_name(interface)?;
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.read().await;
+        let _interface_operation = self.inner.interface_operations.lock(interface).await;
         let ctrl_path = self.ctrl_path(interface);
 
         let task = self.inner.tasks.lock().await.get(interface).cloned();

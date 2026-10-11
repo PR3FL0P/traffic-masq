@@ -76,6 +76,33 @@ pub fn fail_replacement_and_compensation(path: &Path) {
     write_faults().lock().unwrap().insert(path.to_owned(), 2);
 }
 
+#[cfg(any(test, feature = "fault-injection"))]
+type WritePause = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+
+#[cfg(any(test, feature = "fault-injection"))]
+fn write_pauses() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, WritePause>> {
+    static PAUSES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, WritePause>>,
+    > = std::sync::OnceLock::new();
+    PAUSES.get_or_init(Default::default)
+}
+
+/// Pause one replacement at its storage boundary. Dropping the release sender
+/// releases the worker; a watchdog also prevents a broken test hanging forever.
+#[cfg(any(test, feature = "fault-injection"))]
+#[doc(hidden)]
+pub fn pause_next_replacement(
+    path: &Path,
+) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    write_pauses()
+        .lock()
+        .unwrap()
+        .insert(path.to_owned(), (entered_tx, release_rx));
+    (entered_rx, release_tx)
+}
+
 /// Why a directory could not be used as a private store.
 ///
 /// Kept separate from [`io::Error`] because every caller distinguishes these
@@ -237,6 +264,14 @@ fn replace_tracking_publication(
     mode: u32,
     published: &mut bool,
 ) -> io::Result<()> {
+    #[cfg(any(test, feature = "fault-injection"))]
+    {
+        let pause = write_pauses().lock().unwrap().remove(path);
+        if let Some((entered, release)) = pause {
+            let _ = entered.send(());
+            let _ = release.recv_timeout(std::time::Duration::from_secs(5));
+        }
+    }
     #[cfg(any(test, feature = "fault-injection"))]
     let fault = {
         let mut faults = write_faults().lock().unwrap();

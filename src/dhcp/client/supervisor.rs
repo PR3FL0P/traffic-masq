@@ -7,7 +7,7 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{watch, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -243,7 +243,8 @@ struct Inner {
     applier: Arc<DhcpClientOwnershipApplier>,
     launcher: Arc<dyn DhcpClientLauncher>,
     tasks: Mutex<HashMap<String, ClientTask>>,
-    operation_lock: Mutex<()>,
+    operation_lock: RwLock<()>,
+    interface_operations: crate::core::mutation::InterfaceMutationLocks,
 }
 
 impl Inner {
@@ -281,7 +282,8 @@ impl DhcpClientSupervisor {
                 network,
                 launcher,
                 tasks: Mutex::new(HashMap::new()),
-                operation_lock: Mutex::new(()),
+                operation_lock: RwLock::new(()),
+                interface_operations: Default::default(),
             }),
         })
     }
@@ -383,8 +385,9 @@ impl DhcpClientSupervisor {
             tracing::error!(interface = %spec.interface, %error, "DHCP client blocked by interface recovery");
             return;
         }
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.read().await;
         let interface = spec.interface.clone();
+        let _interface_operation = self.inner.interface_operations.lock(&interface).await;
         let (unchanged, readiness_changed) = {
             let mut tasks = self.inner.tasks.lock().await;
             match tasks.get_mut(&interface) {
@@ -442,7 +445,8 @@ impl DhcpClientSupervisor {
 
     /// Stop a client and release its owned state, returning its previous specification.
     pub async fn disable(&self, interface: &str) -> Result<Option<DhcpClientSpec>> {
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.read().await;
+        let _interface_operation = self.inner.interface_operations.lock(interface).await;
         if !self.inner.tasks.lock().await.contains_key(interface) {
             if let Err(error) = self.inner.applier.cleanup(interface).await {
                 tracing::warn!(%interface, %error, "failed to release owned DHCP client state while disabling it; cleanup will be retried");
@@ -569,7 +573,8 @@ impl DhcpClientSupervisor {
 
     /// Restart acquisition for the configured interface to request a fresh lease.
     pub async fn renew_now(&self, interface: &str) -> Result<DhcpClientStatus> {
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.read().await;
+        let _interface_operation = self.inner.interface_operations.lock(interface).await;
         let link_ready = self
             .inner
             .tasks
@@ -589,7 +594,8 @@ impl DhcpClientSupervisor {
 
     /// Release the current lease and start a new DHCP acquisition.
     pub async fn release_and_reacquire(&self, interface: &str) -> Result<DhcpClientStatus> {
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.read().await;
+        let _interface_operation = self.inner.interface_operations.lock(interface).await;
         let (link_ready, transport, shared) = {
             let tasks = self.inner.tasks.lock().await;
             let task = tasks
@@ -709,7 +715,7 @@ impl DhcpClientSupervisor {
     }
 
     async fn ensure_alive_matching(&self, desired: Option<&[DhcpClientSpec]>) -> Result<bool> {
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.read().await;
         let interfaces: Vec<String> = self
             .inner
             .tasks
@@ -721,6 +727,19 @@ impl DhcpClientSupervisor {
             .collect();
         let mut changed = false;
         for interface in interfaces {
+            let _interface_operation = self.inner.interface_operations.lock(&interface).await;
+            if let Some(specs) = desired {
+                if self
+                    .inner
+                    .tasks
+                    .lock()
+                    .await
+                    .get(&interface)
+                    .is_none_or(|task| !specs.contains(&task.spec))
+                {
+                    continue;
+                }
+            }
             if self.ensure_interface_alive(&interface).await {
                 changed = true;
             }
@@ -790,7 +809,7 @@ impl DhcpClientSupervisor {
 
     /// Stop client runtimes and apply the requested ownership cleanup policy.
     pub async fn shutdown(&self, policy: ShutdownPolicy) {
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.write().await;
         let interfaces: Vec<String> = self.inner.tasks.lock().await.keys().cloned().collect();
 
         for interface in interfaces {

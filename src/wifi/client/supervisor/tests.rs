@@ -1548,7 +1548,13 @@ async fn status_waits_for_the_operation_lock() {
         .configure(spec("wlan0", "upstream"))
         .await
         .unwrap();
-    let operation = supervisor.inner.operation_lock.lock().await;
+    let operation = supervisor.inner.interface_operations.lock("wlan0").await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), supervisor.status("wlan1"))
+            .await
+            .expect("another interface's launch must not block status")
+            .is_none()
+    );
     assert!(
         tokio::time::timeout(Duration::from_millis(20), supervisor.status("wlan0"))
             .await

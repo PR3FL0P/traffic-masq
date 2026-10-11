@@ -173,6 +173,7 @@ impl ControlService {
             desired_state,
         );
         transactions.set_runtime_gate(network_mutations.clone());
+        transactions.require_converger(true);
         if let Some(router) = &subsystems.router {
             router.set_timeout_mutation_gate(network_mutations.clone());
         }
@@ -235,7 +236,7 @@ impl ControlService {
         journal: AddressOwnershipJournal,
     ) -> Self {
         let desired_state = DesiredNetworkState::new(config.clone(), overrides.clone());
-        Self::from_runtime(
+        let service = Self::from_runtime(
             ControlRuntime {
                 active_config: config.clone(),
                 base_config: config,
@@ -248,7 +249,9 @@ impl ControlService {
                 mutation_gate: Arc::new(NetworkMutationGate::default()),
             },
             ControlSubsystems::default(),
-        )
+        );
+        service.transactions.require_converger(false);
+        service
     }
 
     /// Set the merge base for a standalone service built by tests or tooling.

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::config::{AppConfig, InterfaceConfig, ShutdownPolicy};
 use crate::dhcp::supervisor::resolve_interface_index;
@@ -125,7 +125,8 @@ struct Inner {
     radio: Arc<dyn RadioValidator>,
     passphrase_store: PassphraseStore,
     tasks: Mutex<HashMap<String, ApTask>>,
-    operation_lock: Mutex<()>,
+    operation_lock: RwLock<()>,
+    interface_operations: crate::core::mutation::InterfaceMutationLocks,
 }
 
 impl HostapdSupervisor {
@@ -156,7 +157,8 @@ impl HostapdSupervisor {
                     IwCapabilitiesProvider::new(config.wifi.iw_binary.clone()),
                 ))),
                 tasks: Mutex::new(HashMap::new()),
-                operation_lock: Mutex::new(()),
+                operation_lock: RwLock::new(()),
+                interface_operations: Default::default(),
             }),
         }
     }
@@ -300,7 +302,8 @@ impl HostapdSupervisor {
                 radio,
                 passphrase_store: supervisor.inner.passphrase_store.clone(),
                 tasks: Mutex::new(HashMap::new()),
-                operation_lock: Mutex::new(()),
+                operation_lock: RwLock::new(()),
+                interface_operations: Default::default(),
             }),
         };
         supervisor.reconcile_startup(config).await?;
@@ -413,8 +416,9 @@ impl HostapdSupervisor {
             self.inner.records_dir.parent().expect("state directory"),
             Some(&spec.interface),
         )?;
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.read().await;
         let interface = spec.interface.clone();
+        let _interface_operation = self.inner.interface_operations.lock(&interface).await;
         self.validate_radio(&spec).await?;
         let ctrl_path = self.ctrl_path(&interface);
         let rendered = self.render_for(&spec).await?;
@@ -864,7 +868,8 @@ impl HostapdSupervisor {
 
     /// Validate durable ownership before an offline cleanup stops any service.
     pub async fn check_cleanup_ownership(&self, interface: &str) -> Result<(), SupervisorError> {
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.read().await;
+        let _interface_operation = self.inner.interface_operations.lock(interface).await;
         let store = self.record_store(interface);
         if store.transition_pending().await? {
             return Err(SupervisorError::Configuration(anyhow::anyhow!(
@@ -888,7 +893,8 @@ impl HostapdSupervisor {
     /// Stop the configured process and remove its runtime configuration and ownership record.
     /// Return the previous specification, or `None` when the interface was not configured.
     pub async fn disable(&self, interface: &str) -> Result<Option<WifiApSpec>, SupervisorError> {
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.read().await;
+        let _interface_operation = self.inner.interface_operations.lock(interface).await;
         let Some(task) = self.inner.tasks.lock().await.get(interface).cloned() else {
             return Ok(None);
         };
@@ -924,7 +930,8 @@ impl HostapdSupervisor {
 
     /// Return configured service state and observed health; `None` means no supervised task exists.
     pub async fn status(&self, interface: &str) -> Option<WifiApStatus> {
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.read().await;
+        let _interface_operation = self.inner.interface_operations.lock(interface).await;
         let task = self.inner.tasks.lock().await.get(interface).cloned()?;
 
         // Never query a pathname merely because a task exists. A stale task or
@@ -1015,7 +1022,8 @@ impl HostapdSupervisor {
 
     /// Query connected stations for a configured and ownership-verified access point.
     pub async fn stations(&self, interface: &str) -> Result<Vec<Station>, SupervisorError> {
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.read().await;
+        let _interface_operation = self.inner.interface_operations.lock(interface).await;
         let task = self
             .inner
             .tasks
@@ -1036,7 +1044,8 @@ impl HostapdSupervisor {
         interface: &str,
         mac: MacAddr,
     ) -> Result<(), SupervisorError> {
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.read().await;
+        let _interface_operation = self.inner.interface_operations.lock(interface).await;
         let task = self
             .inner
             .tasks
@@ -1054,7 +1063,8 @@ impl HostapdSupervisor {
 
     /// Reconfigure an ownership-verified access point from its current specification.
     pub async fn reload(&self, interface: &str) -> Result<WifiApSpec, SupervisorError> {
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.read().await;
+        let _interface_operation = self.inner.interface_operations.lock(interface).await;
         let task = self
             .inner
             .tasks
@@ -1123,7 +1133,7 @@ impl HostapdSupervisor {
         &self,
         desired: Option<&[WifiApSpec]>,
     ) -> Result<bool, SupervisorError> {
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.read().await;
         let interfaces: Vec<String> = self
             .inner
             .tasks
@@ -1136,6 +1146,19 @@ impl HostapdSupervisor {
 
         let mut restarted_any = false;
         for interface in interfaces {
+            let _interface_operation = self.inner.interface_operations.lock(&interface).await;
+            if let Some(specs) = desired {
+                if self
+                    .inner
+                    .tasks
+                    .lock()
+                    .await
+                    .get(&interface)
+                    .is_none_or(|task| !specs.contains(&task.spec))
+                {
+                    continue;
+                }
+            }
             if self.ensure_interface_alive(&interface).await? {
                 restarted_any = true;
             }
@@ -1442,7 +1465,7 @@ impl HostapdSupervisor {
 
     /// Apply the shutdown policy to supervised processes and their ownership records.
     pub async fn shutdown(&self, policy: ShutdownPolicy) {
-        let _operation = self.inner.operation_lock.lock().await;
+        let _operation = self.inner.operation_lock.write().await;
         let tasks = std::mem::take(&mut *self.inner.tasks.lock().await);
 
         for (interface, task) in tasks {

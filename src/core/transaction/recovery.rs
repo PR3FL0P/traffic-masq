@@ -132,6 +132,7 @@ pub(crate) async fn retry_interface_recovery(
     manager: &InterfaceManager,
     committed: &crate::state::overrides::RuntimeOverrides,
     wifi_runtime_dirs: &crate::wifi::WifiRuntimeDirs,
+    desired: &crate::core::desired::DesiredNetworkState,
 ) -> Result<()> {
     crate::core::recovery::check_commit(state_dir)?;
     let names = crate::core::recovery::retryable_blocked_interfaces(state_dir);
@@ -139,16 +140,25 @@ pub(crate) async fn retry_interface_recovery(
         return Ok(());
     }
     let store = open_interface_recovery_store(state_dir).await?;
-    recover_interface_journals(
-        state_dir,
-        manager,
-        &committed.committed_interface_transactions,
-        &store,
-        names,
-        wifi_runtime_dirs,
-        false,
-    )
-    .await;
+    for name in names {
+        let Some(_operation) = desired.transaction_locks.try_lock(&name).await else {
+            continue;
+        };
+        let _lane = desired.runtime_locks.lock(&name).await;
+        if !crate::core::recovery::retryable_blocked_interfaces(state_dir).contains(&name) {
+            continue;
+        }
+        recover_interface_journals(
+            state_dir,
+            manager,
+            &committed.committed_interface_transactions,
+            &store,
+            vec![name],
+            wifi_runtime_dirs,
+            false,
+        )
+        .await;
+    }
     Ok(())
 }
 
