@@ -53,6 +53,7 @@ impl SessionPreferences {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct SessionStore {
     directory: PathBuf,
     key: String,
@@ -80,6 +81,13 @@ impl SessionStore {
         Ok(Self {
             directory: Self::directory()?,
             key: "connections".into(),
+        })
+    }
+
+    pub(crate) fn direct() -> Result<Self> {
+        Ok(Self {
+            directory: Self::directory()?,
+            key: "direct".into(),
         })
     }
 
@@ -115,6 +123,14 @@ impl SessionStore {
     }
 
     pub(crate) fn read<T: serde::de::DeserializeOwned>(&self, suffix: &str) -> Result<Option<T>> {
+        self.read_bounded(suffix, 16_384)
+    }
+
+    pub(super) fn read_bounded<T: serde::de::DeserializeOwned>(
+        &self,
+        suffix: &str,
+        limit: usize,
+    ) -> Result<Option<T>> {
         self.check_directory()?;
         let path = self.path(suffix);
         let file = match OpenOptions::new()
@@ -134,21 +150,33 @@ impl SessionStore {
             bail!("session files must be regular files owned by the current user with mode 0600");
         }
         let mut bytes = Zeroizing::new(Vec::new());
-        file.take(16_385).read_to_end(&mut bytes)?;
-        if bytes.len() > 16_384 {
-            bail!("session file is too large");
+        file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > limit {
+            bail!("saved client file is too large");
         }
         Ok(Some(
-            serde_json::from_slice(&bytes).context("invalid saved session or preferences")?,
+            serde_json::from_slice(&bytes).context("invalid saved client data")?,
         ))
     }
 
     pub(crate) fn write<T: Serialize>(&self, suffix: &str, value: &T) -> Result<()> {
+        self.write_bounded(suffix, value, 16_384)
+    }
+
+    pub(super) fn write_bounded<T: Serialize>(
+        &self,
+        suffix: &str,
+        value: &T,
+        limit: usize,
+    ) -> Result<()> {
         self.check_directory()?;
         atomic_file::ensure_private_dir(&self.directory, 0o700)?;
         let bytes = Zeroizing::new(serde_json::to_vec(value)?);
-        if bytes.len() > 16_384 {
-            bail!("saved client data exceeds the 16 KiB file limit");
+        if bytes.len() > limit {
+            bail!(
+                "saved client data exceeds the {} KiB file limit",
+                limit / 1024
+            );
         }
         atomic_file::replace(&self.path(suffix), &bytes, 0o600)?;
         Ok(())

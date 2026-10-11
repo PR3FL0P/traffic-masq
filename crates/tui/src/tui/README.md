@@ -53,7 +53,9 @@ The TUI serves as the primary operational console for the `traffic-masq` network
 | [`router_health.rs`](router_health.rs) | Saved router readiness and explicitly confirmed repair through provisioning APIs. | `View` |
 | [`router_settings.rs`](router_settings.rs) | Physical uplink and global VPN chain editor feeding the shared router draft/plan. | `Editor` |
 | [`connections.rs`](connections.rs) | Named HTTPS destinations; endpoint and CA-scoped session caches remain separate. | `SavedConnection` |
-| [`logs.rs`](logs.rs) | In-memory circular log buffer (`LOG_HISTORY_LEN = 500`), severity levels (`Info`, `Warn`, `Error`), Ctrl+G popup viewer, log export. | `LogEntry`, `LogLevel`, `LogFocus`, `render_log` |
+| [`logs.rs`](logs.rs) | Circular log buffer (`LOG_HISTORY_LEN = 500`) persisted per endpoint through `SessionStore`, severity levels (`Info`, `Warn`, `Error`), Ctrl+G popup viewer, log export. | `LogEntry`, `LogLevel`, `LogFocus`, `render_log` |
+
+Client log history is stored in `$XDG_STATE_HOME/traffic-masq/client` (or `~/.local/state/traffic-masq/client`) using the same endpoint identity and private permissions as session preferences. Direct mode has a separate history. Logs survive credential expiration and logout. Dirty history is atomically saved on the blocking pool between UI operations and on loop exit, including error exits; clearing the log persists too. History retains up to 500 entries with a separate 4 MiB file limit; credential and preference files keep their 16 KiB limit. Storage failures appear in the client log and retry on the next new message.
 
 ---
 

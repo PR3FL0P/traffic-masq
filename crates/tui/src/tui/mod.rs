@@ -311,6 +311,7 @@ struct TuiApp {
     message_scroll: u16,
     should_quit: bool,
     logs: VecDeque<logs::LogEntry>,
+    logs_dirty: bool,
     logs_scroll: usize,
     logs_max_scroll: usize,
     logs_focus: logs::LogFocus,
@@ -371,6 +372,7 @@ impl Default for TuiApp {
             message_scroll: 0,
             should_quit: false,
             logs: VecDeque::new(),
+            logs_dirty: false,
             logs_scroll: 0,
             logs_max_scroll: 0,
             logs_focus: logs::LogFocus::default(),
@@ -389,6 +391,7 @@ impl TuiApp {
             level,
             message: text,
         });
+        self.logs_dirty = true;
         if self.logs.len() > logs::LOG_HISTORY_LEN {
             self.logs.pop_front();
         }
@@ -583,150 +586,180 @@ async fn run_loop(
     let mut last_refresh: Option<Instant> = None;
     let mut queued_input: Option<Event> = None;
 
-    while !app.should_quit {
-        if !direct && !client.is_authenticated().await {
-            if !reauthenticate(terminal, client, pending_deadline(&app), !has_authenticated).await?
-            {
-                break;
-            }
-            app.last_drawn_view = None;
-            has_authenticated = true;
-            last_refresh = None;
-            match session::remember(client).await {
-                Ok(_) => app.push_message(
-                    LogLevel::Info,
-                    "Authenticated. Inspect pending state before retrying any operation.",
-                ),
-                Err(error) => app.push_message(
-                    LogLevel::Warn,
-                    format!("Authenticated, but could not save session: {error}"),
-                ),
-            }
+    let log_store = match if direct {
+        session::SessionStore::direct()
+    } else {
+        session::SessionStore::for_client(client)
+    } {
+        Ok(store) => {
+            logs::restore(&mut app, &store).await;
+            Some(store)
         }
+        Err(error) => {
+            app.push_message(
+                LogLevel::Warn,
+                format!("Client log storage unavailable: {error}"),
+            );
+            None
+        }
+    };
 
-        let refresh_interval = if pending_deadline(&app).is_some() {
-            Duration::from_millis(500)
-        } else {
-            Duration::from_secs(1)
-        };
-
-        let should_refresh = last_refresh.is_none_or(|t| t.elapsed() >= refresh_interval);
-
-        if should_refresh {
-            let snapshot = draw_app(terminal, &mut app, direct)?.buffer.clone();
-            let deadline = pending_deadline(&app);
-            let refresh = async {
-                let updated = if direct {
-                    load_direct_dashboard(direct_network.as_ref()).await
-                } else {
-                    load_daemon_dashboard(client).await
-                };
-                dashboard::accept_update(&mut app, updated);
-                if !direct
-                    && matches!(
-                        app.screen,
-                        Screen::DhcpInterfaceList | Screen::DhcpEditor | Screen::DhcpLeases
-                    )
+    let result = async {
+        while !app.should_quit {
+            if let Some(store) = &log_store {
+                logs::flush(&mut app, store).await;
+            }
+            if !direct && !client.is_authenticated().await {
+                if !reauthenticate(terminal, client, pending_deadline(&app), !has_authenticated)
+                    .await?
                 {
-                    if let Ok(Response::DhcpStatus {
-                        running_interfaces, ..
-                    }) = client.request(&Request::DhcpStatus).await
-                    {
-                        app.dhcp_interfaces = running_interfaces;
-                    }
+                    break;
                 }
-                normalize_selection(&mut app);
-                refresh_pending_screen(&mut app);
-                dashboard::record_traffic_samples(&mut app);
+                app.last_drawn_view = None;
+                has_authenticated = true;
+                last_refresh = None;
+                match session::remember(client).await {
+                    Ok(_) => app.push_message(
+                        LogLevel::Info,
+                        "Authenticated. Inspect pending state before retrying any operation.",
+                    ),
+                    Err(error) => app.push_message(
+                        LogLevel::Warn,
+                        format!("Authenticated, but could not save session: {error}"),
+                    ),
+                }
+            }
 
-                if !direct && matches!(app.screen, Screen::Router | Screen::RouterPlan) {
-                    router::refresh_router_status(&mut app, client).await;
-                }
-                if !direct {
-                    router::refresh_router_pending_screen(&mut app, client).await;
-                }
-                if !direct && app.screen == Screen::Settings {
-                    settings::refresh_settings_status(&mut app, client).await;
-                }
-                if !direct && app.screen == Screen::Access {
-                    access::refresh_access_status(&mut app, client).await;
-                }
-                if !direct && app.screen == Screen::WifiStations {
-                    wifi_stations::refresh(&mut app, client).await;
-                }
-                if !direct && app.screen == Screen::DaemonLogs {
-                    daemon_logs::tick(&mut app, client).await;
-                }
-                if !direct && app.screen == Screen::Wifi {
-                    wifi::load_wifi_data(&mut app, client).await;
-                }
-                if !direct && app.screen == Screen::VpnPolicy {
-                    vpn_policy::refresh_vpn_policy_status(&mut app, client).await;
-                }
-                if !direct && app.screen == Screen::DhcpLeases {
-                    dhcp::refresh_dhcp_leases(&mut app, client).await;
-                }
-                if !direct && app.screen == Screen::DhcpClient {
-                    dhcp_client::refresh(&mut app, client).await;
-                }
-                if !direct && app.screen == Screen::Vpn {
-                    vpn::load_vpn_data(&mut app, client).await;
-                }
-            };
-            let interrupted = drive_ui(terminal, snapshot, deadline, refresh, true).await?;
-            if interrupted.is_some() {
-                queued_input = interrupted;
+            let refresh_interval = if pending_deadline(&app).is_some() {
+                Duration::from_millis(500)
             } else {
-                last_refresh = Some(Instant::now());
+                Duration::from_secs(1)
+            };
+
+            let should_refresh = last_refresh.is_none_or(|t| t.elapsed() >= refresh_interval);
+
+            if should_refresh {
+                let snapshot = draw_app(terminal, &mut app, direct)?.buffer.clone();
+                let deadline = pending_deadline(&app);
+                let refresh = async {
+                    let updated = if direct {
+                        load_direct_dashboard(direct_network.as_ref()).await
+                    } else {
+                        load_daemon_dashboard(client).await
+                    };
+                    dashboard::accept_update(&mut app, updated);
+                    if !direct
+                        && matches!(
+                            app.screen,
+                            Screen::DhcpInterfaceList | Screen::DhcpEditor | Screen::DhcpLeases
+                        )
+                    {
+                        if let Ok(Response::DhcpStatus {
+                            running_interfaces, ..
+                        }) = client.request(&Request::DhcpStatus).await
+                        {
+                            app.dhcp_interfaces = running_interfaces;
+                        }
+                    }
+                    normalize_selection(&mut app);
+                    refresh_pending_screen(&mut app);
+                    dashboard::record_traffic_samples(&mut app);
+
+                    if !direct && matches!(app.screen, Screen::Router | Screen::RouterPlan) {
+                        router::refresh_router_status(&mut app, client).await;
+                    }
+                    if !direct {
+                        router::refresh_router_pending_screen(&mut app, client).await;
+                    }
+                    if !direct && app.screen == Screen::Settings {
+                        settings::refresh_settings_status(&mut app, client).await;
+                    }
+                    if !direct && app.screen == Screen::Access {
+                        access::refresh_access_status(&mut app, client).await;
+                    }
+                    if !direct && app.screen == Screen::WifiStations {
+                        wifi_stations::refresh(&mut app, client).await;
+                    }
+                    if !direct && app.screen == Screen::DaemonLogs {
+                        daemon_logs::tick(&mut app, client).await;
+                    }
+                    if !direct && app.screen == Screen::Wifi {
+                        wifi::load_wifi_data(&mut app, client).await;
+                    }
+                    if !direct && app.screen == Screen::VpnPolicy {
+                        vpn_policy::refresh_vpn_policy_status(&mut app, client).await;
+                    }
+                    if !direct && app.screen == Screen::DhcpLeases {
+                        dhcp::refresh_dhcp_leases(&mut app, client).await;
+                    }
+                    if !direct && app.screen == Screen::DhcpClient {
+                        dhcp_client::refresh(&mut app, client).await;
+                    }
+                    if !direct && app.screen == Screen::Vpn {
+                        vpn::load_vpn_data(&mut app, client).await;
+                    }
+                };
+                let interrupted = drive_ui(terminal, snapshot, deadline, refresh, true).await?;
+                if interrupted.is_some() {
+                    queued_input = interrupted;
+                } else {
+                    last_refresh = Some(Instant::now());
+                    draw_app(terminal, &mut app, direct)?;
+                }
+            }
+
+            let poll_timeout = refresh_interval
+                .saturating_sub(last_refresh.map_or(Duration::ZERO, |t| t.elapsed()))
+                .min(Duration::from_millis(100));
+
+            let input = if queued_input.is_some() {
+                queued_input.take()
+            } else if event::poll(poll_timeout)? {
+                let ev = event::read()?;
+                match ev {
+                    Event::Mouse(m) if matches!(m.kind, MouseEventKind::Moved) => None,
+                    Event::Key(k) if k.kind != event::KeyEventKind::Press => None,
+                    _ => Some(ev),
+                }
+            } else {
+                None
+            };
+            if let Some(input) = input {
+                let snapshot = draw_app(terminal, &mut app, direct)?.buffer.clone();
+                let deadline = pending_deadline(&app);
+                let action = async {
+                    match input {
+                        Event::Key(key) if key.kind == event::KeyEventKind::Press => {
+                            handle_key_event(&mut app, key, client, direct).await;
+                        }
+                        Event::Mouse(mouse) => {
+                            handle_mouse(&mut app, mouse, client, direct).await;
+                        }
+                        _ => {}
+                    }
+                };
+                if drive_ui(terminal, snapshot, deadline, action, false)
+                    .await?
+                    .is_some()
+                {
+                    app.should_quit = true;
+                }
                 draw_app(terminal, &mut app, direct)?;
             }
-        }
 
-        let poll_timeout = refresh_interval
-            .saturating_sub(last_refresh.map_or(Duration::ZERO, |t| t.elapsed()))
-            .min(Duration::from_millis(100));
-
-        let input = if queued_input.is_some() {
-            queued_input.take()
-        } else if event::poll(poll_timeout)? {
-            let ev = event::read()?;
-            match ev {
-                Event::Mouse(m) if matches!(m.kind, MouseEventKind::Moved) => None,
-                Event::Key(k) if k.kind != event::KeyEventKind::Press => None,
-                _ => Some(ev),
+            if terminal::size().is_err() {
+                break;
             }
-        } else {
-            None
-        };
-        if let Some(input) = input {
-            let snapshot = draw_app(terminal, &mut app, direct)?.buffer.clone();
-            let deadline = pending_deadline(&app);
-            let action = async {
-                match input {
-                    Event::Key(key) if key.kind == event::KeyEventKind::Press => {
-                        handle_key_event(&mut app, key, client, direct).await;
-                    }
-                    Event::Mouse(mouse) => {
-                        handle_mouse(&mut app, mouse, client, direct).await;
-                    }
-                    _ => {}
-                }
-            };
-            if drive_ui(terminal, snapshot, deadline, action, false)
-                .await?
-                .is_some()
-            {
-                app.should_quit = true;
-            }
-            draw_app(terminal, &mut app, direct)?;
         }
 
-        if terminal::size().is_err() {
-            break;
-        }
+        Ok(())
     }
-
-    Ok(())
+    .await;
+    // Flush on normal exit and on terminal/authentication errors alike.
+    if let Some(store) = &log_store {
+        logs::flush(&mut app, store).await;
+    }
+    result
 }
 
 // Reads may be cancelled to prioritize input. Actions are never cancelled or

@@ -8,6 +8,92 @@ fn store(directory: &std::path::Path) -> SessionStore {
     }
 }
 
+#[tokio::test]
+async fn client_log_survives_relaunch_and_token_removal_with_full_history() {
+    use super::super::{logs, TuiApp};
+    let temp = tempfile::tempdir().unwrap();
+    let store = store(temp.path());
+    let mut app = TuiApp::default();
+    for index in 0..550 {
+        app.push_message(
+            logs::LogLevel::Warn,
+            format!("{index}: {}", "действие ".repeat(20)),
+        );
+    }
+    logs::flush(&mut app, &store).await;
+    assert!(!app.logs_dirty);
+    assert!(fs::metadata(store.path("logs")).unwrap().len() > 16_384);
+    assert_eq!(
+        fs::metadata(store.path("logs")).unwrap().mode() & 0o777,
+        0o600
+    );
+    store.write("session", &credential(1000)).unwrap();
+    store.clear().unwrap();
+
+    let mut reopened = TuiApp::default();
+    logs::restore(&mut reopened, &store).await;
+    assert_eq!(reopened.logs, app.logs);
+    assert_eq!(reopened.logs.len(), logs::LOG_HISTORY_LEN);
+    assert!(reopened.logs.front().unwrap().message.starts_with("50:"));
+    assert!(reopened.message.is_none());
+    assert!(!reopened.logs_dirty);
+}
+
+#[tokio::test]
+async fn clearing_client_log_is_persistent_and_endpoint_scoped() {
+    use super::super::{logs, TuiApp};
+    use crossterm::event::KeyCode;
+    let temp = tempfile::tempdir().unwrap();
+    let store = store(temp.path());
+    let other = SessionStore {
+        key: "other".into(),
+        ..store.clone()
+    };
+    let mut app = TuiApp::default();
+    app.push_message(logs::LogLevel::Info, "old entry");
+    logs::flush(&mut app, &store).await;
+    logs::flush(&mut TuiApp::default(), &other).await;
+    let mut isolated = TuiApp::default();
+    logs::restore(&mut isolated, &other).await;
+    assert!(isolated.logs.is_empty());
+    isolated.push_message(logs::LogLevel::Info, "other endpoint");
+    logs::flush(&mut isolated, &other).await;
+
+    app.logs_focus = logs::LogFocus::Clear;
+    logs::handle_log_key(&mut app, KeyCode::Enter);
+    logs::flush(&mut app, &store).await;
+    let mut reopened = TuiApp::default();
+    logs::restore(&mut reopened, &store).await;
+    assert_eq!(reopened.logs.len(), 1);
+    assert_eq!(reopened.logs[0].message, "Log cleared");
+    logs::restore(&mut reopened, &other).await;
+    assert_eq!(reopened.logs[0].message, "other endpoint");
+}
+
+#[tokio::test]
+async fn client_log_storage_failure_is_visible_without_recursive_retry() {
+    use super::super::{logs, TuiApp};
+    let temp = tempfile::tempdir().unwrap();
+    let store = store(temp.path());
+    store.write("logs", &"invalid history").unwrap();
+    let mut app = TuiApp::default();
+    logs::restore(&mut app, &store).await;
+    assert!(app.logs[0].message.contains("Could not restore client log"));
+    fs::remove_file(store.path("logs")).unwrap();
+    std::os::unix::fs::symlink(temp.path().join("untouched"), store.path("logs")).unwrap();
+    logs::flush(&mut app, &store).await;
+    assert!(app
+        .logs
+        .back()
+        .unwrap()
+        .message
+        .contains("Could not save client log"));
+    let count = app.logs.len();
+    logs::flush(&mut app, &store).await;
+    assert_eq!(app.logs.len(), count);
+    assert!(!temp.path().join("untouched").exists());
+}
+
 #[test]
 fn oversized_saved_data_preserves_the_previous_readable_file() {
     let temp = tempfile::tempdir().unwrap();

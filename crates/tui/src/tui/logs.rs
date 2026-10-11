@@ -3,12 +3,13 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
+use serde::{Deserialize, Serialize};
 
 use super::layout::panel;
 use super::theme;
 use super::{Screen, TuiApp};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum LogLevel {
     Info,
     Warn,
@@ -33,7 +34,7 @@ impl LogLevel {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct LogEntry {
     pub(crate) at_unix: u64,
     pub(crate) level: LogLevel,
@@ -41,6 +42,54 @@ pub(crate) struct LogEntry {
 }
 
 pub(crate) const LOG_HISTORY_LEN: usize = 500;
+const LOG_FILE_LIMIT: usize = 4 * 1024 * 1024;
+
+/// Restore history without replaying old messages into the status line.
+pub(super) async fn restore(app: &mut TuiApp, store: &super::session::SessionStore) {
+    let store = store.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        store.read_bounded::<std::collections::VecDeque<LogEntry>>("logs", LOG_FILE_LIMIT)
+    })
+    .await
+    .map_err(anyhow::Error::from)
+    .and_then(|result| result);
+    match result {
+        Ok(Some(mut entries)) => {
+            while entries.len() > LOG_HISTORY_LEN {
+                entries.pop_front();
+            }
+            app.logs = entries;
+            app.logs_scroll = usize::MAX;
+        }
+        Ok(None) => {}
+        Err(error) => app.push_message(
+            LogLevel::Warn,
+            format!("Could not restore client log: {error}"),
+        ),
+    }
+}
+
+/// Serialize writes on the blocking pool, outside cancellable UI operations.
+pub(super) async fn flush(app: &mut TuiApp, store: &super::session::SessionStore) {
+    if !app.logs_dirty {
+        return;
+    }
+    let store = store.clone();
+    let entries = app.logs.clone();
+    let result =
+        tokio::task::spawn_blocking(move || store.write_bounded("logs", &entries, LOG_FILE_LIMIT))
+            .await
+            .map_err(anyhow::Error::from)
+            .and_then(|result| result);
+    if let Err(error) = result {
+        app.push_message(
+            LogLevel::Warn,
+            format!("Could not save client log: {error}"),
+        );
+    }
+    // Retry on the next real message, rather than logging failures forever.
+    app.logs_dirty = false;
+}
 
 pub(crate) fn with_troubleshooting_hint(level: LogLevel, message: String) -> String {
     if level == LogLevel::Info || message.contains("Hint:") {
