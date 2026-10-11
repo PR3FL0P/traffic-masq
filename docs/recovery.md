@@ -1,5 +1,8 @@
 # Recovery runbook
 
+For resource ownership conflicts and diagnostic limits, see the
+[external resource coverage matrix](resource-conflicts.md).
+
 This guide is for operator-visible recovery diagnostics emitted by `traffic-masqd`.
 It describes how to recover without discarding the evidence the daemon uses to
 prove whether an interrupted network change committed or must be rolled back.

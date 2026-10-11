@@ -93,6 +93,14 @@ request_dns = true
 send_release_on_shutdown = false
 ```
 
+`route_metric` is the requested default-route priority; higher values have lower
+priority. If another route already occupies that destination, table and metric,
+the client warns and uses the next free higher metric. It preserves existing
+routes and records the effective metric in the lease for renewals and restart.
+The configured value stays unchanged. In **Router**, select the default route
+marked `traffic-masq (dhcp)` and press **e** or Enter to open the DHCP client
+settings, edit **Route metric**, then apply.
+
 Those DHCP-client values are defaults. `wifi_owned` is internal bookkeeping for
 DHCP enabled by Wi-Fi activation; leave it at its default `false`. `request_dns`
 requests and records lease DNS servers; the client does not update the host's

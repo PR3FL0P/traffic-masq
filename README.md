@@ -152,6 +152,12 @@ a client can reconnect. Tab moves between the list and clickable actions.
 In **DHCP Client**, select an interface and press **e** or Enter to edit route
 metric, default-route installation, DNS requests and Release on shutdown.
 The form loads saved settings and applies immediately, without a rollback timer.
+If a DHCP default route conflicts with an existing route, traffic-masq selects
+the next free higher metric (lower priority) and logs a warning. The effective
+metric is retained with the lease across renewals and restart; saved settings
+keep the requested metric. To change it from **Router**, select the interface's
+`0.0.0.0/0` route marked `traffic-masq (dhcp)`, press **e**, change **Route metric**,
+and select **Apply DHCP client settings now**. Existing routes are preserved.
 The existing **c** shortcut still enables/resets the client to defaults. Enable
 the DHCP Client tab in Settings if it is hidden.
 
@@ -366,6 +372,7 @@ It keeps configuration, passwords, state, logs and dependency packages.
 - [Configuration reference](docs/configuration.md): supported TOML fields, defaults and examples.
 - [HTTP API](docs/api.md): authentication, endpoints, JSON schemas and commit-confirm flows.
 - [Recovery runbook](docs/recovery.md): `TM-REC-xxx` operator procedures for startup-blocking and degraded recovery.
+- [External resource conflicts](docs/resource-conflicts.md): ownership evidence, manual actions and diagnostic coverage limits.
 - [Service integration](packaging/INIT.md): init systems, updates and service ownership.
 - [Security and recovery](SECURITY.md): access control, rollback and recovery policy.
 - [Architecture](docs/architecture.md): modules and how network changes are applied.
