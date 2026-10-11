@@ -800,6 +800,24 @@ async fn an_apply_writes_desired_state_rather_than_the_kernel() {
 
 #[tokio::test]
 async fn failed_apply_with_failed_compensation_stays_pending_and_rollback_only() {
+    async fn wait_for_version<T>(
+        desired: &DesiredNetworkState,
+        version: u64,
+        task: &tokio::task::JoinHandle<T>,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while desired.version() < version {
+                assert!(
+                    !task.is_finished(),
+                    "operation ended before publishing desired-state version {version}"
+                );
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("operation must publish the expected desired-state version");
+    }
+
     let directory = tempdir().expect("tempdir");
     let desired = desired_state(directory.path()).await;
     desired.attach_converger();
@@ -825,17 +843,14 @@ async fn failed_apply_with_failed_compensation_stays_pending_and_rollback_only()
             .await
     });
 
-    while desired.version() < 1 {
-        tokio::task::yield_now().await;
-    }
+    wait_for_version(&desired, 1, &apply).await;
     desired.report_result(1, Err(anyhow::anyhow!("candidate failed")));
-    while desired.version() < 2 {
-        tokio::task::yield_now().await;
-    }
+    wait_for_version(&desired, 2, &apply).await;
     desired.report_result(2, Err(anyhow::anyhow!("rollback failed")));
 
-    let error = apply
+    let error = tokio::time::timeout(Duration::from_secs(5), apply)
         .await
+        .expect("failed apply and compensation must finish")
         .expect("apply task")
         .expect_err("apply must fail");
     assert!(error.to_string().contains("candidate failed"));
@@ -858,12 +873,11 @@ async fn failed_apply_with_failed_compensation_stays_pending_and_rollback_only()
     let rollback_manager = manager.clone();
     let rollback_token = token.clone();
     let rollback = tokio::spawn(async move { rollback_manager.rollback(&rollback_token).await });
-    while desired.version() < 3 {
-        tokio::task::yield_now().await;
-    }
+    wait_for_version(&desired, 3, &rollback).await;
     desired.report_pass(3, BTreeMap::new());
-    rollback
+    tokio::time::timeout(Duration::from_secs(5), rollback)
         .await
+        .expect("rollback retry must finish")
         .expect("rollback task")
         .expect("retry rollback");
     assert!(manager.pending().await.is_empty());

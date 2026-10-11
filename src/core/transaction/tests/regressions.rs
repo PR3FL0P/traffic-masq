@@ -4,8 +4,10 @@
 
 use super::*;
 
-const WINDOW: Duration = Duration::from_millis(100);
-const WATCHDOG: Duration = Duration::from_secs(2);
+// File operations use real time. Expiry tests advance the clock only after
+// setup, so disk latency does not consume a tiny confirmation window.
+const WINDOW: Duration = Duration::from_secs(60);
+const WATCHDOG: Duration = Duration::from_secs(5);
 
 async fn apply_candidate(manager: &NetworkTransactionManager) -> PendingNetworkChange {
     manager
@@ -61,6 +63,9 @@ async fn regression_expired_rollback_must_not_wait_for_unrelated_admission() {
     // Another request is waiting for convergence. It holds admission, but the
     // runtime execution lock is free, so compensation could safely progress.
     let admission = gate.admit().await;
+    tokio::time::pause();
+    tokio::time::advance(WINDOW).await;
+    tokio::time::resume();
     let recovered = tokio::time::timeout(WATCHDOG, async {
         while manager
             .inner
@@ -77,7 +82,10 @@ async fn regression_expired_rollback_must_not_wait_for_unrelated_admission() {
     drop(admission);
     converger.abort();
 
-    assert!(recovered.is_ok(), "expired candidate stayed active for 2s because an unrelated operation held admission (confirmation window: 100ms)");
+    assert!(
+        recovered.is_ok(),
+        "expired candidate stayed active because an unrelated operation held admission"
+    );
     assert!(!remaining_addresses.contains(&Ipv4Addr::new(192, 168, 50, 1)));
 }
 
@@ -105,7 +113,9 @@ async fn regression_commit_queued_before_expiry_must_recheck_deadline_at_executi
         std::task::Poll::Ready(())
     })
     .await;
-    tokio::time::sleep(WINDOW * 3).await;
+    tokio::time::pause();
+    tokio::time::advance(WINDOW * 3).await;
+    tokio::time::resume();
     drop(admission);
     let result = tokio::time::timeout(WATCHDOG, commit).await.unwrap();
     let committed = desired.committed_interface("test0").await.unwrap();
@@ -230,6 +240,14 @@ async fn regression_uncertain_security_write_must_not_disable_network_compensati
     let manager = manager_for(&desired, provider.clone());
     let converger = spawn_converger(desired.clone(), provider);
     let pending = apply_candidate(&manager).await;
+    // This test exercises manual compensation after uncertain persistence,
+    // not expiry. Invalidate its timer before doing filesystem work.
+    manager
+        .inner
+        .timer_epochs
+        .lock()
+        .unwrap()
+        .remove(&pending.token);
     let network_before = overrides.snapshot().await;
 
     crate::atomic_file::fail_replacement_and_compensation(overrides.path());
@@ -268,7 +286,12 @@ async fn commit_started_before_deadline_may_finish_persistence_after_it() {
             let desired = desired.clone();
             let token = pending.token.clone();
             async move {
-                tokio::time::sleep(WINDOW * 3).await;
+                // The callback is entered only after commit owns the lane and
+                // has checked the deadline. Expire it without a real sleep,
+                // then resume real time for durable persistence.
+                tokio::time::pause();
+                tokio::time::advance(WINDOW * 3).await;
+                tokio::time::resume();
                 desired
                     .commit_interface(&token, interface, config, allow)
                     .await

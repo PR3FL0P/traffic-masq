@@ -18,7 +18,9 @@ use traffic_masq::config::{
 
 mod support;
 
-use support::namespace::{create_veth, require_command, require_root, run, unique_suffix};
+use support::namespace::{
+    create_veth, require_command, require_root, run, unique_suffix, wait_for_listener_ready,
+};
 
 static NAMESPACE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -419,9 +421,7 @@ async fn run_happy_path(fixture: &mut RouterNamespaceFixture) -> Result<()> {
 
     assert_lease_matches_config(fixture)?;
 
-    let server = spawn_echo_server(fixture)?;
-
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let server = spawn_echo_server(fixture).await?;
 
     let echoed = timeout(WAIT_TIMEOUT, connect_and_echo(fixture))
         .await
@@ -547,11 +547,13 @@ fn assert_lease_matches_config(fixture: &RouterNamespaceFixture) -> Result<()> {
     Ok(())
 }
 
-fn spawn_echo_server(fixture: &RouterNamespaceFixture) -> Result<std::process::Child> {
+async fn spawn_echo_server(fixture: &RouterNamespaceFixture) -> Result<std::process::Child> {
+    let ready = tempfile::NamedTempFile::new_in(fixture.temp.path())
+        .context("failed to create echo listener readiness file")?;
     let script = format!(
-        "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.settimeout(25)\ns.bind(('{UPSTREAM_ADDR}', {ECHO_PORT}))\ns.listen(1)\nconn, addr = s.accept()\nconn.settimeout(25)\ndata = conn.recv(4096)\nconn.sendall(data)\nconn.close()\nprint(addr[0], flush=True)\n"
+        "import socket, sys\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.settimeout(25)\ns.bind(('{UPSTREAM_ADDR}', {ECHO_PORT}))\ns.listen(1)\nwith open(sys.argv[1], 'w') as ready:\n    ready.write('ready')\nconn, addr = s.accept()\nconn.settimeout(25)\ndata = conn.recv(4096)\nconn.sendall(data)\nconn.close()\nprint(addr[0], flush=True)\n"
     );
-    Command::new("ip")
+    let child = Command::new("ip")
         .args([
             "netns",
             "exec",
@@ -560,11 +562,13 @@ fn spawn_echo_server(fixture: &RouterNamespaceFixture) -> Result<std::process::C
             "-c",
             &script,
         ])
+        .arg(ready.path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("failed to spawn upstream TCP echo server")
+        .context("failed to spawn upstream TCP echo server")?;
+    wait_for_listener_ready(child, ready.path(), WAIT_TIMEOUT).await
 }
 
 async fn connect_and_echo(fixture: &RouterNamespaceFixture) -> Result<String> {

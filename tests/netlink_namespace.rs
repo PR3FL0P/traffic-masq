@@ -406,7 +406,23 @@ async fn an_unconfirmed_change_converges_and_expires_on_a_live_kernel() -> Resul
 
     // Nobody confirms it. The rollback timer withdraws the proposal, and the
     // committed configuration is what convergence goes back to.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if manager.pending().await.is_empty()
+                && addresses_on_link().await? == vec![(committed, AddressOwner::TrafficMasqStatic)]
+                && !desired.is_tentative(&fixture.host_if).await
+            {
+                return Ok::<_, anyhow::Error>(());
+            }
+            anyhow::ensure!(
+                !converger.is_finished(),
+                "test converger stopped during rollback"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("unconfirmed change did not finish rollback and kernel convergence")??;
 
     assert!(manager.pending().await.is_empty());
     assert_eq!(

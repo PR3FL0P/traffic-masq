@@ -9865,6 +9865,7 @@ async fn regression_provisioning_secrets_follow_successful_automatic_router_retr
             fixture.overrides.clone(),
             Duration::from_secs(1),
         ));
+    *fixture.subsystems.rollback_unavailable.lock().unwrap() = true;
     let response = fixture
         .service
         .dispatch(apply_request(provisioning_request()))
@@ -9873,13 +9874,16 @@ async fn regression_provisioning_secrets_follow_successful_automatic_router_retr
         matches!(response, Response::RouterProvisioningApplied { .. }),
         "{response:?}"
     );
-    *fixture.subsystems.rollback_unavailable.lock().unwrap() = true;
-
-    // Both timers fire at one second. Keep the dependency unavailable until
-    // both first attempts have had time to run, then let the router retry.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
     let router = fixture.service.router.as_ref().unwrap();
-    assert_eq!(router.status().await, CoordinatorStatus::RollbackFailed);
+    // Wait for the failed attempt to complete; elapsed time alone does not
+    // prove the timer's filesystem work has finished.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while router.status().await != CoordinatorStatus::RollbackFailed {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("automatic router rollback must encounter the injected failure");
     *fixture.subsystems.rollback_unavailable.lock().unwrap() = false;
     tokio::time::timeout(Duration::from_secs(5), async {
         while router.status().await != CoordinatorStatus::Idle {

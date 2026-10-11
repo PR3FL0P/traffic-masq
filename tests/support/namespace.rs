@@ -1,9 +1,39 @@
 #![allow(dead_code)]
 
-use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
+
+/// The child writes this private file only after bind/listen succeeds. A TCP
+/// readiness probe would consume the single connection these fixtures accept.
+pub async fn wait_for_listener_ready(
+    mut child: Child,
+    ready: &Path,
+    deadline: Duration,
+) -> Result<Child> {
+    let result = tokio::time::timeout(deadline, async {
+        loop {
+            if let Some(status) = child.try_wait()? {
+                bail!("test listener exited before becoming ready: {status}");
+            }
+            if std::fs::metadata(ready)?.len() > 0 {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .context("test listener did not signal readiness")
+    .and_then(|result| result);
+    if let Err(error) = result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    Ok(child)
+}
 
 pub fn create_veth(host_if: &str, peer_if: &str, peer_ns: &str) -> Result<()> {
     run(

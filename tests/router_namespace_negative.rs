@@ -19,7 +19,9 @@ use traffic_masq::config::{
 
 mod support;
 
-use support::namespace::{create_veth, require_command, require_root, run, unique_suffix};
+use support::namespace::{
+    create_veth, require_command, require_root, run, unique_suffix, wait_for_listener_ready,
+};
 
 static NAMESPACE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -633,11 +635,13 @@ fn leased_client_ip(fixture: &RouterNamespaceFixture) -> Result<Ipv4Addr> {
     bail!("lease result missing ip")
 }
 
-fn spawn_echo_server(fixture: &RouterNamespaceFixture) -> Result<std::process::Child> {
+async fn spawn_echo_server(fixture: &RouterNamespaceFixture) -> Result<std::process::Child> {
+    let ready = tempfile::NamedTempFile::new_in(fixture.temp.path())
+        .context("failed to create echo listener readiness file")?;
     let script = format!(
-        "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.settimeout(25)\ns.bind(('{UPSTREAM_ADDR}', {ECHO_PORT}))\ns.listen(1)\nconn, addr = s.accept()\nconn.settimeout(25)\ndata = conn.recv(4096)\nconn.sendall(data)\nconn.close()\nprint(addr[0], flush=True)\n"
+        "import socket, sys\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.settimeout(25)\ns.bind(('{UPSTREAM_ADDR}', {ECHO_PORT}))\ns.listen(1)\nwith open(sys.argv[1], 'w') as ready:\n    ready.write('ready')\nconn, addr = s.accept()\nconn.settimeout(25)\ndata = conn.recv(4096)\nconn.sendall(data)\nconn.close()\nprint(addr[0], flush=True)\n"
     );
-    Command::new("ip")
+    let child = Command::new("ip")
         .args([
             "netns",
             "exec",
@@ -646,11 +650,13 @@ fn spawn_echo_server(fixture: &RouterNamespaceFixture) -> Result<std::process::C
             "-c",
             &script,
         ])
+        .arg(ready.path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("failed to spawn upstream TCP echo server")
+        .context("failed to spawn upstream TCP echo server")?;
+    wait_for_listener_ready(child, ready.path(), WAIT_TIMEOUT).await
 }
 
 async fn connect_and_echo(fixture: &RouterNamespaceFixture, timeout_secs: u64) -> Result<String> {
@@ -764,8 +770,7 @@ async fn uplink_down_blocks_new_flows_without_crashing_daemon() -> Result<()> {
             .await
             .context("timed out acquiring DHCP lease")??;
 
-        let server = spawn_echo_server(&fixture)?;
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let server = spawn_echo_server(&fixture).await?;
         let echoed = timeout(WAIT_TIMEOUT, connect_and_echo(&fixture, 20))
             .await
             .context("timed out checking traffic before uplink failure")??;
@@ -773,8 +778,7 @@ async fn uplink_down_blocks_new_flows_without_crashing_daemon() -> Result<()> {
         let output = tokio::task::spawn_blocking(move || server.wait_with_output()).await??;
         assert!(output.status.success(), "baseline echo server failed");
 
-        let mut server = spawn_echo_server(&fixture)?;
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut server = spawn_echo_server(&fixture).await?;
 
         run("ip", &["link", "set", &fixture.uplink_if, "down"])?;
 
@@ -976,8 +980,7 @@ async fn absent_uplink_waits_without_reconfiguring_lan_and_recovers_when_added()
         })
         .await
         .context("router did not recover after uplink appeared")??;
-        let server = spawn_echo_server(&fixture)?;
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let server = spawn_echo_server(&fixture).await?;
         assert_eq!(connect_and_echo(&fixture, 20).await?, "traffic-masq-e2e");
         assert!(server.wait_with_output()?.status.success());
         fixture.stop_daemon_gracefully().await?;
@@ -1145,8 +1148,7 @@ async fn foreign_route_and_nftables_table_survive_apply_rollback_and_shutdown() 
             .await
             .context("timed out acquiring a DHCP lease")??;
 
-        let server = spawn_echo_server(&fixture)?;
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let server = spawn_echo_server(&fixture).await?;
         timeout(WAIT_TIMEOUT, connect_and_echo(&fixture, 20))
             .await
             .context("timed out reaching the upstream echo server")??;
@@ -1222,8 +1224,7 @@ async fn new_inbound_from_upstream_is_blocked_established_reply_is_allowed() -> 
 
 
 
-        let server = spawn_echo_server(&fixture)?;
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let server = spawn_echo_server(&fixture).await?;
         let echoed = timeout(WAIT_TIMEOUT, connect_and_echo(&fixture, 20))
             .await
             .context("timed out reaching the upstream echo server")??;
@@ -1258,8 +1259,7 @@ async fn new_inbound_from_upstream_is_blocked_established_reply_is_allowed() -> 
             ],
         )?;
 
-        let mut client_server = spawn_client_listener(&fixture)?;
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        let mut client_server = spawn_client_listener(&fixture).await?;
 
         let probe = timeout(
             BLOCKED_FLOW_TIMEOUT,
@@ -1287,15 +1287,19 @@ async fn new_inbound_from_upstream_is_blocked_established_reply_is_allowed() -> 
     result
 }
 
-fn spawn_client_listener(fixture: &RouterNamespaceFixture) -> Result<std::process::Child> {
-    let script = "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.settimeout(6)\ns.bind(('0.0.0.0', 18522))\ns.listen(1)\ntry:\n    conn, addr = s.accept()\n    conn.close()\nexcept socket.timeout:\n    pass\n";
-    Command::new("ip")
+async fn spawn_client_listener(fixture: &RouterNamespaceFixture) -> Result<std::process::Child> {
+    let ready = tempfile::NamedTempFile::new_in(fixture.temp.path())
+        .context("failed to create client listener readiness file")?;
+    let script = "import socket, sys\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\ns.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\ns.settimeout(6)\ns.bind(('0.0.0.0', 18522))\ns.listen(1)\nwith open(sys.argv[1], 'w') as ready:\n    ready.write('ready')\ntry:\n    conn, addr = s.accept()\n    conn.close()\nexcept socket.timeout:\n    pass\n";
+    let child = Command::new("ip")
         .args(["netns", "exec", &fixture.client_ns, "python3", "-c", script])
+        .arg(ready.path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .context("failed to spawn client listener")
+        .context("failed to spawn client listener")?;
+    wait_for_listener_ready(child, ready.path(), WAIT_TIMEOUT).await
 }
 
 async fn connect_from_upstream(
