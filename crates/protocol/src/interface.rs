@@ -49,6 +49,8 @@ pub struct DhcpInterfaceConfigView {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DhcpClientInterfaceConfigView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
     pub wifi_owned: bool,
     pub enabled: bool,
     pub route_metric: u32,
@@ -62,6 +64,7 @@ impl Default for DhcpClientInterfaceConfigView {
         Self {
             wifi_owned: false,
             enabled: true,
+            hostname: None,
             route_metric: 100,
             install_default_route: true,
             request_dns: true,

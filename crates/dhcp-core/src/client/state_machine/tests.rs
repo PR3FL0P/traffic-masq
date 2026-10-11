@@ -318,3 +318,32 @@ fn secs_is_monotonic_and_saturates() {
     let packet = DhcpPacket::parse(sent(&actions).0).unwrap();
     assert_eq!(packet.secs, u16::MAX);
 }
+
+#[test]
+fn hostname_is_retained_through_acquisition_renewal_and_rebinding() {
+    use crate::packet::{DhcpPacket, OPTION_HOST_NAME};
+    let mut sm = DhcpClientStateMachine::new(MAC).with_hostname(Some("travel-router".into()));
+    let discover = sm.link_ready(Duration::ZERO, XID, None, 0);
+    let request = sm.receive(
+        Duration::ZERO,
+        &reply(XID, DhcpMessageType::Offer, ADDRESS, None),
+        0,
+    );
+    let acquired = sm.receive(
+        Duration::ZERO,
+        &reply(XID, DhcpMessageType::Ack, ADDRESS, Some(80)),
+        0,
+    );
+    let Action::LeaseAcquired(lease) = &acquired[0] else {
+        panic!()
+    };
+    let renewal = sm.timeout(lease.renewal_at, 99, 0);
+    let rebind = sm.timeout(lease.rebinding_at, 100, 0);
+    for actions in [discover, request, renewal, rebind] {
+        let packet = DhcpPacket::parse(sent(&actions).0).unwrap();
+        assert_eq!(
+            packet.singleton_option(OPTION_HOST_NAME, 13).unwrap(),
+            Some(b"travel-router".as_slice())
+        );
+    }
+}

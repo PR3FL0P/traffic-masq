@@ -742,3 +742,18 @@ fn wifi_set_passphrase_request_debug_is_redacted() {
     assert!(!debug.contains(secret), "{debug}");
     assert!(debug.contains("redacted"), "{debug}");
 }
+
+#[test]
+fn dhcp_hostname_survives_config_wire_and_persistence_roundtrips() {
+    let policy = crate::config::DhcpClientInterfaceConfig {
+        hostname: Some("travel-router".into()),
+        ..Default::default()
+    };
+    let view: traffic_masq_protocol::DhcpClientInterfaceConfigView = policy.clone().into();
+    assert_eq!(view.hostname, policy.hostname);
+    let restored: crate::config::DhcpClientInterfaceConfig = view.into();
+    assert_eq!(restored, policy);
+    let serialized = toml::to_string(&policy).unwrap();
+    let restored: crate::config::DhcpClientInterfaceConfig = toml::from_str(&serialized).unwrap();
+    assert_eq!(restored, policy);
+}

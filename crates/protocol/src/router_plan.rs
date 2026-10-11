@@ -83,6 +83,8 @@ pub struct RouterInterfaceDesiredView {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DhcpClientSpecView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
     pub interface: String,
     pub route_metric: u32,
     pub install_default_route: bool,

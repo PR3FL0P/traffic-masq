@@ -148,6 +148,7 @@ async fn arp_probe_fake_is_bounded_and_stops_on_conflict() {
 async fn actor_sends_discover_rejects_wrong_ifindex_and_cancels() {
     let transport = Arc::new(FakeTransport::new(Vec::new()));
     let config = DhcpClientRuntimeConfig {
+        hostname: Some("travel-router".into()),
         interface: "lo".into(),
         interface_index: 1,
         hardware_address: [2, 0, 0, 0, 0, 1],
@@ -227,6 +228,13 @@ async fn actor_sends_discover_rejects_wrong_ifindex_and_cancels() {
         request.message_type(),
         Some(traffic_masq_dhcp_core::packet::DhcpMessageType::Request)
     );
+    for packet in &packets {
+        let packet = traffic_masq_dhcp_core::packet::DhcpPacket::parse(packet).unwrap();
+        assert_eq!(
+            packet.singleton_option(12, "travel-router".len()).unwrap(),
+            Some(b"travel-router".as_slice())
+        );
+    }
     tx.send(true).unwrap();
     tokio::time::timeout(Duration::from_secs(5), task)
         .await
@@ -310,6 +318,7 @@ async fn socket_has_required_options() {
     use nix::sys::socket::getsockopt;
     use std::os::fd::BorrowedFd;
     let config = DhcpClientRuntimeConfig {
+        hostname: None,
         interface: "lo".into(),
         interface_index: 1,
         hardware_address: [2, 0, 0, 0, 0, 1],

@@ -12,6 +12,7 @@ pub const ETHERNET_HLEN: u8 = 6;
 pub const OPTION_SUBNET_MASK: u8 = 1;
 pub const OPTION_ROUTERS: u8 = 3;
 pub const OPTION_DNS_SERVERS: u8 = 6;
+pub const OPTION_HOST_NAME: u8 = 12;
 pub const OPTION_REQUESTED_IP: u8 = 50;
 pub const OPTION_LEASE_TIME: u8 = 51;
 pub const OPTION_MESSAGE_TYPE: u8 = 53;

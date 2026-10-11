@@ -349,6 +349,7 @@ fn dhcp_uplink_preserves_existing_override_metadata_and_policy_options() {
     let mut committed = committed();
     let mut wan = base.network.interfaces["wan0"].clone();
     wan.dhcp_client = Some(DhcpClientInterfaceConfig {
+        hostname: None,
         wifi_owned: true,
         enabled: false,
         route_metric: 777,

@@ -1134,6 +1134,7 @@ async fn liveness_resynchronizes_wifi_association_into_dhcp_link_ready() {
     let wifi_client = FakeWifiReconciler::default();
     let dhcp_client = FakeDhcpClientReconciler::default();
     let spec = DhcpClientSpec {
+        hostname: None,
         interface: "wlan0".into(),
         route_metric: 100,
         install_default_route: true,
@@ -2296,6 +2297,7 @@ async fn liveness_does_not_replay_dhcp_association_from_withdrawn_desired_policy
     let wifi = FakeWifiReconciler::default();
     let client = FakeDhcpClientReconciler::default();
     let spec = DhcpClientSpec {
+        hostname: None,
         interface: "wlan0".into(),
         route_metric: 100,
         install_default_route: true,

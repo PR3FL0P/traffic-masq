@@ -206,6 +206,8 @@ pub struct OwnedIpv4RouteConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DhcpClientInterfaceConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
     /// True only when Wi-Fi activation enabled this previously disabled policy.
     pub wifi_owned: bool,
     pub enabled: bool,
@@ -220,6 +222,7 @@ impl Default for DhcpClientInterfaceConfig {
         Self {
             wifi_owned: false,
             enabled: true,
+            hostname: None,
             route_metric: 100,
             install_default_route: true,
             request_dns: true,
@@ -818,6 +821,13 @@ impl InterfaceConfig {
             bail!("an interface cannot be both a Wi-Fi access point and a Wi-Fi client (non-goal: concurrent AP+STA)");
         }
 
+        if let Some(hostname) = self
+            .dhcp_client
+            .as_ref()
+            .and_then(|client| client.hostname.as_deref())
+        {
+            traffic_masq_protocol::validate_dhcp_hostname(hostname).map_err(anyhow::Error::msg)?;
+        }
         if self.dhcp_client.is_some() && self.role != InterfaceRole::Input {
             bail!("a DHCP client can only be configured on an input interface");
         }

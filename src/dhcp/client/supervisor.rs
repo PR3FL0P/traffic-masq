@@ -43,6 +43,8 @@ pub(crate) const LEASE_READY_TIMEOUT: Duration = Duration::from_secs(5)
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DhcpClientSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
     pub interface: String,
     pub route_metric: u32,
     pub install_default_route: bool,
@@ -73,6 +75,7 @@ impl DhcpClientSpec {
     fn from_parts(interface: &str, dhcp_client: &DhcpClientInterfaceConfig) -> Self {
         Self {
             interface: interface.to_string(),
+            hostname: dhcp_client.hostname.clone(),
             route_metric: dhcp_client.route_metric,
             install_default_route: dhcp_client.install_default_route,
             request_dns: dhcp_client.request_dns,
@@ -97,6 +100,7 @@ impl DhcpClientSpec {
 
     pub fn interface_config(&self) -> DhcpClientInterfaceConfig {
         DhcpClientInterfaceConfig {
+            hostname: self.hostname.clone(),
             wifi_owned: false,
             enabled: true,
             route_metric: self.route_metric,
@@ -133,6 +137,7 @@ struct SharedState {
 }
 
 pub struct DhcpClientLaunch {
+    pub hostname: Option<String>,
     pub interface: String,
     pub interface_index: u32,
     pub hardware_address: [u8; 6],
@@ -165,11 +170,12 @@ impl DhcpClientLauncher for LinuxDhcpClientLauncher {
             DhcpClientActor, DhcpClientRuntimeConfig, LinuxArpDad, LinuxDhcpClientSocket,
         };
 
-        let config = DhcpClientRuntimeConfig::new(
+        let mut config = DhcpClientRuntimeConfig::new(
             launch.interface.clone(),
             launch.interface_index,
             launch.hardware_address,
         );
+        config.hostname = launch.hostname.clone();
         let socket = Arc::new(
             LinuxDhcpClientSocket::bind(config.clone()).with_context(|| {
                 format!("failed to bind DHCP client socket on {}", config.interface)
@@ -596,7 +602,7 @@ impl DhcpClientSupervisor {
     pub async fn release_and_reacquire(&self, interface: &str) -> Result<DhcpClientStatus> {
         let _operation = self.inner.operation_lock.read().await;
         let _interface_operation = self.inner.interface_operations.lock(interface).await;
-        let (link_ready, transport, shared) = {
+        let (link_ready, transport, shared, hostname) = {
             let tasks = self.inner.tasks.lock().await;
             let task = tasks
                 .get(interface)
@@ -607,12 +613,15 @@ impl DhcpClientSupervisor {
                     .as_ref()
                     .map(|running| running.transport.clone()),
                 task.shared.clone(),
+                task.spec.hostname.clone(),
             )
         };
         let lease = shared.lock().await.lease.clone();
         self.stop_task(interface).await;
         let release_error = if let (Some(transport), Some(lease)) = (transport, lease.as_ref()) {
-            send_release(transport.as_ref(), lease).await.err()
+            send_release(transport.as_ref(), lease, hostname.as_deref())
+                .await
+                .err()
         } else {
             None
         };
@@ -833,7 +842,9 @@ impl DhcpClientSupervisor {
             }
             if spec.send_release_on_shutdown {
                 if let (Some(transport), Some(lease)) = (transport, lease.as_ref()) {
-                    if let Err(error) = send_release(transport.as_ref(), lease).await {
+                    if let Err(error) =
+                        send_release(transport.as_ref(), lease, spec.hostname.as_deref()).await
+                    {
                         tracing::warn!(%interface, %error, "failed to send DHCP RELEASE during shutdown");
                     }
                 }
@@ -908,6 +919,7 @@ impl DhcpClientSupervisor {
             inner: Arc::downgrade(&self.inner),
         };
         let launch = DhcpClientLaunch {
+            hostname: spec.hostname.clone(),
             interface: interface.to_string(),
             interface_index: identity.index,
             hardware_address: identity.hardware_address,
@@ -1278,14 +1290,22 @@ fn prefix_to_mask(prefix_len: u8) -> Ipv4Addr {
     Ipv4Addr::from(u32::MAX << (32 - prefix_len.min(32)))
 }
 
-async fn send_release(transport: &dyn DhcpClientTransport, lease: &DhcpClientLease) -> Result<()> {
+async fn send_release(
+    transport: &dyn DhcpClientTransport,
+    lease: &DhcpClientLease,
+    hostname: Option<&str>,
+) -> Result<()> {
     let hardware_address: [u8; 6] = lease
         .hardware_address
         .as_slice()
         .try_into()
         .context("persisted DHCP lease has a non-Ethernet hardware address")?;
-    let packet = ClientPacketBuilder::new(rand::random(), hardware_address)
-        .release(lease.address, lease.server_identifier)?;
+    let builder = ClientPacketBuilder::new(rand::random(), hardware_address);
+    let builder = match hostname {
+        Some(hostname) => builder.hostname(hostname),
+        None => builder,
+    };
+    let packet = builder.release(lease.address, lease.server_identifier)?;
     transport
         .send(&packet, SendKind::Unicast(lease.server_identifier))
         .await

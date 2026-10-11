@@ -219,3 +219,45 @@ fn rejects_invalid_masks_timers_addresses_and_builder_bounds() {
         .discover()
         .is_err());
 }
+
+#[test]
+fn hostname_option_is_encoded_once_and_absent_by_default() {
+    let hostname = "travel-router.example";
+    let builder = builder().hostname(hostname);
+    for bytes in [
+        builder.discover().unwrap(),
+        builder.selecting_request(ADDRESS, SERVER).unwrap(),
+        builder.init_reboot_request(ADDRESS).unwrap(),
+        builder.renew(ADDRESS).unwrap(),
+        builder.rebind(ADDRESS).unwrap(),
+        builder.release(ADDRESS, SERVER).unwrap(),
+    ] {
+        assert_eq!(
+            parsed(&bytes)
+                .singleton_option(OPTION_HOST_NAME, hostname.len())
+                .unwrap(),
+            Some(hostname.as_bytes())
+        );
+    }
+    let bytes = ClientPacketBuilder::new(XID, MAC).discover().unwrap();
+    assert_eq!(
+        parsed(&bytes)
+            .singleton_option(OPTION_HOST_NAME, 1)
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn hostname_option_rejects_empty_oversized_and_non_ascii_payloads() {
+    for hostname in [
+        "".to_string(),
+        "x".repeat(256),
+        "bad\0name".into(),
+        "bad name".into(),
+        "роутер".into(),
+    ] {
+        assert!(builder().hostname(hostname).discover().is_err());
+    }
+    assert!(builder().hostname("x".repeat(255)).discover().is_ok());
+}

@@ -21,14 +21,16 @@ use super::{
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Field {
     Metric,
+    Hostname,
     DefaultRoute,
     Dns,
     Release,
     Apply,
     Cancel,
 }
-const FIELDS: [Field; 6] = [
+const FIELDS: [Field; 7] = [
     Field::Metric,
+    Field::Hostname,
     Field::DefaultRoute,
     Field::Dns,
     Field::Release,
@@ -40,6 +42,7 @@ pub(crate) struct Editor {
     interface: String,
     config: DhcpClientConfigRequest,
     metric: String,
+    hostname: String,
     cursor: usize,
     field: Field,
 }
@@ -47,11 +50,13 @@ pub(crate) struct Editor {
 impl Editor {
     fn new(interface: String, config: DhcpClientConfigRequest) -> Self {
         let metric = config.route_metric.to_string();
+        let hostname = config.hostname.clone().unwrap_or_default();
         Self {
             interface,
             config,
             cursor: metric.len(),
             metric,
+            hostname,
             field: Field::Metric,
         }
     }
@@ -62,6 +67,13 @@ impl Editor {
             .trim()
             .parse()
             .map_err(|_| "Metric must be an integer from 0 to 4294967295")?;
+        let hostname = self.hostname.trim();
+        config.hostname = if hostname.is_empty() {
+            None
+        } else {
+            traffic_masq_protocol::validate_dhcp_hostname(hostname)?;
+            Some(hostname.to_string())
+        };
         Ok(Request::ConfigureDhcpClient {
             interface: self.interface.clone(),
             config,
@@ -73,6 +85,7 @@ fn saved_policy(config: Option<InterfaceConfigView>) -> DhcpClientConfigRequest 
     config
         .and_then(|c| c.dhcp_client)
         .map(|c| DhcpClientConfigRequest {
+            hostname: c.hostname,
             route_metric: c.route_metric,
             install_default_route: c.install_default_route,
             request_dns: c.request_dns,
@@ -108,6 +121,11 @@ pub(crate) async fn open(app: &mut TuiApp, client: &ApiClient, interface: String
 pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
     if let (Some(editor), Some(field)) = (app.dhcp_client_editor.as_mut(), FIELDS.get(slot)) {
         editor.field = *field;
+        editor.cursor = input::grapheme_count(if editor.field == Field::Hostname {
+            &editor.hostname
+        } else {
+            &editor.metric
+        });
     }
 }
 
@@ -131,6 +149,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
         let style = Style::default().fg(if selected { theme::ACCENT } else { theme::TEXT });
         let label = match field {
             Field::Metric => "Route metric".to_string(),
+            Field::Hostname => "Hostname (empty: do not send)".to_string(),
             Field::DefaultRoute => format!(
                 "Install default route: {}",
                 editor.config.install_default_route
@@ -147,10 +166,15 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
             format!("{} {label}", if selected { "▶" } else { " " }),
             style,
         )];
-        if *field == Field::Metric {
+        if matches!(field, Field::Metric | Field::Hostname) {
+            let value = if *field == Field::Hostname {
+                &editor.hostname
+            } else {
+                &editor.metric
+            };
             spans.push(Span::raw(": "));
             spans.extend(input::render_value_with_cursor(
-                &editor.metric,
+                value,
                 editor.cursor,
                 selected,
                 style,
@@ -177,7 +201,12 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClien
             app.screen = Screen::DhcpClient;
         }
         KeyCode::Up | KeyCode::Down => {
-            editor.field = input::move_clamped(&FIELDS, editor.field, key == KeyCode::Down)
+            editor.field = input::move_clamped(&FIELDS, editor.field, key == KeyCode::Down);
+            editor.cursor = input::grapheme_count(if editor.field == Field::Hostname {
+                &editor.hostname
+            } else {
+                &editor.metric
+            });
         }
         KeyCode::Enter => match editor.field {
             Field::DefaultRoute => {
@@ -213,10 +242,19 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClien
                     Err(error) => app.push_message(LogLevel::Error, format!("Apply outcome unverified: {error}. Inspect current state before retrying")),
                 }
             }
-            Field::Metric => editor.field = Field::DefaultRoute,
+            Field::Metric => {
+                editor.field = Field::Hostname;
+                editor.cursor = input::grapheme_count(&editor.hostname);
+            }
+            Field::Hostname => editor.field = Field::DefaultRoute,
         },
-        other if editor.field == Field::Metric => {
-            input::TextEditor::new(&mut editor.metric, &mut editor.cursor).handle_key(other);
+        other if matches!(editor.field, Field::Metric | Field::Hostname) => {
+            let value = if editor.field == Field::Hostname {
+                &mut editor.hostname
+            } else {
+                &mut editor.metric
+            };
+            input::TextEditor::new(value, &mut editor.cursor).handle_key(other);
         }
         _ => {}
     }
@@ -228,6 +266,7 @@ mod tests {
     #[test]
     fn metric_edit_preserves_all_other_options_and_interface() {
         let config = DhcpClientConfigRequest {
+            hostname: Some("travel-router".into()),
             route_metric: 321,
             install_default_route: false,
             request_dns: false,
@@ -257,7 +296,7 @@ mod tests {
     }
     #[tokio::test]
     async fn loads_saved_policy_and_keeps_draft_on_rejected_apply() {
-        let config = serde_json::from_value(serde_json::json!({"role":"input","managed":true,"ipv4":null,"dhcp":null,"dhcp_client":{"route_metric":777,"install_default_route":false,"request_dns":false,"send_release_on_shutdown":true}})).unwrap();
+        let config = serde_json::from_value(serde_json::json!({"role":"input","managed":true,"ipv4":null,"dhcp":null,"dhcp_client":{"hostname":"saved-router","route_metric":777,"install_default_route":false,"request_dns":false,"send_release_on_shutdown":true}})).unwrap();
         let mock = super::super::test_api::mock(vec![
             Response::InterfaceConfig {
                 interface: "wan9".into(),
@@ -274,6 +313,8 @@ mod tests {
         assert_eq!(app.screen, Screen::DhcpClientEditor);
         assert_eq!(app.dhcp_client_editor.as_ref().unwrap().metric, "777");
         let editor = app.dhcp_client_editor.as_mut().unwrap();
+        assert_eq!(editor.hostname, "saved-router");
+        editor.hostname = "new-router".into();
         editor.metric = "42".into();
         editor.field = Field::Apply;
         handle_key(&mut app, KeyCode::Enter, &mock.client).await;
@@ -285,10 +326,53 @@ mod tests {
             assert_eq!(calls[1].path, "/api/v1/dhcp-client/wan9");
             assert_eq!(
                 calls[1].body,
-                serde_json::json!({"route_metric":42,"install_default_route":false,"request_dns":false,"send_release_on_shutdown":true})
+                serde_json::json!({"hostname":"new-router","route_metric":42,"install_default_route":false,"request_dns":false,"send_release_on_shutdown":true})
             );
         }
         handle_key(&mut app, KeyCode::Esc, &mock.client).await;
         assert!(app.dhcp_client_editor.is_none());
+    }
+}
+
+#[cfg(test)]
+mod hostname_tests {
+    use super::*;
+
+    #[test]
+    fn hostname_draft_is_validated_and_can_be_cleared() {
+        let mut editor = Editor::new("wan0".into(), DhcpClientConfigRequest::default());
+        editor.hostname = " travel-router.example ".into();
+        let Request::ConfigureDhcpClient { config, .. } = editor.request().unwrap() else {
+            panic!()
+        };
+        assert_eq!(config.hostname.as_deref(), Some("travel-router.example"));
+        for invalid in ["bad name", "-router", "router-", "bad..name", "роутер"] {
+            editor.hostname = invalid.into();
+            assert!(editor.request().is_err());
+        }
+        editor.hostname.clear();
+        let Request::ConfigureDhcpClient { config, .. } = editor.request().unwrap() else {
+            panic!()
+        };
+        assert_eq!(config.hostname, None);
+    }
+
+    #[tokio::test]
+    async fn hostname_field_accepts_text_and_keeps_cursor_on_focus_changes() {
+        let client = ApiClient::new(std::path::PathBuf::from("/unused-hostname-test.sock"));
+        let mut app = TuiApp {
+            dhcp_client_editor: Some(Editor::new(
+                "wan0".into(),
+                DhcpClientConfigRequest::default(),
+            )),
+            ..Default::default()
+        };
+        handle_key(&mut app, KeyCode::Down, &client).await;
+        handle_key(&mut app, KeyCode::Char('a'), &client).await;
+        handle_key(&mut app, KeyCode::Char('b'), &client).await;
+        handle_key(&mut app, KeyCode::Up, &client).await;
+        handle_key(&mut app, KeyCode::Down, &client).await;
+        handle_key(&mut app, KeyCode::Backspace, &client).await;
+        assert_eq!(app.dhcp_client_editor.as_ref().unwrap().hostname, "a");
     }
 }

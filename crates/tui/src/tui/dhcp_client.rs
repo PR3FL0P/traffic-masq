@@ -216,7 +216,8 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
                     .map(|reason| format!("  {reason}"))
                     .unwrap_or_else(|| {
                         format!(
-                            "  metric {}  default route {}  request DNS {}",
+                            "  hostname {}  metric {}  default route {}  request DNS {}",
+                            status.config.hostname.as_deref().unwrap_or("(not sent)"),
                             status.config.route_metric,
                             status.config.install_default_route,
                             status.config.request_dns

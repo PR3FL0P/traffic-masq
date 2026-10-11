@@ -84,6 +84,7 @@ pub enum DhcpClientState {
 #[derive(Debug, Clone)]
 pub struct DhcpClientStateMachine {
     mac: [u8; 6],
+    hostname: Option<String>,
     state: DhcpClientState,
     xid: Option<u32>,
     transaction_started: Option<MonotonicTime>,
@@ -96,12 +97,18 @@ impl DhcpClientStateMachine {
     pub fn new(mac: [u8; 6]) -> Self {
         Self {
             mac,
+            hostname: None,
             state: DhcpClientState::WaitingForLink,
             xid: None,
             transaction_started: None,
             retry: 0,
             deadline: None,
         }
+    }
+
+    pub fn with_hostname(mut self, hostname: Option<String>) -> Self {
+        self.hostname = hostname;
+        self
     }
 
     pub fn state(&self) -> &DhcpClientState {
@@ -428,7 +435,12 @@ impl DhcpClientStateMachine {
 
     fn builder(&self, now: MonotonicTime) -> ClientPacketBuilder {
         let elapsed = now.saturating_sub(self.transaction_started.unwrap_or(now));
-        ClientPacketBuilder::new(self.xid.expect("sending requires xid"), self.mac).elapsed(elapsed)
+        let builder = ClientPacketBuilder::new(self.xid.expect("sending requires xid"), self.mac)
+            .elapsed(elapsed);
+        match &self.hostname {
+            Some(hostname) => builder.hostname(hostname.clone()),
+            None => builder,
+        }
     }
 
     /// Schedule a wakeup no earlier than the minimum timer interval after `now`.

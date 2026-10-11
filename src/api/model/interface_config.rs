@@ -68,6 +68,7 @@ impl From<DhcpClientInterfaceConfigView> for DhcpClientInterfaceConfig {
         Self {
             wifi_owned: value.wifi_owned,
             enabled: value.enabled,
+            hostname: value.hostname,
             route_metric: value.route_metric,
             install_default_route: value.install_default_route,
             request_dns: value.request_dns,
@@ -81,6 +82,7 @@ impl From<DhcpClientInterfaceConfig> for DhcpClientInterfaceConfigView {
         Self {
             wifi_owned: value.wifi_owned,
             enabled: value.enabled,
+            hostname: value.hostname,
             route_metric: value.route_metric,
             install_default_route: value.install_default_route,
             request_dns: value.request_dns,

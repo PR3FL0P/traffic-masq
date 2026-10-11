@@ -5,15 +5,16 @@ use anyhow::{bail, Result};
 use crate::packet::{
     finish_options, push_option, DhcpMessageType, DhcpPacket, BOOTREPLY, BOOTREQUEST,
     DHCP_FIXED_HEADER_LEN, DHCP_MAGIC_COOKIE, ETHERNET_HLEN, ETHERNET_HTYPE,
-    OPTION_CLIENT_IDENTIFIER, OPTION_DNS_SERVERS, OPTION_LEASE_TIME, OPTION_MESSAGE_TYPE,
-    OPTION_PARAMETER_REQUEST_LIST, OPTION_REBINDING_TIME, OPTION_RENEWAL_TIME, OPTION_REQUESTED_IP,
-    OPTION_ROUTERS, OPTION_SERVER_IDENTIFIER, OPTION_SUBNET_MASK,
+    OPTION_CLIENT_IDENTIFIER, OPTION_DNS_SERVERS, OPTION_HOST_NAME, OPTION_LEASE_TIME,
+    OPTION_MESSAGE_TYPE, OPTION_PARAMETER_REQUEST_LIST, OPTION_REBINDING_TIME, OPTION_RENEWAL_TIME,
+    OPTION_REQUESTED_IP, OPTION_ROUTERS, OPTION_SERVER_IDENTIFIER, OPTION_SUBNET_MASK,
 };
 
 const BROADCAST_FLAG: u16 = 0x8000;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClientPacketOptions {
+    pub hostname: Option<String>,
     pub parameter_request_list: Vec<u8>,
     pub client_identifier: Option<Vec<u8>>,
 }
@@ -53,6 +54,11 @@ impl ClientPacketBuilder {
 
     pub fn client_identifier(mut self, identifier: impl Into<Vec<u8>>) -> Self {
         self.options.client_identifier = Some(identifier.into());
+        self
+    }
+
+    pub fn hostname(mut self, hostname: impl Into<String>) -> Self {
+        self.options.hostname = Some(hostname.into());
         self
     }
 
@@ -151,6 +157,17 @@ impl ClientPacketBuilder {
             bail!("DHCP client identifier must not be empty");
         }
 
+        if let Some(hostname) = &self.options.hostname {
+            if hostname.is_empty()
+                || hostname.len() > 255
+                || !hostname.bytes().all(|byte| byte.is_ascii_graphic())
+            {
+                bail!(
+                    "DHCP hostname must contain 1 to 255 printable ASCII characters without spaces"
+                );
+            }
+        }
+
         let mut packet = vec![0; DHCP_FIXED_HEADER_LEN + DHCP_MAGIC_COOKIE.len()];
         packet[0] = BOOTREQUEST;
         packet[1] = ETHERNET_HTYPE;
@@ -175,6 +192,9 @@ impl ClientPacketBuilder {
         }
         if let Some(identifier) = &self.options.client_identifier {
             push_option(&mut packet, OPTION_CLIENT_IDENTIFIER, identifier)?;
+        }
+        if let Some(hostname) = &self.options.hostname {
+            push_option(&mut packet, OPTION_HOST_NAME, hostname.as_bytes())?;
         }
         finish_options(&mut packet);
         Ok(packet)

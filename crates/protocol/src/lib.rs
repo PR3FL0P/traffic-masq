@@ -617,6 +617,8 @@ pub enum WifiClientErrorDetail {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DhcpClientConfigRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
     #[serde(default = "default_route_metric")]
     pub route_metric: u32,
     #[serde(default = "default_true")]
@@ -630,12 +632,33 @@ pub struct DhcpClientConfigRequest {
 impl Default for DhcpClientConfigRequest {
     fn default() -> Self {
         Self {
+            hostname: None,
             route_metric: default_route_metric(),
             install_default_route: true,
             request_dns: true,
             send_release_on_shutdown: false,
         }
     }
+}
+
+/// Validate the ASCII DNS name sent as DHCP option 12; None is handled by callers.
+pub fn validate_dhcp_hostname(hostname: &str) -> Result<(), &'static str> {
+    if hostname.is_empty() || hostname.len() > 253 {
+        return Err("Hostname must contain 1 to 253 ASCII characters");
+    }
+    for label in hostname.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || !label.as_bytes()[0].is_ascii_alphanumeric()
+            || !label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err("Hostname must use DNS labels of 1 to 63 letters, digits or hyphens, starting and ending with a letter or digit");
+        }
+    }
+    Ok(())
 }
 
 const fn default_route_metric() -> u32 {
@@ -1972,5 +1995,53 @@ mod tests {
         );
         assert!(!lease.is_expired_at(99));
         assert!(lease.is_expired_at(100));
+    }
+}
+
+#[cfg(test)]
+mod hostname_tests {
+    use super::*;
+
+    #[test]
+    fn validates_dhcp_hostnames_and_dns_label_boundaries() {
+        for name in ["travel-router", "Router7", "7router", "router.home.example"] {
+            assert!(validate_dhcp_hostname(name).is_ok(), "{name}");
+        }
+        for name in [
+            "",
+            "bad name",
+            "-router",
+            "router-",
+            "bad..name",
+            "bad_name",
+            "роутер",
+            ".router",
+            "router.",
+            "bad\0name",
+        ] {
+            assert!(validate_dhcp_hostname(name).is_err(), "{name}");
+        }
+        assert!(validate_dhcp_hostname(&"x".repeat(63)).is_ok());
+        assert!(validate_dhcp_hostname(&"x".repeat(64)).is_err());
+        let longest = format!(
+            "{}.{}.{}.{}",
+            "x".repeat(63),
+            "x".repeat(63),
+            "x".repeat(63),
+            "x".repeat(61)
+        );
+        assert_eq!(longest.len(), 253);
+        assert!(validate_dhcp_hostname(&longest).is_ok());
+        assert!(validate_dhcp_hostname(&(longest + "x")).is_err());
+    }
+
+    #[test]
+    fn legacy_dhcp_client_requests_default_to_no_hostname() {
+        let request: DhcpClientConfigRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(request.hostname, None);
+        assert!(serde_json::to_value(request)
+            .unwrap()
+            .get("hostname")
+            .is_none());
     }
 }

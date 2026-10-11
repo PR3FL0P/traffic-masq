@@ -256,6 +256,7 @@ pub(super) fn dhcp_client_request_to_config(
     enabled: bool,
 ) -> DhcpClientInterfaceConfig {
     DhcpClientInterfaceConfig {
+        hostname: request.hostname.clone(),
         wifi_owned: false,
         enabled,
         route_metric: request.route_metric,
@@ -318,6 +319,7 @@ pub(super) fn dhcp_client_status_view(status: DhcpClientStatus) -> DhcpClientSta
             .unwrap_or_default(),
         degraded_reason,
         config: DhcpClientConfigRequest {
+            hostname: status.spec.hostname.clone(),
             route_metric: status.spec.route_metric,
             install_default_route: status.spec.install_default_route,
             request_dns: status.spec.request_dns,

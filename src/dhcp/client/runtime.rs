@@ -22,6 +22,7 @@ pub const DHCP_CLIENT_PORT: u16 = 68;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DhcpClientRuntimeConfig {
+    pub hostname: Option<String>,
     pub interface: String,
     pub interface_index: u32,
     pub hardware_address: [u8; 6],
@@ -37,6 +38,7 @@ impl DhcpClientRuntimeConfig {
         hardware_address: [u8; 6],
     ) -> Self {
         Self {
+            hostname: None,
             interface: interface.into(),
             interface_index,
             hardware_address,
@@ -47,6 +49,9 @@ impl DhcpClientRuntimeConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        if let Some(hostname) = &self.hostname {
+            traffic_masq_protocol::validate_dhcp_hostname(hostname).map_err(anyhow::Error::msg)?;
+        }
         if self.interface.is_empty() || self.interface.as_bytes().contains(&0) {
             bail!("invalid DHCP client interface name");
         }
@@ -794,7 +799,8 @@ where
     ) -> Result<Self> {
         config.validate()?;
         Ok(Self {
-            state_machine: DhcpClientStateMachine::new(config.hardware_address),
+            state_machine: DhcpClientStateMachine::new(config.hardware_address)
+                .with_hostname(config.hostname.clone()),
             config,
             transport,
             dad,

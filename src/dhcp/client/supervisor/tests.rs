@@ -142,6 +142,7 @@ type SentPackets = Arc<std::sync::Mutex<Vec<(Vec<u8>, SendKind)>>>;
 #[derive(Default)]
 struct FakeLauncher {
     launches: std::sync::Mutex<Vec<String>>,
+    hostnames: std::sync::Mutex<Vec<Option<String>>>,
     remembered: std::sync::Mutex<Vec<Option<Ipv4Addr>>>,
     sinks: std::sync::Mutex<Vec<Box<dyn DhcpClientActionSink>>>,
     sends: SentPackets,
@@ -172,6 +173,7 @@ impl DhcpClientLauncher for FakeLauncher {
             anyhow::bail!("injected launch failure");
         }
         self.launches.lock().unwrap().push(launch.interface.clone());
+        self.hostnames.lock().unwrap().push(launch.hostname.clone());
         self.remembered
             .lock()
             .unwrap()
@@ -234,6 +236,7 @@ fn config(state_dir: &TempDir, interface: Option<DhcpClientInterfaceConfig>) -> 
 
 fn spec() -> DhcpClientSpec {
     DhcpClientSpec {
+        hostname: None,
         interface: "wan0".to_string(),
         route_metric: 100,
         install_default_route: true,
@@ -1234,4 +1237,31 @@ async fn unrelated_interface_cleanup_does_not_wait_for_a_client_operation() {
     );
     drop(operation);
     supervisor.shutdown(ShutdownPolicy::RestoreInterfaces).await;
+}
+
+#[tokio::test]
+async fn changing_hostname_restarts_the_client_and_clearing_it_stops_advertising() {
+    let state_dir = TempDir::new().unwrap();
+    let network = FakeNetwork::present(7).await;
+    let launcher = Arc::new(FakeLauncher::default());
+    let supervisor = supervisor_with(&state_dir, network, launcher.clone()).await;
+    let mut target = spec();
+    target.hostname = Some("travel-router".into());
+    supervisor.reconcile(target.clone()).await;
+    supervisor.reconcile(target.clone()).await;
+    assert_eq!(launcher.launch_count(), 2);
+    assert_eq!(
+        supervisor.spec("wan0").await.unwrap().hostname,
+        target.hostname
+    );
+    target.hostname = None;
+    supervisor.reconcile(target).await;
+    assert_eq!(launcher.launch_count(), 3);
+    assert_eq!(
+        *launcher.hostnames.lock().unwrap(),
+        vec![None, Some("travel-router".into()), None]
+    );
+    supervisor
+        .shutdown(ShutdownPolicy::PreserveInterfaces)
+        .await;
 }

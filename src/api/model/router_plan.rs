@@ -109,6 +109,7 @@ impl From<DhcpClientSpec> for DhcpClientSpecView {
     fn from(value: DhcpClientSpec) -> Self {
         Self {
             interface: value.interface,
+            hostname: value.hostname,
             route_metric: value.route_metric,
             install_default_route: value.install_default_route,
             request_dns: value.request_dns,
