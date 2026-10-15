@@ -1692,65 +1692,7 @@ fn authorize_control_request(principal: &Principal, request: &Request) -> Result
 
 /// Classify control requests that require administrator authorization.
 fn control_request_requires_administrator(request: &Request) -> bool {
-    matches!(
-        request,
-        Request::DaemonLogs { .. }
-            | Request::SaveRouterIntent { .. }
-            | Request::SaveWifiClientProfile { .. }
-            | Request::SaveWifiInterface { .. }
-            | Request::SaveInterfaceConfig { .. }
-            | Request::ForgetInterfaceConfig { .. }
-            | Request::ResetInterfaceOverride { .. }
-            | Request::ConfigureApiHttpsSettings { .. }
-            | Request::ResetApiHttpsSettings
-            | Request::ConfigureDhcp { .. }
-            | Request::ConfigureDhcpSettings { .. }
-            | Request::DisableDhcp { .. }
-            | Request::ConfigureDhcpClient { .. }
-            | Request::DisableDhcpClient { .. }
-            | Request::RenewDhcpClient { .. }
-            | Request::ReleaseDhcpClient { .. }
-            | Request::ApplyInterface { .. }
-            | Request::ApplyInterfaceEdit { .. }
-            | Request::CommitNetworkChange { .. }
-            | Request::RollbackNetworkChange { .. }
-            | Request::RouterApply { .. }
-            | Request::RouterCommit { .. }
-            | Request::RouterRollback { .. }
-            | Request::RouterProvisioningApply { .. }
-            | Request::RouterProvisioningRepair
-            | Request::VpnListSources
-            | Request::VpnImportFromSource { .. }
-            | Request::VpnImportProfile { .. }
-            | Request::VpnDeleteProfile { .. }
-            | Request::SetVpnEnabled { .. }
-            | Request::VpnActivate { .. }
-            | Request::VpnDeactivate
-            | Request::VpnPolicySetMode { .. }
-            | Request::VpnPolicyClearMode
-            | Request::ConfigureSecuritySettings { .. }
-            | Request::ResetSecuritySettings
-            | Request::ConfigureWifi { .. }
-            | Request::ProvisionWifiAccessPoint { .. }
-            | Request::SaveWifiApProfile { .. }
-            | Request::DeleteWifiApProfile { .. }
-            | Request::ActivateWifiApProfile { .. }
-            | Request::DisableWifi { .. }
-            | Request::WifiSetPassphrase { .. }
-            | Request::WifiDeauthStation { .. }
-            | Request::WifiReload { .. }
-            | Request::ConfigureWifiClient { .. }
-            | Request::DisableWifiClient { .. }
-            | Request::WifiClientSetPassphrase { .. }
-            | Request::WifiClientReconnect { .. }
-            | Request::WifiClientScan { .. }
-            | Request::CreateWifiClientProfile { .. }
-            | Request::UpdateWifiClientProfile { .. }
-            | Request::DeleteWifiClientProfile { .. }
-            | Request::ProvisionWifiClient { .. }
-            | Request::ActivateWifiClientProfile { .. }
-            | Request::DeactivateWifiClientProfile { .. }
-    )
+    request.policy().administrator
 }
 
 #[derive(Debug)]

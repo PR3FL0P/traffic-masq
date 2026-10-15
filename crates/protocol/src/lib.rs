@@ -5,6 +5,8 @@ mod interface;
 mod interface_plan;
 mod network;
 mod recovery_action;
+mod request_policy;
+pub use request_policy::{MutationKind, RequestPolicy};
 mod route;
 mod router;
 mod router_plan;

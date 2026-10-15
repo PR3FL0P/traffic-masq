@@ -7,32 +7,18 @@ use crate::core::transaction::InterfaceChange;
 impl ControlService {
     /// Route a typed request to its handler while enforcing mutation and recovery gates.
     pub(super) async fn dispatch_inner(&self, request: Request) -> Response {
-        // Admission stays held across convergence waits. Execution is held only
-        // by direct writers: the worker must remain able to realize proposals.
-        // Settings share the committed document with network intent. Their
-        // writes can fence the entire daemon, so serialize them with runtime
-        // writers even though router/interface recovery scopes do not apply.
-        let writes_settings = matches!(
-            &request,
-            Request::ConfigureApiHttpsSettings { .. }
-                | Request::ResetApiHttpsSettings
-                | Request::ConfigureSecuritySettings { .. }
-                | Request::ResetSecuritySettings
-        );
-        let _admission = if is_network_mutation(&request) || writes_settings {
+        let policy = request.policy();
+        let _admission = if policy.needs_admission() {
             Some(self.network_mutations.admit().await)
         } else {
             None
         };
-        let _execution = if writes_settings
-            || (is_network_mutation(&request)
-                && !is_converged_network_transaction_request(&request))
-        {
+        let _execution = if policy.needs_execution() {
             Some(self.network_mutations.execute().await)
         } else {
             None
         };
-        if is_network_mutation(&request) {
+        if policy.network_mutation() {
             // Confirmation requests carry a token, not an interface name.
             // Keep their recovery scope identical to the original apply.
             let transaction_interface = match &request {
@@ -48,7 +34,7 @@ impl ControlService {
             };
             let scope = transaction_interface
                 .as_deref()
-                .or_else(|| recovery_interface(&request));
+                .or(policy.recovery_interface);
             let retry_journal = match &request {
                 Request::RollbackNetworkChange { .. } => {
                     transaction_interface.as_ref().map(|interface| {
@@ -81,7 +67,7 @@ impl ControlService {
                 };
             }
         }
-        if is_network_mutation(&request) && !is_provisioning_secret_recovery_request(&request) {
+        if policy.network_mutation() && !policy.provisioning_recovery {
             if let Some(router) = &self.router {
                 // The provisioning-secret journal is an extra crash-recovery
                 // barrier only after the router coordinator itself is idle.
@@ -114,7 +100,7 @@ impl ControlService {
                 }
             }
         }
-        if is_direct_network_mutation(&request) {
+        if policy.direct_network_mutation() {
             if !matches!(
                 &request,
                 Request::ApplyInterface { .. }
@@ -752,150 +738,5 @@ impl ControlService {
                 self.disable_wifi_client(interface).await
             }
         }
-    }
-}
-
-/// Classify requests that must be serialized with other network mutations.
-fn is_network_mutation(request: &Request) -> bool {
-    matches!(
-        request,
-        Request::SaveRouterIntent { .. }
-            | Request::SaveWifiClientProfile { .. }
-            | Request::SaveWifiInterface { .. }
-            | Request::SaveInterfaceConfig { .. }
-            | Request::ForgetInterfaceConfig { .. }
-            | Request::ResetInterfaceOverride { .. }
-            | Request::ConfigureDhcpClient { .. }
-            | Request::DisableDhcpClient { .. }
-            | Request::RenewDhcpClient { .. }
-            | Request::ReleaseDhcpClient { .. }
-            | Request::ConfigureDhcpSettings { .. }
-            | Request::ConfigureDhcp { .. }
-            | Request::DisableDhcp { .. }
-            | Request::ApplyInterface { .. }
-            | Request::ApplyInterfaceEdit { .. }
-            | Request::CommitNetworkChange { .. }
-            | Request::RollbackNetworkChange { .. }
-            | Request::RouterApply { .. }
-            | Request::RouterCommit { .. }
-            | Request::RouterRollback { .. }
-            | Request::RouterProvisioningApply { .. }
-            | Request::RouterProvisioningRepair
-            | Request::VpnImportFromSource { .. }
-            | Request::VpnImportProfile { .. }
-            | Request::VpnDeleteProfile { .. }
-            | Request::SetVpnEnabled { .. }
-            | Request::VpnActivate { .. }
-            | Request::VpnDeactivate
-            | Request::VpnPolicySetMode { .. }
-            | Request::VpnPolicyClearMode
-            | Request::ConfigureWifi { .. }
-            | Request::ProvisionWifiAccessPoint { .. }
-            | Request::SaveWifiApProfile { .. }
-            | Request::DeleteWifiApProfile { .. }
-            | Request::ActivateWifiApProfile { .. }
-            | Request::DisableWifi { .. }
-            | Request::WifiSetPassphrase { .. }
-            | Request::WifiDeauthStation { .. }
-            | Request::WifiReload { .. }
-            | Request::ConfigureWifiClient { .. }
-            | Request::DisableWifiClient { .. }
-            | Request::WifiClientSetPassphrase { .. }
-            | Request::WifiClientReconnect { .. }
-            | Request::WifiClientScan { .. }
-            | Request::CreateWifiClientProfile { .. }
-            | Request::UpdateWifiClientProfile { .. }
-            | Request::DeleteWifiClientProfile { .. }
-            | Request::ProvisionWifiClient { .. }
-            | Request::ActivateWifiClientProfile { .. }
-            | Request::DeactivateWifiClientProfile { .. }
-    )
-}
-
-/// Identify transactions that require convergence to progress while admission remains reserved.
-fn is_converged_network_transaction_request(request: &Request) -> bool {
-    matches!(
-        request,
-        Request::ConfigureWifi { .. }
-            | Request::ConfigureDhcpClient { .. }
-            | Request::DisableWifi { .. }
-            | Request::ConfigureWifiClient { .. }
-            | Request::DisableWifiClient { .. }
-            | Request::DeactivateWifiClientProfile { .. }
-            | Request::ActivateWifiClientProfile { .. }
-            | Request::ProvisionWifiClient { .. }
-            | Request::ProvisionWifiAccessPoint { .. }
-            | Request::ActivateWifiApProfile { .. }
-            | Request::ApplyInterface { .. }
-            | Request::ApplyInterfaceEdit { .. }
-            | Request::CommitNetworkChange { .. }
-            | Request::RollbackNetworkChange { .. }
-    )
-}
-
-/// Identify mutations that require exclusive runtime execution.
-fn is_direct_network_mutation(request: &Request) -> bool {
-    is_network_mutation(request)
-        && !matches!(
-            request,
-            Request::RouterApply { .. }
-                | Request::RouterCommit { .. }
-                | Request::RouterRollback { .. }
-                | Request::RouterProvisioningApply { .. }
-                | Request::RouterProvisioningRepair
-        )
-}
-
-/// Identify requests allowed to repair or inspect retained provisioning recovery state.
-fn is_provisioning_secret_recovery_request(request: &Request) -> bool {
-    matches!(
-        request,
-        Request::RouterCommit { .. }
-            | Request::RouterRollback { .. }
-            | Request::RollbackNetworkChange { .. }
-    )
-}
-
-fn recovery_interface(request: &Request) -> Option<&str> {
-    match request {
-        Request::SaveWifiClientProfile { interface, .. }
-        | Request::SaveWifiInterface { interface, .. }
-        | Request::SaveInterfaceConfig { interface, .. }
-        | Request::ForgetInterfaceConfig { interface, .. }
-        | Request::ResetInterfaceOverride { interface, .. }
-        | Request::GetInterfaceConfig { interface, .. }
-        | Request::GetDhcpClient { interface, .. }
-        | Request::ConfigureDhcpClient { interface, .. }
-        | Request::DisableDhcpClient { interface, .. }
-        | Request::RenewDhcpClient { interface, .. }
-        | Request::ReleaseDhcpClient { interface, .. }
-        | Request::ConfigureDhcpSettings { interface, .. }
-        | Request::GetDhcpConfig { interface, .. }
-        | Request::ConfigureDhcp { interface, .. }
-        | Request::DisableDhcp { interface, .. }
-        | Request::ListLeases { interface, .. }
-        | Request::DryRunInterface { interface, .. }
-        | Request::DryRunInterfaceEdit { interface, .. }
-        | Request::ApplyInterface { interface, .. }
-        | Request::ApplyInterfaceEdit { interface, .. }
-        | Request::GetWifiConfig { interface, .. }
-        | Request::ConfigureWifi { interface, .. }
-        | Request::ProvisionWifiAccessPoint { interface, .. }
-        | Request::ActivateWifiApProfile { interface, .. }
-        | Request::DisableWifi { interface, .. }
-        | Request::WifiSetPassphrase { interface, .. }
-        | Request::ListWifiStations { interface, .. }
-        | Request::WifiDeauthStation { interface, .. }
-        | Request::WifiReload { interface, .. }
-        | Request::GetWifiClientConfig { interface, .. }
-        | Request::ConfigureWifiClient { interface, .. }
-        | Request::DisableWifiClient { interface, .. }
-        | Request::WifiClientSetPassphrase { interface, .. }
-        | Request::WifiClientReconnect { interface, .. }
-        | Request::WifiClientScan { interface, .. }
-        | Request::ProvisionWifiClient { interface, .. }
-        | Request::ActivateWifiClientProfile { interface, .. }
-        | Request::DeactivateWifiClientProfile { interface, .. } => Some(interface),
-        _ => None,
     }
 }
