@@ -33,8 +33,9 @@ pub struct InterfaceChangePlan {
     pub mac_address: Option<traffic_masq_protocol::MacAddr>,
     pub interface: String,
     pub delete_ipv4: Vec<Ipv4AddressInfo>,
-    /// The desired address is already on the link but carries no ownership
-    /// tag: claim it in place rather than dropping and re-adding it.
+    /// Explicit in-place ownership retag requested by a supplied plan.
+    /// Current planners leave this unset: an existing address is never claimed
+    /// merely because it matches the desired address.
     #[serde(default)]
     pub retag_ipv4: Option<Ipv4AddressInfo>,
     pub add_ipv4: Option<Ipv4AddressInfo>,

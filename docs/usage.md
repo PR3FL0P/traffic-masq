@@ -728,11 +728,12 @@ not keep its transaction pending once surviving owned services and leases have
 been cleaned up. Connectivity can remain unavailable after successful rollback.
 Inspect pending state to learn the outcome.
 
-Standalone DHCP and VPN controls plus Wi-Fi runtime controls such as
-reconnect/reload/passphrase updates take effect immediately and do not have an
-interface/router confirmation timer. Operator-triggered Wi-Fi configuration,
-profile activation, and live AP/client deactivation instead use the same tentative
-commit-confirm flow as other connectivity-sensitive interface changes. For an
+DHCP route metric and default-route policy changes on enabled clients use the
+interface confirmation timer. Other standalone DHCP controls, VPN controls and
+Wi-Fi runtime controls such as reconnect/reload/passphrase updates take effect
+immediately without an interface/router confirmation timer. Operator-triggered
+Wi-Fi configuration, profile activation, and live AP/client deactivation use the
+same tentative commit-confirm flow as other connectivity-sensitive interface changes. For an
 absent adapter with saved intent, edits/deactivation instead save intent after
 verified cleanup without a timer; see [disconnected adapters](#editing-disconnected-adapters). The
 immediate subsystems write durable ownership or launch records before persistent

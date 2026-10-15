@@ -148,18 +148,23 @@ HTTP 200, for example:
 ```
 
 Clients must therefore inspect both the HTTP status and the response `type`.
-Authentication and HTTP-layer failures use an untagged error body:
+Authentication and authorization failures use an untagged JSON error body:
 
 ```json
 { "error": "authentication required" }
 ```
 
-Common statuses are `400` for an invalid authentication request, `401` for a
-missing, invalid or expired session, `403` for insufficient access, `409` when
-the password is already initialized, `413` for an oversized body, `422` for
-malformed JSON, `429` for authentication throttling, and `500` for an internal
-authentication/server failure. Domain validation failures inside authenticated
-control requests use a typed response.
+HTTP extraction failures, such as invalid JSON, an invalid request schema or an
+oversized body, return plain-text errors rather than this JSON envelope. Clients
+must check the response status and content type before decoding an error body.
+
+Common statuses are `400` for syntactically invalid JSON or an invalid
+authentication request, `401` for a missing, invalid or expired session,
+`403` for insufficient access, `409` when the password is already initialized,
+`413` for an oversized body, `422` for
+JSON that does not match the request schema, `429` for authentication throttling,
+and `500` for an internal authentication/server failure. Domain validation
+failures inside authenticated control requests use a typed response.
 
 Path parameters such as `{interface}`, `{id}`, `{name}`, and `{mac}` must be
 percent-encoded as URL path segments.
@@ -239,7 +244,11 @@ Body names in the tables refer to the [request schemas](#request-schemas).
 | `POST` | `/router/provisioning/preview` | `RouterProvisioningPreview` | Preview Wi-Fi uplink/AP router setup | Authenticated |
 | `POST` | `/router/provisioning/apply` | `RouterProvisioningApply` | Tentatively apply the complete setup | Administrator |
 | `GET` | `/router/provisioning/status` | — | Provisioning readiness and failures | Authenticated |
-| `POST` | `/router/provisioning/repair` | — | Retry repair after a degraded rollback | Administrator |
+| `POST` | `/router/provisioning/repair` | — | Reapply committed router intent without a confirmation timer | Administrator |
+
+Repair requires an idle router coordinator and no pending interface transactions.
+After a failed rollback, inspect `/router/pending` and explicitly retry
+`POST /router/rollback` with its token before requesting repair.
 
 `/router/intent/preview` works without router execution or present adapters. It
 returns the candidate's base `revision`, effective router `config` (including
@@ -757,9 +766,11 @@ connection does not prove that a mutation failed; inspect the matching pending
 endpoint and current state before retrying. Never automatically retry a
 mutation whose outcome is unknown.
 
-DHCP and VPN controls plus Wi-Fi passphrase updates and runtime controls such
-as reconnect and reload still apply immediately. Their successful responses do
-not require a commit. Wi-Fi configuration, profile activation, and
+Changing DHCP route metric or default-route installation on an enabled client
+requires confirmation through the network transaction endpoints. Other DHCP
+controls, VPN controls, Wi-Fi passphrase updates and runtime controls such as
+reconnect and reload apply immediately; their successful responses do not
+require a commit. Wi-Fi configuration, profile activation, and
 operator-triggered AP/client deactivation on a present adapter require
 confirmation even through non-provisioning endpoints. On an absent adapter
 with a saved role, DELETE saves intent after verified cleanup and returns

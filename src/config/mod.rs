@@ -1,9 +1,10 @@
 //! Loading, validation, and resolution of application configuration.
 //!
 //! Configuration describes runtime directories, network interfaces, DHCP,
-//! Wi-Fi, VPN, firewall, API, and security settings. Values may come from a
-//! TOML file and environment variables; [`ResolvedConfig`] records the source
-//! of each resolved value.
+//! Wi-Fi, VPN, firewall, API, and security settings. Configuration comes from
+//! one TOML file or built-in defaults. The command line and `TRAFFIC_MASQ_CONFIG`
+//! environment variable select the file; [`ResolvedConfig`] records the source
+//! of the configuration as a whole.
 
 use std::collections::BTreeMap;
 use std::fs;

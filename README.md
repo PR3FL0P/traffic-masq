@@ -151,7 +151,9 @@ a client can reconnect. Tab moves between the list and clickable actions.
 
 In **DHCP Client**, select an interface and press **e** or Enter to edit route
 metric, default-route installation, DNS requests and Release on shutdown.
-The form loads saved settings and applies immediately, without a rollback timer.
+The form loads saved settings. Changing route metric or default-route
+installation on an enabled client requires Apply → Commit and rolls back if
+unconfirmed. Initial enablement and changes to other options apply immediately.
 If a DHCP default route conflicts with an existing route, traffic-masq selects
 the next free higher metric (lower priority) and logs a warning. The effective
 metric is retained with the lease across renewals and restart; saved settings

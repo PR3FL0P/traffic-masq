@@ -171,9 +171,11 @@ are drained before global errors are returned. Autonomous background writers
 (such as supervised-process liveness repair) take exclusive runtime execution so
 they cannot replay stale state across a convergence pass. Accepted control
 operations keep running if the HTTP client disconnects. The executor
-limits queued work and waits for accepted operations during shutdown. If a
-request times out, the client must check the current state before retrying: the
-change may already have taken effect.
+limits queued work and waits up to 30 seconds for accepted operations during
+shutdown, then cancels remaining tasks while retaining unresolved recovery
+journals. In-flight storage and runtime workers retain their reservations until
+completion. If a request times out, the client must check the current state
+before retrying: the change may already have taken effect.
 
 Async nftables operations reserve execution before entering the blocking pool
 and transfer that reservation to the worker. Cancellation leaves the reservation

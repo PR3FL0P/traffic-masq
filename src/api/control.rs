@@ -308,7 +308,8 @@ impl ControlService {
         self.transactions.clone()
     }
 
-    /// Close operation admission and wait for accepted requests before runtime shutdown.
+    /// Close admission and drain accepted requests up to the shutdown deadline.
+    /// Cancel remaining tasks while retaining recovery proof before runtime shutdown.
     pub async fn finish_operations(&self) {
         self.operations.close().await;
     }

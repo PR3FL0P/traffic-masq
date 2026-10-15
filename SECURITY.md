@@ -22,8 +22,10 @@ ownership record.
 ## Rollback and recovery
 
 The daemon runs the confirmation timer. Disconnecting the client does not stop
-an accepted operation. On normal shutdown, the daemon waits for those operations
-before cleaning up pending changes.
+an accepted operation. On normal shutdown, the daemon stops admitting operations
+and waits up to 30 seconds for accepted operations. It then cancels remaining
+tasks and retains unresolved recovery journals. Pending-change cleanup follows;
+in-flight storage and runtime work retains its reservations until it finishes.
 
 Router transactions save a private snapshot before making changes. After a
 restart, the daemon restores an uncommitted snapshot unless a matching commit

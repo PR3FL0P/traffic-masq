@@ -19,7 +19,8 @@ struct State {
 
 impl Operations {
     /// Accepted operations outlive their callers. Closing the service waits
-    /// for them before network shutdown begins.
+    /// up to the shutdown deadline, then cancels remaining tasks while retaining
+    /// recovery proof before network shutdown begins.
     pub(crate) async fn run<T: Send + 'static>(
         &self,
         operation: impl Future<Output = T> + Send + 'static,

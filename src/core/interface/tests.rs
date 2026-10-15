@@ -703,7 +703,7 @@ async fn applying_a_retag_honours_the_ownership_the_plan_carries() {
 }
 
 #[tokio::test]
-async fn legacy_address_is_claimed_in_place_on_every_path() {
+async fn existing_untagged_address_is_not_claimed_on_any_planning_path() {
     let provider = Arc::new(FakeNetworkProvider::default());
     provider
         .add_interface(
@@ -716,8 +716,7 @@ async fn legacy_address_is_claimed_in_place_on_every_path() {
     let desired = config(InterfaceRole::Output, "192.168.50.1/24");
 
     // The startup/reconcile path and the transactional path must agree:
-    // both claim the untagged address rather than one of them adopting it
-    // silently and the other tearing it down.
+    // both preserve the untagged address without adopting or replacing it.
     let startup = manager
         .plan_interface("eth0", &desired, Some(InterfaceRole::Output), false)
         .await
@@ -736,7 +735,7 @@ async fn legacy_address_is_claimed_in_place_on_every_path() {
     for plan in [&startup, &explicit] {
         assert!(
             plan.delete_ipv4.is_empty(),
-            "claiming an address must not take it off the link"
+            "preserving an existing address must not take it off the link"
         );
         assert!(plan.add_ipv4.is_none());
         assert!(plan.retag_ipv4.is_none());
@@ -744,7 +743,7 @@ async fn legacy_address_is_claimed_in_place_on_every_path() {
 }
 
 #[tokio::test]
-async fn claiming_a_legacy_address_keeps_it_on_the_link() {
+async fn applying_matching_configuration_preserves_existing_untagged_address() {
     let provider = Arc::new(FakeNetworkProvider::default());
     provider
         .add_interface(

@@ -593,8 +593,10 @@ pub trait RouterSubsystems: Send + Sync {
     /// Stop DHCP runtime installed by the candidate before interface rollback.
     /// Previous DHCP intent is restored by `rollback_dhcp_clients` afterwards.
     async fn rollback_candidate_uplink_dhcp(&self) -> Result<()>;
-    /// Restore captured client leases/configuration, with legacy uplink compatibility.
-    /// Keep durable lease ownership on cleanup failure.
+    /// Restore captured client configuration, with legacy uplink compatibility,
+    /// without replaying captured leases. Production verifies a current lease
+    /// before reporting restoration complete. Keep durable lease ownership on
+    /// cleanup failure.
     async fn rollback_dhcp_clients(
         &self,
         snapshots: &[DhcpClientSnapshot],
