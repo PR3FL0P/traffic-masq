@@ -9,6 +9,224 @@ use super::*;
 const WINDOW: Duration = Duration::from_secs(60);
 const WATCHDOG: Duration = Duration::from_secs(5);
 
+#[tokio::test]
+async fn failed_apply_must_not_restore_credentials_after_commit_becomes_indeterminate() {
+    let directory = tempdir().unwrap();
+    let desired = desired_state(directory.path()).await;
+    desired.attach_converger();
+    let manager = manager_for(&desired, fake_network());
+    let store = PassphraseStore::for_role(directory.path(), WifiCredentialRole::Ap);
+    store
+        .set("test0", &WifiPassphrase::new("original-password").unwrap())
+        .unwrap();
+    let worker = manager.clone();
+    let applying = tokio::spawn(async move {
+        worker
+            .apply(
+                "test0",
+                InterfaceChange {
+                    config: &credential_config(WifiCredentialRole::Ap),
+                    previous: Some(&interface_config(COMMITTED)),
+                    current_role: Some(InterfaceRole::Output),
+                    passphrase: WifiPassphraseUpdate::Set(
+                        WifiPassphrase::new("replacement-password").unwrap(),
+                    ),
+                    allow_management_change: false,
+                },
+            )
+            .await
+    });
+    wait_for_proposal(&desired).await;
+    assert_eq!(
+        store.get("test0").unwrap().unwrap().expose(),
+        "replacement-password"
+    );
+    crate::core::recovery::fence_commit(
+        directory.path(),
+        "concurrent persistence uncertain".into(),
+    );
+    // Once fenced, even a failed convergence pass must preserve credentials
+    // and tentative intent until restart resolves the durable commit proof.
+    desired.report_result(
+        desired.version(),
+        Err(anyhow::anyhow!("convergence failed")),
+    );
+    desired.fail_converger("worker stopped after uncertain persistence");
+    let error = tokio::time::timeout(WATCHDOG, applying)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        store.get("test0").unwrap().unwrap().expose(),
+        "replacement-password",
+        "failed apply compensated credentials despite the global commit fence"
+    );
+    assert!(desired.restorations().await.is_empty());
+    assert!(manager.journal_path("test0").exists());
+    let pending = manager.pending().await;
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].phase, NetworkChangePhase::CommitIndeterminate);
+    assert!(error.to_string().contains("commit_indeterminate"));
+}
+
+#[tokio::test]
+async fn failed_apply_rechecks_commit_fence_after_waiting_for_runtime_lane() {
+    let directory = tempdir().unwrap();
+    let desired = desired_state(directory.path()).await;
+    desired.attach_converger();
+    let manager = manager_for(&desired, fake_network());
+    let gate = Arc::new(NetworkMutationGate::default());
+    manager.set_runtime_gate(gate.clone());
+    let convergence = gate.converge().await;
+    let worker = manager.clone();
+    let applying = tokio::spawn(async move {
+        worker
+            .apply(
+                "test0",
+                InterfaceChange {
+                    config: &interface_config(PROPOSED),
+                    previous: None,
+                    current_role: Some(InterfaceRole::Output),
+                    passphrase: WifiPassphraseUpdate::Keep,
+                    allow_management_change: false,
+                },
+            )
+            .await
+    });
+    wait_for_proposal(&desired).await;
+    let lane = desired.runtime_locks.lock("test0").await;
+    desired.fail_converger("worker failed");
+    let path = manager.journal_path("test0");
+    tokio::time::timeout(WATCHDOG, async {
+        // Sharing the converger reservation proves compensation passed its
+        // initial scope check and is now waiting for the lane held above.
+        while Arc::strong_count(&convergence) == 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // The scope was admitted before this fence, but its runtime lane was not.
+    crate::core::recovery::fence_commit(
+        directory.path(),
+        "persistence uncertain while queued".into(),
+    );
+    drop(lane);
+    let error = tokio::time::timeout(WATCHDOG, applying)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(error.to_string().contains("commit_indeterminate"));
+    assert!(desired.restorations().await.is_empty());
+    assert!(path.exists());
+    assert_eq!(
+        manager.pending().await[0].phase,
+        NetworkChangePhase::CommitIndeterminate
+    );
+}
+
+#[tokio::test]
+async fn interface_apply_rejects_existing_commit_fence_before_registration() {
+    let directory = tempdir().unwrap();
+    let desired = desired_state(directory.path()).await;
+    let manager = manager_for(&desired, fake_network());
+    crate::core::recovery::fence_commit(directory.path(), "unresolved persistence".into());
+    let error = manager
+        .apply(
+            "test0",
+            InterfaceChange {
+                config: &interface_config(PROPOSED),
+                previous: None,
+                current_role: Some(InterfaceRole::Output),
+                passphrase: WifiPassphraseUpdate::Keep,
+                allow_management_change: false,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("commit_indeterminate"));
+    assert!(manager.pending().await.is_empty());
+    assert!(!desired.has_pending().await);
+    assert!(!manager.journal_path("test0").exists());
+}
+
+#[tokio::test]
+async fn cancelled_journal_write_is_owned_until_shutdown_can_retire_it() {
+    let directory = tempdir().unwrap();
+    let desired = desired_state(directory.path()).await;
+    let manager = manager_for(&desired, fake_network());
+    let path = manager.journal_path("test0");
+    let (entered, release) = crate::atomic_file::pause_next_replacement(&path);
+    let worker = manager.clone();
+    let applying = tokio::spawn(async move { apply_candidate(&worker).await });
+    tokio::task::spawn_blocking(move || entered.recv_timeout(WATCHDOG).unwrap())
+        .await
+        .unwrap();
+    applying.abort();
+    assert!(applying.await.unwrap_err().is_cancelled());
+
+    let shutdown_manager = manager.clone();
+    let mut shutdown = Box::pin(shutdown_manager.rollback_all_pending());
+    std::future::poll_fn(|cx| {
+        use std::future::Future;
+        assert!(
+            shutdown.as_mut().poll(cx).is_pending(),
+            "shutdown must drain the unfinished journal registration"
+        );
+        std::task::Poll::Ready(())
+    })
+    .await;
+    release.send(()).unwrap();
+    tokio::time::timeout(WATCHDOG, shutdown)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(manager.pending().await.is_empty());
+    assert!(!desired.has_pending().await);
+    assert!(
+        !path.exists(),
+        "shutdown must retire the cancelled apply's journal"
+    );
+    // No late write may recreate the journal or strand the next operation.
+    let pending = apply_candidate(&manager).await;
+    manager.rollback(&pending.token).await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_journal_write_compensates_without_shutdown_or_operator() {
+    let directory = tempdir().unwrap();
+    let desired = desired_state(directory.path()).await;
+    let manager = manager_for(&desired, fake_network());
+    let path = manager.journal_path("test0");
+    let (entered, release) = crate::atomic_file::pause_next_replacement(&path);
+    let worker = manager.clone();
+    let applying = tokio::spawn(async move { apply_candidate(&worker).await });
+    tokio::task::spawn_blocking(move || entered.recv_timeout(WATCHDOG).unwrap())
+        .await
+        .unwrap();
+    applying.abort();
+    assert!(applying.await.unwrap_err().is_cancelled());
+    release.send(()).unwrap();
+    // Drain registration without performing rollback: only its recovery guard
+    // can hand the cancelled transaction to autonomous compensation.
+    drop(
+        tokio::time::timeout(WATCHDOG, manager.inner.operation_lock.write())
+            .await
+            .unwrap(),
+    );
+    tokio::time::timeout(WATCHDOG, async {
+        while path.exists() || !manager.pending().await.is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!desired.has_pending().await);
+}
+
 async fn apply_candidate(manager: &NetworkTransactionManager) -> PendingNetworkChange {
     manager
         .apply(
@@ -39,7 +257,7 @@ fn manager_for(
     desired: &DesiredNetworkState,
     provider: Arc<FakeNetwork>,
 ) -> NetworkTransactionManager {
-    NetworkTransactionManager::new(
+    NetworkTransactionManager::new_detached(
         InterfaceManager::new(provider, AddressOwnershipJournal::in_memory()),
         WINDOW,
         desired.clone(),

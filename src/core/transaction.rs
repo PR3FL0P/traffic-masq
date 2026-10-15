@@ -50,6 +50,30 @@ const CONVERGENCE_DEADLINE: Duration = crate::wifi::lifecycle::STARTUP_READY_TIM
 /// report a pass that had already seen it, and keeps the bookkeeping —
 /// token, expiry, rollback timer — that turns "the machine now looks like
 /// this" into "and it stays that way only if you confirm".
+///
+/// Dropping an in-flight apply transfers compensation to a background task.
+/// Restoration must still be verified by convergence; storage/conflict stops
+/// leave a visible recovery token requiring explicit rollback.
+///
+/// Commit always persists configuration and its recovery token through the
+/// shared desired state's override manager. Custom persistence callbacks are
+/// not part of the public transaction contract.
+/// The desired state is supplied at construction and remains shared for the
+/// entire lifetime of the manager and its pending transactions.
+///
+/// ```compile_fail
+/// use traffic_masq::core::transaction::NetworkTransactionManager;
+/// async fn bypass_persistence(manager: &NetworkTransactionManager) {
+///     manager.commit_with("token", |_, _, _| async { Ok(()) }).await.unwrap();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use traffic_masq::core::{desired::DesiredNetworkState, transaction::NetworkTransactionManager};
+/// fn replace_state(manager: &NetworkTransactionManager, desired: DesiredNetworkState) {
+///     manager.set_desired_state(desired);
+/// }
+/// ```
 #[derive(Clone)]
 pub struct NetworkTransactionManager {
     inner: Arc<Inner>,
@@ -73,17 +97,14 @@ struct Inner {
     /// restored on shutdown. Nothing to do with transactions: by then the
     /// converger is gone, so this is the one path that still writes directly.
     baselines: Mutex<HashMap<String, InterfaceSnapshot>>,
-    operation_lock: RwLock<()>,
+    operation_lock: Arc<RwLock<()>>,
     runtime_gate: std::sync::Mutex<Option<Arc<NetworkMutationGate>>>,
     require_converger: std::sync::atomic::AtomicBool,
     token_counter: AtomicU64,
     timer_epochs: std::sync::Mutex<HashMap<String, u64>>,
     dhcp: Option<DhcpSupervisor>,
     default_lease_seconds: u32,
-    /// Where proposals go. Replaceable because the daemon builds the service
-    /// before it builds the converger, and the two have to share one state —
-    /// see [`NetworkTransactionManager::set_desired_state`].
-    desired: std::sync::Mutex<DesiredNetworkState>,
+    desired: DesiredNetworkState,
 }
 
 #[derive(Clone)]
@@ -162,6 +183,7 @@ impl NetworkTransactionManager {
         *self.inner.runtime_gate.lock().expect("runtime gate lock") = Some(gate);
     }
 
+    #[cfg(test)]
     pub(crate) fn require_converger(&self, required: bool) {
         self.inner
             .require_converger
@@ -189,7 +211,8 @@ impl NetworkTransactionManager {
             || address.owner() == crate::netlink::AddressOwner::TrafficMasqDhcp
     }
 
-    /// Create a transaction manager with no startup baselines or DHCP supervisor.
+    /// Create a transaction manager requiring a running converger.
+    /// No startup baselines or DHCP supervisor are installed.
     pub fn new(
         interface_manager: InterfaceManager,
         rollback_timeout: Duration,
@@ -198,7 +221,26 @@ impl NetworkTransactionManager {
         Self::new_with_baselines(interface_manager, rollback_timeout, Vec::new(), desired)
     }
 
-    /// Create a transaction manager that can restore the supplied startup snapshots.
+    /// Create a manager permitting apply without a converger for tests and tooling.
+    /// Detached apply reports acceptance of intent, not runtime convergence.
+    /// Failed or stopped convergers still cause apply to fail.
+    pub fn new_detached(
+        interface_manager: InterfaceManager,
+        rollback_timeout: Duration,
+        desired: DesiredNetworkState,
+    ) -> Self {
+        Self::build(
+            interface_manager,
+            rollback_timeout,
+            Vec::new(),
+            None,
+            1,
+            desired,
+            false,
+        )
+    }
+
+    /// Create a manager requiring a running converger, with startup snapshots to restore.
     pub fn new_with_baselines(
         interface_manager: InterfaceManager,
         rollback_timeout: Duration,
@@ -212,10 +254,11 @@ impl NetworkTransactionManager {
             None,
             1,
             desired,
+            true,
         )
     }
 
-    /// Create a manager with startup snapshots and DHCP-aware change previews.
+    /// Create a manager requiring a running converger, with startup snapshots and DHCP-aware previews.
     pub fn new_with_services(
         interface_manager: InterfaceManager,
         rollback_timeout: Duration,
@@ -231,6 +274,26 @@ impl NetworkTransactionManager {
             Some(dhcp),
             default_lease_seconds,
             desired,
+            true,
+        )
+    }
+
+    pub(crate) fn new_detached_with_services(
+        interface_manager: InterfaceManager,
+        rollback_timeout: Duration,
+        baselines: Vec<InterfaceSnapshot>,
+        dhcp: DhcpSupervisor,
+        default_lease_seconds: u32,
+        desired: DesiredNetworkState,
+    ) -> Self {
+        Self::build(
+            interface_manager,
+            rollback_timeout,
+            baselines,
+            Some(dhcp),
+            default_lease_seconds,
+            desired,
+            false,
         )
     }
 
@@ -241,6 +304,7 @@ impl NetworkTransactionManager {
         dhcp: Option<DhcpSupervisor>,
         default_lease_seconds: u32,
         desired: DesiredNetworkState,
+        require_converger: bool,
     ) -> Self {
         let baselines = baselines
             .into_iter()
@@ -252,37 +316,20 @@ impl NetworkTransactionManager {
                 rollback_timeout,
                 pending: Mutex::new(HashMap::new()),
                 baselines: Mutex::new(baselines),
-                operation_lock: RwLock::new(()),
+                operation_lock: Arc::new(RwLock::new(())),
                 runtime_gate: std::sync::Mutex::new(None),
-                require_converger: std::sync::atomic::AtomicBool::new(false),
+                require_converger: std::sync::atomic::AtomicBool::new(require_converger),
                 token_counter: AtomicU64::new(0),
                 timer_epochs: std::sync::Mutex::new(HashMap::new()),
                 dhcp,
                 default_lease_seconds,
-                desired: std::sync::Mutex::new(desired),
+                desired,
             }),
         }
     }
 
-    /// Point the manager at the desired state the converger is driving.
-    ///
-    /// Proposing into a state nobody converges would report success without
-    /// anything having happened, so the daemon has to call this once both
-    /// halves exist.
-    pub fn set_desired_state(&self, desired: DesiredNetworkState) {
-        *self
-            .inner
-            .desired
-            .lock()
-            .expect("desired state lock is never held across a panic") = desired;
-    }
-
     fn desired(&self) -> DesiredNetworkState {
-        self.inner
-            .desired
-            .lock()
-            .expect("desired state lock is never held across a panic")
-            .clone()
+        self.inner.desired.clone()
     }
 
     /// Preview an interface change without modifying desired state or kernel configuration.
@@ -363,7 +410,7 @@ impl NetworkTransactionManager {
             passphrase: passphrase_update,
             allow_management_change,
         } = change;
-        let _operation = self.inner.operation_lock.read().await;
+        let _operation = self.inner.operation_lock.clone().read_owned().await;
         let _interface_operation = self.desired().transaction_locks.lock(interface).await;
         let desired = self.desired();
         let gate = self.runtime_gate();
@@ -373,6 +420,7 @@ impl NetworkTransactionManager {
         };
 
         let lane = desired.runtime_locks.lock(interface).await;
+        crate::core::recovery::check_scope(desired.state_dir(), Some(interface))?;
         if self.inner.require_converger.load(Ordering::SeqCst) {
             anyhow::ensure!(
                 matches!(desired.converger_state(), ConvergerState::Running),
@@ -438,35 +486,64 @@ impl NetworkTransactionManager {
         })
         .await??;
         let secret = credentials.snapshot.clone();
-        self.write_journal_record(&token, snapshot.clone(), secret.clone())
-            .await?;
-        // Expose rollback-only ownership before changing credentials or intent.
-        // Cancellation can no longer strand a journal outside pending status.
-        self.inner.pending.lock().await.insert(
-            token.clone(),
-            PendingTransaction {
-                info: PendingNetworkChange {
-                    recovery_progress: None,
-                    token: token.clone(),
-                    interface: interface.to_owned(),
-                    rollback_timeout_seconds: self.inner.rollback_timeout.as_secs(),
-                    expires_at_unix: 0,
-                    phase: NetworkChangePhase::RollbackRequired,
-                    last_error: None,
-                },
-                confirmation_deadline: None,
-                target: config.clone(),
-                allow_management_change,
-                snapshot: snapshot.clone(),
-                previous_config: previous_config.clone(),
-                secret: secret.clone(),
+        let pending = PendingTransaction {
+            info: PendingNetworkChange {
+                recovery_progress: None,
+                token: token.clone(),
+                interface: interface.to_owned(),
+                rollback_timeout_seconds: self.inner.rollback_timeout.as_secs(),
+                expires_at_unix: 0,
+                phase: NetworkChangePhase::RollbackRequired,
+                last_error: None,
             },
-        );
-        let mut cancellation = ApplyRecoveryGuard {
-            manager: self.clone(),
-            token: token.clone(),
-            armed: true,
+            confirmation_deadline: None,
+            target: config.clone(),
+            allow_management_change,
+            snapshot: snapshot.clone(),
+            previous_config: previous_config.clone(),
+            secret: secret.clone(),
         };
+        let manager = self.clone();
+        // Registration owns the reservations until durable and volatile state
+        // agree. Cancelling the caller detaches this short task; its returned
+        // recovery guard then hands the registered transaction to compensation.
+        let (
+            _operation,
+            _interface_operation,
+            lane,
+            credential_update,
+            execution,
+            mut cancellation,
+        ) = tokio::spawn(async move {
+            manager
+                .write_journal_record(
+                    &pending.info.token,
+                    pending.snapshot.clone(),
+                    pending.secret.clone(),
+                )
+                .await?;
+            let token = pending.info.token.clone();
+            manager
+                .inner
+                .pending
+                .lock()
+                .await
+                .insert(token.clone(), pending);
+            let cancellation = ApplyRecoveryGuard {
+                manager,
+                token,
+                armed: true,
+            };
+            Ok::<_, anyhow::Error>((
+                _operation,
+                _interface_operation,
+                lane,
+                credential_update,
+                execution,
+                cancellation,
+            ))
+        })
+        .await??;
         let (apply_guard, stage_error) =
             match recovery_control::begin_apply(&self.journal_path(interface)).await {
                 Ok(guard) => (Some(guard), None),
@@ -509,11 +586,19 @@ impl NetworkTransactionManager {
             tracing::warn!(%interface, %token, error = %format!("{error:#}"), ?running_network_managers, "interface change failed; restoring previous configuration");
             let path = self.journal_path(interface);
             let rollback = recovery_control::run(&path, false, async {
+                crate::core::recovery::check_rollback_scope(
+                    desired.state_dir(),
+                    Some(interface),
+                    &path,
+                )?;
                 let execution = match &gate {
                     Some(gate) => Some(gate.participate().await),
                     None => None,
                 };
                 let lane = desired.runtime_locks.lock(interface).await;
+                // Persistence in another scope may have become uncertain
+                // while compensation waited for its runtime reservation/lane.
+                crate::core::recovery::check_commit(desired.state_dir())?;
                 let credential_update = desired.credential_updates.clone().read_owned().await;
                 let secret = secret.clone();
                 let root = desired.state_dir().to_path_buf();
@@ -699,7 +784,7 @@ impl NetworkTransactionManager {
 
     /// Confirm a pending change through the supplied persistence callback.
     /// A failed callback leaves the transaction pending; rollback-only changes cannot be committed.
-    pub async fn commit_with<F, Fut>(&self, token: &str, persist: F) -> Result<PendingNetworkChange>
+    async fn commit_with<F, Fut>(&self, token: &str, persist: F) -> Result<PendingNetworkChange>
     where
         F: FnOnce(String, InterfaceConfig, bool) -> Fut,
         Fut: Future<Output = Result<()>>,
@@ -987,8 +1072,11 @@ impl NetworkTransactionManager {
 
     /// Attempt every pending rollback and return all restoration failures together.
     pub async fn rollback_all_pending(&self) -> Result<()> {
+        // Registration and cancellation compensation must settle before the
+        // sweep captures its tokens. Keep ownership throughout the sweep so
+        // compensation cannot retire a token between collection and rollback.
+        let _operation = self.inner.operation_lock.write().await;
         let tokens: Vec<_> = {
-            let _operation = self.inner.operation_lock.write().await;
             // Cancelled applies and stopped startup recovery may exist only
             // in the journal; shutdown must not depend on a prior status query.
             self.import_stopped_journals().await?;
@@ -996,7 +1084,13 @@ impl NetworkTransactionManager {
         };
         let mut errors = Vec::new();
         for token in tokens {
-            if let Err(error) = self.rollback_inner(&token, false).await {
+            let result = async {
+                let interface = self.interface_for_token(&token).await?;
+                let _interface_operation = self.desired().transaction_locks.lock(&interface).await;
+                self.rollback_locked(&token, false).await
+            }
+            .await;
+            if let Err(error) = result {
                 errors.push(format!("{token}: {error:#}"));
             }
         }

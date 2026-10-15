@@ -153,6 +153,10 @@ pub struct ControlSubsystems {
 impl ControlService {
     /// Assemble the service with its final shared state before exposing it.
     pub fn from_runtime(runtime: ControlRuntime, subsystems: ControlSubsystems) -> Self {
+        Self::build(runtime, subsystems, false)
+    }
+
+    fn build(runtime: ControlRuntime, subsystems: ControlSubsystems, detached: bool) -> Self {
         let ControlRuntime {
             active_config: config,
             base_config,
@@ -164,7 +168,12 @@ impl ControlService {
             desired_state,
             mutation_gate: network_mutations,
         } = runtime;
-        let transactions = NetworkTransactionManager::new_with_services(
+        let transaction_constructor = if detached {
+            NetworkTransactionManager::new_detached_with_services
+        } else {
+            NetworkTransactionManager::new_with_services
+        };
+        let transactions = transaction_constructor(
             InterfaceManager::new(network.clone(), ownership_journal),
             Duration::from_secs(config.security.rollback_timeout_seconds),
             baselines,
@@ -173,7 +182,6 @@ impl ControlService {
             desired_state,
         );
         transactions.set_runtime_gate(network_mutations.clone());
-        transactions.require_converger(true);
         if let Some(router) = &subsystems.router {
             router.set_timeout_mutation_gate(network_mutations.clone());
         }
@@ -206,16 +214,16 @@ impl ControlService {
         }
     }
 
-    /// A service with an ownership journal of its own, which is to say one that
-    /// is not written down. For tests and tooling; the daemon shares the
-    /// journal it opened at startup through [`Self::from_runtime`].
-    pub fn new(
+    /// Create a standalone service with an in-memory ownership journal.
+    /// Detached interface apply accepts intent without proving runtime convergence.
+    /// For tests and tooling; daemon startup uses [`Self::from_runtime`].
+    pub fn new_detached(
         config: AppConfig,
         network: Arc<dyn NetworkProvider>,
         dhcp: DhcpSupervisor,
         overrides: RuntimeOverrideManager,
     ) -> Self {
-        Self::new_with_baselines(
+        Self::new_detached_with_baselines(
             config,
             network,
             dhcp,
@@ -226,8 +234,9 @@ impl ControlService {
     }
 
     /// Standalone construction for tests and tooling without a runtime worker.
+    /// Detached interface apply accepts intent without proving runtime convergence.
     /// Daemon startup uses [`Self::from_runtime`] instead.
-    pub fn new_with_baselines(
+    pub fn new_detached_with_baselines(
         config: AppConfig,
         network: Arc<dyn NetworkProvider>,
         dhcp: DhcpSupervisor,
@@ -236,7 +245,7 @@ impl ControlService {
         journal: AddressOwnershipJournal,
     ) -> Self {
         let desired_state = DesiredNetworkState::new(config.clone(), overrides.clone());
-        let service = Self::from_runtime(
+        Self::build(
             ControlRuntime {
                 active_config: config.clone(),
                 base_config: config,
@@ -249,9 +258,8 @@ impl ControlService {
                 mutation_gate: Arc::new(NetworkMutationGate::default()),
             },
             ControlSubsystems::default(),
-        );
-        service.transactions.require_converger(false);
-        service
+            true,
+        )
     }
 
     /// Set the merge base for a standalone service built by tests or tooling.
@@ -259,15 +267,6 @@ impl ControlService {
     ///
     pub fn with_base_config(mut self, base_config: AppConfig) -> Self {
         self.base_config = base_config;
-        self
-    }
-
-    /// Share the desired state that the convergence loop is driving.
-    ///
-    /// For standalone tests and tooling. Daemon construction supplies this
-    /// dependency through [`ControlRuntime`] without replacing live state.
-    pub fn with_desired_state(self, desired: DesiredNetworkState) -> Self {
-        self.transactions.set_desired_state(desired);
         self
     }
 

@@ -19,6 +19,85 @@ use crate::wifi::store::WifiCredentialRole;
 
 mod regressions;
 
+#[tokio::test]
+async fn runtime_constructors_reject_detached_apply_before_staging_changes() {
+    let directory = tempdir().unwrap();
+    let desired = desired_state(directory.path()).await;
+    let provider = fake_network();
+    let interfaces = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
+    let dhcp = DhcpSupervisor::start(&AppConfig::default()).await.unwrap();
+    let managers = [
+        NetworkTransactionManager::new(
+            interfaces.clone(),
+            Duration::from_secs(60),
+            desired.clone(),
+        ),
+        NetworkTransactionManager::new_with_baselines(
+            interfaces.clone(),
+            Duration::from_secs(60),
+            Vec::new(),
+            desired.clone(),
+        ),
+        NetworkTransactionManager::new_with_services(
+            interfaces,
+            Duration::from_secs(60),
+            Vec::new(),
+            dhcp,
+            60,
+            desired.clone(),
+        ),
+    ];
+    let before = addresses(&provider).await;
+    for manager in managers {
+        let error = manager
+            .apply(
+                "test0",
+                InterfaceChange {
+                    config: &interface_config(PROPOSED),
+                    previous: None,
+                    current_role: None,
+                    passphrase: WifiPassphraseUpdate::Keep,
+                    allow_management_change: false,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("converger unavailable"));
+        assert!(manager.pending().await.is_empty());
+        assert!(!desired.has_pending().await);
+        assert!(!manager.journal_path("test0").exists());
+        assert_eq!(addresses(&provider).await, before);
+    }
+}
+
+#[tokio::test]
+async fn detached_mode_only_skips_convergence_for_an_unattached_worker() {
+    let directory = tempdir().unwrap();
+    let desired = desired_state(directory.path()).await;
+    let manager = NetworkTransactionManager::new_detached(
+        InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory()),
+        Duration::from_secs(60),
+        desired.clone(),
+    );
+    manager.await_convergence(&desired, "test0").await.unwrap();
+    desired.fail_converger("worker failed");
+    assert!(manager
+        .await_convergence(&desired, "test0")
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("worker failed"));
+    desired.attach_converger();
+    desired.stop_converger();
+    assert!(manager
+        .await_convergence(&desired, "test0")
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("stopped"));
+    assert!(manager.pending().await.is_empty());
+}
+
 fn wifi_runtime_dirs() -> WifiRuntimeDirs {
     WifiRuntimeDirs::new(
         "/run/traffic-masq/hostapd",
@@ -309,8 +388,11 @@ async fn restart_removes_unconfirmed_address_on_previously_unmanaged_interface()
     let provider = fake_network();
     let interfaces = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
     let desired = desired_state(directory.path()).await;
-    let transactions =
-        NetworkTransactionManager::new(interfaces.clone(), Duration::from_secs(60), desired);
+    let transactions = NetworkTransactionManager::new_detached(
+        interfaces.clone(),
+        Duration::from_secs(60),
+        desired,
+    );
     let snapshot = interfaces.snapshot("test0").await.unwrap();
     transactions
         .write_journal("interrupted", snapshot)
@@ -348,8 +430,11 @@ async fn independently_blocked_interface_is_not_rolled_back_by_transaction_recov
     let provider = fake_network();
     let interfaces = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
     let desired = desired_state(directory.path()).await;
-    let transactions =
-        NetworkTransactionManager::new(interfaces.clone(), Duration::from_secs(60), desired);
+    let transactions = NetworkTransactionManager::new_detached(
+        interfaces.clone(),
+        Duration::from_secs(60),
+        desired,
+    );
     transactions
         .write_journal("interrupted", interfaces.snapshot("test0").await.unwrap())
         .await
@@ -389,8 +474,11 @@ async fn restart_keeps_address_whose_commit_token_was_persisted() {
     let provider = fake_network();
     let interfaces = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
     let desired = desired_state(directory.path()).await;
-    let transactions =
-        NetworkTransactionManager::new(interfaces.clone(), Duration::from_secs(60), desired);
+    let transactions = NetworkTransactionManager::new_detached(
+        interfaces.clone(),
+        Duration::from_secs(60),
+        desired,
+    );
     transactions
         .write_journal("confirmed", interfaces.snapshot("test0").await.unwrap())
         .await
@@ -467,7 +555,7 @@ async fn committed_invalid_interface_schema_is_retired_without_rollback() {
 async fn direct_commit_persists_the_configuration_and_recovery_token() {
     let directory = tempdir().unwrap();
     let desired = desired_state(directory.path()).await;
-    let manager = NetworkTransactionManager::new(
+    let manager = NetworkTransactionManager::new_detached(
         InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory()),
         Duration::from_secs(60),
         desired.clone(),
@@ -509,7 +597,7 @@ async fn direct_commit_persists_the_configuration_and_recovery_token() {
 async fn confirmation_waits_for_an_active_convergence_pass() {
     let directory = tempdir().unwrap();
     let desired = desired_state(directory.path()).await;
-    let manager = NetworkTransactionManager::new(
+    let manager = NetworkTransactionManager::new_detached(
         InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory()),
         Duration::from_secs(60),
         desired.clone(),
@@ -620,7 +708,7 @@ async fn failed_commit_persistence_keeps_change_pending_for_rollback() {
 async fn admission_does_not_extend_confirmation_deadline() {
     let directory = tempdir().unwrap();
     let desired = desired_state(directory.path()).await;
-    let manager = NetworkTransactionManager::new(
+    let manager = NetworkTransactionManager::new_detached(
         InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory()),
         Duration::from_millis(20),
         desired.clone(),
@@ -658,7 +746,7 @@ async fn admission_does_not_extend_confirmation_deadline() {
 async fn replaced_timer_cannot_rollback_after_waiting_for_operation_lock() {
     let directory = tempdir().unwrap();
     let desired = desired_state(directory.path()).await;
-    let manager = NetworkTransactionManager::new(
+    let manager = NetworkTransactionManager::new_detached(
         InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory()),
         Duration::from_secs(3600),
         desired.clone(),
@@ -706,7 +794,7 @@ async fn uncommitted_change_is_automatically_rolled_back() {
     let provider = fake_network();
     let desired = desired_state(directory.path()).await;
     let converger = spawn_converger(desired.clone(), provider.clone());
-    let manager = NetworkTransactionManager::new(
+    let manager = NetworkTransactionManager::new_detached(
         InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory()),
         Duration::from_millis(20),
         desired,
@@ -760,7 +848,7 @@ async fn an_apply_writes_desired_state_rather_than_the_kernel() {
     let directory = tempdir().expect("tempdir");
     let provider = fake_network();
     let desired = desired_state(directory.path()).await;
-    let manager = NetworkTransactionManager::new(
+    let manager = NetworkTransactionManager::new_detached(
         InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory()),
         Duration::from_secs(60),
         desired.clone(),
@@ -887,7 +975,7 @@ async fn failed_apply_with_failed_compensation_stays_pending_and_rollback_only()
 async fn clear_passphrase_is_journaled_and_restored_on_rollback() {
     let directory = tempdir().expect("tempdir");
     let desired = desired_state(directory.path()).await;
-    let manager = NetworkTransactionManager::new(
+    let manager = NetworkTransactionManager::new_detached(
         InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory()),
         Duration::from_secs(60),
         desired,
@@ -944,7 +1032,7 @@ async fn clearing_a_removed_wifi_role_uses_the_previous_role_store_and_rolls_bac
         .await
         .expect("overrides");
     let desired = DesiredNetworkState::new(base, overrides);
-    let manager = NetworkTransactionManager::new(
+    let manager = NetworkTransactionManager::new_detached(
         InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory()),
         Duration::from_secs(60),
         desired,
@@ -992,7 +1080,7 @@ async fn clearing_a_removed_wifi_role_uses_the_previous_role_store_and_rolls_bac
 async fn rollback_publishes_restore_intent_even_when_secret_restore_fails() {
     let directory = tempdir().expect("tempdir");
     let desired = desired_state(directory.path()).await;
-    let manager = NetworkTransactionManager::new(
+    let manager = NetworkTransactionManager::new_detached(
         InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory()),
         Duration::from_secs(60),
         desired.clone(),
@@ -1060,7 +1148,7 @@ async fn a_refused_change_is_reported_to_the_caller_and_not_proposed() {
     let directory = tempdir().expect("tempdir");
     let provider = fake_network();
     let desired = desired_state(directory.path()).await;
-    let manager = NetworkTransactionManager::new(
+    let manager = NetworkTransactionManager::new_detached(
         InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory()),
         Duration::from_secs(60),
         desired.clone(),
@@ -1090,7 +1178,7 @@ async fn corrupt_interface_journal_does_not_prevent_another_recovery() {
     let directory = tempdir().unwrap();
     let provider = fake_network();
     let interfaces = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
-    let transactions = NetworkTransactionManager::new(
+    let transactions = NetworkTransactionManager::new_detached(
         interfaces.clone(),
         Duration::from_secs(60),
         desired_state(directory.path()).await,
@@ -1287,7 +1375,7 @@ async fn rejected_wifi_candidate_restores_credentials_and_both_ip_policy_transit
 async fn automatic_rollback_retries_after_converger_recovers() {
     let directory = tempdir().unwrap();
     let desired = desired_state(directory.path()).await;
-    let manager = NetworkTransactionManager::new(
+    let manager = NetworkTransactionManager::new_detached(
         InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory()),
         Duration::from_millis(20),
         desired.clone(),
@@ -1468,7 +1556,7 @@ async fn keep_cannot_reuse_credentials_across_wifi_roles_in_either_direction() {
             .await
             .unwrap();
         let desired = DesiredNetworkState::new(base, overrides);
-        let manager = NetworkTransactionManager::new(
+        let manager = NetworkTransactionManager::new_detached(
             InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory()),
             Duration::from_secs(60),
             desired.clone(),
@@ -1535,7 +1623,7 @@ async fn role_switch_rollback_and_crash_recovery_restore_only_the_target_namespa
             let desired = DesiredNetworkState::new(base, overrides);
             let interfaces =
                 InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory());
-            let manager = NetworkTransactionManager::new(
+            let manager = NetworkTransactionManager::new_detached(
                 interfaces.clone(),
                 Duration::from_secs(60),
                 desired,
@@ -1655,7 +1743,7 @@ async fn explicit_file_on_role_switch_cannot_be_shadowed_by_stale_target_secret(
         .await
         .unwrap();
     let desired = DesiredNetworkState::new(base, overrides);
-    let manager = NetworkTransactionManager::new(
+    let manager = NetworkTransactionManager::new_detached(
         InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory()),
         Duration::from_secs(60),
         desired,
@@ -1691,7 +1779,7 @@ async fn stopped_interface_recovery_is_rechecked_and_completed_on_restart() {
     let desired = desired_state(directory.path()).await;
     let provider = fake_network();
     let interfaces = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
-    let manager = NetworkTransactionManager::new(
+    let manager = NetworkTransactionManager::new_detached(
         interfaces.clone(),
         Duration::from_secs(3600),
         desired.clone(),
@@ -1720,7 +1808,8 @@ async fn stopped_interface_recovery_is_rechecked_and_completed_on_restart() {
     .await
     .unwrap();
     assert!(!recovery_control::stopped(&path));
-    let restarted = NetworkTransactionManager::new(interfaces, Duration::from_secs(3600), desired);
+    let restarted =
+        NetworkTransactionManager::new_detached(interfaces, Duration::from_secs(3600), desired);
     assert!(!path.exists());
     assert!(restarted.pending().await.is_empty());
     assert!(crate::core::recovery::check_scope(directory.path(), Some("test0")).is_ok());

@@ -116,7 +116,7 @@ async fn dhcp_client_http_routes_allow_viewer_get_and_require_admin_for_put() ->
     let overrides = RuntimeOverrideManager::load(&config.runtime.state_dir, &config).await?;
     let dhcp = DhcpSupervisor::start(&config).await?;
     let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork);
-    let control = ControlService::new(config.clone(), network, dhcp.clone(), overrides);
+    let control = ControlService::new_detached(config.clone(), network, dhcp.clone(), overrides);
     let auth = AuthService::open(&config.auth).await?;
     auth.initialize_device_password("correct horse battery")
         .await?;
@@ -198,7 +198,8 @@ async fn authenticated_http_client_controls_daemon_over_unix_socket() -> Result<
     let overrides = RuntimeOverrideManager::load(&config.runtime.state_dir, &config).await?;
     let dhcp = DhcpSupervisor::start(&config).await?;
     let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork);
-    let control = ControlService::new(config.clone(), network, dhcp.clone(), overrides.clone());
+    let control =
+        ControlService::new_detached(config.clone(), network, dhcp.clone(), overrides.clone());
     let auth = AuthService::open(&config.auth).await?;
     auth.initialize_device_password("correct horse battery")
         .await?;
@@ -536,7 +537,7 @@ async fn optional_tcp_listener_serves_http_only_after_tls_handshake() -> Result<
 
     let overrides = RuntimeOverrideManager::load(&config.runtime.state_dir, &config).await?;
     let dhcp = DhcpSupervisor::start(&config).await?;
-    let control = ControlService::new(
+    let control = ControlService::new_detached(
         config.clone(),
         Arc::new(FakeNetwork),
         dhcp.clone(),
@@ -960,7 +961,7 @@ async fn router_test_server_with(
     let manager = RouterManager::new(fake);
     let coordinator =
         RouterTransactionCoordinator::new(manager, overrides.clone(), Duration::from_secs(60));
-    let control = ControlService::new(config.clone(), network, dhcp.clone(), overrides)
+    let control = ControlService::new_detached(config.clone(), network, dhcp.clone(), overrides)
         .with_router_coordinator(coordinator);
     let auth = AuthService::open(&config.auth).await?;
     auth.initialize_device_password("correct horse battery")
@@ -1370,7 +1371,7 @@ async fn vpn_profile_list_import_activate_status_deactivate_over_http() -> Resul
         active_profile_store,
     ));
 
-    let control = ControlService::new(config.clone(), network, dhcp.clone(), overrides)
+    let control = ControlService::new_detached(config.clone(), network, dhcp.clone(), overrides)
         .with_vpn_manager(vpn_manager);
     let auth = AuthService::open(&config.auth).await?;
     auth.initialize_device_password("correct horse battery")
@@ -1556,7 +1557,7 @@ async fn vpn_requests_return_vpn_disabled_when_no_vpn_manager_is_attached() -> R
     let dhcp = DhcpSupervisor::start(&config).await?;
     let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork);
 
-    let control = ControlService::new(config.clone(), network, dhcp.clone(), overrides);
+    let control = ControlService::new_detached(config.clone(), network, dhcp.clone(), overrides);
     let auth = AuthService::open(&config.auth).await?;
     auth.initialize_device_password("correct horse battery")
         .await?;
@@ -1598,7 +1599,7 @@ async fn wifi_runtime_requires_supervisors_but_configuration_remains_available()
     let dhcp = DhcpSupervisor::start(&config).await?;
     let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork);
 
-    let control = ControlService::new(config.clone(), network, dhcp.clone(), overrides);
+    let control = ControlService::new_detached(config.clone(), network, dhcp.clone(), overrides);
     let auth = AuthService::open(&config.auth).await?;
     auth.initialize_device_password("correct horse battery")
         .await?;
@@ -1870,7 +1871,7 @@ async fn vpn_policy_status_set_mode_clear_mode_over_http() -> Result<()> {
         ),
     );
 
-    let control = ControlService::new(config.clone(), network, dhcp.clone(), overrides)
+    let control = ControlService::new_detached(config.clone(), network, dhcp.clone(), overrides)
         .with_vpn_manager(tunnel)
         .with_vpn_policy_manager(policy);
     let auth = AuthService::open(&config.auth).await?;
@@ -2085,7 +2086,7 @@ async fn provisioning_test_server() -> Result<ProvisioningServer> {
     let manager = RouterManager::new(Arc::new(FakeRouterSubsystems::default()));
     let coordinator =
         RouterTransactionCoordinator::new(manager, overrides.clone(), Duration::from_secs(30));
-    let control = ControlService::new(
+    let control = ControlService::new_detached(
         config.clone(),
         Arc::new(ProvisioningNetwork) as Arc<dyn NetworkProvider>,
         dhcp.clone(),
@@ -2534,7 +2535,7 @@ async fn ap_profiles_roundtrip_over_http_without_disclosing_credentials() -> Res
     let overrides = RuntimeOverrideManager::load(&config.runtime.state_dir, &config).await?;
     let dhcp = DhcpSupervisor::start(&config).await?;
     let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork);
-    let control = ControlService::new(config.clone(), network, dhcp.clone(), overrides);
+    let control = ControlService::new_detached(config.clone(), network, dhcp.clone(), overrides);
     let auth = AuthService::open(&config.auth).await?;
     auth.initialize_device_password("correct horse battery")
         .await?;
@@ -2649,7 +2650,7 @@ async fn verified_https_client_reads_daemon_logs_only_as_administrator() -> Resu
     std::fs::write(config.runtime.log_dir.join("traffic-masqd.log.2026-10-09"), "2026-10-09T00:00:00Z INFO traffic_masq: ready\n2026-10-09T00:00:01Z WARN traffic_masq::wifi: retry\n")?;
     let overrides = RuntimeOverrideManager::load(&config.runtime.state_dir, &config).await?;
     let dhcp = DhcpSupervisor::start(&config).await?;
-    let control = ControlService::new(
+    let control = ControlService::new_detached(
         config.clone(),
         Arc::new(FakeNetwork),
         dhcp.clone(),

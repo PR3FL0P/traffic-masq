@@ -611,32 +611,23 @@ impl ControlService {
                     Err(error) => error_response(error),
                 }
             }
-            Request::CommitNetworkChange { token } => match self
-                .transactions
-                .commit_with(&token, |interface, config, allow_management_change| {
-                    self.overrides.commit_interface(
-                        interface,
-                        config,
-                        allow_management_change,
-                        &token,
-                    )
-                })
-                .await
-            {
-                Ok(change) => {
-                    let deactivated_interface = {
-                        self.pending_wifi_client_deactivations
-                            .lock()
-                            .await
-                            .remove(&token)
-                    };
-                    if let Some(interface) = deactivated_interface {
-                        self.wifi_autoconnect.lock().await.suspend(&interface);
+            Request::CommitNetworkChange { token } => {
+                match self.transactions.commit(&token).await {
+                    Ok(change) => {
+                        let deactivated_interface = {
+                            self.pending_wifi_client_deactivations
+                                .lock()
+                                .await
+                                .remove(&token)
+                        };
+                        if let Some(interface) = deactivated_interface {
+                            self.wifi_autoconnect.lock().await.suspend(&interface);
+                        }
+                        Response::NetworkChangeCommitted { change }
                     }
-                    Response::NetworkChangeCommitted { change }
+                    Err(error) => error_response(error),
                 }
-                Err(error) => error_response(error),
-            },
+            }
             Request::RollbackNetworkChange { token } => {
                 match self.transactions.rollback(&token).await {
                     Ok(change) => {

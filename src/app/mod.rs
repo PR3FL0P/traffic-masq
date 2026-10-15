@@ -250,7 +250,7 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
             .await?
     };
     // Cloned, not borrowed: `startup_baselines` is moved into
-    // ControlService::new_with_baselines later in this function, and a live
+    // ControlService::from_runtime later in this function, and a live
     // borrow held inside `stack` would make that move a compile error.
     stack.push({
         let interface_manager = interface_manager.clone();

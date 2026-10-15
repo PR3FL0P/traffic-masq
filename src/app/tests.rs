@@ -2365,7 +2365,7 @@ async fn rollback_without_external_connectivity(device_present: bool) {
         .add_interface_with_state("wan0", 7, true, Vec::new())
         .await;
     let journal = AddressOwnershipJournal::in_memory();
-    let manager = NetworkTransactionManager::new(
+    let manager = NetworkTransactionManager::new_detached(
         crate::core::interface::InterfaceManager::new(network.clone(), journal.clone()),
         Duration::from_secs(3600),
         desired.clone(),
