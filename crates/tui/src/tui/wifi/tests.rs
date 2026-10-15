@@ -16,10 +16,7 @@ async fn scan_request_opens_the_network_picker_with_returned_networks() {
     let mut app = TuiApp::default();
     app.wifi.rows.push(radio("wlp1s0"));
     start_scan(&mut app, &client, "wlp1s0".into()).await;
-    assert_eq!(
-        server.await.unwrap(),
-        vec!["POST /api/v1/wifi-client/wlp1s0/scan"]
-    );
+    assert_eq!(server.await.unwrap(), vec!["wifi_client_scan wlp1s0"]);
     assert_eq!(app.screen, Screen::WifiScan);
     let picker = app.wifi_scan.unwrap();
     assert_eq!(picker.interface, "wlp1s0");
@@ -56,12 +53,17 @@ async fn mock_api(
                         let paths = paths.clone();
                         let body = body.clone();
                         async move {
-                            paths.lock().await.push(format!(
-                                "{} {}",
-                                request.method(),
-                                request.uri().path()
-                            ));
-                            request.into_body().collect().await.unwrap();
+                            assert_eq!(request.method(), hyper::Method::POST);
+                            assert_eq!(request.uri().path(), "/api/v1/control");
+                            let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                            let command: serde_json::Value =
+                                serde_json::from_slice(&bytes).unwrap();
+                            let kind = command["type"].as_str().unwrap();
+                            let interface = command["interface"].as_str().unwrap_or("");
+                            paths
+                                .lock()
+                                .await
+                                .push(format!("{kind} {interface}").trim_end().to_owned());
                             Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(
                                 Bytes::from(body),
                             )))
@@ -218,10 +220,7 @@ async fn connect_failure_uses_one_backend_operation() {
         ..Default::default()
     };
     submit_wifi_connect(&mut app, &client).await;
-    assert_eq!(
-        server.await.unwrap(),
-        vec!["PUT /api/v1/wifi-client/wlan0/provision"]
-    );
+    assert_eq!(server.await.unwrap(), vec!["provision_wifi_client wlan0"]);
     assert!(app.wifi_connect.is_some());
     assert_eq!(app.message.as_deref(), Some("activation failed"));
 }
@@ -248,10 +247,7 @@ async fn static_connect_retains_pending_transaction_without_auto_commit() {
         ..Default::default()
     };
     submit_wifi_connect(&mut app, &client).await;
-    assert_eq!(
-        server.await.unwrap(),
-        vec!["PUT /api/v1/wifi-client/wlan0/provision"]
-    );
+    assert_eq!(server.await.unwrap(), vec!["provision_wifi_client wlan0"]);
     assert_eq!(app.screen, Screen::PendingChange);
     assert_eq!(app.pending.as_ref().unwrap().token, "pending-token");
     assert!(app.wifi_connect.is_none());
@@ -485,7 +481,7 @@ async fn ap_apply_enters_shared_commit_confirm_screen() {
 
     assert_eq!(
         server.await.unwrap(),
-        vec!["POST /api/v1/wifi/wlan0/provision"]
+        vec!["provision_wifi_access_point wlan0"]
     );
     assert_eq!(app.screen, Screen::PendingChange);
     assert_eq!(app.pending_return_screen, Screen::Wifi);
@@ -1513,10 +1509,7 @@ async fn profile_deactivation_enters_pending_change_and_returns_to_profiles() {
     assert_eq!(app.screen, Screen::PendingChange);
     assert_eq!(app.pending_return_screen, Screen::WifiProfiles);
     let paths = server.await.unwrap();
-    assert_eq!(
-        paths,
-        vec!["DELETE /api/v1/wifi-client/wlan0/active-profile"]
-    );
+    assert_eq!(paths, vec!["deactivate_wifi_client_profile wlan0"]);
 }
 
 #[test]
@@ -1744,7 +1737,7 @@ async fn ap_profile_save_does_not_activate_and_returns_to_selected_profile() {
     handle_wifi_editor_key(&mut app, KeyCode::Enter, &client).await;
     let paths = server.await.unwrap();
     assert_eq!(paths.len(), 1);
-    assert_eq!(paths, vec!["PUT /api/v1/wifi-ap-profiles"]);
+    assert_eq!(paths, vec!["save_wifi_ap_profile"]);
     assert!(app.wifi_editor.is_none());
     assert!(app.pending.is_none());
     assert_eq!(app.screen, Screen::WifiApProfiles);
@@ -1772,7 +1765,7 @@ async fn ap_profile_apply_uses_saved_profile_and_commit_confirmation() {
     handle_wifi_ap_profiles_key(&mut app, KeyCode::Enter, &client).await;
     let paths = server.await.unwrap();
     assert_eq!(paths.len(), 1);
-    assert_eq!(paths, vec!["PUT /api/v1/wifi/wlan0/profile"]);
+    assert_eq!(paths, vec!["activate_wifi_ap_profile wlan0"]);
     assert_eq!(app.pending, Some(change));
     assert_eq!(app.screen, Screen::PendingChange);
     assert_eq!(app.pending_return_screen, Screen::WifiApProfiles);
@@ -1809,8 +1802,8 @@ async fn ap_profile_delete_requires_confirmation_and_keeps_network_unchanged() {
     handle_wifi_ap_profiles_key(&mut app, KeyCode::Char('y'), &client).await;
     let paths = server.await.unwrap();
     assert_eq!(paths.len(), 2);
-    assert!(paths[0].starts_with("DELETE "));
-    assert!(paths[1].starts_with("GET "));
+    assert_eq!(paths[0], "delete_wifi_ap_profile");
+    assert_eq!(paths[1], "list_wifi_ap_profiles");
     assert!(app.wifi_ap_profiles.as_ref().unwrap().profiles.is_empty());
     assert!(app.pending.is_none());
 }
@@ -2014,10 +2007,7 @@ async fn control_o_submits_wifi_connection_from_any_field() {
         false,
     )
     .await;
-    assert_eq!(
-        server.await.unwrap(),
-        vec!["PUT /api/v1/wifi-client/wlan0/provision"]
-    );
+    assert_eq!(server.await.unwrap(), vec!["provision_wifi_client wlan0"]);
 }
 
 #[test]
@@ -2122,10 +2112,7 @@ async fn missing_client_without_wifi_settings_can_reopen_a_saved_profile_prompt(
         app.wifi_connect.as_ref().unwrap().expected_revision,
         Some(7)
     );
-    assert_eq!(
-        server.await.unwrap(),
-        vec!["GET /api/v1/interface-inventory"]
-    );
+    assert_eq!(server.await.unwrap(), vec!["list_interface_inventory"]);
 }
 
 #[tokio::test]
@@ -2158,9 +2145,9 @@ async fn missing_client_profile_prompt_saves_without_live_transaction_or_runtime
     assert_eq!(
         server.await.unwrap(),
         vec![
-            "GET /api/v1/interface-inventory",
-            "PUT /api/v1/interfaces/wlan0/wifi-client-intent",
-            "GET /api/v1/wifi-inventory"
+            "list_interface_inventory",
+            "save_wifi_client_profile wlan0",
+            "list_wifi_inventory"
         ]
     );
     assert!(app.pending.is_none());
@@ -2188,10 +2175,7 @@ async fn unknown_client_observation_does_not_open_a_profile_prompt() {
     )
     .await;
     assert!(app.wifi_connect.is_none());
-    assert_eq!(
-        server.await.unwrap(),
-        vec!["GET /api/v1/interface-inventory"]
-    );
+    assert_eq!(server.await.unwrap(), vec!["list_interface_inventory"]);
 }
 
 #[tokio::test]
@@ -2210,7 +2194,7 @@ async fn offline_profile_stale_error_keeps_the_prompt_and_revision_for_review() 
     submit_wifi_connect(&mut app, &client).await;
     assert_eq!(
         server.await.unwrap(),
-        vec!["PUT /api/v1/interfaces/wlan0/wifi-client-intent"]
+        vec!["save_wifi_client_profile wlan0"]
     );
     assert_eq!(
         app.wifi_connect.as_ref().unwrap().expected_revision,

@@ -944,14 +944,21 @@ mod tests {
         assert_eq!(app.router_rollback_timeout_seconds, 90);
         let calls = mock.calls.lock().unwrap();
         assert_eq!(calls.len(), 4);
-        assert_eq!(calls[3].path, "/api/v1/router/provisioning/apply");
+        assert_eq!(calls[3].path, "/api/v1/control");
+        assert_eq!(calls[3].body["type"], "router_provisioning_apply");
         assert_eq!(
-            calls[3].body["provisioning"]["downstream"]["interface_ipv4"],
+            calls[3].body["request"]["provisioning"]["downstream"]["interface_ipv4"],
             "192.168.77.1/24"
         );
-        assert_eq!(calls[3].body["uplink_passphrase"], "secret-upstream");
-        assert_eq!(calls[3].body["output_passphrase"], "secret-downstream");
-        assert!(!calls.iter().any(|c| c.path.ends_with("/commit")));
+        assert_eq!(
+            calls[3].body["request"]["uplink_passphrase"],
+            "secret-upstream"
+        );
+        assert_eq!(
+            calls[3].body["request"]["output_passphrase"],
+            "secret-downstream"
+        );
+        assert!(!calls.iter().any(|c| c.body["type"] == "router_commit"));
         assert!(!format!("{:?}", calls[1].body).contains("secret-upstream"));
     }
 

@@ -400,13 +400,10 @@ mod tests {
         let calls = mock.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].method, "POST");
-        assert!(
-            calls[0]
-                .path
-                .contains("wlan1/stations/00%3A11%3A22%3A33%3A44%3A55/deauthenticate"),
-            "{}",
-            calls[0].path
-        );
+        assert_eq!(calls[0].path, "/api/v1/control");
+        assert_eq!(calls[0].body["type"], "wifi_deauth_station");
+        assert_eq!(calls[0].body["interface"], "wlan1");
+        assert_eq!(calls[0].body["mac"], "00:11:22:33:44:55");
         assert!(app.wifi_stations.as_ref().unwrap().stations.is_empty());
     }
 

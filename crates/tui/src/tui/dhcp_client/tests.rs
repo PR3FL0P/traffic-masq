@@ -108,7 +108,7 @@ async fn mock_api(
     ApiClient,
     tokio::task::JoinHandle<Vec<String>>,
 ) {
-    use http_body_util::Full;
+    use http_body_util::{BodyExt, Full};
     use hyper::{body::Bytes, server::conn::http1, service::service_fn};
     use hyper_util::rt::TokioIo;
     let dir = tempfile::tempdir().unwrap();
@@ -124,13 +124,19 @@ async fn mock_api(
                 .serve_connection(
                     TokioIo::new(stream),
                     service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
-                        paths.lock().unwrap().push(format!(
-                            "{} {}",
-                            request.method(),
-                            request.uri().path()
-                        ));
+                        let paths = paths.clone();
                         let response = response.clone();
                         async move {
+                            assert_eq!(request.method(), hyper::Method::POST);
+                            assert_eq!(request.uri().path(), "/api/v1/control");
+                            let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                            let command: serde_json::Value =
+                                serde_json::from_slice(&bytes).unwrap();
+                            paths.lock().unwrap().push(format!(
+                                "{} {}",
+                                command["type"].as_str().unwrap(),
+                                command["interface"].as_str().unwrap_or("")
+                            ));
                             Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(
                                 Bytes::from(response),
                             )))
@@ -199,8 +205,8 @@ async fn successful_disable_refreshes_status_and_preserves_selection() {
         .unwrap()
         .unwrap();
     assert_eq!(paths.len(), 2);
-    assert!(paths[0].starts_with("DELETE "));
-    assert!(paths[1].starts_with("GET "));
+    assert_eq!(paths[0], "disable_dhcp_client wan0");
+    assert_eq!(paths[1], "dhcp_client_status ");
     assert!(app.dhcp_clients.is_empty());
     assert_eq!(app.dhcp_client_selected.as_deref(), Some("wan0"));
     assert!(app.message.as_deref().unwrap().contains("disabled on wan0"));
@@ -230,7 +236,7 @@ async fn resetting_route_policy_opens_network_confirmation() {
     assert_eq!(app.screen, Screen::PendingChange);
     assert_eq!(app.pending_return_screen, Screen::DhcpClient);
     assert_eq!(app.pending.as_ref().unwrap().token, "dhcp-reset");
-    assert_eq!(server.await.unwrap(), vec!["PUT /api/v1/dhcp-client/wan0"]);
+    assert_eq!(server.await.unwrap(), vec!["configure_dhcp_client wan0"]);
 }
 
 #[tokio::test]

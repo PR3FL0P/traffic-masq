@@ -2,7 +2,7 @@
 mod endpoint;
 
 mod control;
-pub use control::{encode_path_segment, map_request, RestRequest};
+pub use control::{map_request, RestRequest};
 mod session;
 pub use session::{
     control_request_timeout, ApiClient, ClientAuthentication, LoginSession,

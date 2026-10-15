@@ -13,6 +13,39 @@ Request bodies are limited to 64 KiB. HTTP/1 connections close after one
 request and have a 60-second server deadline; TLS handshakes have a 10-second
 deadline. A lost response does not cancel an admitted control operation.
 
+## Typed control endpoint
+
+The terminal client sends commands to `POST /api/v1/control`. Its JSON body is
+`traffic_masq_protocol::ControlRequest`, tagged by `type`, with the command's
+fields alongside it. For example:
+
+```json
+{"type": "get_interface_config", "interface": "eth0"}
+```
+
+```json
+{"type": "commit_network_change", "token": "<pending-token>"}
+```
+
+Responses use the same `ControlResponse` envelope as the REST routes below.
+The control endpoint requires a bearer session, including read commands and
+`ping`. Authorization depends on the decoded command, not the HTTP method:
+reads and previews accept any authenticated role, while administrative commands
+require `administrator`. Daemon logs and VPN source listings are administrative
+reads. The same admission, recovery and transaction rules apply to both
+transports. Invalid JSON returns HTTP 400, unknown commands or invalid payloads
+return HTTP 422, and bodies exceeding 64 KiB return HTTP 413.
+
+The client retains the public `GET /status` for availability checks before
+login and translates a successful response to `Pong`. Other typed commands use
+`/control` without automatic fallback or retries. Existing REST routes remain
+available for automation. Use a client from the same release as the daemon;
+older daemons do not expose `/control`.
+
+Client deadlines follow the command: observations use 10 seconds; writes,
+scans and dry-run plans use 65 seconds. Using POST for reads does not extend
+their deadline. A timeout does not cancel an admitted server operation.
+
 ## Quick start
 
 Check the daemon and authentication state without a session:

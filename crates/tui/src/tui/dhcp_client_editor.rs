@@ -332,7 +332,10 @@ mod tests {
         super::super::interfaces::handle_pending_key(&mut app, KeyCode::Esc, &mock.client).await;
         assert_eq!(app.screen, Screen::DhcpClient);
         assert!(app.pending.is_none());
-        assert!(mock.calls.lock().unwrap()[1].path.contains("rollback"));
+        assert_eq!(
+            mock.calls.lock().unwrap()[1].body["type"],
+            "rollback_network_change"
+        );
     }
 
     #[tokio::test]
@@ -363,10 +366,12 @@ mod tests {
         assert_eq!(app.dhcp_client_editor.as_ref().unwrap().metric, "42");
         {
             let calls = mock.calls.lock().unwrap();
-            assert_eq!(calls[1].method, "PUT");
-            assert_eq!(calls[1].path, "/api/v1/dhcp-client/wan9");
+            assert_eq!(calls[1].method, "POST");
+            assert_eq!(calls[1].path, "/api/v1/control");
+            assert_eq!(calls[1].body["type"], "configure_dhcp_client");
+            assert_eq!(calls[1].body["interface"], "wan9");
             assert_eq!(
-                calls[1].body,
+                calls[1].body["config"],
                 serde_json::json!({"hostname":"new-router","route_metric":42,"install_default_route":false,"request_dns":false,"send_release_on_shutdown":true})
             );
         }

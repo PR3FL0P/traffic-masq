@@ -531,10 +531,14 @@ mod tests {
         );
         let calls = mock.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].path, "/api/v1/router/intent/preview");
-        assert_eq!(calls[0].body["set_router"]["uplink"]["interface"], "wan0");
+        assert_eq!(calls[0].path, "/api/v1/control");
+        assert_eq!(calls[0].body["type"], "router_intent_preview");
         assert_eq!(
-            calls[0].body["set_router"]["vpn_chain"][1]["profile_name"],
+            calls[0].body["proposal"]["set_router"]["uplink"]["interface"],
+            "wan0"
+        );
+        assert_eq!(
+            calls[0].body["proposal"]["set_router"]["vpn_chain"][1]["profile_name"],
             "vpn1"
         );
     }

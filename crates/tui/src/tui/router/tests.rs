@@ -1191,12 +1191,14 @@ async fn router_mock_api(
                         let requests = requests.clone();
                         let body = body.clone();
                         async move {
-                            let path = format!("{} {}", request.method(), request.uri().path());
+                            assert_eq!(request.method(), hyper::Method::POST);
+                            assert_eq!(request.uri().path(), "/api/v1/control");
                             let request_body =
                                 request.into_body().collect().await.unwrap().to_bytes();
-                            let json = serde_json::from_slice(&request_body)
+                            let json: serde_json::Value = serde_json::from_slice(&request_body)
                                 .unwrap_or(serde_json::Value::Null);
-                            requests.lock().await.push((path, json));
+                            let kind = json["type"].as_str().unwrap().to_owned();
+                            requests.lock().await.push((kind, json));
                             Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(
                                 Bytes::from(body),
                             )))
@@ -1316,8 +1318,8 @@ async fn offline_router_preview_saves_latched_revision_and_retains_draft_on_stal
     assert_eq!(app.router.editor_revision, Some(7));
     assert!(app.router.staged && app.router.offline_preview.is_some());
     let requests = server.await.unwrap();
-    assert_eq!(requests[0].0, "POST /api/v1/router/intent/preview");
-    assert_eq!(requests[1].0, "PUT /api/v1/router/intent");
+    assert_eq!(requests[0].0, "router_intent_preview");
+    assert_eq!(requests[1].0, "save_router_intent");
     assert_eq!(requests[1].1["expected_revision"], 7);
     assert_eq!(
         requests[1].1["config"],
@@ -1504,8 +1506,10 @@ async fn editing_dhcp_default_route_opens_client_metric_settings() {
         allow_management_change: false,
     }])
     .await;
-    let mut app = TuiApp::default();
-    app.screen = Screen::Router;
+    let mut app = TuiApp {
+        screen: Screen::Router,
+        ..Default::default()
+    };
     app.router.routes = vec![route_status(
         &route_config("0.0.0.0/0"),
         RouteOwner::TrafficMasqDhcp,

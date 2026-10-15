@@ -9,7 +9,7 @@ the client reads interface state itself and cannot make changes.
 | `api` | HTTP, authorization and control-operation limits |
 | `crates/protocol` (`traffic-masq-protocol`) | API wire DTOs and pure shared intent validation, independent of daemon internals |
 | `crates/host-observation` (`traffic-masq-host-observation`) | Init-system observation, competing network-manager discovery and operator guidance |
-| `crates/api-client` (`traffic-masq-api-client`) | Unix-socket HTTP and verified HTTPS transport, auth/session, request mapping and response decoding |
+| `crates/api-client` (`traffic-masq-api-client`) | Unix-socket HTTP and verified HTTPS transport, auth/session, typed command transport and response decoding |
 | `crates/tui` (`traffic-masq-tui`) | Standalone terminal client and read-only direct-mode observation |
 | `core` | Configuration, ownership, plans, transactions and reconciliation |
 | `crates/netlink` (`traffic-masq-netlink`) | Kernel interfaces, IPv4 addresses, routes, rules and change events |
@@ -78,9 +78,12 @@ depending on the daemon crate. Its binary provides the operator interface.
 `config` re-exports shared interface, Wi-Fi and VPN enum values from protocol;
 `core::router_provisioning` similarly re-exports downstream overrides.
 The root `api::client::ApiClient` aliases the standalone `ControlApiClient`.
-The client crate maps protocol
-requests to REST endpoints and owns auth/session behavior without importing the
-daemon crate.
+The client sends protocol requests directly to `POST /api/v1/control` and owns
+auth/session behavior without importing the daemon crate. Public availability
+checks still use `GET /status`. REST adapters remain available and share the
+same authorization and dispatcher. An exhaustive protocol request policy owns
+administrative access, mutation execution discipline, recovery scope and client
+deadline classification; adding a command requires selecting its policy.
 
 ## Applying changes
 

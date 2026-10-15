@@ -1,20 +1,39 @@
 use super::*;
 
+async fn read_http_request(stream: &mut tokio::net::UnixStream) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut request = Vec::new();
+    let mut bytes = [0; 1024];
+    loop {
+        if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+            let headers = std::str::from_utf8(&request[..end]).unwrap();
+            let length: usize = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse().unwrap())
+                })
+                .unwrap();
+            if request.len() >= end + 4 + length {
+                return request;
+            }
+        }
+        let count = stream.read(&mut bytes).await.unwrap();
+        assert!(count > 0);
+        request.extend_from_slice(&bytes[..count]);
+    }
+}
+
 #[tokio::test]
 async fn rollback_click_sends_rollback_request() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("api.sock");
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = Vec::new();
-        let mut bytes = [0; 1024];
-        while !request.windows(4).any(|part| part == b"\r\n\r\n") {
-            let count = stream.read(&mut bytes).await.unwrap();
-            assert!(count > 0);
-            request.extend_from_slice(&bytes[..count]);
-        }
+        let request = read_http_request(&mut stream).await;
         stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
         String::from_utf8(request).unwrap()
     });
@@ -56,7 +75,8 @@ async fn rollback_click_sends_rollback_request() {
         .await
         .unwrap()
         .unwrap();
-    assert!(request.starts_with("POST /api/v1/network-transactions/rollback "));
+    assert!(request.starts_with("POST /api/v1/control "));
+    assert!(request.contains(r#""type":"rollback_network_change""#));
 }
 
 #[tokio::test]
@@ -887,19 +907,13 @@ async fn mouse_scrolls_message_when_open_and_ignores_navigation() {
 
 #[tokio::test]
 async fn small_terminal_escape_sends_rollback_request() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("api.sock");
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = Vec::new();
-        let mut bytes = [0; 1024];
-        while !request.windows(4).any(|part| part == b"\r\n\r\n") {
-            let count = stream.read(&mut bytes).await.unwrap();
-            assert!(count > 0);
-            request.extend_from_slice(&bytes[..count]);
-        }
+        let request = read_http_request(&mut stream).await;
         stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
         String::from_utf8(request).unwrap()
     });
@@ -934,7 +948,8 @@ async fn small_terminal_escape_sends_rollback_request() {
         .await
         .unwrap()
         .unwrap();
-    assert!(request.starts_with("POST /api/v1/network-transactions/rollback "));
+    assert!(request.starts_with("POST /api/v1/control "));
+    assert!(request.contains(r#""type":"rollback_network_change""#));
 }
 
 #[tokio::test]
@@ -962,19 +977,13 @@ async fn help_is_modal_and_does_not_activate_underlying_screen() {
 
 #[tokio::test]
 async fn small_terminal_enter_sends_commit_request() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("api.sock");
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = Vec::new();
-        let mut bytes = [0; 1024];
-        while !request.windows(4).any(|part| part == b"\r\n\r\n") {
-            let count = stream.read(&mut bytes).await.unwrap();
-            assert!(count > 0);
-            request.extend_from_slice(&bytes[..count]);
-        }
+        let request = read_http_request(&mut stream).await;
         stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
         String::from_utf8(request).unwrap()
     });
@@ -1009,7 +1018,8 @@ async fn small_terminal_enter_sends_commit_request() {
         .await
         .unwrap()
         .unwrap();
-    assert!(request.starts_with("POST /api/v1/network-transactions/commit "));
+    assert!(request.starts_with("POST /api/v1/control "));
+    assert!(request.contains(r#""type":"commit_network_change""#));
 }
 
 #[test]

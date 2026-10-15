@@ -15,12 +15,14 @@ async fn disabling_a_missing_client_saves_without_enabled_wifi_or_dhcp() {
                 TokioIo::new(stream),
                 service_fn(
                     |request: hyper::Request<hyper::body::Incoming>| async move {
-                        assert_eq!(request.method(), hyper::Method::PUT);
-                        assert_eq!(request.uri().path(), "/api/v1/interfaces/wlan0/intent");
+                        assert_eq!(request.method(), hyper::Method::POST);
+                        assert_eq!(request.uri().path(), "/api/v1/control");
                         let body: serde_json::Value = serde_json::from_slice(
                             &request.into_body().collect().await.unwrap().to_bytes(),
                         )
                         .unwrap();
+                        assert_eq!(body["type"], "save_interface_config");
+                        assert_eq!(body["interface"], "wlan0");
                         assert_eq!(body["expected_revision"], 7);
                         assert_eq!(body["config"]["managed"], false);
                         assert!(body["config"]["wifi_client"].is_null());
@@ -207,17 +209,14 @@ async fn keyboard_ip_and_mac_edit_previews_applies_and_confirms_the_typed_addres
                         let requests = requests.clone();
                         let body = body.clone();
                         async move {
-                            let path = request.uri().path().to_owned();
-                            let method = request.method().clone();
+                            assert_eq!(request.method(), hyper::Method::POST);
+                            assert_eq!(request.uri().path(), "/api/v1/control");
                             let bytes = request.into_body().collect().await.unwrap().to_bytes();
-                            let payload: serde_json::Value = if method == hyper::Method::GET {
-                                assert!(bytes.is_empty());
-                                serde_json::Value::Null
-                            } else {
-                                assert_eq!(method, hyper::Method::POST);
-                                serde_json::from_slice(&bytes).unwrap()
-                            };
-                            requests.lock().await.push((path, payload));
+                            let payload: serde_json::Value =
+                                serde_json::from_slice(&bytes).unwrap();
+                            let kind = payload["type"].as_str().unwrap().to_owned();
+                            assert_eq!(payload["interface"].as_str().unwrap_or("wlp1s0"), "wlp1s0");
+                            requests.lock().await.push((kind, payload));
                             Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(
                                 Bytes::from(body),
                             )))
@@ -259,16 +258,16 @@ async fn keyboard_ip_and_mac_edit_previews_applies_and_confirms_the_typed_addres
     assert!(app.pending.is_none());
     server.await.unwrap();
     let requests = requests.lock().await;
-    assert_eq!(requests[0].0, "/api/v1/interfaces/wlp1s0/config");
+    assert_eq!(requests[0].0, "get_interface_config");
     let requests = &requests[1..];
-    assert_eq!(requests[0].0, "/api/v1/interfaces/wlp1s0/edit/plan");
-    assert_eq!(requests[1].0, "/api/v1/interfaces/wlp1s0/edit/apply");
+    assert_eq!(requests[0].0, "dry_run_interface_edit");
+    assert_eq!(requests[1].0, "apply_interface_edit");
     for (_, body) in &requests[..2] {
-        assert_eq!(body["cidr"], "198.18.0.1/24");
-        assert_eq!(body["managed"], true);
-        assert_eq!(body["mac_address"], "02:11:22:33:44:55");
+        assert_eq!(body["edit"]["cidr"], "198.18.0.1/24");
+        assert_eq!(body["edit"]["managed"], true);
+        assert_eq!(body["edit"]["mac_address"], "02:11:22:33:44:55");
     }
-    assert_eq!(requests[2].0, "/api/v1/network-transactions/commit");
+    assert_eq!(requests[2].0, "commit_network_change");
     assert_eq!(requests[2].1["token"], "ip-test-token");
 }
 

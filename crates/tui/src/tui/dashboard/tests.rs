@@ -384,20 +384,28 @@ async fn partial_api_failure_does_not_clear_other_status_or_fetch_dhcp() {
                     .serve_connection(
                         TokioIo::new(stream),
                         service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
-                            let response = match req.uri().path() {
-                                "/api/v1/interface-inventory" => Response::Interfaces {
+                            assert_eq!(req.method(), hyper::Method::POST);
+                            assert_eq!(req.uri().path(), "/api/v1/control");
+                            let bytes = http_body_util::BodyExt::collect(req.into_body())
+                                .await
+                                .unwrap()
+                                .to_bytes();
+                            let command: serde_json::Value =
+                                serde_json::from_slice(&bytes).unwrap();
+                            let response = match command["type"].as_str().unwrap() {
+                                "list_interface_inventory" => Response::Interfaces {
                                     interfaces: vec![status(1)],
                                 },
-                                "/api/v1/interfaces/eth1/config" => Response::InterfaceConfig {
+                                "get_interface_config" => Response::InterfaceConfig {
                                     interface: "eth1".into(),
                                     config: None,
                                     allow_management_change: false,
                                 },
-                                "/api/v1/routes" => Response::Error {
+                                "list_routes" => Response::Error {
                                     message: "routes unavailable".into(),
                                 },
-                                "/api/v1/vpn/config" => Response::VpnConfig { enabled: false },
-                                "/api/v1/network-transactions" => {
+                                "get_vpn_config" => Response::VpnConfig { enabled: false },
+                                "pending_network_changes" => {
                                     Response::PendingNetworkChanges { changes: vec![] }
                                 }
                                 path => panic!("unexpected dashboard request: {path}"),

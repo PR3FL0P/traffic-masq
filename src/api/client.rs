@@ -7,8 +7,7 @@ pub use traffic_masq_api_client::ClientAuthentication;
 use hyper::Method;
 #[cfg(test)]
 use traffic_masq_api_client::{
-    control_request_timeout, encode_path_segment, map_request, CONTROL_MUTATION_REQUEST_TIMEOUT,
-    DEFAULT_REQUEST_TIMEOUT,
+    control_request_timeout, map_request, CONTROL_MUTATION_REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT,
 };
 
 #[cfg(test)]

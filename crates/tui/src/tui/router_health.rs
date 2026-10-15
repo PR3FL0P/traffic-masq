@@ -263,19 +263,22 @@ mod tests {
         handle_key(&mut app, KeyCode::Esc, &mock.client).await;
         assert!(!app.router_health.confirming);
         assert_eq!(app.screen, Screen::RouterHealth);
-        assert!(mock
-            .calls
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|call| call.method == "GET"));
+        assert!(
+            mock.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|call| call.method == "POST"
+                    && call.body["type"] == "router_provisioning_status")
+        );
         handle_key(&mut app, KeyCode::Char('f'), &mock.client).await;
         handle_key(&mut app, KeyCode::Char('y'), &mock.client).await;
         assert!(app.router_health.status.as_ref().unwrap().ready);
         let calls = mock.calls.lock().unwrap();
         assert_eq!(calls.len(), 4);
         assert_eq!(calls[3].method, "POST");
-        assert_eq!(calls[3].path, "/api/v1/router/provisioning/repair");
+        assert_eq!(calls[3].path, "/api/v1/control");
+        assert_eq!(calls[3].body["type"], "router_provisioning_repair");
     }
 
     #[tokio::test]

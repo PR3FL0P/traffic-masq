@@ -187,6 +187,7 @@ struct AppState {
 /// Register versioned REST routes and the shared authentication middleware.
 fn build_router(state: AppState) -> Router {
     let protected = Router::new()
+        .route("/control", post(control_request))
         .route("/auth/logout", post(logout))
         .route("/auth/me", get(current_principal))
         .route("/logs", get(daemon_logs))
@@ -1671,6 +1672,15 @@ async fn wifi_client_reconnect(
         Request::WifiClientReconnect { interface },
     )
     .await
+}
+
+/// Typed control transport; REST adapters use the same authorization and dispatcher.
+async fn control_request(
+    State(state): State<AppState>,
+    Extension(principal): Extension<Principal>,
+    Json(request): Json<Request>,
+) -> Result<Json<Response>, ApiError> {
+    dispatch_control(&state, &principal, request).await
 }
 
 async fn dispatch_control(

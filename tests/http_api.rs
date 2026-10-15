@@ -103,7 +103,7 @@ impl NetworkProvider for FakeNetwork {
 }
 
 #[tokio::test]
-async fn dhcp_client_http_routes_allow_viewer_get_and_require_admin_for_put() -> Result<()> {
+async fn dhcp_client_control_reads_allow_viewer_and_mutations_require_admin() -> Result<()> {
     let directory = tempdir()?;
     let mut config = AppConfig::default();
     config.runtime.socket_path = directory.path().join("traffic-masqd.sock");
@@ -144,7 +144,7 @@ async fn dhcp_client_http_routes_allow_viewer_get_and_require_admin_for_put() ->
             config: Default::default(),
         })
         .await
-        .expect_err("viewer PUT must be forbidden");
+        .expect_err("viewer mutation must be forbidden");
     assert!(forbidden.to_string().contains("403"), "{forbidden:#}");
 
     sqlx::query("UPDATE users SET role = 'administrator' WHERE username = 'device'")
@@ -2694,6 +2694,109 @@ async fn verified_https_client_reads_daemon_logs_only_as_administrator() -> Resu
         .to_string()
         .contains("403"));
     shutdown_tx.send(true)?;
+    task.await??;
+    dhcp.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn control_transport_preserves_rest_reads_and_rejects_invalid_requests() -> Result<()> {
+    use hyper::Method;
+    let (_directory, config, admin, task, shutdown, dhcp) = router_enabled_test_server().await?;
+    let anonymous = ApiClient::new(&config.runtime.socket_path);
+    assert!(matches!(
+        anonymous.request(&Request::Ping).await?,
+        Response::Pong
+    ));
+    let deadline = Duration::from_secs(5);
+    let response = anonymous
+        .send_with_timeout(
+            Method::POST,
+            "/api/v1/control",
+            Some(br#"{"type":"list_interfaces"}"#.to_vec()),
+            deadline,
+        )
+        .await?;
+    assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+
+    let rest = admin
+        .send_with_timeout(Method::GET, "/api/v1/interfaces", None, deadline)
+        .await?;
+    assert_eq!(rest.status, StatusCode::OK);
+    let rest: serde_json::Value = serde_json::from_slice(&rest.body)?;
+    let typed = admin.request(&Request::ListInterfaces).await?;
+    assert_eq!(rest, serde_json::to_value(typed)?);
+
+    // Both existing DHCP routes must still reach the same configuration handler.
+    // This interface is intentionally unmanaged, so each returns the same error.
+    let dhcp_body = serde_json::json!({
+        "pool_start": "192.0.2.10", "pool_end": "192.0.2.20",
+        "router": "192.0.2.1", "dns_servers": [], "lease_seconds": null
+    });
+    let mut dhcp_responses = Vec::new();
+    for path in ["/api/v1/dhcp/wan0", "/api/v1/dhcp/wan0/settings"] {
+        let response = admin
+            .send_with_timeout(
+                Method::PUT,
+                path,
+                Some(serde_json::to_vec(&dhcp_body)?),
+                deadline,
+            )
+            .await?;
+        assert_eq!(response.status, StatusCode::OK);
+        dhcp_responses.push(serde_json::from_slice::<serde_json::Value>(&response.body)?);
+    }
+    assert_eq!(dhcp_responses[0]["type"], "error");
+    assert_eq!(dhcp_responses[0], dhcp_responses[1]);
+
+    for (body, status) in [
+        (br#"{"type":"ping"}"#.to_vec(), StatusCode::OK),
+        (b"{".to_vec(), StatusCode::BAD_REQUEST),
+        (
+            br#"{"type":"unknown_command"}"#.to_vec(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            br#"{"type":"get_interface_config"}"#.to_vec(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (vec![b' '; 64 * 1024 + 1], StatusCode::PAYLOAD_TOO_LARGE),
+    ] {
+        let response = admin
+            .send_with_timeout(Method::POST, "/api/v1/control", Some(body), deadline)
+            .await?;
+        assert_eq!(response.status, status);
+        if status == StatusCode::OK {
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&response.body)?,
+                serde_json::json!({"type":"pong"})
+            );
+        }
+    }
+    let pool =
+        sqlx::SqlitePool::connect(&format!("sqlite://{}", config.auth.database_path.display()))
+            .await?;
+    sqlx::query("UPDATE users SET role = 'viewer' WHERE username = 'device'")
+        .execute(&pool)
+        .await?;
+    for (method, path, body) in [
+        (
+            Method::POST,
+            "/api/v1/control",
+            serde_json::json!({"type":"configure_dhcp_client", "interface":"wan0", "config":{}}),
+        ),
+        (
+            Method::PUT,
+            "/api/v1/dhcp-client/wan0",
+            serde_json::json!({}),
+        ),
+    ] {
+        let response = admin
+            .send_with_timeout(method, path, Some(serde_json::to_vec(&body)?), deadline)
+            .await?;
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
+    }
+    shutdown.send(true)?;
     task.await??;
     dhcp.shutdown().await;
     Ok(())

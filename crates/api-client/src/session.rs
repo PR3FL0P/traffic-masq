@@ -214,10 +214,10 @@ impl<Response: serde::de::DeserializeOwned> ApiClient<Response> {
         self.session.read().await.is_some()
     }
 
-    /// Translate a control request to REST, send it, and decode the typed response.
+    /// Send a typed command to the control endpoint and decode its response.
     /// Transport, HTTP status, and response decoding failures are returned to the caller.
     /// HTTP 200 domain errors decode successfully as `Ok(Response::*Error)`;
-    /// callers must inspect the variant. GET uses 10 seconds, mutations 65.
+    /// callers must inspect the variant. Reads use 10 seconds; writes, scans and plans 65.
     /// A lost response leaves mutation outcome unknown: inspect state before
     /// retrying and never automatically retry such a mutation.
     pub async fn request(
@@ -230,7 +230,7 @@ impl<Response: serde::de::DeserializeOwned> ApiClient<Response> {
             body,
             synthesize_pong,
         } = map_request(request)?;
-        let deadline = control_request_timeout(&method);
+        let deadline = control_request_timeout(request);
         let response = self
             .send_with_timeout(method, &path, body, deadline)
             .await?;
@@ -316,14 +316,12 @@ fn serialize_json(value: &(impl Serialize + ?Sized)) -> Result<Vec<u8>> {
     serde_json::to_vec(value).context("failed to encode API request body")
 }
 
-/// Return 65 seconds for POST/PUT/DELETE/PATCH and 10 seconds otherwise.
-/// This bounds client waiting, not the lifetime of an admitted server operation.
-pub fn control_request_timeout(method: &Method) -> std::time::Duration {
-    if method == Method::POST
-        || method == Method::PUT
-        || method == Method::DELETE
-        || method == Method::PATCH
-    {
+/// Bound client waiting independently of the shared POST transport.
+/// Writes, scans and plans retain 65 seconds; observations use 10 seconds.
+pub fn control_request_timeout(
+    request: &traffic_masq_protocol::ControlRequest,
+) -> std::time::Duration {
+    if request.policy().long_running {
         CONTROL_MUTATION_REQUEST_TIMEOUT
     } else {
         DEFAULT_REQUEST_TIMEOUT

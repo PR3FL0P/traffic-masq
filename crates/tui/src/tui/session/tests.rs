@@ -262,7 +262,7 @@ async fn restored_token_is_checked_by_api_and_revoked_token_is_discarded() {
                 let handler = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
                     let token_revoked = Arc::clone(&token_revoked);
                     async move {
-                        assert_eq!(request.uri().path(), "/api/v1/security/settings");
+                        assert_eq!(request.uri().path(), "/api/v1/control");
                         let token = request
                             .headers()
                             .get("authorization")

@@ -296,10 +296,12 @@ async fn missing_dhcp_editor_saves_revision_checked_intent_without_live_apply() 
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         http1::Builder::new().serve_connection(TokioIo::new(stream), service_fn(|request: hyper::Request<hyper::body::Incoming>| async move {
-            assert_eq!(request.method(), hyper::Method::PUT);
-            assert_eq!(request.uri().path(), "/api/v1/interfaces/usb0/intent");
+            assert_eq!(request.method(), hyper::Method::POST);
+            assert_eq!(request.uri().path(), "/api/v1/control");
             let body = request.into_body().collect().await.unwrap().to_bytes();
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["type"], "save_interface_config");
+            assert_eq!(body["interface"], "usb0");
             assert_eq!(body["expected_revision"], 42);
             assert_eq!(body["config"]["nat"], false);
             assert_eq!(body["config"]["dhcp"]["pool_start"], "192.168.50.10");
@@ -434,7 +436,9 @@ async fn failed_and_mismatched_lease_refreshes_retain_snapshot_then_recover() {
         .lock()
         .unwrap()
         .iter()
-        .all(|call| call.method == "GET"));
+        .all(|call| call.method == "POST"
+            && call.path == "/api/v1/control"
+            && call.body["type"] == "list_leases"));
 }
 
 #[tokio::test]
