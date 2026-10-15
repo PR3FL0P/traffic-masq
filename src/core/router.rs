@@ -800,20 +800,36 @@ impl RouterManager {
 
     /// Apply router operations in dependency order and verify DHCP readiness before dependent work.
     pub async fn apply(&self, plan: &RouterPlan) -> Result<()> {
+        self.apply_inner(plan, true).await
+    }
+
+    /// Execute under a coordinator-owned journal. The coordinator restores
+    /// credentials before compensating runtime consumers on any failure.
+    pub(crate) async fn apply_transaction(&self, plan: &RouterPlan) -> Result<()> {
+        self.apply_inner(plan, false).await
+    }
+
+    async fn apply_inner(&self, plan: &RouterPlan, compensate: bool) -> Result<()> {
         self.preflight(&plan.desired).await?;
         // Ownership changes only when execution begins. A dry-run plan calls
         // snapshot_for too, and must not acquire resources merely by observing
         // them. Adopt before the apply snapshot so DHCP/Wi-Fi teardown covers
         // interfaces newly introduced by this intent.
         self.subsystems.adopt_router_interfaces(&plan.desired).await;
-        let snapshot = self.snapshot_for(&plan.desired).await?;
+        let snapshot = if compensate {
+            Some(self.snapshot_for(&plan.desired).await?)
+        } else {
+            None
+        };
         let mut started = Vec::new();
 
         macro_rules! apply_stage {
             ($stage:expr, $operation:expr) => {{
                 started.push($stage);
                 if let Err(error) = $operation.await {
-                    return Err(self.rollback_error(error, &snapshot, &started).await.into());
+                    return Err(self
+                        .rollback_error(error, snapshot.as_ref(), &started)
+                        .await);
                 }
             }};
         }
@@ -829,7 +845,9 @@ impl RouterManager {
             .quiesce_uplink_dhcp(plan.desired.uplink_dhcp.as_ref())
             .await
         {
-            return Err(self.rollback_error(error, &snapshot, &started).await.into());
+            return Err(self
+                .rollback_error(error, snapshot.as_ref(), &started)
+                .await);
         }
 
         apply_stage!(
@@ -865,7 +883,9 @@ impl RouterManager {
             Err(error) => {
                 // A failed apply may already have changed runtime state.
                 started.push(Stage::UplinkDhcpCandidate);
-                return Err(self.rollback_error(error, &snapshot, &started).await.into());
+                return Err(self
+                    .rollback_error(error, snapshot.as_ref(), &started)
+                    .await);
             }
         }
         apply_stage!(
@@ -882,7 +902,9 @@ impl RouterManager {
             .cloned()
             .collect();
         if let Err(error) = self.subsystems.apply_output_wifi(&output_changes).await {
-            return Err(self.rollback_error(error, &snapshot, &started).await.into());
+            return Err(self
+                .rollback_error(error, snapshot.as_ref(), &started)
+                .await);
         }
         apply_stage!(Stage::Dhcp, self.subsystems.apply_dhcp(&plan.dhcp));
         apply_stage!(Stage::Routes, self.subsystems.apply_routes(&plan.routes));
@@ -895,7 +917,9 @@ impl RouterManager {
             ($name:literal, $operation:expr) => {
                 if let Err(error) = $operation.await {
                     let error = anyhow::anyhow!(concat!($name, " health failed: {}"), error);
-                    return Err(self.rollback_error(error, &snapshot, &started).await.into());
+                    return Err(self
+                        .rollback_error(error, snapshot.as_ref(), &started)
+                        .await);
                 }
             };
         }
@@ -915,7 +939,9 @@ impl RouterManager {
                 };
                 if tokio::time::Instant::now() >= deadline {
                     let error = anyhow::anyhow!("uplink DHCP readiness timed out: {reason:?}");
-                    return Err(self.rollback_error(error, &snapshot, &started).await.into());
+                    return Err(self
+                        .rollback_error(error, snapshot.as_ref(), &started)
+                        .await);
                 }
                 tokio::time::sleep(self.dhcp_readiness_poll).await;
             }
@@ -934,13 +960,18 @@ impl RouterManager {
     async fn rollback_error(
         &self,
         original: anyhow::Error,
-        snapshot: &RouterSnapshot,
+        snapshot: Option<&RouterSnapshot>,
         started: &[Stage],
-    ) -> RouterApplyError {
+    ) -> anyhow::Error {
+        let rollback_failures = match snapshot {
+            Some(snapshot) => self.rollback_stages(snapshot, started).await,
+            None => Vec::new(),
+        };
         RouterApplyError {
             original: format!("{original:#}"),
-            rollback_failures: self.rollback_stages(snapshot, started).await,
+            rollback_failures,
         }
+        .into()
     }
 
     /// Attempt subsystem restoration from the snapshot and collect all rollback failures.

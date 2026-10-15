@@ -418,6 +418,7 @@ struct FakeRouterSubsystems {
     cleanup_started: tokio::sync::Notify,
     cleanup_hold: std::sync::Mutex<Option<Arc<tokio::sync::Notify>>>,
     cleanup_failure: std::sync::Mutex<bool>,
+    health_pending: std::sync::atomic::AtomicBool,
     unhealthy_interfaces: std::sync::Mutex<bool>,
     unhealthy_routes: std::sync::Mutex<bool>,
     unhealthy_dhcp: std::sync::Mutex<bool>,
@@ -548,6 +549,12 @@ impl RouterSubsystems for FakeRouterSubsystems {
         Ok(())
     }
     async fn health_interfaces(&self, _: &RouterDesired) -> Result<()> {
+        if self
+            .health_pending
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            std::future::pending::<()>().await;
+        }
         if *self.unhealthy_interfaces.lock().unwrap() {
             anyhow::bail!("injected interfaces health failure");
         }
@@ -9885,11 +9892,21 @@ async fn cancelled_router_cleanup_keeps_coordination_until_writes_settle() {
     caller.abort();
     let _ = caller.await;
     assert!(
-        tokio::time::timeout(Duration::from_millis(20), router.status())
+        tokio::time::timeout(Duration::from_millis(20), router.wait_until_idle())
             .await
             .is_err()
     );
+    assert_eq!(
+        tokio::time::timeout(Duration::from_millis(100), router.status())
+            .await
+            .unwrap(),
+        CoordinatorStatus::Idle,
+        "status observation must remain available while cleanup retains coordination"
+    );
     hold.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), router.wait_until_idle())
+        .await
+        .unwrap();
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(2), router.status())
             .await
@@ -10233,4 +10250,45 @@ async fn regression_provisioning_secrets_follow_successful_automatic_router_retr
     .await;
     assert!(restored.is_ok(),
         "router recovered automatically, but uncommitted provisioning secrets/journal remain; ordinary network mutations stay blocked");
+}
+
+#[tokio::test]
+async fn router_status_endpoints_bound_health_observation() {
+    let fake = Arc::new(FakeRouterSubsystems::default());
+    let (service, _) =
+        router_service_with_config(fake.clone(), router_with_two_saved_sharing_rules()).await;
+    fake.health_pending
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::pause();
+    for request in [Request::RouterStatus, Request::RouterProvisioningStatus] {
+        let response = tokio::time::timeout(Duration::from_secs(2), service.dispatch(request))
+            .await
+            .expect("a busy health probe must not hide transaction status");
+        let (coordinator, ready, health) = match response {
+            Response::RouterStatus {
+                coordinator_status,
+                ready,
+                health,
+                ..
+            } => (coordinator_status, ready, health),
+            Response::RouterProvisioningStatus { status } => {
+                (status.coordinator, status.ready, status.readiness)
+            }
+            other => panic!("unexpected status response: {other:?}"),
+        };
+        assert_eq!(coordinator, CoordinatorStatus::Idle);
+        assert!(!ready);
+        assert!(health
+            .interfaces
+            .as_deref()
+            .unwrap()
+            .contains("observation timed out"));
+    }
+    fake.health_pending
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let Response::RouterStatus { health, .. } = service.dispatch(Request::RouterStatus).await
+    else {
+        panic!("expected router status after observation recovers");
+    };
+    assert!(health.ready(), "a later request must observe fresh health");
 }

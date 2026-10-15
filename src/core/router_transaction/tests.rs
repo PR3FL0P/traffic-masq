@@ -16,6 +16,7 @@ use crate::dhcp::supervisor::DhcpServiceSpec;
 use crate::firewall::{RouterDataplanePlan, RouterDataplaneSnapshot};
 
 use super::*;
+use crate::wifi::PassphraseStore;
 
 fn output_interface(address: &str, pool_start: u8, pool_end: u8) -> InterfaceConfig {
     let ipv4: ipnet::Ipv4Net = address.parse().expect("IPv4 network");
@@ -82,6 +83,11 @@ struct FakeSubsystems {
     rollback_fail: StdMutex<Option<&'static str>>,
     pause_apply: std::sync::atomic::AtomicBool,
     apply_entered: tokio::sync::Notify,
+    apply_release: tokio::sync::Notify,
+    pause_rollback: std::sync::atomic::AtomicBool,
+    rollback_entered: tokio::sync::Notify,
+    rollback_release: tokio::sync::Notify,
+    rollback_credentials_restored: StdMutex<Vec<bool>>,
     prepare_fail: std::sync::atomic::AtomicBool,
     prepare_attempts: std::sync::atomic::AtomicUsize,
     drifted: StdMutex<bool>,
@@ -97,6 +103,11 @@ impl FakeSubsystems {
             rollback_fail: StdMutex::new(None),
             pause_apply: std::sync::atomic::AtomicBool::new(false),
             apply_entered: tokio::sync::Notify::new(),
+            apply_release: tokio::sync::Notify::new(),
+            pause_rollback: std::sync::atomic::AtomicBool::new(false),
+            rollback_entered: tokio::sync::Notify::new(),
+            rollback_release: tokio::sync::Notify::new(),
+            rollback_credentials_restored: StdMutex::new(Vec::new()),
             prepare_fail: std::sync::atomic::AtomicBool::new(false),
             prepare_attempts: std::sync::atomic::AtomicUsize::new(0),
             drifted: StdMutex::new(false),
@@ -225,7 +236,7 @@ impl RouterSubsystems for FakeSubsystems {
     async fn apply_interfaces(&self, _: &[InterfaceChangePlan]) -> Result<()> {
         if self.pause_apply.load(Ordering::SeqCst) {
             self.apply_entered.notify_one();
-            std::future::pending::<()>().await;
+            self.apply_release.notified().await;
         }
         self.fail_if_matched("apply_interfaces", &self.apply_fail)
     }
@@ -239,12 +250,21 @@ impl RouterSubsystems for FakeSubsystems {
         self.fail_if_matched("apply_dataplane", &self.apply_fail)
     }
     async fn rollback_interfaces(&self, _: &[InterfaceSnapshot]) -> Result<()> {
+        if self.pause_rollback.load(Ordering::SeqCst) {
+            self.rollback_entered.notify_one();
+            self.rollback_release.notified().await;
+        }
         if let Some(root) = self.rollback_secret.lock().unwrap().as_ref() {
             let store = crate::wifi::store::PassphraseStore::new(root.join("wifi/psk-ap"));
+            let restored = store
+                .get("wlan0")?
+                .is_some_and(|secret| secret.expose() == "old-password");
+            self.rollback_credentials_restored
+                .lock()
+                .unwrap()
+                .push(restored);
             anyhow::ensure!(
-                store
-                    .get("wlan0")?
-                    .is_some_and(|secret| secret.expose() == "old-password"),
+                restored,
                 "runtime rollback needs the original Wi-Fi credential"
             );
         }
@@ -615,7 +635,10 @@ async fn write_journal_creates_missing_parent_directory() {
             manager: coordinator.manager(),
             overrides,
             rollback_timeout: Duration::from_secs(60),
-            state: Mutex::new(CoordinatorState::Idle),
+            state: Arc::new(Mutex::new(CoordinatorState::Idle)),
+            observation: StdRwLock::new(RouterTransactionCoordinator::observe(
+                &CoordinatorState::Idle,
+            )),
             token_counter: AtomicU64::new(0),
             timer_epoch: AtomicU64::new(0),
             timeout_mutation_gate: StdRwLock::new(None),
@@ -1059,6 +1082,11 @@ async fn provisioning_apply_failure_restores_unbound_secret_before_compensation(
         .unwrap();
 
     assert!(coordinator.apply(plan).await.is_err());
+    assert_eq!(
+        *fake.rollback_credentials_restored.lock().unwrap(),
+        vec![true],
+        "the first runtime rollback must see restored credentials; do not compensate twice"
+    );
     assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
     assert!(!secrets
         .unresolved_after_committed_cleanup(None)
@@ -1519,7 +1547,14 @@ async fn failed_apply_compensation_is_retried_automatically() {
         .unwrap();
     fake.fail_apply("apply_routes");
     fake.fail_rollback("rollback_routes");
-    assert!(coordinator.apply(plan).await.is_err());
+    let error = coordinator.apply(plan).await.unwrap_err();
+    let apply_error = error
+        .downcast_ref::<RouterApplyError>()
+        .expect("API callers need the coordinator's classified compensation outcome");
+    assert!(apply_error
+        .rollback_failures
+        .iter()
+        .any(|error| error.contains("rollback_routes")));
     assert_eq!(
         coordinator.status().await,
         CoordinatorStatus::RollbackFailed
@@ -1736,4 +1771,249 @@ async fn cancelled_router_apply_keeps_a_recovery_token_and_cannot_be_confirmed()
     assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
     assert!(!coordinator.inner.journal.exists());
     assert_eq!(overrides.committed_revision().await, 0);
+}
+
+#[tokio::test]
+async fn cancelled_router_apply_and_repair_journal_writes_register_explicit_recovery() {
+    for repair in [false, true] {
+        let fake = FakeSubsystems::new();
+        let (coordinator, overrides, _directory) = coordinator_with(fake).await;
+        let candidate = build_candidate(&overrides).await;
+        let plan = coordinator.plan(candidate).await.unwrap();
+        let desired = overrides
+            .build_candidate(&RouterIntentProposal::new())
+            .await
+            .unwrap()
+            .desired()
+            .clone();
+        let (entered, release) =
+            crate::atomic_file::pause_next_replacement(&coordinator.inner.journal);
+        let worker = coordinator.clone();
+        let applying = tokio::spawn(async move {
+            if repair {
+                worker.repair(desired).await
+            } else {
+                worker.apply(plan).await.map(|_| ())
+            }
+        });
+        tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(5)).unwrap())
+            .await
+            .unwrap();
+        applying.abort();
+        assert!(applying.await.unwrap_err().is_cancelled());
+        release.send(()).unwrap();
+
+        // The cancelled caller detached registration; explicitly join its
+        // owner before inspecting the settled recovery outcome. Status reads
+        // deliberately no longer serve as completion barriers.
+        drop(
+            tokio::time::timeout(Duration::from_secs(5), coordinator.inner.state.lock())
+                .await
+                .unwrap(),
+        );
+        let view = tokio::time::timeout(Duration::from_secs(5), coordinator.view())
+            .await
+            .unwrap();
+        assert_eq!(
+            view.status(),
+            CoordinatorStatus::RecoveryRequired,
+            "repair={repair}"
+        );
+        let token = view
+            .token
+            .expect("durable journal must have a visible recovery owner");
+        assert!(coordinator.commit(&token).await.is_err());
+        coordinator.rollback_with_token(&token).await.unwrap();
+        assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
+        assert!(!coordinator.inner.journal.exists());
+    }
+}
+
+#[tokio::test]
+async fn provisioning_commit_retires_secrets_without_api_bookkeeping() {
+    let fake = FakeSubsystems::new();
+    let (coordinator, overrides, directory) = coordinator_with(fake).await;
+    let secrets = stage_test_secret(directory.path()).await;
+    let plan = coordinator
+        .plan(build_candidate(&overrides).await)
+        .await
+        .unwrap();
+    let token = coordinator.apply(plan).await.unwrap();
+    // Binding and retirement belong to the coordinator, including direct users.
+    assert!(secrets.restore(None).await.is_err());
+    coordinator.commit(&token).await.unwrap();
+    assert!(!directory
+        .path()
+        .join("wifi/router-provisioning-secrets.json")
+        .exists());
+    assert_eq!(
+        PassphraseStore::new(directory.path().join("wifi/psk-ap"))
+            .get("wlan0")
+            .unwrap()
+            .unwrap()
+            .expose(),
+        "new-password"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_provisioning_secret_binding_remains_owned_until_explicit_rollback() {
+    let fake = FakeSubsystems::new();
+    let (coordinator, overrides, directory) = coordinator_with(fake).await;
+    stage_test_secret(directory.path()).await;
+    let plan = coordinator
+        .plan(build_candidate(&overrides).await)
+        .await
+        .unwrap();
+    let path = directory
+        .path()
+        .join("wifi/router-provisioning-secrets.json");
+    let (entered, release) = crate::atomic_file::pause_next_replacement(&path);
+    let worker = coordinator.clone();
+    let applying = tokio::spawn(async move { worker.apply(plan).await });
+    tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(5)).unwrap())
+        .await
+        .unwrap();
+    applying.abort();
+    assert!(applying.await.unwrap_err().is_cancelled());
+    release.send(()).unwrap();
+    // The cancelled caller detached registration; explicitly join its
+    // owner before inspecting the settled recovery outcome. Status reads
+    // deliberately no longer serve as completion barriers.
+    drop(
+        tokio::time::timeout(Duration::from_secs(5), coordinator.inner.state.lock())
+            .await
+            .unwrap(),
+    );
+    let view = tokio::time::timeout(Duration::from_secs(5), coordinator.view())
+        .await
+        .unwrap();
+    assert_eq!(view.status(), CoordinatorStatus::RecoveryRequired);
+    coordinator
+        .rollback_with_token(&view.token.unwrap())
+        .await
+        .unwrap();
+    assert!(!path.exists());
+    assert_eq!(
+        PassphraseStore::new(directory.path().join("wifi/psk-ap"))
+            .get("wlan0")
+            .unwrap()
+            .unwrap()
+            .expose(),
+        "old-password"
+    );
+}
+
+#[tokio::test]
+async fn rejected_router_apply_restores_unbound_secrets_without_runtime_repair() {
+    let fake = FakeSubsystems::new();
+    let (coordinator, overrides, directory) = coordinator_with(fake.clone()).await;
+    let plan = coordinator
+        .plan(build_candidate(&overrides).await)
+        .await
+        .unwrap();
+    let secrets = stage_test_secret(directory.path()).await;
+    // A settings write makes the prepared candidate stale before registration.
+    overrides
+        .commit_candidate(&build_candidate(&overrides).await)
+        .await
+        .unwrap();
+    let before = fake.events();
+    assert!(coordinator.apply(plan).await.is_err());
+    assert_eq!(fake.events(), before);
+    assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
+    assert!(!secrets
+        .unresolved_after_committed_cleanup(None)
+        .await
+        .unwrap());
+    assert_eq!(
+        PassphraseStore::new(directory.path().join("wifi/psk-ap"))
+            .get("wlan0")
+            .unwrap()
+            .unwrap()
+            .expose(),
+        "old-password"
+    );
+}
+
+#[tokio::test]
+async fn status_and_token_remain_readable_during_apply() {
+    let fake = FakeSubsystems::new();
+    let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
+    let plan = coordinator
+        .plan(build_candidate(&overrides).await)
+        .await
+        .unwrap();
+    fake.pause_apply.store(true, Ordering::SeqCst);
+    let running = tokio::spawn({
+        let coordinator = coordinator.clone();
+        async move { coordinator.apply(plan).await }
+    });
+    fake.apply_entered.notified().await;
+    let view = tokio::time::timeout(Duration::from_secs(1), coordinator.view())
+        .await
+        .expect("status must not wait for apply");
+    assert_eq!(view.phase, RouterPhase::RollbackRequired);
+    let token = tokio::time::timeout(Duration::from_secs(1), coordinator.pending_token())
+        .await
+        .expect("token must remain readable")
+        .expect("registered apply token");
+    assert_eq!(view.token.as_deref(), Some(token.as_str()));
+    fake.apply_release.notify_one();
+    assert_eq!(running.await.unwrap().unwrap(), token);
+    assert_eq!(coordinator.view().await.phase, RouterPhase::Pending);
+    coordinator.commit(&token).await.unwrap();
+    assert_eq!(coordinator.view().await.phase, RouterPhase::Idle);
+    assert!(coordinator.pending_token().await.is_none());
+}
+
+#[tokio::test]
+async fn status_remains_readable_during_rollback() {
+    let fake = FakeSubsystems::new();
+    let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
+    let plan = coordinator
+        .plan(build_candidate(&overrides).await)
+        .await
+        .unwrap();
+    let token = coordinator.apply(plan).await.unwrap();
+    fake.pause_rollback.store(true, Ordering::SeqCst);
+    let running = tokio::spawn({
+        let coordinator = coordinator.clone();
+        let token = token.clone();
+        async move { coordinator.rollback_with_token(&token).await }
+    });
+    fake.rollback_entered.notified().await;
+    let view = tokio::time::timeout(Duration::from_secs(1), coordinator.view())
+        .await
+        .expect("status must not wait for rollback");
+    assert_eq!(view.phase, RouterPhase::RollbackRequired);
+    assert_eq!(view.token.as_deref(), Some(token.as_str()));
+    fake.rollback_release.notify_one();
+    running.await.unwrap().unwrap();
+    assert_eq!(coordinator.view().await.phase, RouterPhase::Idle);
+    assert!(coordinator.pending_token().await.is_none());
+}
+
+#[tokio::test]
+async fn status_remains_readable_during_repair() {
+    let fake = FakeSubsystems::new();
+    let (coordinator, overrides, _directory) = coordinator_with(fake.clone()).await;
+    let candidate = build_candidate(&overrides).await;
+    let desired = candidate.desired().clone();
+    overrides.commit_candidate(&candidate).await.unwrap();
+    fake.pause_apply.store(true, Ordering::SeqCst);
+    let running = tokio::spawn({
+        let coordinator = coordinator.clone();
+        async move { coordinator.repair(desired).await }
+    });
+    fake.apply_entered.notified().await;
+    let view = tokio::time::timeout(Duration::from_secs(1), coordinator.view())
+        .await
+        .expect("status must not wait for repair");
+    assert_eq!(view.phase, RouterPhase::RollbackRequired);
+    assert!(view.token.is_some());
+    fake.apply_release.notify_one();
+    running.await.unwrap().unwrap();
+    assert_eq!(coordinator.view().await.phase, RouterPhase::Idle);
+    assert_eq!(coordinator.last_applied_revision(), Some(1));
 }

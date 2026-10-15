@@ -104,6 +104,10 @@ credential recovery semantics remain unchanged. A rollback-only pending token
 and cancellation guard exist before the first runtime mutation. Cancellation
 hands compensation to a background owner that reacquires the per-interface
 transaction lock and participates in the shared convergence reservation.
+Journal registration retains operation and runtime reservations until its
+durable snapshot has a pending owner; cancellation during storage cannot leave
+a late journal write outside shutdown rollback. The desired state is supplied
+at construction and cannot be replaced while a manager or its clones exist.
 Blocking credential writes retain their runtime, interface-lane and credential
 reservations until the worker finishes, so compensation cannot race a late
 write. The handoff does not reset an existing recovery budget or erase a stopped
@@ -121,12 +125,24 @@ restoring runtime services, so reconnecting the previous uplink can obtain a
 fresh DHCP lease. The secret journal remains until runtime restoration succeeds;
 secret I/O or runtime failures keep the transaction in rollback recovery and
 prevent confirmation. This ordering also applies to timeout, shutdown and
-failed-apply compensation. The provisioning timeout worker stays alive across
-automatic coordinator retries, releases mutation admission while waiting for
-Idle, and rechecks the committed token before restoring secrets. A matching
-commit retires the secret journal instead. If fallback secret restoration was
-needed, it repairs committed router runtime before retiring the journal; errors
-retain recovery evidence.
+failed-apply compensation. The router coordinator binds staged secrets to its
+token before runtime apply and owns their commit, rollback and timeout cleanup.
+API handlers prepare credentials before registration and translate outcomes;
+they do not run a second rollback or timeout worker. Rejection before registration
+restores staged credentials without changing runtime consumers. Router apply
+and repair register their journals and recovery guards in an owned task so a
+cancelled storage await still leaves an inspectable recovery token.
+
+The coordinator owns compensation for transactional router apply and repair;
+the manager executes their stages without a separate inner rollback. Standalone
+manager apply retains its own compensation. Coordinator transitions publish a
+small status snapshot under a separate short-lived lock, so status and token
+reads do not wait for apply, repair, or rollback I/O. Until application has a
+known successful outcome, its published token remains rollback-only. Recovery
+and commit-uncertainty diagnostics are overlaid when reading that snapshot.
+Status API health probes have a one-second observation budget; a busy runtime
+reports unknown readiness while the coordinator status remains available.
+Explicit completion waits still join the operation owner before reporting idle.
 
 Operator AP/client configuration, saved profile activation, and operator-triggered
 AP/client deactivation use the same commit-confirm interface transactions as
