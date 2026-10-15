@@ -346,28 +346,35 @@ async fn authenticated_http_client_controls_daemon_over_unix_socket() -> Result<
         managed: true,
         allow_management_change: false,
     };
-    match admin
-        .request(&Request::DryRunInterfaceEdit {
+    for request in [
+        Request::DryRunInterface {
+            interface: "test0".to_string(),
+            config: interface_config.clone().into(),
+            allow_management_change: false,
+        },
+        Request::DryRunInterfaceEdit {
             interface: "test0".to_string(),
             edit: interface_edit.clone(),
-        })
-        .await?
-    {
-        Response::InterfacePlan { plan } => {
-            assert_eq!(plan.interface, "test0");
-            assert_eq!(plan.delete_ipv4.len(), 1);
-            assert_eq!(
-                plan.add_ipv4.expect("new address").address,
-                Ipv4Addr::new(192, 168, 100, 1)
-            );
+        },
+    ] {
+        match admin.request(&request).await? {
+            Response::InterfacePlan { plan } => {
+                assert_eq!(plan.interface, "test0");
+                assert_eq!(plan.delete_ipv4.len(), 1);
+                assert_eq!(
+                    plan.add_ipv4.expect("new address").address,
+                    Ipv4Addr::new(192, 168, 100, 1)
+                );
+            }
+            response => panic!("unexpected response: {response:?}"),
         }
-        response => panic!("unexpected response: {response:?}"),
     }
 
     let token = match admin
-        .request(&Request::ApplyInterfaceEdit {
+        .request(&Request::ApplyInterface {
             interface: "test0".to_string(),
-            edit: interface_edit.clone(),
+            config: interface_config.clone().into(),
+            allow_management_change: false,
         })
         .await?
     {

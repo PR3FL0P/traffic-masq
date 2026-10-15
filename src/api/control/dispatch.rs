@@ -1,8 +1,7 @@
 use super::dhcp::{build_effective_dhcp_service, configure_dhcp_persisted, disable_dhcp_persisted};
-use super::interfaces::{interface_edit_request_to_config, interface_statuses};
+use super::interfaces::{interface_statuses, InterfaceChangeInput};
 use super::runtime::error_response;
 use super::*;
-use crate::core::transaction::InterfaceChange;
 
 impl ControlService {
     /// Route a typed request to its handler while enforcing mutation and recovery gates.
@@ -151,65 +150,54 @@ impl ControlService {
                     Err(error) => error_response(error),
                 }
             }
-            Request::GetApiHttpsConfig => match self.api_https_config_response().await {
-                Ok(response) => response,
-                Err(error) => error_response(error),
-            },
-            Request::ConfigureApiHttpsSettings { settings } => {
-                match self.configure_api_https_settings(settings).await {
-                    Ok(response) => response,
-                    Err(error) => error_response(error),
-                }
+            Request::GetApiHttpsConfig => self
+                .api_https_config_response()
+                .await
+                .unwrap_or_else(error_response),
+            Request::ConfigureApiHttpsSettings { settings } => self
+                .configure_api_https_settings(settings)
+                .await
+                .unwrap_or_else(error_response),
+            Request::ResetApiHttpsSettings => self
+                .reset_api_https_settings()
+                .await
+                .unwrap_or_else(error_response),
+            Request::GetSecurityConfig => self
+                .security_config_response()
+                .await
+                .unwrap_or_else(error_response),
+            Request::ConfigureSecuritySettings { settings } => self
+                .configure_security_settings(settings)
+                .await
+                .unwrap_or_else(error_response),
+            Request::ResetSecuritySettings => self
+                .reset_security_settings()
+                .await
+                .unwrap_or_else(error_response),
+            Request::ListWifiInventory => {
+                self.wifi_inventory().await.unwrap_or_else(error_response)
             }
-            Request::ResetApiHttpsSettings => match self.reset_api_https_settings().await {
-                Ok(response) => response,
-                Err(error) => error_response(error),
-            },
-            Request::GetSecurityConfig => match self.security_config_response().await {
-                Ok(response) => response,
-                Err(error) => error_response(error),
-            },
-            Request::ConfigureSecuritySettings { settings } => {
-                match self.configure_security_settings(settings).await {
-                    Ok(response) => response,
-                    Err(error) => error_response(error),
-                }
-            }
-            Request::ResetSecuritySettings => match self.reset_security_settings().await {
-                Ok(response) => response,
-                Err(error) => error_response(error),
-            },
-            Request::ListWifiInventory => match self.wifi_inventory().await {
-                Ok(response) => response,
-                Err(error) => error_response(error),
-            },
             Request::SaveWifiClientProfile {
                 interface,
                 settings,
                 expected_revision,
-            } => match self
+            } => self
                 .save_wifi_client_profile(interface, settings, expected_revision)
                 .await
-            {
-                Ok(response) => response,
-                Err(error) => error_response(error),
-            },
+                .unwrap_or_else(error_response),
             Request::SaveWifiInterface {
                 interface,
                 config,
                 expected_revision,
                 passphrase,
-            } => match self
+            } => self
                 .save_wifi_interface(interface, config.into(), expected_revision, passphrase)
                 .await
-            {
-                Ok(response) => response,
-                Err(error) => error_response(error),
-            },
-            Request::ListInterfaceInventory => match self.interface_inventory().await {
-                Ok(response) => response,
-                Err(error) => error_response(error),
-            },
+                .unwrap_or_else(error_response),
+            Request::ListInterfaceInventory => self
+                .interface_inventory()
+                .await
+                .unwrap_or_else(error_response),
             Request::SaveInterfaceConfig {
                 interface,
                 config,
@@ -221,39 +209,27 @@ impl ControlService {
                     config.into(),
                     allow_management_change,
                 );
-                match self
-                    .save_missing_interface_intent(interface, proposal, expected_revision)
+                self.save_missing_interface_intent(interface, proposal, expected_revision)
                     .await
-                {
-                    Ok(response) => response,
-                    Err(error) => error_response(error),
-                }
+                    .unwrap_or_else(error_response)
             }
             Request::ForgetInterfaceConfig {
                 interface,
                 expected_revision,
             } => {
                 let proposal = RouterIntentProposal::new().forget_interface(interface.clone());
-                match self
-                    .save_missing_interface_intent(interface, proposal, expected_revision)
+                self.save_missing_interface_intent(interface, proposal, expected_revision)
                     .await
-                {
-                    Ok(response) => response,
-                    Err(error) => error_response(error),
-                }
+                    .unwrap_or_else(error_response)
             }
             Request::ResetInterfaceOverride {
                 interface,
                 expected_revision,
             } => {
                 let proposal = RouterIntentProposal::new().remove_interface(interface.clone());
-                match self
-                    .save_missing_interface_intent(interface, proposal, expected_revision)
+                self.save_missing_interface_intent(interface, proposal, expected_revision)
                     .await
-                {
-                    Ok(response) => response,
-                    Err(error) => error_response(error),
-                }
+                    .unwrap_or_else(error_response)
             }
             Request::ListInterfaces => {
                 match interface_statuses(self.network.as_ref(), &self.transactions).await {
@@ -263,12 +239,10 @@ impl ControlService {
                     Err(error) => error_response(error),
                 }
             }
-            Request::GetInterfaceConfig { interface } => {
-                match self.interface_config_response(interface).await {
-                    Ok(response) => response,
-                    Err(error) => error_response(error),
-                }
-            }
+            Request::GetInterfaceConfig { interface } => self
+                .interface_config_response(interface)
+                .await
+                .unwrap_or_else(error_response),
             Request::DhcpStatus => Response::DhcpStatus {
                 running_interfaces: self.dhcp.running_interfaces().await,
                 unhealthy_interfaces: self.dhcp.unhealthy_interfaces().await,
@@ -363,218 +337,30 @@ impl ControlService {
                 config,
                 allow_management_change,
             } => {
-                let config: InterfaceConfig = config.into();
-                let current = match self.overrides.effective_interface(&interface).await {
-                    Ok(current) => current,
-                    Err(error) => {
-                        return Response::Error {
-                            message: error.to_string(),
-                        }
-                    }
-                };
-                let current_role = current.as_ref().map(|config| config.role);
-                if let Err(error) = self
-                    .validate_default_route_management(
-                        &interface,
-                        current.as_ref(),
-                        &config,
-                        allow_management_change,
-                    )
-                    .await
-                {
-                    return Response::Error {
-                        message: error.to_string(),
-                    };
-                }
-                if let Err(error) = Self::validate_router_service_management(
+                self.plan_interface_change(
                     &interface,
-                    current.as_ref(),
-                    &config,
-                    allow_management_change,
-                ) {
-                    return Response::Error {
-                        message: error.to_string(),
-                    };
-                }
-                match self
-                    .transactions
-                    .dry_run_transition(
-                        &interface,
-                        &config,
-                        current.as_ref(),
-                        current_role,
-                        allow_management_change,
-                    )
-                    .await
-                {
-                    Ok(plan) => Response::InterfacePlan { plan: plan.into() },
-                    Err(error) => error_response(error),
-                }
+                    InterfaceChangeInput::Config(Box::new(config.into()), allow_management_change),
+                )
+                .await
             }
             Request::DryRunInterfaceEdit { interface, edit } => {
-                let current = match self.overrides.effective_interface(&interface).await {
-                    Ok(current) => current,
-                    Err(error) => {
-                        return Response::Error {
-                            message: error.to_string(),
-                        }
-                    }
-                };
-                let current_role = current.as_ref().map(|config| config.role);
-                match interface_edit_request_to_config(edit, current.as_ref()) {
-                    Ok((config, allow_management_change)) => {
-                        if let Err(error) = self
-                            .validate_default_route_management(
-                                &interface,
-                                current.as_ref(),
-                                &config,
-                                allow_management_change,
-                            )
-                            .await
-                        {
-                            return Response::Error {
-                                message: error.to_string(),
-                            };
-                        }
-                        if let Err(error) = Self::validate_router_service_management(
-                            &interface,
-                            current.as_ref(),
-                            &config,
-                            allow_management_change,
-                        ) {
-                            return Response::Error {
-                                message: error.to_string(),
-                            };
-                        }
-                        match self
-                            .transactions
-                            .dry_run_transition(
-                                &interface,
-                                &config,
-                                current.as_ref(),
-                                current_role,
-                                allow_management_change,
-                            )
-                            .await
-                        {
-                            Ok(plan) => Response::InterfacePlan { plan: plan.into() },
-                            Err(error) => error_response(error),
-                        }
-                    }
-                    Err(error) => error_response(error),
-                }
+                self.plan_interface_change(&interface, InterfaceChangeInput::Edit(edit))
+                    .await
             }
             Request::ApplyInterface {
                 interface,
                 config,
                 allow_management_change,
             } => {
-                let config: InterfaceConfig = config.into();
-                let current = match self.overrides.effective_interface(&interface).await {
-                    Ok(current) => current,
-                    Err(error) => {
-                        return Response::Error {
-                            message: error.to_string(),
-                        }
-                    }
-                };
-                let current_role = current.as_ref().map(|config| config.role);
-                if let Err(error) = self
-                    .validate_default_route_management(
-                        &interface,
-                        current.as_ref(),
-                        &config,
-                        allow_management_change,
-                    )
-                    .await
-                {
-                    return Response::Error {
-                        message: error.to_string(),
-                    };
-                }
-                if let Err(error) = Self::validate_router_service_management(
+                self.apply_interface_change(
                     &interface,
-                    current.as_ref(),
-                    &config,
-                    allow_management_change,
-                ) {
-                    return Response::Error {
-                        message: error.to_string(),
-                    };
-                }
-                match self
-                    .transactions
-                    .apply(
-                        &interface,
-                        InterfaceChange {
-                            config: &config,
-                            previous: current.as_ref(),
-                            current_role,
-                            allow_management_change,
-                            passphrase: crate::wifi::WifiPassphraseUpdate::Keep,
-                        },
-                    )
-                    .await
-                {
-                    Ok(change) => Response::NetworkChangePending { change },
-                    Err(error) => error_response(error),
-                }
+                    InterfaceChangeInput::Config(Box::new(config.into()), allow_management_change),
+                )
+                .await
             }
             Request::ApplyInterfaceEdit { interface, edit } => {
-                let current = match self.overrides.effective_interface(&interface).await {
-                    Ok(current) => current,
-                    Err(error) => {
-                        return Response::Error {
-                            message: error.to_string(),
-                        }
-                    }
-                };
-                let current_role = current.as_ref().map(|config| config.role);
-                match interface_edit_request_to_config(edit, current.as_ref()) {
-                    Ok((config, allow_management_change)) => {
-                        if let Err(error) = self
-                            .validate_default_route_management(
-                                &interface,
-                                current.as_ref(),
-                                &config,
-                                allow_management_change,
-                            )
-                            .await
-                        {
-                            return Response::Error {
-                                message: error.to_string(),
-                            };
-                        }
-                        if let Err(error) = Self::validate_router_service_management(
-                            &interface,
-                            current.as_ref(),
-                            &config,
-                            allow_management_change,
-                        ) {
-                            return Response::Error {
-                                message: error.to_string(),
-                            };
-                        }
-                        match self
-                            .transactions
-                            .apply(
-                                &interface,
-                                InterfaceChange {
-                                    config: &config,
-                                    previous: current.as_ref(),
-                                    current_role,
-                                    allow_management_change,
-                                    passphrase: crate::wifi::WifiPassphraseUpdate::Keep,
-                                },
-                            )
-                            .await
-                        {
-                            Ok(change) => Response::NetworkChangePending { change },
-                            Err(error) => error_response(error),
-                        }
-                    }
-                    Err(error) => error_response(error),
-                }
+                self.apply_interface_change(&interface, InterfaceChangeInput::Edit(edit))
+                    .await
             }
             Request::CommitNetworkChange { token } => {
                 match self.transactions.commit(&token).await {

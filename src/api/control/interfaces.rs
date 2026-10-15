@@ -1,6 +1,107 @@
+use super::runtime::error_response;
 use super::*;
+use crate::core::transaction::InterfaceChange;
+
+pub(super) enum InterfaceChangeInput {
+    Config(Box<InterfaceConfig>, bool),
+    Edit(InterfaceEditRequest),
+}
+
+struct PreparedInterfaceChange {
+    current: Option<InterfaceConfig>,
+    config: InterfaceConfig,
+    allow_management_change: bool,
+}
 
 impl ControlService {
+    async fn prepare_interface_change(
+        &self,
+        interface: &str,
+        input: InterfaceChangeInput,
+    ) -> std::result::Result<PreparedInterfaceChange, String> {
+        // Keep the same snapshot for edit conversion, admission checks and execution.
+        let plain_error = |error: anyhow::Error| error.to_string();
+        let current = self
+            .overrides
+            .effective_interface(interface)
+            .await
+            .map_err(plain_error)?;
+        let (config, allow_management_change) = match input {
+            InterfaceChangeInput::Config(config, allow) => (*config, allow),
+            InterfaceChangeInput::Edit(edit) => {
+                interface_edit_request_to_config(edit, current.as_ref())
+                    .map_err(|error| format!("{error:#}"))?
+            }
+        };
+        self.validate_default_route_management(
+            interface,
+            current.as_ref(),
+            &config,
+            allow_management_change,
+        )
+        .await
+        .map_err(plain_error)?;
+        Self::validate_router_service_management(
+            interface,
+            current.as_ref(),
+            &config,
+            allow_management_change,
+        )
+        .map_err(plain_error)?;
+        Ok(PreparedInterfaceChange {
+            current,
+            config,
+            allow_management_change,
+        })
+    }
+
+    pub(super) async fn plan_interface_change(
+        &self,
+        interface: &str,
+        input: InterfaceChangeInput,
+    ) -> Response {
+        let change = match self.prepare_interface_change(interface, input).await {
+            Ok(change) => change,
+            Err(message) => return Response::Error { message },
+        };
+        self.transactions
+            .dry_run_transition(
+                interface,
+                &change.config,
+                change.current.as_ref(),
+                change.current.as_ref().map(|config| config.role),
+                change.allow_management_change,
+            )
+            .await
+            .map(|plan| Response::InterfacePlan { plan: plan.into() })
+            .unwrap_or_else(error_response)
+    }
+
+    pub(super) async fn apply_interface_change(
+        &self,
+        interface: &str,
+        input: InterfaceChangeInput,
+    ) -> Response {
+        let change = match self.prepare_interface_change(interface, input).await {
+            Ok(change) => change,
+            Err(message) => return Response::Error { message },
+        };
+        self.transactions
+            .apply(
+                interface,
+                InterfaceChange {
+                    config: &change.config,
+                    previous: change.current.as_ref(),
+                    current_role: change.current.as_ref().map(|config| config.role),
+                    allow_management_change: change.allow_management_change,
+                    passphrase: crate::wifi::WifiPassphraseUpdate::Keep,
+                },
+            )
+            .await
+            .map(|change| Response::NetworkChangePending { change })
+            .unwrap_or_else(error_response)
+    }
+
     pub(super) async fn interface_inventory(&self) -> Result<Response> {
         use traffic_masq_protocol::{
             InterfaceConfigSource, InterfaceInventoryEntry, InterfacePresence, InterfaceReadiness,
