@@ -1,5 +1,8 @@
 use super::*;
-use crate::tui::{input, layout};
+use crate::tui::{
+    api::model::{ProvisionWifiAccessPointRequest, WifiApProfileWriteRequest},
+    input, layout,
+};
 
 pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
     let Some(editor) = &app.wifi_editor else {
@@ -117,21 +120,12 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
                 style,
             ));
         } else if active && field == WifiField::Passphrase {
-            if editor.passphrase.is_empty() && editor.existing {
-                spans.push(Span::styled(
-                    "•••••• (saved; leave blank to keep) ",
-                    Style::default().fg(theme::MUTED),
-                ));
-                spans.extend(input::render_masked_with_cursor(0, 0, true, '•', style));
-            } else {
-                spans.extend(input::render_masked_with_cursor(
-                    input::grapheme_count(&editor.passphrase),
-                    editor.cursor,
-                    true,
-                    '•',
-                    style,
-                ));
-            }
+            spans.extend(input::render_passphrase_with_cursor(
+                &editor.passphrase,
+                editor.cursor,
+                editor.existing,
+                style,
+            ));
         } else {
             spans.push(Span::styled(value, style));
         }
@@ -314,12 +308,24 @@ pub(crate) async fn handle_wifi_editor_key(app: &mut TuiApp, key: KeyCode, clien
 }
 
 pub(super) fn ap_provision_request(editor: &WifiEditor) -> Request {
+    let configuration = ap_configuration(editor);
     Request::ProvisionWifiAccessPoint {
         interface: editor.interface.clone(),
+        settings: configuration.settings,
+        passphrase: configuration.passphrase,
+        clear_passphrase: configuration.clear_passphrase,
+        configure_dhcp: configuration.configure_dhcp,
+        subnet: configuration.subnet,
+        disable_dhcp: configuration.disable_dhcp,
+    }
+}
+
+fn ap_configuration(editor: &WifiEditor) -> ProvisionWifiAccessPointRequest {
+    ProvisionWifiAccessPointRequest {
         settings: ap_settings(editor),
-        passphrase: (editor.security != WifiSecurity::Open && !editor.passphrase.is_empty())
+        passphrase: (editor.security.requires_passphrase() && !editor.passphrase.is_empty())
             .then(|| editor.passphrase.clone()),
-        clear_passphrase: editor.security == WifiSecurity::Open,
+        clear_passphrase: !editor.security.requires_passphrase(),
         configure_dhcp: editor.configure_dhcp,
         subnet: editor.subnet.trim().parse().ok(),
         disable_dhcp: editor.disable_dhcp,
@@ -489,18 +495,9 @@ async fn save_ap_profile(app: &mut TuiApp, client: &ApiClient) -> bool {
         return false;
     }
     let request = Request::SaveWifiApProfile {
-        profile: crate::tui::api::model::WifiApProfileWriteRequest {
+        profile: WifiApProfileWriteRequest {
             id: editor.profile_id.clone(),
-            configuration: crate::tui::api::model::ProvisionWifiAccessPointRequest {
-                settings: ap_settings(editor),
-                passphrase: (editor.security.requires_passphrase()
-                    && !editor.passphrase.is_empty())
-                .then(|| editor.passphrase.clone()),
-                clear_passphrase: !editor.security.requires_passphrase(),
-                configure_dhcp: editor.configure_dhcp,
-                subnet: editor.subnet.trim().parse().ok(),
-                disable_dhcp: editor.disable_dhcp,
-            },
+            configuration: ap_configuration(editor),
         },
     };
     match client.request(&request).await {

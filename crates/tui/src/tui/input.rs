@@ -253,6 +253,25 @@ pub(crate) fn render_value_with_cursor(
     spans
 }
 
+/// Renders an active passphrase field, including the hint for a saved secret.
+pub(crate) fn render_passphrase_with_cursor(
+    value: &str,
+    cursor: usize,
+    has_saved: bool,
+    style: Style,
+) -> Vec<Span<'static>> {
+    if value.is_empty() && has_saved {
+        let mut spans = vec![Span::styled(
+            "•••••• (saved; leave blank to keep) ",
+            Style::default().fg(theme::MUTED),
+        )];
+        spans.extend(render_masked_with_cursor(0, 0, true, '•', style));
+        spans
+    } else {
+        render_masked_with_cursor(grapheme_count(value), cursor, true, '•', style)
+    }
+}
+
 /// Formats masked password text into Spans with cursor highlighting.
 pub(crate) fn render_masked_with_cursor(
     grapheme_count: usize,

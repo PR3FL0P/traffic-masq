@@ -67,21 +67,12 @@ pub(crate) fn render_wifi_profile_editor(
                     style,
                 ));
             } else if active && field == ProfileField::Passphrase {
-                if editor.passphrase.is_empty() && editor.has_passphrase {
-                    spans.push(Span::styled(
-                        "•••••• (saved; leave blank to keep) ",
-                        Style::default().fg(theme::MUTED),
-                    ));
-                    spans.extend(input::render_masked_with_cursor(0, 0, true, '•', style));
-                } else {
-                    spans.extend(input::render_masked_with_cursor(
-                        input::grapheme_count(&editor.passphrase),
-                        editor.cursor,
-                        true,
-                        '•',
-                        style,
-                    ));
-                }
+                spans.extend(input::render_passphrase_with_cursor(
+                    &editor.passphrase,
+                    editor.cursor,
+                    editor.has_passphrase,
+                    style,
+                ));
             } else {
                 spans.push(Span::styled(value, style));
             }
