@@ -1,0 +1,32 @@
+name: Transaction proofs
+
+on:
+  push:
+    paths:
+      - 'formal/**'
+      - 'src/core/**'
+      - '.github/workflows/lean.yml'
+  pull_request:
+    paths:
+      - 'formal/**'
+      - 'src/core/**'
+      - '.github/workflows/lean.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  proofs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Lean toolchain manager
+        run: |
+          curl -sSfL https://elan.lean-lang.org/elan-init.sh -o "$RUNNER_TEMP/elan-init.sh"
+          sh "$RUNNER_TEMP/elan-init.sh" -y --no-modify-path --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Check transaction proofs
+        working-directory: formal
+        run: lake build
