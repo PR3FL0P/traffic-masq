@@ -409,6 +409,14 @@ pub async fn retire(path: &Path) -> Result<()> {
 }
 
 async fn housekeeping(path: &Path) -> Result<()> {
+    let path = path.to_owned();
+    // A cancelled caller cannot release the lock while a blocking receipt
+    // writer/unlink still runs. The owner finishes cleanup before a later
+    // before_write can admit another journal at this path.
+    tokio::spawn(async move { housekeeping_owned(&path).await }).await?
+}
+
+async fn housekeeping_owned(path: &Path) -> Result<()> {
     // Serializes the background retry with pre-write housekeeping. New writes
     // are admitted only after the old journal AND receipt have been removed.
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -986,6 +994,62 @@ mod tests {
 #[cfg(test)]
 mod crash_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_housekeeping_cannot_publish_receipt_after_new_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.json");
+        tokio::fs::write(&path, b"same bytes").await.unwrap();
+        let marker = receipt(&path);
+        let (entered, release) = crate::atomic_file::pause_next_replacement(&marker);
+        let retiring_path = path.clone();
+        let retiring = tokio::spawn(async move { retire(&retiring_path).await });
+        tokio::task::spawn_blocking(move || {
+            entered
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        retiring.abort();
+        assert!(retiring.await.unwrap_err().is_cancelled());
+
+        // Admission must drain the old receipt writer and its cleanup even
+        // after the caller drops. Otherwise a late receipt authenticates a
+        // new, byte-identical provisioning journal as already restored.
+        let admission_path = path.clone();
+        let mut admission = tokio::spawn(async move { before_write(&admission_path).await });
+        let early =
+            tokio::time::timeout(std::time::Duration::from_millis(150), &mut admission).await;
+        let waiting = early.is_err();
+        release.send(()).unwrap();
+        match early {
+            Ok(result) => result.unwrap().unwrap(),
+            Err(_) => tokio::time::timeout(std::time::Duration::from_secs(5), admission)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap(),
+        }
+        tokio::fs::write(&path, b"same bytes").await.unwrap();
+        if !waiting {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !marker.exists() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        assert!(
+            !completed(&path, b"same bytes").await.unwrap(),
+            "late receipt authenticated the new journal as already restored"
+        );
+        assert!(
+            waiting,
+            "new admission did not wait for cancelled receipt persistence"
+        );
+    }
 
     #[tokio::test]
     async fn new_transaction_cannot_inherit_an_orphan_receipt() {
