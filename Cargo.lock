@@ -3079,6 +3079,7 @@ dependencies = [
 name = "traffic-masq-host-observation"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "tempfile",
  "tokio",
 ]

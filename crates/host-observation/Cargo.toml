@@ -7,7 +7,8 @@ rust-version = "1.95"
 description = "Linux host observations and network-manager guidance for traffic-masq"
 
 [dependencies]
-tokio = { version = "1", features = ["fs"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["fs", "process", "time"] }
 
 [dev-dependencies]
 tempfile = "3"

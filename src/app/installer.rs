@@ -244,6 +244,7 @@ pub async fn run(mut args: InstallArgs, config_override: Option<PathBuf>) -> Res
         bail!("interactive installation requires a terminal; use --non-interactive and provide all required choices");
     }
 
+    print_network_preflight(&[]).await;
     let mut config_path = config_override
         .or_else(|| std::env::var_os(CONFIG_ENV).map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
@@ -266,6 +267,11 @@ pub async fn run(mut args: InstallArgs, config_override: Option<PathBuf>) -> Res
             Err(error) => return Err(error),
         };
         print_plan(&plan);
+        let managed = managed_interfaces(&plan.config);
+        if !managed.is_empty() {
+            println!("\nExisting configuration assigns these interfaces to traffic-masq:");
+            print_network_preflight(&managed).await;
+        }
         if args.dry_run {
             plan.password.zeroize();
             println!("Dry run completed; no changes were made.");
@@ -334,16 +340,30 @@ async fn interactive_choices(
     }
 
     println!("\nDependency presets select checks and packages only; they do not enable network features.");
-    let defaults = args.dependency_presets.clone();
-    args.dependency_presets.clear();
-    for (preset, label) in [
-        (DependencyPreset::Router, "Routing / NAT"),
-        (DependencyPreset::WifiAp, "Wi-Fi access point"),
-        (DependencyPreset::WifiClient, "Wi-Fi client"),
-        (DependencyPreset::Wireguard, "WireGuard VPN"),
-    ] {
-        if prompt_yes_no(&format!("Select {label}?"), defaults.contains(&preset))? {
-            args.dependency_presets.push(preset);
+    let defaults = args
+        .dependency_presets
+        .iter()
+        .map(|preset| {
+            preset
+                .to_possible_value()
+                .expect("dependency preset")
+                .get_name()
+                .to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    println!("Available: router, wifi-ap, wifi-client, wireguard; enter 'none' for no dependency checks.");
+    loop {
+        let answer = prompt(&format!("Dependency presets [{defaults}]: "))?;
+        if answer.trim().is_empty() {
+            break;
+        }
+        match parse_dependency_presets(&answer) {
+            Ok(presets) => {
+                args.dependency_presets = presets;
+                break;
+            }
+            Err(error) => println!("{error}"),
         }
     }
     args.install_deps = prompt_yes_no("Install missing dependencies?", true)?;
@@ -909,6 +929,8 @@ async fn apply_plan_inner(plan: &mut InstallPlan, completed: &mut Vec<&'static s
             bail!("package installation failed with status {status}; completed package actions were not rolled back. Fix the package-manager error and rerun the installer");
         }
         completed.push("package manager completed");
+        println!("\nRechecking networking after package installation (package hooks may start services):");
+        print_network_preflight(&managed_interfaces(&plan.config)).await;
         let remaining = dependency_plan(&plan.presets, &plan.config)?;
         if !remaining.missing.is_empty() {
             bail!("package manager completed, but these dependencies are still unavailable: {}. Package changes were not rolled back; fix the dependency paths or packages and rerun", remaining.missing.join(", "));
@@ -984,7 +1006,61 @@ async fn apply_plan_inner(plan: &mut InstallPlan, completed: &mut Vec<&'static s
     } else {
         println!("No boot service is registered.");
     }
+    if !plan.start {
+        println!(
+            "Start when ready: sudo {} --config {} start",
+            shell_path(&plan.daemon_destination),
+            shell_path(&plan.config_path)
+        );
+    }
+    println!(
+        "Open the TUI: {}{} --socket {}",
+        if !plan.auth_initialized && plan.password.is_none() || plan.user.is_none() {
+            "sudo "
+        } else {
+            ""
+        },
+        shell_path(&plan.tui_destination),
+        shell_path(&plan.config.runtime.socket_path)
+    );
+    println!("Next: release only the interfaces you will configure, then select them in Interfaces. A fresh configuration manages no interfaces; dependency presets do not enable routing or Wi-Fi.");
+    println!(
+        "Recheck a selected interface: {} --check-conflicts --interface NAME",
+        shell_path(&plan.tui_destination)
+    );
     Ok(())
+}
+
+fn managed_interfaces(config: &AppConfig) -> Vec<String> {
+    config
+        .network
+        .interfaces
+        .iter()
+        .filter(|(_, settings)| settings.managed)
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+async fn print_network_preflight(interfaces: &[String]) {
+    let report = traffic_masq_host_observation::scan_conflicts(interfaces).await;
+    println!("\n{}", report.render());
+    println!("Installation can proceed; these findings require review before network configuration. The installer does not release interfaces or stop foreign services.\n");
+}
+
+fn parse_dependency_presets(input: &str) -> Result<Vec<DependencyPreset>> {
+    if input.trim() == "none" {
+        return Ok(Vec::new());
+    }
+    let mut presets = BTreeSet::new();
+    for name in input.split(',').map(str::trim) {
+        let preset = DependencyPreset::from_str(name, false).map_err(|_| {
+            anyhow::anyhow!(
+                "Unknown preset {name:?}; choose router,wifi-ap,wifi-client,wireguard or none."
+            )
+        })?;
+        presets.insert(preset);
+    }
+    Ok(presets.into_iter().collect())
 }
 
 fn shell_path(path: &Path) -> String {

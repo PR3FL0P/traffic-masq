@@ -58,7 +58,10 @@ DHCP server and client are built in. WireGuard uses the kernel's netlink API;
 sudo ./target/release/traffic-masqd install
 ```
 
-The wizard shows an installation plan before making changes. Its defaults
+The installer first shows network-manager and socket conflicts with manual
+resolution advice, and rechecks after installing dependencies. The wizard accepts
+dependency presets as one comma-separated list and shows a plan before making
+changes. Its defaults
 install into `/usr/local`, start the daemon and enable boot autostart when the
 init system is recognized. Service integration supports systemd, OpenRC, runit
 and SysVinit.
@@ -102,6 +105,13 @@ To inspect interfaces before installing anything, use the read-only mode:
 This example uses `wan0` for an interface that already has working Internet
 access, and `lan0` for the local network. Substitute your actual interface names.
 Both links must be up when you apply a sharing connection.
+
+Before configuring `lan0`, release it from the distribution's network manager.
+Competing NetworkManager, networkd or DHCP/Wi-Fi services can reclaim interfaces
+and interfere with traffic-masq. See
+[network manager conflicts and interface handover](docs/resource-conflicts.md#avoiding-conflicts-with-distribution-network-managers)
+for persistent exclusions and checks. The existing externally managed `wan0`
+can remain with its current manager in this example.
 
 1. In **Interfaces**, select `lan0`, enable **Configure with traffic-masq**,
    choose role `output` and set an address such as `192.168.50.1/24`. Choose a

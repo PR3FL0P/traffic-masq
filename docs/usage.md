@@ -2,7 +2,17 @@
 
 ## Requirements
 
-### Build
+#### Network manager conflicts
+
+Before configuring an interface, release it from any other network manager or
+independent DHCP/Wi-Fi service. Distribution defaults vary, and competing
+services can reclaim interfaces or overwrite addresses and routes. Follow
+[Avoiding conflicts with distribution network managers](resource-conflicts.md#avoiding-conflicts-with-distribution-network-managers)
+for detection, persistent exclusions, handover and verification after reboot.
+An externally managed WAN can remain with its current manager when used only as
+an existing uplink.
+
+## Build
 
 - Rust toolchain with Cargo
 - a C compiler (`cc`, `gcc` or `clang`)
@@ -154,7 +164,9 @@ plan at the final prompt before applying it.
 
 Set the password afterward with `sudo /usr/local/bin/traffic-masq`. Initial setup
 requires a local root client; there is no default password. Select Wi-Fi or
-WireGuard dependency presets if needed. Presets install prerequisites only;
+WireGuard dependency presets if needed. Enter presets as one comma-separated
+list (`router,wifi-ap`, for example), or `none` to skip dependency checks.
+Presets install prerequisites only;
 network features remain disabled until you configure them.
 
 For unattended installation, specify user access and password setup:
@@ -208,6 +220,16 @@ The manual compile workflow builds an archive containing both binaries. Use the
 local release script to produce a versioned archive and SHA-256 checksum. See
 [release procedure](release.md). Target machines do not need Rust
 or a C compiler.
+
+The installer prints a read-only network conflict report before asking questions,
+including in unattended and dry-run mode. It checks saved managed interfaces again
+when an existing configuration is selected, and repeats the scan after installing
+packages because package hooks can start networking services. Findings do not
+block installation: a fresh configuration manages no interfaces, and existing
+services may legitimately provide the WAN. Follow the report's interface-specific
+handover advice before enabling network features. No foreign service is stopped
+and no interface is released automatically. The final summary prints commands
+using the actual installation prefix, configuration path and API socket.
 
 ## Reset all settings
 
@@ -680,13 +702,39 @@ traffic-masq --delete-connection <name>
 | `--delete-connection NAME` | Delete a local destination profile and exit. |
 | `--direct` | Read interface state without the daemon. |
 | `--change-password` | Change the password through a running daemon. |
-| `--check-conflicts` | Report detected competing network managers and resolution advice. |
+| `--check-conflicts` | Read-only interface, process and socket preflight with manual resolution advice. |
+| `--interface NAME` | Focus `--check-conflicts` on selected interfaces; repeat for multiple interfaces. |
+| `--json` | Emit the `--check-conflicts` report as JSON. |
 
-The conflict scan reads process names in `/proc`; it does not require a daemon
-session and does not change services. It reports possible competitors, not
-proof that they manage a particular interface. It excludes `hostapd` and
-`wpa_supplicant`, which traffic-masq also supervises. An empty result does not
-rule out unreadable processes or an independently launched Wi-Fi worker.
+The conflict scan works without a daemon session and never changes networking:
+
+```sh
+traffic-masq --check-conflicts
+traffic-masq --check-conflicts --interface wlan0
+sudo traffic-masq --check-conflicts --interface wlan0 --interface lan0 --json
+```
+
+It lists visible interfaces, candidate processes with PIDs/service evidence,
+NetworkManager management state (via optional `nmcli`), networkd runtime state,
+Wi-Fi control sockets and DHCP UDP port 67 listeners with socket-holder PIDs
+where readable. Known processes in other network namespaces are excluded.
+`hostapd` and `wpa_supplicant` are included as candidates: the report does not
+assume they are foreign or stop traffic-masq's own workers. A socket holder is
+not by itself proof of a conflict with the intended configuration.
+
+`--interface` can be repeated. It filters interface and Wi-Fi socket observations;
+process and DHCP candidates remain host-wide and are labeled accordingly.
+Unavailable observations are reported as **INCOMPLETE**, rather than a clean
+result. `nmcli` queries have a timeout; missing tools or permissions do not change
+interface state. JSON includes `schema_version`, observations, `incomplete`,
+`remediation` and `exit_code`.
+
+Exit codes: **0** means no findings in the checked scope, **1** means findings
+need review, **2** means the scan is incomplete (even if it also found candidates).
+These codes describe the report, not whether installation or routing will fail.
+The scan does not compare desired addresses/routes, prove ownership from Wi-Fi
+journals, or inspect every possible custom control socket path. Read the
+[scope and handover guide](resource-conflicts.md#avoiding-conflicts-with-distribution-network-managers).
 
 Direct mode is read-only. DHCP, router, VPN, and settings operations are not
 available in this mode.

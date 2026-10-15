@@ -7,6 +7,144 @@ unblock radios, or replace foreign network objects. Suggested commands are not
 executed by the diagnostic code. Existing ownership-checked cleanup and rollback
 remain responsible for the daemon's own resources.
 
+## Avoiding conflicts with distribution network managers
+
+Different distributions, editions and installation images use different network
+stacks: NetworkManager, systemd-networkd (sometimes configured through Netplan),
+ifupdown, dhcpcd, ConnMan or wicked. Check the actual host configuration rather
+than assuming a manager from the distribution name. These services can claim
+interfaces, start DHCP or Wi-Fi workers, and restore addresses or routes after
+traffic-masq changes them. Symptoms include failed AP/client startup, conflicting
+control sockets, changing IP addresses/default routes and intermittent connectivity.
+
+Assign one configuration owner to each interface. Release interfaces whose
+addresses, DHCP client or Wi-Fi role traffic-masq will configure from other
+managers first. Enabling **Configure with traffic-masq** does not detach another
+manager or transfer ownership of its existing settings. An externally configured
+WAN may remain with its current manager when traffic-masq uses it only as an
+existing uplink (for example, **External** uplink mode).
+
+### Identify the manager before changing anything
+
+Replace `wlan0` and `lan0` below with your selected interfaces. Releasing an
+interface can remove its address, route or Wi-Fi connection; use a local console
+or a separate management connection if it currently carries your SSH session.
+
+```sh
+traffic-masq --check-conflicts
+ip -brief address
+ip -4 route show table all
+ps -eo pid,comm,args
+```
+
+On systems with the relevant tools installed, inspect per-interface state:
+
+```sh
+nmcli device status
+nmcli -f GENERAL.STATE,GENERAL.NM-MANAGED device show wlan0
+networkctl status wlan0
+```
+
+The report distinguishes candidate processes, observed socket holders, confirmed
+NetworkManager management state and incomplete checks. Use
+`traffic-masq --check-conflicts --interface wlan0` for focused guidance, or add
+`--json` for automation. Exit codes are 0 (no findings in scope), 1 (review needed)
+and 2 (incomplete). The installer displays the same report before its questions
+and repeats it after package installation.
+
+The process scan reports candidates, not confirmed interface ownership. Check
+matching connection profiles, service arguments and configuration files as well.
+A running global service may be needed for other interfaces; exclude only the
+interfaces being handed over instead of disabling the entire network stack.
+
+### NetworkManager
+
+Release the selected interface now and verify that it is unmanaged:
+
+```sh
+sudo nmcli device set wlan0 managed no
+nmcli -f GENERAL.NM-MANAGED device show wlan0
+```
+
+For a persistent exclusion, create
+`/etc/NetworkManager/conf.d/90-traffic-masq-unmanaged.conf` with:
+
+```ini
+[keyfile]
+unmanaged-devices=interface-name:wlan0;interface-name:lan0
+```
+
+Include only interfaces traffic-masq will configure. If another snippet already
+sets `unmanaged-devices`, merge its exclusions so this setting does not replace
+them. Reload configuration with `sudo nmcli general reload`, then check each
+selected interface again and verify the exclusion after reboot. See the
+[NetworkManager configuration reference](https://networkmanager.dev/docs/api/latest/NetworkManager.conf.html).
+
+To hand an interface back, first disable its traffic-masq features and interface
+management, then remove its persistent exclusion, reload NetworkManager and run
+`sudo nmcli device set wlan0 managed yes`. A strict `unmanaged-devices` exclusion
+must be removed before `managed yes` can work. Reactivate the intended connection
+profile if it does not reconnect automatically.
+
+### systemd-networkd and generated configuration
+
+Inspect the matching network file shown by `networkctl status wlan0`. Create
+`/etc/systemd/network/00-traffic-masq-unmanaged.network` with:
+
+```ini
+[Match]
+Name=wlan0 lan0
+
+[Link]
+Unmanaged=yes
+```
+
+networkd uses the first matching `.network` file in lexical order. Ensure this
+file sorts before any other matching file; the `00-` prefix alone is not a
+guarantee. Check the installed `systemd.network(5)` manual for support for
+`Unmanaged=yes`. Reload with `sudo networkctl reload` and inspect
+`networkctl status` for each selected interface. See the
+[systemd networkd documentation](https://www.freedesktop.org/software/systemd/man/257/systemd-networkd.service.html).
+
+An exclusion does not guarantee removal of previously installed addresses and
+routes. Arrange their cleanup through their previous owner before enabling
+traffic-masq; inspect the resulting kernel state instead of flushing all routes
+or addresses indiscriminately. To return an interface, disable its traffic-masq
+features and management, remove it from this match, reload networkd and
+reconfigure that interface with its intended networkd configuration.
+
+If Netplan, cloud-init or another provisioning tool generates network settings,
+update that source configuration too. Changing the renderer alone does not
+release an interface. Avoid editing generated files under `/run`; regeneration
+or reboot can restore competing settings. Apply provisioning changes from a
+connection that can tolerate the resulting network reconfiguration.
+
+### Other managers and independent services
+
+| Stack found on the host | How to avoid competing configuration |
+| --- | --- |
+| ifupdown | Bring down the selected interface through its existing configuration, then remove its stanza and `auto`/`allow-hotplug` entries from `/etc/network/interfaces` and included files. Preserve unrelated interfaces. |
+| dhcpcd or dhclient | Exclude the selected interface from the DHCP service configuration or its launch arguments. Stop its existing client for that interface before enabling traffic-masq's built-in DHCP client. |
+| ConnMan or wicked | Use the installed manager's interface exclusion/unmanaged configuration and release the selected interface. Check local manuals because configuration and service layout vary by distribution/version. |
+| Standalone wpa_supplicant, iwd or hostapd | Inspect process arguments and service configuration to find which radio/interface it controls. Release that interface and prevent its independent worker from restarting before enabling traffic-masq Wi-Fi. |
+| dnsmasq or another DHCP server | Remove the traffic-masq LAN from its DHCP service configuration and check for overlapping UDP port 67 listeners before enabling the built-in DHCP server. |
+
+Use the host's service manager (systemd, OpenRC, runit or SysVinit) when changing
+service startup. Killing a process alone is insufficient if its supervisor
+restarts it. Do not stop traffic-masq's own supervised Wi-Fi processes as if they
+were foreign workers; use its Wi-Fi controls.
+
+### Verify the handover
+
+Confirm the previous manager no longer manages the selected interface, inspect
+`ip -brief address` and `ip -4 route show table all`, then apply and commit the
+traffic-masq configuration. Check Wi-Fi association/AP startup, DHCP leases and
+client connectivity for the features enabled. Repeat the checks after reboot to
+catch autostart profiles or regenerated configuration. If conflicts remain,
+inspect the exact resource and PID/service reported by the daemon using the
+coverage matrix below. Never remove a live control socket to bypass ownership
+checks; see [Wi-Fi interface and stale socket checks](#releasing-a-wi-fi-interface-and-checking-a-stale-socket).
+
 ## Evidence rules
 
 * A running NetworkManager, networkd, ConnMan, dhcpcd or similar process is a
@@ -110,10 +248,12 @@ or recovery evidence and require manual inspection. The project therefore has
 resource-specific guards and diagnostics, rather than a claim of exhaustive
 foreign-software detection.
 
-No new runtime dependencies are required for this observation. `/proc` and
-`/sys` are read directly. `ss`, `ps`, `lslocks`, `nmcli`, `rfkill`, `ip`, `wg`,
-`nft` and `systemctl` in messages are optional operator tools, not newly spawned
-helpers. Service advice is conditional on observed service evidence.
+The standalone/installer preflight reads `/proc`, `/sys` and networkd runtime
+state directly. When NetworkManager is observed, it also invokes optional `nmcli`
+for read-only per-interface state with bounded query time; missing/failed queries
+are reported as incomplete. Other commands in advice are manual operator actions,
+not automatically executed fixes. The daemon's resource-error observations remain
+independent of these optional CLI queries.
 
 ## Validation expectations
 

@@ -36,8 +36,7 @@ fn detect_init_system_at(root: &std::path::Path) -> InitSystem {
     InitSystem::Unknown
 }
 
-/// Generates clear, actionable advice on how to stop/disable competing network managers
-/// (or isolate the specific interface from them) adapted to the current operating environment.
+/// Suggest per-interface inspection and handover without guessing service ownership.
 pub fn format_competing_manager_advice(managers: &[String], interface: &str) -> String {
     format_competing_manager_advice_for_init(managers, interface, detect_init_system())
 }
@@ -47,199 +46,45 @@ pub fn format_competing_manager_advice_for_init(
     interface: &str,
     init: InitSystem,
 ) -> String {
-    let mut lines = Vec::new();
-
+    let config_interface = interface;
+    let interface = shell_quote(interface);
+    let mut lines = vec!["Release only interfaces traffic-masq will configure; an externally managed WAN can stay with its current manager. Releasing your SSH interface can disconnect this session.".to_string()];
     for manager in managers {
+        lines.push(format!("• {manager}: potential competitor; process presence alone does not establish interface ownership."));
         match manager.as_str() {
-            "iwd" => {
-                lines.push(format!("• Manager '{manager}' is running:"));
-                match init {
-                    InitSystem::Runit => {
-                        lines.push("  - Stop service:      sudo sv down iwd".to_string());
-                        lines
-                            .push("  - Disable service:   sudo touch /etc/sv/iwd/down".to_string());
-                    }
-                    InitSystem::Systemd => {
-                        lines.push("  - Stop service:      sudo systemctl stop iwd".to_string());
-                        lines.push(
-                            "  - Disable service:   sudo systemctl disable --now iwd".to_string(),
-                        );
-                    }
-                    InitSystem::OpenRc => {
-                        lines.push("  - Stop service:      sudo rc-service iwd stop".to_string());
-                        lines.push(
-                            "  - Disable service:   sudo rc-update del iwd default".to_string(),
-                        );
-                    }
-                    _ => {
-                        lines.push("  - Stop service:      sudo sv down iwd   (or: sudo systemctl stop iwd)".to_string());
-                        lines.push("  - Disable service:   sudo touch /etc/sv/iwd/down   (or: sudo systemctl disable --now iwd)".to_string());
-                    }
-                }
-                lines.push(format!(
-                    "  - Release '{interface}' only: add to /etc/iwd/main.conf:"
-                ));
-                lines.push("      [Blacklist]".to_string());
-                lines.push(format!("      Interfaces={interface}"));
-            }
             "NetworkManager" => {
-                lines.push(format!("• Manager '{manager}' is running:"));
-                match init {
-                    InitSystem::Runit => {
-                        lines
-                            .push("  - Stop service:      sudo sv down NetworkManager".to_string());
-                        lines.push(
-                            "  - Disable service:   sudo touch /etc/sv/NetworkManager/down"
-                                .to_string(),
-                        );
-                    }
-                    InitSystem::Systemd => {
-                        lines.push(
-                            "  - Stop service:      sudo systemctl stop NetworkManager".to_string(),
-                        );
-                        lines.push(
-                            "  - Disable service:   sudo systemctl disable --now NetworkManager"
-                                .to_string(),
-                        );
-                    }
-                    InitSystem::OpenRc => {
-                        lines.push(
-                            "  - Stop service:      sudo rc-service NetworkManager stop"
-                                .to_string(),
-                        );
-                        lines.push(
-                            "  - Disable service:   sudo rc-update del NetworkManager default"
-                                .to_string(),
-                        );
-                    }
-                    _ => {
-                        lines.push("  - Stop service:      sudo sv down NetworkManager   (or: sudo systemctl stop NetworkManager)".to_string());
-                        lines.push("  - Disable service:   sudo touch /etc/sv/NetworkManager/down   (or: sudo systemctl disable --now NetworkManager)".to_string());
-                    }
-                }
-                lines.push(format!(
-                    "  - Release '{interface}' only: sudo nmcli device set {interface} managed no"
-                ));
-                lines.push(format!("    (or in /etc/NetworkManager/conf.d/99-traffic-masq.conf: [keyfile] unmanaged-devices=interface-name:{interface})"));
+                lines.push(format!("  Check: nmcli -f GENERAL.STATE,GENERAL.NM-MANAGED device show {interface}"));
+                lines.push(format!("  If managed and intended for traffic-masq: sudo nmcli device set {interface} managed no"));
+                lines.push(format!("  Persist in /etc/NetworkManager/conf.d/90-traffic-masq-unmanaged.conf (merge existing exclusions):\n      [keyfile]\n      unmanaged-devices=interface-name:{config_interface}\n  Reload: sudo nmcli general reload"));
+                lines.push(format!("  Verify unmanaged status now and after reboot. To return control, disable traffic-masq management, remove the exclusion, reload, then sudo nmcli device set {interface} managed yes."));
             }
             "systemd-network" | "systemd-networkd" | "networkd" => {
-                lines.push("• Manager 'systemd-networkd' is running:".to_string());
-                lines.push(
-                    "  - Stop service:      sudo systemctl stop systemd-networkd".to_string(),
-                );
-                lines.push(
-                    "  - Disable service:   sudo systemctl disable --now systemd-networkd"
-                        .to_string(),
-                );
-                lines.push(format!("  - Release '{interface}' only: create /etc/systemd/network/99-{interface}-unmanaged.network:"));
-                lines.push("      [Match]".to_string());
-                lines.push(format!("      Name={interface}"));
-                lines.push("      [Link]".to_string());
-                lines.push("      Unmanaged=yes".to_string());
+                lines.push(format!("  Check: networkctl status {interface}"));
+                lines.push(format!("  Persist in /etc/systemd/network/00-traffic-masq-unmanaged.network:\n      [Match]\n      Name={config_interface}\n      [Link]\n      Unmanaged=yes"));
+                lines.push("  The FIRST matching .network file wins: verify lexical ordering, then sudo networkctl reload and check networkctl status. Update Netplan/cloud-init source if it generates configuration; do not edit /run files. Release existing addresses/routes through their previous owner.".into());
             }
-            "connman" | "connmand" => {
-                lines.push("• Manager 'connman' is running:".to_string());
-                match init {
-                    InitSystem::Runit => {
-                        lines.push("  - Stop service:      sudo sv down connman".to_string());
-                        lines.push(
-                            "  - Disable service:   sudo touch /etc/sv/connman/down".to_string(),
-                        );
-                    }
-                    InitSystem::Systemd => {
-                        lines
-                            .push("  - Stop service:      sudo systemctl stop connman".to_string());
-                        lines.push(
-                            "  - Disable service:   sudo systemctl disable --now connman"
-                                .to_string(),
-                        );
-                    }
-                    InitSystem::OpenRc => {
-                        lines.push(
-                            "  - Stop service:      sudo rc-service connman stop".to_string(),
-                        );
-                        lines.push(
-                            "  - Disable service:   sudo rc-update del connman default".to_string(),
-                        );
-                    }
-                    _ => {
-                        lines.push("  - Stop service:      sudo sv down connman   (or: sudo systemctl stop connman)".to_string());
-                        lines.push("  - Disable service:   sudo touch /etc/sv/connman/down   (or: sudo systemctl disable --now connman)".to_string());
-                    }
-                }
-                lines.push(format!(
-                    "  - Release '{interface}' only: add to /etc/connman/main.conf:"
-                ));
-                lines.push(format!("      NetworkInterfaceBlacklist = {interface}"));
+            "iwd" => {
+                lines.push(format!("  Inspect iwd's actual service launch arguments. Add --nointerfaces {interface} to that service's existing arguments, preserving other options, then restart the verified service when other Wi-Fi connections can tolerate it."));
+                lines.push("  Check the installed iwd(8) manual. [Blacklist] in main.conf controls access-point blacklisting, not interface exclusion.".into());
             }
-            "dhcpcd" => {
-                lines.push("• Manager 'dhcpcd' is running:".to_string());
-                match init {
-                    InitSystem::Runit => {
-                        lines.push("  - Stop service:      sudo sv down dhcpcd".to_string());
-                        lines.push(
-                            "  - Disable service:   sudo touch /etc/sv/dhcpcd/down".to_string(),
-                        );
-                    }
-                    InitSystem::Systemd => {
-                        lines.push("  - Stop service:      sudo systemctl stop dhcpcd".to_string());
-                        lines.push(
-                            "  - Disable service:   sudo systemctl disable --now dhcpcd"
-                                .to_string(),
-                        );
-                    }
-                    InitSystem::OpenRc => {
-                        lines
-                            .push("  - Stop service:      sudo rc-service dhcpcd stop".to_string());
-                        lines.push(
-                            "  - Disable service:   sudo rc-update del dhcpcd default".to_string(),
-                        );
-                    }
-                    _ => {
-                        lines.push("  - Stop service:      sudo sv down dhcpcd   (or: sudo systemctl stop dhcpcd)".to_string());
-                        lines.push("  - Disable service:   sudo touch /etc/sv/dhcpcd/down   (or: sudo systemctl disable --now dhcpcd)".to_string());
-                    }
-                }
-                lines.push(format!(
-                    "  - Release '{interface}' only: add to /etc/dhcpcd.conf:"
-                ));
-                lines.push(format!("      denyinterfaces {interface}"));
-            }
-            other => {
-                lines.push(format!("• Manager '{other}' is running:"));
-                match init {
-                    InitSystem::Runit => {
-                        lines.push(format!("  - Stop service:      sudo sv down {other}"));
-                        lines.push(format!(
-                            "  - Disable service:   sudo touch /etc/sv/{other}/down"
-                        ));
-                    }
-                    InitSystem::Systemd => {
-                        lines.push(format!(
-                            "  - Stop service:      sudo systemctl stop {other}"
-                        ));
-                        lines.push(format!(
-                            "  - Disable service:   sudo systemctl disable --now {other}"
-                        ));
-                    }
-                    InitSystem::OpenRc => {
-                        lines.push(format!(
-                            "  - Stop service:      sudo rc-service {other} stop"
-                        ));
-                        lines.push(format!(
-                            "  - Disable service:   sudo rc-update del {other} default"
-                        ));
-                    }
-                    _ => {
-                        lines.push(format!("  - Stop service:      sudo sv down {other}   (or: sudo systemctl stop {other})"));
-                        lines.push(format!("  - Disable service:   sudo touch /etc/sv/{other}/down   (or: sudo systemctl disable --now {other})"));
-                    }
-                }
-            }
+            "connman" | "connmand" => lines.push("  Merge the selected interface into [General] NetworkInterfaceBlacklist in /etc/connman/main.conf, preserving existing entries; reload/restart the verified service and check the interface.".into()),
+            "dhcpcd" => lines.push(format!("  Add denyinterfaces {config_interface} to /etc/dhcpcd.conf; release that interface's existing DHCP client through its verified service before enabling traffic-masq DHCP.")),
+            "hostapd" | "wpa_supplicant" => lines.push("  Inspect the reported PID/service and control socket. It may be traffic-masq's own worker; never stop it based on its process name. Release only a verified foreign worker on the selected interface and disable its automatic restart.".into()),
+            "dnsmasq" | "dhcpd" | "kea-dhcp4" => lines.push("  Check DHCP listen addresses/interfaces and UDP port 67. Exclude only the LAN assigned to traffic-masq; preserve unrelated DHCP/DNS service.".into()),
+            _ => lines.push("  Inspect the reported PID/service and its interface configuration. Exclude the selected interface and prevent its DHCP/Wi-Fi worker from restarting. Do not infer a service name from a process name.".into()),
         }
     }
-
+    lines.push(match init {
+        InitSystem::Systemd => "Service manager: systemd; inspect a verified unit with systemctl status UNIT.",
+        InitSystem::OpenRc => "Service manager: OpenRC; inspect the verified service with rc-service SERVICE status.",
+        InitSystem::Runit => "Service manager: runit; inspect the verified service with sv status SERVICE.",
+        InitSystem::Unknown => "Service manager unknown; inspect the host's actual supervisor before changing service startup.",
+    }.into());
     lines.join("\n")
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 #[cfg(test)]

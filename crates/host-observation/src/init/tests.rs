@@ -28,24 +28,24 @@ fn advice_formatting_respects_init_systems() {
         "wlan0",
         super::InitSystem::Runit,
     );
-    assert!(runit_advice.contains("sv down iwd"));
-    assert!(runit_advice.contains("/etc/sv/iwd/down"));
-
+    assert!(runit_advice.contains("sv status SERVICE"));
     let systemd_advice = super::format_competing_manager_advice_for_init(
         &managers,
         "wlan0",
         super::InitSystem::Systemd,
     );
-    assert!(systemd_advice.contains("systemctl stop iwd"));
-    assert!(systemd_advice.contains("systemctl disable --now iwd"));
-
+    assert!(systemd_advice.contains("systemctl status UNIT"));
     let openrc_advice = super::format_competing_manager_advice_for_init(
         &managers,
         "wlan0",
         super::InitSystem::OpenRc,
     );
-    assert!(openrc_advice.contains("rc-service iwd stop"));
-    assert!(openrc_advice.contains("rc-update del iwd default"));
+    assert!(openrc_advice.contains("rc-service SERVICE status"));
+    for advice in [runit_advice, systemd_advice, openrc_advice] {
+        assert!(!advice.contains("disable --now"));
+        assert!(!advice.contains("[Blacklist]\n"));
+        assert!(advice.contains("--nointerfaces 'wlan0'"));
+    }
 }
 
 #[test]
@@ -65,4 +65,17 @@ fn missing_pid_one_uses_runtime_markers_and_unknown_is_safe() {
     assert_eq!(detect_init_system_at(root.path()), InitSystem::OpenRc);
     std::fs::create_dir_all(root.path().join("run/systemd/system")).unwrap();
     assert_eq!(detect_init_system_at(root.path()), InitSystem::Systemd);
+}
+
+#[test]
+fn networkd_advice_respects_first_match_and_quotes_interface_commands() {
+    let advice = format_competing_manager_advice_for_init(
+        &["systemd-networkd".into(), "NetworkManager".into()],
+        "odd'iface",
+        InitSystem::Systemd,
+    );
+    assert!(advice.contains("00-traffic-masq-unmanaged.network"));
+    assert!(advice.contains("FIRST matching"));
+    assert!(advice.contains("'odd'\"'\"'iface'"));
+    assert!(!advice.contains("systemctl stop NetworkManager"));
 }

@@ -185,3 +185,15 @@ fn binary_install_is_atomic_and_preserves_source() {
         0o755
     );
 }
+
+#[test]
+fn preset_selection_accepts_lists_deduplicates_and_rejects_mistakes() {
+    assert_eq!(
+        parse_dependency_presets(" router, wifi-ap,router ").unwrap(),
+        vec![DependencyPreset::Router, DependencyPreset::WifiAp]
+    );
+    assert!(parse_dependency_presets("none").unwrap().is_empty());
+    assert!(parse_dependency_presets("router,typo").is_err());
+    assert!(parse_dependency_presets("router,").is_err());
+    assert!(parse_dependency_presets("none,router").is_err());
+}

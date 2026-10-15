@@ -29,9 +29,24 @@ struct Args {
         long,
         conflicts_with = "change_password",
         conflicts_with = "direct",
-        help = "Scan for competing network managers (iwd, NetworkManager, systemd-networkd, etc.) and print resolution advice"
+        help = "Inspect interface managers, Wi-Fi sockets and DHCP listeners without changing networking"
     )]
     check_conflicts: bool,
+
+    #[arg(
+        long,
+        requires = "check_conflicts",
+        value_name = "NAME",
+        help = "Focus conflict checks on this interface; repeat for multiple interfaces"
+    )]
+    interface: Vec<String>,
+
+    #[arg(
+        long,
+        requires = "check_conflicts",
+        help = "Print the conflict report as JSON"
+    )]
+    json: bool,
 
     #[arg(
         long,
@@ -78,8 +93,8 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if args.check_conflicts {
-        conflicts::run().await;
-        return Ok(());
+        let code = conflicts::run(&args.interface, args.json).await?;
+        std::process::exit(code);
     }
     let remote = if let Some(name) = &args.connection {
         Some(connections::load_connection(name)?)
@@ -121,5 +136,29 @@ mod tests {
         ] {
             assert!(Args::try_parse_from(std::iter::once("traffic-masq").chain(args)).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn conflict_options_require_scan_and_accept_repeated_interfaces() {
+        assert!(Args::try_parse_from(["traffic-masq", "--json"]).is_err());
+        assert!(Args::try_parse_from(["traffic-masq", "--interface", "wlan0"]).is_err());
+        assert!(Args::try_parse_from(["traffic-masq", "--check-conflicts", "--direct"]).is_err());
+        let args = Args::try_parse_from([
+            "traffic-masq",
+            "--check-conflicts",
+            "--interface",
+            "wlan0",
+            "--interface",
+            "lan0",
+            "--json",
+        ])
+        .unwrap();
+        assert_eq!(args.interface, ["wlan0", "lan0"]);
+        assert!(args.json);
     }
 }
