@@ -8,7 +8,7 @@ use zeroize::Zeroize;
 use crate::tui::api::client::ApiClient;
 use crate::tui::api::model::{Request, Response, SecuritySettings};
 
-use super::layout::panel;
+use super::layout::{field_row, panel, text_field_row};
 use super::logs::LogLevel;
 use super::theme;
 use super::{Screen, TuiApp};
@@ -105,33 +105,17 @@ pub(crate) fn render_settings(frame: &mut ratatui::Frame<'_>, area: Rect, app: &
     };
 
     let row = |label: String, field: SettingsField, base: Style| {
-        let active = editor.field == field;
-        let marker = if active { "▶ " } else { "  " };
-        let style = if active {
-            base.add_modifier(Modifier::BOLD)
-        } else {
-            base
-        };
-        Line::styled(format!("{marker}{label}"), style)
+        field_row(&label, editor.field == field, base)
     };
-
-    let text_row = |label: &str, value: &str, field: SettingsField, base: Style| -> Line<'static> {
-        let active = editor.field == field;
-        let is_editing = active && editor.is_editing();
-        let marker = if active { "▶ " } else { "  " };
-        let label_style = if active {
-            base.add_modifier(Modifier::BOLD)
-        } else {
-            base
-        };
-        let mut spans = vec![Span::styled(format!("{marker}{label}: "), label_style)];
-        spans.extend(super::input::render_value_with_cursor(
+    let text_row = |label: &str, value: &str, field: SettingsField, base: Style| {
+        text_field_row(
+            label,
             value,
+            editor.field == field,
             editor.cursor,
-            is_editing,
-            label_style,
-        ));
-        Line::from(spans)
+            editor.is_editing(),
+            base,
+        )
     };
 
     let mut lines = vec![

@@ -1,13 +1,13 @@
 use crossterm::event::KeyCode;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
+use ratatui::style::Style;
+use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 
 use crate::tui::api::client::ApiClient;
 use crate::tui::api::model::{ApiHttpsSettings, Request, Response};
 
-use super::layout::panel;
+use super::layout::{field_row, panel, text_field_row};
 use super::logs::LogLevel;
 use super::theme;
 use super::{Screen, TuiApp};
@@ -158,50 +158,37 @@ pub(crate) fn render_access(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         return;
     };
 
-    let row = |label: &str, value: String, field: AccessField| {
-        let active = editor.field == field;
-        let marker = if active { "▶ " } else { "  " };
-        let style = if active {
-            Style::default()
-                .fg(theme::ACCENT)
-                .add_modifier(Modifier::BOLD)
+    let field_style = |field: AccessField| {
+        if editor.field == field {
+            Style::default().fg(theme::ACCENT)
         } else {
             Style::default()
-        };
-        Line::styled(format!("{marker}{label}: {value}"), style)
+        }
     };
-
-    let text_row = |label: &str, value: &str, field: AccessField| -> Line<'static> {
-        let active = editor.field == field;
-        let marker = if active { "▶ " } else { "  " };
-        let label_style = if active {
-            Style::default()
-                .fg(theme::ACCENT)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        let mut spans = vec![Span::styled(format!("{marker}{label}: "), label_style)];
-        spans.extend(super::input::render_value_with_cursor(
+    let row = |label: &str, value: String, field: AccessField| {
+        field_row(
+            &format!("{label}: {value}"),
+            editor.field == field,
+            field_style(field),
+        )
+    };
+    let text_row = |label: &str, value: &str, field: AccessField| {
+        text_field_row(
+            label,
             value,
+            editor.field == field,
             editor.cursor,
-            active,
-            label_style,
-        ));
-        Line::from(spans)
+            true,
+            field_style(field),
+        )
     };
 
     let action_row = |label: &str, field: AccessField| {
-        let active = editor.field == field;
-        let marker = if active { "▶ " } else { "  " };
-        let style = if active {
-            Style::default()
-                .fg(theme::ACCENT)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme::ACCENT)
-        };
-        Line::styled(format!("{marker}{label}"), style)
+        field_row(
+            label,
+            editor.field == field,
+            Style::default().fg(theme::ACCENT),
+        )
     };
 
     let active_summary = format!(

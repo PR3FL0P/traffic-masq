@@ -20,6 +20,35 @@ pub(crate) fn panel(title: &str) -> Block<'static> {
         .border_style(Style::default().fg(theme::BORDER))
 }
 
+pub(crate) fn field_row(label: &str, selected: bool, base: Style) -> Line<'static> {
+    let marker = if selected { "▶ " } else { "  " };
+    let style = if selected {
+        base.add_modifier(Modifier::BOLD)
+    } else {
+        base
+    };
+    Line::styled(format!("{marker}{label}"), style)
+}
+
+pub(crate) fn text_field_row(
+    label: &str,
+    value: &str,
+    selected: bool,
+    cursor: usize,
+    editing: bool,
+    base: Style,
+) -> Line<'static> {
+    let mut line = field_row(&format!("{label}: "), selected, base);
+    let style = line.style;
+    line.spans.extend(super::input::render_value_with_cursor(
+        value,
+        cursor,
+        selected && editing,
+        style,
+    ));
+    line
+}
+
 pub(crate) fn focused_lines_offset(lines: &[Line<'_>], height: u16) -> usize {
     lines
         .iter()
