@@ -1,4 +1,4 @@
-use super::dhcp::{default_dhcp_settings, dhcp_edit_request_to_config};
+use super::dhcp::default_dhcp_settings;
 use super::*;
 use crate::core::transaction::InterfaceChange;
 
@@ -199,7 +199,7 @@ impl ControlService {
                 Ok(settings) => settings,
                 Err(message) => return wifi_error(WifiErrorDetail::InvalidSpec { message }),
             };
-            target.dhcp = Some(dhcp_edit_request_to_config(settings));
+            target.dhcp = Some(settings.into());
         }
         let spec = match WifiApSpec::from_interface_config(&interface, &target) {
             Ok(Some(spec)) => spec,

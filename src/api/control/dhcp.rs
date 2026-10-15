@@ -13,16 +13,6 @@ pub(super) fn default_dhcp_settings(cidr: ipnet::Ipv4Net) -> Result<DhcpEditRequ
     })
 }
 
-pub(super) fn dhcp_edit_request_to_config(settings: DhcpEditRequest) -> DhcpInterfaceConfig {
-    DhcpInterfaceConfig {
-        pool_start: settings.pool_start,
-        pool_end: settings.pool_end,
-        router: settings.router,
-        dns_servers: settings.dns_servers,
-        lease_seconds: settings.lease_seconds,
-    }
-}
-
 pub(super) async fn configure_dhcp_persisted(
     dhcp: &DhcpSupervisor,
     overrides: &RuntimeOverrideManager,

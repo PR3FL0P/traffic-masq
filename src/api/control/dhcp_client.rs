@@ -298,7 +298,7 @@ pub(super) fn dhcp_client_request_to_config(
     }
 }
 
-async fn configure_dhcp_client_checked(
+pub(super) async fn configure_dhcp_client_checked(
     supervisor: &DhcpClientSupervisor,
     spec: DhcpClientSpec,
     link_ready: bool,
@@ -315,7 +315,7 @@ async fn configure_dhcp_client_checked(
     Ok(())
 }
 
-async fn restore_dhcp_client(
+pub(super) async fn restore_dhcp_client(
     supervisor: &DhcpClientSupervisor,
     interface: &str,
     previous: Option<DhcpClientSpec>,

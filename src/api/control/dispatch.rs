@@ -1,7 +1,4 @@
-use super::dhcp::{
-    build_effective_dhcp_service, configure_dhcp_persisted, dhcp_edit_request_to_config,
-    disable_dhcp_persisted,
-};
+use super::dhcp::{build_effective_dhcp_service, configure_dhcp_persisted, disable_dhcp_persisted};
 use super::interfaces::{interface_edit_request_to_config, interface_statuses};
 use super::runtime::error_response;
 use super::*;
@@ -321,31 +318,13 @@ impl ControlService {
             Request::ConfigureDhcp {
                 interface,
                 config: dhcp_config,
+            }
+            | Request::ConfigureDhcpSettings {
+                interface,
+                settings: dhcp_config,
             } => match build_effective_dhcp_service(
                 &interface,
                 dhcp_config.into(),
-                &self.overrides,
-                self.network.as_ref(),
-                self.base_config.dhcp.default_lease_seconds,
-            )
-            .await
-            {
-                Ok(spec) => {
-                    let _mutation = self.dhcp_mutations.lock().await;
-                    match configure_dhcp_persisted(&self.dhcp, &self.overrides, spec.clone()).await
-                    {
-                        Ok(()) => Response::DhcpConfigured { spec: spec.into() },
-                        Err(error) => error_response(error),
-                    }
-                }
-                Err(error) => error_response(error),
-            },
-            Request::ConfigureDhcpSettings {
-                interface,
-                settings,
-            } => match build_effective_dhcp_service(
-                &interface,
-                dhcp_edit_request_to_config(settings),
                 &self.overrides,
                 self.network.as_ref(),
                 self.base_config.dhcp.default_lease_seconds,

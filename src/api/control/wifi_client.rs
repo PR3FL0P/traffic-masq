@@ -1,3 +1,4 @@
+use super::dhcp_client::{configure_dhcp_client_checked, restore_dhcp_client};
 use super::runtime::compensation_message;
 use super::*;
 use crate::core::transaction::InterfaceChange;
@@ -1143,38 +1144,6 @@ pub(super) fn wifi_client_profile_input(
         security: request.security,
         priority: request.priority,
         autoconnect: request.autoconnect,
-    }
-}
-
-async fn configure_dhcp_client_checked(
-    supervisor: &DhcpClientSupervisor,
-    spec: DhcpClientSpec,
-    link_ready: bool,
-) -> Result<()> {
-    let interface = spec.interface.clone();
-    supervisor.configure_with_link_ready(spec, link_ready).await;
-    let status = supervisor
-        .status(&interface)
-        .await
-        .ok_or_else(|| anyhow::anyhow!("DHCP client disappeared after configuration"))?;
-    if let DhcpClientRunState::Degraded { reason } = status.state {
-        anyhow::bail!("DHCP client failed to start on {interface}: {reason}");
-    }
-    Ok(())
-}
-
-async fn restore_dhcp_client(
-    supervisor: &DhcpClientSupervisor,
-    interface: &str,
-    previous: Option<DhcpClientSpec>,
-    link_ready: bool,
-) -> Result<()> {
-    match previous {
-        Some(spec) => configure_dhcp_client_checked(supervisor, spec, link_ready).await,
-        None => {
-            supervisor.disable(interface).await?;
-            Ok(())
-        }
     }
 }
 
