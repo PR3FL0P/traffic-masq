@@ -8,7 +8,22 @@ It describes how to recover without discarding the evidence the daemon uses to
 prove whether an interrupted network change committed or must be rolled back.
 
 The default state directory is `/var/lib/traffic-masq`. If the installation uses
-another configuration, check it first:
+another configuration, identify the file used by the installed service or the
+original daemon invocation first. Use that same `--config` path for every
+configuration, log, stop, start and status command below; commands without it
+select the default configuration and may inspect a different state directory.
+For example, replace `/path/to/traffic-masq.toml` with the actual service config:
+
+```sh
+sudo traffic-masqd --config /path/to/traffic-masq.toml config path
+sudo traffic-masqd --config /path/to/traffic-masq.toml config show
+```
+
+The remaining examples assume the default configuration. Read `runtime.state_dir`
+from the selected configuration before choosing the backup source. `config show`
+shows file settings with defaults, not persisted runtime overrides. Preserve the
+selected configuration file alongside the state backup so its storage paths and
+runtime dependencies remain known. For the default configuration, check:
 
 ```sh
 sudo traffic-masqd config path
@@ -29,7 +44,16 @@ state, use this order:
 
 2. **Stop repeated restart attempts before changing files.** If the service
    manager is retrying startup, stop it through `traffic-masqd` or the native init
-   manager before taking a backup.
+   manager before taking a backup. For the default configuration:
+
+   ```sh
+   sudo traffic-masqd stop
+   sudo traffic-masqd status
+   ```
+
+   Confirm the daemon is stopped and automatic restarts are suspended before
+   copying or restoring state. If stopping fails, inspect the native service and
+   logs before proceeding.
 
 3. **Back up the complete state directory as one unit.** Prefer a filesystem
    snapshot. Otherwise, with the daemon stopped, copy the state directory to a
@@ -57,10 +81,19 @@ state, use this order:
    longer reports the same blocking invariant. Check:
 
    ```sh
-   sudo traffic-masqd start
+   sudo traffic-masqd start --timeout-seconds 300
    sudo traffic-masqd status
    sudo traffic-masqd logs --lines 100
    ```
+
+   The default start timeout is only 10 seconds. Interface recovery runs before
+   API readiness and can spend up to 180 seconds per recovery cycle. The example
+   allows 300 seconds; increase it for multiple pending interfaces or slow startup
+   dependencies. For a direct/background launch, expiry sends SIGTERM to the
+   daemon and can interrupt recovery. For a registered init service, check its
+   own startup deadlines and restart policy as well: the CLI timeout does not
+   override every service-manager limit. After a timeout, inspect status and logs
+   before another attempt; a native service may still be running.
 
    Normal success is a ready daemon with no new startup-blocking recovery
    diagnostic. Recovery metadata is retired or quarantined by the daemon when it
@@ -232,7 +265,7 @@ Safe procedure:
 Unrelated interfaces and the control plane should remain available while this
 journal is blocked.
 
-## Router journal validation failures
+## Router journal validation and commit failures
 
 <a id="tm-rec-201"></a>
 ### `TM-REC-201` — `provable_router_recovery`
@@ -319,6 +352,29 @@ Safe procedure:
    `runtime-overrides.json`.
 4. Restore the **complete state directory** from one coherent backup.
 5. Restart and verify that the revision-order diagnostic is gone.
+
+<a id="tm-rec-209"></a>
+### `TM-REC-209` — `commit_indeterminate`
+
+The override replacement failed and restoring its previous contents also failed.
+The file may contain the new commit token while the running daemon still holds
+its previous revision. The daemon blocks configuration writes, network mutations,
+confirmation and rollback, including timer and shutdown rollback. Shutdown preserves
+interface and dataplane ownership for startup recovery.
+
+Repair storage access, then restart the daemon. Keep the complete state directory;
+do not delete a transaction journal or replace an individual override file.
+Startup reloads the persisted commit proof: a matching token retains the committed
+change; an uncommitted journal is rolled back. Unreadable or invalid proof continues
+to block the affected recovery scope. A failed commit response in this state does
+not establish whether the configuration was committed.
+
+An uncertain API/security-only write reports `settings_commit_indeterminate`
+when both possible documents have exactly the same network intent and transaction
+tokens. All further configuration writes remain blocked until restart reloads
+the document, but network convergence and rollback remain available. This
+exception does not apply to writes that change network intent, commit tokens,
+or any other persisted field apart from API/security settings and the revision.
 
 ## Provisioning-secret recovery failures
 
@@ -430,14 +486,6 @@ block startup convergence. Reconnect the adapter, check `ip link`, or correct th
 interface name in router configuration. The daemon retries convergence when the
 interface appears.
 
-### Recovery completed but journal cleanup is pending
-
-If the runtime/network recovery completed but journal retirement failed, the
-daemon can report a cleanup-pending state and retry housekeeping separately. Do
-not treat the leftover journal as evidence that rollback still needs to be run,
-and do not delete it manually. Repair the reported filesystem/storage problem
-and let the daemon retry retirement.
-
 ## What not to do
 
 Do not use any of these as a shortcut around a recovery error:
@@ -470,30 +518,9 @@ following:
 - the preserved backup remains available until network behavior and committed
   configuration have been checked.
 
-<a id="tm-rec-209"></a>
-## TM-REC-209: commit outcome is indeterminate
-
-The override replacement failed and restoring its previous contents also failed.
-The file may contain the new commit token while the running daemon still holds
-its previous revision. The daemon blocks configuration writes, network mutations,
-confirmation and rollback, including timer and shutdown rollback. Shutdown preserves
-interface and dataplane ownership for startup recovery.
-
-Repair storage access, then restart the daemon. Keep the complete state directory;
-do not delete a transaction journal or replace an individual override file.
-Startup reloads the persisted commit proof: a matching token retains the committed
-change; an uncommitted journal is rolled back. Unreadable or invalid proof continues
-to block the affected recovery scope. A failed commit response in this state does
-not establish whether the configuration was committed.
-
-An uncertain API/security-only write reports `settings_commit_indeterminate`
-when both possible documents have exactly the same network intent and transaction
-tokens. All further configuration writes remain blocked until restart reloads
-the document, but network convergence and rollback remain available. This
-exception does not apply to writes that change network intent, commit tokens,
-or any other persisted field apart from API/security settings and the revision.
-
 ## Bounded automatic recovery
+
+### Limits and operator response
 
 Interface and router recovery share a bounded cycle: at most **three attempts**,
 **60 seconds per attempt**, and **180 seconds for the whole cycle**, including
@@ -506,22 +533,6 @@ ownership again before changing resources. Router recovery retains its explicit
 retry policy. Live recovery budgets use only monotonic time, so clock corrections
 cannot extend or prematurely stop a cycle. Wall time reconstructs the remaining
 budget when loading recovery records after restart.
-
-Confirmation is checked when commit acquires transaction ownership; waiting in
-the request admission queue does not extend the confirmation window. A commit
-already persisting before expiry is allowed to finish. Automatic rollback does
-not wait for request admission, but still serializes with transaction ownership
-and exclusive runtime writes.
-
-An interrupted interface apply retains a rollback-only pending token before its
-first runtime mutation. Its in-process owner transfers compensation to a background task, including
-cancellation during confirmation bookkeeping. The task reacquires transaction
-ownership for that interface and joins the shared runtime reservation. Blocking
-credential writes keep their reservations until completion, preventing recovery
-from racing a late write. Unrelated interfaces can finish convergence while
-this lane recovers; work on the same interface or PHY remains serialized. The
-handoff cannot renew a recovery attempt or clear a storage/conflict stop. If
-the process exits, the original journal remains the startup recovery authority.
 
 Failures are classified by error types and kernel error codes, not message text:
 
@@ -555,6 +566,24 @@ and TUI together to display this new status.
 limit, deadline and whether automatic recovery remains enabled. Confirmation of
 a partially restored change is disabled. The TUI displays these details and
 keeps the existing explicit rollback action available.
+
+### Recovery evidence and implementation details
+
+Confirmation is checked when commit acquires transaction ownership; waiting in
+the request admission queue does not extend the confirmation window. A commit
+already persisting before expiry is allowed to finish. Automatic rollback does
+not wait for request admission, but still serializes with transaction ownership
+and exclusive runtime writes.
+
+An interrupted interface apply retains a rollback-only pending token before its
+first runtime mutation. Its in-process owner transfers compensation to a background task, including
+cancellation during confirmation bookkeeping. The task reacquires transaction
+ownership for that interface and joins the shared runtime reservation. Blocking
+credential writes keep their reservations until completion, preventing recovery
+from racing a late write. Unrelated interfaces can finish convergence while
+this lane recovers; work on the same interface or PHY remains serialized. The
+handoff cannot renew a recovery attempt or clear a storage/conflict stop. If
+the process exits, the original journal remains the startup recovery authority.
 
 The immutable snapshot journal is accompanied by a private
 `<journal>.recovery-control` record bound to its exact SHA-256 digest. This record
