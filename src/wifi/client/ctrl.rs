@@ -240,12 +240,7 @@ impl WpaSupplicantCtrlClient {
     }
 
     pub async fn ping(&self) -> Result<(), CtrlError> {
-        let reply = self.request("PING").await?;
-        if reply.trim_end() == "PONG" {
-            Ok(())
-        } else {
-            Err(CtrlError::MalformedReply(reply))
-        }
+        self.socket.ping().await
     }
 
     pub async fn status(&self) -> Result<WpaSupplicantStatus, CtrlError> {
@@ -253,8 +248,7 @@ impl WpaSupplicantCtrlClient {
     }
 
     pub async fn scan(&self) -> Result<(), CtrlError> {
-        let reply = self.request("SCAN").await?;
-        ctrl_transport::expect_ok("SCAN", &reply)
+        self.socket.request_ok("SCAN").await
     }
 
     pub async fn scan_results(&self) -> Result<Vec<WpaSupplicantScanResult>, CtrlError> {
@@ -288,18 +282,15 @@ impl WpaSupplicantCtrlClient {
     }
 
     pub async fn reconnect(&self) -> Result<(), CtrlError> {
-        let reply = self.request("RECONNECT").await?;
-        ctrl_transport::expect_ok("RECONNECT", &reply)
+        self.socket.request_ok("RECONNECT").await
     }
 
     pub async fn disconnect(&self) -> Result<(), CtrlError> {
-        let reply = self.request("DISCONNECT").await?;
-        ctrl_transport::expect_ok("DISCONNECT", &reply)
+        self.socket.request_ok("DISCONNECT").await
     }
 
     pub async fn reassociate(&self) -> Result<(), CtrlError> {
-        let reply = self.request("REASSOCIATE").await?;
-        ctrl_transport::expect_ok("REASSOCIATE", &reply)
+        self.socket.request_ok("REASSOCIATE").await
     }
 }
 

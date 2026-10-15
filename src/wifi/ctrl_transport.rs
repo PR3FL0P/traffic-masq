@@ -108,6 +108,19 @@ impl CtrlSocket {
     pub(crate) async fn request(&self, command: &str) -> Result<String, CtrlError> {
         control_request(&self.socket, self.timeout, command).await
     }
+
+    pub(crate) async fn ping(&self) -> Result<(), CtrlError> {
+        let reply = self.request("PING").await?;
+        if reply.trim_end() == "PONG" {
+            Ok(())
+        } else {
+            Err(CtrlError::MalformedReply(reply))
+        }
+    }
+
+    pub(crate) async fn request_ok(&self, command: &str) -> Result<(), CtrlError> {
+        expect_ok(command, &self.request(command).await?)
+    }
 }
 
 pub(crate) fn parse_kv_lines(reply: &str) -> std::collections::BTreeMap<String, String> {

@@ -173,15 +173,9 @@ impl PassphraseStore {
         let canonical_dir = self.ensure_directory()?;
         let target = self.safe_target(&canonical_dir, interface)?;
 
-        let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
-        let raw_fd = match open(&target, flags, Mode::empty()) {
-            Ok(fd) => fd,
-            Err(Errno::ENOENT) => return Ok(None),
-            Err(Errno::ELOOP) => return Err(PassphraseStoreError::SymlinkRejected(target)),
-            Err(error) => return Err(error.into()),
+        let Some(mut file) = open_secret_file(&target)? else {
+            return Ok(None);
         };
-
-        let mut file = unsafe { File::from_raw_fd(raw_fd) };
 
         let mut contents = Zeroizing::new(String::new());
         file.read_to_string(&mut contents)?;
@@ -249,7 +243,7 @@ pub async fn migrate_legacy_passphrases(config: &crate::config::AppConfig) -> an
     Ok(())
 }
 
-fn read_secret_bytes(path: &Path) -> Result<Option<Zeroizing<Vec<u8>>>, PassphraseStoreError> {
+fn open_secret_file(path: &Path) -> Result<Option<File>, PassphraseStoreError> {
     let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
     let raw_fd = match open(path, flags, Mode::empty()) {
         Ok(fd) => fd,
@@ -257,8 +251,13 @@ fn read_secret_bytes(path: &Path) -> Result<Option<Zeroizing<Vec<u8>>>, Passphra
         Err(Errno::ELOOP) => return Err(PassphraseStoreError::SymlinkRejected(path.to_path_buf())),
         Err(error) => return Err(error.into()),
     };
+    Ok(Some(unsafe { File::from_raw_fd(raw_fd) }))
+}
 
-    let mut file = unsafe { File::from_raw_fd(raw_fd) };
+fn read_secret_bytes(path: &Path) -> Result<Option<Zeroizing<Vec<u8>>>, PassphraseStoreError> {
+    let Some(mut file) = open_secret_file(path)? else {
+        return Ok(None);
+    };
     let mut bytes = Zeroizing::new(Vec::new());
     file.read_to_end(&mut bytes)?;
     Ok(Some(bytes))

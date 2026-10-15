@@ -106,12 +106,7 @@ impl HostapdCtrlClient {
     }
 
     pub async fn ping(&self) -> Result<(), CtrlError> {
-        let reply = self.request("PING").await?;
-        if reply.trim_end() == "PONG" {
-            Ok(())
-        } else {
-            Err(CtrlError::MalformedReply(reply))
-        }
+        self.socket.ping().await
     }
 
     pub async fn status(&self) -> Result<HostapdStatus, CtrlError> {
@@ -148,13 +143,11 @@ impl HostapdCtrlClient {
 
     pub async fn deauthenticate(&self, mac: MacAddr) -> Result<(), CtrlError> {
         let command = format!("DEAUTHENTICATE {mac}");
-        let reply = self.request(&command).await?;
-        ctrl_transport::expect_ok(&command, &reply)
+        self.socket.request_ok(&command).await
     }
 
     pub async fn reload(&self) -> Result<(), CtrlError> {
-        let reply = self.request("RELOAD").await?;
-        ctrl_transport::expect_ok("RELOAD", &reply)
+        self.socket.request_ok("RELOAD").await
     }
 }
 
