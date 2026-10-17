@@ -1741,6 +1741,33 @@ async fn disable_cleans_socket_left_by_owned_process() {
 }
 
 #[tokio::test]
+async fn disable_retires_exited_unadopted_record_and_its_stale_socket() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("run");
+    let process = fake_process();
+    process.set_spawn_profile("LEAVE_SOCKET");
+    let original = supervisor(temp.path(), &runtime, process.clone()).await;
+    original.configure(spec("wlan0", "upstream")).await.unwrap();
+    process.terminate(2000).await.unwrap();
+    assert!(runtime.join("wlan0").exists());
+    let reopened = WifiClientSupervisor::open_with_process_for_recovery(
+        &app_config(temp.path(), &runtime),
+        process.clone(),
+    );
+    reopened.check_cleanup_ownership("wlan0").await.unwrap();
+    assert!(reopened.disable("wlan0").await.unwrap().is_none());
+    assert!(!runtime.join("wlan0").exists());
+    assert!(!config_path(&runtime, "wlan0").exists());
+    assert!(reopened
+        .record_store("wlan0")
+        .load()
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(process.spawn_count(), 1);
+}
+
+#[tokio::test]
 async fn reconfigure_cleans_socket_left_by_owned_process() {
     let temp = tempdir().unwrap();
     let runtime = temp.path().join("run");

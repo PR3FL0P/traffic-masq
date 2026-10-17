@@ -898,6 +898,13 @@ impl HostapdSupervisor {
     pub async fn check_cleanup_ownership(&self, interface: &str) -> Result<(), SupervisorError> {
         let _operation = self.inner.operation_lock.read().await;
         let _interface_operation = self.inner.interface_operations.lock(interface).await;
+        self.check_cleanup_ownership_locked(interface).await
+    }
+
+    // Caller holds the interface operation lock. An unadopted record is safe
+    // to retire only after proving its PID has exited. Missing sockets alone
+    // never establish process absence, and launch intents still need recovery.
+    async fn check_cleanup_ownership_locked(&self, interface: &str) -> Result<(), SupervisorError> {
         let store = self.record_store(interface);
         if store.transition_pending().await? {
             return Err(SupervisorError::Configuration(anyhow::anyhow!(
@@ -905,11 +912,19 @@ impl HostapdSupervisor {
             )));
         }
         if let Some(record) = store.load().await? {
-            let tasks = self.inner.tasks.lock().await;
-            if !tasks
+            let task_record = self
+                .inner
+                .tasks
+                .lock()
+                .await
                 .get(interface)
-                .is_some_and(|task| task.record == record)
-            {
+                .map(|task| task.record.clone());
+            let matches_task = task_record.as_ref().is_some_and(|task| *task == record);
+            let can_retire = !matches_task
+                && task_record.as_ref().is_none_or(|task| task.pid == 0)
+                && record.pid != 0
+                && !self.inner.process.is_alive(record.pid).await?;
+            if !matches_task && !can_retire {
                 return Err(SupervisorError::NotOwned {
                     interface: interface.to_owned(),
                     diagnostics: crate::wifi::process::wifi_conflict_diagnostics(
@@ -928,12 +943,25 @@ impl HostapdSupervisor {
     pub async fn disable(&self, interface: &str) -> Result<Option<WifiApSpec>, SupervisorError> {
         let _operation = self.inner.operation_lock.read().await;
         let _interface_operation = self.inner.interface_operations.lock(interface).await;
-        let Some(task) = self.inner.tasks.lock().await.get(interface).cloned() else {
+        self.check_cleanup_ownership_locked(interface).await?;
+        let task = self.inner.tasks.lock().await.get(interface).cloned();
+        let record = self.record_store(interface).load().await?;
+        if task.is_none() && record.is_none() {
             return Ok(None);
-        };
-
-        self.stop_task(&task).await?;
-        self.record_store(interface).clear().await?;
+        }
+        // A failed-start placeholder has no process or socket ownership of its
+        // own. Clean the durable exited record instead of the placeholder.
+        if let Some(task) = task
+            .as_ref()
+            .filter(|task| task.record.pid != 0 || record.is_none())
+        {
+            self.stop_task(task).await?;
+        }
+        if task.as_ref().is_some_and(|task| task.record.pid != 0) {
+            self.record_store(interface).clear().await?;
+        } else {
+            crate::wifi::lifecycle::clear_owned_record(&self.record_store(interface)).await?;
+        }
         let config_path = render::config_path(&self.inner.runtime_dir, interface);
         match tokio::fs::remove_file(&config_path).await {
             Ok(()) => {}
@@ -946,7 +974,7 @@ impl HostapdSupervisor {
             }
         }
         self.inner.tasks.lock().await.remove(interface);
-        Ok(Some(task.spec))
+        Ok(task.map(|task| task.spec))
     }
 
     /// Check that the configured hostapd binary is runnable.

@@ -250,6 +250,12 @@ pub(crate) fn render_dhcp_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
     let Some(editor) = &app.dhcp_editor else {
         return;
     };
+    let area = if editor.offline_intent.is_some() {
+        super::layout::render_offline_intent_warning(frame, area)
+    } else {
+        area
+    };
+
     let field = |label: &str, value: &str, active: bool| {
         let marker = if active { "▶" } else { " " };
         let style = if active {

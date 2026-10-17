@@ -8,6 +8,12 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
     let Some(editor) = &app.wifi_editor else {
         return;
     };
+    let area = if editor.offline_intent.is_some() && !editor.profile_mode {
+        layout::render_offline_intent_warning(frame, area)
+    } else {
+        area
+    };
+
     let mut lines = Vec::new();
     let settings = ap_settings(editor);
     let values = [
@@ -88,7 +94,9 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
         (
             WifiField::Apply,
             "",
-            if editor.configure_dhcp {
+            if editor.offline_intent.is_some() {
+                "Save AP settings for device return"
+            } else if editor.configure_dhcp {
                 "Apply AP + passphrase + DHCP"
             } else if editor.disable_dhcp {
                 "Apply AP; disable DHCP"
@@ -163,6 +171,8 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
             Line::from(warning),
             Line::from(if editor.profile_mode {
                 "Saving a profile does not change the running access point."
+            } else if editor.offline_intent.is_some() {
+                "Save applies automatically when the interface returns."
             } else {
                 "Apply is tentative; confirm before the rollback timer expires."
             }),

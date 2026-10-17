@@ -446,6 +446,12 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         return;
     };
 
+    let area = if editor.offline_revision.is_some() {
+        super::layout::render_offline_intent_warning(frame, area)
+    } else {
+        area
+    };
+
     if let Some(forget) = editor.intent_confirmation {
         let entry = app
             .dashboard

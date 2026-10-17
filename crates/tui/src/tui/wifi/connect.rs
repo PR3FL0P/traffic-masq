@@ -244,6 +244,12 @@ pub(crate) fn render_wifi_connect_prompt(
     let Some(prompt) = &app.wifi_connect else {
         return;
     };
+    let area = if prompt.expected_revision.is_some() {
+        layout::render_offline_intent_warning(frame, area)
+    } else {
+        area
+    };
+
     let block = panel(&format!(
         "{} '{}' on {}",
         if prompt.expected_revision.is_some() {

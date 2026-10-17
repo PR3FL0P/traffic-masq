@@ -8839,6 +8839,210 @@ async fn unplugged_ap_changed_process_proof_blocks_cleanup_and_preserves_intent(
 }
 
 #[tokio::test]
+async fn unplugged_client_with_exited_unadopted_record_can_save_offline_intent() {
+    for placeholder in [false, true] {
+        for operation in ["unmanage", "edit", "forget"] {
+            let mut fixture = wifi_client_enabled_fixture().await;
+            let status = fixture
+                .service
+                .wifi_client
+                .as_ref()
+                .unwrap()
+                .status("wlan1")
+                .await
+                .unwrap();
+            let store = crate::wifi::record::WifiRecordStore::for_client(
+                fixture._directory.path().join("wifi"),
+                &fixture.service.config.wifi_client.runtime_dir,
+                "wlan1",
+            );
+            fixture.network.missing.store(true, WifiOrdering::SeqCst);
+            // Unplug/restart: the process and socket are gone, but the durable
+            // record survives and startup skips adoption of the absent NIC.
+            fixture.process.terminate(status.pid).await.unwrap();
+            let runtime = ClientSupervisor::open_with_process_for_recovery(
+                &fixture.service.config,
+                fixture.process.clone(),
+            );
+            if placeholder {
+                runtime
+                    .record_failed_startup(&status.spec, "device disappeared")
+                    .await;
+            }
+            fixture.service.wifi_client = Some(runtime);
+            assert!(store.load().await.unwrap().is_some());
+            let mut config = fixture
+                .service
+                .overrides
+                .effective_interface("wlan1")
+                .await
+                .unwrap()
+                .unwrap();
+            let request = match operation {
+                "unmanage" => {
+                    config.managed = false;
+                    config.wifi_client = None;
+                    config.dhcp_client = None;
+                    config.nat = false;
+                    Request::SaveInterfaceConfig {
+                        interface: "wlan1".into(),
+                        config: config.clone().into(),
+                        allow_management_change: true,
+                        expected_revision: 0,
+                    }
+                }
+                "edit" => {
+                    config.wifi_client.as_mut().unwrap().ssid = "offline-upstream".into();
+                    Request::SaveWifiInterface {
+                        interface: "wlan1".into(),
+                        config: config.clone().into(),
+                        expected_revision: 0,
+                        passphrase: None,
+                    }
+                }
+                "forget" => Request::ForgetInterfaceConfig {
+                    interface: "wlan1".into(),
+                    expected_revision: 0,
+                },
+                _ => unreachable!(),
+            };
+            let response = fixture.service.dispatch(request).await;
+            assert!(
+                matches!(response, Response::InterfaceIntentSaved { .. }),
+                "{operation}, placeholder={placeholder}: {response:?}"
+            );
+            assert!(store.load().await.unwrap().is_none());
+            assert!(!fixture
+                .service
+                .config
+                .wifi_client
+                .runtime_dir
+                .join("wlan1.conf")
+                .exists());
+            assert!(fixture
+                .service
+                .wifi_client
+                .as_ref()
+                .unwrap()
+                .status("wlan1")
+                .await
+                .is_none());
+            assert_eq!(fixture.service.overrides.committed_revision().await, 1);
+            let restarted = RuntimeOverrideManager::load(
+                fixture._directory.path(),
+                &fixture.service.base_config,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                restarted.effective_interface("wlan1").await.unwrap(),
+                (operation != "forget").then_some(config)
+            );
+            assert!(fixture.process.configs.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn unplugged_ap_with_exited_unadopted_record_can_be_forgotten() {
+    let mut fixture = wifi_enabled_fixture().await;
+    let pid = fixture
+        .service
+        .wifi
+        .as_ref()
+        .unwrap()
+        .status("wlan0")
+        .await
+        .unwrap()
+        .pid;
+    fixture.network.interfaces.lock().await.remove("wlan0");
+    fixture.process.terminate(pid).await.unwrap();
+    fixture.service.wifi = Some(WifiSupervisor::open_with_process_for_recovery(
+        &fixture.service.config,
+        fixture.process.clone(),
+    ));
+    let response = fixture
+        .service
+        .dispatch(Request::ForgetInterfaceConfig {
+            interface: "wlan0".into(),
+            expected_revision: 0,
+        })
+        .await;
+    assert!(
+        matches!(response, Response::InterfaceIntentSaved { .. }),
+        "{response:?}"
+    );
+    let store = crate::wifi::record::WifiRecordStore::for_access_point(
+        fixture._directory.path().join("wifi"),
+        &fixture.service.config.wifi.runtime_dir,
+        "wlan0",
+    );
+    assert!(store.load().await.unwrap().is_none());
+    assert!(fixture
+        .service
+        .overrides
+        .effective_interface("wlan0")
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+async fn unplugged_client_unadopted_record_retains_intent_for_live_process_or_foreign_socket() {
+    for live_process in [false, true] {
+        let mut fixture = wifi_client_enabled_fixture().await;
+        let pid = fixture
+            .service
+            .wifi_client
+            .as_ref()
+            .unwrap()
+            .status("wlan1")
+            .await
+            .unwrap()
+            .pid;
+        fixture.network.missing.store(true, WifiOrdering::SeqCst);
+        let _foreign = if live_process {
+            None
+        } else {
+            fixture.process.terminate(pid).await.unwrap();
+            Some(
+                std::os::unix::net::UnixDatagram::bind(
+                    fixture.service.config.wifi_client.runtime_dir.join("wlan1"),
+                )
+                .unwrap(),
+            )
+        };
+        fixture.service.wifi_client = Some(ClientSupervisor::open_with_process_for_recovery(
+            &fixture.service.config,
+            fixture.process.clone(),
+        ));
+        let response = fixture
+            .service
+            .dispatch(Request::ForgetInterfaceConfig {
+                interface: "wlan1".into(),
+                expected_revision: 0,
+            })
+            .await;
+        assert!(matches!(response, Response::Error { .. }), "{response:?}");
+        assert_eq!(fixture.process.is_alive(pid).await.unwrap(), live_process);
+        assert_eq!(fixture.service.overrides.committed_revision().await, 0);
+        let store = crate::wifi::record::WifiRecordStore::for_client(
+            fixture._directory.path().join("wifi"),
+            &fixture.service.config.wifi_client.runtime_dir,
+            "wlan1",
+        );
+        assert!(store.load().await.unwrap().is_some());
+        assert!(fixture
+            .service
+            .config
+            .wifi_client
+            .runtime_dir
+            .join("wlan1")
+            .exists());
+    }
+}
+
+#[tokio::test]
 async fn unplugged_client_disable_stops_supplicant_and_dhcp_before_commit() {
     let fixture = wifi_client_enabled_fixture().await;
     let runtime = fixture.service.wifi_client.as_ref().unwrap();

@@ -20,6 +20,21 @@ pub(crate) fn panel(title: &str) -> Block<'static> {
         .border_style(Style::default().fg(theme::BORDER))
 }
 
+/// Keep offline-save risks visible above editor fields, including while scrolling.
+pub(crate) fn render_offline_intent_warning(frame: &mut ratatui::Frame<'_>, area: Rect) -> Rect {
+    let lines = super::logs::wrap_log_message(
+        "Warning: interface absent. Saved settings apply automatically when it returns, \
+         without confirmation or automatic rollback. IP, routes, DHCP or Wi-Fi changes may disconnect you.",
+        area.width as usize,
+    );
+    let height = lines.len().min(u16::MAX as usize) as u16;
+    let warning = Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+        .style(Style::default().fg(theme::WARN));
+    let regions = Layout::vertical([Constraint::Length(height), Constraint::Min(0)]).split(area);
+    frame.render_widget(warning, regions[0]);
+    regions[1]
+}
+
 pub(crate) fn field_row(label: &str, selected: bool, base: Style) -> Line<'static> {
     let marker = if selected { "▶ " } else { "  " };
     let style = if selected {
