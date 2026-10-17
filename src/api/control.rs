@@ -92,6 +92,7 @@ pub struct ControlService {
     /// file config, so anything else here would make the two disagree about
     /// what the effective configuration is.
     base_config: AppConfig,
+    base_config_file: Option<std::path::PathBuf>,
     network: Arc<dyn NetworkProvider>,
     transactions: NetworkTransactionManager,
     interface_observation: Arc<Mutex<Vec<InterfaceStatus>>>,
@@ -151,6 +152,11 @@ pub struct ControlSubsystems {
 }
 
 impl ControlService {
+    pub fn with_base_config_file(mut self, path: Option<std::path::PathBuf>) -> Self {
+        self.base_config_file = path;
+        self
+    }
+
     /// Assemble the service with its final shared state before exposing it.
     pub fn from_runtime(runtime: ControlRuntime, subsystems: ControlSubsystems) -> Self {
         Self::build(runtime, subsystems, false)
@@ -190,6 +196,7 @@ impl ControlService {
 
         Self {
             operations: Default::default(),
+            base_config_file: None,
             base_config,
             config,
             network,

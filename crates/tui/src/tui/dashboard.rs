@@ -298,6 +298,7 @@ pub(crate) fn format_rate(bytes_per_sec: u64) -> String {
 pub(crate) struct DashboardData {
     pub(crate) interfaces: Vec<InterfaceStatus>,
     pub(crate) inventory: Option<Vec<traffic_masq_protocol::InterfaceInventoryEntry>>,
+    pub(crate) base_config: Option<traffic_masq_protocol::InterfaceBaseConfigView>,
     pub(crate) intent_revision: Option<u64>,
     pub(crate) managed: std::collections::HashMap<String, bool>,
     pub(crate) roles: std::collections::HashMap<String, InterfaceRole>,
@@ -335,6 +336,7 @@ pub(crate) fn accept_update(app: &mut TuiApp, mut updated: DashboardData) {
     if updated.inventory.is_none() {
         updated.inventory = app.dashboard.inventory.clone();
         updated.intent_revision = app.dashboard.intent_revision;
+        updated.base_config = app.dashboard.base_config.clone();
     }
     if updated.interfaces_updated.is_none() {
         updated.interfaces = std::mem::take(&mut app.dashboard.interfaces);

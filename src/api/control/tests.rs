@@ -7988,13 +7988,18 @@ async fn missing_interface_inventory_save_forget_reset_and_stale_editor() {
         }),
         dhcp,
         overrides.clone(),
-    );
+    )
+    .with_base_config_file(Some("/custom/router.toml".into()));
     let revision = match service.dispatch(Request::ListInterfaceInventory).await {
         Response::InterfaceInventory {
+            base_config,
             interfaces,
             revision,
             ..
         } => {
+            let base_config = base_config.unwrap();
+            assert_eq!(base_config.file.as_deref(), Some("/custom/router.toml"));
+            assert!(base_config.interfaces.contains(&"lan0".to_owned()));
             let lan = interfaces
                 .iter()
                 .find(|entry| entry.name == "lan0")

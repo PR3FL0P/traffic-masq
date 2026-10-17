@@ -2161,6 +2161,7 @@ fn saved_client_interface_inventory(
         unreachable!()
     };
     Response::InterfaceInventory {
+        base_config: None,
         revision,
         interfaces: interfaces
             .into_iter()

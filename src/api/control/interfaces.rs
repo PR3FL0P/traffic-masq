@@ -203,6 +203,19 @@ impl ControlService {
             })
             .collect();
         Ok(Response::InterfaceInventory {
+            base_config: Some(traffic_masq_protocol::InterfaceBaseConfigView {
+                file: self
+                    .base_config_file
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
+                interfaces: self
+                    .base_config
+                    .network
+                    .interfaces
+                    .keys()
+                    .cloned()
+                    .collect(),
+            }),
             revision: snapshot.revision,
             interfaces,
             suppressed_interfaces: snapshot.suppressed_interfaces.into_iter().collect(),

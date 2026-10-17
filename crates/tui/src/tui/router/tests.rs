@@ -1391,6 +1391,7 @@ async fn offline_router_save_reports_deferred_result_and_reloads_inventory() {
             observation_error: None,
         },
         Response::InterfaceInventory {
+            base_config: None,
             revision: 8,
             interfaces: vec![],
             suppressed_interfaces: vec![],

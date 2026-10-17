@@ -450,8 +450,8 @@ const REMOVE_IPV4_BUTTON_SLOT: usize = 2;
 const FORGET_BUTTON_SLOT: usize = 3;
 const RESET_BUTTON_SLOT: usize = 4;
 const ADVANCED_BUTTON_SLOT: usize = 5;
-const FORGET_LABEL: &str = "[Forget saved configuration]";
-const RESET_LABEL: &str = "[Reset to base configuration]";
+const FORGET_LABEL: &str = "[Delete saved settings]";
+const RESET_LABEL: &str = "[Restore settings from file]";
 
 pub(super) fn confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> {
     let editor = app.editor.as_ref()?;
@@ -461,30 +461,40 @@ pub(super) fn confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> 
         .inventory
         .as_ref()
         .and_then(|entries| entries.iter().find(|entry| entry.name == editor.interface));
+    let source = app
+        .dashboard
+        .base_config
+        .as_ref()
+        .and_then(|base| base.file.as_deref())
+        .unwrap_or("not reported by daemon");
     Some(super::confirmation::Dialog {
-        title: "Saved interface configuration",
-        action: if forget { "Forget" } else { "Reset" },
+        title: if forget {
+            "Delete saved interface settings?"
+        } else {
+            "Restore settings from file?"
+        },
+        action: if forget {
+            "Delete settings"
+        } else {
+            "Restore from file"
+        },
         lines: vec![
-            format!("Interface: {}", editor.interface),
+            format!("Device absent: {}", editor.interface),
+            format!("Base file: {source}"),
             if forget {
-                "Forget saved configuration, including base configuration.".into()
+                "Remove saved override and suppress the base definition. The base file is not edited. Reconnecting will not configure this device from that definition.".into()
             } else {
-                "Remove the override and restore base configuration.".into()
+                "Remove override and suppression. The definition loaded from the base file will apply when the device returns. The file is not edited.".into()
             },
-            format!(
-                "Source: {}",
-                entry
-                    .map(|entry| format!("{:?}", entry.config_source))
-                    .unwrap_or_default()
-            ),
             format!(
                 "References retained: {}",
                 entry
                     .map(|entry| entry.references.join(", "))
-                    .unwrap_or_default()
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("none".into())
             ),
-            "Profiles and credentials are retained.".into(),
-            "Saved settings apply when the interface returns, without a rollback timer.".into(),
+            "Saved Wi-Fi/VPN profiles and passwords are retained.".into(),
+            "Saved immediately. No confirmation timer or automatic rollback.".into(),
         ],
     })
 }
@@ -608,6 +618,7 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         ));
     }
     let help = match editor.field {
+        InterfaceEditorField::Reset if restore_unavailable(app).is_some() => restore_unavailable(app).unwrap(),
         InterfaceEditorField::Cidr | InterfaceEditorField::RemoveIpv4 if !editor.managed =>
             "IPv4 editing disabled: enable Configure with traffic-masq first.",
         InterfaceEditorField::Cidr | InterfaceEditorField::RemoveIpv4 =>
@@ -623,7 +634,7 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         InterfaceEditorField::Forget => "Delete saved settings; suppress the base definition. Profiles and passwords stay.",
         InterfaceEditorField::Reset => "Remove saved override and restore settings from the daemon's base file.",
         InterfaceEditorField::Save if editor.offline_revision.is_some() =>
-            "Save immediately for device return. No automatic rollback.",
+            "Edit saved settings: save immediately for device return. No automatic rollback.",
         InterfaceEditorField::Save => "Review the change plan before applying. The network has not changed yet.",
         _ => "Tab/Shift+Tab or Up/Down: focus. Enter/Space: activate. Esc: back.",
     };
@@ -1108,7 +1119,22 @@ fn editor_address_defaults(
     (cidr, true)
 }
 
+fn restore_unavailable(app: &TuiApp) -> Option<&'static str> {
+    let editor = app.editor.as_ref()?;
+    let Some(base) = app.dashboard.base_config.as_ref() else {
+        return Some("Restore unavailable: daemon did not report the base file");
+    };
+    if base.file.is_none() {
+        Some("Restore unavailable: daemon uses built-in defaults, without a base file")
+    } else if !base.interfaces.contains(&editor.interface) {
+        Some("Restore unavailable: this device has no definition in the base file")
+    } else {
+        None
+    }
+}
+
 pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
+    let restore_reason = restore_unavailable(app);
     let Some(editor) = app.editor.as_mut() else {
         app.screen = Screen::InterfaceList;
         return;
@@ -1229,6 +1255,12 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
             }
             InterfaceEditorField::Forget | InterfaceEditorField::Reset => {
                 if editor.offline_revision.is_some() {
+                    if editor.field == InterfaceEditorField::Reset {
+                        if let Some(reason) = restore_reason {
+                            app.push_message(LogLevel::Warn, reason);
+                            return;
+                        }
+                    }
                     editor.intent_confirmation = Some(editor.field == InterfaceEditorField::Forget);
                 }
             }
@@ -1364,7 +1396,7 @@ pub(crate) async fn submit_dry_run(app: &mut TuiApp, client: &ApiClient) {
             Ok(Response::InterfaceIntentSaved { interface, .. }) => {
                 app.push_message(
                     LogLevel::Info,
-                    format!("Saved; application waits for interface {interface}"),
+                    format!("Saved immediately for {interface}; applies on device return. No automatic rollback."),
                 );
                 app.screen = Screen::InterfaceList;
             }

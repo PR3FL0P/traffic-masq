@@ -213,7 +213,15 @@ fn router_recovery_allows_degraded_startup(
 
 /// Initialize services, recover interrupted changes, and drive network convergence until shutdown.
 /// Drain accepted operations before applying configured shutdown and restoration policies.
-pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
+pub async fn run_daemon(config: AppConfig) -> Result<()> {
+    run_daemon_with_config_file(config, None).await
+}
+
+/// Start with the selected base file so clients can explain restore actions.
+pub async fn run_daemon_with_config_file(
+    mut config: AppConfig,
+    base_config_file: Option<std::path::PathBuf>,
+) -> Result<()> {
     migrate_vpn_policy_mode_to_chain(&mut config).await;
     let shutdown = install_shutdown_signal()?;
     let _process_guard = ProcessGuard::acquire(&config.runtime.pid_path)?;
@@ -674,6 +682,7 @@ pub async fn run_daemon(mut config: AppConfig) -> Result<()> {
         },
     );
 
+    let control = control.with_base_config_file(base_config_file);
     let transactions = control.transactions();
     let socket_path = bindings.socket_path().to_path_buf();
     let reaper_auth = auth.clone();

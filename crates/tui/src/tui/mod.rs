@@ -1891,6 +1891,7 @@ async fn load_daemon_dashboard(client: &ApiClient) -> DashboardData {
     );
     match interfaces {
         Ok(Response::InterfaceInventory {
+            base_config,
             interfaces,
             revision,
             observation_error,
@@ -1906,6 +1907,7 @@ async fn load_daemon_dashboard(client: &ApiClient) -> DashboardData {
                     data.roles.insert(entry.name.clone(), config.role);
                 }
             }
+            data.base_config = base_config;
             data.inventory = Some(interfaces);
             data.intent_revision = Some(revision);
             data.interfaces_updated = Some(Instant::now());

@@ -1170,6 +1170,13 @@ pub struct WifiInventoryEntry {
     pub client_runtime: Option<WifiClientStatusView>,
 }
 
+/// Base definitions loaded at daemon startup; no credentials are exposed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterfaceBaseConfigView {
+    pub file: Option<String>,
+    pub interfaces: Vec<String>,
+}
+
 /// Control request envelope. Interface and router proposal payloads stay typed
 /// while callers migrate those domain values to dedicated wire DTOs.
 #[derive(Clone, Serialize, Deserialize)]
@@ -1491,6 +1498,8 @@ pub enum Response<
         interfaces: Vec<InterfaceStatus>,
     },
     InterfaceInventory {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_config: Option<InterfaceBaseConfigView>,
         revision: u64,
         interfaces: Vec<InterfaceInventoryEntry>,
         suppressed_interfaces: Vec<String>,

@@ -653,6 +653,10 @@ async fn offline_forget_and_reset_confirm_with_enter_and_preserve_revision() {
             editor: Some(editor),
             ..Default::default()
         };
+        app.dashboard.base_config = Some(traffic_masq_protocol::InterfaceBaseConfigView {
+            file: Some("/custom/router.toml".into()),
+            interfaces: vec!["wlan0".into()],
+        });
         for _ in 0..steps {
             handle_editor_key(&mut app, KeyCode::Tab, &mock.client).await;
         }
@@ -764,4 +768,50 @@ async fn basic_editor_skips_hidden_mac_fields_and_keeps_review_visible() {
     assert!(text.contains("Invalid MAC"));
     assert!(text.contains("Review changes"));
     assert!(app.ui.buttons.iter().any(|(_, slot)| *slot == 0));
+}
+
+#[tokio::test]
+async fn offline_restore_requires_a_reported_file_and_device_definition() {
+    let client = ApiClient::new("/must-not-connect.sock");
+    let mut editor = default_route_editor(false);
+    editor.offline_revision = Some(7);
+    editor.field = InterfaceEditorField::Reset;
+    let mut app = TuiApp {
+        screen: Screen::InterfaceEditor,
+        editor: Some(editor),
+        ..Default::default()
+    };
+    for base in [
+        None,
+        Some(traffic_masq_protocol::InterfaceBaseConfigView {
+            file: None,
+            interfaces: vec![],
+        }),
+        Some(traffic_masq_protocol::InterfaceBaseConfigView {
+            file: Some("/custom/router.toml".into()),
+            interfaces: vec![],
+        }),
+    ] {
+        app.dashboard.base_config = base;
+        handle_editor_key(&mut app, KeyCode::Enter, &client).await;
+        assert!(app.editor.as_ref().unwrap().intent_confirmation.is_none());
+        assert!(app
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("Restore unavailable"));
+    }
+    app.dashboard.base_config = Some(traffic_masq_protocol::InterfaceBaseConfigView {
+        file: Some("/custom/router.toml".into()),
+        interfaces: vec!["wlan0".into()],
+    });
+    handle_editor_key(&mut app, KeyCode::Enter, &client).await;
+    let restore = confirmation(&app).unwrap().lines.join(" ");
+    assert!(restore.contains("/custom/router.toml"));
+    assert!(restore.contains("when the device returns"));
+    app.editor.as_mut().unwrap().intent_confirmation = Some(true);
+    let delete = confirmation(&app).unwrap().lines.join(" ");
+    assert!(delete.contains("suppress the base definition"));
+    assert!(delete.contains("passwords are retained"));
+    assert!(delete.contains("base file is not edited"));
 }

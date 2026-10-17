@@ -11,7 +11,7 @@ use traffic_masq::app::init::{self, NativeRunner, ServiceStore};
 use traffic_masq::app::installer::{self, InstallArgs, UninstallArgs};
 use traffic_masq::app::reset::{self, ResetArgs};
 use traffic_masq::app::service::{self, ServiceStatus};
-use traffic_masq::app::{reset_device_password, run_daemon};
+use traffic_masq::app::{reset_device_password, run_daemon_with_config_file};
 use traffic_masq::config::{AppConfig, ResolvedConfig, DEFAULT_CONFIG_PATH};
 use zeroize::Zeroize;
 
@@ -180,7 +180,11 @@ async fn main() -> Result<()> {
             if resolved.source.is_built_in() {
                 eprintln!("Safe mode: no interfaces are configured or managed.");
             }
-            let result = run_daemon(config.clone()).await;
+            let result = run_daemon_with_config_file(
+                config.clone(),
+                resolved.source.path().map(Path::to_path_buf),
+            )
+            .await;
             if let Err(error) = &result {
                 let _ = service::persist_startup_recovery_report(config, error).await;
             }
