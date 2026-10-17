@@ -244,6 +244,12 @@ async fn keyboard_ip_and_mac_edit_previews_applies_and_confirms_the_typed_addres
     }
     assert_eq!(
         app.editor.as_ref().unwrap().field,
+        InterfaceEditorField::Advanced
+    );
+    handle_editor_key(&mut app, KeyCode::Enter, &client).await;
+    handle_editor_key(&mut app, KeyCode::Tab, &client).await;
+    assert_eq!(
+        app.editor.as_ref().unwrap().field,
         InterfaceEditorField::MacAddress
     );
     for character in "02:11:22:33:44:55".chars() {
@@ -277,6 +283,7 @@ fn default_route_editor(allow_management_change: bool) -> InterfaceEditor {
         saved_config: None,
         offline_revision: None,
         intent_confirmation: None,
+        advanced: false,
         interface: "wlan0".into(),
         field: InterfaceEditorField::Save,
         cidr: "192.168.1.10/24".into(),
@@ -417,21 +424,21 @@ fn the_remove_row_clears_the_cidr_field() {
 #[test]
 fn interface_editor_field_reaches_save_and_clamps_at_both_ends() {
     for offline in [false, true] {
-        let fields = editor_fields(offline);
+        let fields = editor_fields(offline, true);
         for pair in fields.windows(2) {
-            assert_eq!(next_editor_field(pair[0], offline), pair[1]);
-            assert_eq!(previous_editor_field(pair[1], offline), pair[0]);
+            assert_eq!(next_editor_field(pair[0], offline, true), pair[1]);
+            assert_eq!(previous_editor_field(pair[1], offline, true), pair[0]);
         }
-        assert_eq!(previous_editor_field(fields[0], offline), fields[0]);
+        assert_eq!(previous_editor_field(fields[0], offline, true), fields[0]);
         let last = *fields.last().unwrap();
-        assert_eq!(next_editor_field(last, offline), last);
+        assert_eq!(next_editor_field(last, offline, true), last);
     }
     assert_eq!(
-        next_editor_field(InterfaceEditorField::Save, false),
+        next_editor_field(InterfaceEditorField::Save, false, true),
         InterfaceEditorField::Save
     );
     assert_eq!(
-        next_editor_field(InterfaceEditorField::Save, true),
+        next_editor_field(InterfaceEditorField::Save, true, true),
         InterfaceEditorField::Forget
     );
 }
@@ -588,6 +595,7 @@ fn manual_mac_rejects_invalid_zero_and_multicast_addresses() {
 #[tokio::test]
 async fn mac_controls_require_management_and_switching_it_off_clears_the_mac() {
     let mut editor = unmanaged_editor();
+    editor.advanced = true;
     editor.field = InterfaceEditorField::MacAddress;
     let mut app = TuiApp {
         editor: Some(editor),
@@ -616,6 +624,7 @@ async fn mac_controls_require_management_and_switching_it_off_clears_the_mac() {
     assert_eq!(app.editor.as_ref().unwrap().cursor, 17);
     handle_editor_key(&mut app, KeyCode::Backspace, &client).await;
     assert_eq!(app.editor.as_ref().unwrap().mac_address.len(), 16);
+    handle_editor_key(&mut app, KeyCode::Up, &client).await;
     handle_editor_key(&mut app, KeyCode::Up, &client).await;
     assert_eq!(
         app.editor.as_ref().unwrap().field,
@@ -715,4 +724,44 @@ fn offline_action_buttons_are_visible_clickable_and_hidden_for_present_devices()
             .contains(action)));
         }
     }
+}
+
+#[tokio::test]
+async fn basic_editor_skips_hidden_mac_fields_and_keeps_review_visible() {
+    use ratatui::{backend::TestBackend, Terminal};
+    let mut editor = default_route_editor(false);
+    editor.field = InterfaceEditorField::Advanced;
+    let mut app = TuiApp {
+        screen: Screen::InterfaceEditor,
+        editor: Some(editor),
+        ..Default::default()
+    };
+    let client = ApiClient::new("/nonexistent.sock");
+    handle_editor_key(&mut app, KeyCode::Tab, &client).await;
+    assert_eq!(
+        app.editor.as_ref().unwrap().field,
+        InterfaceEditorField::Save
+    );
+    handle_editor_key(&mut app, KeyCode::BackTab, &client).await;
+    handle_editor_key(&mut app, KeyCode::Enter, &client).await;
+    handle_editor_key(&mut app, KeyCode::Tab, &client).await;
+    assert_eq!(
+        app.editor.as_ref().unwrap().field,
+        InterfaceEditorField::MacAddress
+    );
+    app.editor.as_mut().unwrap().mac_address = "invalid".into();
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| super::super::render(frame, &mut app, false))
+        .unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(text.contains("Invalid MAC"));
+    assert!(text.contains("Review changes"));
+    assert!(app.ui.buttons.iter().any(|(_, slot)| *slot == 0));
 }

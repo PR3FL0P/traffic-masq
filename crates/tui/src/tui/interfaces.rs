@@ -20,6 +20,7 @@ pub(crate) enum InterfaceEditorField {
     RemoveIpv4,
     Role,
     Managed,
+    Advanced,
     MacAddress,
     RandomizeMac,
     Save,
@@ -27,11 +28,12 @@ pub(crate) enum InterfaceEditorField {
     Reset,
 }
 
-const INTERFACE_EDITOR_FIELDS: [InterfaceEditorField; 9] = [
+const INTERFACE_EDITOR_FIELDS: [InterfaceEditorField; 10] = [
     InterfaceEditorField::Cidr,
     InterfaceEditorField::RemoveIpv4,
     InterfaceEditorField::Role,
     InterfaceEditorField::Managed,
+    InterfaceEditorField::Advanced,
     InterfaceEditorField::MacAddress,
     InterfaceEditorField::RandomizeMac,
     InterfaceEditorField::Save,
@@ -64,6 +66,7 @@ pub(crate) struct InterfaceEditor {
     /// daemon side, which refuses the save outright unless confirmed).
     pub(crate) current_wifi_summary: Option<String>,
     pub(crate) current_dhcp_summary: Option<String>,
+    pub(crate) advanced: bool,
     pub(crate) cursor: usize,
 }
 
@@ -446,6 +449,7 @@ const REMOVE_IPV4_LABEL: &str = "Remove IPv4 address (clear the field)";
 const REMOVE_IPV4_BUTTON_SLOT: usize = 2;
 const FORGET_BUTTON_SLOT: usize = 3;
 const RESET_BUTTON_SLOT: usize = 4;
+const ADVANCED_BUTTON_SLOT: usize = 5;
 const FORGET_LABEL: &str = "[Forget saved configuration]";
 const RESET_LABEL: &str = "[Reset to base configuration]";
 
@@ -501,108 +505,62 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         return;
     }
 
-    let row = |label: &str, value: String, field: InterfaceEditorField| {
-        let active = editor.field == field;
-        let marker = if active { "▶ " } else { "  " };
-        let style = if active {
-            Style::default()
-                .fg(theme::ACCENT)
-                .add_modifier(Modifier::BOLD)
+    let block = panel("Interface · Editing");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let chunks = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(3),
+        Constraint::Length(if editor.offline_revision.is_some() {
+            3
         } else {
-            Style::default()
-        };
-        Line::styled(format!("{marker}{label}: {value}"), style)
+            1
+        }),
+    ])
+    .split(inner);
+    let row = |label: &str, field| {
+        super::layout::field_row(
+            label,
+            editor.field == field,
+            Style::default().fg(theme::ACCENT),
+        )
     };
-    let action_row = |label: &str, field: InterfaceEditorField| {
-        let active = editor.field == field;
-        let marker = if active { "▶ " } else { "  " };
-        let style = if active {
-            Style::default()
-                .fg(theme::ACCENT)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme::ACCENT)
-        };
-        Line::styled(format!("{marker}{label}"), style)
-    };
-
-    let active = editor.field == InterfaceEditorField::Cidr;
-    let cidr_label_style = if active {
-        Style::default()
-            .fg(theme::ACCENT)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme::ACCENT)
-    };
-    let cidr_marker = if active { "▶ " } else { "  " };
-    let mut cidr_spans = vec![Span::styled(
-        format!("{cidr_marker}IPv4 CIDR: "),
-        cidr_label_style,
-    )];
-    cidr_spans.extend(super::input::render_value_with_cursor(
-        &editor.cidr,
-        editor.cursor,
-        active && editor.managed,
-        cidr_label_style,
-    ));
-
     let mut lines = vec![
-        Line::from(format!("Interface: {}", editor.interface)),
-        Line::from(cidr_spans),
+        Line::from(format!(
+            "Device: {} · {}",
+            editor.interface,
+            if editor.offline_revision.is_some() {
+                "absent"
+            } else {
+                "present"
+            }
+        )),
+        Line::styled("Main settings", Style::default().fg(theme::MUTED)),
+        super::layout::text_field_row(
+            "IPv4 CIDR",
+            &editor.cidr,
+            editor.field == InterfaceEditorField::Cidr,
+            editor.cursor,
+            editor.managed,
+            Style::default().fg(theme::ACCENT),
+        ),
     ];
-    if editor.offline_revision.is_some() {
-        lines.push(Line::from(
-            "Missing: saved settings apply when the device returns",
-        ));
-    }
-    if !editor.managed {
-        lines.push(Line::styled(
-            "IPv4 editing is disabled. Enable Configure with traffic-masq to change addresses.",
-            Style::default().fg(theme::MUTED),
-        ));
-    }
     if !editor.cidr.trim().is_empty() && editor.cidr.trim().parse::<ipnet::Ipv4Net>().is_err() {
         lines.push(Line::styled(
-            "  Invalid CIDR — expected address/prefix, e.g. 192.168.1.10/24",
+            "  Invalid CIDR: use address/prefix, e.g. 192.168.1.10/24",
             Style::default().fg(theme::BAD),
         ));
     }
-    let mut observed = Line::from("  Observed: ");
-    observed.spans.extend(editor.observed_addresses.clone());
-    lines.push(observed);
-    lines.push(Line::styled(
-        "  [ext] external; [?] ownership unknown",
-        Style::default().fg(theme::WARN),
-    ));
-    let remove_row_index = lines.len() as u16;
-    lines.push(action_row(
-        REMOVE_IPV4_LABEL,
-        InterfaceEditorField::RemoveIpv4,
-    ));
-    // An empty field is the instruction to take the address off, so it has to
-    // read as one. Silence here is how "I cleared it and nothing happened"
-    // starts.
-    if editor.cidr.trim().is_empty() {
-        let removal = if editor.current_addresses.is_empty() {
-            Line::styled(
-                "  No static IPv4 requested",
-                Style::default().fg(theme::MUTED),
-            )
-        } else {
-            Line::styled(
-                format!(
-                    "  Observed on {}: {}. Preview shows which owned addresses will be removed",
-                    editor.interface,
-                    editor.current_addresses.join(", ")
-                ),
-                Style::default().fg(theme::WARN),
-            )
-        };
-        lines.push(removal);
+    if editor.field == InterfaceEditorField::Cidr {
+        let mut observed = Line::from("  Observed: ");
+        observed.spans.extend(editor.observed_addresses.clone());
+        lines.push(observed);
     }
-    lines.extend([
-        row(
-            "Router role",
+    let remove_row = lines.len();
+    lines.push(row(REMOVE_IPV4_LABEL, InterfaceEditorField::RemoveIpv4));
+    lines.push(row(
+        &format!(
+            "Router role: {}",
             match editor.role {
                 InterfaceRole::Input => "Input — Internet / WAN",
                 InterfaceRole::Output => "Output — local network / LAN",
@@ -610,111 +568,107 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
                 InterfaceRole::Middle => "Middle — VPN hop",
                 InterfaceRole::Disabled => "Disabled",
             }
-            .to_string(),
-            InterfaceEditorField::Role,
         ),
-        row(
-            "Configure with traffic-masq",
-            if editor.managed { "On" } else { "Off" }.to_string(),
-            InterfaceEditorField::Managed,
+        InterfaceEditorField::Role,
+    ));
+    lines.push(row(
+        &format!(
+            "Configure with traffic-masq: {}",
+            if editor.managed { "On" } else { "Off" }
         ),
-    ]);
-    let mac_active = editor.field == InterfaceEditorField::MacAddress;
-    let mac_style = Style::default().fg(theme::ACCENT);
-    let mut mac_spans = vec![Span::styled(
-        format!(
-            "{}MAC address (manual): ",
-            if mac_active { "▶ " } else { "  " }
-        ),
-        mac_style,
-    )];
-    mac_spans.extend(super::input::render_value_with_cursor(
-        &editor.mac_address,
-        editor.cursor,
-        mac_active && editor.managed,
-        mac_style,
+        InterfaceEditorField::Managed,
     ));
-    lines.push(Line::from(mac_spans));
-    if let Err(error) = editor.parsed_mac_address() {
-        lines.push(Line::styled(
-            format!("  {error}"),
-            Style::default().fg(theme::BAD),
-        ));
-    }
-    lines.push(action_row(
-        "Generate random MAC (Enter)",
-        InterfaceEditorField::RandomizeMac,
-    ));
-    lines.push(Line::styled(
-        "  Type MAC manually or generate above; empty MAC keeps the current address",
-        Style::default().fg(theme::MUTED),
-    ));
-    lines.push(Line::styled(
-        "None: outside the router. Review changes before applying.",
-        Style::default().fg(theme::MUTED),
-    ));
-    if !editor.managed && editor.cidr.trim() != editor.original_cidr.trim() {
-        let message = if editor.cidr.trim().is_empty() {
-            "Cannot remove the IP while the interface is unmanaged; enable Configure with traffic-masq first"
+    let advanced_row = lines.len();
+    lines.push(row(
+        if editor.advanced {
+            "[Advanced ▾]"
         } else {
-            "Cannot change IP while the interface is unmanaged; enable Configure with traffic-masq first"
-        };
-        lines.push(Line::styled(message, Style::default().fg(theme::BAD)));
-    }
-    if editor.original_managed && !editor.managed {
-        lines.push(Line::styled(
-            "Applying will remove traffic-masq-owned settings and stop managing this interface",
-            Style::default().fg(theme::WARN),
+            "[Advanced ▸]"
+        },
+        InterfaceEditorField::Advanced,
+    ));
+    if editor.advanced {
+        lines.push(super::layout::text_field_row(
+            "MAC address (manual)",
+            &editor.mac_address,
+            editor.field == InterfaceEditorField::MacAddress,
+            editor.cursor,
+            editor.managed,
+            Style::default().fg(theme::ACCENT),
+        ));
+        if let Err(error) = editor.parsed_mac_address() {
+            lines.push(Line::styled(
+                format!("  {error}"),
+                Style::default().fg(theme::BAD),
+            ));
+        }
+        lines.push(row(
+            "Generate random MAC (Enter)",
+            InterfaceEditorField::RandomizeMac,
         ));
     }
-    lines.push(Line::styled(
-        "Tab or up/down: move | Enter/Space: activate | type to edit IPv4 CIDR or MAC",
-        Style::default().fg(theme::MUTED),
-    ));
-    lines.push(Line::styled(
-        "Empty CIDR removes owned static IPv4 only; external addresses are preserved",
-        Style::default().fg(theme::MUTED),
-    ));
-    lines.push(Line::from(""));
-
+    let help = match editor.field {
+        InterfaceEditorField::Cidr | InterfaceEditorField::RemoveIpv4 if !editor.managed =>
+            "IPv4 editing disabled: enable Configure with traffic-masq first.",
+        InterfaceEditorField::Cidr | InterfaceEditorField::RemoveIpv4 =>
+            "Input: type address/prefix; Left/Right move cursor. Empty removes owned static IPv4; external addresses stay.",
+        InterfaceEditorField::Managed if editor.original_managed && !editor.managed =>
+            "Applying removes traffic-masq-owned settings and stops managing this interface.",
+        InterfaceEditorField::Managed => "Enables address and MAC configuration independently of routing.",
+        InterfaceEditorField::Role => "Enter/Space changes router participation. None keeps this interface outside routing.",
+        InterfaceEditorField::MacAddress | InterfaceEditorField::RandomizeMac if !editor.managed =>
+            "MAC editing disabled: enable Configure with traffic-masq first.",
+        InterfaceEditorField::MacAddress | InterfaceEditorField::RandomizeMac =>
+            "Input: type MAC or generate a random one. Empty keeps current MAC.",
+        InterfaceEditorField::Forget => "Delete saved settings; suppress the base definition. Profiles and passwords stay.",
+        InterfaceEditorField::Reset => "Remove saved override and restore settings from the daemon's base file.",
+        InterfaceEditorField::Save if editor.offline_revision.is_some() =>
+            "Save immediately for device return. No automatic rollback.",
+        InterfaceEditorField::Save => "Review the change plan before applying. The network has not changed yet.",
+        _ => "Tab/Shift+Tab or Up/Down: focus. Enter/Space: activate. Esc: back.",
+    };
+    frame.render_widget(
+        Paragraph::new(help)
+            .style(Style::default().fg(theme::MUTED))
+            .wrap(ratatui::widgets::Wrap { trim: false }),
+        chunks[1],
+    );
     let save_label = if editor.offline_revision.is_some() {
         "[Save for device return]"
     } else {
-        "[Plan / Apply]"
+        "[Review changes]"
     };
-    let button_row_index = lines.len() as u16;
-    lines.push(action_row(save_label, InterfaceEditorField::Save));
-
-    let mut buttons = vec![
-        (button_row_index, save_label.len() + 2, 0),
-        (
-            remove_row_index,
-            REMOVE_IPV4_LABEL.len() + 2,
-            REMOVE_IPV4_BUTTON_SLOT,
-        ),
-    ];
+    let mut actions = vec![(save_label, InterfaceEditorField::Save, 0)];
     if editor.offline_revision.is_some() {
-        buttons.push((
-            lines.len() as u16,
-            FORGET_LABEL.len() + 2,
-            FORGET_BUTTON_SLOT,
-        ));
-        lines.push(action_row(FORGET_LABEL, InterfaceEditorField::Forget));
-        buttons.push((lines.len() as u16, RESET_LABEL.len() + 2, RESET_BUTTON_SLOT));
-        lines.push(action_row(RESET_LABEL, InterfaceEditorField::Reset));
+        actions.extend([
+            (
+                FORGET_LABEL,
+                InterfaceEditorField::Forget,
+                FORGET_BUTTON_SLOT,
+            ),
+            (RESET_LABEL, InterfaceEditorField::Reset, RESET_BUTTON_SLOT),
+        ]);
     }
-
-    let block = panel("Interface editor");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let offset = super::layout::focused_lines_offset(&lines, inner.height);
-    for (row, width, slot) in buttons {
-        if row as usize >= offset && (row as usize) < offset + inner.height as usize {
+    for (index, (label, field, slot)) in actions.into_iter().enumerate() {
+        let rect = Rect::new(chunks[2].x, chunks[2].y + index as u16, chunks[2].width, 1)
+            .intersection(chunks[2]);
+        if !rect.is_empty() {
+            frame.render_widget(Paragraph::new(row(label, field)), rect);
+            app.ui.buttons.push((rect, slot));
+        }
+    }
+    // Keep both a selected input and its validation message in the viewport.
+    let offset = super::layout::focused_lines_offset(&lines, chunks[0].height.saturating_sub(1));
+    for (index, slot) in [
+        (remove_row, REMOVE_IPV4_BUTTON_SLOT),
+        (advanced_row, ADVANCED_BUTTON_SLOT),
+    ] {
+        if index >= offset && index < offset + chunks[0].height as usize {
             app.ui.buttons.push((
                 Rect::new(
-                    inner.x,
-                    inner.y + (row as usize - offset) as u16,
-                    (width as u16).min(inner.width),
+                    chunks[0].x,
+                    chunks[0].y + (index - offset) as u16,
+                    chunks[0].width,
                     1,
                 ),
                 slot,
@@ -723,7 +677,7 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
     }
     frame.render_widget(
         Paragraph::new(lines.into_iter().skip(offset).collect::<Vec<_>>()),
-        inner,
+        chunks[0],
     );
 }
 
@@ -984,6 +938,7 @@ pub(crate) fn render_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
 pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
     if let Some(editor) = app.editor.as_mut() {
         editor.field = match slot {
+            ADVANCED_BUTTON_SLOT => InterfaceEditorField::Advanced,
             REMOVE_IPV4_BUTTON_SLOT => InterfaceEditorField::RemoveIpv4,
             FORGET_BUTTON_SLOT if editor.offline_revision.is_some() => InterfaceEditorField::Forget,
             RESET_BUTTON_SLOT if editor.offline_revision.is_some() => InterfaceEditorField::Reset,
@@ -1083,6 +1038,7 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
                 saved_config: config.clone(),
                 offline_revision,
                 intent_confirmation: None,
+                advanced: false,
                 field: InterfaceEditorField::Cidr,
                 cidr,
                 role: original_role,
@@ -1212,19 +1168,35 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
     match key {
         KeyCode::Esc => app.screen = Screen::InterfaceList,
         KeyCode::Up | KeyCode::Char('k') if editor.field != InterfaceEditorField::Cidr => {
-            editor.field = previous_editor_field(editor.field, editor.offline_revision.is_some());
+            editor.field = previous_editor_field(
+                editor.field,
+                editor.offline_revision.is_some(),
+                editor.advanced,
+            );
             editor.reset_cursor();
         }
         KeyCode::Up | KeyCode::BackTab => {
-            editor.field = previous_editor_field(editor.field, editor.offline_revision.is_some());
+            editor.field = previous_editor_field(
+                editor.field,
+                editor.offline_revision.is_some(),
+                editor.advanced,
+            );
             editor.reset_cursor();
         }
         KeyCode::Down | KeyCode::Char('j') if editor.field != InterfaceEditorField::Cidr => {
-            editor.field = next_editor_field(editor.field, editor.offline_revision.is_some());
+            editor.field = next_editor_field(
+                editor.field,
+                editor.offline_revision.is_some(),
+                editor.advanced,
+            );
             editor.reset_cursor();
         }
         KeyCode::Down | KeyCode::Tab => {
-            editor.field = next_editor_field(editor.field, editor.offline_revision.is_some());
+            editor.field = next_editor_field(
+                editor.field,
+                editor.offline_revision.is_some(),
+                editor.advanced,
+            );
             editor.reset_cursor();
         }
         KeyCode::Enter | KeyCode::Char(' ') => match editor.field {
@@ -1243,6 +1215,7 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
                     editor.mac_address.clear();
                 }
             }
+            InterfaceEditorField::Advanced => editor.advanced = !editor.advanced,
             InterfaceEditorField::RandomizeMac => {
                 if editor.managed {
                     use rand::RngCore;
@@ -1307,20 +1280,39 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
     }
 }
 
-fn editor_fields(offline: bool) -> &'static [InterfaceEditorField] {
-    if offline {
-        &INTERFACE_EDITOR_FIELDS
-    } else {
-        &INTERFACE_EDITOR_FIELDS[..INTERFACE_EDITOR_FIELDS.len() - 2]
-    }
+fn editor_fields(offline: bool, advanced: bool) -> Vec<InterfaceEditorField> {
+    INTERFACE_EDITOR_FIELDS
+        .iter()
+        .copied()
+        .filter(|field| {
+            (offline
+                || !matches!(
+                    field,
+                    InterfaceEditorField::Forget | InterfaceEditorField::Reset
+                ))
+                && (advanced
+                    || !matches!(
+                        field,
+                        InterfaceEditorField::MacAddress | InterfaceEditorField::RandomizeMac
+                    ))
+        })
+        .collect()
 }
 
-fn previous_editor_field(field: InterfaceEditorField, offline: bool) -> InterfaceEditorField {
-    super::input::move_clamped(editor_fields(offline), field, false)
+fn previous_editor_field(
+    field: InterfaceEditorField,
+    offline: bool,
+    advanced: bool,
+) -> InterfaceEditorField {
+    super::input::move_clamped(&editor_fields(offline, advanced), field, false)
 }
 
-fn next_editor_field(field: InterfaceEditorField, offline: bool) -> InterfaceEditorField {
-    super::input::move_clamped(editor_fields(offline), field, true)
+fn next_editor_field(
+    field: InterfaceEditorField,
+    offline: bool,
+    advanced: bool,
+) -> InterfaceEditorField {
+    super::input::move_clamped(&editor_fields(offline, advanced), field, true)
 }
 
 pub(crate) async fn submit_dry_run(app: &mut TuiApp, client: &ApiClient) {
