@@ -1,13 +1,12 @@
-# traffic-masq
+# traffic-masq — Linux router, Wi-Fi access point and WireGuard gateway
 
-Turn a Linux machine into a router, Wi-Fi access point or WireGuard gateway,
-and manage it from a terminal UI.
+traffic-masq turns a Linux PC or mini PC into an IPv4 router, Wi-Fi access point
+or WireGuard VPN gateway, managed through a terminal user interface (TUI).
 
-For example, connect a mini PC to your Internet connection through one network
-interface and to your local devices through another. traffic-masq can give those
-devices IP addresses over DHCP and share the Internet connection using NAT.
-With a compatible Wi-Fi adapter, it can also provide an access point. WireGuard
-profiles and VPN policy routing let you send client traffic through a VPN.
+Share an Internet connection with local devices using NAT and built-in DHCP,
+configure a Wi-Fi hotspot with a compatible adapter, or route LAN traffic
+through WireGuard tunnels. Manage the daemon locally or connect a remote
+terminal client over HTTPS.
 
 ```text
 Internet ── WAN interface ── Linux machine ── LAN interface ── Local devices
@@ -23,16 +22,34 @@ The project has two programs:
 The project is under development. Use a spare machine for testing. Networking
 is IPv4-only, apart from addresses inside WireGuard profiles.
 
-## Reset to defaults
+## What can I use traffic-masq for?
 
-To clear traffic-masq configuration and persistent application state without uninstalling it, preview and run:
+- **Turn a Linux PC into a router:** connect WAN and LAN interfaces, assign
+  client addresses with DHCP, and share Internet access through NAT. See
+  [wired Internet sharing](#first-setup-share-a-wired-internet-connection).
+- **Share Ethernet Internet over Wi-Fi:** configure a compatible wireless
+  adapter as an access point with hostapd, then configure DHCP and Internet
+  sharing for wireless clients. See [first setup](#first-setup-share-a-wired-internet-connection).
+- **Share a Wi-Fi uplink through a separate access point:** use two radios
+  and the [Wi-Fi router setup wizard](#wi-fi-router-setup-wizard) to configure
+  the upstream connection, local AP and LAN settings together.
+- **Set up a WireGuard gateway for LAN devices:** import WireGuard profiles
+  and configure VPN policy routing or an ordered VPN chain. See
+  [uplink and VPN chains](#uplink-and-vpn-chains).
+- **Manage a Linux router from the terminal:** inspect interfaces, configure
+  routes and DHCP, manage Wi-Fi, and view recent daemon logs. Use the
+  [remote terminal client](#remote-terminal-client) to manage another machine.
 
-```sh
-sudo traffic-masqd reset --dry-run
-sudo traffic-masqd reset
-```
+## Confirm network changes before keeping them
 
-For a normal reset the daemon must be running and healthy: it restores traffic-masq-owned network state and acknowledges successful cleanup before recovery journals are removed. Logs and service registration are preserved; the daemon remains stopped until `sudo traffic-masqd start`. After a reboot, an intentional offline reset can be performed with `--force-offline`.
+Interface, router and Wi-Fi connection changes use an **Apply → Commit**
+workflow. Apply changes the running network and starts a confirmation timer,
+normally 60 seconds. If you lose access and cannot confirm in time, the daemon
+schedules rollback. This requires a running daemon; restoration can take longer
+while operations finish or recovery retries run.
+
+See [applying and confirming changes](#applying-and-confirming-changes) for
+coverage, immediate operations and crash-recovery behavior.
 
 ## Quick start
 
@@ -379,7 +396,18 @@ sudo traffic-masqd --config /path/to/config.toml start
 | Logs | `/var/log/traffic-masq` |
 | Local API socket | `/run/traffic-masq/traffic-masqd.sock` |
 
-### Service commands
+## Reset to defaults
+
+To clear traffic-masq configuration and persistent application state without uninstalling it, preview and run:
+
+```sh
+sudo traffic-masqd reset --dry-run
+sudo traffic-masqd reset
+```
+
+For a normal reset the daemon must be running and healthy: it restores traffic-masq-owned network state and acknowledges successful cleanup before recovery journals are removed. Logs and service registration are preserved; the daemon remains stopped until `sudo traffic-masqd start`. After a reboot, an intentional offline reset can be performed with `--force-offline`.
+
+## Service commands
 
 ```sh
 sudo traffic-masqd status
@@ -397,6 +425,50 @@ sudo traffic-masqd uninstall
 
 Uninstall stops the daemon and removes installed binaries and service files.
 It keeps configuration, passwords, state, logs and dependency packages.
+
+## Frequently asked questions
+
+### Can I turn a Linux mini PC into a router with traffic-masq?
+
+Yes. A typical wired setup uses one interface for the Internet uplink and another
+for local devices. Configure the LAN address, a DHCP pool and an Internet sharing
+rule with masquerading. The uplink needs a working address and route. See
+[first setup](#first-setup-share-a-wired-internet-connection).
+
+### Can I share a wired Internet connection over Wi-Fi?
+
+Yes, with a Linux-compatible adapter that supports AP mode and hostapd installed.
+Configure the access point, its LAN address and DHCP pool, then add an Internet
+sharing rule through the wired uplink. A Wi-Fi uplink and local AP on two separate
+radios can instead be configured with the
+[Wi-Fi setup wizard](#wi-fi-router-setup-wizard).
+
+### Do LAN devices need WireGuard installed to use the VPN gateway?
+
+No. WireGuard runs on the Linux gateway. Local devices use it as their router,
+and the configured VPN traffic policy determines which traffic enters the
+tunnel. See [uplink and VPN chains](#uplink-and-vpn-chains).
+
+### Does traffic-masq replace NetworkManager?
+
+traffic-masq manages the interfaces you explicitly assign to it. Release those
+interfaces from NetworkManager, systemd-networkd or other network services before
+configuring them. An externally managed uplink can stay with its current manager
+in the wired sharing example. See
+[network manager conflicts and interface handover](docs/resource-conflicts.md#avoiding-conflicts-with-distribution-network-managers).
+
+### What happens if a network change disconnects my terminal session?
+
+For changes covered by Apply → Commit, an unconfirmed change expires and the
+running daemon schedules rollback. Some operations apply immediately, and the
+timer cannot run while the daemon is stopped. See
+[applying and confirming changes](#applying-and-confirming-changes) and the
+[recovery runbook](docs/recovery.md).
+
+### Does traffic-masq support IPv6 routing?
+
+Networking is IPv4-only, apart from addresses inside WireGuard profiles.
+traffic-masq is under development; use a spare machine for testing.
 
 ## More documentation
 
