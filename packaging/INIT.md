@@ -85,11 +85,29 @@ prefix or configuration path requires uninstalling the old registration first;
 this avoids leaving two services controlling the same daemon.
 
 ```sh
-sudo traffic-masqd --config /etc/traffic-masq/config.toml stop
-sudo ./traffic-masqd install
+sudo ./update.sh
+# For binaries downloaded by gitcompile.sh:
+sudo ./update.sh --binary-dir ./binaries
+# For a release archive containing both binaries beside update.sh:
+sudo ./update.sh --binary-dir .
 sudo traffic-masqd --config /etc/traffic-masq/config.toml uninstall --dry-run
 sudo traffic-masqd --config /etc/traffic-masq/config.toml uninstall --yes
 ```
+
+`update.sh` uses prepared binaries from `target/release` by default; it does not
+build, download or pull source code. It checks both executables and validates the
+existing configuration before stopping the installed daemon, then delegates to
+`traffic-masqd install --non-interactive --skip-user-access --defer-password --start`.
+The installer preserves the recorded service backend, saved settings, existing
+password and group memberships, and waits for daemon readiness after startup.
+Stopping follows the configured shutdown policy and may interrupt connectivity.
+Use `--prefix PATH` and `--config PATH` for a custom installation.
+`--dry-run` validates inputs and describes the steps without stopping or installing;
+the full native installation plan, including service ownership checks, is checked
+after stopping. `--no-start` leaves the daemon stopped; runit does not support this
+option because enabling its service starts it. If installation fails, inspect
+the reported completed steps and retry; the wrapper does not attempt rollback
+of a potentially partial installation.
 
 Uninstall verifies ownership, disables boot activation and stops the manager,
 waits for the daemon lock to be released, removes owned service files and then

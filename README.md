@@ -100,6 +100,24 @@ To inspect interfaces before installing anything, use the read-only mode:
 ./target/release/traffic-masq --direct
 ```
 
+## Updating an existing installation
+
+To update an existing installation after building new release binaries:
+
+```sh
+sudo ./update.sh --dry-run
+sudo ./update.sh
+# Or use binaries downloaded by gitcompile.sh:
+sudo ./update.sh --binary-dir ./binaries
+```
+
+The script validates the new binaries and existing configuration, stops the
+daemon, updates through its native installer and starts it again. Configuration,
+saved network settings, credentials and user access are retained. Stopping may
+interrupt connectivity according to the configured shutdown policy. See
+[service integration](packaging/INIT.md#ownership-updates-and-removal) for custom
+paths, updating from release archives and leaving the daemon stopped.
+
 ## First setup: share a wired Internet connection
 
 This example uses `wan0` for an interface that already has working Internet

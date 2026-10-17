@@ -2,6 +2,7 @@
 set -eu
 
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+python3 "$project_dir/packaging/test-update.py"
 stage=$(mktemp -d)
 trap 'rm -rf -- "$stage"' EXIT HUP INT TERM
 
@@ -55,4 +56,5 @@ mkdir "$stage/unpacked"
 tar -xzf "$archive" -C "$stage/unpacked"
 test -x "$stage/unpacked/$(basename "$archive" .tar.gz)/traffic-masq"
 test -x "$stage/unpacked/$(basename "$archive" .tar.gz)/traffic-masqd"
+test -x "$stage/unpacked/$(basename "$archive" .tar.gz)/update.sh"
 printf '%s\n' "packaging staging smoke test passed"
