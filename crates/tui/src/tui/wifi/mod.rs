@@ -336,6 +336,7 @@ pub(crate) struct WifiScanPicker {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WifiProfilesMode {
+    Connect,
     Menu,
     Management,
     ProfileActions,
@@ -679,17 +680,17 @@ fn actions(role: WifiRole) -> &'static [(PrimaryAction, &'static str)] {
     match role {
         WifiRole::AccessPoint => &[
             (PrimaryAction::ConfigureAp, "Configure access point"),
+            (PrimaryAction::Stations, "Connected devices"),
             (PrimaryAction::ApProfiles, "Saved AP profiles"),
             (PrimaryAction::Reload, "Reload access point"),
             (PrimaryAction::Deactivate, "Deactivate access point"),
             (PrimaryAction::Refresh, "Refresh"),
-            (PrimaryAction::Stations, "Connected devices"),
         ],
         WifiRole::Client => &[
             (PrimaryAction::Scan, "Scan networks"),
-            (PrimaryAction::Profiles, "Saved profiles"),
+            (PrimaryAction::Profiles, "Connect saved profile"),
+            (PrimaryAction::Deactivate, "Disconnect"),
             (PrimaryAction::Reconnect, "Reconnect"),
-            (PrimaryAction::Deactivate, "Deactivate"),
             (PrimaryAction::Refresh, "Refresh"),
         ],
         WifiRole::Unknown => &[(PrimaryAction::Refresh, "Refresh")],
@@ -757,6 +758,62 @@ pub(crate) fn render_wifi(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
     }
     if app.wifi.actions_open {
         if let Some(row) = app.wifi.focused_radio() {
+            let ssid = row
+                .client
+                .as_ref()
+                .map(|client| client.spec.ssid.as_str())
+                .or_else(|| row.ap.as_ref().map(|ap| ap.spec.ssid.as_str()))
+                .or_else(|| {
+                    row.configured.as_ref().and_then(|config| {
+                        config
+                            .wifi_client
+                            .as_ref()
+                            .map(|wifi| wifi.ssid.as_str())
+                            .or_else(|| config.wifi.as_ref().map(|wifi| wifi.ssid.as_str()))
+                    })
+                })
+                .unwrap_or("none");
+            let observed = app
+                .dashboard
+                .interfaces
+                .iter()
+                .find(|status| status.interface.name == row.interface);
+            let addresses = observed
+                .map(|status| {
+                    status
+                        .ipv4_addresses
+                        .iter()
+                        .map(|address| format!("{}/{}", address.address, address.prefix_len))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .filter(|value| !value.is_empty());
+            let saved_ip = row
+                .configured
+                .as_ref()
+                .and_then(|config| config.ipv4)
+                .map(|ip| ip.to_string());
+            for detail in [
+                format!("Radio: {} · {}", row.interface, describe_row_state(row)),
+                format!("SSID: {ssid}"),
+                format!("IPv4: {}", addresses.as_deref().unwrap_or("not observed")),
+                format!(
+                    "Saved IPv4 policy: {}",
+                    saved_ip
+                        .as_deref()
+                        .unwrap_or(if row.role == WifiRole::Client {
+                            "DHCP / automatic"
+                        } else {
+                            "no static subnet"
+                        })
+                ),
+            ] {
+                lines.extend(
+                    super::logs::wrap_log_message(&detail, inner.width as usize)
+                        .into_iter()
+                        .map(Line::from),
+                );
+            }
             lines.push(Line::from(format!("Actions for {}", row.interface)));
             for (slot, (_, label)) in actions(row.role).iter().enumerate() {
                 let cursor = app.wifi.rows.len() + slot;
@@ -832,10 +889,7 @@ pub(crate) fn render_wifi(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
             }
         }
     }
-    let selected_line = radio_start
-        + app.wifi.selected
-        + usize::from(app.wifi.actions_open || app.wifi.rows.is_empty());
-    let offset = selected_line.saturating_sub(inner.height.saturating_sub(1) as usize);
+    let offset = super::layout::focused_lines_offset(&lines, inner.height);
     let visible_start = offset.max(radio_start);
     let visible_end = (offset + inner.height as usize).min(radio_start + app.wifi.rows.len());
     if visible_start < visible_end {
@@ -883,11 +937,21 @@ pub(crate) async fn handle_wifi_key(app: &mut TuiApp, key: KeyCode, client: &Api
         }
         KeyCode::Esc => app.screen = Screen::Dashboard,
         KeyCode::Tab | KeyCode::BackTab => {
-            if app.wifi.actions_open {
+            let forward = key == KeyCode::Tab;
+            if !app.wifi.actions_open {
+                open_radio(app, app.wifi.selected_radio);
+                if !forward {
+                    app.wifi.selected = app.wifi.cursor_limit();
+                }
+            } else if (forward && app.wifi.selected >= app.wifi.cursor_limit())
+                || (!forward && app.wifi.selected == app.wifi.rows.len())
+            {
                 app.wifi.actions_open = false;
                 app.wifi.selected = app.wifi.selected_radio;
+            } else if forward {
+                app.wifi.selected += 1;
             } else {
-                open_radio(app, app.wifi.selected_radio);
+                app.wifi.selected = app.wifi.selected.saturating_sub(1);
             }
         }
         KeyCode::Home => {
@@ -1026,7 +1090,7 @@ async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
         }
         PrimaryAction::Scan => start_scan(app, client, row.interface).await,
         PrimaryAction::Profiles => {
-            open_profiles(app, client, row.interface, WifiProfilesMode::Menu).await
+            open_profiles(app, client, row.interface, WifiProfilesMode::Connect).await
         }
         PrimaryAction::Reconnect => {
             request_simple(

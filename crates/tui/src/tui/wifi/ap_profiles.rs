@@ -30,7 +30,7 @@ impl WifiApProfilesView {
     pub(crate) fn select(&mut self, index: usize) {
         let count = match self.mode {
             WifiProfilesMode::Menu => 2,
-            WifiProfilesMode::Management => self.profiles.len(),
+            WifiProfilesMode::Management | WifiProfilesMode::Connect => self.profiles.len(),
             WifiProfilesMode::ProfileActions => self.actions().len(),
         };
         self.selected = index.min(count.saturating_sub(1));
@@ -174,7 +174,7 @@ pub(crate) fn render_wifi_ap_profiles(
         WifiProfilesMode::Management if view.profiles.is_empty() => {
             vec!["No saved AP profiles. Enter: create a profile".into()]
         }
-        WifiProfilesMode::Management => view
+        WifiProfilesMode::Management | WifiProfilesMode::Connect => view
             .profiles
             .iter()
             .map(|p| {
@@ -287,7 +287,7 @@ pub(crate) async fn handle_wifi_ap_profiles_key(
                 app.wifi_ap_profiles = None;
                 app.screen = Screen::Wifi;
             }
-            WifiProfilesMode::Management => {
+            WifiProfilesMode::Management | WifiProfilesMode::Connect => {
                 view.mode = WifiProfilesMode::Menu;
                 view.select(0);
             }
@@ -306,7 +306,7 @@ pub(crate) async fn handle_wifi_ap_profiles_key(
                     open_ap_profile_editor(app, interface, None);
                 }
             }
-            WifiProfilesMode::Management => {
+            WifiProfilesMode::Management | WifiProfilesMode::Connect => {
                 if view.profiles.is_empty() {
                     let interface = view.interface.clone();
                     open_ap_profile_editor(app, interface, None);

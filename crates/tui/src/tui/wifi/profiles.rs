@@ -45,7 +45,7 @@ pub(super) async fn open_profiles(
             };
             let selected = match mode {
                 WifiProfilesMode::Menu => 0,
-                WifiProfilesMode::Management => selected_profile,
+                WifiProfilesMode::Management | WifiProfilesMode::Connect => selected_profile,
                 WifiProfilesMode::ProfileActions => 0,
             };
             app.wifi_profiles = Some(WifiProfilesView {
@@ -89,7 +89,9 @@ pub(crate) fn render_wifi_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, a
     }
     match view.mode {
         WifiProfilesMode::Menu => render_profiles_menu(frame, area, &mut app.ui, view),
-        WifiProfilesMode::Management => render_profiles_management(frame, area, &mut app.ui, view),
+        WifiProfilesMode::Management | WifiProfilesMode::Connect => {
+            render_profiles_management(frame, area, &mut app.ui, view)
+        }
         WifiProfilesMode::ProfileActions => render_profile_actions(frame, area, &mut app.ui, view),
     }
 }
@@ -155,7 +157,11 @@ fn render_profiles_management(
         .profiles
         .get(view.selected_profile)
         .map_or("none", |p| p.id.as_str());
-    let title = format!("Saved profiles — Management (selected: {target})");
+    let title = if view.mode == WifiProfilesMode::Connect {
+        format!("Connect saved profile — Enter: IPv4 policy ({target})")
+    } else {
+        format!("Saved profiles — Management (selected: {target})")
+    };
     let block = panel(&title);
     let inner = block.inner(area);
 
@@ -313,6 +319,10 @@ pub(crate) async fn handle_wifi_profiles_key(app: &mut TuiApp, key: KeyCode, cli
         return;
     }
 
+    if key == KeyCode::Esc && view.mode == WifiProfilesMode::Connect {
+        app.screen = Screen::Wifi;
+        return;
+    }
     match view.mode {
         WifiProfilesMode::Menu => match key {
             KeyCode::Esc => {
@@ -335,7 +345,7 @@ pub(crate) async fn handle_wifi_profiles_key(app: &mut TuiApp, key: KeyCode, cli
             KeyCode::Enter => activate_profile_row(app, client).await,
             _ => {}
         },
-        WifiProfilesMode::Management => {
+        WifiProfilesMode::Management | WifiProfilesMode::Connect => {
             if view.profiles.is_empty() {
                 match key {
                     KeyCode::Esc => {
@@ -500,7 +510,10 @@ async fn activate_profile_row(app: &mut TuiApp, client: &ApiClient) {
             }
             None => {}
         },
-        WifiProfilesMode::Management => {
+        WifiProfilesMode::Connect if !is_empty => {
+            activate_profile_action(app, client, WifiProfileAction::Activate).await;
+        }
+        WifiProfilesMode::Management | WifiProfilesMode::Connect => {
             if is_empty {
                 open_create_profile(app, interface);
             } else if let Some(current) = app.wifi_profiles.as_mut() {

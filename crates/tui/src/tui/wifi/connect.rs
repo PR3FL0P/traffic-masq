@@ -314,8 +314,19 @@ pub(crate) fn render_wifi_connect_prompt(
     ));
     let mut lines = Vec::new();
 
+    lines.push(Line::from(format!(
+        "Selected IPv4 policy: {}",
+        match prompt.choice {
+            WifiIpChoice::Dhcp => "DHCP / automatic".to_string(),
+            WifiIpChoice::KeepStatic => format!(
+                "static {}",
+                prompt.current_static_ip.as_deref().unwrap_or("")
+            ),
+            WifiIpChoice::NewStatic => format!("static {}", prompt.static_cidr),
+        }
+    )));
     lines.push(Line::from(
-        "Select how IPv4 will be obtained for this connection:",
+        "Choose a policy below; Enter selects, Tab moves focus.",
     ));
     if prompt.expected_revision.is_some() {
         lines.push(Line::from(

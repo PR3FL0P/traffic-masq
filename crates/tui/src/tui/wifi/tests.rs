@@ -2449,3 +2449,75 @@ async fn access_point_draft_resumes_without_reloading_or_losing_credentials() {
     assert_eq!(app.wifi_editor.as_ref().unwrap().passphrase, "draft secret");
     assert!(app.ap_drafts.is_empty());
 }
+
+#[tokio::test]
+async fn saved_profile_from_radio_opens_ipv4_policy_without_management_menus() {
+    let profile = WifiClientProfileSummary {
+        created_at: 0,
+        modified_at: 0,
+        id: "home".into(),
+        ssid: "Home".into(),
+        security: WifiClientSecurity::Wpa2,
+        country_code: None,
+        priority: 1,
+        autoconnect: true,
+        has_passphrase: true,
+    };
+    let mock = crate::tui::test_api::mock(vec![
+        Response::WifiClientProfiles {
+            profiles: vec![profile],
+        },
+        saved_client_interface_inventory(traffic_masq_protocol::InterfacePresence::Present),
+    ])
+    .await;
+    let mut app = TuiApp {
+        screen: Screen::Wifi,
+        ..Default::default()
+    };
+    app.wifi.rows = vec![radio("wlan0")];
+    open_radio(&mut app, 0);
+    focus_action(&mut app, 1);
+    handle_wifi_key(&mut app, KeyCode::Enter, &mock.client).await;
+    assert_eq!(
+        app.wifi_profiles.as_ref().unwrap().mode,
+        WifiProfilesMode::Connect
+    );
+    handle_wifi_profiles_key(&mut app, KeyCode::Enter, &mock.client).await;
+    assert_eq!(app.screen, Screen::WifiConnectPrompt);
+    assert_eq!(app.wifi_connect.as_ref().unwrap().profile_id, "home");
+    assert_eq!(mock.calls.lock().unwrap().len(), 2);
+}
+
+#[test]
+fn radio_card_shows_policy_and_frequent_ap_actions_at_both_sizes() {
+    for (width, height) in [(80, 24), (120, 38)] {
+        let mut row = radio("wlan0");
+        row.role = WifiRole::AccessPoint;
+        let mut app = TuiApp {
+            screen: Screen::Wifi,
+            ..Default::default()
+        };
+        app.wifi.rows = vec![row];
+        open_radio(&mut app, 0);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| crate::tui::render(frame, &mut app, false))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("SSID:"));
+        assert!(text.contains("IPv4:"));
+        assert!(text.contains("Connected devices"));
+        assert!(matches!(
+            actions(WifiRole::AccessPoint)[1].0,
+            PrimaryAction::Stations
+        ));
+        assert!(app.ui.buttons.iter().any(|(_, slot)| *slot == 1));
+    }
+}
