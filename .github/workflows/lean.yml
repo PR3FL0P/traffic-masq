@@ -1,16 +1,7 @@
 name: Transaction proofs
 
 on:
-  push:
-    paths:
-      - 'formal/**'
-      - 'src/core/**'
-      - '.github/workflows/lean.yml'
-  pull_request:
-    paths:
-      - 'formal/**'
-      - 'src/core/**'
-      - '.github/workflows/lean.yml'
+  workflow_call:
   workflow_dispatch:
 
 permissions:
@@ -21,7 +12,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Install Lean toolchain manager
         run: |
           curl -sSfL https://elan.lean-lang.org/elan-init.sh -o "$RUNNER_TEMP/elan-init.sh"

@@ -84,7 +84,7 @@ sh packaging/test-namespaces.sh
 sh packaging/test-namespaces.sh vpn_wireguard_namespace vpn_policy_namespace
 ```
 
-You need Linux, iproute2, nftables, iputils-ping, wireguard-tools, `udhcpc`,
+You need Linux, iproute2, nftables, iputils-ping, wireguard-tools, ethtool, `udhcpc`,
 Python 3, util-linux and coreutils. Cargo builds as your user. Each suite then
 runs in its own network, mount and PID namespaces, with private `/run`, `/proc`
 and `/sys` mounts. A suite has ten minutes to finish; on exit, its remaining

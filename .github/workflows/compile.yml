@@ -6,102 +6,84 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: 'Build profile'
-        required: false
-        default: 'release'
+        description: Build profile
+        default: release
         type: choice
-        options:
-          - release
-          - debug
+        options: [release, debug]
       run_tests:
-        description: 'Run extra tests after mandatory validation'
-        required: false
+        description: Run extra tests after mandatory validation
         default: false
         type: boolean
       tests_only:
-        description: 'Run tests only without building/packaging binaries'
-        required: false
+        description: Run tests without building or packaging binaries
         default: false
         type: boolean
       test_filter:
-        description: 'Optional test filter pattern'
-        required: false
+        description: Optional extra test filter (implies run_tests)
         default: ''
         type: string
       cache:
-        description: 'Enable Rust build cache'
-        required: false
+        description: Enable Rust build caching, including mandatory validation
         default: true
         type: boolean
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-compile
+  cancel-in-progress: false
+
 jobs:
   validate:
     uses: ./.github/workflows/ci.yml
+    with:
+      cache: ${{ github.event_name != 'workflow_dispatch' || inputs.cache }}
   compile:
     needs: validate
     name: Build Binaries (Linux x86_64)
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
-
+    timeout-minutes: 45
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Setup Rust toolchain
-        run: |
-          rustup show active-toolchain
-
-      - name: Rust Cache
-        if: ${{ inputs.cache != false && inputs.cache != 'false' }}
-        uses: Swatinem/rust-cache@v2
+        uses: actions/checkout@v7
         with:
-          cache-all-crates: "true"
-          save-if: "true"
-
-      - name: Install test runtime dependencies
-        if: ${{ inputs.run_tests == true || inputs.run_tests == 'true' }}
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends hostapd wpasupplicant iw
-
-      - name: Run tests
-        if: ${{ inputs.run_tests == true || inputs.run_tests == 'true' }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          cache: ${{ github.event_name != 'workflow_dispatch' || inputs.cache }}
+          test-dependencies: ${{ inputs.run_tests || inputs.tests_only || inputs.test_filter != '' }}
+      - name: Run extra tests
+        if: inputs.run_tests || inputs.tests_only || inputs.test_filter != ''
         env:
           TEST_FILTER: ${{ inputs.test_filter }}
         run: |
-          # Always compile and run tests in fast debug mode (no release optimizations)
-          if [ -n "$TEST_FILTER" ] && [ "$TEST_FILTER" != "all" ]; then
+          if [ -n "$TEST_FILTER" ] && [ "$TEST_FILTER" != all ]; then
             cargo test --locked --workspace -- "$TEST_FILTER"
-          elif [ "$TEST_FILTER" = "all" ]; then
-            echo "==> Running complete test suite (debug)"
+          elif [ "$TEST_FILTER" = all ]; then
             cargo test --locked --workspace
           else
-            echo "==> Running library unit test suite (debug)"
             cargo test --locked --workspace --lib
           fi
-
-      - name: Build binaries
-        if: ${{ inputs.tests_only != true && inputs.tests_only != 'true' }}
+      - name: Build and package binaries
+        if: '!inputs.tests_only'
+        env:
+          BUILD_PROFILE: ${{ inputs.profile || 'release' }}
         run: |
-          if [ "${{ inputs.profile }}" = "debug" ]; then
-            cargo build --locked --bins
-            BUILD_DIR="target/debug"
+          if [ "$BUILD_PROFILE" = debug ]; then
+            cargo build --locked --workspace --bins
+            build_dir=target/debug
           else
-            cargo build --release --locked --bins
-            BUILD_DIR="target/release"
+            cargo build --release --locked --workspace --bins
+            build_dir=target/release
           fi
-
-          BINARY_DIR="$BUILD_DIR" sh packaging/release.sh
+          BINARY_DIR="$build_dir" sh packaging/release.sh
           (cd release && sha256sum -c ./*.sha256)
           # Preserve direct binary downloads used by gitcompile.sh.
-          cp "$BUILD_DIR/traffic-masq" "$BUILD_DIR/traffic-masqd" release/
-
+          cp "$build_dir/traffic-masq" "$build_dir/traffic-masqd" release/
       - name: Upload compiled binaries
-        if: ${{ inputs.tests_only != true && inputs.tests_only != 'true' }}
-        uses: actions/upload-artifact@v4
+        if: '!inputs.tests_only'
+        uses: actions/upload-artifact@v7
         with:
           name: traffic-masq-binaries
           path: release/*

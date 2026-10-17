@@ -51,24 +51,42 @@ verify their architecture. `TARGET` labels the archive and must match the build.
 
 ## GitHub Actions
 
-[`ci.yml`](../.github/workflows/ci.yml) runs formatting, Clippy, workspace tests,
-the isolated network/VPN suites with sudo, and the packaging smoke test on
-Ubuntu 24.04. It runs on pushes, pull requests, manual dispatch and calls from
-other workflows. Rustdoc checks above are additional local checks.
+[`ci.yml`](../.github/workflows/ci.yml) is the shared validation gate for
+pushes to `main`, pull requests, manual runs and binary builds. Lean transaction
+proofs run first through [`lean.yml`](../.github/workflows/lean.yml), which also
+supports manual dispatch. Rust checks then run workflow linting (actionlint
+1.7.12), formatting, Clippy, workspace tests (including doctests), rustdoc, all
+eight isolated network/VPN suites with sudo, and packaging smoke tests on
+Ubuntu 24.04. Pull-request validation cancels superseded runs. Physical Wi-Fi
+tests remain separate and are never selected by these workflows.
+
+Both validation and binary builds use the pinned Rust toolchain and
+[shared setup action](../.github/actions/setup-rust/action.yml) for the cache
+and test runtime dependencies. The DHCP namespace fixture disables TX checksum
+offload on its server veth so the pre-address raw client receives completed
+UDP checksums; this does not change host interfaces or production validation.
+
+CodeQL is managed by GitHub **Default setup** for Actions, Python and Rust.
+The redundant Advanced workflow was removed because GitHub rejects its analysis
+uploads while Default setup is enabled. Security scanning remains enabled;
+this CI cleanup does not disable queries or dismiss alerts. If switching to
+Advanced setup later, disable Default setup before adding that workflow.
 
 [`compile.yml`](../.github/workflows/compile.yml) runs on `v*` tag pushes or
-manual dispatch. It always waits for the reusable validation workflow before
-building Linux x86_64 binaries. It uploads an Actions artifact named
-`traffic-masq-binaries`, containing the archive, checksum and loose binaries.
-It does not create or publish a GitHub Release.
+manual dispatch. It always waits for the complete reusable validation workflow,
+including Lean, before building Linux x86_64 binaries. It uploads an Actions
+artifact named `traffic-masq-binaries`, containing the archive, checksum and
+loose binaries. It does not create or publish a GitHub Release.
 
 For tag builds, the tag must equal `v<version>` from the root `Cargo.toml`;
 packaging rejects a mismatch. Manual dispatch accepts `profile` (`release` or
 `debug`), `run_tests`, `tests_only`, `test_filter`, and `cache`. Extra tests run
 in debug mode: an empty filter runs library tests, `all` runs workspace tests,
-and another value selects matching workspace tests. `tests_only` skips binary
-builds and artifact upload after validation. The cache option controls the
-compile job's cache; the validation job has its own cache.
+and another value selects matching workspace tests. Setting a filter or
+`tests_only` also enables extra tests. `tests_only` skips binary builds and
+artifact upload after validation. The cache option applies to both validation
+and compilation. Manual and tag build runs are not cancelled when another
+build is queued for the same ref.
 
 ## Remote compilation helper
 

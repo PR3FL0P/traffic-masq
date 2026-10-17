@@ -2,40 +2,59 @@ name: Validate
 
 on:
   push:
-    branches: ['**']
+    branches: [main]
   pull_request:
   workflow_call:
+    inputs:
+      cache:
+        description: Enable Rust build caching for validation.
+        type: boolean
+        default: true
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}-validation
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  proofs:
+    name: Transaction proofs
+    uses: ./.github/workflows/lean.yml
   validate:
     name: Rust and isolated network checks
+    needs: proofs
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up pinned Rust toolchain
-        run: rustup show active-toolchain
-      - uses: Swatinem/rust-cache@v2
+      - name: Require transaction proofs
+        env:
+          PROOFS_RESULT: ${{ needs.proofs.result }}
+        run: test "$PROOFS_RESULT" = success
+      - uses: actions/checkout@v7
         with:
-          cache-all-crates: 'true'
-      - name: Install test dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            hostapd wpasupplicant iw iproute2 nftables iputils-ping \
-            wireguard-tools busybox python3 util-linux coreutils
-          sudo ln -s "$(command -v busybox)" /usr/local/bin/udhcpc
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+        with:
+          # Push/PR events have no inputs; an explicitly false reusable input disables caching.
+          cache: ${{ format('{0}', inputs.cache) != 'false' }}
+          test-dependencies: 'true'
+      - name: Check workflow syntax
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Check Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Run workspace tests
         run: cargo test --locked --workspace
+      - name: Check documentation
+        run: cargo doc --locked --workspace --no-deps
       - name: Run isolated network and VPN tests
+        env:
+          RUST_LOG: traffic_masq::dhcp::client=debug
         run: sh packaging/test-namespaces.sh --sudo
       - name: Check packaging
         run: sh packaging/smoke-test.sh

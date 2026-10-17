@@ -98,6 +98,19 @@ impl Segment {
             &self.server_if,
         ])?;
         run_ip(&["-n", &self.namespace, "link", "set", &self.server_if, "up"])?;
+        // The client can receive before it has an IPv4 address via AF_PACKET.
+        // Veth TX offload otherwise exposes the server's unfinished UDP checksum
+        // to that socket; it must see the same completed checksum as a real NIC.
+        run_ip(&[
+            "netns",
+            "exec",
+            &self.namespace,
+            "ethtool",
+            "-K",
+            &self.server_if,
+            "tx",
+            "off",
+        ])?;
 
         run_ip(&[
             "-n",
@@ -421,6 +434,10 @@ fn start_client<S: DhcpClientActionSink + 'static>(
     segment: &Segment,
     sink: S,
 ) -> Result<(ClientTask, watch::Sender<bool>)> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_test_writer()
+        .try_init();
     let (index, mac) = segment.interface_identity()?;
     let config = DhcpClientRuntimeConfig::new(&segment.client_if, index, mac);
     assert_eq!(config.client_port, DHCP_CLIENT_PORT);
@@ -510,7 +527,10 @@ fn fake_dhcp_server_process() -> Result<()> {
         || request.requested_ip() != Some(offered)
         || request.server_identifier() != Some(SERVER_IP)
     {
-        bail!("received invalid selecting DHCPREQUEST");
+        bail!(
+            "received invalid selecting DHCPREQUEST: type={:?}, xid={:#010x}, expected_xid={discover_xid:#010x}, requested_ip={:?}, expected_ip={offered}, server={:?}",
+            request.strict_message_type()?, request.xid, request.requested_ip(), request.server_identifier()
+        );
     }
     socket.send_to(
         &reply(&request, offered, DhcpMessageType::Ack, &mode)?,

@@ -27,7 +27,9 @@ set --
 while IFS= read -r suite; do
     set -- "$@" --test "$suite"
 done < "$stage/suites"
-cargo test --locked --no-run --message-format=json "$@" > "$stage/build.jsonl"
+# Match the workspace feature resolution used by CI's ordinary test pass, so
+# selecting namespace targets does not rebuild them with a different feature set.
+cargo test --locked --workspace --no-run --message-format=json "$@" > "$stage/build.jsonl"
 python3 - "$stage" <<'PY'
 import json
 import pathlib

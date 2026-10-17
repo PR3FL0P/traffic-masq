@@ -1,0 +1,30 @@
+name: Set up Rust checks and builds
+description: Use the pinned toolchain, a shared cache and optional Linux test dependencies.
+inputs:
+  cache:
+    description: Enable the Rust build cache.
+    default: 'true'
+  test-dependencies:
+    description: Install runtime dependencies for workspace and namespace tests.
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - name: Set up pinned Rust toolchain
+      shell: bash
+      run: rustup show active-toolchain
+    - name: Restore Rust cache
+      if: inputs.cache == 'true'
+      uses: Swatinem/rust-cache@v2
+      with:
+        cache-all-crates: 'true'
+        shared-key: linux-x86_64
+    - name: Install test dependencies
+      if: inputs.test-dependencies == 'true'
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends \
+          hostapd wpasupplicant iw iproute2 nftables iputils-ping \
+          wireguard-tools busybox python3 util-linux coreutils ethtool
+        sudo ln -sf "$(command -v busybox)" /usr/local/bin/udhcpc
