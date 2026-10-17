@@ -271,6 +271,9 @@ struct TuiApp {
     dashboard_statistics_index: usize,
     api_access: Option<AccessEditor>,
     editor: Option<InterfaceEditor>,
+    interface_drafts: HashMap<String, InterfaceEditor>,
+    ap_drafts: HashMap<String, wifi::WifiEditor>,
+    confirmation_focus: usize,
     dhcp_editor: Option<DhcpEditor>,
     dhcp_leases: Option<DhcpLeasesView>,
     dhcp_clients: Vec<DhcpClientStatusView>,
@@ -333,6 +336,9 @@ impl Default for TuiApp {
             dashboard_statistics_index: 0,
             api_access: None,
             editor: None,
+            interface_drafts: HashMap::new(),
+            ap_drafts: HashMap::new(),
+            confirmation_focus: 0,
             dhcp_editor: None,
             dhcp_leases: None,
             dhcp_clients: Vec::new(),
@@ -1110,6 +1116,13 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                 .find(|(rect, _)| layout::point_in_rect(point, *rect))
                 .and_then(|(_, slot)| confirmation::key_for_slot(*slot))
             {
+                app.confirmation_focus = if key == KeyCode::Delete {
+                    2
+                } else if key == KeyCode::Esc {
+                    1
+                } else {
+                    0
+                };
                 handle_key(app, key, client, direct).await;
             }
         }
@@ -1682,9 +1695,28 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
         return;
     }
 
-    if confirmation::current(app).is_some() && !matches!(key, KeyCode::Enter | KeyCode::Esc) {
-        return;
-    }
+    let key = if let Some(dialog) = confirmation::current(app) {
+        let count = if dialog.secondary.is_some() { 3 } else { 2 };
+        match key {
+            KeyCode::Tab | KeyCode::Down | KeyCode::Right => {
+                app.confirmation_focus = (app.confirmation_focus + 1) % count;
+                return;
+            }
+            KeyCode::BackTab | KeyCode::Up | KeyCode::Left => {
+                app.confirmation_focus = (app.confirmation_focus + count - 1) % count;
+                return;
+            }
+            KeyCode::Enter => {
+                confirmation::key_for_slot(app.confirmation_focus).unwrap_or(KeyCode::Esc)
+            }
+            KeyCode::Esc => KeyCode::Esc,
+            KeyCode::Delete if dialog.secondary.is_some() => KeyCode::Delete,
+            _ => return,
+        }
+    } else {
+        app.confirmation_focus = 0;
+        key
+    };
 
     // Forms and simple lists share forward/backward focus navigation. Screens
     // with separate panes handle Tab themselves so it skips the whole list.
@@ -1786,6 +1818,9 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
         }
         Screen::Log => logs::handle_log_key(app, key),
         Screen::DaemonLogs => daemon_logs::handle_key(app, key, client).await,
+    }
+    if confirmation::current(app).is_none() {
+        app.confirmation_focus = 0;
     }
 }
 

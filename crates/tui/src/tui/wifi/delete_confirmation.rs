@@ -34,6 +34,7 @@ pub(in crate::tui) fn profile_delete_dialog(app: &TuiApp) -> Option<Dialog> {
 
 fn delete_dialog(id: &str, ssid: &str, consequences: &str) -> Dialog {
     Dialog {
+        secondary: None,
         title: "Delete saved Wi-Fi profile?",
         action: "Delete",
         lines: vec![
@@ -54,6 +55,7 @@ pub(super) fn render_delete_confirmation(
     id: &str,
     ssid: &str,
     consequences: &str,
+    focus: usize,
 ) {
-    delete_dialog(id, ssid, consequences).render(frame, area, ui);
+    delete_dialog(id, ssid, consequences).render(frame, area, ui, focus);
 }

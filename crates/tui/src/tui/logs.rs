@@ -190,7 +190,7 @@ fn format_time_hms(unix_time: u64) -> String {
 
 pub(crate) fn render_log(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
     if let Some(dialog) = super::confirmation::current(app) {
-        dialog.render(frame, area, &mut app.ui);
+        dialog.render(frame, area, &mut app.ui, app.confirmation_focus);
         return;
     }
     let sections = ratatui::layout::Layout::default()
@@ -274,14 +274,21 @@ pub(super) fn wrap_log_message(message: &str, width: usize) -> Vec<String> {
     for line in message.split('\n') {
         let mut row = String::new();
         let mut used = 0;
-        for grapheme in line.graphemes(true) {
-            let size = grapheme.width();
-            if used + size > width.max(1) && !row.is_empty() {
+        for word in line.split_word_bounds() {
+            if used + word.width() > width.max(1) && word.width() <= width.max(1) && !row.is_empty()
+            {
                 rows.push(std::mem::take(&mut row));
                 used = 0;
             }
-            row.push_str(grapheme);
-            used += size;
+            for grapheme in word.graphemes(true) {
+                let size = grapheme.width();
+                if used + size > width.max(1) && !row.is_empty() {
+                    rows.push(std::mem::take(&mut row));
+                    used = 0;
+                }
+                row.push_str(grapheme);
+                used += size;
+            }
         }
         rows.push(row);
     }

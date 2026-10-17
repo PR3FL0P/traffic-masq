@@ -133,6 +133,7 @@ pub(crate) fn render_router_plan(frame: &mut ratatui::Frame<'_>, area: Rect, app
         let block = panel("Saved router intent preview");
         let inner = block.inner(area);
         frame.render_widget(block, area);
+        let lines = super::super::layout::wrap_lines(lines, inner.width);
         app.router.plan_max_scroll = lines.len().saturating_sub(inner.height.max(1) as usize);
         app.router.plan_scroll = app.router.plan_scroll.min(app.router.plan_max_scroll);
         frame.render_widget(
@@ -277,6 +278,7 @@ pub(crate) fn render_router_plan(frame: &mut ratatui::Frame<'_>, area: Rect, app
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let mut lines = super::super::layout::wrap_lines(lines, inner.width);
     let cancel_row = lines.len();
     lines.push(Line::styled(
         ROUTER_CANCEL_LABEL,

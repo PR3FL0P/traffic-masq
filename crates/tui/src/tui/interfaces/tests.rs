@@ -284,6 +284,9 @@ fn default_route_editor(allow_management_change: bool) -> InterfaceEditor {
         offline_revision: None,
         intent_confirmation: None,
         advanced: false,
+        exit_requested: false,
+        original_role: InterfaceRole::Output,
+        original_mac: String::new(),
         interface: "wlan0".into(),
         field: InterfaceEditorField::Save,
         cidr: "192.168.1.10/24".into(),
@@ -814,4 +817,37 @@ async fn offline_restore_requires_a_reported_file_and_device_definition() {
     assert!(delete.contains("suppress the base definition"));
     assert!(delete.contains("passwords are retained"));
     assert!(delete.contains("base file is not edited"));
+}
+
+#[tokio::test]
+async fn interface_exit_keeps_or_discards_draft_with_keyboard_focus() {
+    let client = ApiClient::new("/must-not-connect.sock");
+    let mut editor = default_route_editor(false);
+    editor.cidr = "192.0.2.99/24".into();
+    let mut app = TuiApp {
+        screen: Screen::InterfaceEditor,
+        editor: Some(editor),
+        ..Default::default()
+    };
+    app.ui.input_enabled = true;
+    handle_editor_key(&mut app, KeyCode::Esc, &client).await;
+    assert!(app.editor.as_ref().unwrap().exit_requested);
+    super::super::handle_key(&mut app, KeyCode::Enter, &client, false).await;
+    assert_eq!(app.screen, Screen::InterfaceList);
+    assert_eq!(app.interface_drafts["wlan0"].cidr, "192.0.2.99/24");
+    app.dashboard
+        .interfaces
+        .push(observed_address(None, Some(false)));
+    app.dashboard.interfaces[0].interface.name = "wlan0".into();
+    open_editor(&mut app, &client).await;
+    assert_eq!(app.screen, Screen::InterfaceEditor);
+    assert_eq!(app.editor.as_ref().unwrap().cidr, "192.0.2.99/24");
+    assert!(app.interface_drafts.is_empty());
+    handle_editor_key(&mut app, KeyCode::Esc, &client).await;
+    super::super::handle_key(&mut app, KeyCode::BackTab, &client, false).await;
+    assert_eq!(app.confirmation_focus, 2);
+    super::super::handle_key(&mut app, KeyCode::Enter, &client, false).await;
+    assert!(app.editor.is_none());
+    assert!(app.interface_drafts.is_empty());
+    assert_eq!(app.screen, Screen::InterfaceList);
 }

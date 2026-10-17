@@ -558,3 +558,15 @@ pub(crate) fn render_change_review(
         }
     }
 }
+
+pub(crate) fn wrap_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .flat_map(|line| {
+            let style = line.style;
+            super::logs::wrap_log_message(&line.to_string(), width as usize)
+                .into_iter()
+                .map(move |text| Line::styled(text, style))
+        })
+        .collect()
+}

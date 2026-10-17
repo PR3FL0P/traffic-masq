@@ -1654,7 +1654,7 @@ async fn ap_unsaved_edits_require_explicit_discard() {
     assert!(!app.wifi_editor.as_ref().unwrap().discard_requested);
     assert!(app.wifi_editor.as_ref().unwrap().ssid.ends_with('x'));
     handle_wifi_editor_key(&mut app, KeyCode::Esc, &client).await;
-    handle_wifi_editor_key(&mut app, KeyCode::Enter, &client).await;
+    handle_wifi_editor_key(&mut app, KeyCode::Delete, &client).await;
     assert!(app.wifi_editor.is_none());
     assert_eq!(app.screen, Screen::Wifi);
 }
@@ -2424,4 +2424,28 @@ async fn wifi_and_ap_review_are_read_only_and_return_to_the_same_draft() {
     assert!(app.message.is_none());
     handle_wifi_editor_key(&mut app, KeyCode::Esc, &client).await;
     assert!(!app.wifi_editor.as_ref().unwrap().reviewing);
+}
+
+#[tokio::test]
+async fn access_point_draft_resumes_without_reloading_or_losing_credentials() {
+    let client = ApiClient::new("/must-not-connect.sock");
+    let mut row = radio("wlan0");
+    row.role = WifiRole::AccessPoint;
+    let mut editor = WifiEditor::from_row(&row);
+    editor.passphrase = "draft secret".into();
+    editor.dirty = true;
+    let mut app = TuiApp {
+        screen: Screen::WifiEditor,
+        wifi_editor: Some(editor),
+        ..Default::default()
+    };
+    handle_wifi_editor_key(&mut app, KeyCode::Esc, &client).await;
+    handle_wifi_editor_key(&mut app, KeyCode::Enter, &client).await;
+    assert_eq!(app.ap_drafts["wlan0"].passphrase, "draft secret");
+    app.wifi.rows = vec![row];
+    open_radio(&mut app, 0);
+    handle_wifi_key(&mut app, KeyCode::Enter, &client).await;
+    assert_eq!(app.screen, Screen::WifiEditor);
+    assert_eq!(app.wifi_editor.as_ref().unwrap().passphrase, "draft secret");
+    assert!(app.ap_drafts.is_empty());
 }

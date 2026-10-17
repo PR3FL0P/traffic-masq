@@ -127,6 +127,7 @@ pub(super) fn confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> 
         _ => return None,
     };
     Some(super::confirmation::Dialog {
+        secondary: None,
         title,
         action,
         lines,
@@ -135,7 +136,7 @@ pub(super) fn confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> 
 
 pub(crate) fn render_settings(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
     if let Some(dialog) = confirmation(app) {
-        dialog.render(frame, area, &mut app.ui);
+        dialog.render(frame, area, &mut app.ui, app.confirmation_focus);
         return;
     }
     let Some(editor) = &app.settings else {

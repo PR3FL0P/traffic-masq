@@ -6,7 +6,7 @@ use crate::tui::{
 
 pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
     if let Some(dialog) = discard_confirmation(app) {
-        dialog.render(frame, area, &mut app.ui);
+        dialog.render(frame, area, &mut app.ui, app.confirmation_focus);
         return;
     }
     let Some(editor) = &app.wifi_editor else {
@@ -220,6 +220,17 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
     frame.render_widget(block, area);
     let body_height = inner.height.saturating_sub(3);
     let offset = layout::focused_lines_offset(&lines, body_height);
+    if let Some(index) = fields
+        .iter()
+        .position(|field| matches!(field, WifiField::Apply | WifiField::SaveProfile))
+    {
+        if index >= offset && index < offset + body_height as usize {
+            app.ui.buttons.push((
+                Rect::new(inner.x, inner.y + (index - offset) as u16, inner.width, 1),
+                0,
+            ));
+        }
+    }
     frame.render_widget(
         Paragraph::new(lines.into_iter().skip(offset).collect::<Vec<_>>()),
         Rect::new(inner.x, inner.y, inner.width, body_height),
@@ -261,8 +272,22 @@ pub(crate) async fn handle_wifi_editor_key(app: &mut TuiApp, key: KeyCode, clien
     if editor.discard_requested {
         match key {
             KeyCode::Enter => {
-                close_editor(app);
+                let mut draft = app.wifi_editor.take().unwrap();
+                draft.discard_requested = false;
+                let key = draft_key(&draft);
+                let profile_mode = draft.profile_mode;
+                app.ap_drafts.insert(key, draft);
+                app.screen = if profile_mode {
+                    Screen::WifiApProfiles
+                } else {
+                    Screen::Wifi
+                };
+                app.push_message(
+                    LogLevel::Info,
+                    "Draft kept for this session; reopen the editor to resume",
+                );
             }
+            KeyCode::Delete => close_editor(app),
             KeyCode::Esc => editor.discard_requested = false,
             _ => {}
         }
@@ -658,16 +683,28 @@ pub(in crate::tui) fn discard_confirmation(
     editor
         .discard_requested
         .then(|| crate::tui::confirmation::Dialog {
-            title: "Discard access point edits?",
-            action: "Discard",
+            secondary: Some("Discard edits"),
+            title: "Leave access point editor?",
+            action: "Keep draft",
             lines: vec![
                 if editor.profile_mode {
                     format!("AP profile: {}", editor.profile_id)
                 } else {
                     format!("Interface: {}", editor.interface)
                 },
-                "Unsaved settings and entered credentials will be discarded.".into(),
+                "Keep draft retains edits and entered credentials in memory for this session. Discard removes them without changing the network.".into(),
                 "Cancel returns to editing.".into(),
             ],
         })
+}
+
+pub(super) fn draft_key(editor: &WifiEditor) -> String {
+    if editor.profile_mode {
+        format!(
+            "profile:{}",
+            editor.original_profile_id.as_deref().unwrap_or("new")
+        )
+    } else {
+        editor.interface.clone()
+    }
 }

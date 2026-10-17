@@ -105,6 +105,7 @@ impl VpnImportEditor {
 pub(super) fn confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> {
     let name = app.vpn.delete_confirmation.as_ref()?;
     Some(super::confirmation::Dialog {
+        secondary: None,
         title: "Delete saved VPN profile?",
         action: "Delete",
         lines: vec![
@@ -117,7 +118,7 @@ pub(super) fn confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> 
 
 pub(crate) fn render_vpn(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
     if let Some(dialog) = confirmation(app) {
-        dialog.render(frame, area, &mut app.ui);
+        dialog.render(frame, area, &mut app.ui, app.confirmation_focus);
         return;
     }
     let chunks = Layout::default()

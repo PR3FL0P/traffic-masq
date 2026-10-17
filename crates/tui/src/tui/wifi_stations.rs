@@ -143,6 +143,7 @@ pub(super) fn confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> 
     let view = app.wifi_stations.as_ref()?;
     let mac = view.confirm?;
     Some(super::confirmation::Dialog {
+        secondary: None,
         title: "Disconnect Wi-Fi client?",
         action: "Disconnect",
         lines: vec![
@@ -155,7 +156,7 @@ pub(super) fn confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> 
 
 pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
     if let Some(dialog) = confirmation(app) {
-        dialog.render(frame, area, &mut app.ui);
+        dialog.render(frame, area, &mut app.ui, app.confirmation_focus);
         return;
     }
     let Some(view) = &mut app.wifi_stations else {

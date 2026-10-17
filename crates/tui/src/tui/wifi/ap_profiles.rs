@@ -120,6 +120,10 @@ pub(super) fn open_ap_profile_editor(
         editor.field = WifiField::Ssid;
     }
     editor.reset_cursor();
+    let editor = app
+        .ap_drafts
+        .remove(&super::ap_editor::draft_key(&editor))
+        .unwrap_or(editor);
     app.wifi_editor = Some(editor);
     app.screen = Screen::WifiEditor;
 }
@@ -145,6 +149,7 @@ pub(crate) fn render_wifi_ap_profiles(
             id,
             ssid,
             "The running access point and saved interface settings are kept.",
+            app.confirmation_focus,
         );
         return;
     }

@@ -102,13 +102,12 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
         });
     frame.render_widget(gauge, chunks[0]);
 
+    let detail_lines = super::super::layout::wrap_lines(detail_lines, chunks[1].width);
     let visible_rows = chunks[1].height.max(1) as usize;
     view.max_scroll = detail_lines.len().saturating_sub(visible_rows);
     view.scroll = view.scroll.min(view.max_scroll);
     frame.render_widget(
-        Paragraph::new(detail_lines)
-            .wrap(ratatui::widgets::Wrap { trim: false })
-            .scroll((view.scroll.min(u16::MAX as usize) as u16, 0)),
+        Paragraph::new(detail_lines).scroll((view.scroll.min(u16::MAX as usize) as u16, 0)),
         chunks[1],
     );
 

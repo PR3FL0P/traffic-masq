@@ -14,6 +14,7 @@ use ratatui::{
 pub(super) struct Dialog {
     pub(super) title: &'static str,
     pub(super) action: &'static str,
+    pub(super) secondary: Option<&'static str>,
     pub(super) lines: Vec<String>,
 }
 
@@ -21,12 +22,14 @@ pub(super) struct Dialog {
 enum Action {
     Execute,
     Cancel,
+    Secondary,
 }
 
 pub(super) fn key_for_slot(slot: usize) -> Option<KeyCode> {
     match slot {
         slot if slot == Action::Execute as usize => Some(KeyCode::Enter),
         slot if slot == Action::Cancel as usize => Some(KeyCode::Esc),
+        slot if slot == Action::Secondary as usize => Some(KeyCode::Delete),
         _ => None,
     }
 }
@@ -42,6 +45,7 @@ pub(super) fn current(app: &TuiApp) -> Option<Dialog> {
         Screen::Provisioning => super::provisioning::confirmation(app),
         Screen::Vpn => super::vpn::confirmation(app),
         Screen::Log if app.logs_clear_confirmation => Some(Dialog {
+            secondary: None,
             title: "Clear client log?",
             action: "Clear",
             lines: vec![
@@ -54,11 +58,21 @@ pub(super) fn current(app: &TuiApp) -> Option<Dialog> {
 }
 
 impl Dialog {
-    pub(super) fn render(&self, frame: &mut ratatui::Frame<'_>, area: Rect, ui: &mut UiLayout) {
+    pub(super) fn render(
+        &self,
+        frame: &mut ratatui::Frame<'_>,
+        area: Rect,
+        ui: &mut UiLayout,
+        focus: usize,
+    ) {
         let block = panel(self.title);
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).split(inner);
+        let chunks = Layout::vertical([
+            Constraint::Min(0),
+            Constraint::Length(if self.secondary.is_some() { 3 } else { 2 }),
+        ])
+        .split(inner);
         frame.render_widget(
             Paragraph::new(
                 self.lines
@@ -73,23 +87,31 @@ impl Dialog {
         ui.list_area = None;
         ui.list_count = 0;
         ui.buttons.clear();
-        for (row, action, label, color) in [
+        let mut actions = vec![
+            (Action::Execute, format!("[{}]", self.action)),
             (
-                0,
-                Action::Execute,
-                format!("[{}]  Enter", self.action),
-                theme::WARN,
-            ),
-            (
-                1,
                 Action::Cancel,
-                "[Cancel]  Esc".into(),
-                theme::SELECTED_BG,
+                if self.secondary.is_some() {
+                    "[Continue editing]".into()
+                } else {
+                    "[Cancel]".into()
+                },
             ),
-        ] {
+        ];
+        if let Some(label) = self.secondary {
+            actions.push((Action::Secondary, format!("[{label}]")));
+        }
+        for (row, (action, label)) in actions.into_iter().enumerate() {
+            let active = action as usize == focus;
+            let color = if active {
+                theme::WARN
+            } else {
+                theme::SELECTED_BG
+            };
+            let label = format!("{}{label}", if active { "▶ " } else { "  " });
             let button = Rect::new(
                 chunks[1].x,
-                chunks[1].y.saturating_add(row),
+                chunks[1].y.saturating_add(row as u16),
                 (label.len() as u16).min(chunks[1].width),
                 1,
             )

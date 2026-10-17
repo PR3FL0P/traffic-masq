@@ -972,6 +972,11 @@ async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
     match action {
         PrimaryAction::Stations => super::wifi_stations::open(app, client, row.interface).await,
         PrimaryAction::ConfigureAp => {
+            if let Some(editor) = app.ap_drafts.remove(&row.interface) {
+                app.wifi_editor = Some(editor);
+                app.screen = Screen::WifiEditor;
+                return;
+            }
             if row.presence == traffic_masq_protocol::InterfacePresence::Missing
                 || !subsystem_disabled(app, WifiRole::AccessPoint)
             {
@@ -1499,7 +1504,9 @@ mod tests;
 
 pub(crate) fn focus_editor_action(app: &mut TuiApp, slot: usize) {
     if let Some(editor) = app.wifi_editor.as_mut() {
-        editor.field = if slot == 0 {
+        editor.field = if slot == 0 && editor.profile_mode {
+            WifiField::SaveProfile
+        } else if slot == 0 {
             WifiField::Apply
         } else {
             WifiField::Ssid

@@ -67,10 +67,24 @@ pub(crate) struct InterfaceEditor {
     pub(crate) current_wifi_summary: Option<String>,
     pub(crate) current_dhcp_summary: Option<String>,
     pub(crate) advanced: bool,
+    pub(crate) exit_requested: bool,
+    pub(crate) original_role: InterfaceRole,
+    pub(crate) original_mac: String,
     pub(crate) cursor: usize,
 }
 
 impl InterfaceEditor {
+    fn dirty(&self) -> bool {
+        self.cidr != self.original_cidr
+            || self.managed
+                != self
+                    .saved_config
+                    .as_ref()
+                    .map_or(true, |config| config.managed)
+            || self.role != self.original_role
+            || self.mac_address != self.original_mac
+    }
+
     pub(crate) fn reset_cursor(&mut self) {
         self.cursor = match self.field {
             InterfaceEditorField::Cidr => super::input::grapheme_count(&self.cidr),
@@ -455,6 +469,12 @@ const RESET_LABEL: &str = "[Restore settings from file]";
 
 pub(super) fn confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> {
     let editor = app.editor.as_ref()?;
+    if editor.exit_requested {
+        return Some(super::confirmation::Dialog {
+            title: "Leave interface editor?", action: "Keep draft", secondary: Some("Discard edits"),
+            lines: vec![format!("Interface: {}", editor.interface), "Keep draft to resume it in this session; no network changes are applied. Discard removes the unsaved edits. Cancel continues editing.".into()],
+        });
+    }
     let forget = editor.intent_confirmation?;
     let entry = app
         .dashboard
@@ -468,6 +488,7 @@ pub(super) fn confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> 
         .and_then(|base| base.file.as_deref())
         .unwrap_or("not reported by daemon");
     Some(super::confirmation::Dialog {
+        secondary: None,
         title: if forget {
             "Delete saved interface settings?"
         } else {
@@ -511,7 +532,7 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
     };
 
     if let Some(dialog) = confirmation(app) {
-        dialog.render(frame, area, &mut app.ui);
+        dialog.render(frame, area, &mut app.ui, app.confirmation_focus);
         return;
     }
 
@@ -811,6 +832,7 @@ pub(crate) fn render_preview(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
     } else {
         PREVIEW_APPLY_LABEL
     };
+    let mut lines = super::layout::wrap_lines(lines, inner.width);
     let cancel_row = lines.len();
     lines.push(Line::styled(
         PREVIEW_CANCEL_LABEL,
@@ -1031,6 +1053,15 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
     let Some(name) = selected_interface_name(app) else {
         return;
     };
+    if let Some(editor) = app.interface_drafts.remove(&name) {
+        app.editor = Some(editor);
+        app.screen = Screen::InterfaceEditor;
+        app.push_message(
+            LogLevel::Info,
+            "Resumed interface draft; review before applying",
+        );
+        return;
+    }
     let status = app
         .dashboard
         .interfaces
@@ -1090,6 +1121,13 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
                 offline_revision,
                 intent_confirmation: None,
                 advanced: false,
+                exit_requested: false,
+                original_role,
+                original_mac: config
+                    .as_ref()
+                    .and_then(|config| config.mac_address)
+                    .map(|mac| mac.to_string())
+                    .unwrap_or_default(),
                 field: InterfaceEditorField::Cidr,
                 cidr,
                 role: original_role,
@@ -1180,6 +1218,27 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
         return;
     };
 
+    if editor.exit_requested {
+        match key {
+            KeyCode::Esc => editor.exit_requested = false,
+            KeyCode::Delete => {
+                app.editor = None;
+                app.screen = Screen::InterfaceList;
+            }
+            KeyCode::Enter => {
+                let mut draft = app.editor.take().unwrap();
+                draft.exit_requested = false;
+                app.interface_drafts.insert(draft.interface.clone(), draft);
+                app.screen = Screen::InterfaceList;
+                app.push_message(
+                    LogLevel::Info,
+                    "Draft kept for this session; reopen the interface to resume",
+                );
+            }
+            _ => {}
+        }
+        return;
+    }
     if let Some(forget) = editor.intent_confirmation {
         if key == KeyCode::Esc {
             editor.intent_confirmation = None;
@@ -1232,8 +1291,17 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
     let mut unmanaged_mac_attempt = false;
 
     match key {
-        KeyCode::Esc => app.screen = Screen::InterfaceList,
-        KeyCode::Up | KeyCode::Char('k') if editor.field != InterfaceEditorField::Cidr => {
+        KeyCode::Esc if editor.dirty() => editor.exit_requested = true,
+        KeyCode::Esc => {
+            app.editor = None;
+            app.screen = Screen::InterfaceList;
+        }
+        KeyCode::Up | KeyCode::Char('k')
+            if !matches!(
+                editor.field,
+                InterfaceEditorField::Cidr | InterfaceEditorField::MacAddress
+            ) =>
+        {
             editor.field = previous_editor_field(
                 editor.field,
                 editor.offline_revision.is_some(),
@@ -1249,7 +1317,12 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
             );
             editor.reset_cursor();
         }
-        KeyCode::Down | KeyCode::Char('j') if editor.field != InterfaceEditorField::Cidr => {
+        KeyCode::Down | KeyCode::Char('j')
+            if !matches!(
+                editor.field,
+                InterfaceEditorField::Cidr | InterfaceEditorField::MacAddress
+            ) =>
+        {
             editor.field = next_editor_field(
                 editor.field,
                 editor.offline_revision.is_some(),

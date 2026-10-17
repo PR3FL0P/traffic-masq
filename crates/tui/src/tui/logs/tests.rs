@@ -132,3 +132,17 @@ fn long_log_can_be_scrolled_to_its_hint() {
     handle_log_key(&mut app, KeyCode::Home);
     assert_eq!(app.logs_scroll, 0);
 }
+
+#[test]
+fn warnings_wrap_at_word_boundaries_and_keep_graphemes() {
+    assert_eq!(
+        wrap_log_message("alpha beta gamma", 10),
+        vec!["alpha beta", " gamma"]
+    );
+    let text = "a verylongtokenwithnospace адаптер 👩‍💻";
+    let rows = wrap_log_message(text, 12);
+    assert_eq!(rows.concat(), text);
+    assert!(rows
+        .iter()
+        .all(|row| unicode_width::UnicodeWidthStr::width(row.as_str()) <= 12));
+}

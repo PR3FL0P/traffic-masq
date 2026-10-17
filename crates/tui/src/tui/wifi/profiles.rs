@@ -83,6 +83,7 @@ pub(crate) fn render_wifi_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, a
             id,
             ssid,
             "Saved interface settings are kept. Disconnect an active profile before deleting it.",
+            app.confirmation_focus,
         );
         return;
     }
