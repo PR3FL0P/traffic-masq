@@ -926,8 +926,9 @@ stopped.
 
 Use the Interfaces and Wi-Fi inventory to find saved adapters even when they
 are unplugged. In the missing interface editor, **Save** stores intent without
-a timer; **F5** forgets it (including its base TOML definition), and **F6**
-resets it to base TOML. Refresh observation and read the current revision before
+a timer. Select **Forget saved configuration** to forget it (including its base
+TOML definition), or **Reset to base configuration** to restore base TOML.
+Use Tab or the arrow keys and Enter, or click a button; confirm with Enter. Refresh observation and read the current revision before
 editing through the API.
 Assign a managed input/output role through
 `PUT /api/v1/interfaces/{interface}/intent`, then use `wifi-intent` for AP/STA

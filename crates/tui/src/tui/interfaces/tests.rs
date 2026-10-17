@@ -416,17 +416,23 @@ fn the_remove_row_clears_the_cidr_field() {
 
 #[test]
 fn interface_editor_field_reaches_save_and_clamps_at_both_ends() {
-    for pair in INTERFACE_EDITOR_FIELDS.windows(2) {
-        assert_eq!(next_editor_field(pair[0]), pair[1]);
-        assert_eq!(previous_editor_field(pair[1]), pair[0]);
+    for offline in [false, true] {
+        let fields = editor_fields(offline);
+        for pair in fields.windows(2) {
+            assert_eq!(next_editor_field(pair[0], offline), pair[1]);
+            assert_eq!(previous_editor_field(pair[1], offline), pair[0]);
+        }
+        assert_eq!(previous_editor_field(fields[0], offline), fields[0]);
+        let last = *fields.last().unwrap();
+        assert_eq!(next_editor_field(last, offline), last);
     }
     assert_eq!(
-        previous_editor_field(InterfaceEditorField::Cidr),
-        InterfaceEditorField::Cidr
+        next_editor_field(InterfaceEditorField::Save, false),
+        InterfaceEditorField::Save
     );
     assert_eq!(
-        next_editor_field(InterfaceEditorField::Save),
-        InterfaceEditorField::Save
+        next_editor_field(InterfaceEditorField::Save, true),
+        InterfaceEditorField::Forget
     );
 }
 
@@ -622,9 +628,9 @@ async fn mac_controls_require_management_and_switching_it_off_clears_the_mac() {
 
 #[tokio::test]
 async fn offline_forget_and_reset_confirm_with_enter_and_preserve_revision() {
-    for (trigger, request_type) in [
-        (KeyCode::F(5), "forget_interface_config"),
-        (KeyCode::F(6), "reset_interface_override"),
+    for (steps, request_type) in [
+        (1, "forget_interface_config"),
+        (2, "reset_interface_override"),
     ] {
         let mock = super::super::test_api::mock(vec![Response::Error {
             message: "stale revision".into(),
@@ -632,22 +638,81 @@ async fn offline_forget_and_reset_confirm_with_enter_and_preserve_revision() {
         .await;
         let mut editor = default_route_editor(false);
         editor.offline_revision = Some(7);
+        editor.field = InterfaceEditorField::Save;
         let mut app = TuiApp {
             screen: Screen::InterfaceEditor,
             editor: Some(editor),
             ..Default::default()
         };
-        handle_editor_key(&mut app, trigger, &mock.client).await;
+        for _ in 0..steps {
+            handle_editor_key(&mut app, KeyCode::Tab, &mock.client).await;
+        }
+        handle_editor_key(&mut app, KeyCode::Enter, &mock.client).await;
         handle_editor_key(&mut app, KeyCode::Char('y'), &mock.client).await;
         assert!(mock.calls.lock().unwrap().is_empty());
         handle_editor_key(&mut app, KeyCode::Esc, &mock.client).await;
         assert!(app.editor.as_ref().unwrap().intent_confirmation.is_none());
-        handle_editor_key(&mut app, trigger, &mock.client).await;
+        handle_editor_key(&mut app, KeyCode::Enter, &mock.client).await;
         handle_editor_key(&mut app, KeyCode::Enter, &mock.client).await;
         let calls = mock.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].body["type"], request_type);
         assert_eq!(calls[0].body["interface"], "wlan0");
         assert_eq!(calls[0].body["expected_revision"], 7);
+    }
+}
+
+#[test]
+fn offline_action_buttons_are_visible_clickable_and_hidden_for_present_devices() {
+    use ratatui::{backend::TestBackend, Terminal};
+
+    for (slot, field, label) in [
+        (
+            FORGET_BUTTON_SLOT,
+            InterfaceEditorField::Forget,
+            FORGET_LABEL,
+        ),
+        (RESET_BUTTON_SLOT, InterfaceEditorField::Reset, RESET_LABEL),
+    ] {
+        for height in [16, 40] {
+            let mut editor = default_route_editor(false);
+            editor.offline_revision = Some(7);
+            editor.field = field;
+            let mut app = TuiApp {
+                editor: Some(editor),
+                ..Default::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(100, height)).unwrap();
+            terminal
+                .draw(|frame| render_editor(frame, frame.area(), &mut app))
+                .unwrap();
+            let rect = app
+                .ui
+                .buttons
+                .iter()
+                .find(|(_, action)| *action == slot)
+                .unwrap()
+                .0;
+            let buffer = terminal.backend().buffer();
+            let text: String = (rect.x..rect.right())
+                .map(|x| buffer[(x, rect.y)].symbol())
+                .collect();
+            assert!(text.contains(label), "button text: {text}");
+            app.editor.as_mut().unwrap().field = InterfaceEditorField::Cidr;
+            focus_action(&mut app, slot);
+            assert_eq!(app.editor.as_ref().unwrap().field, field);
+
+            app.editor.as_mut().unwrap().offline_revision = None;
+            app.editor.as_mut().unwrap().field = InterfaceEditorField::Save;
+            app.ui.buttons.clear();
+            terminal
+                .draw(|frame| render_editor(frame, frame.area(), &mut app))
+                .unwrap();
+            assert!(!app.ui.buttons.iter().any(|(_, action)| [
+                FORGET_BUTTON_SLOT,
+                RESET_BUTTON_SLOT
+            ]
+            .contains(action)));
+        }
     }
 }

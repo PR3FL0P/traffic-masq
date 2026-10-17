@@ -124,7 +124,9 @@ of a VPN profile in use. VPN deletion latches the name before confirmation so a
 list refresh cannot change the target.
 
 Missing-device interface edits use revision-checked Save rather than the live
-preview/pending flow; F5 Forget suppresses base intent and F6 Reset restores it.
+preview/pending flow. The Forget and Reset buttons suppress base intent or restore
+it. Both support Tab/arrow navigation, Enter activation, and mouse clicks, with
+Enter confirmation.
 Router routes/sharing use saved inventory and latch the editor revision. Their
 offline preview scrolls to **Save intent** and reports cleanup blockers separately
 from persistence success. Unknown observation or a stale revision retains the

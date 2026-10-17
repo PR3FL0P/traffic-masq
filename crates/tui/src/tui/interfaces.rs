@@ -23,9 +23,11 @@ pub(crate) enum InterfaceEditorField {
     MacAddress,
     RandomizeMac,
     Save,
+    Forget,
+    Reset,
 }
 
-const INTERFACE_EDITOR_FIELDS: [InterfaceEditorField; 7] = [
+const INTERFACE_EDITOR_FIELDS: [InterfaceEditorField; 9] = [
     InterfaceEditorField::Cidr,
     InterfaceEditorField::RemoveIpv4,
     InterfaceEditorField::Role,
@@ -33,6 +35,8 @@ const INTERFACE_EDITOR_FIELDS: [InterfaceEditorField; 7] = [
     InterfaceEditorField::MacAddress,
     InterfaceEditorField::RandomizeMac,
     InterfaceEditorField::Save,
+    InterfaceEditorField::Forget,
+    InterfaceEditorField::Reset,
 ];
 
 #[derive(Debug, Clone)]
@@ -440,6 +444,10 @@ pub(crate) fn render_interface_inventory(
 const REMOVE_IPV4_LABEL: &str = "Remove IPv4 address (clear the field)";
 /// Slot 0 and 1 are already spoken for by Save and the cancel strip below it.
 const REMOVE_IPV4_BUTTON_SLOT: usize = 2;
+const FORGET_BUTTON_SLOT: usize = 3;
+const RESET_BUTTON_SLOT: usize = 4;
+const FORGET_LABEL: &str = "[Forget saved configuration]";
+const RESET_LABEL: &str = "[Reset to base configuration]";
 
 pub(super) fn confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> {
     let editor = app.editor.as_ref()?;
@@ -544,7 +552,7 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
     ];
     if editor.offline_revision.is_some() {
         lines.push(Line::from(
-            "Missing: Save stores settings; F5 forget; F6 reset to base",
+            "Missing: saved settings apply when the device returns",
         ));
     }
     if !editor.managed {
@@ -677,18 +685,30 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
     let button_row_index = lines.len() as u16;
     lines.push(action_row(save_label, InterfaceEditorField::Save));
 
-    let block = panel("Interface editor");
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let offset = super::layout::focused_lines_offset(&lines, inner.height);
-    for (row, width, slot) in [
+    let mut buttons = vec![
         (button_row_index, save_label.len() + 2, 0),
         (
             remove_row_index,
             REMOVE_IPV4_LABEL.len() + 2,
             REMOVE_IPV4_BUTTON_SLOT,
         ),
-    ] {
+    ];
+    if editor.offline_revision.is_some() {
+        buttons.push((
+            lines.len() as u16,
+            FORGET_LABEL.len() + 2,
+            FORGET_BUTTON_SLOT,
+        ));
+        lines.push(action_row(FORGET_LABEL, InterfaceEditorField::Forget));
+        buttons.push((lines.len() as u16, RESET_LABEL.len() + 2, RESET_BUTTON_SLOT));
+        lines.push(action_row(RESET_LABEL, InterfaceEditorField::Reset));
+    }
+
+    let block = panel("Interface editor");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let offset = super::layout::focused_lines_offset(&lines, inner.height);
+    for (row, width, slot) in buttons {
         if row as usize >= offset && (row as usize) < offset + inner.height as usize {
             app.ui.buttons.push((
                 Rect::new(
@@ -963,10 +983,11 @@ pub(crate) fn render_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
 
 pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
     if let Some(editor) = app.editor.as_mut() {
-        editor.field = if slot == REMOVE_IPV4_BUTTON_SLOT {
-            InterfaceEditorField::RemoveIpv4
-        } else {
-            InterfaceEditorField::Save
+        editor.field = match slot {
+            REMOVE_IPV4_BUTTON_SLOT => InterfaceEditorField::RemoveIpv4,
+            FORGET_BUTTON_SLOT if editor.offline_revision.is_some() => InterfaceEditorField::Forget,
+            RESET_BUTTON_SLOT if editor.offline_revision.is_some() => InterfaceEditorField::Reset,
+            _ => InterfaceEditorField::Save,
         };
         editor.reset_cursor();
     }
@@ -1189,27 +1210,21 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
     let mut unmanaged_mac_attempt = false;
 
     match key {
-        KeyCode::F(5) if editor.offline_revision.is_some() => {
-            editor.intent_confirmation = Some(true);
-        }
-        KeyCode::F(6) if editor.offline_revision.is_some() => {
-            editor.intent_confirmation = Some(false);
-        }
         KeyCode::Esc => app.screen = Screen::InterfaceList,
         KeyCode::Up | KeyCode::Char('k') if editor.field != InterfaceEditorField::Cidr => {
-            editor.field = previous_editor_field(editor.field);
+            editor.field = previous_editor_field(editor.field, editor.offline_revision.is_some());
             editor.reset_cursor();
         }
         KeyCode::Up | KeyCode::BackTab => {
-            editor.field = previous_editor_field(editor.field);
+            editor.field = previous_editor_field(editor.field, editor.offline_revision.is_some());
             editor.reset_cursor();
         }
         KeyCode::Down | KeyCode::Char('j') if editor.field != InterfaceEditorField::Cidr => {
-            editor.field = next_editor_field(editor.field);
+            editor.field = next_editor_field(editor.field, editor.offline_revision.is_some());
             editor.reset_cursor();
         }
         KeyCode::Down | KeyCode::Tab => {
-            editor.field = next_editor_field(editor.field);
+            editor.field = next_editor_field(editor.field, editor.offline_revision.is_some());
             editor.reset_cursor();
         }
         KeyCode::Enter | KeyCode::Char(' ') => match editor.field {
@@ -1237,6 +1252,11 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
                     editor.mac_address = traffic_masq_protocol::MacAddr::new(octets).to_string();
                 } else {
                     unmanaged_mac_attempt = true;
+                }
+            }
+            InterfaceEditorField::Forget | InterfaceEditorField::Reset => {
+                if editor.offline_revision.is_some() {
+                    editor.intent_confirmation = Some(editor.field == InterfaceEditorField::Forget);
                 }
             }
             InterfaceEditorField::Save => submit_dry_run(app, client).await,
@@ -1287,12 +1307,20 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
     }
 }
 
-fn previous_editor_field(field: InterfaceEditorField) -> InterfaceEditorField {
-    super::input::move_clamped(&INTERFACE_EDITOR_FIELDS, field, false)
+fn editor_fields(offline: bool) -> &'static [InterfaceEditorField] {
+    if offline {
+        &INTERFACE_EDITOR_FIELDS
+    } else {
+        &INTERFACE_EDITOR_FIELDS[..INTERFACE_EDITOR_FIELDS.len() - 2]
+    }
 }
 
-fn next_editor_field(field: InterfaceEditorField) -> InterfaceEditorField {
-    super::input::move_clamped(&INTERFACE_EDITOR_FIELDS, field, true)
+fn previous_editor_field(field: InterfaceEditorField, offline: bool) -> InterfaceEditorField {
+    super::input::move_clamped(editor_fields(offline), field, false)
+}
+
+fn next_editor_field(field: InterfaceEditorField, offline: bool) -> InterfaceEditorField {
+    super::input::move_clamped(editor_fields(offline), field, true)
 }
 
 pub(crate) async fn submit_dry_run(app: &mut TuiApp, client: &ApiClient) {
