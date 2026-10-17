@@ -507,3 +507,54 @@ pub(crate) fn screen_help_pairs(screen: Screen) -> Vec<(&'static str, &'static s
 
 #[cfg(test)]
 mod tests;
+
+/// Shared review presentation. Enter applies only after opening this separate step.
+pub(crate) fn render_change_review(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    ui: &mut UiLayout,
+    title: &str,
+    mut lines: Vec<String>,
+    offline: bool,
+    cancel_selected: bool,
+) {
+    lines.push(if offline {
+        "Saved immediately; applies on device return. No automatic rollback."
+    } else {
+        "Network unchanged. Apply temporarily, then confirm connectivity. Without confirmation, rollback is scheduled."
+    }.into());
+    let block = panel(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(2)]).split(inner);
+    frame.render_widget(
+        Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+            .wrap(ratatui::widgets::Wrap { trim: false }),
+        chunks[0],
+    );
+    for (index, label) in [
+        if offline {
+            "[Save for device return]"
+        } else {
+            "[Apply temporarily]"
+        },
+        "[Back to editing]",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let rect = Rect::new(chunks[1].x, chunks[1].y + index as u16, chunks[1].width, 1)
+            .intersection(chunks[1]);
+        if !rect.is_empty() {
+            frame.render_widget(
+                Paragraph::new(field_row(
+                    label,
+                    cancel_selected == (index == 1),
+                    Style::default().fg(theme::ACCENT),
+                )),
+                rect,
+            );
+            ui.buttons.push((rect, index));
+        }
+    }
+}

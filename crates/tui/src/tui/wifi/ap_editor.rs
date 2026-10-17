@@ -12,6 +12,69 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
     let Some(editor) = &app.wifi_editor else {
         return;
     };
+    if editor.reviewing {
+        let settings = ap_settings(editor);
+        layout::render_change_review(
+            frame,
+            area,
+            &mut app.ui,
+            "Access point · Review changes",
+            vec![
+                format!("Device: {}", editor.interface),
+                format!(
+                    "SSID: {} → {}",
+                    editor
+                        .original_spec
+                        .as_ref()
+                        .map(|spec| spec.ssid.as_str())
+                        .unwrap_or("none"),
+                    editor.ssid
+                ),
+                format!(
+                    "Security: {} → {}",
+                    editor
+                        .original_spec
+                        .as_ref()
+                        .map(|spec| describe_ap_security(spec.security))
+                        .unwrap_or("none"),
+                    describe_ap_security(editor.security)
+                ),
+                format!(
+                    "Radio: {} / channel {} / {:?}",
+                    settings.band, settings.channel, settings.channel_width
+                ),
+                format!(
+                    "IPv4 subnet: {}",
+                    if editor.subnet.is_empty() {
+                        "preserve existing"
+                    } else {
+                        &editor.subnet
+                    }
+                ),
+                format!(
+                    "DHCP: {}",
+                    if editor.configure_dhcp {
+                        "configure from subnet"
+                    } else if editor.disable_dhcp {
+                        "disable"
+                    } else {
+                        "preserve existing"
+                    }
+                ),
+                format!(
+                    "Passphrase: {}",
+                    if editor.passphrase.is_empty() {
+                        "preserve existing"
+                    } else {
+                        "replace saved passphrase"
+                    }
+                ),
+            ],
+            editor.offline_intent.is_some(),
+            editor.field != WifiField::Apply,
+        );
+        return;
+    }
     let area = if editor.offline_intent.is_some() && !editor.profile_mode {
         layout::render_offline_intent_warning(frame, area)
     } else {
@@ -101,11 +164,11 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
             if editor.offline_intent.is_some() {
                 "Save AP settings for device return"
             } else if editor.configure_dhcp {
-                "Apply AP + passphrase + DHCP"
+                "Review AP + passphrase + DHCP"
             } else if editor.disable_dhcp {
-                "Apply AP; disable DHCP"
+                "Review AP; disable DHCP"
             } else {
-                "Apply AP; preserve DHCP"
+                "Review AP; preserve DHCP"
             }
             .into(),
         ),
@@ -205,6 +268,33 @@ pub(crate) async fn handle_wifi_editor_key(app: &mut TuiApp, key: KeyCode, clien
         }
         return;
     }
+    if editor.reviewing {
+        match key {
+            KeyCode::Esc => {
+                editor.reviewing = false;
+                editor.field = WifiField::Apply;
+            }
+            KeyCode::Enter if editor.field != WifiField::Apply => {
+                editor.reviewing = false;
+                editor.field = WifiField::Apply;
+            }
+            KeyCode::Enter => apply_ap_editor(app, client).await,
+            KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Up
+            | KeyCode::Down => {
+                editor.field = if editor.field == WifiField::Apply {
+                    WifiField::Ssid
+                } else {
+                    WifiField::Apply
+                };
+            }
+            _ => {}
+        }
+        return;
+    }
     match key {
         KeyCode::Esc if editor.dirty => editor.discard_requested = true,
         KeyCode::Esc => close_editor(app),
@@ -298,7 +388,7 @@ pub(crate) async fn handle_wifi_editor_key(app: &mut TuiApp, key: KeyCode, clien
             editor.radio_settings = Some(settings);
         }
         KeyCode::Enter if editor.field == WifiField::Apply && !editor.profile_mode => {
-            apply_ap_editor(app, client).await
+            editor.reviewing = true;
         }
         KeyCode::Enter => {
             editor.field = move_field(&editor.fields(), editor.field, true);
@@ -461,7 +551,7 @@ async fn apply_ap_editor(app: &mut TuiApp, client: &ApiClient) {
         Ok(Response::InterfaceIntentSaved { interface, .. }) => {
             app.push_message(
                 LogLevel::Info,
-                format!("Saved access point settings; application waits for interface {interface}"),
+                format!("Saved immediately for {interface}; applies on device return. No automatic rollback."),
             );
             app.wifi_editor = None;
             app.screen = Screen::Wifi;

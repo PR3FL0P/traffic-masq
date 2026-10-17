@@ -478,6 +478,9 @@ async fn ap_apply_enters_shared_commit_confirm_screen() {
     };
 
     handle_wifi_editor_key(&mut app, KeyCode::Enter, &client).await;
+    assert!(app.wifi_editor.as_ref().unwrap().reviewing);
+    assert!(app.pending.is_none());
+    handle_wifi_editor_key(&mut app, KeyCode::Enter, &client).await;
 
     assert_eq!(
         server.await.unwrap(),
@@ -1676,7 +1679,7 @@ fn ap_warnings_and_focused_action_fit_minimum_terminal() {
         .iter()
         .map(|c| c.symbol())
         .collect();
-    assert!(text.contains("Apply AP + passphrase + DHCP"));
+    assert!(text.contains("Review AP + passphrase + DHCP"));
     assert!(text.contains("DNS is not advertised"));
     assert!(text.contains("confirm before the rollback timer expires"));
 }
@@ -2087,6 +2090,8 @@ async fn control_o_submits_wifi_connection_from_any_field() {
         false,
     )
     .await;
+    assert!(app.wifi_connect.as_ref().unwrap().reviewing);
+    handle_wifi_connect_prompt_key(&mut app, KeyCode::Enter, &client).await;
     assert_eq!(server.await.unwrap(), vec!["provision_wifi_client wlan0"]);
 }
 
@@ -2374,4 +2379,49 @@ fn connect_prompt_button_targets_match_live_and_offline_labels() {
             assert_eq!(cancel.x, submit.right() + 4);
         }
     }
+}
+
+#[tokio::test]
+async fn wifi_and_ap_review_are_read_only_and_return_to_the_same_draft() {
+    let client = ApiClient::new("/must-not-connect.sock");
+    let mut prompt = WifiConnectPrompt::new(
+        "wlan0".into(),
+        "home".into(),
+        "Home".into(),
+        Some("192.0.2.1/24".into()),
+    );
+    prompt.field = WifiConnectField::Submit;
+    let mut app = TuiApp {
+        screen: Screen::WifiConnectPrompt,
+        wifi_connect: Some(prompt),
+        ..Default::default()
+    };
+    handle_wifi_connect_prompt_key(&mut app, KeyCode::Enter, &client).await;
+    assert!(app.wifi_connect.as_ref().unwrap().reviewing);
+    assert!(app.message.is_none());
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| crate::tui::render(frame, &mut app, false))
+        .unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(text.contains("192.0.2.1/24 → DHCP"));
+    assert!(text.contains("Network unchanged"));
+    assert_eq!(app.ui.buttons.len(), 2);
+    handle_wifi_connect_prompt_key(&mut app, KeyCode::Esc, &client).await;
+    assert!(!app.wifi_connect.as_ref().unwrap().reviewing);
+    let mut editor = WifiEditor::from_row(&radio("wlan0"));
+    editor.field = WifiField::Apply;
+    app.wifi_editor = Some(editor);
+    app.screen = Screen::WifiEditor;
+    handle_wifi_editor_key(&mut app, KeyCode::Enter, &client).await;
+    assert!(app.wifi_editor.as_ref().unwrap().reviewing);
+    assert!(app.message.is_none());
+    handle_wifi_editor_key(&mut app, KeyCode::Esc, &client).await;
+    assert!(!app.wifi_editor.as_ref().unwrap().reviewing);
 }

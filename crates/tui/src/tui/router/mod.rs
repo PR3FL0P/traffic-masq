@@ -354,7 +354,7 @@ impl RouterPendingView {
     }
 }
 
-const ROUTER_APPLY_LABEL: &str = "[Apply]  apply changes (Enter)";
+const ROUTER_APPLY_LABEL: &str = "[Apply temporarily] (Enter)";
 const ROUTER_CANCEL_LABEL: &str = "[Cancel] return without applying (Esc)";
 
 #[cfg(test)]

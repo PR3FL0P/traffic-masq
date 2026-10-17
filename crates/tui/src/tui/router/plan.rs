@@ -268,12 +268,12 @@ pub(crate) fn render_router_plan(frame: &mut ratatui::Frame<'_>, area: Rect, app
         ));
     }
     lines.push(Line::styled(
-        "Applying starts an automatic rollback timer.",
+        "Network unchanged. Applying starts a timer; without confirmation, rollback is scheduled.",
         Style::default().fg(theme::WARN),
     ));
     lines.push(Line::from(""));
 
-    let block = panel("Router plan preview");
+    let block = panel("Router · Review changes");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 

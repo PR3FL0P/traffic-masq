@@ -38,7 +38,7 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
         } else if recovery_required {
             "Rollback failed; new router transactions are blocked".to_owned()
         } else {
-            format!("Rollback scheduled in: {remaining}s / {timeout}s")
+            format!("Network changed temporarily. Without confirmation, rollback in {remaining}s / {timeout}s")
         }),
     ];
     if let Some(recovery) = &view.recovery {
@@ -70,7 +70,7 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
     let block = panel(if recovery_required {
         "Router rollback recovery"
     } else {
-        "Router change pending confirmation"
+        "Router · Confirmation"
     });
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -106,7 +106,9 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
     view.max_scroll = detail_lines.len().saturating_sub(visible_rows);
     view.scroll = view.scroll.min(view.max_scroll);
     frame.render_widget(
-        Paragraph::new(detail_lines).scroll((view.scroll.min(u16::MAX as usize) as u16, 0)),
+        Paragraph::new(detail_lines)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .scroll((view.scroll.min(u16::MAX as usize) as u16, 0)),
         chunks[1],
     );
 
@@ -136,14 +138,14 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
     } else {
         vec![
             Line::styled(
-                "[Commit]  persist changes (Enter)",
+                "[Confirm changes] (Enter)",
                 Style::default()
                     .fg(theme::SELECTED_FG)
                     .bg(theme::GOOD)
                     .add_modifier(Modifier::BOLD),
             ),
             Line::styled(
-                "[Rollback]  restore previous state (Esc)",
+                "[Roll back now] (Esc)",
                 Style::default()
                     .fg(theme::SELECTED_FG)
                     .bg(theme::WARN)
@@ -176,14 +178,19 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
         ));
     } else {
         app.ui.buttons.push((
-            Rect::new(chunks[2].x, chunks[2].y, "[Commit]".len() as u16, 1),
+            Rect::new(
+                chunks[2].x,
+                chunks[2].y,
+                "[Confirm changes]".len() as u16,
+                1,
+            ),
             0,
         ));
         app.ui.buttons.push((
             Rect::new(
                 chunks[2].x,
                 chunks[2].y.saturating_add(1),
-                "[Rollback]".len() as u16,
+                "[Roll back now]".len() as u16,
                 1,
             ),
             1,

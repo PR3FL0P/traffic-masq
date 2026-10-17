@@ -1632,6 +1632,7 @@ fn focus_action_slot(app: &mut TuiApp, slot: usize) {
         Screen::RouteEditor => router::focus_route_editor_action(app, slot),
         Screen::Vpn => vpn::focus_action(app, slot),
         Screen::VpnPolicy => vpn_policy::focus_action(app, slot),
+        Screen::WifiEditor => wifi::focus_editor_action(app, slot),
         Screen::Wifi => wifi::focus_action(app, slot),
         Screen::WifiConnectPrompt => {
             if let Some(prompt) = app.wifi_connect.as_mut() {

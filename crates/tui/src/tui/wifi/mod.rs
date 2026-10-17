@@ -199,6 +199,7 @@ pub(crate) struct WifiEditor {
     original_profile_id: Option<String>,
     dirty: bool,
     discard_requested: bool,
+    reviewing: bool,
     original_spec: Option<WifiApSpecView>,
     radio_settings: Option<WifiEditRequest>,
     pub(crate) cursor: usize,
@@ -265,6 +266,7 @@ impl WifiEditor {
             original_profile_id: None,
             dirty: false,
             discard_requested: false,
+            reviewing: false,
             original_spec: spec,
             radio_settings: None,
             cursor,
@@ -604,6 +606,7 @@ pub(crate) struct WifiConnectPrompt {
     pub(crate) profile_id: String,
     pub(crate) ssid: String,
     pub(crate) current_static_ip: Option<String>,
+    pub(crate) reviewing: bool,
     pub(crate) choice: WifiIpChoice,
     pub(crate) field: WifiConnectField,
     pub(crate) static_cidr: String,
@@ -625,6 +628,7 @@ impl WifiConnectPrompt {
             profile_id,
             ssid,
             current_static_ip,
+            reviewing: false,
             choice: WifiIpChoice::Dhcp,
             field: WifiConnectField::Choice(WifiIpChoice::Dhcp),
             static_cidr: initial_cidr,
@@ -1492,3 +1496,13 @@ fn report_unexpected(app: &mut TuiApp, response: Response) {
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) fn focus_editor_action(app: &mut TuiApp, slot: usize) {
+    if let Some(editor) = app.wifi_editor.as_mut() {
+        editor.field = if slot == 0 {
+            WifiField::Apply
+        } else {
+            WifiField::Ssid
+        };
+    }
+}

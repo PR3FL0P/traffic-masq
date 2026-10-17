@@ -72,6 +72,27 @@ pub(crate) async fn handle_wifi_connect_prompt_key(
         return;
     };
 
+    if prompt.reviewing {
+        match key {
+            KeyCode::Esc => prompt.reviewing = false,
+            KeyCode::Enter if prompt.field == WifiConnectField::Cancel => prompt.reviewing = false,
+            KeyCode::Enter => submit_wifi_connect(app, client).await,
+            KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Up
+            | KeyCode::Down => {
+                prompt.field = if prompt.field == WifiConnectField::Submit {
+                    WifiConnectField::Cancel
+                } else {
+                    WifiConnectField::Submit
+                };
+            }
+            _ => {}
+        }
+        return;
+    }
     match key {
         KeyCode::Esc => {
             app.wifi_connect = None;
@@ -128,7 +149,7 @@ pub(crate) async fn handle_wifi_connect_prompt_key(
                 prompt.field = WifiConnectField::Submit;
             }
             WifiConnectField::Submit => {
-                submit_wifi_connect(app, client).await;
+                prompt.reviewing = true;
             }
             WifiConnectField::Cancel => {
                 app.wifi_connect = None;
@@ -216,7 +237,7 @@ pub(super) async fn submit_wifi_connect(app: &mut TuiApp, client: &ApiClient) {
             app.screen = Screen::Wifi;
             app.push_message(
                 LogLevel::Info,
-                format!("Saved profile settings; application waits for interface {interface}"),
+                format!("Saved immediately for {interface}; applies on device return. No automatic rollback."),
             );
             load_wifi_data(app, client).await;
         }
@@ -244,6 +265,37 @@ pub(crate) fn render_wifi_connect_prompt(
     let Some(prompt) = &app.wifi_connect else {
         return;
     };
+    if prompt.reviewing {
+        let after = match prompt.choice {
+            WifiIpChoice::Dhcp => "DHCP".to_string(),
+            WifiIpChoice::KeepStatic => prompt.current_static_ip.clone().unwrap_or_default(),
+            WifiIpChoice::NewStatic => prompt.static_cidr.clone(),
+        };
+        layout::render_change_review(
+            frame,
+            area,
+            &mut app.ui,
+            "Wi-Fi · Review changes",
+            vec![
+                format!("Device: {}", prompt.interface),
+                format!(
+                    "Connect profile: {} (SSID: {})",
+                    prompt.profile_id, prompt.ssid
+                ),
+                format!(
+                    "IPv4: {} → {after}",
+                    prompt
+                        .current_static_ip
+                        .as_deref()
+                        .unwrap_or("automatic / no saved static IP")
+                ),
+                "Connection replaces the current client connection on this radio.".into(),
+            ],
+            prompt.expected_revision.is_some(),
+            prompt.field == WifiConnectField::Cancel,
+        );
+        return;
+    }
     let area = if prompt.expected_revision.is_some() {
         layout::render_offline_intent_warning(frame, area)
     } else {
@@ -351,9 +403,9 @@ pub(crate) fn render_wifi_connect_prompt(
     } else if prompt.expected_revision.is_some() {
         "  [ Save ] "
     } else if submit_active {
-        "▶ [ Connect (Enter) ] "
+        "▶ [ Review changes (Enter) ] "
     } else {
-        "  [ Connect ] "
+        "  [ Review changes ] "
     };
     let cancel_label = if cancel_active {
         "▶ [ Cancel (Esc) ]"

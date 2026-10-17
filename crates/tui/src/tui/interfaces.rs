@@ -692,8 +692,8 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
     );
 }
 
-const PREVIEW_APPLY_LABEL: &str = "[Apply]  apply changes (Enter)";
-const PREVIEW_RELEASE_LABEL: &str = "[Apply]  remove settings and stop managing (Enter)";
+const PREVIEW_APPLY_LABEL: &str = "[Apply temporarily] (Enter)";
+const PREVIEW_RELEASE_LABEL: &str = "[Apply temporarily] stop managing (Enter)";
 const PREVIEW_CANCEL_LABEL: &str = "[Cancel] return without applying (Esc)";
 
 pub(crate) fn render_preview(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
@@ -740,7 +740,7 @@ pub(crate) fn render_preview(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
             plan.releasing_management
         )),
         Line::styled(
-            "Applying starts an automatic rollback timer.",
+            "Network unchanged. Applying starts a timer; without confirmation, rollback is scheduled.",
             Style::default().fg(theme::WARN),
         ),
         Line::from(""),
@@ -769,7 +769,41 @@ pub(crate) fn render_preview(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
         }
     }
 
-    let block = panel("Interface plan preview");
+    if let Some(editor) = &app.editor {
+        let before = if editor.current_addresses.is_empty() {
+            "none".into()
+        } else {
+            editor.current_addresses.join(", ")
+        };
+        lines.insert(
+            1,
+            Line::from(format!(
+                "IPv4: {before} → {}",
+                if editor.cidr.is_empty() {
+                    "no owned static IPv4"
+                } else {
+                    &editor.cidr
+                }
+            )),
+        );
+        if let Some(config) = &editor.saved_config {
+            lines.insert(
+                2,
+                Line::from(format!(
+                    "Router role: {:?} → {:?}",
+                    config.role, editor.role
+                )),
+            );
+        }
+        lines.insert(
+            2,
+            Line::from(format!(
+                "Managed: {} → {}",
+                editor.original_managed, editor.managed
+            )),
+        );
+    }
+    let block = panel("Interface · Review changes");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let apply_label = if plan.releasing_management {
@@ -817,8 +851,8 @@ pub(crate) fn render_preview(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
     );
 }
 
-const PENDING_COMMIT_LABEL: &str = "[Commit]";
-const PENDING_ROLLBACK_LABEL: &str = "[Rollback]";
+const PENDING_COMMIT_LABEL: &str = "[Confirm changes]";
+const PENDING_ROLLBACK_LABEL: &str = "[Roll back now]";
 
 pub(crate) fn render_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
     let Some(change) = &app.pending else {
@@ -847,6 +881,9 @@ pub(crate) fn render_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
         ),
         Line::from(format!("Interface: {}", change.interface)),
         Line::from(format!("Rollback scheduled in: {seconds}s / {timeout}s")),
+        Line::from(
+            "Network already changed temporarily. Without confirmation, rollback is scheduled.",
+        ),
     ];
 
     if let Some(progress) = &change.recovery_progress {
@@ -881,7 +918,7 @@ pub(crate) fn render_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
         );
         return;
     }
-    let block = panel("Network change pending confirmation");
+    let block = panel("Network · Confirmation");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let chunks = Layout::default()
@@ -901,7 +938,10 @@ pub(crate) fn render_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
             .label(format!("{seconds}s")),
         chunks[0],
     );
-    frame.render_widget(Paragraph::new(lines), chunks[1]);
+    frame.render_widget(
+        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+        chunks[1],
+    );
 
     app.ui.buttons.push((
         Rect::new(
@@ -924,14 +964,14 @@ pub(crate) fn render_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(
-                "[Commit]  persist changes (Enter)",
+                "[Confirm changes] (Enter)",
                 Style::default()
                     .fg(theme::SELECTED_FG)
                     .bg(theme::GOOD)
                     .add_modifier(Modifier::BOLD),
             ),
             Line::styled(
-                "[Rollback]  restore previous state (Esc)",
+                "[Roll back now] (Esc)",
                 Style::default()
                     .fg(theme::SELECTED_FG)
                     .bg(theme::WARN)
