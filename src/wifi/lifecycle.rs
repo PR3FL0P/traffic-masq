@@ -444,6 +444,20 @@ pub(crate) async fn persist_owned_ctrl_node(
             store.path().to_path_buf(),
         ));
     }
+    // The ownership checks above await /proc observations. The daemon can
+    // rebind its control path while those observations are in flight; never
+    // persist the inode of the node that preceded that rebind.
+    let current = tokio::fs::symlink_metadata(&record.ctrl_path)
+        .await
+        .map_err(|error| WifiRecordError::Read(record.ctrl_path.clone(), error))?;
+    if !current.file_type().is_socket()
+        || current.dev() != node.dev()
+        || current.ino() != node.ino()
+    {
+        return Err(WifiRecordError::MismatchedContext(
+            store.path().to_path_buf(),
+        ));
+    }
     record.ctrl_dev = Some(node.dev());
     record.ctrl_ino = Some(node.ino());
     store.save(&record).await?;

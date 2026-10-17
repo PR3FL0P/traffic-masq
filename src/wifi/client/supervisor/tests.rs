@@ -1903,3 +1903,196 @@ async fn cleanup_retains_record_when_socket_identity_was_not_captured() {
     assert!(runtime.join("wlan0").exists());
     assert_eq!(store.load().await.unwrap(), Some(record));
 }
+
+#[tokio::test]
+async fn client_launch_paths_wait_for_a_socket_created_during_ownership_observation() {
+    for (scenario, bind_after_probe) in [
+        ("first", 1),
+        ("first", 2),
+        ("switch", 1),
+        ("switch", 2),
+        ("respawn", 2),
+        ("rollback", 2),
+    ] {
+        let temp = tempdir().unwrap();
+        let runtime = temp.path().join("run");
+        let process = fake_process();
+        let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
+        if scenario != "first" {
+            supervisor
+                .configure(spec("wlan0", "original"))
+                .await
+                .unwrap();
+        }
+        if scenario == "respawn" {
+            process.kill_externally(2000);
+        } else if scenario == "rollback" {
+            process.fail_spawn.store(true, Ordering::Relaxed);
+            assert!(supervisor
+                .configure(spec("wlan0", "replacement"))
+                .await
+                .is_err());
+            process.fail_spawn.store(false, Ordering::Relaxed);
+        }
+        let expected_pid = if scenario == "first" { 2000 } else { 2001 };
+        let expected_ssid = if matches!(scenario, "respawn" | "rollback") {
+            "original"
+        } else {
+            "replacement"
+        };
+
+        // Real supplicant sockets appear asynchronously after spawn. Let both
+        // ownership observations see absence, then bind just before metadata is read.
+        process
+            .suppress_spawn_responder
+            .store(true, Ordering::Relaxed);
+        let probes = std::sync::atomic::AtomicUsize::new(0);
+        let weak = Arc::downgrade(&process);
+        let config = config_path(&runtime, "wlan0");
+        process.set_after_socket_proof_hook(move |pid| {
+            if pid == expected_pid && probes.fetch_add(1, Ordering::SeqCst) + 1 == bind_after_probe
+            {
+                seed_process(&weak.upgrade().unwrap(), pid, config.clone(), "COMPLETED");
+            }
+        });
+
+        if scenario == "respawn" {
+            assert!(supervisor.ensure_alive().await.unwrap());
+        } else {
+            supervisor
+                .configure(spec("wlan0", expected_ssid))
+                .await
+                .expect("the newly bound socket must be re-observed before refusing ownership");
+        }
+        let status = supervisor.status("wlan0").await.unwrap();
+        assert_eq!(status.pid, expected_pid, "{scenario}");
+        assert_eq!(status.spec.ssid, expected_ssid, "{scenario}");
+        assert!(status.wpa_state.is_connected());
+        let record = supervisor
+            .record_store("wlan0")
+            .load()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(record.ctrl_dev.is_some() && record.ctrl_ino.is_some());
+        assert!(!process
+            .calls()
+            .iter()
+            .any(|call| matches!(call, FakeCall::Terminate(pid) if *pid == expected_pid)));
+    }
+}
+
+#[tokio::test]
+async fn startup_retry_never_sends_commands_to_a_foreign_socket_that_appears_mid_probe() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("run");
+    let process = fake_process();
+    let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
+    process
+        .suppress_spawn_responder
+        .store(true, Ordering::Relaxed);
+    let probes = std::sync::atomic::AtomicUsize::new(0);
+    let foreign = Arc::new(std::sync::Mutex::new(None));
+    let foreign_for_hook = foreign.clone();
+    let path = runtime.join("wlan0");
+    process.set_after_socket_proof_hook(move |pid| {
+        if pid == 2000 && probes.fetch_add(1, Ordering::SeqCst) == 1 {
+            let socket = StdUnixDatagram::bind(&path).unwrap();
+            socket.set_nonblocking(true).unwrap();
+            *foreign_for_hook.lock().unwrap() = Some(socket);
+        }
+    });
+
+    assert!(supervisor
+        .configure(spec("wlan0", "candidate"))
+        .await
+        .is_err());
+    assert!(
+        runtime.join("wlan0").exists(),
+        "a foreign socket must be retained"
+    );
+    let socket = foreign.lock().unwrap();
+    let mut message = [0; 512];
+    assert_eq!(
+        socket
+            .as_ref()
+            .unwrap()
+            .recv(&mut message)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::WouldBlock,
+        "no PING, ATTACH or mutation may reach a foreign endpoint"
+    );
+    assert_eq!(
+        process.spawn_count(),
+        1,
+        "startup must not enter a respawn loop"
+    );
+}
+
+#[tokio::test]
+async fn recording_socket_identity_refuses_a_node_replaced_during_the_final_proof() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("run");
+    let process = fake_process();
+    let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
+    supervisor
+        .configure(spec("wlan0", "upstream"))
+        .await
+        .unwrap();
+    let store = supervisor.record_store("wlan0");
+    let record = store.load().await.unwrap().unwrap();
+    let probes = std::sync::atomic::AtomicUsize::new(0);
+    let weak = Arc::downgrade(&process);
+    let config = record.config_path.clone();
+    let path = record.ctrl_path.clone();
+    process.set_after_socket_proof_hook(move |pid| {
+        if probes.fetch_add(1, Ordering::SeqCst) == 1 {
+            let process = weak.upgrade().unwrap();
+            // Retain the old filesystem node to prevent inode reuse.
+            std::fs::rename(&path, path.with_extension("old")).unwrap();
+            process.detach_ctrl_socket(pid);
+            seed_process(&process, pid, config.clone(), "COMPLETED");
+        }
+    });
+
+    assert!(
+        persist_owned_ctrl_node(&store, process.as_ref(), record.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(store.load().await.unwrap(), Some(record));
+}
+
+#[tokio::test]
+async fn ephemeral_scan_waits_for_a_socket_created_during_ownership_observation() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("run");
+    let process = fake_process();
+    let supervisor = supervisor(temp.path(), &runtime, process.clone()).await;
+    process
+        .suppress_spawn_responder
+        .store(true, Ordering::Relaxed);
+    let probes = std::sync::atomic::AtomicUsize::new(0);
+    let weak = Arc::downgrade(&process);
+    let config = scan_config_path(&runtime, "wlan0");
+    let path = runtime.join("wlan0");
+    process.set_after_socket_proof_hook(move |pid| {
+        if probes.fetch_add(1, Ordering::SeqCst) == 1 {
+            let responder = FakeSupplicantCtrl::spawn(path.clone(), "DISCONNECTED", &config);
+            weak.upgrade().unwrap().seed(pid, config.clone(), responder);
+        }
+    });
+
+    assert_eq!(supervisor.scan("wlan0").await.unwrap().len(), 1);
+    assert_eq!(process.spawn_count(), 1);
+    assert!(!runtime.join("wlan0").exists());
+    assert!(!config_path(&runtime, "wlan0-scan").exists());
+    assert!(
+        WifiRecordStore::for_scan(temp.path().join("wifi"), &runtime, "wlan0")
+            .load()
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

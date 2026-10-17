@@ -1015,6 +1015,15 @@ impl WifiClientSupervisor {
     ) -> Result<OwnedWpaCtrlSession, ClientSupervisorError> {
         let deadline = Instant::now() + STARTUP_READY_TIMEOUT.max(timeout);
         loop {
+            // A real supplicant binds asynchronously. Remember absence before
+            // inspecting /proc and connecting: the path can appear during those
+            // awaits, after an ownership observation already returned false.
+            let socket_was_missing =
+                match tokio::fs::symlink_metadata(&identity.record.ctrl_path).await {
+                    Ok(_) => false,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                    Err(error) => return Err(anyhow::Error::from(error).into()),
+                };
             // Persist ownership as soon as the socket can be tied to our
             // recorded process, even if connect or PING subsequently fails.
             if identity.record.ctrl_dev.is_none() && identity.prove(&self.inner).await? {
@@ -1026,14 +1035,18 @@ impl WifiClientSupervisor {
                 .await?;
             }
             match self.open_owned_ctrl_session(identity.clone()).await {
+                // The first ownership probe may have missed a socket that the
+                // connect probe can already prove. Re-open on the next pass,
+                // after persisting its identity, before sending PING or using it.
+                Ok(session) if session.identity.record.ctrl_dev.is_none() => {}
                 Ok(session) if session.client.ping().await.is_ok() => return Ok(session),
                 Ok(_) | Err(ClientSupervisorError::Ctrl(_)) => {}
                 Err(ClientSupervisorError::NotOwned { .. }) => {
-                    // During normal startup the path may simply not exist yet.
-                    // If it does exist while ownership proof fails, fail closed
-                    // instead of accepting whichever daemon answers there.
+                    // A newly appeared path needs a fresh ownership observation.
+                    // A path already present when this pass started must pass
+                    // the normal proof; never send commands to a foreign socket.
                     match tokio::fs::symlink_metadata(&identity.record.ctrl_path).await {
-                        Ok(_) => {
+                        Ok(_) if !socket_was_missing => {
                             return Err(ClientSupervisorError::NotOwned {
                                 interface: identity.interface.clone(),
                                 diagnostics: crate::wifi::process::wifi_conflict_diagnostics(
@@ -1043,6 +1056,7 @@ impl WifiClientSupervisor {
                                 .await,
                             })
                         }
+                        Ok(_) => {}
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                         Err(error) => return Err(anyhow::Error::from(error).into()),
                     }

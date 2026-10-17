@@ -329,6 +329,39 @@ async fn configure_spawns_hostapd_and_persists_a_record() {
 }
 
 #[tokio::test]
+async fn ap_waits_for_a_socket_created_during_ownership_observation() {
+    let temp = tempdir().unwrap();
+    let runtime = temp.path().join("hostapd");
+    let process = fake_process();
+    let supervisor = test_supervisor(temp.path(), &runtime, process.clone()).await;
+    process
+        .suppress_spawn_responder
+        .store(true, Ordering::Relaxed);
+    let weak = Arc::downgrade(&process);
+    let config = render::config_path(&runtime, "wlan0");
+    let bound = AtomicBool::new(false);
+    process.set_after_socket_proof_hook(move |pid| {
+        if !bound.swap(true, Ordering::SeqCst) {
+            seed_process(&weak.upgrade().unwrap(), pid, config.clone(), "net-a");
+        }
+    });
+
+    supervisor.configure(spec("wlan0", "net-a")).await.unwrap();
+    let record = supervisor
+        .record_store("wlan0")
+        .load()
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(record.ctrl_dev.is_some() && record.ctrl_ino.is_some());
+    assert_eq!(process.spawn_count(), 1);
+    assert!(!process
+        .calls()
+        .iter()
+        .any(|call| matches!(call, FakeCall::Terminate(_))));
+}
+
+#[tokio::test]
 async fn readiness_failure_stops_the_spawned_hostapd_without_recording_it() {
     let temp = tempdir().expect("tempdir");
     let runtime_dir = temp.path().join("hostapd");
