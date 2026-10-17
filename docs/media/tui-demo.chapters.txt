@@ -1,0 +1,39 @@
+   0.0s  Live traffic overview
+   3.5s  Traffic statistics
+   6.5s  Interface inventory
+  10.0s  Configure an interface
+  13.0s  IPv4 and MAC configuration
+  17.0s  Preview before applying
+  20.5s  Automatic rollback protection
+  24.5s  Changes committed
+  27.0s  Manage a disconnected adapter
+  30.5s  Confirm forgetting saved settings
+  33.5s  Disconnected adapter settings forgotten
+  36.0s  DHCP server
+  38.5s  DHCP address pool
+  42.0s  Connected DHCP clients
+  45.0s  Search DHCP leases
+  47.5s  DHCP client uplink
+  50.5s  Configure the DHCP client
+  53.5s  Routing table
+  57.0s  Internet sharing
+  60.5s  Network topology
+  64.0s  Guided router setup: Wi-Fi uplink
+  67.0s  Guided router setup: access point
+  70.0s  Guided router setup: LAN
+  73.0s  Add a static route
+  76.0s  Router readiness and diagnostics
+  79.0s  VPN profiles and connection
+  82.5s  Import a VPN profile
+  85.0s  VPN traffic policy
+  88.5s  Wi-Fi radios
+  91.5s  Access point actions
+  94.0s  Configure a Wi-Fi access point
+  97.5s  Clients connected to the access point
+ 100.5s  Scan nearby Wi-Fi networks
+ 104.0s  Saved Wi-Fi profiles
+ 107.0s  Connect with an IPv4 policy
+ 110.5s  Security and session settings
+ 114.0s  Remote HTTPS API access
+ 117.0s  Operation log
+ 120.5s  Keyboard navigation

@@ -8,6 +8,11 @@ configure a Wi-Fi hotspot with a compatible adapter, or route LAN traffic
 through WireGuard tunnels. Manage the daemon locally or connect a remote
 terminal client over HTTPS.
 
+![traffic-masq TUI walkthrough: interfaces, DHCP, routing, VPN and Wi-Fi](docs/media/tui-demo.gif)
+
+Two-minute walkthrough using demonstration data. See the
+[chapter index](docs/media/tui-demo.chapters.txt).
+
 ```text
 Internet ── WAN interface ── Linux machine ── LAN interface ── Local devices
                             traffic-masq       or Wi-Fi AP

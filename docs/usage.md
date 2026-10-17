@@ -1,5 +1,13 @@
 # Operating guide
 
+## Interface walkthrough
+
+![traffic-masq TUI walkthrough: interfaces, DHCP, routing, VPN and Wi-Fi](media/tui-demo.gif)
+
+This two-minute walkthrough uses demonstration data and covers the main screens,
+configuration workflows and confirmation dialogs. Use the
+[chapter index](media/tui-demo.chapters.txt) to find a feature.
+
 ## Requirements
 
 #### Network manager conflicts
