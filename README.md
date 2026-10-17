@@ -122,10 +122,10 @@ To inspect interfaces before installing anything, use the read-only mode:
 To update an existing installation after building new release binaries:
 
 ```sh
-sudo ./update.sh --dry-run
-sudo ./update.sh
+sudo ./packaging/update.sh --dry-run
+sudo ./packaging/update.sh
 # Or use binaries downloaded by gitcompile.sh:
-sudo ./update.sh --binary-dir ./binaries
+sudo ./packaging/update.sh --binary-dir ./binaries
 ```
 
 The script validates the new binaries and existing configuration, stops the

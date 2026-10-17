@@ -85,16 +85,18 @@ prefix or configuration path requires uninstalling the old registration first;
 this avoids leaving two services controlling the same daemon.
 
 ```sh
-sudo ./update.sh
+sudo ./packaging/update.sh
 # For binaries downloaded by gitcompile.sh:
-sudo ./update.sh --binary-dir ./binaries
-# For a release archive containing both binaries beside update.sh:
-sudo ./update.sh --binary-dir .
+sudo ./packaging/update.sh --binary-dir ./binaries
+# From the root of an extracted release archive containing both binaries:
+sudo ./packaging/update.sh --binary-dir .
 sudo traffic-masqd --config /etc/traffic-masq/config.toml uninstall --dry-run
 sudo traffic-masqd --config /etc/traffic-masq/config.toml uninstall --yes
 ```
 
-`update.sh` uses prepared binaries from `target/release` by default; it does not
+`packaging/update.sh` uses prepared binaries from the project's `target/release`
+directory by default, regardless of the working directory. Explicit
+`--binary-dir` paths are relative to the working directory. The script does not
 build, download or pull source code. It checks both executables and validates the
 existing configuration before stopping the installed daemon, then delegates to
 `traffic-masqd install --non-interactive --skip-user-access --defer-password --start`.

@@ -4,12 +4,13 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
 
 
-SCRIPT = Path(__file__).resolve().parent.parent / "update.sh"
+SCRIPT = Path(__file__).resolve().parent / "update.sh"
 
 
 class UpdateTests(unittest.TestCase):
@@ -52,16 +53,16 @@ class UpdateTests(unittest.TestCase):
         )
         path.chmod(0o755)
 
-    def run_update(self, *options, defaults=False):
+    def run_update(self, *options, defaults=False, script=SCRIPT, cwd=None):
         arguments = [] if defaults else [
             "--binary-dir", str(self.build),
             "--prefix", str(self.prefix),
             "--config", str(self.config),
         ]
         return subprocess.run(
-            ["sh", str(SCRIPT), *arguments, *options],
+            ["sh", str(script), *arguments, *options],
             env=self.environment, text=True, capture_output=True, check=False,
-            cwd=self.root,
+            cwd=self.root if cwd is None else cwd,
         )
 
     def calls(self):
@@ -91,6 +92,30 @@ class UpdateTests(unittest.TestCase):
         result = self.run_update("--no-start")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("--start", self.calls()[-1])
+
+    def test_default_binary_directory_is_relative_to_project_not_working_directory(self):
+        project = self.root / "project checkout"
+        packaging = project / "packaging"
+        packaging.mkdir(parents=True)
+        shutil.copy2(SCRIPT, packaging / "update.sh")
+        self.make_binary(project / "target/release/traffic-masqd", "new")
+        self.make_binary(project / "target/release/traffic-masq", "tui")
+        for cwd, script in ((project, "packaging/update.sh"), (packaging, "./update.sh")):
+            with self.subTest(cwd=cwd):
+                self.log.unlink(missing_ok=True)
+                result = self.run_update(
+                    "--prefix", str(self.prefix), "--config", str(self.config),
+                    "--dry-run", defaults=True, script=script, cwd=cwd,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(str(project / "target/release"), result.stdout)
+                self.assertEqual(len(self.calls()), 3)
+
+    def test_missing_binary_directory_does_not_stop_daemon(self):
+        result = self.run_update("--binary-dir", str(self.root / "missing binaries"))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Binary directory not found", result.stderr)
+        self.assertEqual(self.calls(), [])
 
     def test_environment_defaults(self):
         self.environment.update(BINARY_DIR=str(self.build), PREFIX=str(self.prefix),

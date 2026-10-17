@@ -24,7 +24,7 @@ for binary in traffic-masq traffic-masqd; do
     test -x "$binary_dir/$binary"
     cp "$binary_dir/$binary" "$stage/$name/$binary"
 done
-for doc in README.md LICENSE CHANGELOG.md SECURITY.md CONTRIBUTING.md Cargo.toml update.sh; do
+for doc in README.md LICENSE CHANGELOG.md SECURITY.md CONTRIBUTING.md Cargo.toml; do
     if [ -f "$project_dir/$doc" ]; then
         cp "$project_dir/$doc" "$stage/$name/"
     fi

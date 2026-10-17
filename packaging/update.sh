@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 binary_dir=${BINARY_DIR:-$project_dir/target/release}
 prefix=${PREFIX:-/usr/local}
 config=${TRAFFIC_MASQ_CONFIG:-/etc/traffic-masq/config.toml}
@@ -10,13 +10,13 @@ dry_run=false
 
 usage() {
     cat <<'EOF'
-Usage: sudo ./update.sh [options]
+Usage: sudo ./packaging/update.sh [options]
 
 Update an existing installation from prepared binaries; no build or download.
 Configuration, saved network settings, credentials and user access are retained.
 Stopping the daemon follows its shutdown policy and may interrupt connectivity.
 
-  --binary-dir DIR  Directory containing both new binaries (default: target/release)
+  --binary-dir DIR  Directory containing both new binaries (default: project target/release)
   --prefix PATH     Existing installation prefix (default: /usr/local)
   --config PATH     Existing configuration (default: /etc/traffic-masq/config.toml)
   --no-start        Leave the updated daemon stopped (not supported by runit)
@@ -51,7 +51,7 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-[ "$(id -u)" -eq 0 ] || fail "Run update.sh as root, for example: sudo ./update.sh"
+[ "$(id -u)" -eq 0 ] || fail "Run update.sh as root, for example: sudo $0"
 [ -z "${DESTDIR:-}" ] || fail "Updates do not support DESTDIR; use packaging/install.sh for staging."
 case "$prefix" in
     /*) ;;
@@ -65,6 +65,7 @@ case "$config" in
     *) config=$PWD/$config ;;
 esac
 [ -f "$config" ] || fail "Existing configuration not found: $config. Use the installer for a new installation."
+[ -d "$binary_dir" ] || fail "Binary directory not found: $binary_dir. Build both binaries or use --binary-dir."
 binary_dir=$(CDPATH= cd -- "$binary_dir" && pwd)
 installed_daemon=$prefix/sbin/traffic-masqd
 [ -f "$installed_daemon" ] && [ -x "$installed_daemon" ] && [ ! -L "$installed_daemon" ] \
