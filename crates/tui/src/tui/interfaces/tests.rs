@@ -619,3 +619,35 @@ async fn mac_controls_require_management_and_switching_it_off_clears_the_mac() {
     assert!(!app.editor.as_ref().unwrap().managed);
     assert!(app.editor.as_ref().unwrap().mac_address.is_empty());
 }
+
+#[tokio::test]
+async fn offline_forget_and_reset_confirm_with_enter_and_preserve_revision() {
+    for (trigger, request_type) in [
+        (KeyCode::F(5), "forget_interface_config"),
+        (KeyCode::F(6), "reset_interface_override"),
+    ] {
+        let mock = super::super::test_api::mock(vec![Response::Error {
+            message: "stale revision".into(),
+        }])
+        .await;
+        let mut editor = default_route_editor(false);
+        editor.offline_revision = Some(7);
+        let mut app = TuiApp {
+            screen: Screen::InterfaceEditor,
+            editor: Some(editor),
+            ..Default::default()
+        };
+        handle_editor_key(&mut app, trigger, &mock.client).await;
+        handle_editor_key(&mut app, KeyCode::Char('y'), &mock.client).await;
+        assert!(mock.calls.lock().unwrap().is_empty());
+        handle_editor_key(&mut app, KeyCode::Esc, &mock.client).await;
+        assert!(app.editor.as_ref().unwrap().intent_confirmation.is_none());
+        handle_editor_key(&mut app, trigger, &mock.client).await;
+        handle_editor_key(&mut app, KeyCode::Enter, &mock.client).await;
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].body["type"], request_type);
+        assert_eq!(calls[0].body["interface"], "wlan0");
+        assert_eq!(calls[0].body["expected_revision"], 7);
+    }
+}

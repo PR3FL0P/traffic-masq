@@ -441,6 +441,42 @@ const REMOVE_IPV4_LABEL: &str = "Remove IPv4 address (clear the field)";
 /// Slot 0 and 1 are already spoken for by Save and the cancel strip below it.
 const REMOVE_IPV4_BUTTON_SLOT: usize = 2;
 
+pub(super) fn confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> {
+    let editor = app.editor.as_ref()?;
+    let forget = editor.intent_confirmation?;
+    let entry = app
+        .dashboard
+        .inventory
+        .as_ref()
+        .and_then(|entries| entries.iter().find(|entry| entry.name == editor.interface));
+    Some(super::confirmation::Dialog {
+        title: "Saved interface configuration",
+        action: if forget { "Forget" } else { "Reset" },
+        lines: vec![
+            format!("Interface: {}", editor.interface),
+            if forget {
+                "Forget saved configuration, including base configuration.".into()
+            } else {
+                "Remove the override and restore base configuration.".into()
+            },
+            format!(
+                "Source: {}",
+                entry
+                    .map(|entry| format!("{:?}", entry.config_source))
+                    .unwrap_or_default()
+            ),
+            format!(
+                "References retained: {}",
+                entry
+                    .map(|entry| entry.references.join(", "))
+                    .unwrap_or_default()
+            ),
+            "Profiles and credentials are retained.".into(),
+            "Saved settings apply when the interface returns, without a rollback timer.".into(),
+        ],
+    })
+}
+
 pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
     let Some(editor) = &app.editor else {
         return;
@@ -452,30 +488,8 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         area
     };
 
-    if let Some(forget) = editor.intent_confirmation {
-        let entry = app
-            .dashboard
-            .inventory
-            .as_ref()
-            .and_then(|entries| entries.iter().find(|entry| entry.name == editor.interface));
-        let action = if forget {
-            "Forget saved configuration (including base)"
-        } else {
-            "Reset override and restore base configuration"
-        };
-        let references = entry
-            .map(|entry| entry.references.join(", "))
-            .unwrap_or_default();
-        let origin = entry
-            .map(|entry| format!("{:?}", entry.config_source))
-            .unwrap_or_default();
-        let text = format!("{action}: {}\nSource: {origin}\nReferences retained: {references}\nProfiles and credentials are retained.\nPress y to confirm; Esc to cancel.", editor.interface);
-        frame.render_widget(
-            Paragraph::new(text)
-                .wrap(ratatui::widgets::Wrap { trim: false })
-                .block(panel("Saved interface configuration")),
-            area,
-        );
+    if let Some(dialog) = confirmation(app) {
+        dialog.render(frame, area, &mut app.ui);
         return;
     }
 
@@ -1128,7 +1142,7 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
             editor.intent_confirmation = None;
             return;
         }
-        if key != KeyCode::Char('y') {
+        if key != KeyCode::Enter {
             return;
         }
         let Some(expected_revision) = editor.offline_revision else {

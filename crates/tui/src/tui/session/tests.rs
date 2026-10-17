@@ -61,6 +61,7 @@ async fn clearing_client_log_is_persistent_and_endpoint_scoped() {
 
     app.logs_focus = logs::LogFocus::Clear;
     logs::handle_log_key(&mut app, KeyCode::Enter);
+    logs::handle_log_key(&mut app, KeyCode::Enter);
     logs::flush(&mut app, &store).await;
     let mut reopened = TuiApp::default();
     logs::restore(&mut reopened, &store).await;

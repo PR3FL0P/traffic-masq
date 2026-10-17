@@ -28,10 +28,14 @@ pub(crate) use ap_profiles::{
     handle_wifi_ap_profiles_key, render_wifi_ap_profiles, WifiApProfilesView,
 };
 mod connect;
+mod delete_confirmation;
+pub(super) use delete_confirmation::profile_delete_dialog;
+use delete_confirmation::render_delete_confirmation;
 mod profile_editor;
 mod profiles;
 mod scan;
 
+pub(super) use ap_editor::discard_confirmation;
 pub(crate) use ap_editor::{handle_wifi_editor_key, render_wifi_editor};
 pub(crate) use connect::{
     handle_wifi_connect_prompt_key, open_wifi_connect_prompt, render_wifi_connect_prompt,

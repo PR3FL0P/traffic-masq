@@ -55,7 +55,39 @@ fn error_message(response: anyhow::Result<Response>) -> String {
         Err(error) => error.to_string(),
     }
 }
+pub(super) fn confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> {
+    if !app.router_health.confirming {
+        return None;
+    }
+    let mut lines = vec![
+        "Target: saved router configuration".into(),
+        "Reapplies saved state immediately; network traffic may be interrupted.".into(),
+        "This operation has no rollback timer.".into(),
+    ];
+    if let Some(status) = &app.router_health.status {
+        for (name, reason) in [
+            ("Interfaces", &status.readiness.interfaces),
+            ("Routes", &status.readiness.routes),
+            ("DHCP server", &status.readiness.dhcp),
+            ("Dataplane", &status.readiness.dataplane),
+        ] {
+            if let Some(reason) = reason {
+                lines.push(format!("{name}: {reason}"));
+            }
+        }
+    }
+    Some(super::confirmation::Dialog {
+        title: "Repair saved router state?",
+        action: "Repair",
+        lines,
+    })
+}
+
 pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
+    if let Some(dialog) = confirmation(app) {
+        dialog.render(frame, area, &mut app.ui);
+        return;
+    }
     let view = &mut app.router_health;
     let block = panel("Router health | saved configuration");
     let inner = block.inner(area);
@@ -63,16 +95,6 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
     let mut lines = vec![Line::from(
         "r: refresh | f: repair | Esc: back | arrows/PgUp/PgDn: scroll",
     )];
-    if view.confirming {
-        lines.push(Line::styled(
-            "Repair now? y: confirm | n/Esc: cancel",
-            Style::default().fg(theme::WARN),
-        ));
-        lines.push(Line::from(
-            "Reapplies saved state immediately; network traffic may be interrupted.",
-        ));
-        lines.push(Line::from("This operation has no commit-confirm timer."));
-    }
     if let Some(error) = &view.error {
         lines.push(Line::styled(
             format!("STALE / unavailable: {error}"),
@@ -156,8 +178,8 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
 pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
     if app.router_health.confirming {
         match key {
-            KeyCode::Esc | KeyCode::Char('n') => app.router_health.confirming = false,
-            KeyCode::Char('y') => {
+            KeyCode::Esc => app.router_health.confirming = false,
+            KeyCode::Enter => {
                 app.router_health.confirming = false;
                 if !app.router_health.can_repair(app.router.staged) {
                     return;
@@ -272,7 +294,7 @@ mod tests {
                     && call.body["type"] == "router_provisioning_status")
         );
         handle_key(&mut app, KeyCode::Char('f'), &mock.client).await;
-        handle_key(&mut app, KeyCode::Char('y'), &mock.client).await;
+        handle_key(&mut app, KeyCode::Enter, &mock.client).await;
         assert!(app.router_health.status.as_ref().unwrap().ready);
         let calls = mock.calls.lock().unwrap();
         assert_eq!(calls.len(), 4);
@@ -293,7 +315,7 @@ mod tests {
         let mut app = TuiApp::default();
         open(&mut app, &mock.client).await;
         handle_key(&mut app, KeyCode::Char('f'), &mock.client).await;
-        handle_key(&mut app, KeyCode::Char('y'), &mock.client).await;
+        handle_key(&mut app, KeyCode::Enter, &mock.client).await;
         assert!(!app.router_health.confirming);
         assert!(app.router_health.status.is_some());
         assert!(app.router_health.error.is_some());
@@ -313,8 +335,8 @@ mod tests {
         let mut app = TuiApp::default();
         open(&mut app, &mock.client).await;
         handle_key(&mut app, KeyCode::Char('f'), &mock.client).await;
-        handle_key(&mut app, KeyCode::Char('y'), &mock.client).await;
-        handle_key(&mut app, KeyCode::Char('y'), &mock.client).await;
+        handle_key(&mut app, KeyCode::Enter, &mock.client).await;
+        handle_key(&mut app, KeyCode::Enter, &mock.client).await;
         assert!(!app.router_health.can_repair(false));
         assert_eq!(mock.calls.lock().unwrap().len(), 3);
     }
@@ -361,8 +383,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(text.contains("y: confirm"));
-        assert!(text.contains("no commit-confirm timer"));
+        assert!(text.contains("[Repair]"));
+        assert!(text.contains("no rollback timer"));
         assert!(text.contains("saved route missing"));
     }
 }

@@ -223,3 +223,44 @@ async fn vpn_source_browser_selection_is_bounded_and_local_path_remains_availabl
     handle_vpn_import_key(&mut app, KeyCode::Char('a'), &client).await;
     assert_eq!(app.vpn_import.as_ref().unwrap().name, "a");
 }
+
+#[tokio::test]
+async fn deletion_requires_confirmation_and_retains_the_original_target() {
+    let mock = super::super::test_api::mock(vec![Response::VpnError {
+        detail: VpnErrorDetail::Other {
+            message: "outcome unknown".into(),
+        },
+    }])
+    .await;
+    let mut app = TuiApp {
+        screen: Screen::Vpn,
+        ..Default::default()
+    };
+    app.vpn.profiles = ["first.conf", "second.conf"]
+        .into_iter()
+        .map(|name| VpnProfileSummary {
+            name: name.into(),
+            size_bytes: 10,
+            modified_unix: None,
+        })
+        .collect();
+    app.vpn.focus = VpnFocus::Delete;
+    handle_vpn_key(&mut app, KeyCode::Enter, &mock.client).await;
+    assert!(mock.calls.lock().unwrap().is_empty());
+    handle_vpn_key(&mut app, KeyCode::Esc, &mock.client).await;
+    assert!(app.vpn.delete_confirmation.is_none());
+    handle_vpn_key(&mut app, KeyCode::Enter, &mock.client).await;
+    // A background list update must not change the target being confirmed.
+    app.vpn.profiles.reverse();
+    handle_vpn_key(&mut app, KeyCode::Down, &mock.client).await;
+    assert_eq!(app.vpn.delete_confirmation.as_deref(), Some("first.conf"));
+    handle_vpn_key(&mut app, KeyCode::Enter, &mock.client).await;
+    assert!(app.vpn.delete_confirmation.is_none());
+    assert_eq!(mock.calls.lock().unwrap()[0].body["name"], "first.conf");
+    handle_vpn_key(&mut app, KeyCode::Enter, &mock.client).await;
+    assert_eq!(
+        mock.calls.lock().unwrap().len(),
+        1,
+        "an uncertain delete must not retry on Enter"
+    );
+}

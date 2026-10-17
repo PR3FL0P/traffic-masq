@@ -189,6 +189,10 @@ fn format_time_hms(unix_time: u64) -> String {
 }
 
 pub(crate) fn render_log(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
+    if let Some(dialog) = super::confirmation::current(app) {
+        dialog.render(frame, area, &mut app.ui);
+        return;
+    }
     let sections = ratatui::layout::Layout::default()
         .direction(ratatui::layout::Direction::Vertical)
         .constraints([
@@ -285,6 +289,21 @@ pub(super) fn wrap_log_message(message: &str, width: usize) -> Vec<String> {
 }
 
 pub(crate) fn handle_log_key(app: &mut TuiApp, key: KeyCode) {
+    if app.logs_clear_confirmation {
+        match key {
+            KeyCode::Esc => app.logs_clear_confirmation = false,
+            KeyCode::Enter => {
+                app.logs_clear_confirmation = false;
+                app.logs.clear();
+                app.logs_scroll = 0;
+                app.logs_max_scroll = 0;
+                app.push_message(LogLevel::Info, "Log cleared");
+                app.logs_scroll = 0;
+            }
+            _ => {}
+        }
+        return;
+    }
     const PAGE: usize = 10;
     let max_scroll = app.logs_max_scroll;
 
@@ -336,11 +355,7 @@ pub(crate) fn handle_log_key(app: &mut TuiApp, key: KeyCode) {
             LogFocus::Scroll => {}
             LogFocus::Export => export_log(app),
             LogFocus::Clear => {
-                app.logs.clear();
-                app.logs_scroll = 0;
-                app.logs_max_scroll = 0;
-                app.push_message(LogLevel::Info, "Log cleared");
-                app.logs_scroll = 0;
+                app.logs_clear_confirmation = true;
             }
         },
         _ => {}

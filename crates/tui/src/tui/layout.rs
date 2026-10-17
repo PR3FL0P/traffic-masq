@@ -284,6 +284,9 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Tu
 }
 
 pub(crate) fn help_pairs(app: &TuiApp) -> Vec<(&'static str, &'static str)> {
+    if let Some(dialog) = super::confirmation::current(app) {
+        return vec![("Enter", dialog.action), ("Esc", "cancel")];
+    }
     if app.screen == Screen::PendingChange {
         if let Some(change) = &app.pending {
             if !change.can_rollback() {

@@ -54,11 +54,7 @@ fn session_fields_are_reachable_and_save_stays_visible_on_small_terminal() {
 
 #[tokio::test]
 async fn mutating_settings_require_a_second_enter() {
-    for field in [
-        SettingsField::SaveSession,
-        SettingsField::Reset,
-        SettingsField::Save,
-    ] {
+    for field in [SettingsField::Reset, SettingsField::Save] {
         let mut app = TuiApp {
             settings: Some(SecurityEditor {
                 field,
@@ -436,4 +432,38 @@ async fn toggling_dhcp_client_tab_updates_editor_and_app_state() {
     handle_settings_key(&mut app, KeyCode::Enter, &client).await;
     assert!(!app.settings.as_ref().unwrap().show_dhcp_client);
     assert!(!app.show_dhcp_client);
+}
+
+#[tokio::test]
+async fn session_preferences_submit_on_first_enter() {
+    let mut app = TuiApp {
+        settings: Some(SecurityEditor {
+            field: SettingsField::SaveSession,
+            active: SecuritySettings {
+                rollback_timeout_seconds: 30,
+            },
+            rollback_timeout_input: "30".into(),
+            override_active: false,
+            restart_required: false,
+            remember_session: true,
+            remember_minutes_input: "invalid".into(),
+            show_dhcp_client: false,
+            confirmation: None,
+            cursor: 0,
+            editing: false,
+        }),
+        ..Default::default()
+    };
+    handle_settings_key(
+        &mut app,
+        KeyCode::Enter,
+        &ApiClient::new("/nonexistent.sock"),
+    )
+    .await;
+    assert!(app.settings.as_ref().unwrap().confirmation.is_none());
+    assert!(app
+        .message
+        .as_ref()
+        .unwrap()
+        .contains("whole number of minutes"));
 }

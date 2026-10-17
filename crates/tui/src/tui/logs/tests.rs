@@ -48,7 +48,7 @@ fn moving_up_one_row_from_the_bottom_is_not_snapped_back() {
 }
 
 #[test]
-fn enter_on_the_clear_row_empties_the_log() {
+fn clearing_the_log_requires_confirmation_and_can_be_cancelled() {
     let mut app = TuiApp::default();
     app.logs.push_back(LogEntry {
         at_unix: 0,
@@ -58,6 +58,16 @@ fn enter_on_the_clear_row_empties_the_log() {
     app.logs_focus = LogFocus::Clear;
 
     handle_log_key(&mut app, KeyCode::Enter);
+    assert!(app.logs_clear_confirmation);
+    assert_eq!(app.logs.back().unwrap().message, "one");
+    handle_log_key(&mut app, KeyCode::Esc);
+    assert!(!app.logs_clear_confirmation);
+    assert_eq!(app.logs.back().unwrap().message, "one");
+    handle_log_key(&mut app, KeyCode::Enter);
+    handle_log_key(&mut app, KeyCode::Down);
+    assert!(app.logs_clear_confirmation);
+    handle_log_key(&mut app, KeyCode::Enter);
+    assert!(!app.logs_clear_confirmation);
 
     assert_eq!(app.logs.len(), 1);
     assert_eq!(app.logs.back().expect("entry").message, "Log cleared");

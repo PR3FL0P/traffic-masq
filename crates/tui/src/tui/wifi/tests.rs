@@ -630,6 +630,25 @@ async fn long_profile_list_keeps_delete_visible_and_requires_confirmation() {
             .as_deref(),
         Some("p39")
     );
+    // Navigation and unrelated keys keep the explicit confirmation open.
+    handle_wifi_profiles_key(&mut app, KeyCode::Down, &client).await;
+    handle_wifi_profiles_key(&mut app, KeyCode::Char('y'), &client).await;
+    terminal
+        .draw(|frame| render_wifi_profiles(frame, frame.area(), &mut app))
+        .unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(text.contains("Delete saved Wi-Fi profile?"));
+    assert!(text.contains("Profile: p39"));
+    assert!(text.contains("SSID: network39"));
+    assert!(text.contains("[Delete]"));
+    assert!(text.contains("[Cancel]"));
+    assert!(app.ui.list_area.is_none());
     handle_wifi_profiles_key(&mut app, KeyCode::Esc, &client).await;
     assert!(app
         .wifi_profiles
@@ -637,6 +656,18 @@ async fn long_profile_list_keeps_delete_visible_and_requires_confirmation() {
         .unwrap()
         .delete_confirmation
         .is_none());
+    handle_wifi_profiles_key(&mut app, KeyCode::Enter, &client).await;
+    let (_dir, client, server) = mock_api(vec![
+        Response::WifiClientProfileDeleted { id: "p39".into() },
+        Response::WifiClientProfiles { profiles: vec![] },
+    ])
+    .await;
+    handle_wifi_profiles_key(&mut app, KeyCode::Enter, &client).await;
+    assert_eq!(
+        server.await.unwrap(),
+        vec!["delete_wifi_client_profile", "list_wifi_client_profiles"]
+    );
+    assert!(app.pending.is_none());
 }
 
 #[tokio::test]
@@ -1785,7 +1816,41 @@ async fn ap_profile_delete_requires_confirmation_and_keeps_network_unchanged() {
             .as_deref(),
         Some("guest")
     );
-    handle_wifi_ap_profiles_key(&mut app, KeyCode::Esc, &offline).await;
+    handle_wifi_ap_profiles_key(&mut app, KeyCode::Down, &offline).await;
+    handle_wifi_ap_profiles_key(&mut app, KeyCode::Char('y'), &offline).await;
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| super::super::render(frame, &mut app, false))
+        .unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(text.contains("Delete saved Wi-Fi profile?"));
+    assert!(text.contains("Profile: guest"));
+    assert!(text.contains("[Delete]"));
+    assert!(text.contains("[Cancel]"));
+    assert!(app.ui.list_area.is_none());
+    assert_eq!(
+        super::super::layout::help_pairs(&app),
+        vec![("Enter", "Delete"), ("Esc", "cancel")]
+    );
+    let (cancel, _) = app.ui.buttons[1];
+    super::super::handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: cancel.x,
+            row: cancel.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        },
+        &offline,
+        false,
+    )
+    .await;
     assert!(app
         .wifi_ap_profiles
         .as_ref()
@@ -1799,7 +1864,22 @@ async fn ap_profile_delete_requires_confirmation_and_keeps_network_unchanged() {
         Response::WifiApProfiles { profiles: vec![] },
     ])
     .await;
-    handle_wifi_ap_profiles_key(&mut app, KeyCode::Char('y'), &client).await;
+    terminal
+        .draw(|frame| super::super::render(frame, &mut app, false))
+        .unwrap();
+    let (delete, _) = app.ui.buttons[0];
+    super::super::handle_mouse(
+        &mut app,
+        crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: delete.x,
+            row: delete.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        },
+        &client,
+        false,
+    )
+    .await;
     let paths = server.await.unwrap();
     assert_eq!(paths.len(), 2);
     assert_eq!(paths[0], "delete_wifi_ap_profile");

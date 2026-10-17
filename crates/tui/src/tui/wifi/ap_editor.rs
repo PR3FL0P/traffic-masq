@@ -5,6 +5,10 @@ use crate::tui::{
 };
 
 pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
+    if let Some(dialog) = discard_confirmation(app) {
+        dialog.render(frame, area, &mut app.ui);
+        return;
+    }
     let Some(editor) = &app.wifi_editor else {
         return;
     };
@@ -157,9 +161,7 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
         Paragraph::new(lines.into_iter().skip(offset).collect::<Vec<_>>()),
         Rect::new(inner.x, inner.y, inner.width, body_height),
     );
-    let warning = if editor.discard_requested {
-        "Unsaved edits. Enter: discard and leave; Esc: keep editing."
-    } else if editor.configure_dhcp {
+    let warning = if editor.configure_dhcp {
         "DHCP: derive pool from LAN subnet; DNS is not advertised."
     } else if editor.disable_dhcp {
         "DHCP: stop the server on this interface."
@@ -557,4 +559,25 @@ fn close_editor(app: &mut TuiApp) {
     } else {
         Screen::Wifi
     };
+}
+
+pub(in crate::tui) fn discard_confirmation(
+    app: &TuiApp,
+) -> Option<crate::tui::confirmation::Dialog> {
+    let editor = app.wifi_editor.as_ref()?;
+    editor
+        .discard_requested
+        .then(|| crate::tui::confirmation::Dialog {
+            title: "Discard access point edits?",
+            action: "Discard",
+            lines: vec![
+                if editor.profile_mode {
+                    format!("AP profile: {}", editor.profile_id)
+                } else {
+                    format!("Interface: {}", editor.interface)
+                },
+                "Unsaved settings and entered credentials will be discarded.".into(),
+                "Cancel returns to editing.".into(),
+            ],
+        })
 }

@@ -28,6 +28,7 @@ use traffic_masq_protocol::{InterfaceStatusView as InterfaceStatus, Ipv4AddressI
 
 mod access;
 pub(crate) mod api;
+mod confirmation;
 pub mod connections;
 mod daemon_logs;
 mod dashboard;
@@ -312,6 +313,7 @@ struct TuiApp {
     should_quit: bool,
     logs: VecDeque<logs::LogEntry>,
     logs_dirty: bool,
+    logs_clear_confirmation: bool,
     logs_scroll: usize,
     logs_max_scroll: usize,
     logs_focus: logs::LogFocus,
@@ -373,6 +375,7 @@ impl Default for TuiApp {
             should_quit: false,
             logs: VecDeque::new(),
             logs_dirty: false,
+            logs_clear_confirmation: false,
             logs_scroll: 0,
             logs_max_scroll: 0,
             logs_focus: logs::LogFocus::default(),
@@ -976,18 +979,20 @@ async fn reauthenticate(
 
 /// Switch sections and load the data required by the destination screen.
 async fn navigate_to_section(app: &mut TuiApp, section: Section, client: &ApiClient, direct: bool) {
-    if !matches!(
-        app.screen,
-        Screen::Dashboard
-            | Screen::InterfaceList
-            | Screen::DhcpInterfaceList
-            | Screen::DhcpClient
-            | Screen::Wifi
-            | Screen::Router
-            | Screen::Vpn
-            | Screen::Settings
-            | Screen::Log
-    ) {
+    if confirmation::current(app).is_some()
+        || !matches!(
+            app.screen,
+            Screen::Dashboard
+                | Screen::InterfaceList
+                | Screen::DhcpInterfaceList
+                | Screen::DhcpClient
+                | Screen::Wifi
+                | Screen::Router
+                | Screen::Vpn
+                | Screen::Settings
+                | Screen::Log
+        )
+    {
         app.push_message(
             LogLevel::Warn,
             "Finish this operation or use Esc before changing tabs.",
@@ -1091,6 +1096,25 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
         return;
     }
     let point = (mouse.column, mouse.row);
+    if confirmation::current(app).is_some() {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && app
+                .ui
+                .content_area
+                .is_some_and(|area| layout::point_in_rect(point, area))
+        {
+            if let Some(key) = app
+                .ui
+                .buttons
+                .iter()
+                .find(|(rect, _)| layout::point_in_rect(point, *rect))
+                .and_then(|(_, slot)| confirmation::key_for_slot(*slot))
+            {
+                handle_key(app, key, client, direct).await;
+            }
+        }
+        return;
+    }
     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
         if let Some(section) = layout::section_at(&app.ui.tabs, point) {
             navigate_to_section(app, section, client, direct).await;
@@ -1654,6 +1678,10 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
             KeyCode::Down => app.message_scroll = app.message_scroll.saturating_add(1),
             _ => {}
         }
+        return;
+    }
+
+    if confirmation::current(app).is_some() && !matches!(key, KeyCode::Enter | KeyCode::Esc) {
         return;
     }
 

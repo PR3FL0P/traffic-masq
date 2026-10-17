@@ -32,6 +32,7 @@ The TUI serves as the primary operational console for the `traffic-masq` network
 |---|---|---|
 | [`mod.rs`](mod.rs) | Application lifecycle, main event loop (`run_loop`), async UI driver (`drive_ui`), key/mouse dispatch, terminal initialization & RAII cleanup. | `TuiApp`, `Screen`, `Section`, `TerminalGuard`, `run_tui`, `drive_ui` |
 | [`layout.rs`](layout.rs) | Layout partitioning, panel wrappers, top header tab bar, bottom status & key hint footer, mouse hit testing primitives. | `UiLayout`, `panel`, `render_header`, `render_footer`, `point_in_rect`, `section_at` |
+| [`confirmation.rs`](confirmation.rs) | Shared immediate-action confirmation presentation, mouse slots and modal detection. | `Dialog`, `current`, `key_for_slot` |
 | [`input.rs`](input.rs) | Unicode-safe interactive text editing, shared clamped/wrapped focus navigation, blinking phase calculation, masked password span formatting. | `TextEditor`, `move_clamped`, `move_wrapped`, `render_value_with_cursor`, `render_masked_with_cursor` |
 | [`session.rs`](session.rs) | Per-endpoint persistent session caching, XDG state management, strict file permissions (`0700`/`0600`, `O_NOFOLLOW`), zeroization. | `SessionStore`, `SessionPreferences`, `remember`, `SessionStore::restore` |
 | [`dashboard.rs`](dashboard.rs) | Original Overview cards (mode, interfaces, pending, VPN); full-width interface list with per-interface RX/TX graphs and scrollable numeric statistics. No DHCP cards or sidebar. | `DashboardData`, `DashboardPane`, `TrafficHistory`, `TrafficSample` |
@@ -107,6 +108,20 @@ Because misconfiguring an IP address or firewall rule can sever SSH access, inte
 3. **Disconnect Handling:** If the daemon becomes unreachable while on a pending screen, the TUI retains the pending change state and warns the operator that the outcome is unverified rather than falsely claiming success.
 
 Standalone DHCP, Wi-Fi runtime controls such as reconnect/reload/passphrase updates, and VPN actions do not enter these pending screens and do not expose a commit timer. Live operator-triggered AP/client deactivation enters the pending-change screen. For an absent adapter, cleanup and durable intent saving return without a timer. Immediate mutations rely on the daemon's durable ownership/recovery mechanisms rather than TUI rollback state.
+
+Immediate action confirmations share `confirmation.rs`: saved Wi-Fi/VPN profile
+removal, offline interface Forget/Reset, router Repair, security Reset/Save,
+Wi-Fi station disconnect, log clearing, and discarding router/AP drafts. Each
+view identifies its target and consequences and has named action / Cancel
+buttons. Enter executes; Esc cancels; other keys and background mouse targets
+do not change the action. Header navigation is blocked until the dialog closes.
+These dialogs create no network transaction or rollback timer. Session
+preferences save on the first Enter.
+
+Applied Wi-Fi interface settings and credentials are independent of the profile
+library. The daemon rejects deletion of a currently active client profile and
+of a VPN profile in use. VPN deletion latches the name before confirmation so a
+list refresh cannot change the target.
 
 Missing-device interface edits use revision-checked Save rather than the live
 preview/pending flow; F5 Forget suppresses base intent and F6 Reset restores it.

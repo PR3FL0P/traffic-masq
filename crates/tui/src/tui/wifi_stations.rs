@@ -139,24 +139,31 @@ pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
     }
 }
 
+pub(super) fn confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> {
+    let view = app.wifi_stations.as_ref()?;
+    let mac = view.confirm?;
+    Some(super::confirmation::Dialog {
+        title: "Disconnect Wi-Fi client?",
+        action: "Disconnect",
+        lines: vec![
+            format!("Client: {mac}"),
+            format!("Access point interface: {}", view.interface),
+            "This disconnects the client now. It may reconnect; this is not a ban.".into(),
+        ],
+    })
+}
+
 pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
+    if let Some(dialog) = confirmation(app) {
+        dialog.render(frame, area, &mut app.ui);
+        return;
+    }
     let Some(view) = &mut app.wifi_stations else {
         return;
     };
     let block = panel("Connected Wi-Fi devices");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    if let Some(mac) = view.confirm {
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(format!("Disconnect {mac} from {}?", view.interface)),
-                Line::from("This disconnects the client now. It may reconnect; this is not a ban."),
-                Line::from("Enter: disconnect    Esc: cancel"),
-            ]),
-            inner,
-        );
-        return;
-    }
     let mut lines = vec![Line::from(format!(
         "AP: {} | Associated clients: {}",
         view.interface,
@@ -472,7 +479,7 @@ mod tests {
             terminal
                 .draw(|f| super::super::render(f, &mut app, false))
                 .unwrap();
-            assert!(app.ui.buttons.is_empty());
+            assert_eq!(app.ui.buttons.len(), 2);
             assert!(app.ui.list_area.is_none());
         }
     }

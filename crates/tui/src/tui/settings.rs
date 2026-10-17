@@ -99,7 +99,45 @@ fn note(text: impl Into<String>, style: Style) -> Line<'static> {
     Line::styled(format!("\tNote: {}", text.into()), style)
 }
 
+pub(super) fn confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> {
+    let editor = app.settings.as_ref()?;
+    let (title, action, lines) = match editor.confirmation? {
+        SettingsField::Reset => (
+            "Reset security settings?",
+            "Reset",
+            vec![
+                "Target: security settings override".into(),
+                "Remove the override and restore security settings from the base configuration."
+                    .into(),
+                "This changes the rollback timeout used by network transactions.".into(),
+            ],
+        ),
+        SettingsField::Save => (
+            "Save rollback timeout?",
+            "Save",
+            vec![
+                "Target: security settings override".into(),
+                format!(
+                    "Rollback timeout: {} seconds",
+                    editor.rollback_timeout_input
+                ),
+                "This timeout is used by network transactions.".into(),
+            ],
+        ),
+        _ => return None,
+    };
+    Some(super::confirmation::Dialog {
+        title,
+        action,
+        lines,
+    })
+}
+
 pub(crate) fn render_settings(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
+    if let Some(dialog) = confirmation(app) {
+        dialog.render(frame, area, &mut app.ui);
+        return;
+    }
     let Some(editor) = &app.settings else {
         return;
     };
@@ -243,21 +281,6 @@ pub(crate) fn render_settings(frame: &mut ratatui::Frame<'_>, area: Rect, app: &
         Style::default().fg(theme::ACCENT),
     ));
 
-    if let Some(field) = editor.confirmation {
-        let action = match field {
-            SettingsField::SaveSession => "save session preferences",
-            SettingsField::Reset => "reset security settings to the base config",
-            SettingsField::Save => "save the rollback timeout override",
-            _ => "apply this change",
-        };
-        lines.push(note(
-            format!("Confirm: press Enter again to {action}; Esc cancels."),
-            Style::default()
-                .fg(theme::WARN)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-
     let block = panel("Settings");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -303,6 +326,9 @@ pub(crate) async fn handle_settings_key(app: &mut TuiApp, key: KeyCode, client: 
         return;
     };
 
+    if editor.confirmation.is_some() && !matches!(key, KeyCode::Enter | KeyCode::Esc) {
+        return;
+    }
     match key {
         KeyCode::Esc if editor.is_editing() => {
             editor.editing = false;
@@ -340,7 +366,7 @@ pub(crate) async fn handle_settings_key(app: &mut TuiApp, key: KeyCode, client: 
                 editor.show_dhcp_client = !editor.show_dhcp_client;
                 app.show_dhcp_client = editor.show_dhcp_client;
             }
-            SettingsField::SaveSession | SettingsField::Reset | SettingsField::Save
+            SettingsField::Reset | SettingsField::Save
                 if editor.confirmation != Some(editor.field) =>
             {
                 editor.confirmation = Some(editor.field);

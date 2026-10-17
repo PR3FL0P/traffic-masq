@@ -23,6 +23,7 @@ pub(crate) struct VpnData {
     pub(crate) error: Option<VpnErrorDetail>,
     pub(crate) focus: VpnFocus,
     pub(crate) enabled: Option<bool>,
+    pub(crate) delete_confirmation: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -101,7 +102,24 @@ impl VpnImportEditor {
     }
 }
 
+pub(super) fn confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> {
+    let name = app.vpn.delete_confirmation.as_ref()?;
+    Some(super::confirmation::Dialog {
+        title: "Delete saved VPN profile?",
+        action: "Delete",
+        lines: vec![
+            format!("Profile: {name}"),
+            "The saved VPN configuration and its keys will be deleted.".into(),
+            "Deletion is immediate and cannot be undone.".into(),
+        ],
+    })
+}
+
 pub(crate) fn render_vpn(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
+    if let Some(dialog) = confirmation(app) {
+        dialog.render(frame, area, &mut app.ui);
+        return;
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(5), Constraint::Min(3)])
@@ -368,6 +386,21 @@ pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
 }
 
 pub(crate) async fn handle_vpn_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
+    if app.vpn.delete_confirmation.is_some() {
+        match key {
+            KeyCode::Esc => app.vpn.delete_confirmation = None,
+            KeyCode::Enter => {
+                let name = app
+                    .vpn
+                    .delete_confirmation
+                    .take()
+                    .expect("confirmation open");
+                vpn_delete_profile(app, client, name).await;
+            }
+            _ => {}
+        }
+        return;
+    }
     let key = match key {
         KeyCode::Left if app.vpn.focus != VpnFocus::List => KeyCode::Up,
         KeyCode::Right if app.vpn.focus != VpnFocus::List => KeyCode::Down,
@@ -419,7 +452,7 @@ pub(crate) async fn handle_vpn_key(app: &mut TuiApp, key: KeyCode, client: &ApiC
             VpnFocus::List | VpnFocus::Connect => vpn_activate_selected(app, client).await,
             VpnFocus::Disconnect => vpn_deactivate(app, client).await,
             VpnFocus::Import => open_vpn_import(app, client).await,
-            VpnFocus::Delete => vpn_delete_selected(app, client).await,
+            VpnFocus::Delete => vpn_delete_selected(app),
             VpnFocus::Policy => open_vpn_policy(app, client).await,
             VpnFocus::Refresh => load_vpn_data(app, client).await,
             VpnFocus::ToggleEnabled => toggle_vpn_enabled(app, client).await,
@@ -650,7 +683,7 @@ async fn vpn_deactivate(app: &mut TuiApp, client: &ApiClient) {
     }
 }
 
-async fn vpn_delete_selected(app: &mut TuiApp, client: &ApiClient) {
+fn vpn_delete_selected(app: &mut TuiApp) {
     let Some(name) = app
         .vpn
         .profiles
@@ -661,6 +694,10 @@ async fn vpn_delete_selected(app: &mut TuiApp, client: &ApiClient) {
         return;
     };
 
+    app.vpn.delete_confirmation = Some(name);
+}
+
+async fn vpn_delete_profile(app: &mut TuiApp, client: &ApiClient, name: String) {
     match client.request(&Request::VpnDeleteProfile { name }).await {
         Ok(Response::VpnProfileDeleted { name }) => {
             app.push_message(LogLevel::Info, format!("Deleted profile {name}"));

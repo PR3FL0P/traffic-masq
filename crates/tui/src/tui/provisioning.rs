@@ -456,20 +456,32 @@ fn review_text(review: &Review) -> String {
     lines.join("\n")
 }
 
+pub(super) fn confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> {
+    app.provisioning
+        .as_ref()?
+        .discard
+        .then(|| super::confirmation::Dialog {
+            title: "Discard router setup draft?",
+            action: "Discard",
+            lines: vec![
+                "Target: current Wi-Fi router setup draft".into(),
+                "Unsaved settings and entered credentials will be discarded.".into(),
+                "Cancel returns to editing.".into(),
+            ],
+        })
+}
+
 pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
+    if let Some(dialog) = confirmation(app) {
+        dialog.render(frame, area, &mut app.ui);
+        return;
+    }
     let Some(w) = &mut app.provisioning else {
         return;
     };
     let block = panel("Wi-Fi router setup");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    if w.discard {
-        frame.render_widget(
-            Paragraph::new("Discard this setup draft?\nEnter: discard    Esc: continue editing"),
-            inner,
-        );
-        return;
-    }
     if let Some(review) = &mut w.review {
         let body = Rect::new(
             inner.x,

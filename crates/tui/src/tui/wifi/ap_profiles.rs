@@ -132,19 +132,31 @@ pub(crate) fn render_wifi_ap_profiles(
     let Some(view) = &app.wifi_ap_profiles else {
         return;
     };
+    if let Some(id) = &view.delete_confirmation {
+        let ssid = view
+            .profiles
+            .iter()
+            .find(|p| &p.id == id)
+            .map_or("", |p| p.settings.ssid.as_str());
+        render_delete_confirmation(
+            frame,
+            area,
+            &mut app.ui,
+            id,
+            ssid,
+            "The running access point and saved interface settings are kept.",
+        );
+        return;
+    }
     let target = view.profiles.get(view.selected_profile);
-    let title = if let Some(id) = &view.delete_confirmation {
-        format!("Delete {id}? Y: confirm, any other key: cancel")
-    } else {
-        format!(
-            "Saved AP profiles — {}",
-            if view.interface.is_empty() {
-                "library"
-            } else {
-                &view.interface
-            }
-        )
-    };
+    let title = format!(
+        "Saved AP profiles — {}",
+        if view.interface.is_empty() {
+            "library"
+        } else {
+            &view.interface
+        }
+    );
     let block = panel(&title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -234,8 +246,14 @@ pub(crate) async fn handle_wifi_ap_profiles_key(
         app.screen = Screen::Wifi;
         return;
     };
-    if let Some(id) = view.delete_confirmation.take() {
-        if matches!(key, KeyCode::Char('y' | 'Y')) {
+    if view.delete_confirmation.is_some() {
+        if key == KeyCode::Esc {
+            view.delete_confirmation = None;
+        } else if key == KeyCode::Enter {
+            let id = view
+                .delete_confirmation
+                .take()
+                .expect("confirmation is open");
             let interface = view.interface.clone();
             match client.request(&Request::DeleteWifiApProfile { id }).await {
                 Ok(Response::WifiApProfileDeleted { .. }) => {

@@ -70,6 +70,22 @@ pub(crate) fn render_wifi_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, a
     let Some(view) = &app.wifi_profiles else {
         return;
     };
+    if let Some(id) = &view.delete_confirmation {
+        let ssid = view
+            .profiles
+            .iter()
+            .find(|p| &p.id == id)
+            .map_or("", |p| p.ssid.as_str());
+        render_delete_confirmation(
+            frame,
+            area,
+            &mut app.ui,
+            id,
+            ssid,
+            "Saved interface settings are kept. Disconnect an active profile before deleting it.",
+        );
+        return;
+    }
     match view.mode {
         WifiProfilesMode::Menu => render_profiles_menu(frame, area, &mut app.ui, view),
         WifiProfilesMode::Management => render_profiles_management(frame, area, &mut app.ui, view),
@@ -138,11 +154,7 @@ fn render_profiles_management(
         .profiles
         .get(view.selected_profile)
         .map_or("none", |p| p.id.as_str());
-    let title = if let Some(id) = &view.delete_confirmation {
-        format!("Delete {id}? Y: confirm, any other key: cancel")
-    } else {
-        format!("Saved profiles — Management (selected: {target})")
-    };
+    let title = format!("Saved profiles — Management (selected: {target})");
     let block = panel(&title);
     let inner = block.inner(area);
 
@@ -217,11 +229,7 @@ fn render_profile_actions(
         .profiles
         .get(view.selected_profile)
         .map_or("none", |p| p.id.as_str());
-    let title = if let Some(id) = &view.delete_confirmation {
-        format!("Delete {id}? Y: confirm, any other key: cancel")
-    } else {
-        format!("Profile management — target: {target}")
-    };
+    let title = format!("Profile management — target: {target}");
     let block = panel(&title);
     let inner = block.inner(area);
 
@@ -289,9 +297,17 @@ pub(crate) async fn handle_wifi_profiles_key(app: &mut TuiApp, key: KeyCode, cli
         app.screen = Screen::Wifi;
         return;
     };
-    if let Some(id) = view.delete_confirmation.take() {
-        if key == KeyCode::Char('y') || key == KeyCode::Char('Y') {
-            profile_request(app, client, Ok(Request::DeleteWifiClientProfile { id })).await;
+    if view.delete_confirmation.is_some() {
+        match key {
+            KeyCode::Enter => {
+                let id = view
+                    .delete_confirmation
+                    .take()
+                    .expect("confirmation is open");
+                profile_request(app, client, Ok(Request::DeleteWifiClientProfile { id })).await;
+            }
+            KeyCode::Esc => view.delete_confirmation = None,
+            _ => {}
         }
         return;
     }
@@ -448,13 +464,6 @@ async fn activate_profile_action(app: &mut TuiApp, client: &ApiClient, action: W
                     if let Some(current) = app.wifi_profiles.as_mut() {
                         current.delete_confirmation = Some(profile.id.clone());
                     }
-                    app.push_message(
-                        LogLevel::Warn,
-                        format!(
-                            "Delete profile {}? Y confirms; any other key cancels.",
-                            profile.id
-                        ),
-                    );
                 }
                 WifiProfileAction::Deactivate | WifiProfileAction::Back => unreachable!(),
             }
