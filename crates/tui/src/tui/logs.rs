@@ -190,7 +190,13 @@ fn format_time_hms(unix_time: u64) -> String {
 
 pub(crate) fn render_log(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
     if let Some(dialog) = super::confirmation::current(app) {
-        dialog.render(frame, area, &mut app.ui, app.confirmation_focus);
+        dialog.render(
+            frame,
+            area,
+            &mut app.ui,
+            app.confirmation_focus,
+            app.confirmation_scroll,
+        );
         return;
     }
     let sections = ratatui::layout::Layout::default()

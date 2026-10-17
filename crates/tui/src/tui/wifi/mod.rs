@@ -30,7 +30,6 @@ pub(crate) use ap_profiles::{
 mod connect;
 mod delete_confirmation;
 pub(super) use delete_confirmation::profile_delete_dialog;
-use delete_confirmation::render_delete_confirmation;
 mod profile_editor;
 mod profiles;
 mod scan;
@@ -1180,6 +1179,7 @@ fn subsystem_disabled(app: &mut TuiApp, role: WifiRole) -> bool {
 async fn request_simple(app: &mut TuiApp, client: &ApiClient, request: Request, success: &str) {
     match client.request(&request).await {
         Ok(Response::NetworkChangePending { change }) => {
+            app.pending_focus = 0;
             app.pending = Some(change);
             app.pending_return_screen = Screen::Wifi;
             app.screen = Screen::PendingChange;

@@ -349,6 +349,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClien
             if change.interface == interface
                 && matches!(request, Request::ConfigureDhcpClient { .. }) =>
         {
+            app.pending_focus = 0;
             app.pending = Some(change);
             app.pending_return_screen = Screen::DhcpClient;
             app.screen = Screen::PendingChange;

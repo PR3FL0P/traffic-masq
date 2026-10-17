@@ -70,21 +70,16 @@ pub(crate) fn render_wifi_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, a
     let Some(view) = &app.wifi_profiles else {
         return;
     };
-    if let Some(id) = &view.delete_confirmation {
-        let ssid = view
-            .profiles
-            .iter()
-            .find(|p| &p.id == id)
-            .map_or("", |p| p.ssid.as_str());
-        render_delete_confirmation(
-            frame,
-            area,
-            &mut app.ui,
-            id,
-            ssid,
-            "Saved interface settings are kept. Disconnect an active profile before deleting it.",
-            app.confirmation_focus,
-        );
+    if view.delete_confirmation.is_some() {
+        if let Some(dialog) = super::delete_confirmation::client_dialog(view) {
+            dialog.render(
+                frame,
+                area,
+                &mut app.ui,
+                app.confirmation_focus,
+                app.confirmation_scroll,
+            );
+        }
         return;
     }
     match view.mode {
@@ -546,6 +541,7 @@ async fn profile_request(
     };
     match client.request(&request).await {
         Ok(Response::NetworkChangePending { change }) => {
+            app.pending_focus = 0;
             app.pending = Some(change);
             app.pending_return_screen = Screen::WifiProfiles;
             app.screen = Screen::PendingChange;

@@ -6,7 +6,13 @@ use crate::tui::{
 
 pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
     if let Some(dialog) = discard_confirmation(app) {
-        dialog.render(frame, area, &mut app.ui, app.confirmation_focus);
+        dialog.render(
+            frame,
+            area,
+            &mut app.ui,
+            app.confirmation_focus,
+            app.confirmation_scroll,
+        );
         return;
     }
     let Some(editor) = &app.wifi_editor else {
@@ -63,10 +69,14 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
                 ),
                 format!(
                     "Passphrase: {}",
-                    if editor.passphrase.is_empty() {
+                    if editor.security == WifiSecurity::Open {
+                        "remove passphrase (open network)"
+                    } else if editor.passphrase.is_empty() && editor.existing {
                         "preserve existing"
+                    } else if editor.passphrase.is_empty() {
+                        "not set (required)"
                     } else {
-                        "replace saved passphrase"
+                        "set entered passphrase"
                     }
                 ),
             ],
@@ -162,7 +172,7 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
             WifiField::Apply,
             "",
             if editor.offline_intent.is_some() {
-                "Save AP settings for device return"
+                "Review AP settings for device return"
             } else if editor.configure_dhcp {
                 "Review AP + passphrase + DHCP"
             } else if editor.disable_dhcp {
@@ -588,6 +598,7 @@ async fn apply_ap_editor(app: &mut TuiApp, client: &ApiClient) {
                 LogLevel::Info,
                 "Access point change applied tentatively; confirm it before the rollback timer expires",
             );
+            app.pending_focus = 0;
             app.pending = Some(change);
             app.pending_return_screen = Screen::Wifi;
             app.wifi_editor = None;

@@ -51,6 +51,8 @@ mod settings;
 mod test_api;
 mod vpn;
 mod vpn_policy;
+#[cfg(test)]
+mod walkthrough;
 mod wifi;
 mod wifi_stations;
 
@@ -274,6 +276,7 @@ struct TuiApp {
     interface_drafts: HashMap<String, InterfaceEditor>,
     ap_drafts: HashMap<String, wifi::WifiEditor>,
     confirmation_focus: usize,
+    confirmation_scroll: u16,
     dhcp_editor: Option<DhcpEditor>,
     dhcp_leases: Option<DhcpLeasesView>,
     dhcp_clients: Vec<DhcpClientStatusView>,
@@ -287,6 +290,7 @@ struct TuiApp {
     preview_max_scroll: usize,
     pending: Option<PendingNetworkChange>,
     pending_return_screen: Screen,
+    pending_focus: usize,
     router: RouterData,
     router_settings: Option<router_settings::Editor>,
     router_health: router_health::View,
@@ -339,6 +343,7 @@ impl Default for TuiApp {
             interface_drafts: HashMap::new(),
             ap_drafts: HashMap::new(),
             confirmation_focus: 0,
+            confirmation_scroll: 0,
             dhcp_editor: None,
             dhcp_leases: None,
             dhcp_clients: Vec::new(),
@@ -352,6 +357,7 @@ impl Default for TuiApp {
             preview_max_scroll: 0,
             pending: None,
             pending_return_screen: Screen::Dashboard,
+            pending_focus: 0,
             router: RouterData::default(),
             router_settings: None,
             router_health: router_health::View::default(),
@@ -1103,6 +1109,20 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
     }
     let point = (mouse.column, mouse.row);
     if confirmation::current(app).is_some() {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                app.confirmation_scroll = app.confirmation_scroll.saturating_sub(1);
+                return;
+            }
+            MouseEventKind::ScrollDown => {
+                app.confirmation_scroll = app
+                    .confirmation_scroll
+                    .saturating_add(1)
+                    .min(app.ui.dialog_max_scroll);
+                return;
+            }
+            _ => {}
+        }
         if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             && app
                 .ui
@@ -1634,6 +1654,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp, direct: bool) {
 fn focus_action_slot(app: &mut TuiApp, slot: usize) {
     match app.screen {
         Screen::Dashboard => {}
+        Screen::PendingChange | Screen::RouterPending => app.pending_focus = slot.min(1),
         Screen::Access => access::focus_action(app, slot),
         Screen::InterfaceEditor => interfaces::focus_action(app, slot),
         Screen::DhcpEditor => dhcp::focus_action(app, slot),
@@ -1647,6 +1668,13 @@ fn focus_action_slot(app: &mut TuiApp, slot: usize) {
         Screen::Vpn => vpn::focus_action(app, slot),
         Screen::VpnPolicy => vpn_policy::focus_action(app, slot),
         Screen::WifiEditor => wifi::focus_editor_action(app, slot),
+        Screen::WifiApProfiles => {
+            if let Some(view) = app.wifi_ap_profiles.as_mut() {
+                if view.apply_review {
+                    view.review_cancel = slot == 1;
+                }
+            }
+        }
         Screen::Wifi => wifi::focus_action(app, slot),
         Screen::WifiConnectPrompt => {
             if let Some(prompt) = app.wifi_connect.as_mut() {
@@ -1668,6 +1696,7 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
         if (app.pending.is_some() || app.router_pending.is_some())
             && matches!(key, KeyCode::Enter | KeyCode::Esc)
         {
+            app.pending_focus = 0;
             match app.screen {
                 Screen::PendingChange => interfaces::handle_pending_key(app, key, client).await,
                 Screen::RouterPending => router::handle_router_pending_key(app, key, client).await,
@@ -1699,6 +1728,25 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
     let key = if let Some(dialog) = confirmation::current(app) {
         let count = if dialog.secondary.is_some() { 3 } else { 2 };
         match key {
+            KeyCode::PageUp => {
+                app.confirmation_scroll = app.confirmation_scroll.saturating_sub(5);
+                return;
+            }
+            KeyCode::PageDown => {
+                app.confirmation_scroll = app
+                    .confirmation_scroll
+                    .saturating_add(5)
+                    .min(app.ui.dialog_max_scroll);
+                return;
+            }
+            KeyCode::Home => {
+                app.confirmation_scroll = 0;
+                return;
+            }
+            KeyCode::End => {
+                app.confirmation_scroll = app.ui.dialog_max_scroll;
+                return;
+            }
             KeyCode::Tab | KeyCode::Down | KeyCode::Right => {
                 app.confirmation_focus = (app.confirmation_focus + 1) % count;
                 return;
@@ -1716,6 +1764,7 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
         }
     } else {
         app.confirmation_focus = 0;
+        app.confirmation_scroll = 0;
         key
     };
 
@@ -1729,6 +1778,8 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
             | Screen::Router
             | Screen::Forwarding
             | Screen::WifiStations
+            | Screen::PendingChange
+            | Screen::RouterPending
             | Screen::Wifi,
             _,
         ) => key,
@@ -1822,6 +1873,7 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
     }
     if confirmation::current(app).is_none() {
         app.confirmation_focus = 0;
+        app.confirmation_scroll = 0;
     }
 }
 

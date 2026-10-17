@@ -851,3 +851,74 @@ async fn interface_exit_keeps_or_discards_draft_with_keyboard_focus() {
     assert!(app.interface_drafts.is_empty());
     assert_eq!(app.screen, Screen::InterfaceList);
 }
+
+#[tokio::test]
+async fn failed_save_and_background_refresh_keep_the_interface_draft_and_revision() {
+    let mock = crate::tui::test_api::mock(vec![Response::Error {
+        message: "stale revision; refresh before saving".into(),
+    }])
+    .await;
+    let mut editor = default_route_editor(true);
+    editor.offline_revision = Some(7);
+    editor.cidr = "192.0.2.99/24".into();
+    editor.saved_config = Some(
+        serde_json::from_value(
+            serde_json::json!({"role":"output", "managed":true, "ipv4":"192.168.1.10/24"}),
+        )
+        .unwrap(),
+    );
+    let mut app = TuiApp {
+        screen: Screen::InterfaceEditor,
+        editor: Some(editor),
+        ..Default::default()
+    };
+    submit_dry_run(&mut app, &mock.client).await;
+    assert_eq!(app.screen, Screen::InterfaceEditor);
+    super::super::dashboard::accept_update(
+        &mut app,
+        super::super::DashboardData {
+            intent_revision: Some(8),
+            inventory: Some(vec![]),
+            ..Default::default()
+        },
+    );
+    let editor = app.editor.as_ref().unwrap();
+    assert_eq!(editor.cidr, "192.0.2.99/24");
+    assert_eq!(editor.offline_revision, Some(7));
+    assert!(app.message.as_deref().unwrap().contains("stale revision"));
+}
+
+#[tokio::test]
+async fn validation_focus_exposes_mac_error_and_plan_wrap_preserves_actions() {
+    use ratatui::{backend::TestBackend, Terminal};
+    let client = ApiClient::new("/must-not-connect.sock");
+    for (width, height) in [(80, 24), (120, 38)] {
+        let mut editor = default_route_editor(true);
+        editor.mac_address = "invalid".into();
+        editor.interface = "a-very-long-interface-name-to-check-review-and-error-layout".into();
+        let mut app = TuiApp {
+            screen: Screen::InterfaceEditor,
+            editor: Some(editor),
+            ..Default::default()
+        };
+        submit_dry_run(&mut app, &client).await;
+        assert!(app.editor.as_ref().unwrap().advanced);
+        assert_eq!(
+            app.editor.as_ref().unwrap().field,
+            InterfaceEditorField::MacAddress
+        );
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| super::super::render(frame, &mut app, false))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Invalid MAC"));
+        assert!(text.contains("Review changes"));
+    }
+}

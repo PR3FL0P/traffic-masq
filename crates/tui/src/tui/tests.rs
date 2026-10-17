@@ -1219,3 +1219,52 @@ async fn missing_inventory_mouse_and_keyboard_selection_is_independent_of_live_s
     assert_eq!(app.selected_inventory_interface, 1);
     assert_eq!(app.selected_interface, 0);
 }
+
+#[tokio::test]
+async fn tab_then_enter_sends_rollback_for_both_pending_screens() {
+    for router in [false, true] {
+        let mock = test_api::mock(vec![Response::Error {
+            message: "test rejection; retain pending state".into(),
+        }])
+        .await;
+        let mut app = TuiApp::default();
+        if router {
+            app.screen = Screen::RouterPending;
+            app.router_pending = Some(RouterPendingView {
+                token: "demo".into(),
+                applied_at_unix: current_unix_time(),
+                rollback_failure: None,
+                recovery: None,
+                scroll: 0,
+                max_scroll: 0,
+            });
+        } else {
+            app.screen = Screen::PendingChange;
+            app.pending = Some(PendingNetworkChange {
+                token: "demo".into(),
+                interface: "lan0".into(),
+                expires_at_unix: current_unix_time() + 60,
+                rollback_timeout_seconds: 60,
+                phase: Default::default(),
+                last_error: None,
+                recovery_progress: None,
+            });
+        }
+        app.ui.input_enabled = true;
+        handle_key(&mut app, KeyCode::Tab, &mock.client, false).await;
+        assert_eq!(app.pending_focus, 1);
+        assert!(mock.calls.lock().unwrap().is_empty());
+        handle_key(&mut app, KeyCode::Enter, &mock.client, false).await;
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].body["type"],
+            if router {
+                "router_rollback"
+            } else {
+                "rollback_network_change"
+            }
+        );
+        assert!(app.pending.is_some() || app.router_pending.is_some());
+    }
+}

@@ -180,6 +180,7 @@ pub(super) async fn submit_wifi_connect(app: &mut TuiApp, client: &ApiClient) {
         .find(|change| change.interface == prompt.interface)
         .cloned()
     {
+        app.pending_focus = 0;
         app.pending = Some(change);
         app.pending_return_screen = Screen::Wifi;
         app.wifi_connect = None;
@@ -242,6 +243,7 @@ pub(super) async fn submit_wifi_connect(app: &mut TuiApp, client: &ApiClient) {
             load_wifi_data(app, client).await;
         }
         Ok(Response::NetworkChangePending { change }) => {
+            app.pending_focus = 0;
             app.pending = Some(change);
             app.pending_return_screen = Screen::Wifi;
             app.wifi_connect = None;
@@ -410,9 +412,9 @@ pub(crate) fn render_wifi_connect_prompt(
     let submit_active = prompt.field == WifiConnectField::Submit;
     let cancel_active = prompt.field == WifiConnectField::Cancel;
     let submit_label = if prompt.expected_revision.is_some() && submit_active {
-        "▶ [ Save (Enter) ] "
+        "▶ [ Review saved settings (Enter) ] "
     } else if prompt.expected_revision.is_some() {
-        "  [ Save ] "
+        "  [ Review saved settings ] "
     } else if submit_active {
         "▶ [ Review changes (Enter) ] "
     } else {
@@ -431,11 +433,7 @@ pub(crate) fn render_wifi_connect_prompt(
 
     lines.push(Line::from(""));
     lines.push(Line::styled(
-        if prompt.expected_revision.is_some() {
-            "Tab/Shift+Tab: focus • Enter: select • Ctrl+O: save • Esc: cancel"
-        } else {
-            "Tab/Shift+Tab: focus • Enter: select • Ctrl+O: connect • Esc: cancel"
-        },
+        "Tab/Shift+Tab: focus • Enter: select • Ctrl+O: review • Esc: cancel",
         Style::default().fg(theme::MUTED),
     ));
 

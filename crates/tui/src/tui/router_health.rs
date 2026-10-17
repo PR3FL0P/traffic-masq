@@ -86,7 +86,13 @@ pub(super) fn confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> 
 
 pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
     if let Some(dialog) = confirmation(app) {
-        dialog.render(frame, area, &mut app.ui, app.confirmation_focus);
+        dialog.render(
+            frame,
+            area,
+            &mut app.ui,
+            app.confirmation_focus,
+            app.confirmation_scroll,
+        );
         return;
     }
     let view = &mut app.router_health;

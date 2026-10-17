@@ -1704,6 +1704,8 @@ fn ap_profiles_app(mode: WifiProfilesMode) -> TuiApp {
     TuiApp {
         screen: Screen::WifiApProfiles,
         wifi_ap_profiles: Some(WifiApProfilesView {
+            apply_review: false,
+            review_cancel: false,
             interface: "wlan0".into(),
             profiles: vec![ap_test_profile()],
             mode,
@@ -1797,6 +1799,8 @@ async fn ap_profile_apply_uses_saved_profile_and_commit_confirmation() {
     }])
     .await;
     handle_wifi_ap_profiles_key(&mut app, KeyCode::Enter, &client).await;
+    assert!(app.wifi_ap_profiles.as_ref().unwrap().apply_review);
+    handle_wifi_ap_profiles_key(&mut app, KeyCode::Enter, &client).await;
     let paths = server.await.unwrap();
     assert_eq!(paths.len(), 1);
     assert_eq!(paths, vec!["activate_wifi_ap_profile wlan0"]);
@@ -1839,7 +1843,11 @@ async fn ap_profile_delete_requires_confirmation_and_keeps_network_unchanged() {
     assert!(app.ui.list_area.is_none());
     assert_eq!(
         super::super::layout::help_pairs(&app),
-        vec![("Enter", "Delete"), ("Esc", "cancel")]
+        vec![
+            ("Enter", "Delete"),
+            ("Esc", "cancel"),
+            ("PgUp/Dn", "details")
+        ]
     );
     let (cancel, _) = app.ui.buttons[1];
     super::super::handle_mouse(

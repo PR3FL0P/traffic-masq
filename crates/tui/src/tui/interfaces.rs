@@ -80,7 +80,7 @@ impl InterfaceEditor {
                 != self
                     .saved_config
                     .as_ref()
-                    .map_or(true, |config| config.managed)
+                    .is_none_or(|config| config.managed)
             || self.role != self.original_role
             || self.mac_address != self.original_mac
     }
@@ -525,16 +525,22 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         return;
     };
 
+    if let Some(dialog) = confirmation(app) {
+        dialog.render(
+            frame,
+            area,
+            &mut app.ui,
+            app.confirmation_focus,
+            app.confirmation_scroll,
+        );
+        return;
+    }
+
     let area = if editor.offline_revision.is_some() {
         super::layout::render_offline_intent_warning(frame, area)
     } else {
         area
     };
-
-    if let Some(dialog) = confirmation(app) {
-        dialog.render(frame, area, &mut app.ui, app.confirmation_focus);
-        return;
-    }
 
     let block = panel("Interface · Editing");
     let inner = block.inner(area);
@@ -791,15 +797,15 @@ pub(crate) fn render_preview(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
     }
 
     if let Some(editor) = &app.editor {
-        let before = if editor.current_addresses.is_empty() {
-            "none".into()
+        let before = if editor.original_cidr.is_empty() {
+            "none"
         } else {
-            editor.current_addresses.join(", ")
+            &editor.original_cidr
         };
         lines.insert(
             1,
             Line::from(format!(
-                "IPv4: {before} → {}",
+                "Static IPv4: {before} → {}",
                 if editor.cidr.is_empty() {
                     "no owned static IPv4"
                 } else {
@@ -807,12 +813,19 @@ pub(crate) fn render_preview(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
                 }
             )),
         );
-        if let Some(config) = &editor.saved_config {
+        lines.insert(
+            2,
+            Line::from(format!(
+                "Router role: {:?} → {:?}",
+                editor.original_role, editor.role
+            )),
+        );
+        if !editor.current_addresses.is_empty() {
             lines.insert(
                 2,
                 Line::from(format!(
-                    "Router role: {:?} → {:?}",
-                    config.role, editor.role
+                    "Observed IPv4: {}",
+                    editor.current_addresses.join(", ")
                 )),
             );
         }
@@ -969,7 +982,7 @@ pub(crate) fn render_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
         Rect::new(
             chunks[2].x,
             chunks[2].y,
-            PENDING_COMMIT_LABEL.len() as u16,
+            (PENDING_COMMIT_LABEL.len() + 2) as u16,
             1,
         ),
         0,
@@ -978,7 +991,7 @@ pub(crate) fn render_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
         Rect::new(
             chunks[2].x,
             chunks[2].y.saturating_add(1),
-            PENDING_ROLLBACK_LABEL.len() as u16,
+            (PENDING_ROLLBACK_LABEL.len() + 2) as u16,
             1,
         ),
         1,
@@ -986,14 +999,20 @@ pub(crate) fn render_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
     frame.render_widget(
         Paragraph::new(vec![
             Line::styled(
-                "[Confirm changes] (Enter)",
+                format!(
+                    "{}[Confirm changes] (Enter)",
+                    if app.pending_focus == 0 { "▶ " } else { "  " }
+                ),
                 Style::default()
                     .fg(theme::SELECTED_FG)
                     .bg(theme::GOOD)
                     .add_modifier(Modifier::BOLD),
             ),
             Line::styled(
-                "[Roll back now] (Esc)",
+                format!(
+                    "{}[Roll back now] (Esc)",
+                    if app.pending_focus == 1 { "▶ " } else { "  " }
+                ),
                 Style::default()
                     .fg(theme::SELECTED_FG)
                     .bg(theme::WARN)
@@ -1470,6 +1489,13 @@ pub(crate) async fn submit_dry_run(app: &mut TuiApp, client: &ApiClient) {
     let edit = match editor.edit_request() {
         Ok(edit) => edit,
         Err(error) => {
+            if editor.parsed_mac_address().is_err() {
+                editor.advanced = true;
+                editor.field = InterfaceEditorField::MacAddress;
+            } else if !editor.cidr.is_empty() && editor.cidr.parse::<ipnet::Ipv4Net>().is_err() {
+                editor.field = InterfaceEditorField::Cidr;
+            }
+            editor.reset_cursor();
             app.push_message(LogLevel::Warn, format!("Invalid interface edit: {error}"));
             return;
         }
@@ -1591,6 +1617,7 @@ async fn apply_preview(app: &mut TuiApp, client: &ApiClient) {
         .await
     {
         Ok(Response::NetworkChangePending { change }) => {
+            app.pending_focus = 0;
             app.pending = Some(change);
             app.pending_return_screen = Screen::InterfaceList;
             app.screen = Screen::PendingChange;
@@ -1605,8 +1632,21 @@ async fn apply_preview(app: &mut TuiApp, client: &ApiClient) {
 }
 
 pub(crate) async fn handle_pending_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
+    if matches!(
+        key,
+        KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Left
+            | KeyCode::Right
+    ) {
+        app.pending_focus = 1 - app.pending_focus.min(1);
+        return;
+    }
+
     match key {
-        KeyCode::Enter => finish_pending(app, client, true).await,
+        KeyCode::Enter => finish_pending(app, client, app.pending_focus == 0).await,
         KeyCode::Esc => finish_pending(app, client, false).await,
         _ => {}
     }

@@ -95,7 +95,7 @@ In a terminal application, performing long-running network operations directly i
 
 Because misconfiguring an IP address or firewall rule can sever SSH access, interface and router changes use a strict rollback pattern:
 1. **Dry-Run Preview:** Before modifying transactional interface/router state, the daemon calculates a diff (`InterfaceChangePlan`, `RouterPlan`). The TUI presents this plan on a dedicated preview screen (`Screen::Preview`, `Screen::RouterPlan`).
-   - Both previews use the same controls: scroll through the complete plan, press **Enter** on `[Apply]` only after reaching the end, or press **Esc** / `[Cancel]` to return without applying.
+   - Both previews use the same controls: scroll through the complete plan, press **Enter** on `[Apply temporarily]` only after reaching the end, or press **Esc** / `[Cancel]` to return without applying.
 2. **Pending State (`Screen::PendingChange`, `Screen::RouterPending`):**
    - When the user confirms the plan, the change is applied with a daemon-managed rollback timer (e.g. 60 seconds).
    - The TUI transitions to a Pending screen displaying a live countdown timer:
@@ -110,11 +110,11 @@ Because misconfiguring an IP address or firewall rule can sever SSH access, inte
 Standalone DHCP, Wi-Fi runtime controls such as reconnect/reload/passphrase updates, and VPN actions do not enter these pending screens and do not expose a commit timer. Live operator-triggered AP/client deactivation enters the pending-change screen. For an absent adapter, cleanup and durable intent saving return without a timer. Immediate mutations rely on the daemon's durable ownership/recovery mechanisms rather than TUI rollback state.
 
 Immediate action confirmations share `confirmation.rs`: saved Wi-Fi/VPN profile
-removal, offline interface Forget/Reset, router Repair, security Reset/Save,
-Wi-Fi station disconnect, log clearing, and discarding router/AP drafts. Each
+removal, offline interface Delete/Restore, router Repair, security Reset/Save,
+Wi-Fi station disconnect, log clearing, and leaving interface/AP drafts or discarding router drafts. Each
 view identifies its target and consequences and has named action / Cancel
-buttons. Enter executes; Esc cancels; other keys and background mouse targets
-do not change the action. Header navigation is blocked until the dialog closes.
+buttons. Tab/Shift+Tab and arrows select an action; Enter executes the selected action;
+Esc cancels. Background mouse targets do not change the action. Header navigation is blocked until the dialog closes.
 These dialogs create no network transaction or rollback timer. Session
 preferences save on the first Enter.
 
@@ -124,8 +124,9 @@ of a VPN profile in use. VPN deletion latches the name before confirmation so a
 list refresh cannot change the target.
 
 Missing-device interface edits use revision-checked Save rather than the live
-preview/pending flow. The Forget and Reset buttons suppress base intent or restore
-it. Both support Tab/arrow navigation, Enter activation, and mouse clicks, with
+preview/pending flow. The Delete saved settings and Restore settings from file buttons suppress base
+intent or restore it. Inventory reports optional base-file metadata; an older
+daemon without it cannot offer file restoration. Both support Tab/arrow navigation, Enter activation, and mouse clicks, with
 Enter confirmation.
 Router routes/sharing use saved inventory and latch the editor revision. Their
 offline preview scrolls to **Save intent** and reports cleanup blockers separately
@@ -162,7 +163,7 @@ Mouse support is dynamically synchronized during the rendering pass:
 
 Mouse-wheel input on Dashboard, VPN, Router route/sharing lists, and Log returns focus to the list or viewport and clamps at its boundaries; it must not advance focus onto action buttons. Both interface and router plan reviews support wheel scrolling through the same handlers as Up/Down.
 
-Scrollable screens own their viewport state explicitly instead of relying on Paragraph clipping. Lists register the visible `list_area`, `list_row_height`, item count, and model-level scroll offset in `UiLayout`. Interface and router plan reviews both keep explicit scroll/max-scroll state; Apply is accepted only after the operator has reached the end of the plan. Their pending screens share the same countdown and Commit/Rollback action layout; router pending additionally supports scrolling rollback diagnostics. DHCP Client selection is keyed by interface name, not by a shared list index, because dashboard interfaces and configured DHCP clients are different collections.
+Scrollable screens own their viewport state explicitly instead of relying on Paragraph clipping. Lists register the visible `list_area`, `list_row_height`, item count, and model-level scroll offset in `UiLayout`. Interface and router plan reviews both keep explicit scroll/max-scroll state; Apply is accepted only after the operator has reached the end of the plan. Their pending screens share the same countdown and Confirm changes/Roll back now action layout; router pending additionally supports scrolling rollback diagnostics. DHCP Client selection is keyed by interface name, not by a shared list index, because dashboard interfaces and configured DHCP clients are different collections.
 
 ### 3.6. Text Input & Cursor Safety
 
@@ -342,7 +343,9 @@ async fn resize_clears_hit_regions() {
 
 - Ctrl+K opens modal context help, including a first-setup checklist. Ctrl+G remains the operation-message viewer.
 - Below 80x24, an active confirmation deadline is shown with Enter to commit and Esc to roll back. Other editing remains disabled.
-- AP editor consequences stay pinned below the scrolling fields. A `*` marks edited settings; Esc asks before discarding them.
+- AP editor consequences stay pinned below the scrolling fields. A `*` marks edited settings; Esc offers keeping a session draft, discarding it,
+  or continuing editing. Interface and AP drafts retain their original revision
+  and stay memory-only. AP draft credentials still zeroize on drop.
 - Load profile opens a selectable list. Save edited settings before loading another profile or applying a loaded profile.
 - DHCP's Apply DHCP now action changes the running service immediately, without a confirmation timer.
 
@@ -351,3 +354,17 @@ async fn resize_clears_hit_regions() {
 Independent status reads preserve partial results and label unavailable data explicitly. Failed interface reads retain the previous interface list and traffic history, without recording artificial samples. Successful refreshes preserve selection by interface name; the initial selection favors a configured WAN or default-route interface. DHCP is refreshed only in its dedicated screens.
 
 The traffic view uses the original per-interface headers and independently scaled RX/TX graphs. Areas shorter than 14 rows use compact one-line rows. Lists scroll with selection in both layouts. Statistics wrap by grapheme width and use PgUp/PgDn to expose all rows. Aggregate counters are explicitly identified as sums, not Internet usage. VPN interface/policy status does not imply a successful handshake or connectivity probe.
+
+### Rebuilding the documentation walkthrough
+
+The ignored exporter uses `TestBackend` and a local mock API with synthetic data;
+it does not require a daemon or change host networking. Render the exported cells
+with Pillow and a monospace font (fontconfig or `--font`):
+
+```sh
+TRAFFIC_MASQ_DEMO_DIR=/tmp/traffic-masq-frames cargo test -p traffic-masq-tui --lib export_walkthrough -- --ignored
+python3 packaging/render-tui-demo.py /tmp/traffic-masq-frames docs/media/tui-demo.gif
+```
+
+The generator updates the GIF chapter index too. Use `--preview-dir /tmp/tui-preview`
+to inspect individual PNG frames. Keep the frame directory specific to this run.

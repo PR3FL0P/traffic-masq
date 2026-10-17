@@ -593,6 +593,7 @@ async fn router_apply_current_plan(app: &mut TuiApp, client: &ApiClient) {
     let proposal = current_router_proposal(app);
     match client.request(&Request::RouterApply { proposal }).await {
         Ok(Response::RouterTransactionPending { token, .. }) => {
+            app.pending_focus = 0;
             app.router_pending = Some(RouterPendingView {
                 token,
                 applied_at_unix: current_unix_time(),

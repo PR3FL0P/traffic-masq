@@ -474,7 +474,13 @@ pub(super) fn confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> 
 
 pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
     if let Some(dialog) = confirmation(app) {
-        dialog.render(frame, area, &mut app.ui, app.confirmation_focus);
+        dialog.render(
+            frame,
+            area,
+            &mut app.ui,
+            app.confirmation_focus,
+            app.confirmation_scroll,
+        );
         return;
     }
     let Some(w) = &mut app.provisioning else {
@@ -812,6 +818,7 @@ async fn apply(app: &mut TuiApp, client: &ApiClient) {
     }
     match response {
         Ok(Response::RouterProvisioningApplied { token, .. }) => {
+            app.pending_focus = 0;
             app.router_pending = Some(RouterPendingView {
                 token,
                 applied_at_unix: started,

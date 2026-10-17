@@ -2,10 +2,10 @@
 
 ## Interface walkthrough
 
-![traffic-masq TUI walkthrough: interfaces, DHCP, routing, VPN and Wi-Fi](media/tui-demo.gif)
+![traffic-masq TUI walkthrough: editing, confirmations, disconnected adapters and Wi-Fi](media/tui-demo.gif)
 
-This two-minute walkthrough uses demonstration data and covers the main screens,
-configuration workflows and confirmation dialogs. Use the
+This walkthrough renders demonstration data at 80×24 and covers interface editing,
+review, confirmation, missing devices, drafts and Wi-Fi actions. Use the
 [chapter index](media/tui-demo.chapters.txt) to find a feature.
 
 ## Requirements
@@ -359,7 +359,26 @@ use Up/Down to scroll it. Tab/Shift+Tab moves focus forward/backward;
 Ctrl+P/Ctrl+N selects the previous/next main tab. Ctrl+C exits after any in-flight
 action completes. Finish a form or leave it with Esc before changing
 tabs. Long Wi-Fi lists scroll with the selection; deleting a profile requires
-an explicit Y confirmation naming the profile.
+an explicit confirmation naming the profile. Enter activates the selected dialog
+button, Tab/Shift+Tab or arrows moves focus, and Esc cancels. PgUp/PgDn or the
+wheel scrolls long confirmation details while the action buttons stay visible. Buttons also accept
+mouse clicks. In text fields, typing edits the value and Left/Right moves the
+cursor. Review pages use Up/Down, PgUp/PgDn, Home/End and the wheel to scroll.
+
+The interface editor keeps IPv4, router participation and configuration ownership
+in the main view. Open **Advanced** for MAC settings. Help follows the selected
+field, and **Review changes** stays at the bottom. Leaving a changed interface or
+AP editor offers **Keep draft**, **Discard edits**, or **Continue editing**. Drafts
+remain in memory for this TUI session, including entered AP credentials; reopen
+the same interface or AP profile to resume. Closing the TUI loses these drafts.
+Background refresh and API failures preserve the active draft.
+
+Live interface, router, Wi-Fi client and AP edits follow
+**Editing → Review changes → Apply temporarily → Confirm changes**. Review shows
+what will change while the network is still unchanged. After applying, verify
+connectivity, then choose **Confirm changes** or **Roll back now**. Without
+confirmation, the countdown schedules daemon rollback. Rollback failures retain
+recovery details. Ctrl+G opens the full operation result.
 
 ### Routes and Internet sharing
 
@@ -588,10 +607,16 @@ The Wi-Fi screen also offers standalone **Saved client profiles** and
 **Saved AP profiles** libraries, even with no interfaces. Create, edit, and delete
 profiles there; select a compatible interface to connect or apply a profile.
 
-Tab switches between wireless interfaces and their actions; Esc returns to the
-same interface. Lists and connection forms scroll to keep the selection visible.
-In the connection form, arrows move focus and Enter/Space selects an IP option.
-Use **Connect** or Ctrl+O to submit. This provisions the profile, credentials and
+Open a radio to see its connection, SSID, observed IPv4 and saved IPv4 policy.
+Client actions put **Scan networks**, **Connect saved profile**, and **Disconnect**
+first. Selecting a saved profile opens its IPv4 form directly. AP actions put
+**Configure access point** and **Connected devices** first.
+
+Tab/Shift+Tab moves through radio actions; Esc returns to the same radio. Lists
+and connection forms keep the selection visible. In the connection form, arrows
+move focus and Enter/Space selects an IP option. The selected policy is shown
+above the choices. Use **Review changes** or Ctrl+O to open the review, then
+**Apply temporarily** to submit. This provisions the profile, credentials and
 IPv4 policy together as a tentative change. Verify connectivity, then commit
 before the deadline. On failure, inspect the reported pending/recovery state
 before retrying. **Keep current static IP** uses the configured address, never a
@@ -854,9 +879,9 @@ offered in the role selector.
 
 In the interface editor, **Configure with traffic-masq** controls configuration
 ownership independently of the router role. Address editing is unavailable
-when it is off. **Plan / Apply** opens a read-only preview using the same flow
+when it is off. **Review changes** opens a read-only preview using the same flow
 as the router preview: review the complete plan, then press **Enter** on
-**Apply** to start the rollback timer, or **Esc** to cancel.
+**Apply temporarily** to start the rollback timer, or **Esc** to return to editing.
 The API retains `managed` and `allow_management_change` for compatibility.
 
 Test configuration changes on a separate Linux host before production use.
@@ -933,10 +958,20 @@ stopped.
 ## Editing disconnected adapters
 
 Use the Interfaces and Wi-Fi inventory to find saved adapters even when they
-are unplugged. In the missing interface editor, **Save** stores intent without
-a timer. Select **Forget saved configuration** to forget it (including its base
-TOML definition), or **Reset to base configuration** to restore base TOML.
-Use Tab or the arrow keys and Enter, or click a button; confirm with Enter. Refresh observation and read the current revision before
+are unplugged. Edit the saved fields and choose **Save for device return** to
+store them immediately. They apply automatically when the device returns, with
+no confirmation timer or automatic rollback.
+
+**Delete saved settings** removes the override and suppresses the definition
+loaded from the base TOML file; the file itself is not edited. That definition
+will not configure the device on reconnection. **Restore settings from file**
+removes the override and suppression so the base definition applies on return.
+The confirmation names the actual file selected by the daemon and lists retained
+references. Both actions keep Wi-Fi/VPN profile libraries and stored passwords.
+Restore explains its unavailability if the daemon has no file, no matching
+definition, or cannot report the source.
+Use Tab or the arrow keys and Enter, or click a button; confirm with Enter.
+Refresh observation and read the current revision before
 editing through the API.
 Assign a managed input/output role through
 `PUT /api/v1/interfaces/{interface}/intent`, then use `wifi-intent` for AP/STA

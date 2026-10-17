@@ -9,6 +9,8 @@ pub(crate) struct WifiApProfilesView {
     pub(crate) selected: usize,
     pub(crate) selected_profile: usize,
     pub(crate) delete_confirmation: Option<String>,
+    pub(crate) apply_review: bool,
+    pub(crate) review_cancel: bool,
 }
 
 const ACTIONS: [WifiProfileAction; 4] = [
@@ -77,6 +79,8 @@ pub(super) async fn open_ap_profiles(
                     0
                 },
                 delete_confirmation: None,
+                apply_review: false,
+                review_cancel: false,
             });
             app.screen = Screen::WifiApProfiles;
         }
@@ -136,21 +140,57 @@ pub(crate) fn render_wifi_ap_profiles(
     let Some(view) = &app.wifi_ap_profiles else {
         return;
     };
-    if let Some(id) = &view.delete_confirmation {
-        let ssid = view
-            .profiles
-            .iter()
-            .find(|p| &p.id == id)
-            .map_or("", |p| p.settings.ssid.as_str());
-        render_delete_confirmation(
-            frame,
-            area,
-            &mut app.ui,
-            id,
-            ssid,
-            "The running access point and saved interface settings are kept.",
-            app.confirmation_focus,
-        );
+    if view.apply_review {
+        if let Some(profile) = view.profiles.get(view.selected_profile) {
+            super::super::layout::render_change_review(
+                frame,
+                area,
+                &mut app.ui,
+                "AP profile · Review changes",
+                vec![
+                    format!("Device: {}", view.interface),
+                    format!("Apply saved profile: {}", profile.id),
+                    format!("SSID: {}", profile.settings.ssid),
+                    format!(
+                        "Security: {}",
+                        describe_ap_security(profile.settings.security)
+                    ),
+                    format!(
+                        "IPv4: {}",
+                        profile
+                            .subnet
+                            .map(|ip| ip.to_string())
+                            .unwrap_or("preserve existing".into())
+                    ),
+                    format!(
+                        "DHCP: {}",
+                        if profile.configure_dhcp {
+                            "configure from subnet"
+                        } else if profile.disable_dhcp {
+                            "disable"
+                        } else {
+                            "preserve existing"
+                        }
+                    ),
+                    "Replaces the current AP settings and uses the profile's saved credentials."
+                        .into(),
+                ],
+                false,
+                view.review_cancel,
+            );
+        }
+        return;
+    }
+    if view.delete_confirmation.is_some() {
+        if let Some(dialog) = super::delete_confirmation::ap_dialog(view) {
+            dialog.render(
+                frame,
+                area,
+                &mut app.ui,
+                app.confirmation_focus,
+                app.confirmation_scroll,
+            );
+        }
         return;
     }
     let target = view.profiles.get(view.selected_profile);
@@ -251,6 +291,29 @@ pub(crate) async fn handle_wifi_ap_profiles_key(
         app.screen = Screen::Wifi;
         return;
     };
+    if view.apply_review {
+        match key {
+            KeyCode::Esc => {
+                view.apply_review = false;
+                return;
+            }
+            KeyCode::Enter if view.review_cancel => {
+                view.apply_review = false;
+                return;
+            }
+            KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Left
+            | KeyCode::Right => {
+                view.review_cancel = !view.review_cancel;
+                return;
+            }
+            KeyCode::Enter => {}
+            _ => return,
+        }
+    }
     if view.delete_confirmation.is_some() {
         if key == KeyCode::Esc {
             view.delete_confirmation = None;
@@ -341,6 +404,11 @@ pub(crate) async fn handle_wifi_ap_profiles_key(
                             );
                             return;
                         }
+                        if !view.apply_review {
+                            view.apply_review = true;
+                            view.review_cancel = false;
+                            return;
+                        }
                         match client
                             .request(&Request::ActivateWifiApProfile {
                                 interface,
@@ -349,6 +417,7 @@ pub(crate) async fn handle_wifi_ap_profiles_key(
                             .await
                         {
                             Ok(Response::NetworkChangePending { change }) => {
+                                app.pending_focus = 0;
                                 app.pending = Some(change);
                                 app.pending_return_screen = Screen::WifiApProfiles;
                                 app.screen = Screen::PendingChange;

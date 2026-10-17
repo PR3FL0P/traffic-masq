@@ -137,14 +137,20 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
     } else {
         vec![
             Line::styled(
-                "[Confirm changes] (Enter)",
+                format!(
+                    "{}[Confirm changes] (Enter)",
+                    if app.pending_focus == 0 { "▶ " } else { "  " }
+                ),
                 Style::default()
                     .fg(theme::SELECTED_FG)
                     .bg(theme::GOOD)
                     .add_modifier(Modifier::BOLD),
             ),
             Line::styled(
-                "[Roll back now] (Esc)",
+                format!(
+                    "{}[Roll back now] (Esc)",
+                    if app.pending_focus == 1 { "▶ " } else { "  " }
+                ),
                 Style::default()
                     .fg(theme::SELECTED_FG)
                     .bg(theme::WARN)
@@ -180,7 +186,7 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
             Rect::new(
                 chunks[2].x,
                 chunks[2].y,
-                "[Confirm changes]".len() as u16,
+                ("[Confirm changes]".len() + 2) as u16,
                 1,
             ),
             0,
@@ -189,7 +195,7 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
             Rect::new(
                 chunks[2].x,
                 chunks[2].y.saturating_add(1),
-                "[Roll back now]".len() as u16,
+                ("[Roll back now]".len() + 2) as u16,
                 1,
             ),
             1,
@@ -208,6 +214,13 @@ pub(super) fn router_pending_seconds_remaining(
 }
 
 pub(crate) async fn handle_router_pending_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
+    if matches!(
+        key,
+        KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right
+    ) {
+        app.pending_focus = 1 - app.pending_focus.min(1);
+        return;
+    }
     match key {
         KeyCode::Up | KeyCode::Char('k') => {
             if let Some(view) = app.router_pending.as_mut() {
@@ -244,7 +257,12 @@ pub(crate) async fn handle_router_pending_key(app: &mut TuiApp, key: KeyCode, cl
                 .router_pending
                 .as_ref()
                 .is_some_and(|view| view.recovery_required());
-            finish_router_pending(app, client, !recovery_required).await;
+            if recovery_required && app.pending_focus == 1 {
+                app.screen = Screen::Router;
+            } else {
+                finish_router_pending(app, client, !recovery_required && app.pending_focus == 0)
+                    .await;
+            }
         }
         KeyCode::Esc => {
             let recovery_required = app

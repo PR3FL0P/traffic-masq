@@ -75,6 +75,7 @@ pub(crate) fn focused_lines_offset(lines: &[Line<'_>], height: u16) -> usize {
 #[derive(Debug, Default, Clone)]
 pub(crate) struct UiLayout {
     pub(crate) input_enabled: bool,
+    pub(crate) dialog_max_scroll: u16,
     pub(crate) content_area: Option<Rect>,
     pub(crate) tabs: Vec<(Rect, Section)>,
     pub(crate) list_area: Option<Rect>,
@@ -285,7 +286,12 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Tu
 
 pub(crate) fn help_pairs(app: &TuiApp) -> Vec<(&'static str, &'static str)> {
     if let Some(dialog) = super::confirmation::current(app) {
-        return vec![("Enter", dialog.action), ("Esc", "cancel")];
+        let action = match app.confirmation_focus {
+            0 => dialog.action,
+            2 => dialog.secondary.unwrap_or("cancel"),
+            _ => "cancel",
+        };
+        return vec![("Enter", action), ("Esc", "cancel"), ("PgUp/Dn", "details")];
     }
     if app.screen == Screen::PendingChange {
         if let Some(change) = &app.pending {
@@ -479,12 +485,12 @@ pub(crate) fn screen_help_pairs(screen: Screen) -> Vec<(&'static str, &'static s
             ("Enter", "select/save"),
             ("Esc", "cancel"),
         ],
-        Screen::PendingChange => vec![("Enter", "commit"), ("Esc", "rollback")],
+        Screen::PendingChange => vec![("Enter", "activate"), ("Esc", "roll back")],
         Screen::RouterPending => vec![
             ("↑/↓", "details"),
             ("PgUp/Dn", "page"),
-            ("Enter", "commit"),
-            ("Esc", "rollback"),
+            ("Enter", "activate"),
+            ("Esc", "roll back"),
         ],
         Screen::DaemonLogs => vec![
             ("/", "search"),
