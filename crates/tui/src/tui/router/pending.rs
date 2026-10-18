@@ -102,11 +102,16 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
             gauge_color
         }))
         .ratio(if recovery_required { 0.0 } else { ratio })
-        .label(if recovery_required {
-            "recovery required".to_owned()
-        } else {
-            format!("{remaining}s")
-        });
+        .label(Span::styled(
+            if recovery_required {
+                "recovery required".to_owned()
+            } else {
+                format!("{remaining}s")
+            },
+            Style::default()
+                .fg(theme::MUTED)
+                .add_modifier(Modifier::BOLD),
+        ));
     frame.render_widget(gauge, chunks[0]);
 
     let detail_lines = super::super::layout::wrap_lines(detail_lines, chunks[1].width);

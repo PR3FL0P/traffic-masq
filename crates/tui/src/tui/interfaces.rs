@@ -970,7 +970,12 @@ pub(crate) fn render_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
             .block(panel("Rollback countdown"))
             .gauge_style(Style::default().fg(gauge_color))
             .ratio(ratio)
-            .label(format!("{seconds}s")),
+            .label(Span::styled(
+                format!("{seconds}s"),
+                Style::default()
+                    .fg(theme::MUTED)
+                    .add_modifier(Modifier::BOLD),
+            )),
         chunks[0],
     );
     frame.render_widget(
