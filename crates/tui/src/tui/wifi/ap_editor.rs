@@ -20,68 +20,72 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
     };
     if editor.reviewing {
         let settings = ap_settings(editor);
+        let mut lines = vec![
+            format!("Device: {}", editor.interface),
+            format!(
+                "SSID: {} → {}",
+                editor
+                    .original_spec
+                    .as_ref()
+                    .map(|spec| spec.ssid.as_str())
+                    .unwrap_or("none"),
+                editor.ssid
+            ),
+            format!(
+                "Security: {} → {}",
+                editor
+                    .original_spec
+                    .as_ref()
+                    .map(|spec| describe_ap_security(spec.security))
+                    .unwrap_or("none"),
+                describe_ap_security(editor.security)
+            ),
+        ];
+        lines.extend(radio_review_lines(editor.original_spec.as_ref(), &settings));
+        lines.extend([
+            format!(
+                "IPv4 subnet: {}",
+                if editor.subnet.is_empty() {
+                    "preserve existing"
+                } else {
+                    &editor.subnet
+                }
+            ),
+            format!(
+                "DHCP: {}",
+                if editor.configure_dhcp {
+                    "configure from subnet"
+                } else if editor.disable_dhcp {
+                    "disable"
+                } else {
+                    "preserve existing"
+                }
+            ),
+            format!(
+                "Passphrase: {}",
+                if editor.security == WifiSecurity::Open {
+                    "remove passphrase (open network)"
+                } else if editor.passphrase.is_empty() && editor.existing {
+                    "preserve existing"
+                } else if editor.passphrase.is_empty() {
+                    "not set (required)"
+                } else {
+                    "set entered passphrase"
+                }
+            ),
+        ]);
         layout::render_change_review(
             frame,
             area,
             &mut app.ui,
             "Access point · Review changes",
-            vec![
-                format!("Device: {}", editor.interface),
-                format!(
-                    "SSID: {} → {}",
-                    editor
-                        .original_spec
-                        .as_ref()
-                        .map(|spec| spec.ssid.as_str())
-                        .unwrap_or("none"),
-                    editor.ssid
-                ),
-                format!(
-                    "Security: {} → {}",
-                    editor
-                        .original_spec
-                        .as_ref()
-                        .map(|spec| describe_ap_security(spec.security))
-                        .unwrap_or("none"),
-                    describe_ap_security(editor.security)
-                ),
-                format!(
-                    "Radio: {} / channel {} / {:?}",
-                    settings.band, settings.channel, settings.channel_width
-                ),
-                format!(
-                    "IPv4 subnet: {}",
-                    if editor.subnet.is_empty() {
-                        "preserve existing"
-                    } else {
-                        &editor.subnet
-                    }
-                ),
-                format!(
-                    "DHCP: {}",
-                    if editor.configure_dhcp {
-                        "configure from subnet"
-                    } else if editor.disable_dhcp {
-                        "disable"
-                    } else {
-                        "preserve existing"
-                    }
-                ),
-                format!(
-                    "Passphrase: {}",
-                    if editor.security == WifiSecurity::Open {
-                        "remove passphrase (open network)"
-                    } else if editor.passphrase.is_empty() && editor.existing {
-                        "preserve existing"
-                    } else if editor.passphrase.is_empty() {
-                        "not set (required)"
-                    } else {
-                        "set entered passphrase"
-                    }
-                ),
-            ],
-            editor.offline_intent.is_some(),
-            editor.field != WifiField::Apply,
+            lines,
+            layout::ChangeReviewState {
+                offline: editor.offline_intent.is_some(),
+                cancel_selected: editor.field != WifiField::Apply,
+                scroll: &mut app.preview_scroll,
+                max_scroll: &mut app.preview_max_scroll,
+            },
         );
         return;
     }
@@ -304,6 +308,9 @@ pub(crate) async fn handle_wifi_editor_key(app: &mut TuiApp, key: KeyCode, clien
         return;
     }
     if editor.reviewing {
+        if layout::scroll_change_review(key, &mut app.preview_scroll, app.preview_max_scroll) {
+            return;
+        }
         match key {
             KeyCode::Esc => {
                 editor.reviewing = false;
@@ -424,6 +431,7 @@ pub(crate) async fn handle_wifi_editor_key(app: &mut TuiApp, key: KeyCode, clien
         }
         KeyCode::Enter if editor.field == WifiField::Apply && !editor.profile_mode => {
             editor.reviewing = true;
+            app.preview_scroll = 0;
         }
         KeyCode::Enter => {
             editor.field = move_field(&editor.fields(), editor.field, true);
@@ -718,4 +726,44 @@ pub(super) fn draft_key(editor: &WifiEditor) -> String {
     } else {
         editor.interface.clone()
     }
+}
+
+/// Include all AP radio policies in both editor and saved-profile reviews.
+pub(super) fn radio_review_lines(
+    before: Option<&WifiApSpecView>,
+    settings: &WifiEditRequest,
+) -> Vec<String> {
+    let previous = |value: Option<String>| value.unwrap_or_else(|| "not reported".into());
+    vec![
+        format!(
+            "Country: {} → {}",
+            previous(before.map(|spec| spec.country_code.as_deref().unwrap_or("unset").to_owned())),
+            settings.country_code.as_deref().unwrap_or("unset")
+        ),
+        format!(
+            "Radio: {} → {} / channel {} / {:?}",
+            previous(before.map(|spec| format!(
+                "{} / channel {} / {:?}",
+                spec.band, spec.channel, spec.channel_width
+            ))),
+            settings.band,
+            settings.channel,
+            settings.channel_width
+        ),
+        format!(
+            "Hidden SSID: {} → {}",
+            previous(before.map(|spec| spec.hidden.to_string())),
+            settings.hidden
+        ),
+        format!(
+            "Client isolation: {} → {}",
+            previous(before.map(|spec| spec.client_isolation.to_string())),
+            settings.client_isolation
+        ),
+        format!(
+            "Max clients: {} → {}",
+            previous(before.map(|spec| spec.max_stations.to_string())),
+            settings.max_stations
+        ),
+    ]
 }

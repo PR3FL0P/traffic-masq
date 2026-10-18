@@ -1522,3 +1522,94 @@ async fn editing_dhcp_default_route_opens_client_metric_settings() {
     assert!(!app.router.staged);
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn recovery_cannot_keep_an_invisible_back_selection() {
+    let mock = crate::tui::test_api::mock(vec![
+        Response::RouterError {
+            detail: RouterErrorDetail::RollbackFailed {
+                failures: vec!["failed".into()],
+            },
+        },
+        Response::RouterPendingTransaction {
+            token: Some("recover".into()),
+            status: CoordinatorStatus::RecoveryRequired,
+            rollback_failure: Some(vec!["failed".into()]),
+            recovery: None,
+        },
+        Response::Error {
+            message: "retry rejected".into(),
+        },
+    ])
+    .await;
+    let mut app = TuiApp {
+        screen: Screen::RouterPending,
+        pending_focus: 1,
+        router_pending: Some(RouterPendingView {
+            token: "recover".into(),
+            applied_at_unix: current_unix_time(),
+            rollback_failure: None,
+            recovery: None,
+            scroll: 0,
+            max_scroll: 0,
+        }),
+        ..Default::default()
+    };
+    // The operator chose Roll back; failure must clear that old selection
+    // before another input event, even if no frame has been drawn yet.
+    handle_router_pending_key(&mut app, KeyCode::Enter, &mock.client).await;
+    assert!(app.router_pending.as_ref().unwrap().recovery_required());
+    assert_eq!(app.pending_focus, 0);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| crate::tui::render(frame, &mut app, false))
+        .unwrap();
+    assert_eq!(app.pending_focus, 0);
+    for key in [KeyCode::Tab, KeyCode::BackTab, KeyCode::Right] {
+        crate::tui::handle_key(&mut app, key, &mock.client, false).await;
+        assert_eq!(app.pending_focus, 0);
+    }
+    crate::tui::handle_key(&mut app, KeyCode::Enter, &mock.client, false).await;
+    assert_eq!(app.screen, Screen::RouterPending);
+    assert_eq!(
+        mock.calls.lock().unwrap()[2].body["type"],
+        "router_rollback"
+    );
+}
+
+#[tokio::test]
+async fn indeterminate_commit_never_sends_rollback_even_with_stale_focus() {
+    let client = ApiClient::new("/must-not-connect.sock");
+    let mut app = TuiApp {
+        screen: Screen::RouterPending,
+        pending_focus: 1,
+        router_pending: Some(RouterPendingView {
+            token: "unknown".into(),
+            applied_at_unix: current_unix_time(),
+            rollback_failure: None,
+            recovery: Some(RouterRecoveryNotice {
+                recovery_progress: None,
+                recovery_code: "unknown".into(),
+                invariant: "commit_indeterminate".into(),
+                summary: "unknown commit".into(),
+                blocked_operation: "rollback".into(),
+                operator_action: "restart".into(),
+                operator_guidance: "repair storage".into(),
+                runbook: String::new(),
+                failures: vec![],
+            }),
+            scroll: 0,
+            max_scroll: 0,
+        }),
+        ..Default::default()
+    };
+    app.ui.input_enabled = true;
+    crate::tui::handle_key(&mut app, KeyCode::Tab, &client, false).await;
+    crate::tui::handle_key(&mut app, KeyCode::Enter, &client, false).await;
+    assert_eq!(app.screen, Screen::RouterPending);
+    assert!(app
+        .message
+        .as_deref()
+        .unwrap()
+        .contains("rollback is blocked"));
+}

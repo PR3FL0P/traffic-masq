@@ -357,14 +357,25 @@ The traffic view uses the original per-interface headers and independently scale
 
 ### Rebuilding the documentation walkthrough
 
-The ignored exporter uses `TestBackend` and a local mock API with synthetic data;
-it does not require a daemon or change host networking. Render the exported cells
-with Pillow and a monospace font (fontconfig or `--font`):
+The ignored recorder runs a single live TUI session against a stateful local mock
+API. It sends only keyboard events through the production input handlers,
+polls status in the background, and captures the rendered terminal every 50 ms.
+It records typing, focus, scrolling and real countdown updates;
+it never replaces screens or editor values to stage individual screenshots.
+The mock API keeps all network changes inside the recording process.
+
+The session uses 120×30 cells. Recording takes about two minutes in real time.
+The Pillow renderer keeps the recorded frame durations and draws a normal
+16-pixel monospace font, with keyboard input hints and no mouse pointer:
 
 ```sh
-TRAFFIC_MASQ_DEMO_DIR=/tmp/traffic-masq-frames cargo test -p traffic-masq-tui --lib export_walkthrough -- --ignored
-python3 packaging/render-tui-demo.py /tmp/traffic-masq-frames docs/media/tui-demo.gif
+TRAFFIC_MASQ_DEMO_DIR=/tmp/traffic-masq-recording cargo test -p traffic-masq-tui --lib export_walkthrough -- --ignored --nocapture
+python3 packaging/render-tui-demo.py /tmp/traffic-masq-recording docs/media/tui-demo.gif
 ```
 
-The generator updates the GIF chapter index too. Use `--preview-dir /tmp/tui-preview`
-to inspect individual PNG frames. Keep the frame directory specific to this run.
+`timeline.json` contains the frame durations and chapter timestamps; identical
+consecutive frames share a duration. The generator updates the GIF chapter index.
+Use `--preview-dir /tmp/tui-preview` to inspect PNG frames, or `--video /tmp/tui.mp4`
+to also encode a continuous 20-fps MP4 with ffmpeg. A directory of standalone
+screenshots is not accepted as a recording. Keep the recording directory specific
+to this run.

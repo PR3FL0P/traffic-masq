@@ -4,8 +4,9 @@
 
 ![traffic-masq TUI walkthrough: editing, confirmations, disconnected adapters and Wi-Fi](media/tui-demo.gif)
 
-This walkthrough renders demonstration data at 80×24 and covers interface editing,
-review, confirmation, missing devices, drafts and Wi-Fi actions. Use the
+This continuous recording uses a 120×30 terminal and demonstration data. It shows
+keyboard navigation, character-by-character editing, plan scrolling, a running
+rollback countdown, confirmation, Wi-Fi scanning and preserving an AP draft. Use the
 [chapter index](media/tui-demo.chapters.txt) to find a feature.
 
 ## Requirements

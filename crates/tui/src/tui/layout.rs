@@ -514,6 +514,13 @@ pub(crate) fn screen_help_pairs(screen: Screen) -> Vec<(&'static str, &'static s
 #[cfg(test)]
 mod tests;
 
+pub(crate) struct ChangeReviewState<'a> {
+    pub(crate) offline: bool,
+    pub(crate) cancel_selected: bool,
+    pub(crate) scroll: &'a mut usize,
+    pub(crate) max_scroll: &'a mut usize,
+}
+
 /// Shared review presentation. Enter applies only after opening this separate step.
 pub(crate) fn render_change_review(
     frame: &mut ratatui::Frame<'_>,
@@ -521,21 +528,28 @@ pub(crate) fn render_change_review(
     ui: &mut UiLayout,
     title: &str,
     mut lines: Vec<String>,
-    offline: bool,
-    cancel_selected: bool,
+    state: ChangeReviewState<'_>,
 ) {
+    let ChangeReviewState {
+        offline,
+        cancel_selected,
+        scroll,
+        max_scroll,
+    } = state;
     lines.push(if offline {
         "Saved immediately; applies on device return. No automatic rollback."
     } else {
         "Network unchanged. Apply temporarily, then confirm connectivity. Without confirmation, rollback is scheduled."
     }.into());
-    let block = panel(title);
+    let block = panel(&format!("{title} · PgUp/PgDn: details"));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let chunks = Layout::vertical([Constraint::Min(0), Constraint::Length(2)]).split(inner);
+    let lines = wrap_lines(lines.into_iter().map(Line::from).collect(), chunks[0].width);
+    *max_scroll = lines.len().saturating_sub(chunks[0].height as usize);
+    *scroll = (*scroll).min(*max_scroll);
     frame.render_widget(
-        Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
-            .wrap(ratatui::widgets::Wrap { trim: false }),
+        Paragraph::new(lines).scroll(((*scroll).min(u16::MAX as usize) as u16, 0)),
         chunks[0],
     );
     for (index, label) in [
@@ -575,4 +589,20 @@ pub(crate) fn wrap_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'sta
                 .map(move |text| Line::styled(text, style))
         })
         .collect()
+}
+
+pub(crate) fn scroll_change_review(
+    key: crossterm::event::KeyCode,
+    scroll: &mut usize,
+    max_scroll: usize,
+) -> bool {
+    use crossterm::event::KeyCode;
+    *scroll = match key {
+        KeyCode::PageUp => scroll.saturating_sub(5),
+        KeyCode::PageDown => scroll.saturating_add(5).min(max_scroll),
+        KeyCode::Home => 0,
+        KeyCode::End => max_scroll,
+        _ => return false,
+    };
+    true
 }

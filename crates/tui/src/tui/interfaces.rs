@@ -1068,16 +1068,131 @@ pub(crate) async fn handle_interface_list_key(
     }
 }
 
+/// Refresh draft execution mode and revision together. Failed observation must not
+/// consume a saved draft or authorize a missing-device write.
+pub(crate) async fn refresh_draft_interface(
+    app: &mut TuiApp,
+    client: &ApiClient,
+    interface: &str,
+) -> Option<(traffic_masq_protocol::InterfaceInventoryEntry, u64)> {
+    match client.request(&Request::ListInterfaceInventory).await {
+        Ok(Response::InterfaceInventory {
+            interfaces,
+            revision,
+            observation_error: None,
+            ..
+        }) => {
+            if let Some(entry) = interfaces.into_iter().find(|entry| entry.name == interface) {
+                if !entry.observation_stale
+                    && entry.presence != traffic_masq_protocol::InterfacePresence::Unknown
+                {
+                    return Some((entry, revision));
+                }
+            }
+            app.push_message(LogLevel::Warn, "Could not observe the draft's device; refresh and reopen it. The draft is retained.");
+        }
+        result => app.push_message(
+            LogLevel::Warn,
+            format!("Could not refresh device settings; draft retained: {result:?}"),
+        ),
+    }
+    None
+}
+
 pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
     let Some(name) = selected_interface_name(app) else {
         return;
     };
-    if let Some(editor) = app.interface_drafts.remove(&name) {
-        app.editor = Some(editor);
+    if app.interface_drafts.contains_key(&name) {
+        let Some((entry, revision)) = refresh_draft_interface(app, client, &name).await else {
+            return;
+        };
+        let mut draft = app.interface_drafts.remove(&name).unwrap();
+        let (cidr, managed) =
+            editor_address_defaults(entry.configured.as_ref(), entry.observed.as_ref());
+        // Preserve edits, but use current settings for unchanged fields and the review baseline.
+        if draft.cidr == draft.original_cidr {
+            draft.cidr = cidr.clone();
+        }
+        if draft.managed
+            == draft
+                .saved_config
+                .as_ref()
+                .is_none_or(|config| config.managed)
+        {
+            draft.managed = managed;
+        }
+        let role = entry
+            .configured
+            .as_ref()
+            .map_or(InterfaceRole::None, |config| config.role);
+        if draft.role == draft.original_role {
+            draft.role = role;
+        }
+        let mac = entry
+            .configured
+            .as_ref()
+            .and_then(|config| config.mac_address)
+            .map(|mac| mac.to_string())
+            .unwrap_or_default();
+        if draft.mac_address == draft.original_mac {
+            draft.mac_address = mac.clone();
+        }
+        draft.original_cidr = cidr;
+        draft.original_role = role;
+        draft.original_mac = mac;
+        draft.original_managed = entry
+            .configured
+            .as_ref()
+            .is_some_and(|config| config.managed);
+        draft.has_default_route = entry
+            .observed
+            .as_ref()
+            .is_some_and(|status| status.has_default_route);
+        draft.current_addresses = entry
+            .observed
+            .as_ref()
+            .into_iter()
+            .flat_map(|status| &status.ipv4_addresses)
+            .map(|address| format!("{}/{}", address.address, address.prefix_len))
+            .collect();
+        draft.observed_addresses = entry
+            .observed
+            .as_ref()
+            .map(format_addresses)
+            .unwrap_or_else(|| vec![Span::raw("unavailable")]);
+        draft.current_wifi_summary = entry
+            .configured
+            .as_ref()
+            .and_then(|config| config.wifi.as_ref())
+            .map(|wifi| format!("access point '{}'", wifi.ssid));
+        draft.current_dhcp_summary = entry
+            .configured
+            .as_ref()
+            .and_then(|config| config.dhcp.as_ref())
+            .map(|dhcp| format!("DHCP pool {}-{}", dhcp.pool_start, dhcp.pool_end));
+        draft.saved_config = entry.configured;
+        draft.offline_revision = (entry.presence
+            == traffic_masq_protocol::InterfacePresence::Missing)
+            .then_some(revision);
+        draft.allow_management_change = false;
+        if draft.offline_revision.is_none()
+            && matches!(
+                draft.field,
+                InterfaceEditorField::Forget | InterfaceEditorField::Reset
+            )
+        {
+            draft.field = InterfaceEditorField::Save;
+        }
+        draft.intent_confirmation = None;
+        draft.exit_requested = false;
+        draft.reset_cursor();
+        app.editor = Some(draft);
+        app.preview = None;
         app.screen = Screen::InterfaceEditor;
         app.push_message(
             LogLevel::Info,
-            "Resumed interface draft; review before applying",
+            "Resumed draft with current device settings; review before saving or applying",
         );
         return;
     }

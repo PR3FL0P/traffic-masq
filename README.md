@@ -10,7 +10,7 @@ terminal client over HTTPS.
 
 ![traffic-masq TUI walkthrough: editing, confirmations, disconnected adapters and Wi-Fi](docs/media/tui-demo.gif)
 
-A walkthrough of editing, review, rollback and Wi-Fi actions using demonstration data. See the
+A continuous recording of keyboard-only interaction with the TUI, using demonstration data. See the
 [chapter index](docs/media/tui-demo.chapters.txt).
 
 ```text

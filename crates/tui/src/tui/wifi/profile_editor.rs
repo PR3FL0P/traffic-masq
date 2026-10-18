@@ -6,6 +6,16 @@ pub(crate) fn render_wifi_profile_editor(
     area: Rect,
     app: &mut TuiApp,
 ) {
+    if let Some(dialog) = exit_confirmation(app) {
+        dialog.render(
+            frame,
+            area,
+            &mut app.ui,
+            app.confirmation_focus,
+            app.confirmation_scroll,
+        );
+        return;
+    }
     let Some(editor) = &app.wifi_profile_editor else {
         return;
     };
@@ -104,15 +114,17 @@ pub(crate) async fn handle_wifi_profile_editor_key(
         app.screen = Screen::WifiProfiles;
         return;
     };
-    match key {
-        KeyCode::Esc => {
-            app.wifi_profile_editor = None;
-            app.screen = if app.wifi_profiles.is_some() {
-                Screen::WifiProfiles
-            } else {
-                Screen::WifiScan
-            };
+    if editor.exit_requested {
+        match key {
+            KeyCode::Esc => editor.exit_requested = false,
+            KeyCode::Enter => close_editor(app),
+            _ => {}
         }
+        return;
+    }
+    match key {
+        KeyCode::Esc if editor.dirty => editor.exit_requested = true,
+        KeyCode::Esc => close_editor(app),
         KeyCode::Up => {
             editor.field = move_field(&PROFILE_FIELDS, editor.field, false);
             if editor.original_id.is_some() && editor.field == ProfileField::Id {
@@ -128,12 +140,15 @@ pub(crate) async fn handle_wifi_profile_editor_key(
             editor.reset_cursor();
         }
         KeyCode::Enter | KeyCode::Char(' ') if editor.field == ProfileField::Autoconnect => {
+            editor.dirty = true;
             editor.autoconnect = !editor.autoconnect;
         }
         KeyCode::Enter if editor.field == ProfileField::Security => {
+            editor.dirty = true;
             editor.security = cycle_client_security(editor.security)
         }
         KeyCode::Char(' ') if editor.field == ProfileField::Security => {
+            editor.dirty = true;
             editor.security = cycle_client_security(editor.security)
         }
         KeyCode::Enter if editor.field == ProfileField::Save => save_profile(app, client).await,
@@ -146,7 +161,15 @@ pub(crate) async fn handle_wifi_profile_editor_key(
         }
         other => {
             if let Some(mut text_editor) = editor.active_editor() {
-                text_editor.handle_key(other);
+                let changed = text_editor.handle_key(other);
+                if changed
+                    && matches!(
+                        other,
+                        KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete
+                    )
+                {
+                    editor.dirty = true;
+                }
             }
         }
     }
@@ -192,4 +215,24 @@ async fn save_profile(app: &mut TuiApp, client: &ApiClient) {
         Ok(response) => report_unexpected(app, response),
         Err(error) => app.push_message(LogLevel::Error, error.to_string()),
     }
+}
+
+pub(in crate::tui) fn exit_confirmation(app: &TuiApp) -> Option<crate::tui::confirmation::Dialog> {
+    let editor = app.wifi_profile_editor.as_ref()?;
+    editor.exit_requested.then(|| {
+        crate::tui::confirmation::discard_edits_dialog(
+            "Leave Wi-Fi profile editor?",
+            format!("Profile: {}", editor.id),
+        )
+    })
+}
+fn close_editor(app: &mut TuiApp) {
+    app.wifi_profile_editor = None;
+    app.screen = if app.wifi_profiles.is_some() {
+        Screen::WifiProfiles
+    } else if app.wifi_scan.is_some() {
+        Screen::WifiScan
+    } else {
+        Screen::Wifi
+    };
 }

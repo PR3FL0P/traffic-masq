@@ -2,6 +2,8 @@ use super::*;
 
 pub(super) fn open_create_profile(app: &mut TuiApp, interface: String) {
     app.wifi_profile_editor = Some(WifiProfileEditor {
+        dirty: false,
+        exit_requested: false,
         interface,
         original_id: None,
         field: ProfileField::Id,

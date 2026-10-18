@@ -1,6 +1,13 @@
 use super::*;
 
 pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
+    if app
+        .router_pending
+        .as_ref()
+        .is_some_and(|view| view.recovery_required())
+    {
+        app.pending_focus = 0;
+    }
     let Some(view) = app.router_pending.as_mut() else {
         return;
     };
@@ -218,7 +225,15 @@ pub(crate) async fn handle_router_pending_key(app: &mut TuiApp, key: KeyCode, cl
         key,
         KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right
     ) {
-        app.pending_focus = 1 - app.pending_focus.min(1);
+        if !app
+            .router_pending
+            .as_ref()
+            .is_some_and(|view| view.recovery_required())
+        {
+            app.pending_focus = 1 - app.pending_focus.min(1);
+        } else {
+            app.pending_focus = 0;
+        }
         return;
     }
     match key {
@@ -257,12 +272,7 @@ pub(crate) async fn handle_router_pending_key(app: &mut TuiApp, key: KeyCode, cl
                 .router_pending
                 .as_ref()
                 .is_some_and(|view| view.recovery_required());
-            if recovery_required && app.pending_focus == 1 {
-                app.screen = Screen::Router;
-            } else {
-                finish_router_pending(app, client, !recovery_required && app.pending_focus == 0)
-                    .await;
-            }
+            finish_router_pending(app, client, !recovery_required && app.pending_focus == 0).await;
         }
         KeyCode::Esc => {
             let recovery_required = app
@@ -338,6 +348,7 @@ async fn finish_router_pending(app: &mut TuiApp, client: &ApiClient, commit: boo
                 view.rollback_failure = rollback_failure;
                 view.recovery = recovery;
             }
+            app.pending_focus = 0;
         }
         Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
         Ok(response) => {
@@ -381,6 +392,7 @@ pub(crate) async fn refresh_router_pending_screen(app: &mut TuiApp, client: &Api
                 view.rollback_failure = rollback_failure;
                 view.recovery = recovery;
             }
+            app.pending_focus = 0;
         }
         Ok(Response::RouterPendingTransaction {
             status: CoordinatorStatus::Pending,

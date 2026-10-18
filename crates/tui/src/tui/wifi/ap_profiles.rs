@@ -142,41 +142,51 @@ pub(crate) fn render_wifi_ap_profiles(
     };
     if view.apply_review {
         if let Some(profile) = view.profiles.get(view.selected_profile) {
+            let mut lines = vec![
+                format!("Device: {}", view.interface),
+                format!("Apply saved profile: {}", profile.id),
+                format!("SSID: {}", profile.settings.ssid),
+                format!(
+                    "Security: {}",
+                    describe_ap_security(profile.settings.security)
+                ),
+            ];
+            lines.extend(super::ap_editor::radio_review_lines(
+                None,
+                &profile.settings,
+            ));
+            lines.extend([
+                format!(
+                    "IPv4: {}",
+                    profile
+                        .subnet
+                        .map(|ip| ip.to_string())
+                        .unwrap_or("preserve existing".into())
+                ),
+                format!(
+                    "DHCP: {}",
+                    if profile.configure_dhcp {
+                        "configure from subnet"
+                    } else if profile.disable_dhcp {
+                        "disable"
+                    } else {
+                        "preserve existing"
+                    }
+                ),
+                "Replaces the current AP settings and uses the profile's saved credentials.".into(),
+            ]);
             super::super::layout::render_change_review(
                 frame,
                 area,
                 &mut app.ui,
                 "AP profile · Review changes",
-                vec![
-                    format!("Device: {}", view.interface),
-                    format!("Apply saved profile: {}", profile.id),
-                    format!("SSID: {}", profile.settings.ssid),
-                    format!(
-                        "Security: {}",
-                        describe_ap_security(profile.settings.security)
-                    ),
-                    format!(
-                        "IPv4: {}",
-                        profile
-                            .subnet
-                            .map(|ip| ip.to_string())
-                            .unwrap_or("preserve existing".into())
-                    ),
-                    format!(
-                        "DHCP: {}",
-                        if profile.configure_dhcp {
-                            "configure from subnet"
-                        } else if profile.disable_dhcp {
-                            "disable"
-                        } else {
-                            "preserve existing"
-                        }
-                    ),
-                    "Replaces the current AP settings and uses the profile's saved credentials."
-                        .into(),
-                ],
-                false,
-                view.review_cancel,
+                lines,
+                super::super::layout::ChangeReviewState {
+                    offline: false,
+                    cancel_selected: view.review_cancel,
+                    scroll: &mut app.preview_scroll,
+                    max_scroll: &mut app.preview_max_scroll,
+                },
             );
         }
         return;
@@ -292,6 +302,13 @@ pub(crate) async fn handle_wifi_ap_profiles_key(
         return;
     };
     if view.apply_review {
+        if super::super::layout::scroll_change_review(
+            key,
+            &mut app.preview_scroll,
+            app.preview_max_scroll,
+        ) {
+            return;
+        }
         match key {
             KeyCode::Esc => {
                 view.apply_review = false;
@@ -407,6 +424,7 @@ pub(crate) async fn handle_wifi_ap_profiles_key(
                         if !view.apply_review {
                             view.apply_review = true;
                             view.review_cancel = false;
+                            app.preview_scroll = 0;
                             return;
                         }
                         match client
@@ -417,6 +435,8 @@ pub(crate) async fn handle_wifi_ap_profiles_key(
                             .await
                         {
                             Ok(Response::NetworkChangePending { change }) => {
+                                view.apply_review = false;
+                                view.review_cancel = false;
                                 app.pending_focus = 0;
                                 app.pending = Some(change);
                                 app.pending_return_screen = Screen::WifiApProfiles;

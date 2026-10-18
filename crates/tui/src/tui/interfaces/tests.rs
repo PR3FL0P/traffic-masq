@@ -839,7 +839,13 @@ async fn interface_exit_keeps_or_discards_draft_with_keyboard_focus() {
         .interfaces
         .push(observed_address(None, Some(false)));
     app.dashboard.interfaces[0].interface.name = "wlan0".into();
-    open_editor(&mut app, &client).await;
+    let refreshed = crate::tui::test_api::mock(vec![draft_inventory_response(
+        traffic_masq_protocol::InterfacePresence::Present,
+        8,
+        None,
+    )])
+    .await;
+    open_editor(&mut app, &refreshed.client).await;
     assert_eq!(app.screen, Screen::InterfaceEditor);
     assert_eq!(app.editor.as_ref().unwrap().cidr, "192.0.2.99/24");
     assert!(app.interface_drafts.is_empty());
@@ -920,5 +926,162 @@ async fn validation_focus_exposes_mac_error_and_plan_wrap_preserves_actions() {
             .collect();
         assert!(text.contains("Invalid MAC"));
         assert!(text.contains("Review changes"));
+    }
+}
+
+fn draft_inventory_response(
+    presence: traffic_masq_protocol::InterfacePresence,
+    revision: u64,
+    config: Option<traffic_masq_protocol::InterfaceConfigView>,
+) -> Response {
+    use traffic_masq_protocol::{
+        InterfaceConfigSource, InterfaceInventoryEntry, InterfacePresence, InterfaceReadiness,
+    };
+    let mut observed = observed_address(None, Some(false));
+    observed.interface.name = "wlan0".into();
+    Response::InterfaceInventory {
+        base_config: None,
+        revision,
+        suppressed_interfaces: vec![],
+        observation_error: None,
+        interfaces: vec![InterfaceInventoryEntry {
+            name: "wlan0".into(),
+            observed: (presence == InterfacePresence::Present).then_some(observed),
+            configured: config,
+            config_source: InterfaceConfigSource::Override,
+            presence,
+            readiness: InterfaceReadiness::Ready,
+            blockers: vec![],
+            references: vec![],
+            suppressed: false,
+            observation_stale: false,
+        }],
+    }
+}
+
+#[tokio::test]
+async fn resumed_interface_draft_refreshes_execution_mode_revision_and_review_baseline() {
+    use traffic_masq_protocol::{DhcpChangeActionView, InterfaceChangePlanView, InterfacePresence};
+    for presence in [InterfacePresence::Present, InterfacePresence::Missing] {
+        let mut draft = default_route_editor(false);
+        draft.offline_revision = (presence == InterfacePresence::Present).then_some(7);
+        draft.cidr = "192.0.2.99/24".into();
+        draft.mac_address = "02:11:22:33:44:55".into();
+        draft.field = InterfaceEditorField::Reset;
+        let config = serde_json::from_value(serde_json::json!({
+            "role":"input","managed":true,"ipv4":"192.0.2.2/24","mac_address":"02:aa:bb:cc:dd:ee"
+        }))
+        .unwrap();
+        let response = if presence == InterfacePresence::Present {
+            Response::InterfacePlan {
+                plan: InterfaceChangePlanView {
+                    interface: "wlan0".into(),
+                    mac_address: None,
+                    delete_ipv4: vec![],
+                    retag_ipv4: None,
+                    add_ipv4: None,
+                    set_link_up: false,
+                    management_change: false,
+                    dhcp_action: DhcpChangeActionView::Unchanged,
+                    releasing_management: false,
+                },
+            }
+        } else {
+            Response::InterfaceIntentSaved {
+                interface: "wlan0".into(),
+                revision: 10,
+                deferred: true,
+                missing_dependencies: vec!["wlan0".into()],
+            }
+        };
+        let mock = crate::tui::test_api::mock(vec![
+            draft_inventory_response(presence, 9, Some(config)),
+            response,
+        ])
+        .await;
+        let mut app = TuiApp {
+            screen: Screen::InterfaceList,
+            ..Default::default()
+        };
+        let mut status = observed_address(None, Some(false));
+        status.interface.name = "wlan0".into();
+        app.dashboard.interfaces.push(status);
+        app.interface_drafts.insert("wlan0".into(), draft);
+        open_editor(&mut app, &mock.client).await;
+        let editor = app.editor.as_ref().unwrap();
+        assert_eq!(
+            editor.offline_revision,
+            (presence == InterfacePresence::Missing).then_some(9)
+        );
+        assert_eq!(editor.cidr, "192.0.2.99/24");
+        assert_eq!(editor.mac_address, "02:11:22:33:44:55");
+        assert_eq!(editor.original_cidr, "192.0.2.2/24");
+        assert_eq!(editor.original_mac, "02:aa:bb:cc:dd:ee");
+        assert_eq!(
+            editor.role,
+            InterfaceRole::Input,
+            "unchanged fields should follow current config"
+        );
+        assert!(app.interface_drafts.is_empty());
+        if presence == InterfacePresence::Present {
+            assert_eq!(editor.field, InterfaceEditorField::Save);
+        }
+        submit_dry_run(&mut app, &mock.client).await;
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[1].body["type"],
+            if presence == InterfacePresence::Present {
+                "dry_run_interface_edit"
+            } else {
+                "save_interface_config"
+            }
+        );
+        if presence == InterfacePresence::Missing {
+            assert_eq!(calls[1].body["expected_revision"], 9);
+        }
+    }
+}
+
+#[tokio::test]
+async fn failed_draft_observation_keeps_edits_and_does_not_open_stale_editor() {
+    use traffic_masq_protocol::InterfacePresence;
+    let mut stale = draft_inventory_response(InterfacePresence::Present, 9, None);
+    if let Response::InterfaceInventory { interfaces, .. } = &mut stale {
+        interfaces[0].observation_stale = true;
+    }
+    let mut failed = draft_inventory_response(InterfacePresence::Missing, 9, None);
+    if let Response::InterfaceInventory {
+        observation_error, ..
+    } = &mut failed
+    {
+        *observation_error = Some("netlink failed".into());
+    }
+    for response in [
+        Response::Error {
+            message: "unavailable".into(),
+        },
+        draft_inventory_response(InterfacePresence::Unknown, 9, None),
+        stale,
+        failed,
+    ] {
+        let mock = crate::tui::test_api::mock(vec![response]).await;
+        let mut app = TuiApp {
+            screen: Screen::InterfaceList,
+            ..Default::default()
+        };
+        let mut status = observed_address(None, Some(false));
+        status.interface.name = "wlan0".into();
+        app.dashboard.interfaces.push(status);
+        let mut draft = default_route_editor(true);
+        draft.cidr = "192.0.2.99/24".into();
+        draft.offline_revision = Some(7);
+        app.interface_drafts.insert("wlan0".into(), draft);
+        open_editor(&mut app, &mock.client).await;
+        assert_eq!(app.screen, Screen::InterfaceList);
+        assert!(app.editor.is_none());
+        assert_eq!(app.interface_drafts["wlan0"].cidr, "192.0.2.99/24");
+        assert_eq!(app.interface_drafts["wlan0"].offline_revision, Some(7));
+        assert_eq!(mock.calls.lock().unwrap().len(), 1);
     }
 }

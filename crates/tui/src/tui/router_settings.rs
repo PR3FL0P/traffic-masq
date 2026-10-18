@@ -52,6 +52,8 @@ const FIELDS: [Field; 13] = [
 
 pub(crate) struct Editor {
     config: RouterConfigView,
+    original: RouterConfigView,
+    exit_requested: bool,
     uplink: String,
     mode: UplinkMode,
     global: bool,
@@ -76,7 +78,9 @@ impl Editor {
                 .map(|u| u.mode)
                 .unwrap_or(UplinkMode::External),
             global: config.forwarding.is_none(),
+            original: config.clone(),
             config,
+            exit_requested: false,
             cursor: input::grapheme_count(&uplink),
             uplink,
             profiles,
@@ -85,6 +89,23 @@ impl Editor {
             field: Field::Uplink,
             scroll: 0,
         }
+    }
+    fn dirty(&self) -> bool {
+        self.config != self.original
+            || self.uplink
+                != self
+                    .original
+                    .uplink
+                    .as_ref()
+                    .map(|uplink| uplink.interface.as_str())
+                    .unwrap_or("")
+            || self.mode
+                != self
+                    .original
+                    .uplink
+                    .as_ref()
+                    .map_or(UplinkMode::External, |uplink| uplink.mode)
+            || self.global != self.original.forwarding.is_none()
     }
     fn candidate(&self) -> Result<RouterConfigView, &'static str> {
         if !self.global && !self.config.vpn_chain.is_empty() {
@@ -229,6 +250,16 @@ pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
     }
 }
 pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
+    if let Some(dialog) = exit_confirmation(app) {
+        dialog.render(
+            frame,
+            area,
+            &mut app.ui,
+            app.confirmation_focus,
+            app.confirmation_scroll,
+        );
+        return;
+    }
     let Some(e) = &mut app.router_settings else {
         return;
     };
@@ -288,11 +319,19 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClien
     let Some(e) = &mut app.router_settings else {
         return;
     };
-    match key {
-        KeyCode::Esc => {
-            app.router_settings = None;
-            app.screen = Screen::Router;
+    if e.exit_requested {
+        match key {
+            KeyCode::Esc => e.exit_requested = false,
+            KeyCode::Enter => {
+                app.router_settings = None;
+                app.screen = Screen::Router;
+            }
+            _ => {}
         }
+        return;
+    }
+    match key {
+        KeyCode::Esc => request_exit(app),
         KeyCode::Up | KeyCode::Down => {
             e.field = input::move_clamped(&FIELDS, e.field, key == KeyCode::Down)
         }
@@ -365,10 +404,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClien
                 app.screen = Screen::Router;
                 super::router::open_router_plan(app, client).await;
             }
-            Field::Cancel => {
-                app.router_settings = None;
-                app.screen = Screen::Router;
-            }
+            Field::Cancel => request_exit(app),
             Field::Uplink => e.field = Field::Mode,
         },
         other if e.field == Field::Uplink => {
@@ -494,6 +530,8 @@ mod tests {
         app.router.staged = true;
         app.router_settings.as_mut().unwrap().uplink = "changed".into();
         handle_key(&mut app, KeyCode::Esc, &ApiClient::new("/unused")).await;
+        assert!(app.router_settings.as_ref().unwrap().exit_requested);
+        handle_key(&mut app, KeyCode::Enter, &ApiClient::new("/unused")).await;
         assert_eq!(app.router.proposed_router_config, config);
         assert!(app.router.staged);
     }
@@ -628,5 +666,53 @@ mod tests {
         assert!(text.contains("Removed share: lan0 -> wan0"));
         assert!(text.contains("Previous VPN hop 1: old"));
         assert!(text.contains("New VPN chain: none"));
+    }
+}
+
+pub(super) fn exit_confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> {
+    app.router_settings.as_ref()?.exit_requested.then(|| {
+        super::confirmation::discard_edits_dialog(
+            "Leave router settings?",
+            "Router uplink and VPN chain".into(),
+        )
+    })
+}
+fn request_exit(app: &mut TuiApp) {
+    if app.router_settings.as_ref().is_some_and(Editor::dirty) {
+        app.router_settings.as_mut().unwrap().exit_requested = true;
+    } else {
+        app.router_settings = None;
+        app.screen = Screen::Router;
+    }
+}
+
+#[cfg(test)]
+mod exit_tests {
+    use super::*;
+    #[tokio::test]
+    async fn invalid_chain_can_be_kept_or_explicitly_discarded_without_staging() {
+        let client = ApiClient::new("/must-not-connect.sock");
+        let mut editor = Editor::new(RouterConfigView::default(), vec![]);
+        editor.config.vpn_chain.push(VpnHopConfigView {
+            profile_name: "draft".into(),
+        });
+        editor.field = Field::Cancel;
+        let mut app = TuiApp {
+            screen: Screen::RouterSettings,
+            router_settings: Some(editor),
+            ..Default::default()
+        };
+        handle_key(&mut app, KeyCode::Enter, &client).await;
+        assert!(exit_confirmation(&app).is_some());
+        handle_key(&mut app, KeyCode::Esc, &client).await;
+        assert_eq!(
+            app.router_settings.as_ref().unwrap().config.vpn_chain.len(),
+            1
+        );
+        assert!(!app.router.staged);
+        handle_key(&mut app, KeyCode::Esc, &client).await;
+        handle_key(&mut app, KeyCode::Enter, &client).await;
+        assert!(app.router_settings.is_none());
+        assert!(!app.router.staged);
     }
 }

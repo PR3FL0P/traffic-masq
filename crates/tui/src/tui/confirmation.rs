@@ -38,6 +38,9 @@ pub(super) fn current(app: &TuiApp) -> Option<Dialog> {
     match app.screen {
         Screen::WifiProfiles | Screen::WifiApProfiles => super::wifi::profile_delete_dialog(app),
         Screen::WifiEditor => super::wifi::discard_confirmation(app),
+        Screen::WifiProfileEditor => super::wifi::profile_exit_confirmation(app),
+        Screen::DhcpClientEditor => super::dhcp_client_editor::exit_confirmation(app),
+        Screen::RouterSettings => super::router_settings::exit_confirmation(app),
         Screen::InterfaceEditor => super::interfaces::confirmation(app),
         Screen::RouterHealth => super::router_health::confirmation(app),
         Screen::Settings => super::settings::confirmation(app),
@@ -246,5 +249,18 @@ mod long_details_tests {
         assert!(text.contains("Final consequence"));
         assert!(text.contains("[Execute]"));
         assert!(text.contains("[Cancel]"));
+    }
+}
+
+pub(super) fn discard_edits_dialog(title: &'static str, target: String) -> Dialog {
+    Dialog {
+        title,
+        action: "Discard edits",
+        secondary: None,
+        lines: vec![
+            target,
+            "Unsaved edits will be discarded. No changes are applied. Esc returns to editing."
+                .into(),
+        ],
     }
 }

@@ -73,6 +73,9 @@ pub(crate) async fn handle_wifi_connect_prompt_key(
     };
 
     if prompt.reviewing {
+        if layout::scroll_change_review(key, &mut app.preview_scroll, app.preview_max_scroll) {
+            return;
+        }
         match key {
             KeyCode::Esc => prompt.reviewing = false,
             KeyCode::Enter if prompt.field == WifiConnectField::Cancel => prompt.reviewing = false,
@@ -150,6 +153,7 @@ pub(crate) async fn handle_wifi_connect_prompt_key(
             }
             WifiConnectField::Submit => {
                 prompt.reviewing = true;
+                app.preview_scroll = 0;
             }
             WifiConnectField::Cancel => {
                 app.wifi_connect = None;
@@ -293,8 +297,12 @@ pub(crate) fn render_wifi_connect_prompt(
                 ),
                 "Connection replaces the current client connection on this radio.".into(),
             ],
-            prompt.expected_revision.is_some(),
-            prompt.field == WifiConnectField::Cancel,
+            layout::ChangeReviewState {
+                offline: prompt.expected_revision.is_some(),
+                cancel_selected: prompt.field == WifiConnectField::Cancel,
+                scroll: &mut app.preview_scroll,
+                max_scroll: &mut app.preview_max_scroll,
+            },
         );
         return;
     }

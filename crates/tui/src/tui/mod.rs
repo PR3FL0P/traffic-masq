@@ -1162,6 +1162,23 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
         return;
     }
 
+    if wifi::change_review_open(app) {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                app.preview_scroll = app.preview_scroll.saturating_sub(1);
+                return;
+            }
+            MouseEventKind::ScrollDown => {
+                app.preview_scroll = app
+                    .preview_scroll
+                    .saturating_add(1)
+                    .min(app.preview_max_scroll);
+                return;
+            }
+            _ => {}
+        }
+    }
+
     // Wheel input belongs to the list/viewport, even when a button had focus.
     // In particular, scrolling must not select a destructive action for Enter.
     if matches!(

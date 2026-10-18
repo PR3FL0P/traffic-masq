@@ -31,6 +31,7 @@ mod connect;
 mod delete_confirmation;
 pub(super) use delete_confirmation::profile_delete_dialog;
 mod profile_editor;
+pub(super) use profile_editor::exit_confirmation as profile_exit_confirmation;
 mod profiles;
 mod scan;
 
@@ -46,7 +47,8 @@ pub(crate) use scan::{handle_wifi_scan_key, render_wifi_scan};
 use profiles::open_profiles;
 
 #[cfg(test)]
-use ap_editor::{ap_provision_request, ap_settings};
+use ap_editor::ap_provision_request;
+use ap_editor::ap_settings;
 #[cfg(test)]
 use connect::submit_wifi_connect;
 
@@ -448,6 +450,8 @@ const PROFILE_FIELDS: [ProfileField; 8] = [
 
 #[derive(Clone)]
 pub(crate) struct WifiProfileEditor {
+    dirty: bool,
+    exit_requested: bool,
     pub(crate) interface: String,
     pub(crate) original_id: Option<String>,
     pub(crate) field: ProfileField,
@@ -491,6 +495,8 @@ impl WifiProfileEditor {
         Ok(Self {
             interface,
             original_id: None,
+            dirty: false,
+            exit_requested: false,
             field: ProfileField::Id,
             id,
             ssid: network.ssid.clone(),
@@ -509,6 +515,8 @@ impl WifiProfileEditor {
         Self {
             interface,
             original_id: Some(profile.id.clone()),
+            dirty: false,
+            exit_requested: false,
             field: ProfileField::Ssid,
             id: profile.id.clone(),
             ssid: profile.ssid.clone(),
@@ -1035,7 +1043,42 @@ async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
     match action {
         PrimaryAction::Stations => super::wifi_stations::open(app, client, row.interface).await,
         PrimaryAction::ConfigureAp => {
-            if let Some(editor) = app.ap_drafts.remove(&row.interface) {
+            if app.ap_drafts.contains_key(&row.interface) {
+                let Some((entry, revision)) =
+                    super::interfaces::refresh_draft_interface(app, client, &row.interface).await
+                else {
+                    return;
+                };
+                if entry.presence == traffic_masq_protocol::InterfacePresence::Missing
+                    && entry.configured.is_none()
+                {
+                    app.push_message(LogLevel::Warn, "Saved AP configuration no longer exists; draft retained. Configure the device before resuming.");
+                    return;
+                }
+                let mut editor = app.ap_drafts.remove(&row.interface).unwrap();
+                // Keep the desired radio settings while refreshing the review baseline,
+                // credential availability and saved-intent revision from one observation.
+                let settings = ap_settings(&editor);
+                editor.original_spec = entry.configured.as_ref().and_then(|config| {
+                    WifiApSpecView::from_validated_interface_config(&row.interface, config)
+                });
+                editor.existing = editor
+                    .original_spec
+                    .as_ref()
+                    .is_some_and(|spec| spec.requires_passphrase());
+                editor.radio_settings = Some(settings);
+                editor.offline_intent =
+                    if entry.presence == traffic_masq_protocol::InterfacePresence::Missing {
+                        Some((
+                            revision,
+                            entry
+                                .configured
+                                .expect("missing-device configuration checked above"),
+                        ))
+                    } else {
+                        None
+                    };
+                editor.reviewing = false;
                 app.wifi_editor = Some(editor);
                 app.screen = Screen::WifiEditor;
                 return;
@@ -1575,5 +1618,23 @@ pub(crate) fn focus_editor_action(app: &mut TuiApp, slot: usize) {
         } else {
             WifiField::Ssid
         };
+    }
+}
+
+pub(crate) fn change_review_open(app: &TuiApp) -> bool {
+    match app.screen {
+        Screen::WifiEditor => app
+            .wifi_editor
+            .as_ref()
+            .is_some_and(|editor| editor.reviewing),
+        Screen::WifiConnectPrompt => app
+            .wifi_connect
+            .as_ref()
+            .is_some_and(|prompt| prompt.reviewing),
+        Screen::WifiApProfiles => app
+            .wifi_ap_profiles
+            .as_ref()
+            .is_some_and(|view| view.apply_review),
+        _ => false,
     }
 }
