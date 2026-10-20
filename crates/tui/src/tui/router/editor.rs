@@ -238,7 +238,7 @@ pub(super) fn save_route_editor(app: &mut TuiApp) {
     app.screen = Screen::Router;
     app.push_message(
         LogLevel::Info,
-        format!("Staged route {destination} in router configuration"),
+        format!("Route {destination} added to draft — not applied. Review / Apply to continue"),
     );
 }
 

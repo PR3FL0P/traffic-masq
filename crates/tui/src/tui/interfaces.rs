@@ -603,7 +603,6 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
                 InterfaceRole::Output => "Output — local network / LAN",
                 InterfaceRole::None => "None — outside the router",
                 InterfaceRole::Middle => "Middle — VPN hop",
-                InterfaceRole::Disabled => "Disabled",
             }
         ),
         InterfaceEditorField::Role,
@@ -1478,6 +1477,19 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
             );
             editor.reset_cursor();
         }
+        KeyCode::Enter
+            if matches!(
+                editor.field,
+                InterfaceEditorField::Cidr | InterfaceEditorField::MacAddress
+            ) =>
+        {
+            editor.field = next_editor_field(
+                editor.field,
+                editor.offline_revision.is_some(),
+                editor.advanced,
+            );
+            editor.reset_cursor();
+        }
         KeyCode::Enter | KeyCode::Char(' ') => match editor.field {
             InterfaceEditorField::Cidr | InterfaceEditorField::MacAddress => {}
             InterfaceEditorField::RemoveIpv4 => {
@@ -1796,7 +1808,7 @@ async fn finish_pending(app: &mut TuiApp, client: &ApiClient, commit: bool) {
 
     match client.request(&request).await {
         Ok(Response::NetworkChangeCommitted { .. }) if commit => {
-            app.push_message(LogLevel::Info, "Network change committed");
+            app.push_message(LogLevel::Info, "Network changes applied and saved");
             app.pending = None;
             app.preview = None;
             app.editor = None;
@@ -1828,7 +1840,7 @@ fn next_role(role: InterfaceRole) -> InterfaceRole {
         // `Middle` (a VPN-hop chain slot) isn't part of this TUI's manual
         // role cycle yet — that's the later topology-view plan's job. It
         // falls back to `None` rather than being reachable here.
-        InterfaceRole::Disabled | InterfaceRole::Middle => InterfaceRole::None,
+        InterfaceRole::Middle => InterfaceRole::None,
     }
 }
 

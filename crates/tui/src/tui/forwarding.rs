@@ -2,7 +2,7 @@
 use std::collections::HashSet;
 
 use super::{
-    layout::{focused_lines_offset, panel},
+    layout::{panel, wrap_styled_lines as wrap_lines},
     logs::LogLevel,
     router::{RouterData, RouterPane},
     theme, Screen, TuiApp,
@@ -42,6 +42,7 @@ pub(crate) struct ForwardingEditor {
     cursor: usize,
     field: Field,
     error: Option<String>,
+    error_field: Option<Field>,
 }
 
 impl ForwardingEditor {
@@ -54,14 +55,30 @@ impl ForwardingEditor {
         fields
     }
 
-    fn save(&self) -> anyhow::Result<Vec<ForwardingConfig>> {
+    fn save(&self) -> Result<Vec<ForwardingConfig>, super::input::FormError<Field>> {
+        use super::input::FormError;
         let source_subnet = if self.source.trim().is_empty() {
             None
         } else {
             Some(self.source.trim().parse::<ipnet::Ipv4Net>().map_err(|_| {
-                anyhow::anyhow!("Enter an IPv4 subnet, e.g. 192.168.10.0/24, or leave it empty")
+                FormError::field(
+                    Field::Source,
+                    "Enter an IPv4 subnet, e.g. 192.168.10.0/24, or leave it empty",
+                )
             })?)
         };
+        if self.from == self.to {
+            return Err(FormError::field(
+                Field::To,
+                "Choose a different egress interface",
+            ));
+        }
+        if source_subnet.is_some_and(|net| net != net.trunc()) {
+            return Err(FormError::field(
+                Field::Source,
+                "Source subnet must have no host bits",
+            ));
+        }
         let rule = ForwardingConfig {
             from: self.interfaces[self.from].clone(),
             to: self.interfaces[self.to].clone(),
@@ -74,40 +91,22 @@ impl ForwardingEditor {
         } else {
             rules.push(rule);
         }
-        validate_forwarding(&rules).map_err(anyhow::Error::msg)?;
+        validate_forwarding(&rules).map_err(FormError::form)?;
         Ok(rules)
     }
 }
 
-/// None means the old implicit rules have not been loaded, not an empty list.
+/// None means saved configuration has not been loaded.
 pub(crate) fn displayed_rules(router: &RouterData) -> Option<Vec<ForwardingConfig>> {
-    if let Some(rules) = &router.proposed_router_config.forwarding {
-        return Some(rules.clone());
-    }
-    if !router.topology.loaded {
+    if !router.topology.loaded && router.proposed_router_config.forwarding.is_none() {
         return None;
     }
-    if router.proposed_router_config.uplink.is_none() {
-        return Some(vec![]);
-    }
-    let uplink = router.proposed_router_config.uplink.as_ref()?;
     Some(
         router
-            .saved_interfaces
-            .iter()
-            .filter_map(|entry| {
-                let config = entry.configured.as_ref()?;
-                if config.role != InterfaceRole::Output || !config.managed || !config.nat {
-                    return None;
-                }
-                Some(ForwardingConfig {
-                    from: entry.name.clone(),
-                    to: uplink.interface.clone(),
-                    masquerade: true,
-                    source_subnet: Some(config.ipv4?.trunc()),
-                })
-            })
-            .collect(),
+            .proposed_router_config
+            .forwarding
+            .clone()
+            .unwrap_or_default(),
     )
 }
 
@@ -121,10 +120,6 @@ async fn load_rules(app: &mut TuiApp, client: &ApiClient) -> Option<Vec<Forwardi
             );
             return None;
         }
-    }
-    if !app.router.proposed_router_config.vpn_chain.is_empty() {
-        app.push_message(LogLevel::Warn, "The global VPN chain uses legacy forwarding. Configure its tunnel routing before switching to per-interface sharing.");
-        return None;
     }
     let rules = displayed_rules(&app.router);
     if rules.is_none() {
@@ -225,6 +220,7 @@ async fn open(app: &mut TuiApp, client: &ApiClient, edit: bool, egress: Option<S
         rules,
         field: Field::From,
         error: None,
+        error_field: None,
     };
     app.forwarding = Some(editor);
     app.screen = Screen::Forwarding;
@@ -295,6 +291,10 @@ fn stage(app: &mut TuiApp, rules: Vec<ForwardingConfig>) {
         .min(rules.len().saturating_sub(1));
     app.router.proposed_router_config.forwarding = Some(rules);
     app.router.staged = true;
+    app.push_message(
+        LogLevel::Info,
+        "Router draft updated — not applied. Review / Apply to continue.",
+    );
     app.router.error = None;
 }
 
@@ -315,7 +315,7 @@ pub(crate) fn render_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
     .split(area);
     frame.render_widget(
         Paragraph::new(if app.router.staged {
-            "Draft changes — Review / Apply to confirm"
+            "Draft — not applied. Review / Apply to continue"
         } else {
             "Sharing permissions and NAT; routes choose the path"
         })
@@ -433,7 +433,7 @@ pub(crate) fn render_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
             Paragraph::new(if rules.is_some() {
                 "No connections. Choose Add."
             } else {
-                "Legacy/unavailable data — refresh before editing"
+                "Unavailable data — refresh before editing"
             }),
             app.ui.list_area.unwrap(),
         );
@@ -537,10 +537,20 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
     let Some(editor) = &app.forwarding else {
         return;
     };
+    let block = panel(if editor.editing.is_some() {
+        "Edit sharing connection"
+    } else {
+        "Add sharing connection"
+    });
+    let inner = block.inner(area);
     let mut lines = vec![];
+    let mut focus_row = 0;
+    let mut save_row = 0;
     for field in editor.fields() {
         let selected = editor.field == field;
-        let style = if selected {
+        let style = if editor.error_field == Some(field) {
+            Style::default().fg(theme::BAD)
+        } else if selected {
             Style::default()
                 .fg(theme::SELECTED_FG)
                 .bg(theme::SELECTED_BG)
@@ -572,6 +582,13 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
             ),
             Field::Save => "[Save connection]".into(),
         };
+        if selected {
+            focus_row = lines.len();
+        }
+        if field == Field::Save {
+            save_row = lines.len();
+        }
+        let mut row = Vec::new();
         if field == Field::Source && selected {
             let mut spans = vec![Span::styled("▶ Source subnet: ", style)];
             spans.extend(super::input::render_value_with_cursor(
@@ -580,36 +597,53 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
                 true,
                 style,
             ));
-            lines.push(Line::from(spans));
+            row.push(Line::from(spans));
         } else {
-            lines.push(Line::styled(
+            row.push(Line::styled(
                 format!("{}{}", if selected { "▶ " } else { "  " }, label),
                 style,
             ));
         }
+        lines.extend(wrap_lines(row, inner.width));
+        if editor.error_field == Some(field) {
+            if let Some(error) = &editor.error {
+                lines.extend(wrap_lines(
+                    vec![Line::styled(
+                        format!("  Error: {error}"),
+                        Style::default().fg(theme::BAD),
+                    )],
+                    inner.width,
+                ));
+            }
+        }
     }
-    if let Some(error) = &editor.error {
-        lines.push(Line::styled(error.clone(), Style::default().fg(theme::BAD)));
+    if editor.error_field.is_none() {
+        if let Some(error) = &editor.error {
+            lines.extend(wrap_lines(
+                vec![Line::styled(
+                    format!("Rule conflict: {error}"),
+                    Style::default().fg(theme::BAD),
+                )],
+                inner.width,
+            ));
+        }
     }
-    let block = panel(if editor.editing.is_some() {
-        "Edit sharing connection"
-    } else {
-        "Add sharing connection"
-    });
-    let inner = block.inner(area);
-    let offset = if editor.error.is_some() {
-        lines.len().saturating_sub(inner.height as usize)
-    } else {
-        focused_lines_offset(&lines, inner.height)
-    };
-    if let Some(row) = editor
-        .fields()
-        .iter()
-        .position(|field| *field == Field::Save)
-        .filter(|row| *row >= offset && *row < offset + inner.height as usize)
-    {
+    let offset =
+        if editor.error.is_some() && editor.error_field.is_none() && editor.field == Field::Save {
+            lines.len().saturating_sub(inner.height as usize)
+        } else if editor.error_field == Some(editor.field) {
+            focus_row
+        } else {
+            focus_row.saturating_sub(inner.height.saturating_sub(3) as usize)
+        };
+    if save_row >= offset && save_row < offset + inner.height as usize {
         app.ui.buttons.push((
-            Rect::new(inner.x, inner.y + (row - offset) as u16, 19, 1),
+            Rect::new(
+                inner.x,
+                inner.y + (save_row - offset) as u16,
+                19.min(inner.width),
+                1,
+            ),
             0,
         ));
     }
@@ -651,12 +685,29 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, _client: &ApiClie
                 app.screen = Screen::Router;
                 super::router::select_pane(app, RouterPane::Sharing);
             }
-            Err(error) => editor.error = Some(error.to_string()),
+            Err(error) => {
+                editor.error_field = error.field;
+                if let Some(field) = error.field {
+                    editor.field = field;
+                    if field == Field::Source {
+                        editor.advanced = true;
+                    }
+                }
+                editor.error = Some(error.message);
+            }
         },
+        KeyCode::Enter if editor.field == Field::Source => editor.field = Field::Save,
         key if editor.field == Field::Source => {
-            super::input::TextEditor::new(&mut editor.source, &mut editor.cursor).handle_key(key);
+            let handled = super::input::TextEditor::new(&mut editor.source, &mut editor.cursor)
+                .handle_key(key);
+            if handled {
+                editor.error = None;
+                editor.error_field = None;
+            }
         }
         KeyCode::Left | KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ') => {
+            editor.error = None;
+            editor.error_field = None;
             let delta = if key == KeyCode::Left {
                 editor.interfaces.len() - 1
             } else {

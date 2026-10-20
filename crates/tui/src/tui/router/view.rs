@@ -42,7 +42,7 @@ pub(super) fn router_action_buttons(router: &RouterData) -> [(RouterAction, &'st
         (RouterAction::ShareViaRoute, "[Share via: n]"),
         (RouterAction::Refresh, "[Refresh]"),
         (RouterAction::Topology, "[Topology: t]"),
-        (RouterAction::Setup, "[Wi-Fi setup: w]"),
+        (RouterAction::Policy, "[Standalone traffic policy]"),
         (RouterAction::Settings, "[Uplink / VPN: u]"),
     ]
 }
@@ -163,7 +163,7 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
     if router.staged {
         status_lines.push(Line::styled(
             format!(
-                "Staged configuration: {} owned route(s); review with [Plan / Apply]; c: discard draft",
+                "Draft — not applied: {} route(s); [Plan / Apply] to review; c: discard",
                 router.proposed_router_config.owned_routes.len()
             ),
             Style::default()
@@ -573,13 +573,7 @@ pub(super) fn format_coordinator_status(status: CoordinatorStatus) -> &'static s
 
 pub(super) fn summarize_uplink(target: &RouterDataplaneTargetView) -> String {
     match target {
-        RouterDataplaneTargetView::Enabled(desired) => {
-            if desired.forwarding.is_some() {
-                "per-connection".into()
-            } else {
-                desired.uplink.clone()
-            }
-        }
+        RouterDataplaneTargetView::Enabled(_) => "per-connection".into(),
         RouterDataplaneTargetView::Disabled => "none (dataplane disabled)".to_string(),
     }
 }

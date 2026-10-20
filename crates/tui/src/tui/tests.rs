@@ -191,7 +191,7 @@ async fn tab_focus_and_modified_keys_are_consistent() {
     assert_eq!(app.vpn.focus, vpn::VpnFocus::Connect);
     handle_key(&mut app, KeyCode::Right, &client, false).await;
     assert_eq!(app.screen, Screen::Vpn);
-    assert_eq!(app.vpn.focus, vpn::VpnFocus::Disconnect);
+    assert_eq!(app.vpn.focus, vpn::VpnFocus::Details);
     handle_key(&mut app, KeyCode::Left, &client, false).await;
     handle_key(&mut app, KeyCode::BackTab, &client, false).await;
     assert_eq!(app.vpn.focus, vpn::VpnFocus::List);
@@ -306,7 +306,7 @@ fn refreshing_preserves_footer_notification_and_does_not_flash_for_fast_reads() 
             assert!(progress.contains(if cancellable {
                 "Refreshing"
             } else {
-                "Operation in progress"
+                "Applying changes"
             }));
             for y in [height - 2, height - 1] {
                 for x in 0..width {
@@ -344,7 +344,7 @@ fn operation_snapshot_redraws_safely_after_terminal_resize() {
         .iter()
         .map(|cell| cell.symbol())
         .collect::<String>();
-    assert!(rendered.contains("Operation in progress"));
+    assert!(rendered.contains("Applying changes"));
     assert!(!rendered.contains("traffic-masq"));
 }
 
@@ -583,7 +583,7 @@ fn section_of_maps_sub_screens_to_their_parent_tab() {
     assert_eq!(section_of(Screen::RouterPending), Section::Router);
     assert_eq!(section_of(Screen::Vpn), Section::Vpn);
     assert_eq!(section_of(Screen::VpnImport), Section::Vpn);
-    assert_eq!(section_of(Screen::VpnPolicy), Section::Vpn);
+    assert_eq!(section_of(Screen::VpnPolicy), Section::Router);
     assert_eq!(section_of(Screen::Settings), Section::Settings);
     assert_eq!(section_of(Screen::SettingsPassword), Section::Settings);
     assert_eq!(section_of(Screen::Access), Section::Settings);
@@ -649,19 +649,19 @@ async fn settings_tab_switching_and_editing_arrow_isolation() {
     handle_key(&mut app, KeyCode::Right, &client, false).await;
     assert_eq!(app.screen, Screen::Settings);
 
-    // Enter activates editing mode on RollbackTimeout
-    handle_key(&mut app, KeyCode::Enter, &client, false).await;
+    // Typing activates editing mode on RollbackTimeout.
+    handle_key(&mut app, KeyCode::Char('0'), &client, false).await;
     assert!(app.settings.as_ref().unwrap().is_editing());
 
     // When editing, Left moves the cursor and does NOT switch sections
     handle_key(&mut app, KeyCode::Left, &client, false).await;
     assert_eq!(app.screen, Screen::Settings);
-    assert_eq!(app.settings.as_ref().unwrap().cursor, 1);
+    assert_eq!(app.settings.as_ref().unwrap().cursor, 2);
 
     // When editing, Right moves the cursor and does NOT switch sections
     handle_key(&mut app, KeyCode::Right, &client, false).await;
     assert_eq!(app.screen, Screen::Settings);
-    assert_eq!(app.settings.as_ref().unwrap().cursor, 2);
+    assert_eq!(app.settings.as_ref().unwrap().cursor, 3);
 
     // Enter finishes editing mode
     handle_key(&mut app, KeyCode::Enter, &client, false).await;

@@ -45,8 +45,7 @@ pub(super) fn current(app: &TuiApp) -> Option<Dialog> {
         Screen::RouterHealth => super::router_health::confirmation(app),
         Screen::Settings => super::settings::confirmation(app),
         Screen::WifiStations => super::wifi_stations::confirmation(app),
-        Screen::Provisioning => super::provisioning::confirmation(app),
-        Screen::Vpn => super::vpn::confirmation(app),
+        Screen::Vpn | Screen::VpnProfile => super::vpn::confirmation(app),
         Screen::Log if app.logs_clear_confirmation => Some(Dialog {
             secondary: None,
             title: "Clear client log?",

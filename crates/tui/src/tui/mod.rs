@@ -41,7 +41,6 @@ mod interfaces;
 mod layout;
 mod logs;
 mod port_forwarding;
-mod provisioning;
 mod router;
 mod router_health;
 mod router_settings;
@@ -52,8 +51,6 @@ mod settings;
 mod test_api;
 mod vpn;
 mod vpn_policy;
-#[cfg(test)]
-mod walkthrough;
 mod wifi;
 mod wifi_stations;
 
@@ -101,12 +98,13 @@ enum Screen {
     RouterSettings,
     RouterHealth,
     RouterPlan,
-    Provisioning,
     RouterPending,
     RouteEditor,
     Forwarding,
     PortForwarding,
     Vpn,
+    VpnProfile,
+    VpnSettings,
     VpnImport,
     VpnPolicy,
     Wifi,
@@ -173,7 +171,7 @@ impl Section {
             Section::Interfaces => "Interfaces",
             Section::Dhcp => "DHCP Server",
             Section::DhcpClient => "DHCP Client",
-            Section::Router => "Router",
+            Section::Router => "Route",
             Section::Vpn => "VPN",
             Section::Wifi => "Wi-Fi",
             Section::Settings => "Settings",
@@ -190,14 +188,14 @@ fn section_of(screen: Screen) -> Section {
         Screen::DhcpClient | Screen::DhcpClientEditor => Section::DhcpClient,
         Screen::Router
         | Screen::RouteEditor
-        | Screen::Provisioning
         | Screen::RouterHealth
         | Screen::RouterSettings
         | Screen::RouterPlan
         | Screen::RouterPending
         | Screen::Forwarding
-        | Screen::PortForwarding => Section::Router,
-        Screen::Vpn | Screen::VpnImport | Screen::VpnPolicy => Section::Vpn,
+        | Screen::PortForwarding
+        | Screen::VpnPolicy => Section::Router,
+        Screen::Vpn | Screen::VpnImport | Screen::VpnProfile | Screen::VpnSettings => Section::Vpn,
         Screen::Wifi
         | Screen::WifiStations
         | Screen::WifiEditor
@@ -297,7 +295,6 @@ struct TuiApp {
     router: RouterData,
     router_settings: Option<router_settings::Editor>,
     router_health: router_health::View,
-    provisioning: Option<provisioning::Wizard>,
     router_pending: Option<RouterPendingView>,
     forwarding: Option<forwarding::ForwardingEditor>,
     port_forwarding: Option<port_forwarding::Editor>,
@@ -365,7 +362,6 @@ impl Default for TuiApp {
             router: RouterData::default(),
             router_settings: None,
             router_health: router_health::View::default(),
-            provisioning: None,
             router_pending: None,
             forwarding: None,
             port_forwarding: None,
@@ -715,7 +711,12 @@ async fn run_loop(
                     if !direct && app.screen == Screen::DhcpClient {
                         dhcp_client::refresh(&mut app, client).await;
                     }
-                    if !direct && app.screen == Screen::Vpn {
+                    if !direct
+                        && matches!(
+                            app.screen,
+                            Screen::Vpn | Screen::VpnProfile | Screen::VpnSettings
+                        )
+                    {
                         vpn::load_vpn_data(&mut app, client).await;
                     }
                 };
@@ -862,7 +863,7 @@ fn render_operation_snapshot(
         let message = if cancellable {
             "Refreshing… resize to at least 80x24"
         } else {
-            "Operation in progress… resize to at least 80x24. Q: exit after result"
+            "Applying changes… resize to at least 80x24. Q: exit after result"
         };
         frame.render_widget(
             Paragraph::new(message)
@@ -885,7 +886,7 @@ fn render_operation_snapshot(
         if cancellable {
             "Refreshing"
         } else {
-            "Operation in progress"
+            "Applying changes"
         },
         elapsed.as_secs(),
         if cancellable {
@@ -1360,7 +1361,6 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                 );
             }
             Screen::WifiStations => wifi_stations::handle_key(app, KeyCode::Up, client).await,
-            Screen::Provisioning => provisioning::handle_key(app, KeyCode::Up, client).await,
             Screen::RouterHealth => router_health::handle_key(app, KeyCode::Up, client).await,
             Screen::DaemonLogs => daemon_logs::handle_key(app, KeyCode::Up, client).await,
             Screen::DhcpClient => dhcp_client::move_selection(app, false),
@@ -1399,7 +1399,6 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                 interfaces::set_interface_selection(app, interfaces::interface_selection(app) + 1);
             }
             Screen::WifiStations => wifi_stations::handle_key(app, KeyCode::Down, client).await,
-            Screen::Provisioning => provisioning::handle_key(app, KeyCode::Down, client).await,
             Screen::RouterHealth => router_health::handle_key(app, KeyCode::Down, client).await,
             Screen::DaemonLogs => daemon_logs::handle_key(app, KeyCode::Down, client).await,
             Screen::DhcpClient => dhcp_client::move_selection(app, true),
@@ -1590,7 +1589,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp, direct: bool) {
         lines.extend([
             Line::from(""),
             Line::from("First setup: Interfaces (LAN IP + Output role), then DHCP Server,"),
-            Line::from("then Router > Internet sharing (LAN through WAN)."),
+            Line::from("then Route > Internet sharing (LAN through WAN)."),
             Line::from("Verify connectivity before committing each tentative change."),
         ]);
         frame.render_widget(
@@ -1649,13 +1648,14 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp, direct: bool) {
         Screen::Router => router::render_router(frame, chunks[1], app),
         Screen::RouterHealth => router_health::render(frame, chunks[1], app),
         Screen::RouterSettings => router_settings::render(frame, chunks[1], app),
-        Screen::Provisioning => provisioning::render(frame, chunks[1], app),
         Screen::RouteEditor => router::render_route_editor(frame, chunks[1], app),
         Screen::RouterPlan => router::render_router_plan(frame, chunks[1], app),
         Screen::RouterPending => router::render_router_pending(frame, chunks[1], app),
         Screen::Forwarding => forwarding::render(frame, chunks[1], app),
         Screen::PortForwarding => port_forwarding::render(frame, chunks[1], app),
-        Screen::Vpn => vpn::render_vpn(frame, chunks[1], app),
+        Screen::Vpn | Screen::VpnProfile | Screen::VpnSettings => {
+            vpn::render_vpn(frame, chunks[1], app)
+        }
         Screen::VpnImport => vpn::render_vpn_import(frame, chunks[1], app),
         Screen::VpnPolicy => vpn_policy::render_vpn_policy(frame, chunks[1], app),
         Screen::Wifi => wifi::render_wifi(frame, chunks[1], app),
@@ -1688,11 +1688,10 @@ fn focus_action_slot(app: &mut TuiApp, slot: usize) {
         Screen::WifiStations => wifi_stations::focus_action(app, slot),
         Screen::Router => router::focus_action(app, slot),
         Screen::RouterSettings => router_settings::focus_action(app, slot),
-        Screen::Provisioning => provisioning::focus_action(app, slot),
         Screen::Forwarding => forwarding::focus_action(app, slot),
         Screen::PortForwarding => port_forwarding::focus_action(app, slot),
         Screen::RouteEditor => router::focus_route_editor_action(app, slot),
-        Screen::Vpn => vpn::focus_action(app, slot),
+        Screen::Vpn | Screen::VpnProfile | Screen::VpnSettings => vpn::focus_action(app, slot),
         Screen::VpnPolicy => vpn_policy::focus_action(app, slot),
         Screen::WifiEditor => wifi::focus_editor_action(app, slot),
         Screen::WifiApProfiles => {
@@ -1874,13 +1873,14 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
         Screen::Router => router::handle_router_key(app, key, client).await,
         Screen::RouterHealth => router_health::handle_key(app, key, client).await,
         Screen::RouterSettings => router_settings::handle_key(app, key, client).await,
-        Screen::Provisioning => provisioning::handle_key(app, key, client).await,
         Screen::RouteEditor => router::handle_route_editor_key(app, key, client).await,
         Screen::RouterPlan => router::handle_router_plan_key(app, key, client).await,
         Screen::RouterPending => router::handle_router_pending_key(app, key, client).await,
         Screen::Forwarding => forwarding::handle_key(app, key, client).await,
         Screen::PortForwarding => port_forwarding::handle_key(app, key),
-        Screen::Vpn => vpn::handle_vpn_key(app, key, client).await,
+        Screen::Vpn | Screen::VpnProfile | Screen::VpnSettings => {
+            vpn::handle_vpn_key(app, key, client).await
+        }
         Screen::VpnImport => vpn::handle_vpn_import_key(app, key, client).await,
         Screen::VpnPolicy => vpn_policy::handle_vpn_policy_key(app, key, client).await,
         Screen::Wifi => wifi::handle_wifi_key(app, key, client).await,

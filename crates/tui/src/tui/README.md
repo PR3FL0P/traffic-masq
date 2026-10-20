@@ -9,13 +9,13 @@
 
 The `crates/tui/src/tui` module implements the interactive terminal client binary (`traffic-masq`) built on top of [Ratatui](https://github.com/ratatui/ratatui) and [Crossterm](https://github.com/crossterm-rs/crossterm).
 
-The TUI serves as the primary operational console for the `traffic-masq` networking suite, allowing network operators to configure network interfaces, uplink DHCP clients, DHCP servers, Wi-Fi access points, Wi-Fi client connections, WireGuard VPN tunnels, and router provisioning without losing access to remote machines.
+The TUI serves as the primary operational console for the `traffic-masq` networking suite, allowing network operators to configure network interfaces, uplink DHCP clients, DHCP servers, Wi-Fi access points, Wi-Fi client connections, WireGuard VPN tunnels, and routing without losing access to remote machines.
 
 ### Key Operating Modes
 
 1. **Daemon Mode (Default):**
    - Communicates with `traffic-masqd` over a local Unix domain socket (`/run/traffic-masq/traffic-masqd.sock`) or verified HTTPS (`--server` / `--connection`).
-   - Fully interactive: supports all tabs (Interfaces, DHCP Server, DHCP Client (configurable in Settings), Router, VPN, Wi-Fi, Settings, Logs).
+   - Fully interactive: supports all tabs (Interfaces, DHCP Server, DHCP Client (configurable in Settings), Route, VPN, Wi-Fi, Settings, Logs).
    - Authenticated via shared device password; supports secure session caching in `$XDG_STATE_HOME`.
    - Interface/router applies, Wi-Fi client Connect, AP provisioning/profile activation, and operator-triggered Wi-Fi deactivation use commit-confirm rollback timers; standalone DHCP, Wi-Fi runtime controls such as reconnect/reload/passphrase updates, and VPN mutations apply immediately and rely on daemon-side ownership recovery.
 
@@ -40,14 +40,13 @@ The TUI serves as the primary operational console for the `traffic-masq` network
 | [`dhcp.rs`](dhcp.rs) | Downstream DHCP server configuration per interface, pool range validation, DNS settings, active lease viewer. | `DhcpEditor`, `DhcpField`, `DhcpLeasesView` |
 | [`dhcp_client_editor.rs`](dhcp_client_editor.rs) | Saved DHCP client policy editor; immediate apply with error-preserving draft. | `Editor` |
 | [`wifi_stations.rs`](wifi_stations.rs) | AP station inventory, active DHCP lease correlation and confirmed deauthentication. | `View` |
-| [`provisioning.rs`](provisioning.rs) | Three-step whole-router Wi-Fi setup, complete replacement review and router confirmation flow. | `Wizard` |
 | [`dhcp_client.rs`](dhcp_client.rs) | Uplink DHCP client supervision view with interface-name-based selection, scrolling, lease renewal/release, and defaults configuration. | `render`, `refresh`, `handle_key` |
 | [`router/mod.rs`](router/mod.rs) | Router façade and shared state; route editing, controller/API orchestration, rendering, pending transaction views, and tests are split into `router/` submodules. | `RouterData`, `RouteEditorField`, `RouterPendingView`, `render_router` |
 | [`wifi/mod.rs`](wifi/mod.rs) | Wi-Fi façade and shared state/model mapping; owns radio list behavior and re-exports screen handlers. | `WifiData`, `WifiRole`, `WifiEditor`, `WifiScanPicker`, `WifiProfileEditor`, `WifiConnectPrompt` |
 | [`wifi/ap_profiles.rs`](wifi/ap_profiles.rs) | Saved AP profile menu, library, edit/delete/apply actions and deletion confirmation. | `WifiApProfilesView`, `open_ap_profiles`, `render_wifi_ap_profiles` |
 | [`wifi/`](wifi) | Wi-Fi screen implementations split by responsibility: AP editor, scan picker, saved profiles, profile editor, connect/IP prompt, and Wi-Fi-specific tests. | `ap_editor`, `scan`, `profiles`, `profile_editor`, `ap_profiles`, `connect` |
 | [`vpn.rs`](vpn.rs) | WireGuard VPN profile management, connection lifecycle, configuration import wizard, deletion confirmation. | `VpnData`, `VpnFocus`, `VpnImportEditor` |
-| [`vpn_policy.rs`](vpn_policy.rs) | Policy routing rules for WireGuard (routing marks, table IDs, client bypass policies). | `VpnPolicyData`, `VpnPolicyEditor` |
+| [`vpn_policy.rs`](vpn_policy.rs) | Immediate standalone Direct/VPN policy, entered from Route; separate from the global chain and router draft. | `VpnPolicyData`, `VpnPolicyField` |
 | [`settings.rs`](settings.rs) | Daemon configuration, rollback timeout settings, session preferences, device password update wizard, security override reset. | `SecurityEditor`, `SettingsField`, `PasswordChangeEditor` |
 | [`access.rs`](access.rs) | Remote HTTPS access configuration (TLS listen socket, certificate and private key file paths). | `AccessEditor`, `AccessField` |
 | [`daemon_logs.rs`](daemon_logs.rs) | Bounded daemon log snapshots, severity/text filters, pause/follow and private export. | `View` |
@@ -85,7 +84,7 @@ In a terminal application, performing long-running network operations directly i
 1. **Non-blocking Polling Loop:** While awaiting a future (e.g. an API request or background status poll), `drive_ui` sleeps in 50ms intervals using `tokio::select!`.
 2. **Snapshot-Based Progress Rendering:** On each 50ms tick, if an operation takes longer than 500ms, `render_operation_snapshot` draws a subtle progress banner:
    - Cancellable reads: `"Refreshing Xs. Displayed data may be stale; input interrupts refresh"`
-   - Non-cancellable writes: `"Operation in progress Xs; rollback deadline in Ys. Q: exit after result; other actions disabled"`
+   - Non-cancellable writes: `"Applying changes Xs; rollback deadline in Ys. Q: exit after result; other actions disabled"`
 3. **Cancellable vs. Non-Cancellable Operations:**
    - **Reads/Refreshes (`cancellable = true`):** If the user presses any key during a background refresh, the future is dropped immediately, returning the input event so the operator's action is processed without latency.
    - **Mutations/Applies (`cancellable = false`):** The TUI never cancels or retries network mutations. Ctrl+C also queues an exit until the response arrives. The client waits up to 65 seconds while the HTTP connection has a 60-second deadline. Admitted operations can continue beyond either deadline; a timeout leaves the outcome unknown and requires inspecting pending/current state. The UI permits pressing `q` to queue an exit after the response arrives, but blocks other inputs.
@@ -103,8 +102,8 @@ Because misconfiguring an IP address or firewall rule can sever SSH access, inte
    - Pressing **Enter** sends a commit request, making the change permanent.
    - Pressing **Esc** sends a rollback request; completion must be verified.
    - If the connection drops or the operator does not respond, expiry schedules daemon rollback. Admitted operations, retry cycles and commit uncertainty can delay or fence recovery; inspect pending state. See the [timing contract](../../../../docs/architecture.md#commit-uncertainty-and-confirmation-timing).
-   - If rollback itself fails, the router pending screen switches to recovery mode: commit is removed, the `TM-REC-207` notice and individual failures are shown, **Enter** retries rollback, and **Esc** returns to the Router screen without discarding recovery state.
-   - On the Router screen, degraded recovery shows the recovery code, invariant, blocked operation, action and runbook. Press **r** to retry a failed rollback; for `TM-REC-208` journal-cleanup-pending, cleanup retries automatically and **r** refreshes status.
+   - If rollback itself fails, the router pending screen switches to recovery mode: commit is removed, the `TM-REC-207` notice and individual failures are shown, **Enter** retries rollback, and **Esc** returns to the Route screen without discarding recovery state.
+   - On the Route screen, degraded recovery shows the recovery code, invariant, blocked operation, action and runbook. Press **r** to retry a failed rollback; for `TM-REC-208` journal-cleanup-pending, cleanup retries automatically and **r** refreshes status.
 3. **Disconnect Handling:** If the daemon becomes unreachable while on a pending screen, the TUI retains the pending change state and warns the operator that the outcome is unverified rather than falsely claiming success.
 
 Standalone DHCP, Wi-Fi runtime controls such as reconnect/reload/passphrase updates, and VPN actions do not enter these pending screens and do not expose a commit timer. Live operator-triggered AP/client deactivation enters the pending-change screen. For an absent adapter, cleanup and durable intent saving return without a timer. Immediate mutations rely on the daemon's durable ownership/recovery mechanisms rather than TUI rollback state.
@@ -136,7 +135,7 @@ draft. Uplink/VPN-chain edits still require live router execution.
 ### 3.3. Screen and Section State Machine
 
 Navigation is structured around 9 top-level **Sections** represented by the top tab bar:
-`Dashboard` $\to$ `Interfaces` $\to$ `Dhcp` $\to$ `DhcpClient` $\to$ `Router` $\to$ `Vpn` $\to$ `Wifi` $\to$ `Settings` $\to$ `Log`.
+`Dashboard` $\to$ `Interfaces` $\to$ `Dhcp` $\to$ `DhcpClient` $\to$ `Route` $\to$ `Vpn` $\to$ `Wifi` $\to$ `Settings` $\to$ `Log`.
 
 - Every fine-grained `Screen` maps to its parent `Section` via `section_of(Screen)`.
 - Left/Right arrows cycle through sections **only** when not currently editing an input field or trapped in a modal sub-flow.
@@ -355,27 +354,29 @@ Independent status reads preserve partial results and label unavailable data exp
 
 The traffic view uses the original per-interface headers and independently scaled RX/TX graphs. Areas shorter than 14 rows use compact one-line rows. Lists scroll with selection in both layouts. Statistics wrap by grapheme width and use PgUp/PgDn to expose all rows. Aggregate counters are explicitly identified as sums, not Internet usage. VPN interface/policy status does not imply a successful handshake or connectivity probe.
 
-### Rebuilding the documentation walkthrough
+### Form navigation and router draft feedback
 
-The ignored recorder runs a single live TUI session against a stateful local mock
-API. It sends only keyboard events through the production input handlers,
-polls status in the background, and captures the rendered terminal every 50 ms.
-It records typing, focus, scrolling and real countdown updates;
-it never replaces screens or editor values to stage individual screenshots.
-The mock API keeps all network changes inside the recording process.
+Enter advances text inputs; on choices it changes the value, and on actions it
+executes the action. VPN file import submits from the path field and password
+changes submit from the confirmation field. Tab/Shift+Tab only move focus.
+Settings duration fields can be edited by typing digits; Enter advances focus.
 
-The session uses 120×30 cells. Recording takes about two minutes in real time.
-The Pillow renderer keeps the recorded frame durations and draws a normal
-16-pixel monospace font, with keyboard input hints and no mouse pointer:
+Router edits explicitly report that a draft has not been applied. Applying
+changes shows progress, temporary application waits for confirmation with a
+rollback timer, and successful confirmation reports that changes are applied
+and saved. The complete-plan review and commit-confirm guard remain required.
+Port forwarding lists wrap whole rules, including destination/source restrictions,
+with equal-height mouse rows. Port forwarding and sharing validation associates
+local errors with fields, moves focus to them, and renders the error next to the
+input. Conflicts between rules remain form errors. Editable wrapped rows preserve
+cursor and error styling with `layout::wrap_styled_lines`.
 
-```sh
-TRAFFIC_MASQ_DEMO_DIR=/tmp/traffic-masq-recording cargo test -p traffic-masq-tui --lib export_walkthrough -- --ignored --nocapture
-python3 packaging/render-tui-demo.py /tmp/traffic-masq-recording docs/media/tui-demo.gif
-```
+### VPN profile and Route boundary
 
-`timeline.json` contains the frame durations and chapter timestamps; identical
-consecutive frames share a duration. The generator updates the GIF chapter index.
-Use `--preview-dir /tmp/tui-preview` to inspect PNG frames, or `--video /tmp/tui.mp4`
-to also encode a continuous 20-fps MP4 with ffmpeg. A directory of standalone
-screenshots is not accepted as a recording. Keep the recording directory specific
-to this run.
+VPN lists profile summaries and standalone state. Enter opens a profile card;
+connect/disconnect is explicit, deletion is in the card, and subsystem availability
+is in VPN settings. Refresh preserves selection by profile name and distinguishes
+unavailable observations from inactive tunnels. Saved chain membership and local
+Route drafts are labelled separately from runtime state. Standalone traffic policy
+is entered from Route, while the global chain continues to use the shared router
+draft and confirmation flow. See the [architecture contract](../../../../docs/vpn-ui-architecture.md).

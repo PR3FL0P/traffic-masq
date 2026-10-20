@@ -11,7 +11,7 @@ async fn editor_uses_saved_address_even_when_dashboard_is_empty() {
             serde_json::json!({"type": "dhcp_config", "interface": "lan0", "spec": null}),
             serde_json::json!({"type": "interface_config", "interface": "lan0",
                 "allow_management_change": false,
-                "config": {"managed": true, "role": "output", "ipv4": "192.168.50.128/24", "nat": true}}),
+                "config": {"managed": true, "role": "output", "ipv4": "192.168.50.128/24"}}),
         ] {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = Vec::new();
@@ -303,7 +303,7 @@ async fn missing_dhcp_editor_saves_revision_checked_intent_without_live_apply() 
             assert_eq!(body["type"], "save_interface_config");
             assert_eq!(body["interface"], "usb0");
             assert_eq!(body["expected_revision"], 42);
-            assert_eq!(body["config"]["nat"], false);
+            assert!(body["config"].get("nat").is_none());
             assert_eq!(body["config"]["dhcp"]["pool_start"], "192.168.50.10");
             let response = serde_json::json!({"type": "interface_intent_saved", "interface": "usb0", "revision": 43, "deferred": true, "missing_dependencies": ["usb0"]});
             Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(Bytes::from(response.to_string()))))
@@ -318,7 +318,6 @@ async fn missing_dhcp_editor_saves_revision_checked_intent_without_live_apply() 
         dhcp_client: None,
         wifi: None,
         wifi_client: None,
-        nat: false,
     };
     let mut app = TuiApp {
         screen: Screen::DhcpEditor,

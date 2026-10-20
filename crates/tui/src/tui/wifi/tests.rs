@@ -1973,7 +1973,6 @@ fn configured_network_role_determines_wifi_role_before_activation() {
         dhcp_client: None,
         wifi: None,
         wifi_client: None,
-        nat: false,
     };
     assert_eq!(configured_role(Some(&config)), WifiRole::Client);
     config.role = InterfaceRole::Output;
@@ -2111,7 +2110,7 @@ async fn control_o_submits_wifi_connection_from_any_field() {
 fn saved_missing_ap_opens_editor_without_fake_runtime_and_unknown_is_distinct() {
     let config: traffic_masq_protocol::InterfaceConfigView =
         serde_json::from_value(serde_json::json!({
-            "role": "output", "managed": true, "ipv4": "192.168.50.1/24", "nat": true,
+            "role": "output", "managed": true, "ipv4": "192.168.50.1/24",
             "wifi": {"ssid": "saved-ap", "security": "wpa2", "channel": 11, "hidden": true}
         }))
         .unwrap();

@@ -51,9 +51,32 @@ const VPN_POLICY_APPLY_LABEL: &str = "Apply selected mode";
 const VPN_POLICY_CLEAR_LABEL: &str = "Clear override";
 const VPN_POLICY_RELOAD_LABEL: &str = "Reload";
 
+/// This legacy mode is a separate immediate operation, never part of a router draft.
+pub(crate) async fn open(app: &mut TuiApp, client: &ApiClient) {
+    match client.request(&Request::GetRouterConfig).await {
+        Ok(Response::RouterConfig { config }) if config.vpn_chain.is_empty() => {}
+        Ok(Response::RouterConfig { .. }) => {
+            app.push_message(LogLevel::Warn, "A global VPN chain is configured; manage traffic through Uplink / VPN. Standalone policy is unavailable.");
+            return;
+        }
+        _ => {
+            app.push_message(
+                LogLevel::Warn,
+                "Saved VPN chain usage unavailable; refresh Route before opening standalone policy",
+            );
+            return;
+        }
+    }
+    load_vpn_policy_data(app, client).await;
+    app.screen = Screen::VpnPolicy;
+}
+
 pub(crate) fn render_vpn_policy(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
     let data = &app.vpn_policy;
-    let mut lines = Vec::new();
+    let mut lines = vec![
+        Line::styled("Standalone policy (tm-wg0): applies immediately, outside the Route draft.", Style::default().fg(theme::WARN)),
+        Line::from("Unavailable with a saved global VPN chain. Tunnel up does not prove traffic protection."),
+    ];
     let stale = data.read_error.is_some() || data.error.is_some();
     if let Some(error) = &data.read_error {
         lines.extend(
@@ -84,7 +107,7 @@ pub(crate) fn render_vpn_policy(frame: &mut ratatui::Frame<'_>, area: Rect, app:
                 Style::default().fg(theme::MUTED),
             ));
         }
-        let block = panel("VPN traffic policy");
+        let block = panel("Standalone VPN policy — immediate");
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let regions = ratatui::layout::Layout::vertical([
@@ -231,7 +254,7 @@ pub(crate) fn render_vpn_policy(frame: &mut ratatui::Frame<'_>, area: Rect, app:
         Line::styled(format!("{marker}{label}"), style)
     };
 
-    let block = panel("VPN traffic policy");
+    let block = panel("Standalone VPN policy — immediate");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let chunks = ratatui::layout::Layout::vertical([
@@ -282,14 +305,14 @@ pub(crate) async fn handle_vpn_policy_key(app: &mut TuiApp, key: KeyCode, client
     if app.vpn_policy.status.is_none() {
         app.vpn_policy.field = VpnPolicyField::Reload;
         match key {
-            KeyCode::Esc => app.screen = Screen::Vpn,
+            KeyCode::Esc => app.screen = Screen::Router,
             KeyCode::Enter => load_vpn_policy_data(app, client).await,
             _ => {}
         }
         return;
     }
     match key {
-        KeyCode::Esc => app.screen = Screen::Vpn,
+        KeyCode::Esc => app.screen = Screen::Router,
         KeyCode::Up => {
             app.vpn_policy.field = previous_vpn_policy_field(app.vpn_policy.field);
         }
@@ -408,7 +431,7 @@ fn format_mode(mode: VpnPolicyMode) -> &'static str {
 fn describe_vpn_policy_error(detail: &VpnPolicyErrorDetail) -> String {
     match detail {
         VpnPolicyErrorDetail::VpnDisabled => {
-            "VPN is not enabled (vpn.enabled is false in the daemon config)".to_string()
+            "VPN is disabled; enable it in VPN settings".to_string()
         }
         VpnPolicyErrorDetail::NoProtectedSubnets => {
             "No router uplink or managed output subnet to protect; configure the router first"

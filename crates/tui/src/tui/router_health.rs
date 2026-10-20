@@ -110,7 +110,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
     }
     if app.router.staged {
         lines.push(Line::from(
-            "Draft retained. Apply or discard it in Router before repair.",
+            "Draft retained. Apply or discard it in Route before repair.",
         ));
     }
     if let Some(status) = &view.status {
@@ -155,7 +155,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
             lines.push(Line::from("Repair requires fresh degraded status, enabled routing, no draft and an idle coordinator."));
             if status.coordinator != CoordinatorStatus::Idle {
                 lines.push(Line::from(
-                    "Return to Router to resolve the pending transaction or recovery first.",
+                    "Return to Route to resolve the pending transaction or recovery first.",
                 ));
             }
         }

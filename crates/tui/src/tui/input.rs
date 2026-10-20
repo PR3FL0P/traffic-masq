@@ -341,3 +341,29 @@ pub(crate) fn render_masked_with_cursor(
 
 #[cfg(test)]
 mod tests;
+
+/// Local validation keeps field errors separate from conflicts involving the whole form.
+#[derive(Debug, Clone)]
+pub(crate) struct FormError<F> {
+    pub(crate) field: Option<F>,
+    pub(crate) message: String,
+}
+impl<F> FormError<F> {
+    pub(crate) fn field(field: F, message: impl Into<String>) -> Self {
+        Self {
+            field: Some(field),
+            message: message.into(),
+        }
+    }
+    pub(crate) fn form(message: impl Into<String>) -> Self {
+        Self {
+            field: None,
+            message: message.into(),
+        }
+    }
+}
+impl<F> std::fmt::Display for FormError<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}

@@ -22,7 +22,6 @@ use traffic_masq_protocol::{RouterConfigView, UplinkConfigView, UplinkMode, VpnH
 enum Field {
     Uplink,
     Mode,
-    Forwarding,
     Profile,
     Add,
     Hop,
@@ -34,10 +33,9 @@ enum Field {
     Review,
     Cancel,
 }
-const FIELDS: [Field; 13] = [
+const FIELDS: [Field; 12] = [
     Field::Uplink,
     Field::Mode,
-    Field::Forwarding,
     Field::Profile,
     Field::Add,
     Field::Hop,
@@ -56,7 +54,6 @@ pub(crate) struct Editor {
     exit_requested: bool,
     uplink: String,
     mode: UplinkMode,
-    global: bool,
     profiles: Vec<String>,
     profile: usize,
     hop: usize,
@@ -77,7 +74,6 @@ impl Editor {
                 .as_ref()
                 .map(|u| u.mode)
                 .unwrap_or(UplinkMode::External),
-            global: config.forwarding.is_none(),
             original: config.clone(),
             config,
             exit_requested: false,
@@ -105,12 +101,8 @@ impl Editor {
                     .uplink
                     .as_ref()
                     .map_or(UplinkMode::External, |uplink| uplink.mode)
-            || self.global != self.original.forwarding.is_none()
     }
     fn candidate(&self) -> Result<RouterConfigView, &'static str> {
-        if !self.global && !self.config.vpn_chain.is_empty() {
-            return Err("VPN chains require Global uplink sharing. Remove the chain or explicitly select that mode.");
-        }
         if self.uplink.trim().is_empty() && !self.config.vpn_chain.is_empty() {
             return Err("VPN chain requires a physical uplink");
         }
@@ -125,11 +117,6 @@ impl Editor {
                 interface: self.uplink.trim().into(),
                 mode: self.mode,
             })
-        };
-        config.forwarding = if self.global {
-            None
-        } else {
-            Some(config.forwarding.unwrap_or_default())
         };
         Ok(config)
     }
@@ -155,14 +142,6 @@ impl Editor {
         match field {
             Field::Uplink => "Physical uplink (blank = none): ".into(),
             Field::Mode => format!("Uplink addressing: {:?}", self.mode),
-            Field::Forwarding => format!(
-                "Sharing mode: {}",
-                if self.global {
-                    "Global uplink / VPN chain"
-                } else {
-                    "Explicit Internet sharing rules"
-                }
-            ),
             Field::Profile => format!(
                 "Profile to add: {}",
                 self.profiles
@@ -266,13 +245,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
     let block = panel("Router uplink and VPN chain");
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let note = if e.global && e.config.forwarding.is_some() {
-        "Global mode REPLACES explicit sharing rules; managed NAT outputs use uplink."
-    } else if !e.global && e.config.forwarding.is_none() {
-        "Explicit mode starts with NO sharing rules; add rules in Internet sharing."
-    } else {
-        "External: unmanaged Input. DHCP: managed Input with DHCP client enabled."
-    };
+    let note = "Sharing requires explicit rules in Internet sharing; uplink and VPN add no rules.";
     let heading = vec![
         Line::styled(note, Style::default().fg(theme::WARN)),
         Line::from("Chain order: physical uplink -> hop 1 -> ... -> last hop -> LAN."),
@@ -355,7 +328,6 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClien
                     UplinkMode::External
                 }
             }
-            Field::Forwarding => e.global = !e.global,
             Field::Profile => {
                 if !e.profiles.is_empty() {
                     e.profile = (e.profile + 1) % e.profiles.len();
@@ -367,13 +339,6 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClien
                 }
             }
             Field::Add => {
-                if !e.global {
-                    app.push_message(
-                        LogLevel::Warn,
-                        "Select Global uplink sharing explicitly before adding a VPN chain",
-                    );
-                    return;
-                }
                 if let Some(name) = e.profiles.get(e.profile) {
                     e.config.vpn_chain.push(VpnHopConfigView {
                         profile_name: name.clone(),
@@ -437,10 +402,14 @@ pub(crate) fn plan_lines(
         format!("Configured physical uplink: {}", uplink(current)),
         format!(
             "Sharing policy: {}",
-            if current.forwarding.is_some() {
+            if current
+                .forwarding
+                .as_ref()
+                .is_some_and(|rules| !rules.is_empty())
+            {
                 "explicit rules"
             } else {
-                "global uplink / VPN chain"
+                "no forwarding permissions"
             }
         ),
     ];
@@ -448,13 +417,15 @@ pub(crate) fn plan_lines(
         if previous.uplink != current.uplink {
             lines.push(format!("Previous physical uplink: {}", uplink(previous)));
         }
-        if previous.forwarding.is_some() && current.forwarding.is_none() {
-            lines.push(
-                "REPLACE explicit sharing with global sharing for managed NAT outputs:".into(),
-            );
-            for rule in previous.forwarding.iter().flatten() {
+        for rule in previous.forwarding.iter().flatten() {
+            if !current
+                .forwarding
+                .iter()
+                .flatten()
+                .any(|current| current == rule)
+            {
                 lines.push(format!(
-                    "  Removed share: {} -> {} ({:?})",
+                    "Removed share: {} -> {} ({:?})",
                     rule.from, rule.to, rule.source_subnet
                 ));
             }
@@ -489,9 +460,14 @@ pub(crate) fn plan_lines(
 mod tests {
     use super::*;
     #[test]
-    fn chain_requires_explicit_mode_choice_and_preserves_other_configuration() {
+    fn chain_editor_preserves_explicit_forwarding_and_other_configuration() {
         let config = RouterConfigView {
-            forwarding: Some(vec![]),
+            forwarding: Some(vec![traffic_masq_protocol::ForwardingConfigView {
+                from: "lan0".into(),
+                to: "wan0".into(),
+                source_subnet: None,
+                masquerade: true,
+            }]),
             allow_default_route_change: true,
             vpn_chain: vec![
                 VpnHopConfigView {
@@ -503,16 +479,15 @@ mod tests {
             ],
             ..Default::default()
         };
+        let forwarding = config.forwarding.clone();
         let mut e = Editor::new(config, vec![]);
         e.uplink = "wan0".into();
-        assert!(e.candidate().is_err());
-        e.global = true;
         e.move_hop(true);
         assert_eq!(e.config.vpn_chain[0].profile_name, "b");
         e.remove_hop();
         assert_eq!(e.config.vpn_chain.len(), 1);
         let candidate = e.candidate().unwrap();
-        assert!(candidate.forwarding.is_none());
+        assert_eq!(candidate.forwarding, forwarding);
         assert!(candidate.allow_default_route_change);
         assert_eq!(candidate.uplink.unwrap().interface, "wan0");
     }

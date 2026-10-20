@@ -201,7 +201,7 @@ pub(crate) fn render_header(
             Section::Interfaces => "Ifaces",
             Section::Dhcp => "DHCP-S",
             Section::DhcpClient => "DHCP-C",
-            Section::Router => "Router",
+            Section::Router => "Route",
             Section::Vpn => "VPN",
             Section::Wifi => "Wi-Fi",
             Section::Settings => "Settings",
@@ -352,7 +352,7 @@ pub(crate) fn help_pairs(app: &TuiApp) -> Vec<(&'static str, &'static str)> {
     } else if app.screen == Screen::Router && app.router.recovery_blocks_mutations() {
         vec![
             ("r", "recovery action"),
-            ("1/2/3", "router section"),
+            ("1/2/3/4", "route section"),
             ("↑/↓", "move"),
             ("Tab", "focus"),
             ("Enter", "activate"),
@@ -393,7 +393,20 @@ pub(crate) fn screen_help_pairs(screen: Screen) -> Vec<(&'static str, &'static s
         Screen::WifiProfiles | Screen::WifiApProfiles => {
             vec![("↑/↓", "move"), ("Enter", "select"), ("Esc", "back")]
         }
-        Screen::InterfaceList | Screen::DhcpInterfaceList | Screen::Vpn => vec![
+        Screen::Vpn => vec![
+            ("↑/↓", "profile"),
+            ("Tab", "actions"),
+            ("Enter", "open profile"),
+            ("r", "refresh"),
+            ("Esc", "back"),
+        ],
+        Screen::VpnProfile | Screen::VpnSettings => vec![
+            ("Arrows/Tab", "action"),
+            ("Enter", "activate"),
+            ("r", "refresh"),
+            ("Esc", "profiles"),
+        ],
+        Screen::InterfaceList | Screen::DhcpInterfaceList => vec![
             ("↑/↓", "move"),
             ("←/→", "section"),
             ("Enter", "select"),
@@ -413,12 +426,6 @@ pub(crate) fn screen_help_pairs(screen: Screen) -> Vec<(&'static str, &'static s
             ("←/→", "section"),
             ("Esc", "back"),
         ],
-        Screen::Provisioning => vec![
-            ("↑/↓", "move/scroll"),
-            ("PgUp/Dn", "review"),
-            ("Enter", "activate"),
-            ("Esc", "back"),
-        ],
         Screen::RouterHealth => vec![
             ("r", "refresh"),
             ("f", "repair"),
@@ -427,9 +434,8 @@ pub(crate) fn screen_help_pairs(screen: Screen) -> Vec<(&'static str, &'static s
         ],
         Screen::Router => vec![
             ("h", "health / repair"),
-            ("w", "Wi-Fi setup"),
             ("u", "uplink / VPN chain"),
-            ("1/2/3", "router section"),
+            ("1/2/3/4", "route section"),
             ("n", "share via route"),
             ("↑/↓", "move"),
             ("t", "topology"),
@@ -460,7 +466,7 @@ pub(crate) fn screen_help_pairs(screen: Screen) -> Vec<(&'static str, &'static s
         Screen::VpnImport | Screen::SettingsPassword => vec![
             ("↑/↓", "field"),
             ("type", "value"),
-            ("Enter", "submit"),
+            ("Enter", "next/submit"),
             ("Esc", "cancel"),
         ],
         Screen::DhcpLeases => vec![
@@ -482,7 +488,7 @@ pub(crate) fn screen_help_pairs(screen: Screen) -> Vec<(&'static str, &'static s
         Screen::Forwarding | Screen::PortForwarding => vec![
             ("↑/↓", "field"),
             ("←/→", "choose"),
-            ("Enter", "select/save"),
+            ("Enter", "next/activate"),
             ("Esc", "cancel"),
         ],
         Screen::PendingChange => vec![("Enter", "activate"), ("Esc", "roll back")],
@@ -605,4 +611,31 @@ pub(crate) fn scroll_change_review(
         _ => return false,
     };
     true
+}
+
+/// Wrap editable rows without losing the cursor or per-field validation styles.
+pub(crate) fn wrap_styled_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    let width = usize::from(width.max(1));
+    let mut output = Vec::new();
+    for line in lines {
+        let mut row = Line::default().style(line.style);
+        let mut used = 0;
+        for span in line.spans {
+            for grapheme in span.content.graphemes(true) {
+                let cells = UnicodeWidthStr::width(grapheme);
+                if used > 0 && used + cells > width {
+                    output.push(row);
+                    row = Line::default().style(line.style);
+                    used = 0;
+                }
+                row.spans
+                    .push(Span::styled(grapheme.to_owned(), span.style));
+                used += cells;
+            }
+        }
+        output.push(row);
+    }
+    output
 }

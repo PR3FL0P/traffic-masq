@@ -64,11 +64,11 @@ fn router_action_cycles_forward_and_backward() {
     );
     assert_eq!(
         action.next().next().next().next().next().next().next(),
-        RouterAction::Setup
+        RouterAction::Policy
     );
 
     assert_eq!(action.prev(), RouterAction::Settings);
-    assert_eq!(action.prev().prev(), RouterAction::Setup);
+    assert_eq!(action.prev().prev(), RouterAction::Policy);
     assert_eq!(action.prev().prev().prev(), RouterAction::Topology);
 }
 
@@ -725,7 +725,7 @@ fn degraded_recovery_marks_router_mutations_as_blocked() {
         buttons[3],
         (RouterAction::PlanApply, "[Apply blocked: recovery]")
     );
-    assert_eq!(buttons[7], (RouterAction::Setup, "[Wi-Fi setup: w]"));
+    assert_eq!(buttons[8], (RouterAction::Settings, "[Uplink / VPN: u]"));
 }
 
 #[tokio::test]
@@ -864,7 +864,7 @@ fn coordinator_status_blocks_mutations_without_structured_notice() {
             buttons[3],
             (RouterAction::PlanApply, "[Apply blocked: recovery]")
         );
-        assert_eq!(buttons[7], (RouterAction::Setup, "[Wi-Fi setup: w]"));
+        assert_eq!(buttons[8], (RouterAction::Settings, "[Uplink / VPN: u]"));
     }
 }
 
@@ -922,7 +922,6 @@ fn summarizes_only_output_interfaces_with_subnet() {
                 dhcp_client: None,
                 wifi: None,
                 wifi_client: None,
-                nat: true,
             },
         },
         RouterInterfaceDesiredView {
@@ -936,7 +935,6 @@ fn summarizes_only_output_interfaces_with_subnet() {
                 dhcp_client: None,
                 wifi: None,
                 wifi_client: None,
-                nat: true,
             },
         },
     ];
@@ -966,11 +964,9 @@ fn summarizes_dhcp_with_known_and_missing_lease_counts() {
 fn summarizes_uplink_for_enabled_and_disabled_dataplane() {
     let enabled = RouterDataplaneTargetView::Enabled(RouterDataplaneDesiredView {
         port_forwards: Vec::new(),
-        forwarding: None,
-        uplink: "wan0".to_string(),
-        outputs: Vec::new(),
+        forwarding: Some(vec![]),
     });
-    assert_eq!(summarize_uplink(&enabled), "wan0");
+    assert_eq!(summarize_uplink(&enabled), "per-connection");
     assert_eq!(
         summarize_uplink(&RouterDataplaneTargetView::Disabled),
         "none (dataplane disabled)"
@@ -987,9 +983,12 @@ fn formats_forwarding_status_reflects_snapshot_target_and_drift() {
         },
         target: RouterDataplaneTargetView::Enabled(RouterDataplaneDesiredView {
             port_forwards: Vec::new(),
-            forwarding: None,
-            uplink: "wan0".to_string(),
-            outputs: Vec::new(),
+            forwarding: Some(vec![ForwardingConfigView {
+                from: "lan0".into(),
+                to: "wan0".into(),
+                source_subnet: None,
+                masquerade: true,
+            }]),
         }),
         requires_apply: true,
     };
@@ -1016,8 +1015,6 @@ fn forwarding_status_does_not_claim_nat_for_non_masqueraded_rules() {
                 to: "wg0".to_string(),
                 masquerade: false,
             }]),
-            uplink: String::new(),
-            outputs: Vec::new(),
         }),
         requires_apply: false,
     };

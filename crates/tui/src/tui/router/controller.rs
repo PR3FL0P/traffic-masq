@@ -15,7 +15,7 @@ pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
         3 => RouterAction::PlanApply,
         4 => RouterAction::ShareViaRoute,
         6 => RouterAction::Topology,
-        7 => RouterAction::Setup,
+        7 => RouterAction::Policy,
         8 => RouterAction::Settings,
         _ => RouterAction::Refresh,
     };
@@ -30,10 +30,6 @@ pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &A
         }
         KeyCode::Char('u') => {
             super::super::router_settings::open(app, client).await;
-            return;
-        }
-        KeyCode::Char('w') => {
-            super::super::provisioning::open(app, client).await;
             return;
         }
         KeyCode::Char('r') if app.router.recovery_blocks_mutations() => {
@@ -179,10 +175,10 @@ pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &A
                     }
                     RouterAction::Refresh => refresh_router_data(app, client).await,
                     RouterAction::Topology => select_pane(app, RouterPane::Topology),
+                    RouterAction::Policy => super::super::vpn_policy::open(app, client).await,
                     RouterAction::Settings => {
                         super::super::router_settings::open(app, client).await
                     }
-                    RouterAction::Setup => super::super::provisioning::open(app, client).await,
                 },
                 _ => {}
             },

@@ -130,12 +130,6 @@ pub(crate) fn render_router_plan(frame: &mut ratatui::Frame<'_>, area: Rect, app
                 )));
             }
         }
-        if preview.baseline.forwarding.is_none()
-            && preview.config.forwarding.is_some()
-            && preview.baseline.uplink.is_some()
-        {
-            lines.push(Line::from("Legacy sharing will use explicit saved rules."));
-        }
         if preview.config.allow_default_route_change {
             lines.push(Line::styled(
                 "Default route changes are permitted.",
@@ -308,7 +302,14 @@ pub(crate) fn render_router_plan(frame: &mut ratatui::Frame<'_>, area: Rect, app
     ));
     lines.push(Line::from(""));
 
-    let block = panel("Router · Review changes");
+    lines.insert(
+        0,
+        Line::styled(
+            "Draft — not applied. Apply temporarily, then confirm to save.",
+            Style::default().fg(theme::WARN),
+        ),
+    );
+    let block = panel("Route · Review changes");
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -437,7 +438,7 @@ pub(crate) async fn open_router_plan(app: &mut TuiApp, client: &ApiClient) {
                 .editor_revision
                 .is_some_and(|editor_revision| editor_revision != revision)
             {
-                app.push_message(LogLevel::Error, "Router configuration changed while editing; draft retained. Press c in Router to discard and reload before saving.");
+                app.push_message(LogLevel::Error, "Router configuration changed while editing; draft retained. Press c in Route to discard and reload before saving.");
                 return;
             }
             if device_readiness == traffic_masq_protocol::InterfaceReadiness::Unknown {

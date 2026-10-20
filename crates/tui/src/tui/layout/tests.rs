@@ -100,3 +100,24 @@ fn narrow_footer_keeps_action_meanings() {
     assert!(text.contains("Esc:back"));
     assert!(text.contains("Ctrl+K:all keys"));
 }
+
+#[test]
+fn wrapping_form_rows_preserves_cursor_style_and_graphemes() {
+    let cursor = Style::default()
+        .bg(theme::SELECTED_BG)
+        .fg(theme::SELECTED_FG);
+    let rows = wrap_styled_lines(
+        vec![Line::from(vec![
+            Span::raw("ab界"),
+            Span::styled("e\u{301}", cursor),
+            Span::raw("cd"),
+        ])],
+        4,
+    );
+    assert_eq!(
+        rows.iter().map(Line::to_string).collect::<Vec<_>>(),
+        ["ab界", "e\u{301}cd"]
+    );
+    assert_eq!(rows[1].spans[0].content, "e\u{301}");
+    assert_eq!(rows[1].spans[0].style, cursor);
+}

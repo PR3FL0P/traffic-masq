@@ -22,6 +22,7 @@ fn editor() -> ForwardingEditor {
         cursor: 15,
         field: Field::Save,
         error: None,
+        error_field: None,
     }
 }
 
@@ -300,7 +301,7 @@ fn sharing_sections_and_controls_fit_small_and_large_terminals() {
 }
 
 #[tokio::test]
-async fn legacy_sharing_can_be_read_and_edited_from_saved_settings_without_devices() {
+async fn explicit_sharing_can_be_edited_from_saved_settings_without_devices() {
     use traffic_masq_protocol::{
         InterfaceConfigSource, InterfaceConfigView, InterfaceInventoryEntry, InterfacePresence,
         InterfaceReadiness,
@@ -325,7 +326,6 @@ async fn legacy_sharing_can_be_read_and_edited_from_saved_settings_without_devic
             dhcp_client: None,
             wifi: None,
             wifi_client: None,
-            nat: true,
         }),
         config_source: InterfaceConfigSource::Base,
         presence: InterfacePresence::Missing,
@@ -335,6 +335,13 @@ async fn legacy_sharing_can_be_read_and_edited_from_saved_settings_without_devic
         blockers: vec![],
         references: vec![],
     });
+    assert!(displayed_rules(&app.router).unwrap().is_empty());
+    app.router.proposed_router_config.forwarding = Some(vec![ForwardingConfig {
+        from: "unplugged_lan".into(),
+        to: "unplugged_wan".into(),
+        source_subnet: Some("192.168.50.0/24".parse().unwrap()),
+        masquerade: true,
+    }]);
     let rules = displayed_rules(&app.router).unwrap();
     assert_eq!(rules.len(), 1);
     assert_eq!(rules[0].from, "unplugged_lan");
@@ -356,4 +363,39 @@ async fn legacy_sharing_can_be_read_and_edited_from_saved_settings_without_devic
     .await;
     assert_eq!(app.router.proposed_router_config.forwarding, Some(rules));
     assert!(app.router.proposed_router_config.is_active());
+}
+
+#[tokio::test]
+async fn source_error_focuses_input_and_enter_can_reach_save_after_correction() {
+    let mut e = editor();
+    e.source = "192.168.10.3/24".into();
+    let mut app = TuiApp {
+        screen: Screen::Forwarding,
+        forwarding: Some(e),
+        ..Default::default()
+    };
+    let client = ApiClient::new("/must-not-connect");
+    handle_key(&mut app, KeyCode::Enter, &client).await;
+    assert_eq!(app.forwarding.as_ref().unwrap().field, Field::Source);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| super::super::render(f, &mut app, false))
+        .unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect();
+    assert!(text.contains("Source subnet must have no host bits"));
+    let e = app.forwarding.as_mut().unwrap();
+    e.source = "192.168.10.0/24".into();
+    e.cursor = e.source.len();
+    handle_key(&mut app, KeyCode::Enter, &client).await;
+    assert_eq!(app.forwarding.as_ref().unwrap().field, Field::Save);
+    assert!(!app.router.staged);
+    handle_key(&mut app, KeyCode::Enter, &client).await;
+    assert!(app.router.staged);
+    assert!(app.message.as_deref().unwrap().contains("not applied"));
 }

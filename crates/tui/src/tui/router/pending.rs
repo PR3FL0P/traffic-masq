@@ -45,7 +45,7 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
         } else if recovery_required {
             "Rollback failed; new router transactions are blocked".to_owned()
         } else {
-            format!("Network changed temporarily. Without confirmation, rollback in {remaining}s / {timeout}s")
+            format!("Applied temporarily — awaiting confirmation. Rollback in {remaining}s / {timeout}s")
         }),
     ];
     if let Some(recovery) = &view.recovery {
@@ -58,26 +58,12 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
             };
             detail_lines.push(Line::styled(text, style));
         }
-    } else if let Some(failures) = &view.rollback_failure {
-        // Compatibility fallback for an older daemon that does not expose a
-        // structured recovery notice yet.
-        detail_lines.push(Line::from(""));
-        detail_lines.push(Line::styled(
-            "ROLLBACK FAILED — manual recovery required:",
-            Style::default().fg(theme::BAD).add_modifier(Modifier::BOLD),
-        ));
-        for failure in failures {
-            detail_lines.push(Line::styled(
-                format!("  {failure}"),
-                Style::default().fg(theme::BAD),
-            ));
-        }
     }
 
     let block = panel(if recovery_required {
         "Router rollback recovery"
     } else {
-        "Router · Confirmation"
+        "Route · Confirmation"
     });
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -316,7 +302,7 @@ async fn finish_router_pending(app: &mut TuiApp, client: &ApiClient, commit: boo
         Ok(Response::RouterCommitted { revision }) if commit => {
             app.push_message(
                 LogLevel::Info,
-                format!("Router config committed (revision {revision})"),
+                format!("Router changes applied and saved (revision {revision})"),
             );
             app.router_pending = None;
             app.router.staged = false;

@@ -1,6 +1,6 @@
 //! Port forwarding edits stage the same router proposal as routes and sharing.
 use super::{
-    layout::{focused_lines_offset, panel},
+    layout::{panel, wrap_styled_lines as wrap_lines},
     logs::LogLevel,
     router::{self, RouterPane},
     theme, Screen, TuiApp,
@@ -40,52 +40,80 @@ pub(crate) struct Editor {
     rules: Vec<PortForwardConfig>,
     editing: Option<usize>,
     error: Option<String>,
+    error_field: Option<usize>,
 }
 impl Editor {
-    fn save(&self) -> anyhow::Result<Vec<PortForwardConfig>> {
+    fn save(&self) -> Result<Vec<PortForwardConfig>, super::input::FormError<usize>> {
+        use super::input::FormError;
         let v = &self.values;
+        for field in [0, 1] {
+            traffic_masq_protocol::validate_interface_name(v[field].trim())
+                .map_err(|message| FormError::field(field, message))?;
+        }
+        if v[0].trim() == v[1].trim() {
+            return Err(FormError::field(
+                1,
+                "Choose a different target interface; hairpin NAT is not supported",
+            ));
+        }
         let rule = PortForwardConfig {
             from: v[0].trim().into(),
             to: v[1].trim().into(),
             protocol: match v[2].as_str() {
                 "tcp" => PortForwardProtocol::Tcp,
                 "udp" => PortForwardProtocol::Udp,
-                _ => anyhow::bail!("Choose TCP or UDP"),
+                _ => return Err(FormError::field(2, "Choose TCP or UDP")),
             },
             external_port: v[3]
                 .trim()
-                .parse()
-                .map_err(|_| anyhow::anyhow!("External port must be in 1..=65535"))?,
+                .parse::<u16>()
+                .ok()
+                .filter(|port| *port > 0)
+                .ok_or_else(|| FormError::field(3, "External port must be in 1..=65535"))?,
             target_address: v[4]
                 .trim()
                 .parse()
-                .map_err(|_| anyhow::anyhow!("Enter a target IPv4 address"))?,
+                .map_err(|_| FormError::field(4, "Enter a target IPv4 address"))?,
             target_port: v[5]
                 .trim()
-                .parse()
-                .map_err(|_| anyhow::anyhow!("Target port must be in 1..=65535"))?,
+                .parse::<u16>()
+                .ok()
+                .filter(|port| *port > 0)
+                .ok_or_else(|| FormError::field(5, "Target port must be in 1..=65535"))?,
             destination_address: if v[6].trim().is_empty() {
                 None
             } else {
                 Some(v[6].trim().parse().map_err(|_| {
-                    anyhow::anyhow!("Enter an external IPv4 address or leave it empty")
+                    FormError::field(6, "Enter an external IPv4 address or leave it empty")
                 })?)
             },
             source_subnet: if v[7].trim().is_empty() {
                 None
             } else {
                 Some(v[7].trim().parse().map_err(|_| {
-                    anyhow::anyhow!("Enter an IPv4 source subnet or leave it empty")
+                    FormError::field(7, "Enter an IPv4 source subnet or leave it empty")
                 })?)
             },
         };
+        for (field, address) in [
+            (4, Some(rule.target_address)),
+            (6, rule.destination_address),
+        ] {
+            if let Some(address) = address {
+                traffic_masq_protocol::validate_port_forward_address(address)
+                    .map_err(|message| FormError::field(field, message))?;
+            }
+        }
+        if rule.source_subnet.is_some_and(|net| net != net.trunc()) {
+            return Err(FormError::field(7, "Source subnet must have no host bits"));
+        }
         let mut rules = self.rules.clone();
         if let Some(index) = self.editing {
             rules[index] = rule;
         } else {
             rules.push(rule);
         }
-        validate_port_forwards(&rules).map_err(anyhow::Error::msg)?;
+        validate_port_forwards(&rules).map_err(FormError::form)?;
         Ok(rules)
     }
 }
@@ -200,6 +228,7 @@ async fn open(app: &mut TuiApp, client: &ApiClient, edit: bool) {
         rules,
         editing,
         error: None,
+        error_field: None,
     });
     app.screen = Screen::PortForwarding;
 }
@@ -211,6 +240,10 @@ fn stage(app: &mut TuiApp, rules: Vec<PortForwardConfig>) {
     app.router.proposed_router_config.port_forwards = rules;
     app.router.staged = true;
     app.router.error = None;
+    app.push_message(
+        LogLevel::Info,
+        "Router draft updated — not applied. Review / Apply to continue.",
+    );
 }
 async fn delete(app: &mut TuiApp, client: &ApiClient) {
     let Some(selected) = app
@@ -245,7 +278,7 @@ pub(crate) fn render_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
     .split(area);
     frame.render_widget(
         Paragraph::new(if app.router.staged {
-            "Draft changes — Review / Apply to confirm"
+            "Draft — not applied. Review / Apply to continue"
         } else {
             "IPv4 TCP/UDP port forwarding to another host"
         })
@@ -259,40 +292,50 @@ pub(crate) fn render_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
         .router
         .selected_port_forward
         .min(rules.len().saturating_sub(1));
-    let scroll = app
-        .router
-        .selected_port_forward
-        .saturating_sub(usize::from(inner.height).saturating_sub(1));
-    let mut lines: Vec<_> = rules
+    // Equal-height wrapped rows preserve keyboard and mouse selection by rule index.
+    let wrapped: Vec<_> = rules
         .iter()
         .enumerate()
-        .skip(scroll)
-        .map(|(i, r)| {
-            Line::styled(
-                describe(
+        .map(|(i, rule)| {
+            wrap_lines(
+                vec![Line::from(describe(
                     if i == app.router.selected_port_forward {
                         "▶"
                     } else {
                         " "
                     },
-                    r,
-                ),
-                if i == app.router.selected_port_forward && !app.router.sharing_actions_focused {
-                    Style::default()
-                        .fg(theme::SELECTED_FG)
-                        .bg(theme::SELECTED_BG)
-                } else {
-                    Style::default()
-                },
+                    rule,
+                ))],
+                inner.width,
             )
         })
         .collect();
+    let row_height = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
+    let visible = (usize::from(inner.height) / row_height).max(1);
+    let scroll = app.router.selected_port_forward.saturating_sub(visible - 1);
+    let mut lines = Vec::new();
+    for (i, row) in wrapped.into_iter().enumerate().skip(scroll).take(visible) {
+        let style = if i == app.router.selected_port_forward && !app.router.sharing_actions_focused
+        {
+            Style::default()
+                .fg(theme::SELECTED_FG)
+                .bg(theme::SELECTED_BG)
+        } else {
+            Style::default()
+        };
+        let padding = row_height - row.len();
+        lines.extend(row.into_iter().map(|line| line.style(style)));
+        lines.extend((0..padding).map(|_| Line::from("")));
+    }
     if lines.is_empty() {
         lines.push(Line::from("No port forwards. Choose Add."));
     }
     frame.render_widget(Paragraph::new(lines).block(block), chunks[1]);
-    app.ui.list_area = Some(inner);
-    app.ui.list_row_height = 1;
+    app.ui.list_area = Some(Rect {
+        height: (visible * row_height).min(inner.height as usize) as u16,
+        ..inner
+    });
+    app.ui.list_row_height = row_height as u16;
     app.ui.list_count = rules.len();
     app.ui.list_scroll_offset = scroll;
     let block = panel("Port forwarding actions");
@@ -375,10 +418,19 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
     let Some(e) = &app.port_forwarding else {
         return;
     };
+    let block = panel(if e.editing.is_some() {
+        "Edit port forward"
+    } else {
+        "Add port forward"
+    });
+    let inner = block.inner(area);
     let mut lines = Vec::new();
+    let mut focus_row = 0;
     for (i, label) in LABELS.iter().enumerate() {
         let selected = i == e.field;
-        let style = if selected {
+        let style = if e.error_field == Some(i) {
+            Style::default().fg(theme::BAD)
+        } else if selected {
             Style::default()
                 .fg(theme::SELECTED_FG)
                 .bg(theme::SELECTED_BG)
@@ -399,7 +451,25 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
         } else {
             spans.push(Span::styled(e.values[i].clone(), style));
         }
-        lines.push(Line::from(spans));
+        if selected {
+            focus_row = lines.len();
+        }
+        lines.extend(wrap_lines(vec![Line::from(spans)], inner.width));
+        if e.error_field == Some(i) {
+            if let Some(error) = &e.error {
+                lines.extend(wrap_lines(
+                    vec![Line::styled(
+                        format!("  Error: {error}"),
+                        Style::default().fg(theme::BAD),
+                    )],
+                    inner.width,
+                ));
+            }
+        }
+    }
+    let save_row = lines.len();
+    if e.field == 8 {
+        focus_row = save_row;
     }
     lines.push(Line::styled(
         if e.field == 8 {
@@ -409,25 +479,41 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
         },
         Style::default().fg(theme::ACCENT),
     ));
-    lines.push(Line::from("Protocol: ←/→ | Tab: next | Esc: cancel"));
-    if let Some(error) = &e.error {
-        lines.push(Line::styled(error.clone(), Style::default().fg(theme::BAD)));
+    lines.extend(wrap_lines(
+        vec![Line::from(
+            "Enter: next / activate | Tab: next | Esc: cancel",
+        )],
+        inner.width,
+    ));
+    if e.error_field.is_none() {
+        if let Some(error) = &e.error {
+            lines.extend(wrap_lines(
+                vec![Line::styled(
+                    format!("Rule conflict: {error}"),
+                    Style::default().fg(theme::BAD),
+                )],
+                inner.width,
+            ));
+        }
     }
-    let block = panel(if e.editing.is_some() {
-        "Edit port forward"
-    } else {
-        "Add port forward"
-    });
-    let inner = block.inner(area);
-    let offset = if e.error.is_some() && e.field == 8 {
+    let offset = if e.error.is_some() && e.error_field.is_none() && e.field == 8 {
         lines.len().saturating_sub(inner.height as usize)
+    } else if e.error_field == Some(e.field) {
+        focus_row
     } else {
-        focused_lines_offset(&lines, inner.height)
+        // Leave room below the focused input for its validation message.
+        focus_row.saturating_sub(inner.height.saturating_sub(3) as usize)
     };
-    if 8 >= offset && 8 < offset + inner.height as usize {
-        app.ui
-            .buttons
-            .push((Rect::new(inner.x, inner.y + (8 - offset) as u16, 22, 1), 0));
+    if save_row >= offset && save_row < offset + inner.height as usize {
+        app.ui.buttons.push((
+            Rect::new(
+                inner.x,
+                inner.y + (save_row - offset) as u16,
+                22.min(inner.width),
+                1,
+            ),
+            0,
+        ));
     }
     frame.render_widget(
         Paragraph::new(lines)
@@ -462,14 +548,32 @@ pub(crate) fn handle_key(app: &mut TuiApp, key: KeyCode) {
                 app.screen = Screen::Router;
                 router::select_pane(app, RouterPane::Ports);
             }
-            Err(error) => e.error = Some(error.to_string()),
+            Err(error) => {
+                e.error_field = error.field;
+                if let Some(field) = error.field {
+                    e.field = field;
+                }
+                e.error = Some(error.message);
+            }
         },
         KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Enter if e.field == 2 => {
-            e.values[2] = if e.values[2] == "tcp" { "udp" } else { "tcp" }.into()
+            e.values[2] = if e.values[2] == "tcp" { "udp" } else { "tcp" }.into();
+            if e.error_field.is_none() || e.error_field == Some(2) {
+                e.error = None;
+                e.error_field = None;
+            }
         }
+        KeyCode::Enter if e.field < 8 => e.field += 1,
         key if e.field < 8 && e.field != 2 => {
+            let previous = e.values[e.field].clone();
             super::input::TextEditor::new(&mut e.values[e.field], &mut e.cursors[e.field])
                 .handle_key(key);
+            if previous != e.values[e.field]
+                && (e.error_field.is_none() || e.error_field == Some(e.field))
+            {
+                e.error = None;
+                e.error_field = None;
+            }
         }
         _ => {}
     }
@@ -496,6 +600,7 @@ mod tests {
             rules: vec![],
             editing: None,
             error: None,
+            error_field: None,
         }
     }
     #[test]
@@ -591,9 +696,10 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
 
             handle_key(&mut app, KeyCode::Enter);
-            assert!(rendered_text(&mut app, &mut terminal).contains("port forwarding ports"));
+            assert!(rendered_text(&mut app, &mut terminal).contains("External port must be"));
 
-            for _ in 0..8 {
+            assert_eq!(app.port_forwarding.as_ref().unwrap().field, 3);
+            for _ in 0..3 {
                 handle_key(&mut app, KeyCode::Up);
             }
             assert!(rendered_text(&mut app, &mut terminal).contains("▶ Incoming interface: wan0"));
@@ -621,5 +727,140 @@ mod tests {
                 8443
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod ux_tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn form() -> Editor {
+        Editor {
+            values: [
+                "wan0",
+                "lan0",
+                "tcp",
+                "8443",
+                "192.168.10.20",
+                "443",
+                "198.51.100.20",
+                "203.0.113.0/24",
+            ]
+            .map(String::from),
+            cursors: [0; 8],
+            field: 0,
+            rules: vec![],
+            editing: None,
+            error: None,
+            error_field: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn enter_advances_text_and_tab_moves_without_changing_protocol() {
+        let mut app = TuiApp {
+            screen: Screen::PortForwarding,
+            port_forwarding: Some(form()),
+            ..Default::default()
+        };
+        let client = ApiClient::new("/must-not-connect");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| super::super::render(f, &mut app, false))
+            .unwrap();
+        for field in [0, 1, 3, 4, 5, 6, 7] {
+            app.port_forwarding.as_mut().unwrap().field = field;
+            super::super::handle_key(&mut app, KeyCode::Enter, &client, false).await;
+            assert_eq!(app.port_forwarding.as_ref().unwrap().field, field + 1);
+            assert!(!app.router.staged);
+        }
+        app.port_forwarding.as_mut().unwrap().field = 2;
+        super::super::handle_key(&mut app, KeyCode::Tab, &client, false).await;
+        assert_eq!(app.port_forwarding.as_ref().unwrap().values[2], "tcp");
+        super::super::handle_key(&mut app, KeyCode::BackTab, &client, false).await;
+        super::super::handle_key(&mut app, KeyCode::Enter, &client, false).await;
+        assert_eq!(app.port_forwarding.as_ref().unwrap().values[2], "udp");
+    }
+
+    #[test]
+    fn field_error_and_input_are_visible_together_at_minimum_size() {
+        let mut e = form();
+        e.values[7] = "203.0.113.5/24".into();
+        e.field = 8;
+        let mut app = TuiApp {
+            screen: Screen::PortForwarding,
+            port_forwarding: Some(e),
+            ..Default::default()
+        };
+        handle_key(&mut app, KeyCode::Enter);
+        assert_eq!(app.port_forwarding.as_ref().unwrap().field, 7);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| super::super::render(f, &mut app, false))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Source subnet (empty = any)"));
+        assert!(text.contains("Source subnet must have no host bits"));
+        assert!(terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .any(|c| c.symbol() == "S" && c.fg == theme::BAD));
+        assert!(!app.router.staged);
+    }
+
+    #[tokio::test]
+    async fn wrapped_rules_show_restrictions_and_mouse_selects_continuation_rows() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let mut e = form();
+        e.values[0] = "incoming-long15".into();
+        e.values[1] = "target-long15".into();
+        let rule = e.save().unwrap().remove(0);
+        let mut app = TuiApp {
+            screen: Screen::Router,
+            ..Default::default()
+        };
+        router::select_pane(&mut app, RouterPane::Ports);
+        app.router.proposed_router_config.port_forwards = vec![rule; 12];
+        app.router.selected_port_forward = 10;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| super::super::render(f, &mut app, false))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("203.0.113.0/24"));
+        assert!(text.contains("198.51.100.20"));
+        assert!(app.ui.list_row_height > 1);
+        let area = app.ui.list_area.unwrap();
+        let first = app.ui.list_scroll_offset;
+        let client = ApiClient::new("/must-not-connect");
+        let row = area.y + app.ui.list_row_height - 1;
+        super::super::handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: area.x,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            &client,
+            false,
+        )
+        .await;
+        assert_eq!(app.router.selected_port_forward, first);
     }
 }

@@ -219,7 +219,7 @@ pub(crate) enum RouterAction {
     ShareViaRoute,
     Refresh,
     Topology,
-    Setup,
+    Policy,
     Settings,
 }
 
@@ -232,8 +232,8 @@ impl RouterAction {
             Self::PlanApply => Self::ShareViaRoute,
             Self::ShareViaRoute => Self::Refresh,
             Self::Refresh => Self::Topology,
-            Self::Topology => Self::Setup,
-            Self::Setup => Self::Settings,
+            Self::Topology => Self::Policy,
+            Self::Policy => Self::Settings,
             Self::Settings => Self::AddRoute,
         }
     }
@@ -241,8 +241,8 @@ impl RouterAction {
     pub(crate) fn prev(self) -> Self {
         match self {
             Self::AddRoute => Self::Settings,
-            Self::Settings => Self::Setup,
-            Self::Setup => Self::Topology,
+            Self::Settings => Self::Policy,
+            Self::Policy => Self::Topology,
             Self::EditRoute => Self::AddRoute,
             Self::DeleteRoute => Self::EditRoute,
             Self::PlanApply => Self::DeleteRoute,

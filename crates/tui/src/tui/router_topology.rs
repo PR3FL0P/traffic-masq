@@ -176,15 +176,7 @@ fn topology_lines(router: &RouterData, expanded: bool) -> Vec<Line<'static>> {
                 related(&interface.name),
             ));
             if let Some(address) = interface.config.ipv4 {
-                lines.push(note(format!(
-                    "    {}{}",
-                    address.trunc(),
-                    if interface.config.nat {
-                        " NAT"
-                    } else {
-                        " no NAT"
-                    }
-                )));
+                lines.push(note(format!("    {}", address.trunc())));
             }
         }
         if !has_lan {

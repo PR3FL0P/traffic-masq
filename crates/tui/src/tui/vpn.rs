@@ -1,5 +1,5 @@
 use crossterm::event::KeyCode;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -24,6 +24,10 @@ pub(crate) struct VpnData {
     pub(crate) focus: VpnFocus,
     pub(crate) enabled: Option<bool>,
     pub(crate) delete_confirmation: Option<String>,
+    pub(crate) opened_profile: Option<String>,
+    pub(crate) status_known: bool,
+    pub(crate) profiles_known: bool,
+    pub(crate) chain: Option<Vec<traffic_masq_protocol::VpnHopConfigView>>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -31,30 +35,91 @@ pub(crate) enum VpnFocus {
     #[default]
     List,
     Connect,
-    Disconnect,
+    Details,
     Import,
+    Settings,
     Delete,
-    Policy,
-    Refresh,
+    Route,
     ToggleEnabled,
 }
 
-const VPN_ACTION_FOCUS: [VpnFocus; 7] = [
-    VpnFocus::Connect,
-    VpnFocus::Disconnect,
-    VpnFocus::Import,
-    VpnFocus::Delete,
-    VpnFocus::Policy,
-    VpnFocus::Refresh,
-    VpnFocus::ToggleEnabled,
-];
-
-fn next_vpn_action_focus(focus: VpnFocus) -> VpnFocus {
-    super::input::move_clamped(&VPN_ACTION_FOCUS, focus, true)
+fn actions(screen: Screen) -> &'static [VpnFocus] {
+    match screen {
+        Screen::VpnProfile => &[VpnFocus::Connect, VpnFocus::Route, VpnFocus::Delete],
+        Screen::VpnSettings => &[VpnFocus::ToggleEnabled],
+        _ => &[
+            VpnFocus::Connect,
+            VpnFocus::Details,
+            VpnFocus::Import,
+            VpnFocus::Settings,
+        ],
+    }
 }
 
-fn previous_vpn_action_focus(focus: VpnFocus) -> VpnFocus {
-    super::input::move_clamped(&VPN_ACTION_FOCUS, focus, false)
+fn selected_name(app: &TuiApp) -> Option<&str> {
+    if app.screen == Screen::VpnProfile {
+        app.vpn.opened_profile.as_deref()
+    } else {
+        app.vpn
+            .profiles
+            .get(app.vpn.selected_profile)
+            .map(|p| p.name.as_str())
+    }
+}
+
+fn standalone_selected(app: &TuiApp) -> bool {
+    app.vpn.status_known
+        && app
+            .vpn
+            .active
+            .as_ref()
+            .is_some_and(|active| Some(active.profile_name.as_str()) == selected_name(app))
+}
+
+fn selected_in_chain(app: &TuiApp) -> bool {
+    app.vpn.chain.as_ref().is_some_and(|chain| {
+        chain
+            .iter()
+            .any(|hop| Some(hop.profile_name.as_str()) == selected_name(app))
+    })
+}
+
+async fn open_route(app: &mut TuiApp, client: &ApiClient) {
+    super::router::load_router_data(app, client).await;
+    app.screen = Screen::Router;
+}
+
+fn profile_state(app: &TuiApp, name: &str) -> String {
+    let tunnel = if app.vpn.enabled == Some(false) {
+        "VPN disabled"
+    } else if !app.vpn.status_known {
+        "standalone: unknown"
+    } else if let Some(active) = app.vpn.active.as_ref().filter(|a| a.profile_name == name) {
+        if active.up {
+            "standalone: up"
+        } else {
+            "standalone: down"
+        }
+    } else {
+        "standalone: inactive"
+    };
+    let chain = match &app.vpn.chain {
+        None => "chain usage: unknown".into(),
+        Some(chain) => {
+            let hops: Vec<_> = chain
+                .iter()
+                .enumerate()
+                .filter(|(_, hop)| hop.profile_name == name)
+                .map(|(i, _)| (i + 1).to_string())
+                .collect();
+            if hops.is_empty() {
+                "not in saved chain".into()
+            } else {
+                format!("saved chain: hop {}", hops.join(", "))
+            }
+        }
+    };
+    format!("{tunnel} | {chain}")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,157 +192,190 @@ pub(crate) fn render_vpn(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
         );
         return;
     }
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(5), Constraint::Min(3)])
-        .split(area);
-
-    let mut status_lines = vec![Line::styled(
+    let block = panel(match app.screen {
+        Screen::VpnProfile => "VPN profile",
+        Screen::VpnSettings => "VPN settings",
+        _ => "VPN profiles",
+    });
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let regions = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(inner);
+    let content = regions[0];
+    let mut lines = vec![Line::styled(
         match app.vpn.enabled {
-            Some(true) => "VPN: enabled",
-            Some(false) => "VPN: disabled — press e to enable",
-            None => "VPN: status unavailable",
+            Some(true) => "VPN enabled",
+            Some(false) => "VPN disabled — open VPN settings to enable",
+            None => "VPN availability unknown — r: refresh",
         },
-        Style::default().fg(if app.vpn.enabled == Some(true) {
-            theme::GOOD
-        } else {
-            theme::WARN
-        }),
+        Style::default().fg(theme::MUTED),
     )];
-    match &app.vpn.active {
-        Some(active) => status_lines.push(Line::styled(
-            format!(
-                "Active: {} on {} ({})",
-                active.profile_name,
-                active.interface,
-                if active.up { "up" } else { "down" }
-            ),
-            Style::default().fg(if active.up { theme::GOOD } else { theme::WARN }),
-        )),
-        None => status_lines.push(Line::styled(
-            "Active: none",
-            Style::default().fg(theme::MUTED),
-        )),
-    }
     if let Some(detail) = &app.vpn.error {
-        status_lines.push(Line::styled(
-            format!("Error: {}", describe_vpn_error(detail)),
-            Style::default().fg(theme::BAD).add_modifier(Modifier::BOLD),
+        lines.push(Line::styled(
+            describe_vpn_error(detail),
+            Style::default().fg(theme::BAD),
         ));
     }
-    frame.render_widget(
-        Paragraph::new(status_lines).block(panel("VPN status")),
-        chunks[0],
-    );
-
-    let block = panel("Profiles");
-    let inner = block.inner(chunks[1]);
-    frame.render_widget(block, chunks[1]);
-
-    let profile_and_actions = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(7)])
-        .split(inner);
-    let list_area = profile_and_actions[0];
-    let actions_area = profile_and_actions[1];
-
-    let visible_profiles = list_area.height.max(1) as usize;
-    let max_scroll = app.vpn.profiles.len().saturating_sub(visible_profiles);
-    let scroll = app
-        .vpn
-        .selected_profile
-        .saturating_sub(visible_profiles.saturating_sub(1))
-        .min(max_scroll);
-    app.ui.list_area = Some(list_area);
-    app.ui.list_row_height = 1;
-    app.ui.list_count = app.vpn.profiles.len();
-    app.ui.list_scroll_offset = scroll;
-
-    let list_focused = app.vpn.focus == VpnFocus::List;
-    let profile_lines: Vec<Line> = if app.vpn.profiles.is_empty() {
-        vec![Line::styled(
-            "(none imported)",
-            Style::default().fg(theme::MUTED),
-        )]
+    if app.screen == Screen::VpnSettings {
+        lines.extend([
+            Line::from("Enable/disable changes subsystem availability and is saved immediately."),
+            Line::from("To disable: remove the saved chain in Route, select Direct policy,"),
+            Line::from("then disconnect the standalone tunnel. This is not an emergency stop."),
+            Line::from("Saved profiles remain in the library while VPN is disabled."),
+        ]);
+    } else if app.screen == Screen::VpnProfile {
+        if let Some(name) = selected_name(app) {
+            lines.push(Line::styled(
+                name.to_owned(),
+                Style::default().fg(theme::ACCENT),
+            ));
+            lines.push(Line::from(profile_state(app, name)));
+            lines.push(Line::from(
+                "Chain tunnel health and traffic protection: inspect Route.",
+            ));
+            if app.router.staged {
+                let hops: Vec<_> = app
+                    .router
+                    .proposed_router_config
+                    .vpn_chain
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, hop)| hop.profile_name == name)
+                    .map(|(i, _)| (i + 1).to_string())
+                    .collect();
+                lines.push(Line::from(format!(
+                    "Unapplied Route draft: {}",
+                    if hops.is_empty() {
+                        "profile not in chain".into()
+                    } else {
+                        format!("hop {}", hops.join(", "))
+                    }
+                )));
+            }
+            lines.push(Line::from(
+                "Standalone controls apply immediately to tm-wg0 only.",
+            ));
+            if let Some(active) = &app.vpn.active {
+                if active.profile_name != name && app.vpn.status_known {
+                    lines.push(Line::from(format!(
+                        "Disconnect standalone profile '{}' before connecting another.",
+                        active.profile_name
+                    )));
+                }
+            }
+            lines.push(Line::from(
+                "Additional action: delete saved profile (confirmation required).",
+            ));
+        }
     } else {
-        app.vpn
+        if !app.vpn.profiles_known {
+            lines.push(Line::styled(
+                "Profile library unavailable; displayed entries may be stale.",
+                Style::default().fg(theme::WARN),
+            ));
+        }
+        let header = lines.len() as u16;
+        let list = Rect::new(
+            content.x,
+            content.y.saturating_add(header),
+            content.width,
+            content.height.saturating_sub(header),
+        );
+        let visible = list.height.max(1) as usize;
+        let scroll = app
+            .vpn
+            .selected_profile
+            .saturating_sub(visible - 1)
+            .min(app.vpn.profiles.len().saturating_sub(visible));
+        app.ui.list_area = Some(list);
+        app.ui.list_row_height = 1;
+        app.ui.list_count = app.vpn.profiles.len();
+        app.ui.list_scroll_offset = scroll;
+        if app.vpn.profiles.is_empty() {
+            lines.push(Line::from(if app.vpn.profiles_known {
+                "(none imported)"
+            } else {
+                "(library unavailable)"
+            }));
+        }
+        for (index, profile) in app
+            .vpn
             .profiles
             .iter()
             .enumerate()
             .skip(scroll)
-            .take(visible_profiles)
-            .map(|(index, profile)| {
-                let selected = index == app.vpn.selected_profile;
-                let marker = if selected { "▶" } else { " " };
-                let style = if selected && list_focused {
-                    Style::default()
-                        .fg(theme::ACCENT)
-                        .add_modifier(Modifier::BOLD)
-                } else if selected {
+            .take(visible)
+        {
+            let selected = index == app.vpn.selected_profile;
+            lines.push(Line::styled(
+                format!(
+                    "{} {} — {}",
+                    if selected { "▶" } else { " " },
+                    profile.name,
+                    profile_state(app, &profile.name)
+                ),
+                if selected {
                     Style::default().fg(theme::ACCENT)
                 } else {
                     Style::default()
-                };
-                Line::styled(
-                    format!("{marker} {} ({} bytes)", profile.name, profile.size_bytes),
-                    style,
-                )
-            })
-            .collect()
-    };
-    frame.render_widget(Paragraph::new(profile_lines), list_area);
-
-    let action = |label: &str, active: bool| {
-        let marker = if active { "▶ " } else { "  " };
-        let style = if active {
-            Style::default()
-                .fg(theme::ACCENT)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme::ACCENT)
-        };
-        Line::styled(format!("{marker}{label}"), style)
-    };
-    let mut action_lines = Vec::with_capacity(6);
-    for (slot, (label, focus)) in [
-        (VPN_CONNECT_LABEL, VpnFocus::Connect),
-        (VPN_DISCONNECT_LABEL, VpnFocus::Disconnect),
-        (VPN_IMPORT_LABEL, VpnFocus::Import),
-        (VPN_DELETE_LABEL, VpnFocus::Delete),
-        (VPN_POLICY_LABEL, VpnFocus::Policy),
-        (VPN_REFRESH_LABEL, VpnFocus::Refresh),
-        (
-            if app.vpn.enabled == Some(true) {
-                "Disable VPN: e"
-            } else {
-                "Enable VPN: e"
-            },
-            VpnFocus::ToggleEnabled,
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        app.ui.buttons.push((
-            Rect {
-                x: actions_area.x,
-                y: actions_area.y + slot as u16,
-                width: label.len() as u16,
-                height: 1,
-            },
-            slot,
-        ));
-        action_lines.push(action(label, app.vpn.focus == focus));
+                },
+            ));
+        }
     }
-    frame.render_widget(Paragraph::new(action_lines), actions_area);
+    let lines = if app.screen == Screen::Vpn {
+        lines
+    } else {
+        super::layout::wrap_lines(lines, content.width)
+    };
+    frame.render_widget(Paragraph::new(lines), content);
+    let mut x = regions[1].x;
+    let mut y = regions[1].y;
+    for (slot, focus) in actions(app.screen).iter().enumerate() {
+        let label = match focus {
+            VpnFocus::Connect if standalone_selected(app) => "[Disconnect standalone]",
+            VpnFocus::Connect if selected_in_chain(app) => "[Manage chain in Route]",
+            VpnFocus::Connect => "[Connect standalone]",
+            VpnFocus::Details => "[Open profile]",
+            VpnFocus::Import => "[Import]",
+            VpnFocus::Settings => "[VPN settings]",
+            VpnFocus::Delete => "[Delete profile]",
+            VpnFocus::Route => "[Open Route]",
+            VpnFocus::ToggleEnabled if app.vpn.enabled == Some(true) => "[Disable VPN]",
+            VpnFocus::ToggleEnabled => "[Enable VPN]",
+            VpnFocus::List => continue,
+        };
+        let width = label.len() as u16;
+        if x + width > regions[1].right() {
+            x = regions[1].x;
+            y += 1;
+        }
+        let rect = Rect::new(x, y, width.min(regions[1].width), 1).intersection(regions[1]);
+        if rect.is_empty() {
+            continue;
+        }
+        app.ui.buttons.push((rect, slot));
+        frame.render_widget(
+            Paragraph::new(label).style(if app.vpn.focus == *focus {
+                Style::default()
+                    .fg(theme::SELECTED_FG)
+                    .bg(theme::SELECTED_BG)
+            } else {
+                Style::default().fg(theme::ACCENT)
+            }),
+            rect,
+        );
+        x += width + 1;
+    }
+    frame.render_widget(
+        Paragraph::new("r: refresh | Enter: open / activate | Esc: back")
+            .style(Style::default().fg(theme::MUTED)),
+        Rect::new(
+            regions[1].x,
+            regions[1].bottom().saturating_sub(1),
+            regions[1].width,
+            1,
+        ),
+    );
 }
-
-const VPN_CONNECT_LABEL: &str = "Connect selected profile";
-const VPN_DISCONNECT_LABEL: &str = "Disconnect";
-const VPN_IMPORT_LABEL: &str = "Import profile";
-const VPN_DELETE_LABEL: &str = "Delete selected profile";
-const VPN_POLICY_LABEL: &str = "Traffic policy";
-const VPN_REFRESH_LABEL: &str = "Refresh";
 
 const VPN_IMPORT_SAVE_LABEL: &str = "Import";
 
@@ -350,7 +448,7 @@ pub(crate) fn render_vpn_import(frame: &mut ratatui::Frame<'_>, area: Rect, app:
         field_line("File path", &editor.path, VpnImportField::Path),
         Line::from(""),
         Line::styled(
-            "Up/Down or Tab: switch field | Enter: import | Esc: cancel",
+            "Tab: next | Enter: next / import from path | Esc: cancel",
             Style::default().fg(theme::MUTED),
         ),
         Line::styled(
@@ -387,7 +485,7 @@ pub(crate) fn render_vpn_import(frame: &mut ratatui::Frame<'_>, area: Rect, app:
 }
 
 pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
-    if let Some(focus) = VPN_ACTION_FOCUS.get(slot) {
+    if let Some(focus) = actions(app.screen).get(slot) {
         app.vpn.focus = *focus;
     }
 }
@@ -408,60 +506,69 @@ pub(crate) async fn handle_vpn_key(app: &mut TuiApp, key: KeyCode, client: &ApiC
         }
         return;
     }
-    let key = match key {
-        KeyCode::Left if app.vpn.focus != VpnFocus::List => KeyCode::Up,
-        KeyCode::Right if app.vpn.focus != VpnFocus::List => KeyCode::Down,
-        _ => key,
+    let fields: Vec<_> = if app.screen == Screen::Vpn {
+        std::iter::once(VpnFocus::List)
+            .chain(actions(app.screen).iter().copied())
+            .collect()
+    } else {
+        actions(app.screen).to_vec()
     };
     match key {
-        KeyCode::Char('e') => toggle_vpn_enabled(app, client).await,
-        KeyCode::Tab | KeyCode::BackTab => {
-            let fields = [
-                VpnFocus::List,
-                VpnFocus::Connect,
-                VpnFocus::Disconnect,
-                VpnFocus::Import,
-                VpnFocus::Delete,
-                VpnFocus::Policy,
-                VpnFocus::Refresh,
-                VpnFocus::ToggleEnabled,
-            ];
-            app.vpn.focus = super::input::move_wrapped(&fields, app.vpn.focus, key == KeyCode::Tab);
-        }
-        KeyCode::Esc if app.vpn.focus != VpnFocus::List => {
+        KeyCode::Char('r') => load_vpn_data(app, client).await,
+        KeyCode::Esc if app.screen != Screen::Vpn => {
+            app.screen = Screen::Vpn;
+            app.vpn.opened_profile = None;
             app.vpn.focus = VpnFocus::List;
         }
+        KeyCode::Esc if app.vpn.focus != VpnFocus::List => app.vpn.focus = VpnFocus::List,
         KeyCode::Esc => app.screen = Screen::Dashboard,
-        KeyCode::Up => match app.vpn.focus {
-            VpnFocus::List => {
-                app.vpn.selected_profile = app.vpn.selected_profile.saturating_sub(1);
+        KeyCode::Tab | KeyCode::BackTab => {
+            app.vpn.focus = super::input::move_wrapped(&fields, app.vpn.focus, key == KeyCode::Tab);
+        }
+        KeyCode::Up if app.vpn.focus == VpnFocus::List => {
+            app.vpn.selected_profile = app.vpn.selected_profile.saturating_sub(1);
+        }
+        KeyCode::Down if app.vpn.focus == VpnFocus::List => {
+            if app.vpn.selected_profile + 1 < app.vpn.profiles.len() {
+                app.vpn.selected_profile += 1;
+            } else {
+                app.vpn.focus = VpnFocus::Connect;
             }
-            VpnFocus::Connect => {
-                app.vpn.focus = VpnFocus::List;
-                if !app.vpn.profiles.is_empty() {
-                    app.vpn.selected_profile = app.vpn.profiles.len() - 1;
+        }
+        KeyCode::Up | KeyCode::Left => {
+            app.vpn.focus = super::input::move_clamped(&fields, app.vpn.focus, false)
+        }
+        KeyCode::Down | KeyCode::Right => {
+            app.vpn.focus = super::input::move_clamped(&fields, app.vpn.focus, true)
+        }
+        KeyCode::Home => app.vpn.selected_profile = 0,
+        KeyCode::End => app.vpn.selected_profile = app.vpn.profiles.len().saturating_sub(1),
+        KeyCode::Enter => match app.vpn.focus {
+            VpnFocus::List | VpnFocus::Details => {
+                if app.vpn.profiles_known {
+                    if let Some(name) = selected_name(app).map(str::to_owned) {
+                        app.vpn.opened_profile = Some(name);
+                        app.screen = Screen::VpnProfile;
+                        app.vpn.focus = VpnFocus::Connect;
+                    }
                 }
             }
-            focus => app.vpn.focus = previous_vpn_action_focus(focus),
-        },
-        KeyCode::Down => match app.vpn.focus {
-            VpnFocus::List if app.vpn.selected_profile + 1 < app.vpn.profiles.len() => {
-                app.vpn.selected_profile += 1;
+            VpnFocus::Connect => {
+                if standalone_selected(app) {
+                    vpn_deactivate(app, client).await;
+                } else if selected_in_chain(app) {
+                    open_route(app, client).await;
+                } else {
+                    vpn_activate_selected(app, client).await;
+                }
             }
-            VpnFocus::List => app.vpn.focus = VpnFocus::Connect,
-            focus => app.vpn.focus = next_vpn_action_focus(focus),
-        },
-        KeyCode::Home => app.vpn.selected_profile = 0,
-        KeyCode::End => {
-            app.vpn.selected_profile = app.vpn.profiles.len().saturating_sub(1);
-        }
-        KeyCode::Enter => match app.vpn.focus {
-            VpnFocus::List | VpnFocus::Connect => vpn_activate_selected(app, client).await,
-            VpnFocus::Disconnect => vpn_deactivate(app, client).await,
             VpnFocus::Import => open_vpn_import(app, client).await,
             VpnFocus::Delete => vpn_delete_selected(app),
-            VpnFocus::Policy => open_vpn_policy(app, client).await,
-            VpnFocus::Refresh => load_vpn_data(app, client).await,
+            VpnFocus::Route => open_route(app, client).await,
+            VpnFocus::Settings => {
+                app.screen = Screen::VpnSettings;
+                app.vpn.focus = VpnFocus::ToggleEnabled;
+            }
             VpnFocus::ToggleEnabled => toggle_vpn_enabled(app, client).await,
         },
         _ => {}
@@ -474,6 +581,8 @@ async fn toggle_vpn_enabled(app: &mut TuiApp, client: &ApiClient) {
         app.push_message(LogLevel::Warn, "Refresh VPN status before changing it");
         return;
     };
+    app.vpn.enabled = None;
+    app.vpn.status_known = false;
     match client
         .request(&Request::SetVpnEnabled { enabled: !enabled })
         .await
@@ -526,11 +635,6 @@ async fn open_vpn_import(app: &mut TuiApp, client: &ApiClient) {
     app.screen = Screen::VpnImport;
 }
 
-async fn open_vpn_policy(app: &mut TuiApp, client: &ApiClient) {
-    super::vpn_policy::load_vpn_policy_data(app, client).await;
-    app.screen = Screen::VpnPolicy;
-}
-
 pub(crate) async fn handle_vpn_import_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
     let Some(editor) = app.vpn_import.as_mut() else {
         app.screen = Screen::Vpn;
@@ -564,6 +668,10 @@ pub(crate) async fn handle_vpn_import_key(app: &mut TuiApp, key: KeyCode, client
             editor.field = toggle_vpn_import_field(editor.field);
             editor.reset_cursor();
         }
+        KeyCode::Enter if editor.field == VpnImportField::Name => {
+            editor.field = VpnImportField::Path;
+            editor.reset_cursor();
+        }
         KeyCode::Enter => vpn_import_submit(app, client).await,
         other => {
             editor.active_editor().handle_key(other);
@@ -579,78 +687,116 @@ fn toggle_vpn_import_field(field: VpnImportField) -> VpnImportField {
 }
 
 pub(crate) async fn load_vpn_data(app: &mut TuiApp, client: &ApiClient) {
+    let selected = selected_name(app).map(str::to_owned);
     app.vpn.error = None;
     app.vpn.enabled = None;
-    match client.request(&Request::GetVpnConfig).await {
-        Ok(Response::VpnConfig { enabled }) => {
-            app.vpn.enabled = Some(enabled);
-            if !enabled {
-                app.vpn.profiles.clear();
-                app.vpn.active = None;
-                return;
-            }
-        }
-        Ok(Response::Error { message }) => {
-            app.push_message(LogLevel::Error, message);
-            return;
-        }
-        Ok(response) => {
-            app.push_message(
-                LogLevel::Error,
-                format!("Unexpected response: {response:?}"),
-            );
-            return;
-        }
-        Err(error) => {
-            app.push_message(LogLevel::Error, error.to_string());
-            return;
-        }
-    }
-
-    match client.request(&Request::VpnListProfiles).await {
-        Ok(Response::VpnProfiles { profiles }) => app.vpn.profiles = profiles,
-        Ok(Response::VpnError { detail }) => {
-            app.vpn.error = Some(detail);
-            return;
-        }
-        Ok(response) => {
-            app.push_message(
-                LogLevel::Error,
-                format!("Unexpected response: {response:?}"),
-            );
-            return;
-        }
-        Err(error) => {
-            app.push_message(LogLevel::Error, error.to_string());
-            return;
-        }
-    }
-    if app.vpn.selected_profile >= app.vpn.profiles.len() {
-        app.vpn.selected_profile = app.vpn.profiles.len().saturating_sub(1);
-    }
-
-    match client.request(&Request::VpnStatus).await {
-        Ok(Response::VpnStatus { active }) => app.vpn.active = active,
-        Ok(Response::VpnError { detail }) => app.vpn.error = Some(detail),
-        Ok(response) => app.push_message(
-            LogLevel::Error,
-            format!("Unexpected response: {response:?}"),
+    app.vpn.status_known = false;
+    app.vpn.profiles_known = false;
+    app.vpn.chain = None;
+    let config = client.request(&Request::GetVpnConfig).await;
+    let profiles = client.request(&Request::VpnListProfiles).await;
+    let router = client.request(&Request::GetRouterConfig).await;
+    match config {
+        Ok(Response::VpnConfig { enabled }) => app.vpn.enabled = Some(enabled),
+        result => app.push_message(
+            LogLevel::Warn,
+            format!("VPN availability unavailable: {result:?}"),
         ),
-        Err(error) => app.push_message(LogLevel::Error, error.to_string()),
+    }
+    match profiles {
+        Ok(Response::VpnProfiles { profiles }) => {
+            app.vpn.profiles = profiles;
+            app.vpn.profiles_known = true;
+            app.vpn.selected_profile = selected
+                .as_ref()
+                .and_then(|name| app.vpn.profiles.iter().position(|p| &p.name == name))
+                .unwrap_or(
+                    app.vpn
+                        .selected_profile
+                        .min(app.vpn.profiles.len().saturating_sub(1)),
+                );
+        }
+        Ok(Response::VpnError { detail }) => app.vpn.error = Some(detail),
+        result => app.push_message(
+            LogLevel::Warn,
+            format!("VPN profile library unavailable: {result:?}"),
+        ),
+    }
+    match router {
+        Ok(Response::RouterConfig { config }) => app.vpn.chain = Some(config.vpn_chain),
+        result => app.push_message(
+            LogLevel::Warn,
+            format!("VPN chain usage unavailable: {result:?}"),
+        ),
+    }
+    if app.vpn.enabled == Some(true) {
+        match client.request(&Request::VpnStatus).await {
+            Ok(Response::VpnStatus { active }) => {
+                app.vpn.active = active;
+                app.vpn.status_known = true;
+            }
+            Ok(Response::VpnError { detail }) => app.vpn.error = Some(detail),
+            result => app.push_message(
+                LogLevel::Warn,
+                format!("Standalone VPN status unavailable: {result:?}"),
+            ),
+        }
     }
 }
 
 async fn vpn_activate_selected(app: &mut TuiApp, client: &ApiClient) {
-    let Some(name) = app
+    if app.vpn.enabled != Some(true) || !app.vpn.status_known || !app.vpn.profiles_known {
+        app.push_message(
+            LogLevel::Warn,
+            "Enable VPN in VPN settings and refresh status before connecting",
+        );
+        return;
+    }
+    if let Some(active) = &app.vpn.active {
+        app.push_message(
+            LogLevel::Warn,
+            format!(
+                "Disconnect standalone profile '{}' first",
+                active.profile_name
+            ),
+        );
+        return;
+    }
+    if !app
         .vpn
         .profiles
-        .get(app.vpn.selected_profile)
-        .map(|profile| profile.name.clone())
-    else {
+        .iter()
+        .any(|p| Some(p.name.as_str()) == selected_name(app))
+    {
+        app.push_message(
+            LogLevel::Warn,
+            "Profile is no longer in the library; return to the list",
+        );
+        return;
+    }
+    let Some(chain) = &app.vpn.chain else {
+        app.push_message(
+            LogLevel::Warn,
+            "Refresh saved chain usage before connecting",
+        );
+        return;
+    };
+    if chain
+        .iter()
+        .any(|hop| Some(hop.profile_name.as_str()) == selected_name(app))
+    {
+        app.push_message(
+            LogLevel::Warn,
+            "This profile belongs to the saved VPN chain; manage it in Route",
+        );
+        return;
+    }
+    let Some(name) = selected_name(app).map(str::to_owned) else {
         app.push_message(LogLevel::Warn, "No profile selected");
         return;
     };
 
+    app.vpn.status_known = false;
     match client.request(&Request::VpnActivate { name }).await {
         Ok(Response::VpnActivated { active }) => {
             app.push_message(
@@ -661,6 +807,7 @@ async fn vpn_activate_selected(app: &mut TuiApp, client: &ApiClient) {
                 ),
             );
             app.vpn.active = Some(active);
+            app.vpn.status_known = true;
         }
         Ok(Response::VpnError { detail }) => {
             app.push_message(LogLevel::Error, describe_vpn_error(&detail))
@@ -674,10 +821,19 @@ async fn vpn_activate_selected(app: &mut TuiApp, client: &ApiClient) {
 }
 
 async fn vpn_deactivate(app: &mut TuiApp, client: &ApiClient) {
+    if !app.vpn.status_known {
+        app.push_message(
+            LogLevel::Warn,
+            "Refresh standalone status before disconnecting",
+        );
+        return;
+    }
+    app.vpn.status_known = false;
     match client.request(&Request::VpnDeactivate).await {
         Ok(Response::VpnDeactivated) => {
             app.push_message(LogLevel::Info, "VPN disconnected");
             app.vpn.active = None;
+            app.vpn.status_known = true;
         }
         Ok(Response::VpnError { detail }) => {
             app.push_message(LogLevel::Error, describe_vpn_error(&detail))
@@ -691,16 +847,29 @@ async fn vpn_deactivate(app: &mut TuiApp, client: &ApiClient) {
 }
 
 fn vpn_delete_selected(app: &mut TuiApp) {
-    let Some(name) = app
-        .vpn
-        .profiles
-        .get(app.vpn.selected_profile)
-        .map(|profile| profile.name.clone())
-    else {
+    if !app.vpn.profiles_known {
+        app.push_message(LogLevel::Warn, "Refresh profile library before deleting");
+        return;
+    }
+    let Some(name) = selected_name(app).map(str::to_owned) else {
         app.push_message(LogLevel::Warn, "No profile selected");
         return;
     };
 
+    if app.router.staged
+        && app
+            .router
+            .proposed_router_config
+            .vpn_chain
+            .iter()
+            .any(|hop| hop.profile_name == name)
+    {
+        app.push_message(
+            LogLevel::Warn,
+            "Profile is used by the unapplied Route draft; remove it from the draft first",
+        );
+        return;
+    }
     app.vpn.delete_confirmation = Some(name);
 }
 
@@ -709,6 +878,9 @@ async fn vpn_delete_profile(app: &mut TuiApp, client: &ApiClient, name: String) 
         Ok(Response::VpnProfileDeleted { name }) => {
             app.push_message(LogLevel::Info, format!("Deleted profile {name}"));
             load_vpn_data(app, client).await;
+            app.screen = Screen::Vpn;
+            app.vpn.opened_profile = None;
+            app.vpn.focus = VpnFocus::List;
         }
         Ok(Response::VpnError { detail }) => {
             app.push_message(LogLevel::Error, describe_vpn_error(&detail))
@@ -794,9 +966,7 @@ pub(crate) async fn vpn_import_submit(app: &mut TuiApp, client: &ApiClient) {
 
 fn describe_vpn_error(detail: &VpnErrorDetail) -> String {
     match detail {
-        VpnErrorDetail::VpnDisabled => {
-            "VPN is disabled; enable it in the VPN tab with e".to_string()
-        }
+        VpnErrorDetail::VpnDisabled => "VPN is disabled; enable it in VPN settings".to_string(),
         VpnErrorDetail::NotFound { name } => format!("Profile '{name}' not found"),
         VpnErrorDetail::InvalidProfile { message } => format!("Invalid profile: {message}"),
         VpnErrorDetail::AlreadyActive => {

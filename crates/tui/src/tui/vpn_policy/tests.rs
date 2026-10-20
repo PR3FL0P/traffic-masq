@@ -193,3 +193,26 @@ async fn failed_first_load_and_unverified_mutation_never_show_fresh_protection()
         .unwrap()
         .contains("Unverified policy outcome"));
 }
+
+#[tokio::test]
+async fn standalone_policy_is_a_route_screen_and_rejects_saved_chain_usage() {
+    let mock = super::super::test_api::mock(vec![Response::RouterConfig {
+        config: traffic_masq_protocol::RouterConfigView {
+            vpn_chain: vec![traffic_masq_protocol::VpnHopConfigView {
+                profile_name: "home.conf".into(),
+            }],
+            ..Default::default()
+        },
+    }])
+    .await;
+    let mut app = TuiApp {
+        screen: Screen::Router,
+        ..Default::default()
+    };
+    open(&mut app, &mock.client).await;
+    assert_eq!(app.screen, Screen::Router);
+    assert_eq!(mock.calls.lock().unwrap().len(), 1);
+    app.screen = Screen::VpnPolicy;
+    handle_vpn_policy_key(&mut app, KeyCode::Esc, &mock.client).await;
+    assert_eq!(app.screen, Screen::Router);
+}

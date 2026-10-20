@@ -134,7 +134,6 @@ fn editor_keeps_explicit_saved_configuration_and_does_not_choose_between_owned_a
         dhcp_client: None,
         wifi: None,
         wifi_client: None,
-        nat: true,
     };
     assert_eq!(
         editor_address_defaults(Some(&config), Some(&status)),
