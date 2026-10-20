@@ -45,6 +45,15 @@ fn unicast(address: Ipv4Addr) -> bool {
         && address.octets()[0] < 240
 }
 
+/// Validate an address field before assembling a complete forwarding rule.
+pub fn validate_port_forward_address(address: Ipv4Addr) -> Result<(), String> {
+    if unicast(address) {
+        Ok(())
+    } else {
+        Err("port forwarding requires unicast IPv4 addresses".into())
+    }
+}
+
 pub fn validate_port_forwards(rules: &[PortForwardConfig]) -> Result<(), String> {
     for (index, rule) in rules.iter().enumerate() {
         crate::validate_interface_name(&rule.from)?;
@@ -55,9 +64,9 @@ pub fn validate_port_forwards(rules: &[PortForwardConfig]) -> Result<(), String>
         if rule.external_port == 0 || rule.target_port == 0 {
             return Err("port forwarding ports must be in 1..=65535".into());
         }
-        if !unicast(rule.target_address) || rule.destination_address.is_some_and(|ip| !unicast(ip))
-        {
-            return Err("port forwarding requires unicast IPv4 addresses".into());
+        validate_port_forward_address(rule.target_address)?;
+        if let Some(address) = rule.destination_address {
+            validate_port_forward_address(address)?;
         }
         if rule.source_subnet.is_some_and(|net| net != net.trunc()) {
             return Err("port forwarding source subnet must have no host bits".into());

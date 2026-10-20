@@ -218,7 +218,6 @@ fn spec(interface: &str, ssid: &str) -> WifiClientSpec {
         }),
         wifi: None,
         wifi_client: Some(client_config(ssid)),
-        nat: true,
     };
     WifiClientSpec::from_interface_config(interface, &config)
         .expect("valid")
@@ -532,8 +531,8 @@ async fn an_unchanged_supplicant_from_a_previous_daemon_is_adopted() {
         .save(&PersistedWifiRecord {
             pid: 4242,
             started_at_unix: 1,
-            process_start_ticks: None,
-            boot_id: None,
+            process_start_ticks: Some(4242),
+            boot_id: Some("test-boot".into()),
             binary_path: Some(std::path::PathBuf::from("/usr/sbin/wpa_supplicant")),
             ctrl_path: runtime.join("wlan0"),
             ctrl_dev: None,
@@ -661,8 +660,8 @@ async fn a_still_associating_supplicant_is_adopted_not_refused() {
         .save(&PersistedWifiRecord {
             pid: 4243,
             started_at_unix: 1,
-            process_start_ticks: None,
-            boot_id: None,
+            process_start_ticks: Some(4243),
+            boot_id: Some("test-boot".into()),
             binary_path: Some(std::path::PathBuf::from("/usr/sbin/wpa_supplicant")),
             ctrl_path: runtime.join("wlan0"),
             ctrl_dev: None,
@@ -698,8 +697,8 @@ async fn a_supplicant_answering_for_a_different_network_is_refused() {
         .save(&PersistedWifiRecord {
             pid: 4244,
             started_at_unix: 1,
-            process_start_ticks: None,
-            boot_id: None,
+            process_start_ticks: Some(4244),
+            boot_id: Some("test-boot".into()),
             binary_path: Some(std::path::PathBuf::from("/usr/sbin/wpa_supplicant")),
             ctrl_path: runtime.join("wlan0"),
             ctrl_dev: None,
@@ -751,8 +750,8 @@ async fn a_stale_record_with_nothing_behind_it_is_a_fresh_start() {
         .save(&PersistedWifiRecord {
             pid: 9999,
             started_at_unix: 1,
-            process_start_ticks: None,
-            boot_id: None,
+            process_start_ticks: Some(9999),
+            boot_id: Some("test-boot".into()),
             binary_path: Some(std::path::PathBuf::from("/usr/sbin/wpa_supplicant")),
             ctrl_path: runtime.join("wlan0"),
             ctrl_dev: None,
@@ -789,8 +788,8 @@ async fn a_config_changed_while_the_daemon_was_stopped_restarts_the_supplicant()
         .save(&PersistedWifiRecord {
             pid: 4246,
             started_at_unix: 1,
-            process_start_ticks: None,
-            boot_id: None,
+            process_start_ticks: Some(4246),
+            boot_id: Some("test-boot".into()),
             binary_path: Some(std::path::PathBuf::from("/usr/sbin/wpa_supplicant")),
             ctrl_path: runtime.join("wlan0"),
             ctrl_dev: None,
@@ -1379,8 +1378,8 @@ async fn startup_readiness_refuses_a_foreign_responder() {
     let record = PersistedWifiRecord {
         pid: 4242,
         started_at_unix: 1,
-        process_start_ticks: None,
-        boot_id: None,
+        process_start_ticks: Some(4242),
+        boot_id: Some("test-boot".into()),
         binary_path: Some(PathBuf::from("/usr/sbin/wpa_supplicant")),
         ctrl_path: runtime.join("wlan0"),
         ctrl_dev: None,
@@ -1866,7 +1865,6 @@ async fn startup_cleans_stale_socket_before_discarding_unconfigured_record() {
         WifiProcessKind::Client,
         &HashSet::new(),
         process.as_ref(),
-        Path::new("/usr/sbin/wpa_supplicant"),
     )
     .await
     .unwrap();

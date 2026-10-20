@@ -319,7 +319,6 @@ async fn an_unconfirmed_change_converges_and_expires_on_a_live_kernel() -> Resul
 
     let interface = |address: Ipv4Addr| InterfaceConfig {
         mac_address: None,
-        nat: true,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some(format!("{address}/24").parse().expect("network")),
@@ -469,7 +468,6 @@ async fn the_journal_and_the_kernel_tag_agree_about_who_owns_an_address() -> Res
 
     let config = InterfaceConfig {
         mac_address: None,
-        nat: true,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some(format!("{test_ip}/24").parse()?),

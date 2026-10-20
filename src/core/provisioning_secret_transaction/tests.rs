@@ -193,7 +193,7 @@ async fn uncommitted_unknown_schema_remains_operator_blocking() {
     assert!(diagnostic.contains("recovery_code=TM-REC-303"));
     assert!(diagnostic.contains("supported_provisioning_secret_schema"));
     assert!(diagnostic.contains("journal_schema=999"));
-    assert!(diagnostic.contains("supported_schemas=1"));
+    assert!(diagnostic.contains("supported_schemas=2"));
     assert!(diagnostic.contains("operator_action=use_compatible_daemon"));
     assert!(journal.exists());
 }
@@ -292,31 +292,6 @@ async fn router_secret_recovery_restores_each_role_without_touching_the_other() 
 }
 
 #[tokio::test]
-async fn legacy_router_secret_journal_restores_legacy_namespace_only() {
-    let temp = tempfile::tempdir().unwrap();
-    let journal = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
-    std::fs::create_dir_all(temp.path().join("wifi")).unwrap();
-    std::fs::write(
-        &journal.journal,
-        br#"{"version":1,"previous":{"wlan0":"old-password"}}"#,
-    )
-    .unwrap();
-    let ap = PassphraseStore::for_role(temp.path(), WifiCredentialRole::Ap);
-    ap.set("wlan0", &WifiPassphrase::new("ap-password").unwrap())
-        .unwrap();
-    journal.recover(None).await.unwrap();
-    assert_eq!(
-        PassphraseStore::new(temp.path().join("wifi/psk"))
-            .get("wlan0")
-            .unwrap()
-            .unwrap()
-            .expose(),
-        "old-password"
-    );
-    assert_eq!(ap.get("wlan0").unwrap().unwrap().expose(), "ap-password");
-}
-
-#[tokio::test]
 async fn new_router_secret_journal_without_roles_is_rejected_and_retained() {
     let temp = tempfile::tempdir().unwrap();
     let journal = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
@@ -329,4 +304,16 @@ async fn new_router_secret_journal_without_roles_is_rejected_and_retained() {
     assert!(journal.recover(None).await.is_err());
     assert!(journal.journal.exists());
     assert!(!temp.path().join("wifi/psk/wlan0").exists());
+}
+
+#[tokio::test]
+async fn previous_secret_journal_schema_is_rejected_without_restoring_secrets() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
+    std::fs::create_dir_all(temp.path().join("wifi")).unwrap();
+    let bytes = br#"{"version":1,"previous":{"wlan0":"old-password"},"roles":{}}"#;
+    std::fs::write(&store.journal, bytes).unwrap();
+    assert!(store.recover(None).await.is_err());
+    assert_eq!(std::fs::read(&store.journal).unwrap(), bytes);
+    assert!(!temp.path().join("wifi/psk").exists());
 }

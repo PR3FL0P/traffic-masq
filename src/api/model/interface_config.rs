@@ -20,7 +20,6 @@ impl From<InterfaceConfigView> for InterfaceConfig {
             dhcp_client: value.dhcp_client.map(Into::into),
             wifi: value.wifi.map(Into::into),
             wifi_client: value.wifi_client.map(Into::into),
-            nat: value.nat,
         }
     }
 }
@@ -36,7 +35,6 @@ impl From<InterfaceConfig> for InterfaceConfigView {
             dhcp_client: value.dhcp_client.map(Into::into),
             wifi: value.wifi.map(Into::into),
             wifi_client: value.wifi_client.map(Into::into),
-            nat: value.nat,
         }
     }
 }

@@ -1,13 +1,12 @@
 //! Conversion between dataplane state and API views.
 
 use crate::{
-    ForwardingConfig, OutputNetwork, OwnedFirewallIntegrity, RouterDataplaneDesired,
-    RouterDataplanePlan, RouterDataplaneSnapshot, RouterDataplaneTarget,
+    ForwardingConfig, OwnedFirewallIntegrity, RouterDataplaneDesired, RouterDataplanePlan,
+    RouterDataplaneSnapshot, RouterDataplaneTarget,
 };
 use traffic_masq_protocol::{
-    ForwardingConfigView, OutputNetworkView, OwnedFirewallIntegrityView,
-    RouterDataplaneDesiredView, RouterDataplanePlanView, RouterDataplaneSnapshotView,
-    RouterDataplaneTargetView,
+    ForwardingConfigView, OwnedFirewallIntegrityView, RouterDataplaneDesiredView,
+    RouterDataplanePlanView, RouterDataplaneSnapshotView, RouterDataplaneTargetView,
 };
 
 impl From<ForwardingConfigView> for ForwardingConfig {
@@ -32,15 +31,6 @@ impl From<ForwardingConfig> for ForwardingConfigView {
     }
 }
 
-impl From<OutputNetwork> for OutputNetworkView {
-    fn from(value: OutputNetwork) -> Self {
-        Self {
-            interface: value.interface,
-            subnet: value.subnet,
-        }
-    }
-}
-
 impl From<RouterDataplaneDesired> for RouterDataplaneDesiredView {
     fn from(value: RouterDataplaneDesired) -> Self {
         Self {
@@ -48,8 +38,6 @@ impl From<RouterDataplaneDesired> for RouterDataplaneDesiredView {
                 .forwarding
                 .map(|rules| rules.into_iter().map(Into::into).collect()),
             port_forwards: value.port_forwards,
-            uplink: value.uplink,
-            outputs: value.outputs.into_iter().map(Into::into).collect(),
         }
     }
 }

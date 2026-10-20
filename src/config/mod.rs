@@ -26,6 +26,7 @@ mod resolver;
 pub use resolver::{ConfigSource, ResolvedConfig, CONFIG_ENV, DEFAULT_CONFIG_PATH};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     pub runtime: RuntimeConfig,
     pub network: NetworkConfig,
@@ -47,6 +48,7 @@ pub struct AppConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     pub state_dir: PathBuf,
     pub log_dir: PathBuf,
@@ -68,12 +70,14 @@ pub enum ShutdownPolicy {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct ApiConfig {
     pub tcp: Option<TcpApiConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct TcpApiConfig {
     pub enabled: bool,
     pub listen: SocketAddr,
@@ -94,6 +98,7 @@ impl Default for TcpApiConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     pub database_path: PathBuf,
     pub session_idle_seconds: u64,
@@ -119,16 +124,13 @@ impl Default for AuthConfig {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
     #[serde(default)]
     pub interfaces: BTreeMap<String, InterfaceConfig>,
 }
-
-fn default_true() -> bool {
-    true
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InterfaceConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac_address: Option<traffic_masq_protocol::MacAddr>,
@@ -146,21 +148,14 @@ pub struct InterfaceConfig {
 
     #[serde(default)]
     pub wifi_client: Option<WifiClientConfig>,
-
-    /// Whether a managed Output interface's traffic is masqueraded by the
-    /// legacy router dataplane (ignored when router.forwarding is present).
-    /// Defaults to `true` so upgrading a persisted config
-    /// without this key preserves today's unconditional-NAT behavior.
-    #[serde(default = "default_true")]
-    pub nat: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct RouterConfig {
     pub uplink: Option<UplinkConfig>,
-    /// Explicit ingress → egress rules. None preserves legacy uplink NAT;
-    /// Some(empty) disables forwarding without restoring legacy rules.
+    /// Explicit ingress → egress permissions; omission disables forwarding.
     pub forwarding: Option<Vec<ForwardingConfig>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub port_forwards: Vec<PortForwardConfig>,
@@ -190,17 +185,20 @@ pub fn validate_forwarding(rules: &[ForwardingConfig]) -> Result<()> {
 pub const MAX_VPN_CHAIN_LEN: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VpnHopConfig {
     pub profile_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UplinkConfig {
     pub interface: String,
     pub mode: UplinkMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OwnedIpv4RouteConfig {
     pub destination: Ipv4Net,
     pub gateway: Option<Ipv4Addr>,
@@ -211,6 +209,7 @@ pub struct OwnedIpv4RouteConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct DhcpClientInterfaceConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
@@ -238,6 +237,7 @@ impl Default for DhcpClientInterfaceConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DhcpInterfaceConfig {
     pub pool_start: Ipv4Addr,
     pub pool_end: Ipv4Addr,
@@ -248,6 +248,7 @@ pub struct DhcpInterfaceConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DhcpConfig {
     pub leases_dir: PathBuf,
     pub default_lease_seconds: u32,
@@ -255,6 +256,7 @@ pub struct DhcpConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct WifiConfig {
     pub enabled: bool,
 
@@ -278,6 +280,7 @@ impl Default for WifiConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct WifiClientGlobalConfig {
     pub enabled: bool,
 
@@ -328,6 +331,7 @@ fn default_max_stations() -> u16 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WifiApConfig {
     pub ssid: String,
 
@@ -355,6 +359,7 @@ pub struct WifiApConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WifiClientConfig {
     pub ssid: String,
 
@@ -368,6 +373,7 @@ pub struct WifiClientConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VpnConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -392,6 +398,7 @@ pub enum VpnProtectedSubnets {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct VpnTrafficPolicyConfig {
     pub default_mode: VpnPolicyMode,
 
@@ -399,6 +406,7 @@ pub struct VpnTrafficPolicyConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
     pub rollback_timeout_seconds: u64,
 }
@@ -642,7 +650,7 @@ impl RouterConfig {
         traffic_masq_protocol::validate_port_forwards(&self.port_forwards)
             .map_err(anyhow::Error::msg)?;
         if !self.port_forwards.is_empty() && !self.vpn_chain.is_empty() {
-            bail!("port forwarding cannot be combined with the legacy global vpn_chain; configure tunnel routing separately");
+            bail!("port forwarding cannot be combined with a global vpn_chain; configure tunnel routing separately");
         }
         for rule in &self.port_forwards {
             if network
@@ -668,9 +676,6 @@ impl RouterConfig {
         }
         if let Some(rules) = &self.forwarding {
             validate_forwarding(rules)?;
-            if !self.vpn_chain.is_empty() {
-                bail!("explicit forwarding cannot be combined with the legacy global vpn_chain; configure tunnel routing separately");
-            }
         }
         if self.is_active() {
             if let Some(uplink) = self.uplink.as_ref() {
@@ -702,40 +707,10 @@ impl RouterConfig {
                     }
                     UplinkMode::External | UplinkMode::Dhcp => {}
                 }
-
-                let outputs = network
-                    .interfaces
-                    .iter()
-                    .filter(|(_, interface)| {
-                        self.forwarding.is_none()
-                            && interface.role == InterfaceRole::Output
-                            && interface.managed
-                    })
-                    .collect::<Vec<_>>();
-                if outputs.is_empty() && self.forwarding.is_none() {
-                    bail!("router uplink mode requires at least one managed output interface");
-                }
-                for (name, interface) in outputs {
-                    if interface.ipv4.is_none() {
-                        bail!("router output interface {name} requires a static IPv4 subnet");
-                    }
-                }
-            } else {
-                let outputs = network
-                    .interfaces
-                    .iter()
-                    .filter(|(_, interface)| {
-                        self.forwarding.is_none()
-                            && interface.role == InterfaceRole::Output
-                            && interface.managed
-                    })
-                    .collect::<Vec<_>>();
-                for (name, interface) in outputs {
-                    if interface.ipv4.is_none() {
-                        bail!("router output interface {name} requires a static IPv4 subnet");
-                    }
-                }
             }
+        }
+        if !self.vpn_chain.is_empty() && self.uplink.is_none() {
+            bail!("router.uplink is required when router.vpn_chain is configured");
         }
 
         if self.route_host_traffic && self.vpn_chain.is_empty() {
@@ -752,7 +727,7 @@ impl RouterConfig {
 
         for (index, route) in self.owned_routes.iter().enumerate() {
             route
-                .validate(network, self.uplink.as_ref())
+                .validate()
                 .map_err(|error| anyhow::anyhow!("router owned route {index}: {error}"))?;
             if route.destination.prefix_len() == 0 && !self.allow_default_route_change {
                 bail!(
@@ -778,8 +753,8 @@ impl RouterConfig {
 }
 
 impl OwnedIpv4RouteConfig {
-    /// Validate nonzero table, network CIDR, gateway shape and non-disabled output interface; no reachability probe.
-    fn validate(&self, network: &NetworkConfig, _uplink: Option<&UplinkConfig>) -> Result<()> {
+    /// Validate the route table, network prefix, gateway and output interface name.
+    fn validate(&self) -> Result<()> {
         if self.table == 0 {
             bail!("IPv4 route table must not be RT_TABLE_UNSPEC (0)");
         }
@@ -814,11 +789,6 @@ impl OwnedIpv4RouteConfig {
             return Ok(());
         };
         validate_interface_name(name)?;
-        if let Some(interface) = network.interfaces.get(name) {
-            if interface.role == InterfaceRole::Disabled {
-                bail!("disabled interface {name} cannot own a router route");
-            }
-        }
         Ok(())
     }
 }
@@ -836,9 +806,6 @@ impl InterfaceConfig {
                 mac.octets() != [0; 6] && mac.octets()[0] & 1 == 0,
                 "MAC address must be a nonzero unicast address"
             );
-        }
-        if self.role == InterfaceRole::Disabled && self.managed {
-            bail!("disabled interface cannot be managed");
         }
 
         if self.dhcp.is_some() && !self.managed {

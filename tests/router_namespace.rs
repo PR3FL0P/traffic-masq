@@ -334,7 +334,6 @@ fn build_config(temp: &tempfile::TempDir, lan_if: &str, uplink_if: &str) -> AppC
         uplink_if.to_string(),
         InterfaceConfig {
             mac_address: None,
-            nat: true,
             role: InterfaceRole::Input,
             managed: false,
             ipv4: None,
@@ -348,7 +347,6 @@ fn build_config(temp: &tempfile::TempDir, lan_if: &str, uplink_if: &str) -> AppC
         lan_if.to_string(),
         InterfaceConfig {
             mac_address: None,
-            nat: true,
             role: InterfaceRole::Output,
             managed: true,
 
@@ -372,7 +370,12 @@ fn build_config(temp: &tempfile::TempDir, lan_if: &str, uplink_if: &str) -> AppC
 
     config.router = RouterConfig {
         port_forwards: Vec::new(),
-        forwarding: None,
+        forwarding: Some(vec![traffic_masq::config::ForwardingConfig {
+            from: lan_if.to_string(),
+            to: uplink_if.to_string(),
+            source_subnet: Some(CLIENT_SUBNET.parse().unwrap()),
+            masquerade: true,
+        }]),
         vpn_chain: Vec::new(),
         uplink: Some(UplinkConfig {
             interface: uplink_if.to_string(),

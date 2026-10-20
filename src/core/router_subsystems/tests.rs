@@ -65,7 +65,6 @@ fn output_interface(address: &str, pool_start: u8, pool_end: u8) -> InterfaceCon
     let octet = ipv4.addr().octets()[2];
     InterfaceConfig {
         mac_address: None,
-        nat: true,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some(ipv4),
@@ -88,7 +87,6 @@ fn enabled_config() -> AppConfig {
         "wan0".to_string(),
         InterfaceConfig {
             mac_address: None,
-            nat: true,
             role: InterfaceRole::Input,
             managed: false,
             ipv4: None,
@@ -104,7 +102,12 @@ fn enabled_config() -> AppConfig {
     );
     config.router = RouterConfig {
         port_forwards: Vec::new(),
-        forwarding: None,
+        forwarding: Some(vec![traffic_masq_dataplane::ForwardingConfig {
+            from: "lan0".into(),
+            to: "wan0".into(),
+            source_subnet: Some("192.168.10.0/24".parse().unwrap()),
+            masquerade: true,
+        }]),
         vpn_chain: Vec::new(),
         uplink: Some(UplinkConfig {
             interface: "wan0".to_string(),
@@ -120,7 +123,6 @@ fn enabled_config() -> AppConfig {
 fn dhcp_less_output_interface(address: &str) -> InterfaceConfig {
     InterfaceConfig {
         mac_address: None,
-        nat: true,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some(address.parse().expect("IPv4 network")),

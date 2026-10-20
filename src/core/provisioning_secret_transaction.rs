@@ -33,7 +33,6 @@ struct ProvisioningSecretJournal {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     token: Option<String>,
     previous: BTreeMap<String, Option<String>>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     roles: BTreeMap<String, WifiCredentialRole>,
 }
 
@@ -170,10 +169,7 @@ impl ProvisioningSecretTransactionStore {
     async fn restore_only(&self, journal: &ProvisioningSecretJournal) -> Result<()> {
         let mut failures = Vec::new();
         for (interface, previous) in &journal.previous {
-            let passphrases = match journal.roles.get(interface) {
-                Some(role) => PassphraseStore::for_role(&self.state_dir, *role),
-                None => PassphraseStore::new(self.state_dir.join("wifi/psk")),
-            };
+            let passphrases = PassphraseStore::for_role(&self.state_dir, journal.roles[interface]);
             let result = match previous {
                 Some(raw) => match WifiPassphrase::new(raw.clone()) {
                     Ok(secret) => passphrases.set(interface, &secret),
@@ -299,9 +295,12 @@ impl ProvisioningSecretTransactionStore {
             .detail("backup_scope", "complete_state_directory")
             .detail("do_not_edit_journal", true)
         };
-        let journal: ProvisioningSecretJournal =
-            serde_json::from_slice(bytes).with_context(diagnostic)?;
-        if !matches!(journal.version, 1 | JOURNAL_VERSION) {
+        #[derive(Deserialize)]
+        struct Schema {
+            version: u32,
+        }
+        let schema: Schema = serde_json::from_slice(bytes).with_context(diagnostic)?;
+        if schema.version != JOURNAL_VERSION {
             let diagnostic = crate::core::recovery::RecoveryDiagnostic::fatal(
                 crate::core::recovery::StartupRecoveryCode::SupportedProvisioningSecretSchema,
                 "decode",
@@ -309,19 +308,18 @@ impl ProvisioningSecretTransactionStore {
             )
             .journal(self.journal.clone())
             .object("router-provisioning-secrets")
-            .detail("journal_schema", journal.version)
-            .detail("supported_schemas", "1, 2")
+            .detail("journal_schema", schema.version)
+            .detail("supported_schemas", "2")
             .detail("fallback_action", "restore_coherent_backup");
             return Err(anyhow::anyhow!(
                 "unsupported provisioning secret journal version {}",
-                journal.version
+                schema.version
             )
             .context(diagnostic));
         }
-        if !((journal.version == 1 && journal.roles.is_empty())
-            || (journal.version == JOURNAL_VERSION
-                && journal.previous.keys().eq(journal.roles.keys())))
-        {
+        let journal: ProvisioningSecretJournal =
+            serde_json::from_slice(bytes).with_context(diagnostic)?;
+        if !journal.previous.keys().eq(journal.roles.keys()) {
             return Err(
                 anyhow::anyhow!("invalid role provenance in provisioning secret journal")
                     .context(diagnostic()),

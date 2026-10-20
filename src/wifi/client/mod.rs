@@ -75,7 +75,6 @@ impl WifiClientSpec {
             }),
             wifi: None,
             wifi_client: Some(self.wifi_client_config()),
-            nat: true,
         };
         config.validate(&self.interface)
     }

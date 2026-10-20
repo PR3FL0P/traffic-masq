@@ -176,7 +176,6 @@ const PROPOSED: &str = "192.168.50.1/24";
 fn interface_config(cidr: &str) -> InterfaceConfig {
     InterfaceConfig {
         mac_address: None,
-        nat: true,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some(cidr.parse().expect("network")),
@@ -1527,7 +1526,6 @@ fn credential_config(role: WifiCredentialRole) -> InterfaceConfig {
         }
         WifiCredentialRole::Client => {
             config.role = InterfaceRole::Input;
-            config.nat = false;
             config.wifi_client = Some(
                 serde_json::from_value(serde_json::json!({
                     "ssid": "test-sta", "security": "wpa2"
@@ -1684,48 +1682,6 @@ async fn role_switch_rollback_and_crash_recovery_restore_only_the_target_namespa
                 .exists());
         }
     }
-}
-
-#[tokio::test]
-async fn legacy_interface_secret_journal_restores_legacy_namespace_only() {
-    let directory = tempdir().unwrap();
-    let interfaces = InterfaceManager::new(fake_network(), AddressOwnershipJournal::in_memory());
-    let snapshot = interfaces.snapshot("test0").await.unwrap();
-    let journals = crate::state::private_store::PrivateJsonDirectory::open(
-        directory.path(),
-        "interface-transactions",
-    )
-    .unwrap();
-    journals
-        .write(
-            "test0",
-            &serde_json::to_vec(&serde_json::json!({
-                "version": 2, "token": "old-daemon", "snapshot": snapshot,
-                "secret": {"previous": "legacy-password"}
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-    let ap = PassphraseStore::for_role(directory.path(), WifiCredentialRole::Ap);
-    ap.set("test0", &WifiPassphrase::new("ap-password").unwrap())
-        .unwrap();
-    recover_interface_transactions(
-        directory.path(),
-        &interfaces,
-        &Default::default(),
-        &wifi_runtime_dirs(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        PassphraseStore::new(directory.path().join("wifi/psk"))
-            .get("test0")
-            .unwrap()
-            .unwrap()
-            .expose(),
-        "legacy-password"
-    );
-    assert_eq!(ap.get("test0").unwrap().unwrap().expose(), "ap-password");
 }
 
 #[tokio::test]

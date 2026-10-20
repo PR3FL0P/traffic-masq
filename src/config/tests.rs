@@ -49,31 +49,12 @@ fn forwarding_rejects_self_links_duplicates_and_unsafe_names() {
 fn explicit_forwarding_refuses_ambiguous_global_vpn_policy() {
     let mut config = AppConfig::default();
     config.router.forwarding = Some(vec![]);
-    config.router.vpn_chain = vec![VpnHopConfig {
-        profile_name: "vpn.conf".into(),
-    }];
-    assert!(config
-        .validate()
-        .unwrap_err()
-        .to_string()
-        .contains("vpn_chain"));
-    config.router.vpn_chain.clear();
     config.vpn.policy.default_mode = VpnPolicyMode::Vpn;
     assert!(config
         .validate()
         .unwrap_err()
         .to_string()
         .contains("global VPN policy"));
-}
-
-#[test]
-fn legacy_management_role_reads_as_none_and_serializes_canonically() {
-    let config: InterfaceConfig =
-        toml::from_str("role = \"management\"\nmanaged = false\n").unwrap();
-    assert_eq!(config.role, InterfaceRole::None);
-    let encoded = toml::to_string(&config).unwrap();
-    assert!(encoded.contains("role = \"none\""));
-    assert!(!encoded.contains("management"));
 }
 
 use super::*;
@@ -124,7 +105,6 @@ fn vpn_directory_validation_does_not_require_daemon_permissions() {
 fn input_interface() -> InterfaceConfig {
     InterfaceConfig {
         mac_address: None,
-        nat: true,
         role: InterfaceRole::Input,
         managed: false,
         ipv4: None,
@@ -138,7 +118,6 @@ fn input_interface() -> InterfaceConfig {
 fn output_interface(ipv4: &str, pool_start: Ipv4Addr, pool_end: Ipv4Addr) -> InterfaceConfig {
     InterfaceConfig {
         mac_address: None,
-        nat: true,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some(ipv4.parse().expect("valid network")),
@@ -334,9 +313,9 @@ fn default_config_does_not_manage_any_interface() {
 }
 
 #[test]
-fn legacy_vpn_config_without_policy_uses_stage_06_defaults() {
-    let mut legacy = toml::Value::try_from(AppConfig::default()).expect("serialize config");
-    let root = legacy.as_table_mut().expect("root table");
+fn omitted_vpn_policy_uses_direct_defaults() {
+    let mut document = toml::Value::try_from(AppConfig::default()).expect("serialize config");
+    let root = document.as_table_mut().expect("root table");
     let vpn = root
         .get_mut("vpn")
         .and_then(toml::Value::as_table_mut)
@@ -344,13 +323,13 @@ fn legacy_vpn_config_without_policy_uses_stage_06_defaults() {
     vpn.remove("policy");
     vpn.insert("enabled".into(), toml::Value::Boolean(true));
 
-    let config: AppConfig = legacy.try_into().expect("legacy config should parse");
+    let config: AppConfig = document.try_into().expect("minimal config should parse");
     assert_eq!(config.vpn.policy.default_mode, VpnPolicyMode::Direct);
     assert_eq!(
         config.vpn.policy.protected_subnets,
         VpnProtectedSubnets::AllManagedOutputSubnets
     );
-    config.validate().expect("legacy config should validate");
+    config.validate().expect("minimal config should validate");
 }
 
 #[test]
@@ -424,20 +403,6 @@ fn enabled_router_rejects_uplink_with_wrong_interface_role() {
 }
 
 #[test]
-fn enabled_router_rejects_missing_outputs() {
-    let mut config = valid_router_config();
-    config
-        .network
-        .interfaces
-        .retain(|_, interface| interface.role != InterfaceRole::Output);
-    assert!(config
-        .validate()
-        .expect_err("output is required")
-        .to_string()
-        .contains("at least one managed output"));
-}
-
-#[test]
 fn owned_default_route_requires_explicit_permission() {
     let mut config = valid_router_config();
     config.router.owned_routes[0].destination = "0.0.0.0/0".parse().expect("default route");
@@ -457,33 +422,9 @@ fn owned_default_route_requires_explicit_permission() {
 fn rejects_route_ownership_violations() {
     let mut config = valid_router_config();
     config.network.interfaces.insert(
-        "disabled0".to_string(),
-        InterfaceConfig {
-            mac_address: None,
-            nat: true,
-            role: InterfaceRole::Disabled,
-            managed: false,
-            ipv4: None,
-            dhcp: None,
-            dhcp_client: None,
-            wifi: None,
-            wifi_client: None,
-        },
-    );
-    config.router.owned_routes[0].output_interface = Some("disabled0".to_string());
-    assert!(config
-        .validate()
-        .expect_err("disabled role cannot own route")
-        .to_string()
-        .contains("cannot own a router route"));
-
-    // Non-disabled roles (None, unselected Input) and host interfaces not in network.interfaces are permitted
-    let mut config = valid_router_config();
-    config.network.interfaces.insert(
         "unmanaged0".to_string(),
         InterfaceConfig {
             mac_address: None,
-            nat: true,
             role: InterfaceRole::None,
             managed: false,
             ipv4: None,
@@ -564,9 +505,9 @@ fn router_without_uplink_validates_routes_and_detects_duplicates() {
 }
 
 #[test]
-fn legacy_config_uses_api_auth_and_runtime_defaults() {
-    let mut legacy = toml::Value::try_from(AppConfig::default()).expect("serialize config");
-    let root = legacy.as_table_mut().expect("root table");
+fn optional_api_auth_and_runtime_settings_use_defaults() {
+    let mut document = toml::Value::try_from(AppConfig::default()).expect("serialize config");
+    let root = document.as_table_mut().expect("root table");
     root.remove("api");
     root.remove("auth");
     root.remove("router");
@@ -577,7 +518,7 @@ fn legacy_config_uses_api_auth_and_runtime_defaults() {
     runtime.remove("socket_group");
     runtime.remove("shutdown_policy");
 
-    let config: AppConfig = legacy.try_into().expect("legacy config should parse");
+    let config: AppConfig = document.try_into().expect("minimal config should parse");
     assert_eq!(config.api, ApiConfig::default());
     assert_eq!(config.auth, AuthConfig::default());
     assert_eq!(config.router, RouterConfig::default());
@@ -1008,7 +949,6 @@ fn client_association(ssid: &str) -> WifiClientConfig {
 fn client_interface(wifi_client: WifiClientConfig) -> InterfaceConfig {
     InterfaceConfig {
         mac_address: None,
-        nat: true,
         role: InterfaceRole::Input,
         managed: true,
         ipv4: None,
@@ -1158,8 +1098,8 @@ fn dhcp_client() -> DhcpClientInterfaceConfig {
 }
 
 #[test]
-fn dhcp_client_defaults_and_legacy_absence_are_backward_compatible() {
-    let interface: InterfaceConfig = toml::from_str("role = \"input\"").expect("legacy interface");
+fn omitted_dhcp_client_is_disabled_and_settings_have_defaults() {
+    let interface: InterfaceConfig = toml::from_str("role = \"input\"").expect("minimal interface");
     assert!(interface.dhcp_client.is_none());
 
     let interface: InterfaceConfig =
@@ -1220,11 +1160,7 @@ fn accepts_existing_static_input_semantics() {
 
 #[test]
 fn rejects_invalid_dhcp_client_ownership_combinations() {
-    for role in [
-        InterfaceRole::Output,
-        InterfaceRole::None,
-        InterfaceRole::Disabled,
-    ] {
+    for role in [InterfaceRole::Output, InterfaceRole::None] {
         let mut interface = input_interface();
         interface.role = role;
         interface.dhcp_client = Some(DhcpClientInterfaceConfig {
@@ -1284,32 +1220,13 @@ fn an_ap_and_a_client_block_are_mutually_exclusive() {
     );
 }
 
-/// A pre-`nat`-field `InterfaceConfig` (an upgrade from before this
-/// field existed) must deserialize with NAT still on for every output —
-/// today's behavior — not silently turn NAT off because the key is
-/// missing.
-#[test]
-fn interface_config_without_a_nat_key_defaults_nat_to_true() {
-    let toml = r#"
-        role = "output"
-        managed = true
-        ipv4 = "192.168.10.1/24"
-    "#;
-    let interface: InterfaceConfig = toml::from_str(toml).expect("pre-nat fixture parses");
-    assert!(
-        interface.nat,
-        "a config predating InterfaceConfig.nat must still get NAT on upgrade"
-    );
-}
-
 /// A pre-`vpn_chain`-field `RouterConfig` (an upgrade from before the
 /// hop chain existed) must deserialize with an empty chain, not fail to
 /// parse or silently synthesize one at the `RouterConfig` level (that is
-/// `migrate_vpn_policy_mode_to_chain`'s job, exercised separately).
+/// explicit configuration's responsibility).
 #[test]
 fn router_config_without_a_vpn_chain_key_defaults_to_an_empty_chain() {
     let toml = r#"
-        enabled = true
         allow_default_route_change = false
 
         [uplink]
@@ -1420,36 +1337,37 @@ fn router_intent_is_derived_without_a_global_toggle() {
     });
     assert!(
         router.is_active(),
-        "legacy uplink mode must remain configurable"
+        "uplink services must remain configurable"
     );
 }
 
 #[test]
-fn legacy_router_enabled_key_is_ignored_on_deserialization() {
-    let router: RouterConfig = toml::from_str(
-        "enabled = false\nforwarding = [{ from = 'lan0', to = 'wan0', masquerade = true }]\n",
-    )
-    .expect("legacy config parses");
-    assert!(
-        router.is_active(),
-        "forwarding rules, not the legacy switch, govern intent"
-    );
-    let encoded = toml::to_string(&router).unwrap();
-    assert!(!encoded.contains("enabled"));
+fn removed_router_enabled_key_is_rejected() {
+    assert!(toml::from_str::<RouterConfig>("enabled = false").is_err());
 }
 
 #[test]
-fn legacy_iw_binary_is_ignored_and_not_written_back() {
+fn removed_iw_binary_key_is_rejected() {
     let mut document = toml::Value::try_from(AppConfig::default()).expect("default config");
     document["wifi"]
         .as_table_mut()
         .expect("wifi section")
         .insert("iw_binary".into(), toml::Value::String("iw".into()));
-    let config: AppConfig = document.try_into().expect("legacy config");
-    config
-        .validate()
-        .expect("unused iw path does not need validation");
-    assert!(!toml::to_string(&config)
-        .expect("serialize")
-        .contains("iw_binary"));
+    assert!(document.try_into::<AppConfig>().is_err());
+}
+
+#[test]
+fn removed_management_role_is_rejected() {
+    assert!(toml::from_str::<InterfaceConfig>(r#"role = "management""#).is_err());
+}
+
+#[test]
+fn removed_interface_settings_are_rejected() {
+    for document in [
+        r#"role = "disabled""#,
+        r#"role = "output"
+nat = true"#,
+    ] {
+        assert!(toml::from_str::<InterfaceConfig>(document).is_err());
+    }
 }

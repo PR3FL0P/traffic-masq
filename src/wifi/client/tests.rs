@@ -23,7 +23,6 @@ fn interface(wifi_client: Option<ClientConfig>) -> InterfaceConfig {
         }),
         wifi: None,
         wifi_client,
-        nat: true,
     }
 }
 

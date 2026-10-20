@@ -545,7 +545,6 @@ pub(super) fn interface_edit_request_to_config(
             dhcp_client,
             wifi,
             wifi_client,
-            nat: existing.is_none_or(|config| config.nat),
         },
         edit.allow_management_change,
     ))

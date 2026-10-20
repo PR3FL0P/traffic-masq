@@ -138,19 +138,12 @@ pub struct VpnChainPlanView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OutputNetworkView {
-    pub interface: String,
-    pub subnet: Ipv4Net,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouterDataplaneDesiredView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarding: Option<Vec<ForwardingConfigView>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub port_forwards: Vec<crate::PortForwardConfig>,
-    pub uplink: String,
-    pub outputs: Vec<OutputNetworkView>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,14 +157,8 @@ pub enum OwnedFirewallIntegrityView {
 pub struct RouterDataplaneSnapshotView {
     pub ipv4_forwarding: bool,
     pub owned: Option<RouterDataplaneDesiredView>,
-    #[serde(default = "owned_firewall_intact_by_default")]
     pub owned_firewall_integrity: OwnedFirewallIntegrityView,
 }
-
-fn owned_firewall_intact_by_default() -> OwnedFirewallIntegrityView {
-    OwnedFirewallIntegrityView::Intact
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", content = "desired", rename_all = "snake_case")]
 pub enum RouterDataplaneTargetView {

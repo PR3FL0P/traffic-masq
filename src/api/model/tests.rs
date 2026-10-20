@@ -39,7 +39,6 @@ fn interface_request_view_preserves_nested_config_json() {
             security: WifiClientSecurity::Wpa2,
             passphrase_file: None,
         }),
-        nat: false,
     };
     let expected = serde_json::to_value(&config).unwrap();
     let view: traffic_masq_protocol::InterfaceConfigView = config.clone().into();
@@ -100,7 +99,6 @@ fn router_proposal_view_preserves_nested_config_json() {
                     dhcp_client: None,
                     wifi: None,
                     wifi_client: None,
-                    nat: true,
                 },
                 allow_management_change: false,
             },
@@ -294,7 +292,7 @@ fn router_plan_view_preserves_complete_wire_shape() {
     use crate::core::vpn_chain::{VpnHopDesired, VpnHopKind, VpnHopRoutingDesired};
     use crate::core::vpn_policy::VpnPolicyReservedIds;
     use crate::firewall::{
-        OutputNetwork, OwnedFirewallIntegrity, RouterDataplaneDesired, RouterDataplanePlan,
+        OwnedFirewallIntegrity, RouterDataplaneDesired, RouterDataplanePlan,
         RouterDataplaneSnapshot, RouterDataplaneTarget,
     };
     use traffic_masq_protocol::RouterPlanView;
@@ -308,11 +306,6 @@ fn router_plan_view_preserves_complete_wire_shape() {
     let dataplane = RouterDataplaneDesired {
         port_forwards: Vec::new(),
         forwarding: Some(forwarding),
-        uplink: String::new(),
-        outputs: vec![OutputNetwork {
-            interface: "lan0".into(),
-            subnet: "192.0.2.0/24".parse().unwrap(),
-        }],
     };
     let hop = VpnHopDesired {
         hop_index: 0,
@@ -368,7 +361,6 @@ fn router_plan_view_preserves_complete_wire_shape() {
                     dhcp_client: None,
                     wifi: None,
                     wifi_client: None,
-                    nat: true,
                 },
             }],
         },
@@ -448,7 +440,6 @@ fn validated_ap_config_derives_the_same_client_spec() {
             passphrase_file: Some("/run/traffic-masq/ap.psk".into()),
         }),
         wifi_client: None,
-        nat: true,
     };
     config.validate("wlan0").unwrap();
     let expected: WifiApSpecView = WifiApSpec::from_interface_config("wlan0", &config)

@@ -12,15 +12,12 @@ use crate::config::{
     VpnPolicyMode,
 };
 
-/// Version 4 records interface suppression independently of overrides.
-/// Version 3 records router commit identity atomically with committed intent.
-/// Version 2 is readable; version 1 contained obsolete derived service maps.
+/// Current persisted intent schema, including interface suppression.
 pub const CURRENT_RUNTIME_OVERRIDES_SCHEMA: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeOverrides {
-    #[serde(default = "current_schema_version")]
     pub schema_version: u32,
     #[serde(default)]
     pub revision: u64,
@@ -187,11 +184,6 @@ impl RecoveryCommitProof {
         })
     }
 }
-
-const fn current_schema_version() -> u32 {
-    CURRENT_RUNTIME_OVERRIDES_SCHEMA
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterfaceOverride {
     pub config: InterfaceConfig,
@@ -358,30 +350,7 @@ impl RuntimeOverrideStore {
                 self.path.display()
             )
         })?;
-        let persisted_schema = match object.get("schema_version") {
-            None => None,
-            Some(value) => Some(value.as_u64().with_context(|| {
-                format!(
-                    "runtime override schema version in {} is not an unsigned integer",
-                    self.path.display()
-                )
-            })?),
-        };
-        if let Some(version) = persisted_schema {
-            if version > u64::from(CURRENT_RUNTIME_OVERRIDES_SCHEMA) {
-                bail!(
-                    "runtime overrides {} use unsupported future schema version {version} (current is {})",
-                    self.path.display(),
-                    CURRENT_RUNTIME_OVERRIDES_SCHEMA
-                );
-            }
-            if !(2..=u64::from(CURRENT_RUNTIME_OVERRIDES_SCHEMA)).contains(&version) {
-                bail!(
-                    "runtime overrides {} use unsupported schema version {version}",
-                    self.path.display()
-                );
-            }
-        }
+        require_current_schema(&object.get("schema_version").cloned().unwrap_or_default())?;
 
         Ok(RecoveryCommitProof {
             path: self.path.clone(),
@@ -407,31 +376,10 @@ impl RuntimeOverrideStore {
         let value: serde_json::Value = serde_json::from_slice(&content).with_context(|| {
             format!("failed to parse runtime overrides {}", self.path.display())
         })?;
-        let persisted_schema = value.get("schema_version").and_then(|value| value.as_u64());
-        if let Some(version) = persisted_schema {
-            if version > u64::from(CURRENT_RUNTIME_OVERRIDES_SCHEMA) {
-                bail!(
-                    "runtime overrides {} use unsupported future schema version {version} (current is {})",
-                    self.path.display(),
-                    CURRENT_RUNTIME_OVERRIDES_SCHEMA
-                );
-            }
-            if !(2..=u64::from(CURRENT_RUNTIME_OVERRIDES_SCHEMA)).contains(&version) {
-                bail!(
-                    "runtime overrides {} use unsupported schema version {version}",
-                    self.path.display()
-                );
-            }
-        }
-
-        let mut overrides: RuntimeOverrides = serde_json::from_value(value).with_context(|| {
+        require_current_schema(&value["schema_version"])?;
+        let overrides: RuntimeOverrides = serde_json::from_value(value).with_context(|| {
             format!("failed to parse runtime overrides {}", self.path.display())
         })?;
-        if persisted_schema.is_none() {
-            overrides.schema_version = CURRENT_RUNTIME_OVERRIDES_SCHEMA;
-            overrides.revision = 0;
-        }
-        overrides.schema_version = CURRENT_RUNTIME_OVERRIDES_SCHEMA;
         overrides.validate_suppression()?;
         Ok(overrides)
     }
@@ -456,3 +404,9 @@ impl RuntimeOverrideStore {
 
 #[cfg(test)]
 mod tests;
+
+fn require_current_schema(version: &serde_json::Value) -> Result<()> {
+    anyhow::ensure!(version.as_u64() == Some(u64::from(CURRENT_RUNTIME_OVERRIDES_SCHEMA)),
+        "unsupported runtime override schema {version}; expected {CURRENT_RUNTIME_OVERRIDES_SCHEMA}");
+    Ok(())
+}

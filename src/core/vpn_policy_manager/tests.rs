@@ -28,7 +28,6 @@ fn config_with_managed_output_and_uplink() -> AppConfig {
             dhcp_client: None,
             wifi: None,
             wifi_client: None,
-            nat: true,
         },
     );
     config.network.interfaces.insert(
@@ -42,7 +41,6 @@ fn config_with_managed_output_and_uplink() -> AppConfig {
             dhcp_client: None,
             wifi: None,
             wifi_client: None,
-            nat: true,
         },
     );
     config.router = RouterConfig {

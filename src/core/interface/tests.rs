@@ -56,7 +56,6 @@ async fn owned_addresses_remain_editable_after_restart_without_saved_interface_s
             dhcp_client: None,
             wifi: None,
             wifi_client: None,
-            nat: true,
         };
         // No previous configuration or role: same plan used after settings reset.
         let plan = manager
@@ -236,7 +235,6 @@ impl NetworkProvider for FakeNetworkProvider {
 fn config(role: InterfaceRole, address: &str) -> InterfaceConfig {
     InterfaceConfig {
         mac_address: None,
-        nat: true,
         role,
         managed: true,
         ipv4: Some(address.parse::<Ipv4Net>().expect("network")),
@@ -630,7 +628,6 @@ async fn a_leftover_owned_address_is_cleaned_up_after_the_release_transition() {
     // gone, but our address is still sitting on the link.
     let unmanaged = InterfaceConfig {
         mac_address: None,
-        nat: true,
         role: InterfaceRole::Output,
         managed: false,
         ipv4: None,

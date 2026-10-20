@@ -380,9 +380,8 @@ pub(super) async fn reconcile_network_runtime_once<
         &effective.wifi.runtime_dir,
         &effective.wifi_client.runtime_dir,
     );
-    // A recovered legacy secret must be migrated before a transaction can
-    // replace it. This reservation ends before any service readiness wait.
-    let migration = desired.credential_updates.write().await;
+    // Recovery restores current-format secrets under the same reservation as credential edits.
+    let credential_updates = desired.credential_updates.write().await;
     crate::core::transaction::retry_interface_recovery(
         desired.state_dir(),
         &interface_manager,
@@ -391,14 +390,7 @@ pub(super) async fn reconcile_network_runtime_once<
         desired,
     )
     .await?;
-    // An old journal may just have restored a legacy secret. Use committed
-    // intent, never a tentative role switch, before allowing its consumer.
-    // Retry migration failures on later passes even after journal recovery
-    // itself has succeeded and removed the interface's recovery fence.
-    if crate::core::recovery_control::stopped_journals(desired.state_dir()).is_empty() {
-        crate::wifi::store::migrate_legacy_passphrases(&desired.committed_config().await?).await?;
-    }
-    drop(migration);
+    drop(credential_updates);
     let observed_interfaces: HashMap<_, _> = network
         .list_interfaces()
         .await?
@@ -578,7 +570,7 @@ async fn reconcile_interface_runtime_once(
                         dhcp_client: None,
                         wifi: None,
                         wifi_client: None,
-                        nat: false,
+
                         role: config.role,
                     };
                     if let Some(client) = dhcp_client {

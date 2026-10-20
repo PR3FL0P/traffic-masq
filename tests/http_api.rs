@@ -183,7 +183,6 @@ async fn authenticated_http_client_controls_daemon_over_unix_socket() -> Result<
         "test0".to_string(),
         InterfaceConfig {
             mac_address: None,
-            nat: true,
             role: InterfaceRole::Output,
             managed: true,
             ipv4: Some("192.168.99.1/24".parse()?),
@@ -330,7 +329,6 @@ async fn authenticated_http_client_controls_daemon_over_unix_socket() -> Result<
 
     let interface_config = InterfaceConfig {
         mac_address: None,
-        nat: true,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some("192.168.100.1/24".parse()?),
@@ -705,13 +703,11 @@ impl RouterSubsystems for FakeRouterSubsystems {
                     .filter(|spec| spec.interface == interface)
                     .cloned(),
                 interface,
-                lease: None,
             })
             .collect();
         Ok(RouterSnapshot {
             interfaces: Vec::new(),
             uplink_wifi: Vec::new(),
-            uplink_dhcp: current,
             dhcp_clients,
             output_wifi: Vec::new(),
             dhcp: Vec::new(),
@@ -795,12 +791,8 @@ impl RouterSubsystems for FakeRouterSubsystems {
     async fn rollback_dhcp_clients(
         &self,
         snapshots: &[traffic_masq::core::router::DhcpClientSnapshot],
-        legacy: Option<&traffic_masq::dhcp::client::DhcpClientSpec>,
     ) -> Result<()> {
-        *self.dhcp_client.lock().unwrap() = snapshots
-            .iter()
-            .find_map(|entry| entry.spec.clone())
-            .or_else(|| legacy.cloned());
+        *self.dhcp_client.lock().unwrap() = snapshots.iter().find_map(|entry| entry.spec.clone());
         Ok(())
     }
     async fn health_uplink_dhcp(
@@ -829,7 +821,12 @@ fn router_proposal() -> RouterProposalRequest {
     RouterProposalRequest {
         set_router: Some(RouterConfig {
             port_forwards: Vec::new(),
-            forwarding: None,
+            forwarding: Some(vec![traffic_masq::config::ForwardingConfig {
+                from: "lan0".into(),
+                to: "wan0".into(),
+                source_subnet: Some("192.168.10.0/24".parse().unwrap()),
+                masquerade: true,
+            }]),
             vpn_chain: Vec::new(),
             uplink: Some(UplinkConfig {
                 interface: "wan0".to_string(),
@@ -845,7 +842,6 @@ fn router_proposal() -> RouterProposalRequest {
             InterfaceOverrideRequest {
                 config: InterfaceConfig {
                     mac_address: None,
-                    nat: true,
                     role: InterfaceRole::Output,
                     managed: true,
                     ipv4: Some("192.168.10.1/24".parse().unwrap()),
@@ -876,7 +872,6 @@ async fn router_enabled_test_server() -> Result<(
         "wan0".to_string(),
         InterfaceConfig {
             mac_address: None,
-            nat: true,
             role: InterfaceRole::Input,
             managed: false,
             ipv4: None,
@@ -904,7 +899,6 @@ async fn router_status_test_server(
         "wan0".to_string(),
         InterfaceConfig {
             mac_address: None,
-            nat: true,
             role: InterfaceRole::Input,
             managed: false,
             ipv4: None,
@@ -918,7 +912,6 @@ async fn router_status_test_server(
         "lan0".to_string(),
         InterfaceConfig {
             mac_address: None,
-            nat: true,
             role: InterfaceRole::Output,
             managed: true,
             ipv4: Some("192.168.10.1/24".parse().unwrap()),
@@ -930,7 +923,12 @@ async fn router_status_test_server(
     );
     config.router = RouterConfig {
         port_forwards: Vec::new(),
-        forwarding: None,
+        forwarding: Some(vec![traffic_masq::config::ForwardingConfig {
+            from: "lan0".into(),
+            to: "wan0".into(),
+            source_subnet: Some("192.168.10.0/24".parse().unwrap()),
+            masquerade: true,
+        }]),
         vpn_chain: Vec::new(),
         uplink: Some(UplinkConfig {
             interface: "wan0".to_string(),
@@ -1805,7 +1803,6 @@ async fn vpn_policy_status_set_mode_clear_mode_over_http() -> Result<()> {
         "wan0".to_string(),
         InterfaceConfig {
             mac_address: None,
-            nat: true,
             role: InterfaceRole::Input,
             managed: false,
             ipv4: None,
@@ -1819,7 +1816,6 @@ async fn vpn_policy_status_set_mode_clear_mode_over_http() -> Result<()> {
         "lan0".to_string(),
         InterfaceConfig {
             mac_address: None,
-            nat: true,
             role: InterfaceRole::Output,
             managed: true,
             ipv4: Some("192.168.10.1/24".parse().unwrap()),

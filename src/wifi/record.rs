@@ -10,7 +10,6 @@ use crate::atomic_file::{self, PRIVATE_FILE_MODE};
 use crate::wifi::render::WifiDigest;
 
 pub const CURRENT_WIFI_RECORD_SCHEMA: u32 = 2;
-const LEGACY_WIFI_RECORD_SCHEMA: u32 = 1;
 
 #[derive(Debug, Error)]
 pub enum WifiRecordError {
@@ -83,7 +82,6 @@ pub struct PersistedWifiRecord {
 #[derive(Debug, Clone)]
 pub struct WifiRecordStore {
     path: PathBuf,
-    legacy_path: Option<PathBuf>,
     expected_config_stem: String,
     runtime_dir: PathBuf,
     interface: String,
@@ -128,17 +126,6 @@ impl WifiProcessKind {
             Self::Scan => directory.join("scan"),
         }
     }
-
-    fn legacy_path(self, directory: &Path, interface: &str) -> Option<PathBuf> {
-        match self {
-            Self::AccessPoint => Some(directory.join(format!("active-{interface}.json"))),
-            Self::Client => Some(directory.join(format!("active-client-{interface}.json"))),
-            // Scan records already lived in their own namespace before AP/client
-            // records were split, so no migration is required for them.
-            Self::Scan => None,
-        }
-    }
-
     fn expected_config_stem(self, interface: &str) -> String {
         match self {
             Self::AccessPoint | Self::Client => interface.to_string(),
@@ -159,7 +146,6 @@ impl WifiRecordStore {
             path: kind
                 .storage_directory(base)
                 .join(format!("active-{interface}.json")),
-            legacy_path: kind.legacy_path(base, interface),
             expected_config_stem: kind.expected_config_stem(interface),
             runtime_dir: runtime_dir.as_ref().to_path_buf(),
             interface: interface.to_string(),
@@ -225,6 +211,12 @@ impl WifiRecordStore {
         record.ctrl_path == self.expected_ctrl_path()
             && record.config_path == self.expected_config_path()
             && record.ctrl_dev.is_some() == record.ctrl_ino.is_some()
+            && record
+                .binary_path
+                .as_ref()
+                .is_some_and(|path| path.is_absolute())
+            && record.boot_id.as_ref().is_some_and(|id| !id.is_empty())
+            && (record.pid == 0 || record.process_start_ticks.is_some())
             && record.started_at_unix != 0
     }
 
@@ -241,26 +233,15 @@ impl WifiRecordStore {
         let document: PersistedWifiRecordDocument = serde_json::from_slice(&content)
             .map_err(|error| WifiRecordError::Parse(path.to_path_buf(), error))?;
 
-        if !matches!(
-            document.schema_version,
-            LEGACY_WIFI_RECORD_SCHEMA | CURRENT_WIFI_RECORD_SCHEMA
-        ) {
+        if document.schema_version != CURRENT_WIFI_RECORD_SCHEMA {
             return Err(WifiRecordError::UnsupportedSchema(
                 path.to_path_buf(),
                 document.schema_version,
             ));
         }
 
-        let context_matches = if document.schema_version == CURRENT_WIFI_RECORD_SCHEMA {
-            document.kind == Some(self.kind)
-                && document.interface.as_deref() == Some(self.interface.as_str())
-        } else {
-            document.kind.is_none_or(|kind| kind == self.kind)
-                && document
-                    .interface
-                    .as_deref()
-                    .is_none_or(|name| name == self.interface)
-        };
+        let context_matches = document.kind == Some(self.kind)
+            && document.interface.as_deref() == Some(self.interface.as_str());
         if !context_matches {
             return Err(WifiRecordError::MismatchedContext(path.to_path_buf()));
         }
@@ -298,59 +279,8 @@ impl WifiRecordStore {
             .map(|_| ())
             .map_err(|error| WifiRecordError::Write(path.to_path_buf(), error))
     }
-
-    async fn legacy_record(&self) -> Result<Option<PersistedWifiRecord>, WifiRecordError> {
-        let Some(path) = self.legacy_path.as_deref() else {
-            return Ok(None);
-        };
-        let Some((record, _schema_version)) = self.load_path(path).await? else {
-            return Ok(None);
-        };
-        Ok(self.record_matches_store(&record).then_some(record))
-    }
-
-    async fn clear_matching_legacy(&self) -> Result<(), WifiRecordError> {
-        let Some(path) = self.legacy_path.as_deref() else {
-            return Ok(());
-        };
-        let Some((record, _schema_version)) = self.load_path(path).await? else {
-            return Ok(());
-        };
-        if !self.record_matches_store(&record) {
-            return Ok(());
-        }
-        Self::clear_path(path).await?;
-        Self::clear_path(&Self::transition_path_for(path)).await
-    }
-
-    async fn migrate_legacy(&self, record: &PersistedWifiRecord) -> Result<(), WifiRecordError> {
-        let legacy = self
-            .legacy_path
-            .as_deref()
-            .expect("legacy migration requires a legacy path");
-        if Self::path_exists(&Self::transition_path_for(legacy)).await? {
-            self.mark_transition().await?;
-        }
-        self.save_primary(record).await?;
-        self.clear_matching_legacy().await
-    }
-
     pub async fn transition_pending(&self) -> Result<bool, WifiRecordError> {
-        let path = self.transition_path();
-        if Self::path_exists(&path).await? {
-            return Ok(true);
-        }
-
-        // A transition can still live under the legacy name until the first
-        // ownership read after an upgrade. Only trust it when the associated
-        // legacy record proves that it belongs to this exact kind/interface.
-        let Some(legacy) = self.legacy_path.as_deref() else {
-            return Ok(false);
-        };
-        if self.legacy_record().await?.is_none() {
-            return Ok(false);
-        }
-        Self::path_exists(&Self::transition_path_for(legacy)).await
+        Self::path_exists(&self.transition_path()).await
     }
 
     pub async fn mark_transition(&self) -> Result<(), WifiRecordError> {
@@ -366,37 +296,16 @@ impl WifiRecordStore {
     }
 
     pub async fn clear_transition(&self) -> Result<(), WifiRecordError> {
-        Self::clear_path(&self.transition_path()).await?;
-        let Some(legacy) = self.legacy_path.as_deref() else {
-            return Ok(());
-        };
-        if self.legacy_record().await?.is_some() {
-            Self::clear_path(&Self::transition_path_for(legacy)).await?;
-        }
-        Ok(())
+        Self::clear_path(&self.transition_path()).await
     }
 
     pub async fn load(&self) -> Result<Option<PersistedWifiRecord>, WifiRecordError> {
-        if let Some((record, schema_version)) = self.load_path(&self.path).await? {
-            if !self.record_matches_store(&record) {
-                return Err(WifiRecordError::MismatchedContext(self.path.clone()));
-            }
-            // Schema v1 is accepted only after exact context/path validation,
-            // then immediately rewritten as v2 so future recovery requires
-            // explicit kind/interface metadata.
-            if schema_version == LEGACY_WIFI_RECORD_SCHEMA {
-                self.save_primary(&record).await?;
-            }
-            // A crash after writing the new namespaced record but before
-            // removing its legacy copy is harmless; finish that migration now.
-            self.clear_matching_legacy().await?;
-            return Ok(Some(record));
-        }
-
-        let Some(record) = self.legacy_record().await? else {
+        let Some((record, _)) = self.load_path(&self.path).await? else {
             return Ok(None);
         };
-        self.migrate_legacy(&record).await?;
+        if !self.record_matches_store(&record) {
+            return Err(WifiRecordError::MismatchedContext(self.path.clone()));
+        }
         Ok(Some(record))
     }
 
@@ -437,20 +346,16 @@ impl WifiRecordStore {
         if !self.record_matches_store(record) {
             return Err(WifiRecordError::MismatchedContext(self.path.clone()));
         }
-        self.save_primary(record).await?;
-        self.clear_matching_legacy().await
+        self.save_primary(record).await
     }
 
     pub async fn clear(&self) -> Result<(), WifiRecordError> {
         Self::clear_path(&self.path).await?;
-        self.clear_transition().await?;
-        self.clear_matching_legacy().await
+        self.clear_transition().await
     }
 
     /// Discover ownership records of one Wi-Fi process kind. AP and client
-    /// records use separate namespaces. Legacy root-level names are considered
-    /// only long enough to validate their exact configured runtime paths and
-    /// migrate them into the unambiguous schema-v2 namespace.
+    /// records use separate namespaces.
     pub async fn discover(
         kind: WifiProcessKind,
         directory: impl AsRef<Path>,
@@ -460,10 +365,7 @@ impl WifiRecordStore {
         let runtime_dir = runtime_dir.as_ref();
         let namespaced_directory = kind.storage_directory(base);
         let mut candidates = BTreeSet::new();
-        collect_candidates(&namespaced_directory, false, kind, &mut candidates).await?;
-        if kind != WifiProcessKind::Scan {
-            collect_candidates(base, true, kind, &mut candidates).await?;
-        }
+        collect_candidates(&namespaced_directory, &mut candidates).await?;
 
         let mut records = Vec::new();
         for interface in candidates {
@@ -482,8 +384,6 @@ impl WifiRecordStore {
 
 async fn collect_candidates(
     directory: &Path,
-    legacy: bool,
-    kind: WifiProcessKind,
     candidates: &mut BTreeSet<String>,
 ) -> Result<(), WifiRecordError> {
     let mut entries = match fs::read_dir(directory).await {
@@ -499,11 +399,7 @@ async fn collect_candidates(
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        let interface = if legacy {
-            interface_from_legacy_filename(kind, &name)
-        } else {
-            interface_from_namespaced_filename(&name)
-        };
+        let interface = interface_from_namespaced_filename(&name);
         if let Some(interface) = interface {
             candidates.insert(interface);
         }
@@ -516,16 +412,5 @@ fn interface_from_namespaced_filename(name: &str) -> Option<String> {
     let interface = stem.strip_prefix("active-")?;
     (!interface.is_empty()).then(|| interface.to_string())
 }
-
-fn interface_from_legacy_filename(kind: WifiProcessKind, name: &str) -> Option<String> {
-    let stem = name.strip_suffix(".json")?;
-    let interface = match kind {
-        WifiProcessKind::AccessPoint => stem.strip_prefix("active-")?,
-        WifiProcessKind::Client => stem.strip_prefix("active-client-")?,
-        WifiProcessKind::Scan => return None,
-    };
-    (!interface.is_empty()).then(|| interface.to_string())
-}
-
 #[cfg(test)]
 mod tests;

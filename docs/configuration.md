@@ -63,10 +63,9 @@ Names are 1–15 ASCII letters, digits, dots, underscores or hyphens.
 
 | Field | Default / requirement | Meaning |
 | --- | --- | --- |
-| `role` | required | `none`, `input`, `output`, `middle`, or legacy `disabled`; `management` aliases `none` |
+| `role` | required | `none`, `input`, `output`, or `middle` |
 | `managed` | `false` | Allow traffic-masq to configure owned resources |
 | `ipv4` | omitted | Static host CIDR, e.g. `192.168.50.1/24` |
-| `nat` | `true` | Legacy output masquerade; ignored when explicit router forwarding is present |
 | `dhcp` | omitted | DHCP server table; managed output with static IPv4 required |
 | `dhcp_client` | omitted | DHCP client table; input role required |
 | `wifi` | omitted | AP table; managed output required |
@@ -76,7 +75,7 @@ Managed static subnets must not overlap. An enabled DHCP client and static IPv4
 cannot coexist. AP and station configuration cannot coexist on one interface;
 managed AP and station interfaces also cannot share a known physical PHY.
 `middle` denotes an unaddressed WireGuard hop and rejects static IPv4, DHCP
-server and Wi-Fi blocks. Legacy `disabled` cannot be managed.
+server and Wi-Fi blocks.
 
 For a managed wired DHCP uplink, add this to a safe initialized configuration:
 
@@ -128,8 +127,9 @@ provides no DNS resolver. `lease_seconds` is optional and otherwise uses
 
 `[router]` has no global enabled switch. Routing intent is derived from an
 uplink, non-empty explicit forwarding rules or port forwards, owned routes, or a VPN chain.
-With none of these, the router dataplane remains inactive. Old TOML files with
-`router.enabled` still deserialize, but the key is ignored; remove it when migrating.
+With none of these, the router dataplane remains inactive. Unknown configuration
+keys, including removed `router.enabled`, interface `nat`, and `wifi.iw_binary`,
+are rejected. The removed roles `management` and `disabled` are rejected too.
 
 ```toml
 [router]
@@ -140,8 +140,8 @@ owned_routes = []
 allow_default_route_change = false
 ```
 
-`forwarding` is authoritative when present. `[]` removes explicit connections;
-omitting the field preserves legacy uplink/per-output `nat` behavior. Each rule
+`forwarding` defines all connection permissions. `[]`, omission, and `null`
+(in JSON) disable connection forwarding; no implicit NAT rules are generated. Each rule
 requires different `from` and `to` interfaces, defaults `masquerade` to `true`,
 and optionally restricts traffic with `source_subnet` (a network CIDR without
 host bits). Overlapping rules for the same interface pair are rejected.
@@ -180,7 +180,7 @@ The target receives the original client IP and needs a return route through this
 router. Use a stable target address or a DHCP reservation managed outside this
 feature.
 
-Port forwards work with legacy uplink sharing and explicit sharing rules. For
+Port forwards work independently of explicit sharing rules. For
 port forwarding alone, use `forwarding = []`; outbound Internet sharing is not
 required. Only the matching DNAT connections, their established replies and related ICMP errors
 are allowed by the added permissions. Unmatched IPv4 traffic between each mapped
@@ -196,14 +196,14 @@ sharing permissions, established connections may continue after a mapping is
 removed, while new connections use the current mapping.
 
 This version supports single ports and distinct ingress/egress interfaces.
-IPv6, port ranges and hairpin NAT are not supported. Legacy global VPN chains and
-global VPN mode `vpn` must be replaced by explicit per-interface tunnel routing
-before adding mappings.
+IPv6, port ranges and hairpin NAT are not supported. Global VPN chains and global VPN mode `vpn`
+must be replaced by explicit per-interface tunnel routing before adding mappings.
 
 
-The optional legacy `[router.uplink]` table contains `interface` and `mode`:
+The optional `[router.uplink]` table contains `interface` and `mode`:
 `external` requires an unmanaged input; `dhcp` requires a managed input with an
-enabled DHCP client. Legacy managed outputs need static IPv4 subnets.
+enabled DHCP client. This selects uplink services and the physical upstream for
+a VPN chain; it grants no forwarding or NAT permissions.
 
 Static routes use array tables:
 
@@ -222,9 +222,10 @@ bits; tables `0` and `255` are rejected. A default route requires
 `allow_default_route_change = true`. Existing foreign routes are not adopted.
 
 `vpn_chain = [{ profile_name = "first.conf" }, { profile_name = "second.conf" }]`
-selects up to eight WireGuard hops, nearest the physical uplink first. Explicit
-`forwarding` cannot coexist with a legacy VPN chain or global VPN mode `vpn`.
-Configure tunnel routing separately for explicit interface pairs.
+selects up to eight WireGuard hops, nearest the physical uplink first, and requires
+`router.uplink`. Configure `forwarding` explicitly for the interfaces that should
+exchange traffic, including the VPN egress; the chain does not synthesize sharing
+rules. Explicit forwarding cannot coexist with global VPN mode `vpn`.
 
 `route_host_traffic = true` (default `false`) additionally sends the router's own
 locally generated traffic through the VPN chain. It requires a non-empty
@@ -258,8 +259,7 @@ Global settings have these defaults:
 | `runtime_dir` | `/run/traffic-masq/hostapd` | `/run/traffic-masq/wpa_supplicant` |
 | `restart_backoff_seconds` | `5` | `5` |
 
-AP capabilities are read directly via nl80211; legacy `[wifi] iw_binary` is
-ignored and omitted when configuration is serialized. Binary and runtime paths
+AP capabilities are read directly via nl80211. Binary and runtime paths
 must be absolute; backoff must be positive. Global `enabled` is a startup binary-check
 hint, not a runtime off switch: supervisors are available even when it is
 `false`, and interface configuration/profile activation can start Wi-Fi later.

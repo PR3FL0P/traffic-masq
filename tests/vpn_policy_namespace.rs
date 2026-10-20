@@ -473,7 +473,6 @@ fn build_config(temp: &tempfile::TempDir, lan_if: &str, uplink_if: &str) -> AppC
         uplink_if.to_string(),
         InterfaceConfig {
             mac_address: None,
-            nat: true,
             role: InterfaceRole::Input,
             managed: false,
             ipv4: None,
@@ -487,7 +486,6 @@ fn build_config(temp: &tempfile::TempDir, lan_if: &str, uplink_if: &str) -> AppC
         lan_if.to_string(),
         InterfaceConfig {
             mac_address: None,
-            nat: true,
             role: InterfaceRole::Output,
             managed: true,
             ipv4: Some(

@@ -22,7 +22,6 @@ const IPV4_FORWARDING_PATH: &str = "/proc/sys/net/ipv4/ip_forward";
 const NFT_FAMILY: &str = "inet";
 const NFT_TABLE: &str = "traffic_masq";
 const NFT_TABLE_COMMENT: &str = "traffic-masq:v1";
-const NFT_LEGACY_COMMENT_PREFIX: &str = "traffic-masq:v1:";
 const NFT_METADATA_COMMENT_PREFIX: &str = "traffic-masq:v1:part:";
 const NFT_METADATA_HEX_CHUNK_LEN: usize = 96;
 
@@ -96,12 +95,6 @@ fn parse_ipv4_forwarding(value: &[u8]) -> Result<bool> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OutputNetwork {
-    pub interface: String,
-    pub subnet: Ipv4Net,
-}
-
 /// A directional permission to forward IPv4 traffic between existing interfaces.
 /// Routing selects the egress; this rule does not create routes or VPN tunnels.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,83 +128,33 @@ impl traffic_masq_protocol::ForwardingRule for ForwardingConfig {
 fn validate_interface_name(name: &str) -> Result<()> {
     traffic_masq_protocol::validate_interface_name(name).map_err(anyhow::Error::msg)
 }
-
-fn networks_overlap(left: Ipv4Net, right: Ipv4Net) -> bool {
-    left.contains(&right.network()) || right.contains(&left.network())
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RouterDataplaneDesired {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarding: Option<Vec<ForwardingConfig>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub port_forwards: Vec<PortForwardConfig>,
-    pub uplink: String,
-    pub outputs: Vec<OutputNetwork>,
 }
 
 impl RouterDataplaneDesired {
-    /// Canonical directional permissions, also for legacy sharing metadata.
     pub fn forwarding_rules(&self) -> Vec<ForwardingConfig> {
-        self.forwarding.clone().unwrap_or_else(|| {
-            self.outputs
-                .iter()
-                .map(|output| ForwardingConfig {
-                    source_subnet: Some(output.subnet.trunc()),
-                    from: output.interface.clone(),
-                    to: self.uplink.clone(),
-                    masquerade: true,
-                })
-                .collect()
-        })
+        self.forwarding.clone().unwrap_or_default()
     }
 
     pub fn validate(&self) -> Result<()> {
         traffic_masq_protocol::validate_port_forwards(&self.port_forwards)
             .map_err(anyhow::Error::msg)?;
-        if let Some(rules) = &self.forwarding {
-            if !self.uplink.is_empty() || !self.outputs.is_empty() {
-                bail!("explicit forwarding cannot contain legacy dataplane fields");
-            }
-            return traffic_masq_protocol::validate_forwarding(rules).map_err(anyhow::Error::msg);
-        }
-        validate_interface_name(&self.uplink).context("invalid uplink interface")?;
-        if self.outputs.is_empty() {
-            bail!("router dataplane requires at least one output network");
-        }
-
-        for (index, output) in self.outputs.iter().enumerate() {
-            validate_interface_name(&output.interface)
-                .with_context(|| format!("invalid output interface {}", output.interface))?;
-            if output.interface == self.uplink {
-                bail!(
-                    "uplink and output interface must be different: {}",
-                    self.uplink
-                );
-            }
-
-            for other in self.outputs.iter().skip(index + 1) {
-                if output.interface == other.interface {
-                    bail!("duplicate output interface: {}", output.interface);
-                }
-                if networks_overlap(output.subnet, other.subnet) {
-                    bail!(
-                        "output networks overlap: {} ({}) and {} ({})",
-                        output.interface,
-                        output.subnet,
-                        other.interface,
-                        other.subnet
-                    );
-                }
-            }
-        }
-
-        Ok(())
+        let rules = self
+            .forwarding
+            .as_ref()
+            .context("router dataplane requires explicit forwarding rules")?;
+        traffic_masq_protocol::validate_forwarding(rules).map_err(anyhow::Error::msg)
     }
 }
 
 // Intersect committed permissions with proven applied permissions. Preserve
-// the original metadata when nothing was removed, including legacy format.
+// the original metadata when nothing was removed.
 fn retained_firewall(
     current: Option<&RouterDataplaneDesired>,
     target: &RouterDataplaneTarget,
@@ -243,8 +186,6 @@ fn retained_firewall(
     Some(RouterDataplaneDesired {
         forwarding: Some(retained),
         port_forwards,
-        uplink: String::new(),
-        outputs: Vec::new(),
     })
 }
 
@@ -469,23 +410,6 @@ fn render_nftables_batch(
         batch.push_str(&format!("table inet {NFT_TABLE} {{\n  comment \"{NFT_TABLE_COMMENT}\"\n  chain metadata {{\n{metadata_rules}  }}\n{port_prerouting}  chain forward {{\n    type filter hook forward priority filter; policy accept;\n{port_forward_prefix}{forward}{port_guards}  }}\n  chain postrouting {{\n    type nat hook postrouting priority srcnat; policy accept;\n{nat}  }}\n}}\n"));
         return Ok(batch);
     }
-    let output_ifaces = desired
-        .outputs
-        .iter()
-        .map(|output| format!("\"{}\"", output.interface))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let output_subnets = desired
-        .outputs
-        .iter()
-        .map(|output| output.subnet.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    batch.push_str(&format!(
-        "table inet {NFT_TABLE} {{\n  comment \"{NFT_TABLE_COMMENT}\"\n  chain metadata {{\n{metadata_rules}  }}\n  set output_ifaces {{ type ifname; elements = {{ {output_ifaces} }} }}\n  set output_subnets {{ type ipv4_addr; flags interval; elements = {{ {output_subnets} }} }}\n{port_prerouting}  chain forward {{\n    type filter hook forward priority filter; policy accept;\n{port_forward_prefix}    iifname @output_ifaces oifname \"{}\" accept\n    iifname \"{}\" oifname @output_ifaces ct state established,related accept\n    iifname \"{}\" oifname @output_ifaces drop\n{port_guards}  }}\n  chain postrouting {{\n    type nat hook postrouting priority srcnat; policy accept;\n    ip saddr @output_subnets oifname \"{}\" masquerade\n  }}\n}}\n",
-        desired.uplink, desired.uplink, desired.uplink, desired.uplink
-    ));
     Ok(batch)
 }
 
@@ -521,21 +445,17 @@ fn parse_owned_nftables_state(output: &[u8]) -> Result<OwnedFirewallObservation>
             .get("comment")
             .and_then(Value::as_str)
             .context("owned nftables table has no traffic-masq metadata comment; inspect `sudo nft list table inet traffic_masq` and identify/reconfigure the table owner manually before retrying")?;
-        let (encoded, chunked_metadata) = if let Some(legacy) =
-            comment.strip_prefix(NFT_LEGACY_COMMENT_PREFIX)
-        {
-            (legacy.to_string(), false)
-        } else if comment == NFT_TABLE_COMMENT {
-            (collect_metadata_chunks(entries)?, true)
-        } else {
-            bail!("owned nftables table has unsupported metadata; inspect `sudo nft list table inet traffic_masq`; verify the table owner and reconfigure its service manually before retrying; traffic-masq will not overwrite an unverified table");
-        };
+        anyhow::ensure!(
+            comment == NFT_TABLE_COMMENT,
+            "owned nftables table has unsupported metadata"
+        );
+        let encoded = collect_metadata_chunks(entries)?;
         let desired: RouterDataplaneDesired = serde_json::from_slice(&hex_decode(&encoded)?)
             .context("owned nftables metadata is invalid")?;
         desired
             .validate()
             .context("owned nftables metadata is unsafe")?;
-        let integrity = if owned_nftables_structure_is_intact(entries, &desired, chunked_metadata) {
+        let integrity = if owned_nftables_structure_is_intact(entries, &desired) {
             OwnedFirewallIntegrity::Intact
         } else {
             OwnedFirewallIntegrity::Drifted
@@ -589,11 +509,7 @@ fn collect_metadata_chunks(entries: &[Value]) -> Result<String> {
     Ok(chunks.into_iter().map(|(_, chunk)| chunk).collect())
 }
 
-fn owned_nftables_structure_is_intact(
-    entries: &[Value],
-    desired: &RouterDataplaneDesired,
-    require_metadata_chain: bool,
-) -> bool {
+fn owned_nftables_structure_is_intact(entries: &[Value], desired: &RouterDataplaneDesired) -> bool {
     let stripped;
     let entries = if desired.port_forwards.is_empty() {
         entries
@@ -620,10 +536,9 @@ fn owned_nftables_structure_is_intact(
         .filter(|rule| owned_object(rule))
         .collect::<Vec<_>>();
 
-    let metadata_ok = !require_metadata_chain
-        || chains
-            .iter()
-            .any(|chain| object_name(chain) == Some("metadata"));
+    let metadata_ok = chains
+        .iter()
+        .any(|chain| object_name(chain) == Some("metadata"));
     let forward_chain_ok = chains.iter().any(|chain| {
         object_name(chain) == Some("forward")
             && string_field(chain, "type") == Some("filter")
@@ -636,7 +551,7 @@ fn owned_nftables_structure_is_intact(
             && string_field(chain, "hook") == Some("postrouting")
             && string_field(chain, "policy") == Some("accept")
     });
-    let allowed_chain_count = if require_metadata_chain { 3 } else { 2 };
+    let allowed_chain_count = 3;
     let chains_ok = metadata_ok
         && forward_chain_ok
         && postrouting_chain_ok
@@ -646,79 +561,7 @@ fn owned_nftables_structure_is_intact(
         return chains_ok && sets.is_empty() && forwarding_structure_is_intact(&rules, connections);
     }
 
-    let expected_ifaces = desired
-        .outputs
-        .iter()
-        .map(|output| output.interface.as_str())
-        .collect::<Vec<_>>();
-    let expected_subnets = desired
-        .outputs
-        .iter()
-        .map(|output| output.subnet.to_string())
-        .collect::<Vec<_>>();
-    let ifaces_ok = sets.iter().any(|set| {
-        object_name(set) == Some("output_ifaces")
-            && string_field(set, "type") == Some("ifname")
-            && exact_string_elements(set, &expected_ifaces)
-    });
-    let subnets_ok = sets.iter().any(|set| {
-        object_name(set) == Some("output_subnets")
-            && string_field(set, "type") == Some("ipv4_addr")
-            && value_contains_token(set.get("flags").unwrap_or(&Value::Null), "interval")
-            && exact_owned_elements(set, &expected_subnets)
-    });
-    let sets_ok = ifaces_ok && subnets_ok && sets.len() == 2;
-
-    let forward_rules = rules
-        .iter()
-        .filter(|rule| string_field(rule, "chain") == Some("forward"))
-        .collect::<Vec<_>>();
-    let postrouting_rules = rules
-        .iter()
-        .filter(|rule| string_field(rule, "chain") == Some("postrouting"))
-        .collect::<Vec<_>>();
-    let outbound = forward_rules.iter().any(|rule| {
-        rule_has_tokens(
-            rule,
-            &["iifname", "output_ifaces", "oifname", &desired.uplink],
-        ) && value_contains_key(rule, "accept")
-            && !value_contains_key(rule, "ct")
-    });
-    let established = forward_rules.iter().any(|rule| {
-        rule_has_tokens(
-            rule,
-            &[
-                "iifname",
-                &desired.uplink,
-                "oifname",
-                "output_ifaces",
-                "state",
-                "established",
-                "related",
-            ],
-        ) && value_contains_key(rule, "ct")
-            && value_contains_key(rule, "accept")
-    });
-    let blocked_new = forward_rules.iter().any(|rule| {
-        rule_has_tokens(
-            rule,
-            &["iifname", &desired.uplink, "oifname", "output_ifaces"],
-        ) && value_contains_key(rule, "drop")
-    });
-    let masquerade = postrouting_rules.iter().any(|rule| {
-        rule_has_tokens(
-            rule,
-            &["ip", "saddr", "output_subnets", "oifname", &desired.uplink],
-        ) && value_contains_key(rule, "masquerade")
-    });
-    let policy_rules_ok = outbound
-        && established
-        && blocked_new
-        && masquerade
-        && forward_rules.len() == 3
-        && postrouting_rules.len() == 1;
-
-    chains_ok && sets_ok && policy_rules_ok
+    false
 }
 
 // Compare ordered expressions, including exact direction and verdict. Metadata
@@ -827,21 +670,6 @@ fn object_name(value: &Value) -> Option<&str> {
 fn string_field<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
     value.get(field).and_then(Value::as_str)
 }
-
-fn exact_string_elements(value: &Value, expected: &[&str]) -> bool {
-    let Some(elements) = value.get("elem").and_then(Value::as_array) else {
-        return false;
-    };
-    let mut actual = elements
-        .iter()
-        .filter_map(Value::as_str)
-        .collect::<Vec<_>>();
-    let mut expected = expected.to_vec();
-    actual.sort_unstable();
-    expected.sort_unstable();
-    actual == expected
-}
-
 fn exact_owned_elements(value: &Value, expected: &[String]) -> bool {
     let Some(elements) = value.get("elem").and_then(Value::as_array) else {
         return false;
@@ -914,14 +742,8 @@ fn hex_decode(value: &str) -> Result<Vec<u8>> {
 pub struct RouterDataplaneSnapshot {
     pub ipv4_forwarding: bool,
     pub owned: Option<RouterDataplaneDesired>,
-    #[serde(default = "owned_firewall_intact_by_default")]
     pub owned_firewall_integrity: OwnedFirewallIntegrity,
 }
-
-fn owned_firewall_intact_by_default() -> OwnedFirewallIntegrity {
-    OwnedFirewallIntegrity::Intact
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", content = "desired", rename_all = "snake_case")]
 pub enum RouterDataplaneTarget {
@@ -1098,10 +920,6 @@ where
                 validate_active_interface(&interfaces, &rule.to, "egress")?;
             }
             return Ok(());
-        }
-        validate_active_interface(&interfaces, &desired.uplink, "uplink")?;
-        for output in &desired.outputs {
-            validate_active_interface(&interfaces, &output.interface, "output")?;
         }
         Ok(())
     }

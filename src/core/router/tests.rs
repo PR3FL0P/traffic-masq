@@ -82,7 +82,6 @@ fn enabled_config() -> AppConfig {
             dhcp_client: None,
             wifi: None,
             wifi_client: None,
-            nat: true,
         },
     );
     for (name, address, pool_start, pool_end) in [
@@ -108,13 +107,25 @@ fn enabled_config() -> AppConfig {
                 dhcp_client: None,
                 wifi: None,
                 wifi_client: None,
-                nat: true,
             },
         );
     }
     config.router = RouterConfig {
         port_forwards: Vec::new(),
-        forwarding: None,
+        forwarding: Some(vec![
+            traffic_masq_dataplane::ForwardingConfig {
+                from: "lan0".into(),
+                to: "wan0".into(),
+                source_subnet: Some("192.168.10.0/24".parse().unwrap()),
+                masquerade: true,
+            },
+            traffic_masq_dataplane::ForwardingConfig {
+                from: "lan1".into(),
+                to: "wan0".into(),
+                source_subnet: Some("192.168.20.0/24".parse().unwrap()),
+                masquerade: true,
+            },
+        ]),
         vpn_chain: Vec::new(),
         uplink: Some(UplinkConfig {
             interface: "wan0".to_string(),
@@ -134,7 +145,7 @@ fn enabled_config() -> AppConfig {
 }
 
 #[test]
-fn explicit_connections_replace_legacy_nat_and_empty_does_not_restore_it() {
+fn explicit_connections_define_all_forwarding_permissions() {
     let mut config = enabled_config();
     let connections = vec![crate::config::ForwardingConfig {
         source_subnet: None,
@@ -148,8 +159,6 @@ fn explicit_connections_replace_legacy_nat_and_empty_does_not_restore_it() {
         panic!("enabled");
     };
     assert_eq!(dataplane.forwarding, Some(connections));
-    assert!(dataplane.outputs.is_empty());
-    assert!(dataplane.uplink.is_empty());
     assert_eq!(desired.dhcp.len(), 2);
     assert_eq!(desired.routes.len(), 1);
     config.router.forwarding = Some(vec![]);
@@ -174,18 +183,20 @@ fn builds_enabled_router_desired_from_one_effective_config() {
         desired.dataplane,
         RouterDataplaneTarget::Enabled(RouterDataplaneDesired {
             port_forwards: Vec::new(),
-            forwarding: None,
-            uplink: "wan0".to_string(),
-            outputs: vec![
-                OutputNetwork {
-                    interface: "lan0".to_string(),
-                    subnet: "192.168.10.0/24".parse().expect("subnet"),
+            forwarding: Some(vec![
+                traffic_masq_dataplane::ForwardingConfig {
+                    from: "lan0".to_string(),
+                    to: "wan0".to_string(),
+                    source_subnet: Some("192.168.10.0/24".parse().expect("subnet")),
+                    masquerade: true
                 },
-                OutputNetwork {
-                    interface: "lan1".to_string(),
-                    subnet: "192.168.20.0/24".parse().expect("subnet"),
-                },
-            ],
+                traffic_masq_dataplane::ForwardingConfig {
+                    from: "lan1".to_string(),
+                    to: "wan0".to_string(),
+                    source_subnet: Some("192.168.20.0/24".parse().expect("subnet")),
+                    masquerade: true
+                }
+            ]),
         })
     );
 }
@@ -244,6 +255,7 @@ fn disabled_router_does_not_claim_routes_or_dataplane() {
 fn enabled_router_without_uplink_claims_routes_with_disabled_dataplane() {
     let mut config = enabled_config();
     config.router.uplink = None;
+    config.router.forwarding = None;
 
     let desired = RouterDesired::from_effective_config(&config).expect("desired");
 
@@ -260,20 +272,9 @@ fn dhcp_snapshot_serialization_excludes_dynamic_lease_state() {
     let snapshot = DhcpClientSnapshot {
         interface: "wan0".into(),
         spec: None,
-        lease: None,
     };
     let encoded = serde_json::to_value(snapshot).expect("serialize snapshot");
     assert!(encoded.get("lease").is_none());
-}
-
-#[test]
-fn legacy_dhcp_snapshot_lease_field_is_ignored() {
-    let snapshot: DhcpClientSnapshot =
-        serde_json::from_str(r#"{"interface":"wan0","spec":null,"lease":{"legacy":"ignored"}}"#)
-            .expect("legacy snapshot");
-    assert_eq!(snapshot.interface, "wan0");
-    assert!(snapshot.spec.is_none());
-    assert!(snapshot.lease.is_none());
 }
 
 struct FakeSubsystems {
@@ -457,7 +458,6 @@ impl RouterSubsystems for FakeSubsystems {
         Ok(RouterSnapshot {
             interfaces: Vec::new(),
             uplink_wifi: Vec::new(),
-            uplink_dhcp: None,
             dhcp_clients: Vec::new(),
             output_wifi: Vec::new(),
             dhcp: Vec::new(),
@@ -516,11 +516,7 @@ impl RouterSubsystems for FakeSubsystems {
     async fn rollback_interfaces(&self, _: &[InterfaceSnapshot]) -> Result<()> {
         self.event("rollback_interfaces")
     }
-    async fn rollback_dhcp_clients(
-        &self,
-        _: &[DhcpClientSnapshot],
-        _: Option<&DhcpClientSpec>,
-    ) -> Result<()> {
+    async fn rollback_dhcp_clients(&self, _: &[DhcpClientSnapshot]) -> Result<()> {
         if self.quiesce_dhcp {
             self.event("rollback_uplink_dhcp")
         } else {
@@ -917,7 +913,7 @@ async fn health_is_ready_when_every_subsystem_succeeds() {
 }
 
 #[test]
-fn port_forwards_reach_legacy_explicit_and_standalone_dataplanes() {
+fn port_forwards_work_with_explicit_and_standalone_dataplanes() {
     use crate::config::{PortForwardConfig, PortForwardProtocol};
     let rule = PortForwardConfig {
         from: "wan0".into(),
@@ -977,4 +973,24 @@ fn port_forwards_reach_legacy_explicit_and_standalone_dataplanes() {
         .unwrap_err()
         .to_string()
         .contains("vpn_chain"));
+}
+
+#[test]
+fn uplink_without_forwarding_never_synthesizes_nat() {
+    let mut config = enabled_config();
+    for forwarding in [None, Some(vec![])] {
+        config.router.forwarding = forwarding;
+        let desired = RouterDesired::from_effective_config(&config).unwrap();
+        assert!(desired.enabled);
+        assert_eq!(desired.dataplane, RouterDataplaneTarget::Disabled);
+        assert_eq!(desired.interfaces.len(), 3);
+    }
+}
+
+#[test]
+fn obsolete_dhcp_snapshot_lease_field_is_rejected() {
+    assert!(serde_json::from_str::<DhcpClientSnapshot>(
+        r#"{"interface":"wan0","spec":null,"lease":null}"#
+    )
+    .is_err());
 }

@@ -94,7 +94,6 @@ impl DhcpClientSpec {
             dhcp_client: Some(self.interface_config()),
             wifi: None,
             wifi_client: None,
-            nat: true,
         };
         config.validate(&self.interface)
     }
@@ -426,28 +425,6 @@ impl DhcpClientSupervisor {
                 tracing::info!(%interface, "DHCP client paused while Wi-Fi is not associated");
             }
         }
-    }
-
-    /// Restore DHCP configuration without replaying a captured lease.
-    ///
-    /// The `lease` argument is retained for source compatibility with older
-    /// callers. Dynamic DHCP state may have advanced since it was captured, so
-    /// it is intentionally ignored and the client reacquires current state.
-    pub async fn restore(
-        &self,
-        spec: DhcpClientSpec,
-        _lease: Option<DhcpClientLease>,
-    ) -> Result<()> {
-        let interface = spec.interface.clone();
-        self.configure(spec).await;
-        let status = self
-            .status(&interface)
-            .await
-            .context("DHCP client disappeared while restoring configuration")?;
-        if let DhcpClientRunState::Degraded { reason } = status.state {
-            bail!("DHCP client failed to restart on {interface}: {reason}");
-        }
-        Ok(())
     }
 
     /// Stop a client and release its owned state, returning its previous specification.

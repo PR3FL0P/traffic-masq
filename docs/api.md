@@ -289,7 +289,7 @@ incomplete observation. Only exact daemon-owned matches merge with saved rows;
 foreign routes remain separate. `/routes` keeps its observed-only contract.
 
 Router status exposes `desired_revision` and `last_applied_revision` (nullable
-for compatibility). Last applied is historical evidence from a successful
+when the corresponding state is unavailable). Last applied is historical evidence from a successful
 commit, repair, or verification in the current daemon process; it resets on
 restart until verified again. It does not certify current health, and offline
 Save/removal-only cleanup does not advance it.
@@ -401,15 +401,14 @@ JSON enum values use `snake_case`. CIDRs are strings such as
     "dhcp": null,
     "dhcp_client": null,
     "wifi": null,
-    "wifi_client": null,
-    "nat": true
+    "wifi_client": null
   },
   "allow_management_change": false
 }
 ```
 
-Roles are `none`, `input`, `output`, `middle`, and the legacy `disabled`.
-`management` is accepted as an alias for `none`. Nested configuration objects
+Roles are `none`, `input`, `output`, and `middle`. Removed roles and unknown
+configuration fields are rejected. Nested configuration objects
 use the same shape as [`examples/config.toml`](../examples/config.toml).
 
 `InterfaceEdit`
@@ -499,9 +498,9 @@ include the routes and settings you want to retain in `set_router`.
 
 A forwarding rule accepts optional `source_subnet`, a network CIDR without host
 bits such as `"192.168.50.0/24"`. `masquerade` defaults to `true`. Omitted or
-`null` `forwarding` selects legacy uplink behavior; `[]` disables all explicit
-connections. Explicit forwarding requires direct global VPN policy and an empty
-`vpn_chain`. See the [router configuration reference](configuration.md#router)
+`null` `forwarding` grants no forwarding permissions, as does `[]`. Explicit
+forwarding requires direct global VPN policy. VPN chains require explicit
+connection permissions too. See the [router configuration reference](configuration.md#router)
 for uplink, static-route and VPN-chain fields.
 
 `ApiHttpsSettings`

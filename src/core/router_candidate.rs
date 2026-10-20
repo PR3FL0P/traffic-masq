@@ -81,7 +81,7 @@ impl RouterIntentProposal {
     /// base.network.interfaces.insert("wlan0".into(), InterfaceConfig {
     ///     mac_address: None,
     ///     role: InterfaceRole::Input, managed: false, ipv4: None, dhcp: None,
-    ///     dhcp_client: None, wifi: None, wifi_client: None, nat: true,
+    ///     dhcp_client: None, wifi: None, wifi_client: None,
     /// });
     /// let committed = RuntimeOverrides::default();
     /// let forgotten = RouterCandidate::build(&base, &committed,

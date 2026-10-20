@@ -55,7 +55,6 @@ fn principal(role: Role) -> Principal {
 fn interface_config() -> InterfaceConfig {
     InterfaceConfig {
         mac_address: None,
-        nat: true,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: None,

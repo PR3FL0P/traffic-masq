@@ -383,7 +383,7 @@ impl DesiredNetworkState {
     pub(crate) async fn committed_overrides(&self) -> crate::state::overrides::RuntimeOverrides {
         self.overrides.snapshot().await
     }
-
+    #[cfg(test)]
     pub(crate) async fn committed_config(&self) -> Result<AppConfig> {
         let mut config = self
             .overrides
@@ -543,7 +543,6 @@ impl DesiredNetworkState {
             dhcp_client: None,
             wifi: None,
             wifi_client: None,
-            nat: false,
         });
         self.tentative.lock().await.insert(
             interface.clone(),

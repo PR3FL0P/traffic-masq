@@ -11,15 +11,12 @@ use crate::{InterfaceRole, WifiBand, WifiChannelWidth, WifiClientSecurity, WifiS
 /// hostapd's maximum supported station count for an AP configuration.
 pub const MAX_WIFI_STATIONS: u16 = 2007;
 
-fn default_true() -> bool {
-    true
-}
-
 fn default_max_stations() -> u16 {
     32
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InterfaceConfigView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac_address: Option<crate::MacAddr>,
@@ -34,8 +31,6 @@ pub struct InterfaceConfigView {
     pub wifi: Option<WifiApConfigView>,
     #[serde(default)]
     pub wifi_client: Option<WifiClientConfigView>,
-    #[serde(default = "default_true")]
-    pub nat: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

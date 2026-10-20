@@ -135,7 +135,6 @@ pub(super) async fn build_dhcp_spec(
         dhcp_client: None,
         wifi: None,
         wifi_client: None,
-        nat: true,
     };
     DhcpServiceSpec::from_interface_config(interface, &interface_config, default_lease_seconds)?
         .ok_or_else(|| anyhow::anyhow!("DHCP is not enabled by the interface configuration"))
@@ -161,7 +160,6 @@ pub(super) fn select_dhcp_network(
             dhcp_client: None,
             wifi: None,
             wifi_client: None,
-            nat: true,
         };
         if candidate.validate(interface).is_ok() {
             candidates.push(network);

@@ -51,7 +51,6 @@ fn ethernet(cidr: &str) -> InterfaceConfig {
         dhcp_client: None,
         wifi: None,
         wifi_client: None,
-        nat: false,
     }
 }
 

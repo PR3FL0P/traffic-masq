@@ -14,8 +14,7 @@ use crate::core::vpn_policy_manager::VpnPolicyDesired;
 use crate::dhcp::client::DhcpClientSpec;
 use crate::dhcp::supervisor::{DhcpServiceSpec, DhcpSupervisor};
 use crate::firewall::{
-    OutputNetwork, RouterDataplaneDesired, RouterDataplanePlan, RouterDataplaneSnapshot,
-    RouterDataplaneTarget,
+    RouterDataplaneDesired, RouterDataplanePlan, RouterDataplaneSnapshot, RouterDataplaneTarget,
 };
 use crate::vpn::manager::hop_interface_name;
 use crate::wifi::client::WifiClientSpec;
@@ -64,14 +63,6 @@ impl RouterDesired {
                 for rule in rules {
                     names.extend([rule.from.as_str(), rule.to.as_str()]);
                 }
-            } else {
-                names.push(&dataplane.uplink);
-                names.extend(
-                    dataplane
-                        .outputs
-                        .iter()
-                        .map(|output| output.interface.as_str()),
-                );
             }
         }
         names.extend(
@@ -127,145 +118,67 @@ impl RouterDesired {
 
         let managed_outputs = managed_output_interfaces(config);
 
-        if config.router.forwarding.is_some()
-            || (!config.router.port_forwards.is_empty() && config.router.uplink.is_none())
-        {
-            let forwarding = config.router.forwarding.clone().unwrap_or_default();
-            let mut interfaces = managed_outputs.clone();
-            if let Some(uplink) = &config.router.uplink {
-                let interface = config
-                    .network
-                    .interfaces
-                    .get(&uplink.interface)
-                    .ok_or_else(|| anyhow::anyhow!("configured uplink interface is missing"))?;
-                interfaces.push(RouterInterfaceDesired {
+        let forwarding = config.router.forwarding.clone().unwrap_or_default();
+        let dataplane = if forwarding.is_empty() && config.router.port_forwards.is_empty() {
+            RouterDataplaneTarget::Disabled
+        } else {
+            RouterDataplaneTarget::Enabled(RouterDataplaneDesired {
+                forwarding: Some(forwarding),
+                port_forwards: config.router.port_forwards.clone(),
+            })
+        };
+        let mut interfaces = managed_outputs;
+        let uplink_config = config.router.uplink.as_ref().map(|uplink| {
+            let interface = config
+                .network
+                .interfaces
+                .get(&uplink.interface)
+                .expect("validated router uplink is configured");
+            interfaces.insert(
+                0,
+                RouterInterfaceDesired {
                     name: uplink.interface.clone(),
                     config: interface.clone(),
-                });
-            }
-            let output_wifi = output_wifi(&interfaces)?;
-            let dataplane = if forwarding.is_empty() && config.router.port_forwards.is_empty() {
-                RouterDataplaneTarget::Disabled
-            } else {
-                RouterDataplaneTarget::Enabled(RouterDataplaneDesired {
-                    forwarding: Some(forwarding.clone()),
-                    port_forwards: config.router.port_forwards.clone(),
-                    uplink: String::new(),
-                    outputs: Vec::new(),
-                })
-            };
-            let uplink_config = config.router.uplink.as_ref().and_then(|uplink| {
-                config
-                    .network
-                    .interfaces
-                    .get(&uplink.interface)
-                    .map(|interface| (uplink, interface))
-            });
-            let uplink_wifi = uplink_config
-                .map(|(uplink, interface)| {
-                    WifiClientSpec::from_interface_config(&uplink.interface, interface)
-                })
-                .transpose()?
-                .flatten();
-            let uplink_dhcp = uplink_config
-                .filter(|(uplink, _)| uplink.mode == UplinkMode::Dhcp)
-                .map(|(uplink, interface)| {
-                    DhcpClientSpec::from_interface_config(&uplink.interface, interface)
-                })
-                .transpose()?
-                .flatten();
-            return Ok(Self {
-                enabled: true,
-                uplink_wifi,
-                uplink_dhcp,
-                output_wifi,
-                dhcp,
-                routes,
-                allow_default_route_change,
-                vpn_chain: Vec::new(),
-                dataplane,
-                interfaces,
-            });
-        }
-
-        let Some(uplink) = config.router.uplink.as_ref() else {
-            let interfaces = managed_outputs;
-            let mut output_wifi = output_wifi(&interfaces)?;
-            output_wifi.sort_by(|left, right| left.interface.cmp(&right.interface));
-
-            return Ok(Self {
-                enabled: true,
-                uplink_wifi: None,
-                uplink_dhcp: None,
-                output_wifi,
-                dhcp,
-                routes,
-                allow_default_route_change,
-                vpn_chain: Vec::new(),
-                dataplane: RouterDataplaneTarget::Disabled,
-                interfaces,
-            });
-        };
-
-        let uplink_config = config
-            .network
-            .interfaces
-            .get(&uplink.interface)
-            .expect("validated router uplink interface is configured");
-        let outputs = managed_outputs
-            .iter()
-            .filter(|interface| interface.config.nat)
-            .map(|interface| OutputNetwork {
-                interface: interface.name.clone(),
-                subnet: interface
-                    .config
-                    .ipv4
-                    .expect("validated router output has IPv4")
-                    .trunc(),
+                },
+            );
+            (uplink, interface)
+        });
+        let uplink_wifi = uplink_config
+            .map(|(uplink, interface)| {
+                WifiClientSpec::from_interface_config(&uplink.interface, interface)
             })
-            .collect();
-        let dataplane = RouterDataplaneDesired {
-            forwarding: None,
-            port_forwards: config.router.port_forwards.clone(),
-            uplink: uplink.interface.clone(),
-            outputs,
-        };
-        dataplane.validate()?;
-
-        let mut interfaces = vec![RouterInterfaceDesired {
-            name: uplink.interface.clone(),
-            config: uplink_config.clone(),
-        }];
-        interfaces.extend(managed_outputs);
-
-        let uplink_wifi = WifiClientSpec::from_interface_config(&uplink.interface, uplink_config)?;
+            .transpose()?
+            .flatten();
+        let uplink_dhcp = uplink_config
+            .filter(|(uplink, _)| uplink.mode == UplinkMode::Dhcp)
+            .map(|(uplink, interface)| {
+                DhcpClientSpec::from_interface_config(&uplink.interface, interface)
+            })
+            .transpose()?
+            .flatten();
         let mut output_wifi = output_wifi(&interfaces)?;
         output_wifi.sort_by(|left, right| left.interface.cmp(&right.interface));
-
-        let uplink_dhcp = if uplink.mode == UplinkMode::Dhcp {
-            DhcpClientSpec::from_interface_config(&uplink.interface, uplink_config)?
-        } else {
-            None
-        };
-
-        let protected_subnets: Vec<ipnet::Ipv4Net> = config
+        let protected_subnets = config
             .network
             .interfaces
             .values()
-            .filter(|interface| {
-                interface.role == InterfaceRole::Output && interface.managed && interface.nat
-            })
+            .filter(|interface| interface.role == InterfaceRole::Output && interface.managed)
             .filter_map(|interface| interface.ipv4)
             .map(|network| network.trunc())
-            .collect();
-
+            .collect::<Vec<_>>();
         let chain_len = config.router.vpn_chain.len();
         let mut vpn_chain = Vec::with_capacity(chain_len);
         for (index, hop_config) in config.router.vpn_chain.iter().enumerate() {
             let hop_index = index as u32;
             let interface = hop_interface_name(hop_index);
             let upstream = if index == 0 {
-                uplink.interface.clone()
+                config
+                    .router
+                    .uplink
+                    .as_ref()
+                    .expect("VPN chain requires an uplink")
+                    .interface
+                    .clone()
             } else {
                 hop_interface_name(hop_index - 1)
             };
@@ -318,7 +231,7 @@ impl RouterDesired {
             routes,
             allow_default_route_change,
             vpn_chain,
-            dataplane: RouterDataplaneTarget::Enabled(dataplane),
+            dataplane,
             interfaces,
         })
     }
@@ -442,24 +355,18 @@ impl VpnChainSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DhcpClientSnapshot {
     pub interface: String,
     /// DHCP configuration intent. This is the only DHCP state owned by router
     /// transaction rollback.
     pub spec: Option<DhcpClientSpec>,
-    /// Compatibility-only field for callers compiled against the older public
-    /// snapshot shape. Dynamic leases are deliberately excluded from durable
-    /// journals/fingerprints and are never replayed during rollback.
-    #[serde(skip)]
-    pub lease: Option<crate::dhcp::client::lease::DhcpClientLease>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouterSnapshot {
     pub interfaces: Vec<InterfaceSnapshot>,
     pub uplink_wifi: Vec<WifiSnapshot<WifiClientSpec>>,
-    pub uplink_dhcp: Option<DhcpClientSpec>,
-    #[serde(default)]
     pub dhcp_clients: Vec<DhcpClientSnapshot>,
     pub output_wifi: Vec<WifiSnapshot<WifiApSpec>>,
     pub dhcp: Vec<DhcpServiceSpec>,
@@ -601,15 +508,11 @@ pub trait RouterSubsystems: Send + Sync {
     /// Stop DHCP runtime installed by the candidate before interface rollback.
     /// Previous DHCP intent is restored by `rollback_dhcp_clients` afterwards.
     async fn rollback_candidate_uplink_dhcp(&self) -> Result<()>;
-    /// Restore captured client configuration, with legacy uplink compatibility,
+    /// Restore captured client configuration,
     /// without replaying captured leases. Production verifies a current lease
     /// before reporting restoration complete. Keep durable lease ownership on
     /// cleanup failure.
-    async fn rollback_dhcp_clients(
-        &self,
-        snapshots: &[DhcpClientSnapshot],
-        legacy: Option<&DhcpClientSpec>,
-    ) -> Result<()>;
+    async fn rollback_dhcp_clients(&self, snapshots: &[DhcpClientSnapshot]) -> Result<()>;
     /// Restore the captured chain using recorded launch ownership; refuse foreign links.
     async fn rollback_vpn_chain(&self, snapshot: &VpnChainSnapshot) -> Result<()> {
         if !snapshot.hops.is_empty() {
@@ -1055,10 +958,7 @@ impl RouterManager {
                 }
                 Stage::UplinkDhcpRestore => {
                     self.subsystems
-                        .rollback_dhcp_clients(
-                            &snapshot.dhcp_clients,
-                            snapshot.uplink_dhcp.as_ref(),
-                        )
+                        .rollback_dhcp_clients(&snapshot.dhcp_clients)
                         .await
                 }
                 Stage::VpnChain => {

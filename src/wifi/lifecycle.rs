@@ -98,7 +98,10 @@ where
             }
             Ok(None) | Err(_) => return Ok(OwnershipOutcome::ForeignPresent),
         }
-        let binary_path = pending.binary_path.as_deref().unwrap_or(expected_binary);
+        let binary_path = pending
+            .binary_path
+            .as_deref()
+            .expect("record store requires executable identity");
         match process
             .pids_matching_identity(
                 kind,
@@ -140,9 +143,6 @@ where
                         return Ok(OwnershipOutcome::ForeignPresent);
                     }
                 };
-                if recovered.binary_path.is_none() {
-                    recovered.binary_path = Some(expected_binary.to_path_buf());
-                }
                 store.save(&recovered).await?;
                 record = Some(recovered);
             }
@@ -166,7 +166,10 @@ where
     }
 
     if let Some(stale) = record.as_ref().filter(|record| record.pid != 0) {
-        let binary = stale.binary_path.as_deref().unwrap_or(expected_binary);
+        let binary = stale
+            .binary_path
+            .as_deref()
+            .expect("record store requires executable identity");
         if !process
             .identity_matches_record(stale, kind, binary)
             .await
@@ -199,17 +202,16 @@ where
         let Some(record) = record else {
             return Ok(OwnershipOutcome::Absent);
         };
-        let binary_path = record.binary_path.as_deref().unwrap_or(expected_binary);
+        let binary_path = record
+            .binary_path
+            .as_deref()
+            .expect("record store requires executable identity");
         return match process
             .identity_matches_record(&record, kind, binary_path)
             .await
         {
             Ok(true) => {
                 let mut record = record;
-                if record.binary_path.is_none() {
-                    record.binary_path = Some(expected_binary.to_path_buf());
-                    store.save(&record).await?;
-                }
                 if record.ctrl_dev.is_none()
                     && record.process_start_ticks.is_some()
                     && record.boot_id.is_some()
@@ -238,7 +240,10 @@ where
     let Some(record) = record else {
         return Ok(OwnershipOutcome::ForeignPresent);
     };
-    let binary_path = record.binary_path.as_deref().unwrap_or(expected_binary);
+    let binary_path = record
+        .binary_path
+        .as_deref()
+        .expect("record store requires executable identity");
 
     let process_matches = process
         .identity_matches_record(&record, kind, binary_path)
@@ -249,10 +254,6 @@ where
     }
 
     let mut record = record;
-    if record.binary_path.is_none() {
-        record.binary_path = Some(expected_binary.to_path_buf());
-        store.save(&record).await?;
-    }
 
     if record.ctrl_dev.is_none()
         && record.process_start_ticks.is_some()
@@ -576,7 +577,6 @@ pub(crate) async fn cleanup_unconfigured_records(
     kind: WifiProcessKind,
     configured_interfaces: &HashSet<String>,
     process: &dyn SupervisedProcess,
-    expected_binary: &Path,
 ) -> anyhow::Result<()> {
     for (interface, store, record) in
         WifiRecordStore::discover(kind, records_dir, runtime_dir).await?
@@ -593,7 +593,7 @@ pub(crate) async fn cleanup_unconfigured_records(
             let binary_path = record
                 .binary_path
                 .as_deref()
-                .unwrap_or(expected_binary);
+                .expect("record store requires executable identity");
             let recovered_from_intent = record.pid == 0;
             let pid = if recovered_from_intent {
                 let current_boot = process
@@ -601,7 +601,7 @@ pub(crate) async fn cleanup_unconfigured_records(
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("Linux boot identity is unavailable"))?;
                 let Some(expected_boot) = record.boot_id.as_deref() else {
-                    anyhow::bail!("cannot recover legacy Wi-Fi launch intent for {interface}: boot identity is missing");
+                    anyhow::bail!("cannot recover Wi-Fi launch intent for {interface}: boot identity is missing");
                 };
                 if expected_boot != current_boot.as_str() {
                     None
@@ -656,7 +656,7 @@ pub(crate) async fn cleanup_unconfigured_records(
                             .ok_or_else(|| anyhow::anyhow!("Linux boot identity is unavailable"))?,
                     );
                 } else if owned.process_start_ticks.is_none() || owned.boot_id.is_none() {
-                    anyhow::bail!("cannot signal legacy Wi-Fi process record for {interface}: exact process lifetime identity is missing");
+                    anyhow::bail!("cannot signal Wi-Fi process record for {interface}: exact process lifetime identity is missing");
                 }
                 owned.binary_path = Some(binary_path.to_path_buf());
                 if process.owns_unix_socket(pid, &owned.ctrl_path).await? {
@@ -709,7 +709,7 @@ pub(crate) async fn stop_recorded_interface(
         if let Some(record) = store.load().await? {
             let Some(binary_path) = record.binary_path.as_deref() else {
                 anyhow::bail!(
-                    "cannot recover Wi-Fi ownership on {interface}: legacy process record has no executable identity"
+                    "cannot recover Wi-Fi ownership on {interface}: process record has no executable identity"
                 );
             };
             let recovered_from_intent = record.pid == 0;
@@ -719,7 +719,7 @@ pub(crate) async fn stop_recorded_interface(
                     .await?
                     .ok_or_else(|| anyhow::anyhow!("Linux boot identity is unavailable"))?;
                 let Some(expected_boot) = record.boot_id.as_deref() else {
-                    anyhow::bail!("cannot recover legacy Wi-Fi launch intent for {interface}: boot identity is missing");
+                    anyhow::bail!("cannot recover Wi-Fi launch intent for {interface}: boot identity is missing");
                 };
                 if expected_boot != current_boot.as_str() {
                     None
@@ -765,7 +765,7 @@ pub(crate) async fn stop_recorded_interface(
                             anyhow::anyhow!("Linux boot identity is unavailable")
                         })?);
                 } else if owned.process_start_ticks.is_none() || owned.boot_id.is_none() {
-                    anyhow::bail!("cannot signal legacy Wi-Fi process record for {interface}: exact process lifetime identity is missing");
+                    anyhow::bail!("cannot signal Wi-Fi process record for {interface}: exact process lifetime identity is missing");
                 }
                 if process.owns_unix_socket(pid, &owned.ctrl_path).await? {
                     match persist_owned_ctrl_node(&store, &process, owned.clone()).await {

@@ -184,7 +184,6 @@ impl HostapdSupervisor {
             WifiProcessKind::Scan,
             &no_interfaces,
             self.inner.process.as_ref(),
-            &config.wifi_client.wpa_supplicant_binary,
         )
         .await
         .map_err(SupervisorError::Configuration)?;
@@ -194,7 +193,6 @@ impl HostapdSupervisor {
             WifiProcessKind::Client,
             &configured_clients,
             self.inner.process.as_ref(),
-            &config.wifi_client.wpa_supplicant_binary,
         )
         .await
         .map_err(SupervisorError::Configuration)?;
@@ -204,7 +202,6 @@ impl HostapdSupervisor {
             WifiProcessKind::AccessPoint,
             &configured_interfaces,
             self.inner.process.as_ref(),
-            &self.inner.hostapd_binary,
         )
         .await
         .map_err(SupervisorError::Configuration)?;
@@ -486,7 +483,7 @@ impl HostapdSupervisor {
             .record
             .binary_path
             .as_deref()
-            .unwrap_or(self.inner.hostapd_binary.as_path());
+            .expect("record store requires executable identity");
         Ok(self
             .inner
             .process
@@ -672,7 +669,7 @@ impl HostapdSupervisor {
         let binary_path = record
             .binary_path
             .as_deref()
-            .unwrap_or(self.inner.hostapd_binary.as_path());
+            .expect("record store requires executable identity");
         let pid = if record.pid == 0 {
             let pids = match self
                 .inner

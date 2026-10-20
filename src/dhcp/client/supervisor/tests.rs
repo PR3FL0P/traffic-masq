@@ -229,7 +229,6 @@ fn config(state_dir: &TempDir, interface: Option<DhcpClientInterfaceConfig>) -> 
             dhcp_client: interface,
             wifi: None,
             wifi_client: None,
-            nat: true,
         },
     );
     config.network = network;
@@ -287,7 +286,6 @@ fn spec_is_derived_only_from_an_enabled_block() {
         dhcp_client: Some(DhcpClientInterfaceConfig::default()),
         wifi: None,
         wifi_client: None,
-        nat: true,
     };
     let derived = DhcpClientSpec::from_interface_config("wan0", &interface)
         .expect("valid")

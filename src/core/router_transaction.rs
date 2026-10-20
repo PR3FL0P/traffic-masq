@@ -158,10 +158,7 @@ struct TransactionJournal {
     token: String,
     snapshot: RouterSnapshot,
     /// The state that may have been partially applied when the process died.
-    /// Version-1 journals do not have this field; recovery for those keeps the
-    /// historical snapshot-only behaviour.
-    #[serde(default)]
-    current_desired: Option<RouterDesired>,
+    current_desired: RouterDesired,
 }
 
 struct Inner {
@@ -1227,7 +1224,7 @@ impl RouterTransactionCoordinator {
             base_revision,
             token: token.to_owned(),
             snapshot: snapshot.clone(),
-            current_desired: Some(current_desired.clone()),
+            current_desired: current_desired.clone(),
         };
         let bytes = serde_json::to_vec(&journal)?;
         if let Some(parent) = self.inner.journal.parent() {
@@ -1320,7 +1317,7 @@ impl RouterTransactionCoordinator {
             .is_some_and(|token| Some(token) == committed_token.as_deref())
         {
             let suffix = match serde_json::from_slice::<TransactionJournal>(&bytes) {
-                Ok(record) if matches!(record.version, 1 | 2) => "stale",
+                Ok(record) if record.version == 2 => "stale",
                 _ => "corrupt",
             };
             if let Err(error) = crate::core::recovery::quarantine(&self.inner.journal, suffix).await
@@ -1347,7 +1344,7 @@ impl RouterTransactionCoordinator {
             .detail("required_proof", "independent_committed_transaction_token")
             .detail("backup_scope", "complete_state_directory")
         })?;
-        if !matches!(journal.version, 1 | 2) {
+        if journal.version != 2 {
             let diagnostic = crate::core::recovery::RecoveryDiagnostic::fatal(
                 crate::core::recovery::StartupRecoveryCode::SupportedSchema,
                 "decode",
@@ -1356,7 +1353,7 @@ impl RouterTransactionCoordinator {
             .journal(self.inner.journal.clone())
             .object("router")
             .detail("journal_schema", journal.version)
-            .detail("supported_schemas", "1,2")
+            .detail("supported_schemas", "2")
             .detail("fallback_action", "restore_coherent_backup");
             return Err(
                 anyhow::anyhow!("unsupported router transaction journal version")
@@ -1397,7 +1394,7 @@ impl RouterTransactionCoordinator {
                 )
                 .await?;
             self.transition(&mut state, CoordinatorState::RollbackFailed(RollbackFailure {
-                recovery_desired: journal.current_desired.clone(),
+                recovery_desired: Some(journal.current_desired.clone()),
                 token: journal.token.clone(), candidate, snapshot: journal.snapshot.clone(),
                 failures: vec![format!("journal={}; operation=startup_rollback; invariant=restore_snapshot; metadata_safe_to_remove=false", self.inner.journal.display())],
             }));

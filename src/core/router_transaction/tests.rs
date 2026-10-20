@@ -23,7 +23,6 @@ fn output_interface(address: &str, pool_start: u8, pool_end: u8) -> InterfaceCon
     let octet = ipv4.addr().octets()[2];
     InterfaceConfig {
         mac_address: None,
-        nat: true,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some(ipv4),
@@ -46,7 +45,6 @@ fn base_config() -> AppConfig {
         "wan0".to_string(),
         InterfaceConfig {
             mac_address: None,
-            nat: true,
             role: InterfaceRole::Input,
             managed: false,
             ipv4: None,
@@ -66,7 +64,12 @@ fn base_config() -> AppConfig {
 fn enabled_router() -> RouterConfig {
     RouterConfig {
         port_forwards: Vec::new(),
-        forwarding: None,
+        forwarding: Some(vec![traffic_masq_dataplane::ForwardingConfig {
+            from: "lan0".into(),
+            to: "wan0".into(),
+            source_subnet: Some("192.168.10.0/24".parse().unwrap()),
+            masquerade: true,
+        }]),
         vpn_chain: Vec::new(),
         uplink: Some(UplinkConfig {
             interface: "wan0".to_string(),
@@ -224,7 +227,6 @@ impl RouterSubsystems for FakeSubsystems {
         Ok(RouterSnapshot {
             interfaces: Vec::new(),
             uplink_wifi: Vec::new(),
-            uplink_dhcp: None,
             dhcp_clients: Vec::new(),
             output_wifi: Vec::new(),
             dhcp: Vec::new(),
@@ -318,10 +320,9 @@ impl RouterSubsystems for FakeSubsystems {
     async fn rollback_dhcp_clients(
         &self,
         snapshots: &[crate::core::router::DhcpClientSnapshot],
-        legacy: Option<&crate::dhcp::client::DhcpClientSpec>,
     ) -> Result<()> {
         anyhow::ensure!(
-            snapshots.is_empty() && legacy.is_none(),
+            snapshots.is_empty(),
             "DHCP client restoration is unavailable"
         );
         Ok(())
@@ -566,7 +567,7 @@ async fn unsupported_uncommitted_router_schema_reports_versions_and_action() {
         base_revision: candidate.base_revision(),
         token: "uncommitted".to_string(),
         snapshot,
-        current_desired: Some(candidate.desired().clone()),
+        current_desired: candidate.desired().clone(),
     };
     tokio::fs::write(
         &coordinator.inner.journal,
@@ -583,7 +584,7 @@ async fn unsupported_uncommitted_router_schema_reports_versions_and_action() {
     assert!(diagnostic.contains("recovery_code=TM-REC-205"));
     assert!(diagnostic.contains("invariant=supported_schema"));
     assert!(diagnostic.contains("journal_schema=999"));
-    assert!(diagnostic.contains("supported_schemas=1,2"));
+    assert!(diagnostic.contains("supported_schemas=2"));
     assert!(diagnostic.contains("operator_action=use_compatible_daemon"));
 }
 

@@ -10,7 +10,9 @@ pub use request_policy::{MutationKind, RequestPolicy};
 mod port_forwarding;
 mod route;
 mod router;
-pub use port_forwarding::{validate_port_forwards, PortForwardConfig, PortForwardProtocol};
+pub use port_forwarding::{
+    validate_port_forward_address, validate_port_forwards, PortForwardConfig, PortForwardProtocol,
+};
 mod router_plan;
 mod wifi_observation;
 mod wifi_status;
@@ -32,11 +34,11 @@ pub use router::{
 };
 pub use router_plan::{
     hop_interface_name, DhcpClientSpecView, DhcpPlanView, Ipv4RouteInfoView, Ipv4RouteSpecView,
-    OutputNetworkView, OwnedFirewallIntegrityView, RoutePlanView, RouterDataplaneDesiredView,
-    RouterDataplanePlanView, RouterDataplaneSnapshotView, RouterDataplaneTargetView,
-    RouterDesiredView, RouterInterfaceDesiredView, RouterPlanView, RouterRiskView,
-    VpnChainPlanView, VpnHopDesiredView, VpnHopKindView, VpnHopRoutingDesiredView,
-    VpnPolicyDesiredView, VpnPolicyReservedIdsView, WifiPlanView,
+    OwnedFirewallIntegrityView, RoutePlanView, RouterDataplaneDesiredView, RouterDataplanePlanView,
+    RouterDataplaneSnapshotView, RouterDataplaneTargetView, RouterDesiredView,
+    RouterInterfaceDesiredView, RouterPlanView, RouterRiskView, VpnChainPlanView,
+    VpnHopDesiredView, VpnHopKindView, VpnHopRoutingDesiredView, VpnPolicyDesiredView,
+    VpnPolicyReservedIdsView, WifiPlanView,
 };
 pub use wifi_observation::{
     MacAddr, MacAddrParseError, Station, WpaSupplicantScanResult, WpaSupplicantScanSecurity,
@@ -276,15 +278,13 @@ pub struct ProvisioningDownstreamOverrides {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InterfaceRole {
-    /// Does not participate in the router. Legacy management roles retain protection.
-    #[serde(alias = "management")]
+    /// Does not participate in the router.
     None,
     Input,
     Output,
     /// A slot naming one of the VPN hop chain's virtual `tm-wg-<hop_index>`
     /// interfaces. Unaddressed, WireGuard-only: never carries dhcp/wifi/ipv4.
     Middle,
-    Disabled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1509,9 +1509,7 @@ pub enum Response<
     },
     WifiInventory {
         revision: u64,
-        #[serde(default = "default_true")]
         ap_execution_available: bool,
-        #[serde(default = "default_true")]
         client_execution_available: bool,
         interfaces: Vec<WifiInventoryEntry>,
         observation_error: Option<String>,
@@ -1695,13 +1693,6 @@ pub enum Response<
     WifiConfigured {
         spec: WifiApSpecView,
     },
-    /// Legacy response retained for wire compatibility with older daemons that
-    /// committed AP provisioning immediately. Current provisioning returns
-    /// `NetworkChangePending` and requires an explicit commit.
-    WifiAccessPointProvisioned {
-        spec: WifiApSpecView,
-        dhcp: Option<DhcpServiceView>,
-    },
     WifiDisabled {
         interface: String,
     },
@@ -1807,10 +1798,7 @@ mod tests {
     #[test]
     fn shared_config_enums_keep_the_existing_wire_shape() {
         assert_eq!(serde_json::to_string(&WifiBand::Ghz5).unwrap(), "\"5g\"");
-        assert_eq!(
-            serde_json::from_str::<InterfaceRole>("\"management\"").unwrap(),
-            InterfaceRole::None
-        );
+        assert!(serde_json::from_str::<InterfaceRole>("\"management\"").is_err());
         assert_eq!(
             serde_json::to_string(&VpnPolicyMode::Direct).unwrap(),
             "\"direct\""
@@ -1906,7 +1894,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_router_status_reports_unknown_revisions() {
+    fn unavailable_router_revisions_are_none() {
         let response: ControlResponse = serde_json::from_value(serde_json::json!({
             "type": "router_status", "enabled": false, "ready": false,
             "coordinator_status": "idle", "health": { "interfaces": null, "routes": null, "dhcp": null, "uplink_dhcp": null, "dataplane": null }
@@ -1916,22 +1904,6 @@ mod tests {
             ControlResponse::RouterStatus {
                 desired_revision: None,
                 last_applied_revision: None,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn legacy_wifi_inventory_preserves_execution_availability() {
-        let response: ControlResponse = serde_json::from_value(serde_json::json!({
-            "type": "wifi_inventory", "revision": 7, "interfaces": [], "observation_error": null
-        }))
-        .unwrap();
-        assert!(matches!(
-            response,
-            ControlResponse::WifiInventory {
-                ap_execution_available: true,
-                client_execution_available: true,
                 ..
             }
         ));
@@ -2051,7 +2023,7 @@ mod hostname_tests {
     }
 
     #[test]
-    fn legacy_dhcp_client_requests_default_to_no_hostname() {
+    fn omitted_dhcp_hostname_defaults_to_none() {
         let request: DhcpClientConfigRequest = serde_json::from_str("{}").unwrap();
         assert_eq!(request.hostname, None);
         assert!(serde_json::to_value(request)

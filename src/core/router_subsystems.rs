@@ -634,14 +634,9 @@ where
                 dhcp_clients.push(DhcpClientSnapshot {
                     interface: name.clone(),
                     spec: status.map(|status| status.spec),
-                    lease: None,
                 });
             }
         }
-        // Retained for deserializing version-1/2 journals; new snapshots use
-        // the complete scoped collection, including absent clients.
-        let uplink_dhcp = None;
-
         let mut dhcp = Vec::new();
         let mut dhcp_absent_interfaces = Vec::new();
         for name in &names {
@@ -655,7 +650,6 @@ where
         Ok(crate::core::router::RouterSnapshot {
             interfaces,
             uplink_wifi,
-            uplink_dhcp,
             dhcp_clients,
             output_wifi,
             routes: self.routes.snapshot().await?,
@@ -937,13 +931,8 @@ where
         self.dataplane.rollback(snapshot).await
     }
 
-    async fn rollback_dhcp_clients(
-        &self,
-        snapshots: &[DhcpClientSnapshot],
-        legacy: Option<&DhcpClientSpec>,
-    ) -> Result<()> {
+    async fn rollback_dhcp_clients(&self, snapshots: &[DhcpClientSnapshot]) -> Result<()> {
         if snapshots.is_empty() {
-            self.apply_uplink_dhcp_candidate(legacy).await?;
             return Ok(());
         }
         let runtime = self

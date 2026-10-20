@@ -209,21 +209,10 @@ async fn recover_interface_journals(
                 recovery_control::run(&path, new_session, async {
                 let record: InterfaceJournal = serde_json::from_slice(&bytes)?;
                 anyhow::ensure!(
-                matches!(record.version, 1..=3) && record.snapshot.name == name,
+                record.version == 3 && record.snapshot.name == name,
                 recovery_control::failure(recovery_control::FailureKind::Incompatible,
                     "invariant=valid_interface_snapshot: unsupported schema or interface mismatch")
             );
-                anyhow::ensure!(
-                    record.version < 3
-                        || record
-                            .secret
-                            .as_ref()
-                            .is_none_or(|secret| secret.role.is_some()),
-                    recovery_control::failure(
-                        recovery_control::FailureKind::Incompatible,
-                        "role missing from Wi-Fi secret snapshot"
-                    )
-                );
                 if committed.get(&name) != Some(&record.token) {
                     if let Some(secret) = &record.secret {
                         secret.restore(state_dir, &name)?;

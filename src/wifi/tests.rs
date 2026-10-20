@@ -25,7 +25,6 @@ fn interface(wifi: Option<WifiApConfig>) -> InterfaceConfig {
         dhcp_client: None,
         wifi,
         wifi_client: None,
-        nat: true,
     }
 }
 

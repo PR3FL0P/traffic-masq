@@ -191,7 +191,6 @@ fn spec(interface: &str, ssid: &str) -> WifiApSpec {
         dhcp_client: None,
         wifi: Some(ap_config(ssid)),
         wifi_client: None,
-        nat: true,
     };
     WifiApSpec::from_interface_config(interface, &config)
         .expect("valid")
@@ -276,7 +275,6 @@ async fn effective_specs_derives_one_spec_per_access_point_interface() {
             dhcp_client: None,
             wifi: Some(ap_config("net-a")),
             wifi_client: None,
-            nat: true,
         },
     );
     config.network.interfaces.insert(
@@ -290,7 +288,6 @@ async fn effective_specs_derives_one_spec_per_access_point_interface() {
             dhcp_client: None,
             wifi: None,
             wifi_client: None,
-            nat: true,
         },
     );
 
@@ -564,56 +561,6 @@ async fn failed_restart_can_be_rolled_back_to_the_previous_ap() {
 }
 
 #[tokio::test]
-async fn adopts_and_upgrades_a_legacy_process_record_after_strong_identity_check() {
-    let temp = tempdir().expect("tempdir");
-    let runtime_dir = temp.path().join("hostapd");
-    let process = fake_process();
-    let supervisor = test_supervisor(temp.path(), &runtime_dir, process.clone()).await;
-
-    let target = spec("wlan0", "net-a");
-    let rendered = supervisor.render_for(&target).await.expect("render");
-
-    seed_process(&process, 4242, rendered.path.clone(), "net-a");
-    supervisor
-        .record_store("wlan0")
-        .save(&PersistedWifiRecord {
-            pid: 4242,
-            started_at_unix: crate::wifi::lifecycle::unix_now(),
-            process_start_ticks: None,
-            boot_id: None,
-            binary_path: None,
-            ctrl_path: supervisor.ctrl_path("wlan0"),
-            ctrl_dev: None,
-            ctrl_ino: None,
-            config_path: rendered.path.clone(),
-            config_digest: rendered.config_digest,
-            key_digest: rendered.key_digest,
-            ssid: "net-a".to_string(),
-        })
-        .await
-        .expect("seed record");
-
-    supervisor.configure(target).await.expect("configure");
-
-    assert!(
-        process.calls().is_empty(),
-        "adopting a matching record must not spawn or restart anything"
-    );
-    let status = supervisor.status("wlan0").await.expect("status");
-    assert_eq!(status.pid, 4242);
-    let upgraded = supervisor
-        .record_store("wlan0")
-        .load()
-        .await
-        .expect("load upgraded record")
-        .expect("record");
-    assert_eq!(
-        upgraded.binary_path.as_deref(),
-        Some(Path::new("/usr/sbin/hostapd"))
-    );
-}
-
-#[tokio::test]
 async fn recovers_a_process_spawned_after_a_durable_launch_intent() {
     let temp = tempdir().expect("tempdir");
     let runtime_dir = temp.path().join("hostapd");
@@ -683,8 +630,8 @@ async fn interrupted_reload_is_restarted_from_committed_state() {
         .save(&PersistedWifiRecord {
             pid: 4243,
             started_at_unix: 1,
-            process_start_ticks: None,
-            boot_id: None,
+            process_start_ticks: Some(4243),
+            boot_id: Some("test-boot".into()),
             binary_path: Some(std::path::PathBuf::from("/usr/sbin/hostapd")),
             ctrl_path: supervisor.ctrl_path("wlan0"),
             ctrl_dev: None,
@@ -790,8 +737,8 @@ async fn adoption_refuses_a_rebound_ctrl_socket_even_when_the_recorded_pid_still
         .save(&PersistedWifiRecord {
             pid: 4242,
             started_at_unix: 1,
-            process_start_ticks: None,
-            boot_id: None,
+            process_start_ticks: Some(4242),
+            boot_id: Some("test-boot".into()),
             binary_path: Some(PathBuf::from("/usr/sbin/hostapd")),
             ctrl_path: supervisor.ctrl_path("wlan0"),
             ctrl_dev: None,
@@ -834,8 +781,8 @@ async fn a_digest_mismatch_restarts_with_the_new_config() {
         .save(&PersistedWifiRecord {
             pid: 4242,
             started_at_unix: crate::wifi::lifecycle::unix_now(),
-            process_start_ticks: None,
-            boot_id: None,
+            process_start_ticks: Some(4242),
+            boot_id: Some("test-boot".into()),
             binary_path: Some(std::path::PathBuf::from("/usr/sbin/hostapd")),
             ctrl_path: supervisor.ctrl_path("wlan0"),
             ctrl_dev: None,
@@ -871,8 +818,8 @@ async fn absent_ctrl_socket_clears_any_stale_record_and_spawns_fresh() {
         .save(&PersistedWifiRecord {
             pid: 9999,
             started_at_unix: crate::wifi::lifecycle::unix_now(),
-            process_start_ticks: None,
-            boot_id: None,
+            process_start_ticks: Some(9999),
+            boot_id: Some("test-boot".into()),
             binary_path: Some(std::path::PathBuf::from("/usr/sbin/hostapd")),
             ctrl_path: supervisor.ctrl_path("wlan0"),
             ctrl_dev: None,

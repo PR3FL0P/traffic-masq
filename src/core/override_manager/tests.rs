@@ -78,7 +78,6 @@ async fn writing_an_override_wakes_whoever_is_waiting_for_a_change() {
 fn interface_config(address: &str) -> InterfaceConfig {
     InterfaceConfig {
         mac_address: None,
-        nat: true,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some(address.parse().expect("network")),
@@ -115,7 +114,7 @@ fn api_override(port: u16) -> ApiConfig {
 }
 
 #[tokio::test]
-async fn loads_unversioned_legacy_document_as_revision_zero() {
+async fn rejects_unversioned_document() {
     let directory = tempdir().expect("tempdir");
     let store = RuntimeOverrideStore::in_state_dir(directory.path());
     tokio::fs::write(
@@ -129,17 +128,15 @@ async fn loads_unversioned_legacy_document_as_revision_zero() {
     .await
     .unwrap();
 
-    let manager = RuntimeOverrideManager::load(directory.path(), &base_config())
-        .await
-        .expect("legacy load");
-    let state = manager.snapshot().await;
-    assert_eq!(state.schema_version, CURRENT_RUNTIME_OVERRIDES_SCHEMA);
-    assert_eq!(state.revision, 0);
-    assert_eq!(state.api, Some(ApiConfig { tcp: None }));
+    assert!(
+        RuntimeOverrideManager::load(directory.path(), &base_config())
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
-async fn legacy_interface_override_without_dhcp_client_loads_unchanged() {
+async fn rejects_old_interface_override_schema() {
     let directory = tempdir().expect("tempdir");
     let store = RuntimeOverrideStore::in_state_dir(directory.path());
     tokio::fs::write(
@@ -163,12 +160,11 @@ async fn legacy_interface_override_without_dhcp_client_loads_unchanged() {
     .await
     .unwrap();
 
-    let restored = RuntimeOverrideManager::load(directory.path(), &base_config())
-        .await
-        .expect("legacy override")
-        .snapshot()
-        .await;
-    assert!(restored.interfaces["wan0"].config.dhcp_client.is_none());
+    assert!(
+        RuntimeOverrideManager::load(directory.path(), &base_config())
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -180,7 +176,6 @@ async fn dhcp_client_interface_override_normalizes_saves_and_round_trips() {
         .unwrap();
     let mut interface = InterfaceConfig {
         mac_address: None,
-        nat: true,
         role: InterfaceRole::Input,
         managed: true,
         ipv4: None,
@@ -338,7 +333,6 @@ async fn vpn_mode_defaults_to_base_config_and_can_be_overridden_and_cleared() {
         "wan0".into(),
         InterfaceConfig {
             mac_address: None,
-            nat: true,
             role: InterfaceRole::Input,
             managed: false,
             ipv4: None,
@@ -413,25 +407,6 @@ async fn set_vpn_mode_vpn_is_rejected_without_vpn_enabled_or_router_enabled() {
 }
 
 #[tokio::test]
-async fn version_two_records_upgrade_without_losing_revision() {
-    let directory = tempdir().unwrap();
-    let store = RuntimeOverrideStore::in_state_dir(directory.path());
-    tokio::fs::write(store.path(), br#"{"schema_version":2,"revision":7}"#)
-        .await
-        .unwrap();
-    let manager = RuntimeOverrideManager::load(directory.path(), &base_config())
-        .await
-        .unwrap();
-    let snapshot = manager.snapshot().await;
-    assert_eq!(
-        snapshot.schema_version,
-        crate::state::overrides::CURRENT_RUNTIME_OVERRIDES_SCHEMA
-    );
-    assert_eq!(snapshot.revision, 7);
-    assert!(snapshot.committed_router_transaction.is_none());
-}
-
-#[tokio::test]
 async fn rejects_future_schema_version() {
     let directory = tempdir().expect("tempdir");
     let store = RuntimeOverrideStore::in_state_dir(directory.path());
@@ -448,7 +423,7 @@ async fn rejects_future_schema_version() {
         .expect_err("future schema");
     assert!(error
         .to_string()
-        .contains(&format!("future schema version {future}")));
+        .contains(&format!("unsupported runtime override schema {future}")));
 }
 
 #[tokio::test]
@@ -459,7 +434,6 @@ async fn router_and_interface_conflict_is_rejected_without_state_change() {
         "wan0".into(),
         InterfaceConfig {
             mac_address: None,
-            nat: true,
             role: InterfaceRole::Input,
             managed: false,
             ipv4: None,
@@ -488,7 +462,6 @@ async fn router_and_interface_conflict_is_rejected_without_state_change() {
         InterfaceOverride {
             config: InterfaceConfig {
                 mac_address: None,
-                nat: true,
                 role: InterfaceRole::None,
                 managed: false,
                 ipv4: None,
@@ -613,7 +586,6 @@ async fn candidate_commit_advances_revision_and_rejects_a_stale_candidate() {
         "wan0".into(),
         InterfaceConfig {
             mac_address: None,
-            nat: true,
             role: InterfaceRole::Input,
             managed: false,
             ipv4: None,

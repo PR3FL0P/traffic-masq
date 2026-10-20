@@ -33,6 +33,7 @@ pub struct RouterProposalRequestView {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+#[serde(deny_unknown_fields)]
 pub struct RouterConfigView {
     pub uplink: Option<UplinkConfigView>,
     pub forwarding: Option<Vec<ForwardingConfigView>>,

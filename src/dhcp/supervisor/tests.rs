@@ -54,7 +54,6 @@ fn service_spec_is_absent_for_an_output_without_dhcp() {
         dhcp_client: None,
         wifi: None,
         wifi_client: None,
-        nat: true,
     };
 
     assert!(
@@ -86,7 +85,6 @@ async fn start_skips_absent_configured_dhcp_interface_instead_of_failing() {
             dhcp_client: None,
             wifi: None,
             wifi_client: None,
-            nat: true,
         },
     );
 

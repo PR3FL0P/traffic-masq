@@ -181,6 +181,7 @@ impl OwnedWpaCtrlIdentity {
         // intent itself must still match at both sides of connect.
         if !self.require_current_record && persisted.pid == 0 {
             persisted.pid = self.record.pid;
+            persisted.process_start_ticks = self.record.process_start_ticks;
         }
         if persisted != self.record {
             return Ok(false);
@@ -193,7 +194,7 @@ impl OwnedWpaCtrlIdentity {
             .record
             .binary_path
             .as_deref()
-            .unwrap_or(inner.wpa_supplicant_binary.as_path());
+            .expect("record store requires executable identity");
         if !inner
             .process
             .identity_matches_record(&self.record, self.kind, binary_path)
@@ -305,7 +306,6 @@ impl WifiClientSupervisor {
             WifiProcessKind::Scan,
             &no_interfaces,
             self.inner.process.as_ref(),
-            &self.inner.wpa_supplicant_binary,
         )
         .await
         .map_err(ClientSupervisorError::Configuration)?;
@@ -315,7 +315,6 @@ impl WifiClientSupervisor {
             WifiProcessKind::Client,
             &configured_interfaces,
             self.inner.process.as_ref(),
-            &self.inner.wpa_supplicant_binary,
         )
         .await
         .map_err(ClientSupervisorError::Configuration)?;
@@ -588,7 +587,7 @@ impl WifiClientSupervisor {
             .record
             .binary_path
             .as_deref()
-            .unwrap_or(self.inner.wpa_supplicant_binary.as_path());
+            .expect("record store requires executable identity");
         if !self
             .inner
             .process
@@ -769,7 +768,7 @@ impl WifiClientSupervisor {
             let binary_path = record
                 .binary_path
                 .as_deref()
-                .unwrap_or(self.inner.wpa_supplicant_binary.as_path());
+                .expect("record store requires executable identity");
             let pids = match self
                 .inner
                 .process
@@ -784,7 +783,14 @@ impl WifiClientSupervisor {
                 Ok(pids) if pids.len() == 1 => pids,
                 Ok(_) | Err(_) => return Ok(None),
             };
+            if record.boot_id.is_none() || self.inner.process.boot_id().await? != record.boot_id {
+                return Ok(None);
+            }
+            let Some(ticks) = self.inner.process.process_start_ticks(pids[0]).await? else {
+                return Ok(None);
+            };
             record.pid = pids[0];
+            record.process_start_ticks = Some(ticks);
         }
 
         Ok(Some(OwnedWpaCtrlIdentity {

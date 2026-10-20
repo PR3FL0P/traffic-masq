@@ -286,7 +286,6 @@ pub fn derive_router_provisioning(
             security: desired.uplink.security,
             passphrase_file: desired.uplink.passphrase_file.clone(),
         }),
-        nat: true,
     };
 
     let output_interface = InterfaceConfig {
@@ -320,7 +319,6 @@ pub fn derive_router_provisioning(
             passphrase_file: desired.output.passphrase_file.clone(),
         }),
         wifi_client: None,
-        nat: true,
     };
 
     let router = RouterConfig {

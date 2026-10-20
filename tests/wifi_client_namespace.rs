@@ -142,7 +142,6 @@ impl WifiClientNamespaceFixture {
             STA_IF.to_string(),
             InterfaceConfig {
                 mac_address: None,
-                nat: true,
                 role: InterfaceRole::Input,
                 managed: false,
                 ipv4: None,

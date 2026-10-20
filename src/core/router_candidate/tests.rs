@@ -11,7 +11,6 @@ use super::*;
 fn input_interface() -> InterfaceConfig {
     InterfaceConfig {
         mac_address: None,
-        nat: true,
         role: InterfaceRole::Input,
         managed: false,
         ipv4: None,
@@ -27,7 +26,6 @@ fn output_interface(address: &str, pool_start: u8, pool_end: u8) -> InterfaceCon
     let octet = ipv4.addr().octets()[2];
     InterfaceConfig {
         mac_address: None,
-        nat: true,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some(ipv4),
@@ -60,7 +58,12 @@ fn base_config() -> AppConfig {
 fn enabled_router() -> RouterConfig {
     RouterConfig {
         port_forwards: Vec::new(),
-        forwarding: None,
+        forwarding: Some(vec![traffic_masq_dataplane::ForwardingConfig {
+            from: "lan0".into(),
+            to: "wan0".into(),
+            source_subnet: Some("192.168.10.0/24".parse().unwrap()),
+            masquerade: true,
+        }]),
         vpn_chain: Vec::new(),
         uplink: Some(UplinkConfig {
             interface: "wan0".to_string(),
@@ -85,7 +88,6 @@ fn committed() -> RuntimeOverrides {
 fn management_interface() -> InterfaceConfig {
     InterfaceConfig {
         mac_address: None,
-        nat: true,
         role: InterfaceRole::None,
         managed: false,
         ipv4: Some("192.168.1.20/24".parse().expect("IPv4 network")),
@@ -110,7 +112,6 @@ fn rejects_relabelling_a_management_interface_without_confirmation() {
     let base = base_config_with_management();
     let relabelled = InterfaceConfig {
         mac_address: None,
-        nat: true,
         role: InterfaceRole::Output,
         managed: true,
         ipv4: Some("10.9.0.1/24".parse().expect("IPv4 network")),
@@ -220,7 +221,7 @@ fn explicit_forwarding_does_not_require_a_global_uplink() {
 }
 
 #[test]
-fn explicit_empty_forwarding_does_not_restore_the_legacy_uplink_requirement() {
+fn explicit_empty_forwarding_needs_no_uplink() {
     let mut router = enabled_router();
     router.uplink = None;
     router.forwarding = Some(Vec::new());
@@ -237,6 +238,7 @@ fn explicit_empty_forwarding_does_not_restore_the_legacy_uplink_requirement() {
 fn activates_enabled_router_candidate_without_uplink_when_routes_present() {
     let mut router = enabled_router();
     router.uplink = None;
+    router.forwarding = None;
     router.owned_routes = vec![OwnedIpv4RouteConfig {
         destination: "10.0.0.0/24".parse().expect("route"),
         gateway: Some(Ipv4Addr::new(192, 168, 1, 1)),
@@ -330,7 +332,6 @@ fn derived_dhcp_client_follows_later_base_interface_changes() {
 
     let mut updated_base = base.clone();
     let wan = updated_base.network.interfaces.get_mut("wan0").unwrap();
-    wan.nat = false;
     wan.dhcp_client = Some(DhcpClientInterfaceConfig {
         enabled: false,
         route_metric: 777,
@@ -341,7 +342,6 @@ fn derived_dhcp_client_follows_later_base_interface_changes() {
     let committed: RuntimeOverrides = serde_json::from_slice(&persisted).unwrap();
     let effective = committed.effective_config(&updated_base).unwrap();
     let wan = &effective.network.interfaces["wan0"];
-    assert!(!wan.nat);
     assert_eq!(wan.dhcp_client.as_ref().unwrap().route_metric, 777);
     assert!(wan.dhcp_client.as_ref().unwrap().enabled);
 }

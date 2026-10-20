@@ -456,7 +456,7 @@ fn display_optional(value: Option<u32>) -> String {
 #[derive(Deserialize)]
 struct LoginRequest {
     password: Zeroizing<String>,
-    #[serde(default, alias = "client_name")]
+    #[serde(default)]
     client: Option<String>,
 }
 

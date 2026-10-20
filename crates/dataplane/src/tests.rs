@@ -513,18 +513,20 @@ fn forwarding_restores_exact_original_snapshot() {
 fn desired() -> RouterDataplaneDesired {
     RouterDataplaneDesired {
         port_forwards: Vec::new(),
-        forwarding: None,
-        uplink: "eth0".to_string(),
-        outputs: vec![
-            OutputNetwork {
-                interface: "lan0".to_string(),
-                subnet: "192.168.10.0/24".parse().expect("subnet"),
+        forwarding: Some(vec![
+            crate::ForwardingConfig {
+                from: "lan0".to_string(),
+                to: "eth0".to_string(),
+                source_subnet: Some("192.168.10.0/24".parse().expect("subnet")),
+                masquerade: true,
             },
-            OutputNetwork {
-                interface: "lan1".to_string(),
-                subnet: "192.168.20.0/24".parse().expect("subnet"),
+            crate::ForwardingConfig {
+                from: "lan1".to_string(),
+                to: "eth0".to_string(),
+                source_subnet: Some("192.168.20.0/24".parse().expect("subnet")),
+                masquerade: true,
             },
-        ],
+        ]),
     }
 }
 
@@ -570,38 +572,54 @@ fn nft_ruleset(owned: Option<&RouterDataplaneDesired>) -> Vec<u8> {
                 "family": NFT_FAMILY, "table": NFT_TABLE, "name": "postrouting",
                 "type": "nat", "hook": "postrouting", "prio": 100, "policy": "accept"
             }}),
-            serde_json::json!({ "set": {
-                "family": NFT_FAMILY, "table": NFT_TABLE, "name": "output_ifaces",
-                "type": "ifname",
-                "elem": desired.outputs.iter().map(|output| output.interface.clone()).collect::<Vec<_>>()
-            }}),
-            serde_json::json!({ "set": {
-                "family": NFT_FAMILY, "table": NFT_TABLE, "name": "output_subnets",
-                "type": "ipv4_addr", "flags": ["interval"],
-                "elem": desired.outputs.iter().map(|output| output.subnet.to_string()).collect::<Vec<_>>()
-            }}),
-            policy_rule("forward", serde_json::json!([
-                { "match": { "left": { "meta": { "key": "iifname" } }, "right": "@output_ifaces" } },
-                { "match": { "left": { "meta": { "key": "oifname" } }, "right": desired.uplink } },
-                { "accept": null }
-            ])),
-            policy_rule("forward", serde_json::json!([
-                { "match": { "left": { "meta": { "key": "iifname" } }, "right": desired.uplink } },
-                { "match": { "left": { "meta": { "key": "oifname" } }, "right": "@output_ifaces" } },
-                { "match": { "left": { "ct": { "key": "state" } }, "right": { "set": ["established", "related"] } } },
-                { "accept": null }
-            ])),
-            policy_rule("forward", serde_json::json!([
-                { "match": { "left": { "meta": { "key": "iifname" } }, "right": desired.uplink } },
-                { "match": { "left": { "meta": { "key": "oifname" } }, "right": "@output_ifaces" } },
-                { "drop": null }
-            ])),
-            policy_rule("postrouting", serde_json::json!([
-                { "match": { "left": { "payload": { "protocol": "ip", "field": "saddr" } }, "right": "@output_subnets" } },
-                { "match": { "left": { "meta": { "key": "oifname" } }, "right": desired.uplink } },
-                { "masquerade": null }
-            ])),
         ]);
+        let matched = |key: &str, value: &str| {
+            serde_json::json!({"match": {
+                "op": "==", "left": {"meta": {"key": key}}, "right": value
+            }})
+        };
+        for rule in desired.forwarding.as_deref().unwrap_or_default() {
+            let mut outbound = vec![
+                matched("nfproto", "ipv4"),
+                matched("iifname", &rule.from),
+                matched("oifname", &rule.to),
+            ];
+            let mut inbound = vec![
+                matched("nfproto", "ipv4"),
+                matched("iifname", &rule.to),
+                matched("oifname", &rule.from),
+            ];
+            if let Some(subnet) = rule.source_subnet {
+                let right = if subnet.prefix_len() == 32 {
+                    serde_json::json!(subnet.addr().to_string())
+                } else {
+                    serde_json::json!({"prefix": {"addr": subnet.network().to_string(), "len": subnet.prefix_len()}})
+                };
+                for (expr, field) in [(&mut outbound, "saddr"), (&mut inbound, "daddr")] {
+                    expr.push(serde_json::json!({"match": {"op": "==", "left": {"payload": {"protocol": "ip", "field": field}}, "right": right}}));
+                }
+            }
+            let mut translated = outbound.clone();
+            outbound.push(serde_json::json!({"accept": null}));
+            inbound.push(serde_json::json!({"match": {"op": "in", "left": {"ct": {"key": "state"}}, "right": ["established", "related"]}}));
+            inbound.push(serde_json::json!({"accept": null}));
+            entries.push(policy_rule("forward", serde_json::json!(outbound)));
+            entries.push(policy_rule("forward", serde_json::json!(inbound)));
+            if rule.masquerade {
+                translated.push(serde_json::json!({"masquerade": null}));
+                entries.push(policy_rule("postrouting", serde_json::json!(translated)));
+            }
+        }
+        let ingress: std::collections::BTreeSet<_> = desired
+            .forwarding_rules()
+            .into_iter()
+            .map(|rule| rule.from)
+            .collect();
+        for interface in ingress {
+            for key in ["iifname", "oifname"] {
+                entries.push(policy_rule("forward", serde_json::json!([matched("nfproto", "ipv4"), matched(key, &interface), {"drop": null}])));
+            }
+        }
     }
     serde_json::to_vec(&serde_json::json!({ "nftables": entries })).expect("ruleset")
 }
@@ -626,12 +644,12 @@ fn nft_render_contains_owned_policy_and_scoped_masquerade() {
         .lines()
         .filter_map(|line| line.split_once("comment \"").map(|(_, value)| value))
         .all(|comment| comment.trim_end_matches('"').len() <= 128));
-    assert!(rendered.contains("iifname @output_ifaces oifname \"eth0\" accept"));
-    assert!(rendered
-        .contains("iifname \"eth0\" oifname @output_ifaces ct state established,related accept"));
-    assert!(rendered.contains("iifname \"eth0\" oifname @output_ifaces drop"));
-    assert!(rendered.contains("ip saddr @output_subnets oifname \"eth0\" masquerade"));
-    assert!(rendered.contains("192.168.10.0/24, 192.168.20.0/24"));
+    assert!(rendered.contains("iifname \"lan0\" oifname \"eth0\" ip saddr 192.168.10.0/24 accept"));
+    assert!(rendered.contains("iifname \"eth0\" oifname \"lan0\" ip daddr 192.168.10.0/24 ct state established,related accept"));
+    assert!(
+        rendered.contains("iifname \"lan0\" oifname \"eth0\" ip saddr 192.168.10.0/24 masquerade")
+    );
+    assert!(rendered.contains("192.168.20.0/24"));
 }
 
 fn forwarding_desired() -> RouterDataplaneDesired {
@@ -651,8 +669,6 @@ fn forwarding_desired() -> RouterDataplaneDesired {
                 source_subnet: None,
             },
         ]),
-        uplink: String::new(),
-        outputs: Vec::new(),
     }
 }
 
@@ -807,12 +823,12 @@ fn nft_apply_replaces_only_owned_table_in_one_atomic_batch() {
     let executor = FakeNftExecutor::with_responses(vec![
         Ok(nft_ruleset(Some(&RouterDataplaneDesired {
             port_forwards: Vec::new(),
-            forwarding: None,
-            uplink: "old0".to_string(),
-            outputs: vec![OutputNetwork {
-                interface: "lan9".to_string(),
-                subnet: "10.0.0.0/24".parse().expect("subnet"),
-            }],
+            forwarding: Some(vec![crate::ForwardingConfig {
+                from: "lan9".to_string(),
+                to: "old0".to_string(),
+                source_subnet: Some("10.0.0.0/24".parse().expect("subnet")),
+                masquerade: true,
+            }]),
         }))),
         Ok(Vec::new()),
     ]);
@@ -878,47 +894,6 @@ fn nft_observe_reports_intact_rendered_structure() {
 }
 
 #[test]
-fn nft_observe_preserves_legacy_metadata_compatibility() {
-    let wanted = desired();
-    let mut ruleset = nft_ruleset_value(&wanted);
-    let encoded = hex_encode(&serde_json::to_vec(&wanted).expect("serialize desired"));
-    let entries = owned_entries(&mut ruleset);
-    entries
-        .iter_mut()
-        .find(|entry| {
-            entry
-                .get("table")
-                .and_then(|table| table.get("name"))
-                .and_then(Value::as_str)
-                == Some(NFT_TABLE)
-        })
-        .and_then(|entry| entry.get_mut("table"))
-        .expect("owned table")["comment"] =
-        Value::String(format!("{NFT_LEGACY_COMMENT_PREFIX}{encoded}"));
-    entries.retain(|entry| {
-        let metadata_chain = entry
-            .get("chain")
-            .and_then(|chain| chain.get("name"))
-            .and_then(Value::as_str)
-            == Some("metadata");
-        let metadata_rule = entry
-            .get("rule")
-            .and_then(|rule| rule.get("chain"))
-            .and_then(Value::as_str)
-            == Some("metadata");
-        !metadata_chain && !metadata_rule
-    });
-
-    let observed = parse_owned_nftables_state(
-        &serde_json::to_vec(&ruleset).expect("serialize legacy ruleset"),
-    )
-    .expect("legacy metadata");
-
-    assert_eq!(observed.desired, Some(wanted));
-    assert_eq!(observed.integrity, OwnedFirewallIntegrity::Intact);
-}
-
-#[test]
 fn nft_observe_detects_missing_or_changed_owned_objects_and_rules() {
     let wanted = desired();
     let mut drifted_rulesets = Vec::new();
@@ -947,31 +922,6 @@ fn nft_observe_detects_missing_or_changed_owned_objects_and_rules() {
         .expect("forward chain");
     forward["policy"] = Value::String("drop".to_string());
     drifted_rulesets.push(changed_chain);
-
-    let mut missing_set = nft_ruleset_value(&wanted);
-    owned_entries(&mut missing_set).retain(|entry| {
-        entry
-            .get("set")
-            .and_then(|set| set.get("name"))
-            .and_then(Value::as_str)
-            != Some("output_ifaces")
-    });
-    drifted_rulesets.push(missing_set);
-
-    let mut changed_set = nft_ruleset_value(&wanted);
-    let output_ifaces = owned_entries(&mut changed_set)
-        .iter_mut()
-        .find(|entry| {
-            entry
-                .get("set")
-                .and_then(|set| set.get("name"))
-                .and_then(Value::as_str)
-                == Some("output_ifaces")
-        })
-        .and_then(|entry| entry.get_mut("set"))
-        .expect("output interfaces set");
-    output_ifaces["elem"] = serde_json::json!(["lan9"]);
-    drifted_rulesets.push(changed_set);
 
     let mut missing_rule = nft_ruleset_value(&wanted);
     owned_entries(&mut missing_rule).retain(|entry| {
@@ -1045,33 +995,15 @@ fn empty_snapshot() -> RouterDataplaneSnapshot {
 #[test]
 fn desired_validation_rejects_invalid_topologies() {
     let mut candidate = desired();
-    candidate.outputs.clear();
-    assert!(candidate
-        .validate()
-        .unwrap_err()
-        .to_string()
-        .contains("at least one"));
-
+    candidate.forwarding = None;
+    assert!(candidate.validate().is_err());
     let mut candidate = desired();
-    candidate.outputs[0].interface = candidate.uplink.clone();
-    assert!(candidate
-        .validate()
-        .unwrap_err()
-        .to_string()
-        .contains("different"));
-
+    let rule = &mut candidate.forwarding.as_mut().unwrap()[0];
+    rule.from = rule.to.clone();
+    assert!(candidate.validate().is_err());
     let mut candidate = desired();
-    candidate.outputs[1].subnet = "192.168.10.128/25".parse().expect("subnet");
-    assert!(candidate
-        .validate()
-        .unwrap_err()
-        .to_string()
-        .contains("overlap"));
-
-    let mut candidate = desired();
-    candidate.uplink = "bad/name".to_string();
-    let error = candidate.validate().expect_err("invalid name must fail");
-    assert!(format!("{error:#}").contains("unsupported"));
+    candidate.forwarding.as_mut().unwrap()[0].to = "bad/name".into();
+    assert!(candidate.validate().is_err());
 }
 
 #[tokio::test]
@@ -1255,10 +1187,10 @@ async fn linux_provider_restore_attempts_both_resources_and_combines_failures() 
 #[tokio::test]
 async fn linux_provider_preflight_rejects_missing_or_down_interfaces_without_mutations() {
     for (name, role, remove) in [
-        ("eth0", "uplink", true),
-        ("eth0", "uplink", false),
-        ("lan0", "output", true),
-        ("lan0", "output", false),
+        ("eth0", "egress", true),
+        ("eth0", "egress", false),
+        ("lan0", "ingress", true),
+        ("lan0", "ingress", false),
     ] {
         let mut network = FakeNetworkProvider::all_up();
         if remove {
@@ -1390,7 +1322,7 @@ async fn health_reports_healthy_state_and_forwarding_or_firewall_drift() {
     );
 
     let mut other = wanted.clone();
-    other.uplink = "other0".to_string();
+    other.forwarding.as_mut().unwrap()[0].to = "other0".to_string();
     let mismatched_firewall =
         RouterDataplaneManager::new(FakeProvider::new(RouterDataplaneSnapshot {
             ipv4_forwarding: true,
@@ -1620,8 +1552,6 @@ fn cleanup_removed_firewall_retains_only_existing_permissions_without_devices() 
     let target = RouterDataplaneTarget::Enabled(RouterDataplaneDesired {
         port_forwards: Vec::new(),
         forwarding: Some(rules),
-        uplink: String::new(),
-        outputs: vec![],
     });
     let backend = NftablesBackend::new(FakeNftExecutor::with_responses(vec![
         Ok(nft_ruleset(Some(&applied))),
@@ -1720,8 +1650,6 @@ fn port_forward_removal_never_adds_permissions_and_preserves_remaining_rules() {
     let current = RouterDataplaneDesired {
         forwarding: Some(vec![]),
         port_forwards: vec![port_rule()],
-        uplink: String::new(),
-        outputs: vec![],
     };
     let mut target = current.clone();
     target.port_forwards[0].target_port += 1;
@@ -1735,27 +1663,12 @@ fn port_forward_removal_never_adds_permissions_and_preserves_remaining_rules() {
 fn port_forward_kernel_rules_integrity_and_tcp_udp_traffic() {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    for mode in ["port_only", "explicit", "legacy"] {
+    for mode in ["port_only", "explicit"] {
         for scope in ["any", "host", "subnet"] {
-            let legacy = mode == "legacy";
             let scoped = scope != "any";
-            let mut desired = if legacy {
-                RouterDataplaneDesired {
-                    forwarding: None,
-                    port_forwards: vec![],
-                    uplink: "wan0".into(),
-                    outputs: vec![OutputNetwork {
-                        interface: "lan0".into(),
-                        subnet: "192.0.2.0/24".parse().unwrap(),
-                    }],
-                }
-            } else {
-                RouterDataplaneDesired {
-                    forwarding: Some(vec![]),
-                    port_forwards: vec![],
-                    uplink: String::new(),
-                    outputs: vec![],
-                }
+            let mut desired = RouterDataplaneDesired {
+                forwarding: Some(vec![]),
+                port_forwards: vec![],
             };
             if mode == "explicit" {
                 desired.forwarding = Some(vec![ForwardingConfig {
@@ -1800,7 +1713,7 @@ fn port_forward_kernel_rules_integrity_and_tcp_udp_traffic() {
             let output = child.wait_with_output().unwrap();
             assert!(
                 output.status.success(),
-                "legacy={legacy} scoped={scoped}: {}",
+                "mode={mode} scoped={scoped}: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
             let observed = parse_owned_nftables_state(&output.stdout).unwrap();
@@ -1808,7 +1721,7 @@ fn port_forward_kernel_rules_integrity_and_tcp_udp_traffic() {
             assert_eq!(
                 observed.integrity,
                 OwnedFirewallIntegrity::Intact,
-                "legacy={legacy} scoped={scoped}: {}",
+                "mode={mode} scoped={scoped}: {}",
                 String::from_utf8_lossy(&output.stdout)
             );
             // Missing route guards, altered targets, broad accepts and hook drift are unsafe.
@@ -1911,8 +1824,6 @@ async fn port_forward_preflight_rejects_observed_router_addresses_before_firewal
     let wanted = RouterDataplaneDesired {
         forwarding: Some(vec![]),
         port_forwards: vec![rule],
-        uplink: String::new(),
-        outputs: vec![],
     };
     assert!(provider
         .apply_owned(&wanted)
@@ -1922,4 +1833,27 @@ async fn port_forward_preflight_rejects_observed_router_addresses_before_firewal
         .contains("local router address"));
     assert!(provider.nftables.executor.calls.lock().unwrap().is_empty());
     assert!(provider.forwarding.io.writes.lock().unwrap().is_empty());
+}
+
+#[test]
+fn old_firewall_metadata_is_rejected() {
+    let mut ruleset = nft_ruleset_value(&desired());
+    let table = ruleset["nftables"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .filter_map(|entry| entry.get_mut("table"))
+        .find(|table| table["name"] == NFT_TABLE)
+        .unwrap();
+    table["comment"] = serde_json::json!(format!(
+        "traffic-masq:v1:{}",
+        hex_encode(&serde_json::to_vec(&desired()).unwrap())
+    ));
+    assert!(parse_owned_nftables_state(&serde_json::to_vec(&ruleset).unwrap()).is_err());
+    assert!(
+        serde_json::from_value::<RouterDataplaneDesired>(serde_json::json!({
+            "uplink": "wan0", "outputs": [], "forwarding": null
+        }))
+        .is_err()
+    );
 }

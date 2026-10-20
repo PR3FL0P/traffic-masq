@@ -111,7 +111,6 @@ fn interface_edit_preserves_client_and_nat_settings() {
             security: crate::config::WifiClientSecurity::Open,
             passphrase_file: None,
         }),
-        nat: false,
     };
     let (config, _) = interface_edit_request_to_config(
         InterfaceEditRequest {
@@ -126,7 +125,6 @@ fn interface_edit_preserves_client_and_nat_settings() {
     .unwrap();
     assert_eq!(config.dhcp_client, existing.dhcp_client);
     assert_eq!(config.wifi_client, existing.wifi_client);
-    assert!(!config.nat);
     config.validate("wlan0").unwrap();
 }
 
@@ -142,7 +140,6 @@ fn interface_edit_request_preserves_existing_dhcp_settings() {
         dhcp_client: None,
         wifi: None,
         wifi_client: None,
-        nat: true,
     };
     let edit = InterfaceEditRequest {
         mac_address: None,
@@ -190,7 +187,6 @@ fn interface_edit_request_preserves_existing_wifi_settings_while_managed() {
         dhcp_client: None,
         wifi: Some(existing_wifi.clone()),
         wifi_client: None,
-        nat: true,
     };
     let edit = InterfaceEditRequest {
         mac_address: None,
@@ -221,7 +217,6 @@ fn interface_edit_request_drops_wifi_settings_when_unmanaged() {
         dhcp_client: None,
         wifi: Some(wifi_ap_config_fixture("home-net")),
         wifi_client: None,
-        nat: true,
     };
     let edit = InterfaceEditRequest {
         mac_address: None,
@@ -248,7 +243,6 @@ fn unmanaging_an_interface_with_a_running_ap_requires_explicit_confirmation() {
         dhcp_client: None,
         wifi: Some(wifi_ap_config_fixture("home-net")),
         wifi_client: None,
-        nat: true,
     };
     let mut new_config = current.clone();
     new_config.managed = false;
@@ -283,7 +277,6 @@ fn unmanaging_an_interface_with_no_router_services_needs_no_confirmation() {
         dhcp_client: None,
         wifi: None,
         wifi_client: None,
-        nat: true,
     };
     let mut new_config = current.clone();
     new_config.managed = false;
@@ -308,7 +301,6 @@ fn an_empty_cidr_removes_the_configured_address() {
         dhcp_client: None,
         wifi: None,
         wifi_client: None,
-        nat: true,
     };
     let edit = InterfaceEditRequest {
         mac_address: None,
@@ -339,7 +331,6 @@ fn removing_the_address_under_a_dhcp_server_says_what_to_disable_first() {
         dhcp_client: None,
         wifi: None,
         wifi_client: None,
-        nat: true,
     };
     let edit = InterfaceEditRequest {
         mac_address: None,
@@ -450,7 +441,6 @@ fn fake_router_snapshot() -> RouterSnapshot {
     RouterSnapshot {
         interfaces: Vec::new(),
         uplink_wifi: Vec::new(),
-        uplink_dhcp: None,
         dhcp_clients: Vec::new(),
         output_wifi: Vec::new(),
         dhcp: Vec::new(),
@@ -604,10 +594,9 @@ impl RouterSubsystems for FakeRouterSubsystems {
     async fn rollback_dhcp_clients(
         &self,
         snapshots: &[crate::core::router::DhcpClientSnapshot],
-        legacy: Option<&crate::dhcp::client::DhcpClientSpec>,
     ) -> Result<()> {
         anyhow::ensure!(
-            snapshots.is_empty() && legacy.is_none(),
+            snapshots.is_empty(),
             "DHCP client restoration is unavailable"
         );
         Ok(())
@@ -637,7 +626,6 @@ fn router_base_config() -> AppConfig {
             dhcp_client: None,
             wifi: None,
             wifi_client: None,
-            nat: true,
         },
     );
 
@@ -652,7 +640,6 @@ fn router_base_config() -> AppConfig {
             dhcp_client: None,
             wifi: None,
             wifi_client: None,
-            nat: true,
         },
     );
     config
@@ -662,7 +649,12 @@ fn router_proposal() -> RouterProposalRequest {
     RouterProposalRequest {
         set_router: Some(RouterConfig {
             port_forwards: Vec::new(),
-            forwarding: None,
+            forwarding: Some(vec![traffic_masq_dataplane::ForwardingConfig {
+                from: "lan0".into(),
+                to: "wan0".into(),
+                source_subnet: Some("192.168.10.0/24".parse().unwrap()),
+                masquerade: true,
+            }]),
             vpn_chain: Vec::new(),
             uplink: Some(UplinkConfig {
                 interface: "wan0".to_string(),
@@ -700,7 +692,6 @@ async fn removing_an_interface_override_falls_back_to_the_file_configuration() {
         dhcp_client: None,
         wifi: None,
         wifi_client: None,
-        nat: true,
     };
     overrides
         .set_interface("lan0".to_string(), overridden, false)
@@ -894,7 +885,12 @@ fn router_base_config_with_router_enabled() -> AppConfig {
     let mut config = router_base_config();
     config.router = RouterConfig {
         port_forwards: Vec::new(),
-        forwarding: None,
+        forwarding: Some(vec![traffic_masq_dataplane::ForwardingConfig {
+            from: "lan0".into(),
+            to: "wan0".into(),
+            source_subnet: Some("192.168.10.0/24".parse().unwrap()),
+            masquerade: true,
+        }]),
         vpn_chain: Vec::new(),
         uplink: Some(UplinkConfig {
             interface: "wan0".to_string(),
@@ -975,6 +971,7 @@ async fn router_requests_are_rejected_when_router_mode_is_disabled() {
 async fn router_without_intent_reports_inactive_provisioning_state() {
     let mut config = router_base_config_with_router_enabled();
     config.router.uplink = None;
+    config.router.forwarding = None;
     let (service, _directory) =
         router_service_with_config(Arc::new(FakeRouterSubsystems::default()), config).await;
 
@@ -1100,7 +1097,7 @@ async fn dhcp_uplink_plan_preserves_explicit_interface_override_while_enabling_d
         .unwrap()
         .mode = UplinkMode::Dhcp;
 
-    let mut override_config = proposal
+    let override_config = proposal
         .set_interfaces
         .get("wan0")
         .map(|request| request.config.clone())
@@ -1116,9 +1113,7 @@ async fn dhcp_uplink_plan_preserves_explicit_interface_override_while_enabling_d
             }),
             wifi: None,
             wifi_client: None,
-            nat: false,
         });
-    override_config.nat = false;
     proposal.set_interfaces.insert(
         "wan0".to_string(),
         crate::api::model::InterfaceOverrideRequest {
@@ -1140,7 +1135,6 @@ async fn dhcp_uplink_plan_preserves_explicit_interface_override_while_enabling_d
                 .iter()
                 .find(|interface| interface.name == "wan0")
                 .expect("wan0 desired interface");
-            assert!(!uplink.config.nat);
             assert!(uplink
                 .config
                 .dhcp_client
@@ -1777,6 +1771,7 @@ impl NetworkProvider for FakePolicyNetwork {
 
 fn router_and_vpn_base_config(wireguard_dir: std::path::PathBuf) -> AppConfig {
     let mut config = router_base_config_with_router_enabled();
+    config.router.forwarding = None;
     config.vpn.enabled = true;
     config.vpn.wireguard_config_dir = wireguard_dir;
     config
@@ -2367,7 +2362,6 @@ fn wifi_base_config(directory: &std::path::Path) -> AppConfig {
             dhcp_client: None,
             wifi: Some(wifi_ap_config("net-a", WifiSecurity::Open)),
             wifi_client: None,
-            nat: true,
         },
     );
     config
@@ -2566,7 +2560,6 @@ async fn get_wifi_config_reports_none_for_an_interface_without_a_wifi_block() {
             dhcp_client: None,
             wifi: None,
             wifi_client: None,
-            nat: true,
         },
     );
     let overrides = RuntimeOverrideManager::load(fixture_directory.path(), &config)
@@ -3117,7 +3110,6 @@ async fn wifi_set_passphrase_applies_live_via_reload() {
             dhcp_client: None,
             wifi: Some(wifi_ap_config("net-a", WifiSecurity::Wpa2)),
             wifi_client: None,
-            nat: true,
         },
     );
     let overrides = RuntimeOverrideManager::load(directory.path(), &config)
@@ -3195,7 +3187,6 @@ async fn wifi_configured_response_never_serializes_the_passphrase_that_was_just_
             dhcp_client: None,
             wifi: Some(wifi_ap_config("net-a", WifiSecurity::Wpa2)),
             wifi_client: None,
-            nat: true,
         },
     );
     let overrides = RuntimeOverrideManager::load(directory.path(), &config)
@@ -3548,7 +3539,6 @@ fn wifi_client_base_config(directory: &std::path::Path) -> AppConfig {
                 security: WifiClientSecurity::Open,
                 passphrase_file: None,
             }),
-            nat: true,
         },
     );
     config
@@ -4005,7 +3995,6 @@ async fn autoconnect_is_blocked_by_pending_transaction_on_another_interface() {
         dhcp_client: None,
         wifi: None,
         wifi_client: None,
-        nat: false,
     };
     let pending = fixture
         .service
@@ -4352,7 +4341,6 @@ async fn configuring_a_client_on_an_output_interface_is_an_invalid_spec() {
             dhcp_client: None,
             wifi: None,
             wifi_client: None,
-            nat: true,
         },
     );
     let overrides = RuntimeOverrideManager::load(directory.path(), &config)
@@ -4671,7 +4659,6 @@ async fn dhcp_client_control_fixture_with_router(
                 dhcp_client: None,
                 wifi: None,
                 wifi_client: None,
-                nat: true,
             },
         );
     }
@@ -4691,7 +4678,6 @@ async fn dhcp_client_control_fixture_with_router(
                 security: WifiClientSecurity::Open,
                 passphrase_file: None,
             }),
-            nat: true,
         },
     );
     let overrides = RuntimeOverrideManager::load(directory.path(), &config)
@@ -5913,7 +5899,6 @@ impl RouterSubsystems for FakeProvisioningSubsystems {
     async fn rollback_dhcp_clients(
         &self,
         _snapshots: &[crate::core::router::DhcpClientSnapshot],
-        _legacy: Option<&crate::dhcp::client::DhcpClientSpec>,
     ) -> Result<()> {
         Ok(())
     }
@@ -6262,7 +6247,6 @@ async fn provisioning_rejects_a_management_interface_without_confirmation() {
             dhcp_client: None,
             wifi: None,
             wifi_client: None,
-            nat: true,
         },
     );
     let fixture = provisioning_fixture_with(
@@ -7009,7 +6993,6 @@ async fn unrelated_recovery_does_not_block_interface_commit_or_rollback() {
         dhcp_client: None,
         wifi: None,
         wifi_client: None,
-        nat: true,
     };
     config
         .network
@@ -8890,7 +8873,6 @@ async fn unplugged_client_with_exited_unadopted_record_can_save_offline_intent()
                     config.managed = false;
                     config.wifi_client = None;
                     config.dhcp_client = None;
-                    config.nat = false;
                     Request::SaveInterfaceConfig {
                         interface: "wlan1".into(),
                         config: config.clone().into(),

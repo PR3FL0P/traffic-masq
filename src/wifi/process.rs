@@ -163,8 +163,7 @@ pub trait SupervisedProcess: Send + Sync {
         Ok(None)
     }
 
-    /// Match a persisted process record. New records carry an exact kernel
-    /// starttime; legacy records fall back to the historical wall-clock check.
+    /// Match a persisted process record against its exact kernel starttime.
     async fn identity_matches_record(
         &self,
         record: &crate::wifi::record::PersistedWifiRecord,
@@ -183,13 +182,14 @@ pub trait SupervisedProcess: Send + Sync {
         {
             return Ok(false);
         }
-        if let Some(expected_boot) = record.boot_id.as_deref() {
-            if self.boot_id().await?.as_deref() != Some(expected_boot) {
-                return Ok(false);
-            }
+        let Some(expected_boot) = record.boot_id.as_deref() else {
+            return Ok(false);
+        };
+        if self.boot_id().await?.as_deref() != Some(expected_boot) {
+            return Ok(false);
         }
         let Some(expected) = record.process_start_ticks else {
-            return Ok(true);
+            return Ok(false);
         };
         Ok(self.process_start_ticks(record.pid).await? == Some(expected))
     }
@@ -555,14 +555,15 @@ impl SupervisedProcess for TokioSupervisedProcess {
         {
             return Ok(false);
         }
-        if let Some(expected_boot) = record.boot_id.as_deref() {
-            if current_boot_id().await?.as_deref() != Some(expected_boot) {
-                return Ok(false);
-            }
+        let Some(expected_boot) = record.boot_id.as_deref() else {
+            return Ok(false);
+        };
+        if current_boot_id().await?.as_deref() != Some(expected_boot) {
+            return Ok(false);
         }
         match record.process_start_ticks {
             Some(expected) => Ok(process_start_ticks(record.pid).await? == Some(expected)),
-            None => process_started_near(record.pid, record.started_at_unix).await,
+            None => Ok(false),
         }
     }
 

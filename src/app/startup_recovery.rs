@@ -212,11 +212,6 @@ pub(super) async fn prepare(config: &AppConfig) -> Result<StartupRecovery> {
         config.validate()?;
         (overrides.hydrate_strict().await?, true)
     };
-    if !router_recovery_pending
-        && crate::core::recovery_control::stopped_journals(&config.runtime.state_dir).is_empty()
-    {
-        crate::wifi::store::migrate_legacy_passphrases(&effective_config).await?;
-    }
     let override_snapshot = overrides.snapshot().await;
     let management_allowlist = management_allowlist(&override_snapshot);
 

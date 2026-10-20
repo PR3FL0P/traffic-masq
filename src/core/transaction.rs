@@ -1177,14 +1177,7 @@ impl NetworkTransactionManager {
             let Ok(record) = serde_json::from_slice::<InterfaceJournal>(&bytes) else {
                 continue;
             };
-            if !matches!(record.version, 1..=3)
-                || record.snapshot.name != name
-                || (record.version == 3
-                    && record
-                        .secret
-                        .as_ref()
-                        .is_some_and(|secret| secret.role.is_none()))
-            {
+            if record.version != 3 || record.snapshot.name != name {
                 continue;
             }
             let previous_config = desired.committed_interface(name).await?;
@@ -1197,7 +1190,6 @@ impl NetworkTransactionManager {
                 dhcp_client: None,
                 wifi: None,
                 wifi_client: None,
-                nat: false,
             });
             let mut pending = self.inner.pending.lock().await;
             // A concurrent explicit retry may have retired this snapshot while

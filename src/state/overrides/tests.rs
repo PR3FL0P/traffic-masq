@@ -18,7 +18,6 @@ fn interface_config(address: &str) -> InterfaceConfig {
         dhcp_client: None,
         wifi: None,
         wifi_client: None,
-        nat: true,
     }
 }
 
@@ -70,7 +69,6 @@ fn effective_config_revalidates_router_against_interface_overrides() {
             dhcp_client: None,
             wifi: None,
             wifi_client: None,
-            nat: true,
         },
     );
     base.network
@@ -95,7 +93,6 @@ fn effective_config_revalidates_router_against_interface_overrides() {
                 dhcp_client: None,
                 wifi: None,
                 wifi_client: None,
-                nat: true,
             },
             allow_management_change: true,
             dhcp_client_only: false,
@@ -282,27 +279,6 @@ async fn suppression_survives_restart_base_changes_and_recovery_loading() {
     );
 }
 
-#[tokio::test]
-async fn version_three_migrates_with_empty_suppression() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = RuntimeOverrideStore::in_state_dir(directory.path());
-    tokio::fs::write(store.path(), br#"{"schema_version":3,"revision":7}"#)
-        .await
-        .unwrap();
-    let loaded = store.load().await.unwrap();
-    assert_eq!(loaded.schema_version, CURRENT_RUNTIME_OVERRIDES_SCHEMA);
-    assert_eq!(loaded.revision, 7);
-    assert!(loaded.suppressed_interfaces.is_empty());
-    assert!(store
-        .load_recovery_commit_proof()
-        .await
-        .unwrap()
-        .router_recovery_overrides()
-        .unwrap()
-        .suppressed_interfaces
-        .is_empty());
-}
-
 #[test]
 fn suppression_conflict_rejects_derived_dhcp_resurrection() {
     let mut overrides = RuntimeOverrides::default();
@@ -317,4 +293,30 @@ fn suppression_conflict_rejects_derived_dhcp_resurrection() {
     );
     assert!(overrides.normalized().is_err());
     assert!(overrides.effective_network(&base_config().network).is_err());
+}
+
+#[tokio::test]
+async fn only_current_schema_is_readable_for_normal_load_and_recovery() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = RuntimeOverrideStore::in_state_dir(directory.path());
+    for document in [
+        serde_json::json!({}),
+        serde_json::json!({"schema_version": 1}),
+        serde_json::json!({"schema_version": 2}),
+        serde_json::json!({"schema_version": 3}),
+        serde_json::json!({"schema_version": 5}),
+        serde_json::json!({"schema_version": "4"}),
+    ] {
+        tokio::fs::write(store.path(), serde_json::to_vec(&document).unwrap())
+            .await
+            .unwrap();
+        assert!(store.load().await.is_err(), "{document}");
+        assert!(
+            store.load_recovery_commit_proof().await.is_err(),
+            "{document}"
+        );
+    }
+    store.save(&RuntimeOverrides::default()).await.unwrap();
+    store.load().await.unwrap();
+    store.load_recovery_commit_proof().await.unwrap();
 }

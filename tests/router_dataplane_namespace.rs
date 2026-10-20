@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use traffic_masq::firewall::{
     Ipv4ForwardingBackend, LinuxRouterDataplaneProvider, NftCommandExecutor, NftablesBackend,
-    OutputNetwork, ProcSysIpv4ForwardingIo, RouterDataplaneDesired, RouterDataplaneManager,
+    ProcSysIpv4ForwardingIo, RouterDataplaneDesired, RouterDataplaneManager,
 };
 use traffic_masq::netlink::RtnetlinkNetworkProvider;
 
@@ -117,18 +117,12 @@ impl Drop for RouterDataplaneFixture {
 }
 
 #[tokio::test]
-#[ignore = "requires root, Linux, iproute2, nftables and ping; run explicitly on a disposable test host"]
-async fn production_forwarding_and_nftables_route_and_masquerade() -> Result<()> {
-    exercise_forwarding(false).await
-}
-
-#[tokio::test]
 #[ignore = "requires an isolated Linux network namespace, iproute2, nftables and ping"]
 async fn explicit_interface_forwarding_masquerades_and_rolls_back() -> Result<()> {
-    exercise_forwarding(true).await
+    exercise_forwarding().await
 }
 
-async fn exercise_forwarding(explicit: bool) -> Result<()> {
+async fn exercise_forwarding() -> Result<()> {
     let _test_guard = NAMESPACE_TEST_LOCK.lock().await;
     let fixture = RouterDataplaneFixture::new()?;
     let provider = LinuxRouterDataplaneProvider::new(
@@ -139,24 +133,13 @@ async fn exercise_forwarding(explicit: bool) -> Result<()> {
     let manager = RouterDataplaneManager::new(provider);
     let mut desired = RouterDataplaneDesired {
         port_forwards: Vec::new(),
-        forwarding: None,
-        uplink: fixture.uplink_if.clone(),
-        outputs: vec![OutputNetwork {
-            interface: fixture.lan_if.clone(),
-            subnet: "192.0.2.0/24".parse()?,
-        }],
-    };
-
-    if explicit {
-        desired.forwarding = Some(vec![traffic_masq::config::ForwardingConfig {
-            source_subnet: Some("192.0.2.0/24".parse()?),
+        forwarding: Some(vec![traffic_masq_dataplane::ForwardingConfig {
             from: fixture.lan_if.clone(),
             to: fixture.uplink_if.clone(),
+            source_subnet: Some("192.0.2.0/24".parse()?),
             masquerade: true,
-        }]);
-        desired.uplink.clear();
-        desired.outputs.clear();
-    }
+        }]),
+    };
 
     let plan = manager.plan(desired.clone()).await?;
     let snapshot = manager.apply(&plan).await?;
@@ -193,91 +176,22 @@ async fn exercise_forwarding(explicit: bool) -> Result<()> {
     );
     fixture.assert_foreign_table_exists()?;
 
-    if explicit {
-        // Real kernel observation must notice policy loss despite intact metadata.
-        run(
-            "nft",
-            &["flush", "chain", "inet", "traffic_masq", "forward"],
-        )?;
-        let repair = manager.plan(desired.clone()).await?;
-        assert!(repair.requires_apply);
-        manager.apply(&repair).await?;
+    // Real kernel observation must notice policy loss despite intact metadata.
+    run(
+        "nft",
+        &["flush", "chain", "inet", "traffic_masq", "forward"],
+    )?;
+    let repair = manager.plan(desired.clone()).await?;
+    assert!(repair.requires_apply);
+    manager.apply(&repair).await?;
+    assert!(!manager.plan(desired.clone()).await?.requires_apply);
+
+    // Prefix scoping must filter traffic as well as narrow NAT, and be
+    // recognized from the actual nft JSON (including /32 and /0 encodings).
+    for prefix in ["192.0.2.2/32", "0.0.0.0/0"] {
+        desired.forwarding.as_mut().unwrap()[0].source_subnet = Some(prefix.parse()?);
+        manager.apply(&manager.plan(desired.clone()).await?).await?;
         assert!(!manager.plan(desired.clone()).await?.requires_apply);
-
-        // Prefix scoping must filter traffic as well as narrow NAT, and be
-        // recognized from the actual nft JSON (including /32 and /0 encodings).
-        for prefix in ["192.0.2.2/32", "0.0.0.0/0"] {
-            desired.forwarding.as_mut().unwrap()[0].source_subnet = Some(prefix.parse()?);
-            manager.apply(&manager.plan(desired.clone()).await?).await?;
-            assert!(!manager.plan(desired.clone()).await?.requires_apply);
-            run(
-                "ip",
-                &[
-                    "netns",
-                    "exec",
-                    &fixture.client_ns,
-                    "ping",
-                    "-c",
-                    "1",
-                    "-W",
-                    "1",
-                    "198.51.100.2",
-                ],
-            )?;
-        }
-        desired.forwarding.as_mut().unwrap()[0].source_subnet = Some("192.0.2.3/32".parse()?);
-        manager.apply(&manager.plan(desired.clone()).await?).await?;
-        let excluded = Command::new("ip")
-            .args([
-                "netns",
-                "exec",
-                &fixture.client_ns,
-                "ping",
-                "-c",
-                "1",
-                "-W",
-                "1",
-                "198.51.100.2",
-            ])
-            .output()?;
-        assert!(
-            !excluded.status.success(),
-            "excluded source must not be forwarded"
-        );
-        desired.forwarding.as_mut().unwrap()[0].source_subnet = Some("192.0.2.0/24".parse()?);
-
-        // Without NAT the upstream needs a return route to the client subnet.
-        desired.forwarding.as_mut().unwrap()[0].masquerade = false;
-        manager.apply(&manager.plan(desired.clone()).await?).await?;
-        let no_return = Command::new("ip")
-            .args([
-                "netns",
-                "exec",
-                &fixture.client_ns,
-                "ping",
-                "-c",
-                "1",
-                "-W",
-                "1",
-                "198.51.100.2",
-            ])
-            .output()?;
-        assert!(
-            !no_return.status.success(),
-            "forward-only traffic must not be masqueraded"
-        );
-        run(
-            "ip",
-            &[
-                "-n",
-                &fixture.upstream_ns,
-                "route",
-                "add",
-                "192.0.2.0/24",
-                "via",
-                "198.51.100.1",
-            ],
-        )?;
         run(
             "ip",
             &[
@@ -292,8 +206,75 @@ async fn exercise_forwarding(explicit: bool) -> Result<()> {
                 "198.51.100.2",
             ],
         )?;
-        assert!(!manager.plan(desired).await?.requires_apply);
     }
+    desired.forwarding.as_mut().unwrap()[0].source_subnet = Some("192.0.2.3/32".parse()?);
+    manager.apply(&manager.plan(desired.clone()).await?).await?;
+    let excluded = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &fixture.client_ns,
+            "ping",
+            "-c",
+            "1",
+            "-W",
+            "1",
+            "198.51.100.2",
+        ])
+        .output()?;
+    assert!(
+        !excluded.status.success(),
+        "excluded source must not be forwarded"
+    );
+    desired.forwarding.as_mut().unwrap()[0].source_subnet = Some("192.0.2.0/24".parse()?);
+
+    // Without NAT the upstream needs a return route to the client subnet.
+    desired.forwarding.as_mut().unwrap()[0].masquerade = false;
+    manager.apply(&manager.plan(desired.clone()).await?).await?;
+    let no_return = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &fixture.client_ns,
+            "ping",
+            "-c",
+            "1",
+            "-W",
+            "1",
+            "198.51.100.2",
+        ])
+        .output()?;
+    assert!(
+        !no_return.status.success(),
+        "forward-only traffic must not be masqueraded"
+    );
+    run(
+        "ip",
+        &[
+            "-n",
+            &fixture.upstream_ns,
+            "route",
+            "add",
+            "192.0.2.0/24",
+            "via",
+            "198.51.100.1",
+        ],
+    )?;
+    run(
+        "ip",
+        &[
+            "netns",
+            "exec",
+            &fixture.client_ns,
+            "ping",
+            "-c",
+            "1",
+            "-W",
+            "1",
+            "198.51.100.2",
+        ],
+    )?;
+    assert!(!manager.plan(desired).await?.requires_apply);
 
     manager.rollback(&snapshot).await?;
     fixture.assert_foreign_table_exists()?;

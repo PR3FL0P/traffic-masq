@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 
 use crate::config::{
     DhcpInterfaceConfig, InterfaceConfig, InterfaceRole, RouterConfig, UplinkConfig, UplinkMode,
-    VpnConfig, VpnPolicyMode,
+    VpnConfig,
 };
 #[cfg(target_os = "linux")]
 use crate::dhcp::client::supervisor::LinuxDhcpClientLauncher;
@@ -108,7 +108,6 @@ impl ReconcileRetryFixture {
                     dhcp_client: None,
                     wifi: None,
                     wifi_client: None,
-                    nat: false,
                 },
             );
         }
@@ -549,7 +548,6 @@ fn vpn_policy_startup_config() -> AppConfig {
         "wan0".to_string(),
         InterfaceConfig {
             mac_address: None,
-            nat: true,
             role: InterfaceRole::Input,
             managed: false,
             ipv4: None,
@@ -563,7 +561,6 @@ fn vpn_policy_startup_config() -> AppConfig {
         "lan0".to_string(),
         InterfaceConfig {
             mac_address: None,
-            nat: true,
             role: InterfaceRole::Output,
             managed: true,
             ipv4: Some("192.168.10.1/24".parse().expect("network")),
@@ -589,79 +586,12 @@ fn vpn_policy_startup_config() -> AppConfig {
     config
 }
 
-/// `default_mode: Vpn` with an active legacy profile and an empty
-/// `vpn_chain` must migrate into a length-1 chain carrying that
-/// profile's name — the one true migration in Landing 1.
-#[tokio::test]
-async fn migrates_default_mode_vpn_with_an_active_profile_into_a_length_one_chain() {
-    let state_dir = tempdir().expect("tempdir");
-    let mut config = vpn_policy_startup_config();
-    config.runtime.state_dir = state_dir.path().to_path_buf();
-    config.vpn.policy.default_mode = VpnPolicyMode::Vpn;
-    assert!(config.router.vpn_chain.is_empty());
-
-    let legacy_store = ActiveProfileStore::new(state_dir.path().join("vpn-active-profile.json"));
-    legacy_store
-        .save(&crate::vpn::active_profile::PersistedActiveProfile {
-            profile_name: "home.conf".to_string(),
-            interface: "tm-wg0".to_string(),
-            ownership_proof_base64: "irrelevant".to_string(),
-        })
-        .await
-        .expect("persist legacy active profile");
-
-    migrate_vpn_policy_mode_to_chain(&mut config).await;
-
-    assert_eq!(config.router.vpn_chain.len(), 1);
-    assert_eq!(config.router.vpn_chain[0].profile_name, "home.conf");
-}
-
-/// Without a legacy active profile to synthesize from, the migration
-/// must leave `vpn_chain` empty rather than fabricate a hop with no real
-/// profile behind it.
-#[tokio::test]
-async fn does_not_synthesize_a_chain_without_a_legacy_active_profile() {
-    let state_dir = tempdir().expect("tempdir");
-    let mut config = vpn_policy_startup_config();
-    config.runtime.state_dir = state_dir.path().to_path_buf();
-    config.vpn.policy.default_mode = VpnPolicyMode::Vpn;
-
-    migrate_vpn_policy_mode_to_chain(&mut config).await;
-
-    assert!(config.router.vpn_chain.is_empty());
-}
-
-/// `default_mode: Direct` never triggers the migration, regardless of
-/// whether a legacy active profile happens to be lying around.
-#[tokio::test]
-async fn direct_mode_never_triggers_the_migration() {
-    let state_dir = tempdir().expect("tempdir");
-    let mut config = vpn_policy_startup_config();
-    config.runtime.state_dir = state_dir.path().to_path_buf();
-    config.vpn.policy.default_mode = VpnPolicyMode::Direct;
-
-    let legacy_store = ActiveProfileStore::new(state_dir.path().join("vpn-active-profile.json"));
-    legacy_store
-        .save(&crate::vpn::active_profile::PersistedActiveProfile {
-            profile_name: "home.conf".to_string(),
-            interface: "tm-wg0".to_string(),
-            ownership_proof_base64: "irrelevant".to_string(),
-        })
-        .await
-        .expect("persist legacy active profile");
-
-    migrate_vpn_policy_mode_to_chain(&mut config).await;
-
-    assert!(config.router.vpn_chain.is_empty());
-}
-
 fn hotplug_reconcile_config() -> AppConfig {
     let mut config = AppConfig::default();
     config.network.interfaces.insert(
         "lan0".to_string(),
         InterfaceConfig {
             mac_address: None,
-            nat: true,
             role: InterfaceRole::Output,
             managed: true,
             ipv4: Some("192.168.77.1/24".parse().expect("network")),
@@ -914,7 +844,6 @@ async fn a_proposal_carries_its_own_permission_to_touch_a_management_interface()
         "mgmt0".to_string(),
         InterfaceConfig {
             mac_address: None,
-            nat: true,
             role: InterfaceRole::None,
             managed: true,
             ipv4: Some("192.168.1.10/24".parse().expect("network")),
@@ -1002,7 +931,6 @@ async fn convergence_takes_our_addresses_off_an_unmanaged_interface() {
         "lan0".to_string(),
         InterfaceConfig {
             mac_address: None,
-            nat: true,
             role: InterfaceRole::Output,
             managed: false,
             ipv4: None,
@@ -1179,7 +1107,6 @@ fn dhcp_client_reconcile_config() -> AppConfig {
         "wan0".to_string(),
         InterfaceConfig {
             mac_address: None,
-            nat: true,
             role: InterfaceRole::Input,
             managed: true,
             ipv4: None,
@@ -1340,7 +1267,6 @@ async fn managed_wifi_dhcp_tracks_completed_while_wired_stays_ready() {
         "eth0".to_string(),
         InterfaceConfig {
             mac_address: None,
-            nat: true,
             role: InterfaceRole::Input,
             managed: true,
             ipv4: None,
@@ -1449,7 +1375,6 @@ async fn runtime_reconcile_disables_a_dhcp_client_whose_intent_was_removed() {
         "wan0".to_string(),
         InterfaceConfig {
             mac_address: None,
-            nat: true,
             role: InterfaceRole::Input,
             managed: false,
             ipv4: None,
@@ -1522,7 +1447,6 @@ fn desired_with_route_and_dataplane() -> RouterDesired {
         "wan0".to_string(),
         crate::config::InterfaceConfig {
             mac_address: None,
-            nat: true,
             role: crate::config::InterfaceRole::Input,
             managed: false,
             ipv4: None,
@@ -1536,7 +1460,6 @@ fn desired_with_route_and_dataplane() -> RouterDesired {
         "lan0".to_string(),
         crate::config::InterfaceConfig {
             mac_address: None,
-            nat: true,
             role: crate::config::InterfaceRole::Output,
             managed: true,
             ipv4: Some("192.168.10.1/24".parse().expect("network")),
@@ -1548,7 +1471,12 @@ fn desired_with_route_and_dataplane() -> RouterDesired {
     );
     config.router = RouterConfig {
         port_forwards: Vec::new(),
-        forwarding: None,
+        forwarding: Some(vec![traffic_masq_dataplane::ForwardingConfig {
+            from: "lan0".into(),
+            to: "wan0".into(),
+            source_subnet: Some("192.168.10.0/24".parse().unwrap()),
+            masquerade: true,
+        }]),
         vpn_chain: Vec::new(),
         uplink: Some(UplinkConfig {
             interface: "wan0".to_string(),
@@ -1920,7 +1848,6 @@ fn sharing_config() -> AppConfig {
                 dhcp_client: None,
                 wifi: None,
                 wifi_client: None,
-                nat: false,
             },
         );
     }
@@ -2141,7 +2068,6 @@ async fn startup_cancels_removed_device_transaction_without_replaying_it_after_r
             dhcp_client: None,
             wifi: None,
             wifi_client: None,
-            nat: false,
         },
     );
     let overrides = RuntimeOverrideManager::load(directory.path(), &config)
@@ -2166,7 +2092,7 @@ async fn startup_cancels_removed_device_transaction_without_replaying_it_after_r
         .write(
             "eth0",
             &serde_json::to_vec(&serde_json::json!({
-                "version": 2, "token": "interrupted", "snapshot": snapshot,
+                "version": 3, "token": "interrupted", "snapshot": snapshot,
             }))
             .unwrap(),
         )
@@ -2351,7 +2277,6 @@ async fn rollback_without_external_connectivity(device_present: bool) {
             security: crate::config::WifiClientSecurity::Open,
             passphrase_file: None,
         }),
-        nat: false,
     };
     config
         .network

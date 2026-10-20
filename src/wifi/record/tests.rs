@@ -34,30 +34,6 @@ fn record(pid: u32) -> PersistedWifiRecord {
         ssid: "traffic-masq".to_string(),
     }
 }
-
-async fn write_legacy_document(path: &Path, record: &PersistedWifiRecord) {
-    let document = PersistedWifiRecordDocument {
-        schema_version: LEGACY_WIFI_RECORD_SCHEMA,
-        kind: None,
-        interface: None,
-        pid: record.pid,
-        started_at_unix: record.started_at_unix,
-        process_start_ticks: record.process_start_ticks,
-        boot_id: record.boot_id.clone(),
-        binary_path: record.binary_path.clone(),
-        ctrl_path: record.ctrl_path.clone(),
-        ctrl_dev: record.ctrl_dev,
-        ctrl_ino: record.ctrl_ino,
-        config_path: record.config_path.clone(),
-        config_digest: record.config_digest,
-        key_digest: record.key_digest,
-        ssid: record.ssid.clone(),
-    };
-    tokio::fs::write(path, serde_json::to_vec_pretty(&document).unwrap())
-        .await
-        .expect("write legacy record");
-}
-
 #[tokio::test]
 async fn missing_file_loads_as_none() {
     let directory = tempdir().expect("tempdir");
@@ -149,76 +125,6 @@ async fn ap_and_client_namespaces_cannot_collide() {
 }
 
 #[tokio::test]
-async fn legacy_ap_record_is_migrated_into_ap_namespace() {
-    let directory = tempdir().expect("tempdir");
-    let legacy = directory.path().join("active-client-wlan0.json");
-    let legacy_transition = legacy.with_extension("transition");
-    let mut saved = record(7);
-    saved.ctrl_path = PathBuf::from("/run/traffic-masq/hostapd/client-wlan0");
-    saved.config_path = PathBuf::from("/run/traffic-masq/hostapd/client-wlan0.conf");
-    write_legacy_document(&legacy, &saved).await;
-    tokio::fs::write(&legacy_transition, b"pending\n")
-        .await
-        .expect("legacy transition");
-
-    let store = WifiRecordStore::for_access_point(directory.path(), ap_runtime(), "client-wlan0");
-    assert_eq!(store.load().await.expect("load").unwrap().pid, 7);
-    assert!(store.path().exists());
-    assert!(!legacy.exists());
-    assert!(store
-        .transition_pending()
-        .await
-        .expect("transition migrated"));
-    assert!(!legacy_transition.exists());
-}
-
-#[tokio::test]
-async fn discovery_migrates_legacy_record_into_namespaced_store() {
-    let directory = tempdir().expect("tempdir");
-    let legacy = directory.path().join("active-client-wlan0.json");
-    let mut saved = record(10);
-    saved.ctrl_path = PathBuf::from("/run/traffic-masq/wpa/wlan0");
-    saved.config_path = PathBuf::from("/run/traffic-masq/wpa/wlan0.conf");
-    write_legacy_document(&legacy, &saved).await;
-
-    let records =
-        WifiRecordStore::discover(WifiProcessKind::Client, directory.path(), client_runtime())
-            .await
-            .expect("discover client");
-
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].0, "wlan0");
-    assert_eq!(records[0].2.pid, 10);
-    assert!(records[0]
-        .1
-        .path()
-        .starts_with(directory.path().join("client")));
-    assert!(!legacy.exists());
-}
-
-#[tokio::test]
-async fn legacy_collision_is_migrated_only_by_matching_kind() {
-    let directory = tempdir().expect("tempdir");
-    let legacy = directory.path().join("active-client-wlan0.json");
-    let mut saved = record(9);
-    saved.ctrl_path = PathBuf::from("/run/traffic-masq/wpa/wlan0");
-    saved.config_path = PathBuf::from("/run/traffic-masq/wpa/wlan0.conf");
-    write_legacy_document(&legacy, &saved).await;
-
-    let ap = WifiRecordStore::for_access_point(directory.path(), ap_runtime(), "client-wlan0");
-    assert!(ap.load().await.expect("AP load").is_none());
-    assert!(
-        legacy.exists(),
-        "AP lookup must not consume a client record"
-    );
-
-    let client = WifiRecordStore::for_client(directory.path(), client_runtime(), "wlan0");
-    assert_eq!(client.load().await.expect("client load").unwrap().pid, 9);
-    assert!(client.path().exists());
-    assert!(!legacy.exists());
-}
-
-#[tokio::test]
 async fn rejects_unsupported_schema_version() {
     let directory = tempdir().expect("tempdir");
     let store = WifiRecordStore::for_access_point(directory.path(), ap_runtime(), "wlan0");
@@ -245,54 +151,6 @@ async fn rejects_unsupported_schema_version() {
 
     let error = store.load().await.expect_err("unsupported schema");
     assert!(matches!(error, WifiRecordError::UnsupportedSchema(_, 99)));
-}
-
-#[tokio::test]
-async fn legacy_record_without_executable_identity_loads_unproven() {
-    let directory = tempdir().expect("tempdir");
-    let store = WifiRecordStore::for_access_point(directory.path(), ap_runtime(), "wlan0");
-    tokio::fs::create_dir_all(store.path().parent().unwrap())
-        .await
-        .unwrap();
-    tokio::fs::write(
-        store.path(),
-        serde_json::to_vec(&serde_json::json!({
-            "schema_version": 1,
-            "pid": 4242,
-            "started_at_unix": 1_700_000_000u64,
-            "ctrl_path": "/run/traffic-masq/hostapd/wlan0",
-            "config_path": "/run/traffic-masq/hostapd/wlan0.conf",
-            "config_digest": hex_of(&[1; 32]),
-            "key_digest": hex_of(&[2; 32]),
-            "ssid": "traffic-masq",
-        }))
-        .unwrap(),
-    )
-    .await
-    .unwrap();
-
-    let record = store
-        .load()
-        .await
-        .expect("legacy record loads")
-        .expect("record");
-    assert_eq!(record.pid, 4242);
-    assert_eq!(record.process_start_ticks, None);
-    assert_eq!(record.boot_id, None);
-    assert_eq!(record.binary_path, None);
-
-    let migrated: serde_json::Value = serde_json::from_slice(
-        &tokio::fs::read(store.path())
-            .await
-            .expect("read migrated record"),
-    )
-    .expect("parse migrated record");
-    assert_eq!(
-        migrated["schema_version"],
-        serde_json::json!(CURRENT_WIFI_RECORD_SCHEMA)
-    );
-    assert_eq!(migrated["kind"], serde_json::json!("access_point"));
-    assert_eq!(migrated["interface"], serde_json::json!("wlan0"));
 }
 
 #[tokio::test]
@@ -325,36 +183,6 @@ async fn schema_v2_requires_explicit_kind_and_interface() {
             Err(WifiRecordError::MismatchedContext(_))
         ));
     }
-}
-
-#[tokio::test]
-async fn legacy_schema_record_outside_configured_runtime_root_is_rejected() {
-    let directory = tempdir().expect("tempdir");
-    let store = WifiRecordStore::for_access_point(directory.path(), ap_runtime(), "wlan0");
-    tokio::fs::create_dir_all(store.path().parent().unwrap())
-        .await
-        .unwrap();
-    tokio::fs::write(
-        store.path(),
-        serde_json::to_vec(&serde_json::json!({
-            "schema_version": LEGACY_WIFI_RECORD_SCHEMA,
-            "pid": 42,
-            "started_at_unix": 1_700_000_000u64,
-            "ctrl_path": "/tmp/foreign-runtime/wlan0",
-            "config_path": "/tmp/foreign-runtime/wlan0.conf",
-            "config_digest": hex_of(&[1; 32]),
-            "key_digest": hex_of(&[2; 32]),
-            "ssid": "traffic-masq",
-        }))
-        .unwrap(),
-    )
-    .await
-    .unwrap();
-
-    assert!(matches!(
-        store.load().await,
-        Err(WifiRecordError::MismatchedContext(_))
-    ));
 }
 
 #[tokio::test]
@@ -446,5 +274,49 @@ async fn primary_record_rejects_wrong_namespace_fields_before_recovery() {
             ),
             "field {field}"
         );
+    }
+}
+
+#[tokio::test]
+async fn old_schema_and_shared_record_path_are_not_migrated() {
+    let directory = tempdir().unwrap();
+    let store = WifiRecordStore::for_access_point(directory.path(), ap_runtime(), "wlan0");
+    store.save(&record(42)).await.unwrap();
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&tokio::fs::read(store.path()).await.unwrap()).unwrap();
+    document["schema_version"] = serde_json::json!(1);
+    let bytes = serde_json::to_vec(&document).unwrap();
+    tokio::fs::write(store.path(), &bytes).await.unwrap();
+    assert!(matches!(
+        store.load().await,
+        Err(WifiRecordError::UnsupportedSchema(_, 1))
+    ));
+    assert_eq!(tokio::fs::read(store.path()).await.unwrap(), bytes);
+    let old_path = directory.path().join("active-wlan0.json");
+    tokio::fs::rename(store.path(), &old_path).await.unwrap();
+    assert!(store.load().await.unwrap().is_none());
+    assert!(WifiRecordStore::discover(
+        WifiProcessKind::AccessPoint,
+        directory.path(),
+        ap_runtime()
+    )
+    .await
+    .unwrap()
+    .is_empty());
+    assert_eq!(tokio::fs::read(old_path).await.unwrap(), bytes);
+}
+
+#[tokio::test]
+async fn incomplete_process_identity_is_rejected() {
+    let directory = tempdir().unwrap();
+    let store = WifiRecordStore::for_access_point(directory.path(), ap_runtime(), "wlan0");
+    for field in ["binary", "boot", "starttime"] {
+        let mut incomplete = record(42);
+        match field {
+            "binary" => incomplete.binary_path = None,
+            "boot" => incomplete.boot_id = None,
+            _ => incomplete.process_start_ticks = None,
+        }
+        assert!(store.save(&incomplete).await.is_err(), "{field}");
     }
 }

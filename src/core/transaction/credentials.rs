@@ -12,17 +12,13 @@ use std::path::Path;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct SecretSnapshot {
-    #[serde(default)]
-    pub(super) role: Option<WifiCredentialRole>,
+    pub(super) role: WifiCredentialRole,
     pub(super) previous: Option<zeroize::Zeroizing<String>>,
 }
 
 impl SecretSnapshot {
     pub(super) fn restore(&self, state_dir: &std::path::Path, interface: &str) -> Result<()> {
-        let store = match self.role {
-            Some(role) => PassphraseStore::for_role(state_dir, role),
-            None => PassphraseStore::new(state_dir.join("wifi/psk")), // v1/v2 journal
-        };
+        let store = PassphraseStore::for_role(state_dir, self.role);
         match &self.previous {
             Some(secret) => store.set(interface, &WifiPassphrase::new(secret.to_string())?)?,
             None => store.clear(interface)?,
@@ -91,7 +87,7 @@ impl PreparedCredentialChange {
                 anyhow::anyhow!("a Wi-Fi secret update requires an unambiguous AP or client role")
             })?;
             Some(SecretSnapshot {
-                role: secret_role,
+                role: secret_role.expect("credential role validated above"),
                 previous: store
                     .get(interface)?
                     .map(|value| zeroize::Zeroizing::new(value.expose().to_owned())),

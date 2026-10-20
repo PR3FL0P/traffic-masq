@@ -73,10 +73,7 @@ use router_startup::{
     production_router_coordinator, rollback_router_dataplane,
 };
 use startup_recovery::StartupRecovery;
-use vpn_startup::{
-    apply_vpn_policy_startup, build_vpn_manager, build_vpn_policy_manager,
-    migrate_vpn_policy_mode_to_chain,
-};
+use vpn_startup::{apply_vpn_policy_startup, build_vpn_manager, build_vpn_policy_manager};
 
 type ProductionVpnPolicyManager = crate::core::vpn_policy_manager::VpnPolicyManager<
     crate::vpn::WireGuardVpnDriver,
@@ -219,10 +216,9 @@ pub async fn run_daemon(config: AppConfig) -> Result<()> {
 
 /// Start with the selected base file so clients can explain restore actions.
 pub async fn run_daemon_with_config_file(
-    mut config: AppConfig,
+    config: AppConfig,
     base_config_file: Option<std::path::PathBuf>,
 ) -> Result<()> {
-    migrate_vpn_policy_mode_to_chain(&mut config).await;
     let shutdown = install_shutdown_signal()?;
     let _process_guard = ProcessGuard::acquire(&config.runtime.pid_path)?;
     let _logging_guard = init_logging(&config)?;

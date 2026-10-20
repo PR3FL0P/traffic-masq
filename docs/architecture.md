@@ -54,7 +54,7 @@ and regulatory domains are read directly through nl80211. The app's
 `startup_recovery` module validates durable proofs before normal admission or
 API binding; `router_startup` wires the production coordinator and restores
 temporary route/dataplane baselines; `vpn_startup` prepares VPN control and
-legacy policy migration; `reconcile` owns runtime network convergence and
+VPN control-plane initialization; `reconcile` owns runtime network convergence and
 integrity workers. After those workers stop and pending rollback is attempted,
 `daemon_shutdown` chooses the final restore policy and cleans up runtime
 resources. An uncertain commit keeps recovery evidence and prevents baseline
@@ -102,8 +102,8 @@ Interface transaction ordering stays in `core::transaction`. Its `journal`
 module owns the snapshot schema and durable storage, `credentials` prepares
 role-specific secret edits and compensation, and `recovery` restores interrupted
 transactions. Credential preparation is observational: the coordinator writes
-the snapshot before applying a credential edit. Journal versions and legacy
-credential recovery semantics remain unchanged. A rollback-only pending token
+the snapshot before applying a credential edit. Only the current journal schema
+is accepted. A rollback-only pending token
 and cancellation guard exist before the first runtime mutation. Cancellation
 hands compensation to a background owner that reacquires the per-interface
 transaction lock and participates in the shared convergence reservation.
@@ -241,8 +241,7 @@ state after expiry or a request timeout, rather than infer a transaction outcome
 
 AP and station credentials have separate interface-keyed stores:
 `wifi/psk-ap/<interface>` and `wifi/psk-client/<interface>` under the state
-directory. Supervisors never fall back to the legacy `wifi/psk/<interface>`
-namespace. Updating or clearing one role does not change the other role's secret.
+directory. Updating or clearing one role does not change the other role's secret.
 A protected AP/STA role transition cannot use `Keep`: it needs an explicit
 passphrase or an explicit `passphrase_file`. Selecting a file on a role transition
 clears any older stored credential for the target role so it cannot shadow that
@@ -250,14 +249,10 @@ file. Same-role edits can retain their existing credential.
 
 Interface secret journals (version 3) and router provisioning secret journals
 (version 2) record the credential role. Rollback and crash recovery restore only
-that namespace. Older journals are still recovered into the legacy namespace
-before migration; their role is not guessed from the proposed configuration.
-
-After legacy journal recovery, startup migrates credentials according to the
-committed interface configuration. The role-specific copy is persisted before
-the old file is removed, so an interrupted migration can be repeated. Conflicting
-source and destination values stop migration without overwriting either secret.
-Entries without an unambiguous configured role move to `wifi/psk-unassigned/`,
-which neither supervisor reads. Recovery-blocked interfaces are deferred until
-recovery succeeds. Profile stores and explicitly configured external secret
-files retain their existing paths.
+that namespace. Previous journal schemas and the old shared credential namespace
+are unsupported; startup does not migrate credentials. Wi-Fi process records
+must use schema 2 and the AP/client/scan namespaces. Runtime overrides must use
+schema 4, interface journals schema 3, router journals schema 2, and provisioning
+secret journals schema 2. Unsupported uncommitted journals remain on disk and
+block recovery; transaction tokens already proven committed can still retire
+obsolete journal files without replaying them.
