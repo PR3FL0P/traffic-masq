@@ -192,9 +192,9 @@ pub(crate) fn render_settings(frame: &mut ratatui::Frame<'_>, area: Rect, app: &
         ),
         note(
             if editor.is_editing() {
-                "←/→ move cursor · 0-9 edit · Enter/Esc finish editing"
+                "←/→ move cursor · 0-9 edit · Enter: next"
             } else {
-                "Arrows move · Enter edits duration · type digits to edit"
+                "Tab/Enter: next · type digits to edit"
             },
             Style::default().fg(theme::MUTED),
         ),
@@ -363,10 +363,9 @@ pub(crate) async fn handle_settings_key(app: &mut TuiApp, key: KeyCode, client: 
         }
         KeyCode::Enter => match editor.field {
             SettingsField::RollbackTimeout | SettingsField::RememberMinutes => {
-                editor.editing = !editor.editing;
-                if editor.editing {
-                    editor.reset_cursor();
-                }
+                editor.editing = false;
+                editor.field = next_settings_field(editor.field);
+                editor.reset_cursor();
             }
             SettingsField::RememberSession => editor.remember_session = !editor.remember_session,
             SettingsField::ShowDhcpClient => {
@@ -771,7 +770,7 @@ pub(crate) fn render_settings_password(
         ),
         Line::from(""),
         note(
-            "Up/Down or Tab: switch field | Enter: submit | Esc: cancel",
+            "Tab: next | Enter: next / submit on confirmation | Esc: cancel",
             Style::default().fg(theme::MUTED),
         ),
         note(
@@ -828,6 +827,10 @@ pub(crate) async fn handle_settings_password_key(
         }
         KeyCode::Up => {
             editor.field = previous_password_field(editor.field);
+            editor.reset_cursor();
+        }
+        KeyCode::Enter if editor.field != PasswordField::Confirm => {
+            editor.field = next_password_field(editor.field);
             editor.reset_cursor();
         }
         KeyCode::Enter => submit_password_change(app, client).await,

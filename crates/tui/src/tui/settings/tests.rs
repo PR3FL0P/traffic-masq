@@ -324,7 +324,7 @@ async fn settings_editor_cursor_navigation_and_editing() {
 }
 
 #[tokio::test]
-async fn settings_editor_editing_mode_toggling() {
+async fn settings_enter_advances_text_fields_with_or_without_edits() {
     let mut app = TuiApp {
         screen: Screen::Settings,
         settings: Some(SecurityEditor {
@@ -348,31 +348,35 @@ async fn settings_editor_editing_mode_toggling() {
 
     assert!(!app.settings.as_ref().unwrap().is_editing());
 
-    // Enter activates editing mode
-    handle_settings_key(&mut app, KeyCode::Enter, &client).await;
+    // Typing enters editing; Enter advances without sending a request.
+    handle_settings_key(&mut app, KeyCode::Char('1'), &client).await;
     assert!(app.settings.as_ref().unwrap().is_editing());
-
-    // Esc exits editing mode
-    handle_settings_key(&mut app, KeyCode::Esc, &client).await;
-    assert!(!app.settings.as_ref().unwrap().is_editing());
-    assert_eq!(app.screen, Screen::Settings);
-
-    // Enter activates again
     handle_settings_key(&mut app, KeyCode::Enter, &client).await;
-    assert!(app.settings.as_ref().unwrap().is_editing());
-
-    // Enter again finishes editing mode
-    handle_settings_key(&mut app, KeyCode::Enter, &client).await;
-    assert!(!app.settings.as_ref().unwrap().is_editing());
-
-    // Up/Down navigation clears editing mode
-    handle_settings_key(&mut app, KeyCode::Enter, &client).await;
-    assert!(app.settings.as_ref().unwrap().is_editing());
-    handle_settings_key(&mut app, KeyCode::Down, &client).await;
     assert!(!app.settings.as_ref().unwrap().is_editing());
     assert_eq!(
         app.settings.as_ref().unwrap().field,
         SettingsField::RememberSession
+    );
+    assert!(app.message.is_none());
+
+    handle_settings_key(&mut app, KeyCode::Up, &client).await;
+    handle_settings_key(&mut app, KeyCode::Enter, &client).await;
+    assert_eq!(
+        app.settings.as_ref().unwrap().field,
+        SettingsField::RememberSession
+    );
+
+    handle_settings_key(&mut app, KeyCode::Down, &client).await;
+    assert_eq!(
+        app.settings.as_ref().unwrap().field,
+        SettingsField::RememberMinutes
+    );
+    handle_settings_key(&mut app, KeyCode::Char('2'), &client).await;
+    assert!(app.settings.as_ref().unwrap().is_editing());
+    handle_settings_key(&mut app, KeyCode::Enter, &client).await;
+    assert_eq!(
+        app.settings.as_ref().unwrap().field,
+        SettingsField::ShowDhcpClient
     );
 }
 

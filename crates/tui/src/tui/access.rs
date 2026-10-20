@@ -314,7 +314,10 @@ pub(crate) async fn handle_access_key(app: &mut TuiApp, key: KeyCode, client: &A
         }
         KeyCode::Enter => match editor.field {
             AccessField::Enabled => editor.desired.enabled = !editor.desired.enabled,
-            AccessField::Listen | AccessField::CertificatePath | AccessField::PrivateKeyPath => {}
+            AccessField::Listen | AccessField::CertificatePath | AccessField::PrivateKeyPath => {
+                editor.field = next_field(editor.field);
+                editor.reset_cursor();
+            }
             AccessField::Save => submit_access_settings(app, client).await,
             AccessField::Reset => reset_access_settings(app, client).await,
             AccessField::Reload => open_access_editor(app, client).await,
