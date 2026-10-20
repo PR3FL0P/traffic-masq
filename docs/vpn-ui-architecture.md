@@ -9,7 +9,7 @@ Moving a control between screens does not change its API or execution model.
 | --- | --- | --- |
 | Saved WireGuard profile | Profile store, valid profile contents | VPN library; import/delete apply immediately |
 | Standalone tunnel | Enabled VPN, saved profile, available owned `tm-wg0` | `VpnManager`; `VpnActivate` / `VpnDeactivate` apply immediately |
-| Standalone traffic policy | Enabled VPN, global uplink, managed Output IPv4 subnets; VPN mode additionally needs a healthy standalone interface | `VpnPolicyManager`; immediate Direct/VPN override, separate from router drafts |
+| Standalone traffic policy | Enabled VPN, global uplink, managed Output IPv4 subnets, externally managed forwarding; VPN mode additionally needs a healthy standalone interface | `VpnPolicyManager`; immediate Direct/VPN override, separate from router drafts |
 | Global VPN chain | Enabled VPN, physical uplink, saved profiles; LAN traffic needs explicit forwarding rules | Router coordinator; shared draft, plan, apply, confirmation, rollback |
 | Router's own traffic through VPN | Configured global chain and `route_host_traffic` | Router coordinator; exit policy includes kill switch and IPv6 egress blocking |
 | VPN enabled setting | VPN control plane; disabling requires no saved chain, Direct effective policy, and no standalone active record | Persisted subsystem availability; not a disconnect-all operation |
@@ -42,7 +42,10 @@ with an enabled DHCP client. Validation remains authoritative in the daemon.
 The route model stores destination, gateway, output interface, table and metric.
 It does not associate routes with profile names or expose named selectable chains.
 The standalone policy derives protected subnets from managed Output interfaces;
-it is not an arbitrary per-flow traffic selector.
+it is not an arbitrary per-flow traffic selector. This standalone policy overlays
+forwarding managed outside traffic-masq. It does not enable IPv4 forwarding or
+create direct-mode NAT rules, and cannot coexist with daemon-managed explicit
+forwarding in VPN mode.
 
 ## Guarantees preserved by the UI
 

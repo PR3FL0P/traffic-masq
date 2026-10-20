@@ -52,6 +52,7 @@ struct VpnPolicyNamespaceFixture {
     config_path: PathBuf,
     daemon: Option<std::process::Child>,
 
+    original_forwarding: String,
     forwarding_baseline: String,
 }
 
@@ -66,7 +67,7 @@ impl VpnPolicyNamespaceFixture {
         let suffix = unique_suffix();
         let temp = tempdir().context("failed to create temp state directory")?;
 
-        let forwarding_baseline = fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
+        let original_forwarding = fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
             .context("failed to read pre-test IPv4 forwarding sysctl")?
             .trim()
             .to_string();
@@ -102,7 +103,8 @@ impl VpnPolicyNamespaceFixture {
             config,
             config_path,
             daemon: None,
-            forwarding_baseline,
+            original_forwarding,
+            forwarding_baseline: "1".into(),
         };
 
         if let Err(error) = fixture.setup_topology() {
@@ -188,6 +190,27 @@ impl VpnPolicyNamespaceFixture {
                 &self.upstream_if,
                 "up",
             ],
+        )?;
+
+        // Standalone policy overlays an independently managed Linux router.
+        // Keep that baseline separate from the daemon's explicit forwarding model:
+        // the daemon must neither infer permissions nor own these NAT rules.
+        fs::write("/proc/sys/net/ipv4/ip_forward", b"1\n")?;
+        let subnet = format!("{CLIENT_ADDR}/{CLIENT_SUBNET_PREFIX}")
+            .parse::<ipnet::Ipv4Net>()?
+            .trunc();
+        run_with_stdin(
+            "nft",
+            &["-f", "-"],
+            format!(
+                "table ip traffic_masq_test_direct {{\n\
+                 chain postrouting {{\n\
+                 type nat hook postrouting priority srcnat; policy accept;\n\
+                 iifname \"{}\" oifname \"{}\" ip saddr {subnet} masquerade\n\
+                 }}\n}}\n",
+                self.lan_if, self.uplink_if,
+            )
+            .as_bytes(),
         )?;
 
         Ok(())
@@ -431,7 +454,12 @@ impl VpnPolicyNamespaceFixture {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
-        let _ = fs::write("/proc/sys/net/ipv4/ip_forward", b"0\n");
+        let _ = Command::new("nft")
+            .args(["delete", "table", "ip", "traffic_masq_test_direct"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = fs::write("/proc/sys/net/ipv4/ip_forward", &self.original_forwarding);
         let _ = Command::new("ip")
             .args(["link", "del", &self.lan_if])
             .status();
@@ -1129,6 +1157,9 @@ fn assert_router_dataplane_rolled_back(fixture: &VpnPolicyNamespaceFixture) -> R
     if wg_link.status.success() {
         bail!("tm-wg0 still exists after graceful shutdown");
     }
+
+    run("nft", &["list", "table", "ip", "traffic_masq_test_direct"])
+        .context("daemon removed the independently managed direct-mode NAT baseline")?;
 
     let forwarding = fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
         .context("failed to read IPv4 forwarding sysctl after shutdown")?;

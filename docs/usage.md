@@ -886,7 +886,8 @@ visible while VPN is disabled. Open **VPN settings** for subsystem Enable/Disabl
 and its prerequisites.
 
 **Route → Standalone traffic policy** controls the existing immediate Direct/VPN
-policy for the standalone tunnel. It is separate from the Route draft and is
+policy for the standalone tunnel, over forwarding and direct-mode NAT managed
+outside traffic-masq. It is separate from the Route draft and is
 unavailable with a saved global chain. **Route → Uplink / VPN** continues to edit
 the global chain through plan/apply/confirmation. Saved membership and interface
 up do not prove connectivity or active traffic protection. See the

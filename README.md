@@ -317,7 +317,8 @@ are not actively tested by the Dashboard.
 In **VPN**, open **VPN settings** to enable the subsystem without restarting
 the daemon. Import a profile, open its card and choose **Connect standalone**
 to bring up its tunnel. **Route → Standalone traffic policy** controls routing
-through that tunnel and applies immediately. Disconnect, select Direct policy
+through that tunnel and applies immediately; it requires forwarding managed
+outside traffic-masq. Disconnect, select Direct policy
 and remove any saved router VPN chain before disabling VPN.
 
 In **Route**, configure a sharing connection or uplink and use **Plan / Apply**.
