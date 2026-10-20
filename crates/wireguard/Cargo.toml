@@ -16,7 +16,7 @@ netlink-packet-core = "0.8"
 netlink-packet-generic = "0.4"
 netlink-packet-route = "0.19"
 netlink-packet-wireguard = "0.4.2"
-rtnetlink = "0.14"
+rtnetlink = "0.23"
 thiserror = "1"
 tokio = { version = "1", features = ["full"] }
 zeroize = "1"
