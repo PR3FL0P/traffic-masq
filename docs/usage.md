@@ -2,12 +2,7 @@
 
 ## Interface walkthrough
 
-![traffic-masq TUI walkthrough: editing, confirmations, disconnected adapters and Wi-Fi](media/tui-demo.gif)
-
-This continuous recording uses a 120×30 terminal and demonstration data. It shows
-keyboard navigation, character-by-character editing, plan scrolling, a running
-rollback countdown, confirmation, Wi-Fi scanning and preserving an AP draft. Use the
-[chapter index](media/tui-demo.chapters.txt) to find a feature.
+![traffic-masq TUI](media/tui.gif)
 
 ## Requirements
 
@@ -383,7 +378,7 @@ recovery details. Ctrl+G opens the full operation result.
 
 ### Routes and Internet sharing
 
-In **Router**, Tab/Shift+Tab switches between routes and **Actions**. Up/Down
+In **Route**, Tab/Shift+Tab switches between routes and **Actions**. Up/Down
 or Left/Right selects an action, and Enter or Space activates it. Esc returns
 to the route list. Scrolling the route list keeps focus in the list.
 Buttons wrap to fit the terminal. For a route outside the static route editor,
@@ -403,7 +398,7 @@ switch; changing away from DHCP belongs in the confirmed Interfaces editor.
 Manual deletion changes only the live kernel state, has no automatic rollback,
 and may be undone by the DHCP client.
 
-The **Router** tab has three sections, selected with **1 / 2 / 3** or by clicking
+The **Route** tab has four sections, selected with **1 / 2 / 3 / 4** or by clicking
 its section labels:
 
 - **Routes** edits destinations, gateways, interfaces, tables and metrics.
@@ -412,6 +407,8 @@ its section labels:
   Up/Down selects rows; Tab switches to actions; Left/Right selects an action.
 - **Topology** shows configured connections and observed default routes. This is
   a configuration overview, not a verified packet path.
+- **Port forwarding** maps incoming IPv4 TCP/UDP ports to another host, with
+  optional external IPv4 and source subnet restrictions.
 
 In the sharing editor, choose **Traffic from**, **Internet through** and
 **Masquerade**. **Advanced** reveals the optional IPv4 **Source subnet**; leaving
@@ -464,20 +461,18 @@ rewrites the source address on egress; it does not select routes or nest VPN
 encapsulation ([nftables NAT documentation](https://wiki.iptables.org/wiki-nftables/index.php/Performing_Network_Address_Translation_%28NAT%29)).
 An `Ethernet → VPN → VPN → Internet` path also needs the tunnels and their
 endpoint/policy routes configured. This editor manages forwarding/NAT between
-existing interfaces. Use **Uplink / VPN** for the global VPN-chain editor. Explicit
-`forwarding` and the legacy global `vpn_chain`/VPN policy cannot be combined.
-Use direct global VPN policy with explicit connections and separately configured
-tunnel routing. Existing legacy VPN-chain configurations continue to work.
+existing interfaces. Use **Uplink / VPN** for the VPN-chain editor. Set explicit
+sharing rules for the intended interface pairs; the uplink and VPN chain do not
+synthesize connection rules. Global VPN policy must be direct when explicit
+connections are configured.
 
-Old configurations without `forwarding` retain their `uplink` and per-interface
-`nat` behavior. Opening the editor imports those existing NAT pairs for review.
-Once `forwarding` is present it is authoritative: `forwarding = []` removes all
-owned connection rules and never resurrects the old implicit NAT rules.
-The legacy `uplink` may remain to preserve its Wi-Fi/DHCP client services.
+Omitted `forwarding` and `forwarding = []` grant no connection permissions.
+`uplink` can select Wi-Fi/DHCP client services and the VPN chain's physical
+upstream independently of forwarding rules.
 
 ### Physical uplink and global VPN chain
 
-**Router → Uplink / VPN** (**u**) edits the current router draft. Set the uplink
+**Route → Uplink / VPN** (**u**) edits the current router draft. Set the uplink
 interface name and choose External (unmanaged Input) or DHCP (managed Input with
 an enabled DHCP client). Those interface prerequisites are configured in
 Interfaces/DHCP Client; this editor preserves their settings.
@@ -487,12 +482,11 @@ closer to the physical uplink or LAN, or remove it. The first hop connects throu
 the physical uplink; each later hop connects through the preceding tunnel. The
 last hop protects LAN traffic. The daemon validates chain size and profiles.
 
-Choose Global uplink sharing explicitly to use a VPN chain. It replaces explicit
-sharing rules with the backend's global policy for managed NAT outputs. Switching
-from global to explicit mode starts with an empty rule list if no explicit rules
-existed in the draft. Review those consequences before Apply. The shared plan
-shows both old and new hops and removed sharing rules. Esc from the editor
-preserves the pre-existing draft; staging uses the usual confirmed router flow.
+Uplink and chain edits preserve explicit sharing rules. Configure permitted
+connections in Internet sharing, including the VPN egress. An uplink or chain
+alone adds no forwarding or NAT permissions. The shared plan shows both old and
+new hops and removed sharing rules. Esc from the editor preserves the
+pre-existing draft; staging uses the usual confirmed router flow.
 Uplink/chain changes require a live transaction, not an offline intent save.
 
 The **Route router's own traffic through VPN** checkbox (Enter toggles it) sends
@@ -541,30 +535,6 @@ trusted CA bundle has its own cache key, so changing trust requires authenticati
 again. The server is shown on the login screen and TUI header. `--change-password`
 works with either `--server` or `--connection`. Direct recovery mode always
 observes the local host and cannot be combined with a remote destination.
-
-### Whole-router Wi-Fi setup
-
-**Router → Wi-Fi setup** (**w**) opens three steps: Wi-Fi uplink, local AP, and
-LAN/DHCP. Enter cycles available radio names; names and SSIDs can also be typed.
-Use two different wireless PHYs. The daemon validates radio capabilities and
-subnet conflicts during preview/apply. AP setup defaults to visible SSID and
-32 clients; these can subsequently be changed in the AP editor.
-
-Blank LAN address and pool fields request automatic selection. Custom pools
-require both endpoints and an explicit LAN address/prefix. DNS is explicit;
-leaving it empty advertises no DNS servers. Passwords are masked; blank retains
-only credentials already saved for that same role. Management-interface changes
-require the explicit option on the final step.
-
-Review the complete replacement before applying: this replaces the two selected
-interface configurations and the router's owned routes, forwarding rules and VPN
-chain. The chosen LAN values are held for Apply. Editing the draft requires a
-new preview. The wizard refuses to open over a staged router draft or known
-pending/recovery state. Esc asks before discarding the setup draft.
-
-Apply uses a whole-router transaction. Verify connectivity and Commit, or Esc
-to roll back. If the response is unknown, Apply is disabled; leave the wizard
-and inspect Router status before retrying. It never automatically resubmits.
 
 ### Connected AP clients
 
@@ -882,17 +852,15 @@ subnet it serves; disable DHCP first.
 Interfaces with role `none` (outside the router) are not modified until the
 connectivity risk is explicitly confirmed. Interface router roles are `none`,
 `input`, and `output`; VPN hop interfaces use the reserved `middle` role. `none`
-does not disable the link or prevent access to the machine. The legacy
-`management` spelling is accepted as `none`, with its confirmation protection
-preserved. Legacy `disabled` configurations remain readable but are no longer
-offered in the role selector.
+does not disable the link or prevent access to the machine. The removed
+`management` and `disabled` role spellings are rejected.
 
 In the interface editor, **Configure with traffic-masq** controls configuration
 ownership independently of the router role. Address editing is unavailable
 when it is off. **Review changes** opens a read-only preview using the same flow
 as the router preview: review the complete plan, then press **Enter** on
 **Apply temporarily** to start the rollback timer, or **Esc** to return to editing.
-The API retains `managed` and `allow_management_change` for compatibility.
+The API uses `managed` for ownership and `allow_management_change` for confirmation.
 
 Test configuration changes on a separate Linux host before production use.
 
@@ -907,6 +875,23 @@ Before configuring a DHCP client, use **Interfaces** to apply and commit a
 managed `input` interface without a static IPv4 address. DHCP configuration
 requires that prepared interface and applies immediately.
 The overview reports whether the VPN subsystem is enabled; this switch alone does not prove a tunnel is connected.
+
+The **VPN** tab lists saved profiles with standalone tunnel state and saved global
+chain membership. **Enter** opens a profile card; **Connect standalone** and
+**Disconnect standalone** are explicit immediate actions. A profile used by the
+saved chain links to **Route**. The profile card also shows membership in an
+unapplied Route draft and offers confirmed deletion. **Import** is a library
+action; **r** refreshes without changing selection by name. Profiles remain
+visible while VPN is disabled. Open **VPN settings** for subsystem Enable/Disable
+and its prerequisites.
+
+**Route → Standalone traffic policy** controls the existing immediate Direct/VPN
+policy for the standalone tunnel. It is separate from the Route draft and is
+unavailable with a saved global chain. **Route → Uplink / VPN** continues to edit
+the global chain through plan/apply/confirmation. Saved membership and interface
+up do not prove connectivity or active traffic protection. See the
+[VPN and Route architecture contract](vpn-ui-architecture.md) for dependencies,
+ownership and guarantees.
 
 An absent router dataplane interface defers startup convergence after successful
 rollback instead of stopping the daemon. Runtime repair checks for absent
@@ -1010,7 +995,7 @@ Uplink, VPN-chain and derived interface-policy changes still require a live
 confirmed transaction.
 
 Unknown observation or a changed revision blocks Save and retains the draft.
-Press **c** on Router to discard it and reload current saved settings. Removed
+Press **c** on Route to discard it and reload current saved settings. Removed
 owned routes and firewall permissions are cleaned up after a successful Save;
 a cleanup blocker means settings were saved but cleanup is incomplete. Inspect
 the reported cause rather than submitting the old revision again. Remaining
@@ -1023,7 +1008,7 @@ Offline Save does not advance it. See the [router API](api.md#router-and-provisi
 
 ### Router readiness and repair
 
-In **Router**, press **h** to inspect the saved configuration's readiness, transaction
+In **Route**, press **h** to inspect the saved configuration's readiness, transaction
 coordinator, interface/route/DHCP/dataplane blockers and recovery failures. Press
 **r** to refresh. A failed read retains the previous snapshot, marks it stale and
 blocks repair. These checks do not test Internet connectivity.
@@ -1032,7 +1017,7 @@ Press **f** to fetch fresh status and review the repair confirmation, then **y**
 reconcile the saved router configuration. **n** or **Esc** cancels. Repair immediately
 reapplies saved state and may interrupt traffic; it has no commit-confirm timer.
 It is offered only for degraded, active router intent with an idle coordinator and no
-TUI draft. Resolve pending transactions or recovery through Router first. The daemon
+TUI draft. Resolve pending transactions or recovery through Route first. The daemon
 also rejects repair while an interface transaction is pending. A failed or uncertain
 repair requires a fresh status read before retrying.
 

@@ -8,10 +8,7 @@ configure a Wi-Fi hotspot with a compatible adapter, or route LAN traffic
 through WireGuard tunnels. Manage the daemon locally or connect a remote
 terminal client over HTTPS.
 
-![traffic-masq TUI walkthrough: editing, confirmations, disconnected adapters and Wi-Fi](docs/media/tui-demo.gif)
-
-A continuous recording of keyboard-only interaction with the TUI, using demonstration data. See the
-[chapter index](docs/media/tui-demo.chapters.txt).
+![traffic-masq TUI](docs/media/tui.gif)
 
 ```text
 Internet ── WAN interface ── Linux machine ── LAN interface ── Local devices
@@ -35,9 +32,9 @@ is IPv4-only, apart from addresses inside WireGuard profiles.
 - **Share Ethernet Internet over Wi-Fi:** configure a compatible wireless
   adapter as an access point with hostapd, then configure DHCP and Internet
   sharing for wireless clients. See [first setup](#first-setup-share-a-wired-internet-connection).
-- **Share a Wi-Fi uplink through a separate access point:** use two radios
-  and the [Wi-Fi router setup wizard](#wi-fi-router-setup-wizard) to configure
-  the upstream connection, local AP and LAN settings together.
+- **Share a Wi-Fi uplink through a separate access point:** connect the upstream
+  radio and configure the local AP in **Wi-Fi**, configure its LAN address and
+  DHCP pool, then add an Internet sharing rule in **Route**.
 - **Set up a WireGuard gateway for LAN devices:** import WireGuard profiles
   and configure VPN policy routing or an ordered VPN chain. See
   [uplink and VPN chains](#uplink-and-vpn-chains).
@@ -160,7 +157,7 @@ can remain with its current manager in this example.
 2. In **DHCP Server**, configure a pool on `lan0`, for example
    `192.168.50.100`–`192.168.50.200`, with router `192.168.50.1` and DNS servers
    appropriate for your network. Keep static device addresses outside the pool.
-3. In **Router → Internet sharing**, add a connection with **Traffic from** set
+3. In **Route → Internet sharing**, add a connection with **Traffic from** set
    to `lan0`, **Internet through** set to `wan0`, and **Masquerade** enabled.
    Save the connection, then review and apply the draft. Routing activates
    automatically when a sharing rule is configured.
@@ -174,21 +171,6 @@ Internet yet.
 
 For a Wi-Fi LAN, configure an access point in **Wi-Fi** as well. Assigning an
 address and a DHCP pool to a wireless interface alone does not create an AP.
-
-## Wi-Fi router setup wizard
-
-In **Router**, choose **Wi-Fi setup** or press **w** to configure a Wi-Fi uplink
-and a local access point on two separate radios. Enter the upstream network,
-AP settings, and LAN/DHCP settings, then review the complete setup. Blank LAN
-address/pool fields let the daemon choose a non-overlapping subnet; the review
-shows the selected values. Enter DNS servers explicitly if clients need them.
-Blank passwords retain credentials already saved for the same Wi-Fi role.
-
-**This wizard replaces the selected interface configurations and the router
-policy, including existing owned static routes, sharing rules and the VPN
-chain.** The review lists the replaced router settings. Scroll to the end before
-applying, verify connectivity, then Commit before the rollback deadline. Esc
-from the pending screen rolls back the whole setup.
 
 ## Connected devices and DHCP client settings
 
@@ -207,26 +189,26 @@ unconfirmed. Initial enablement and changes to other options apply immediately.
 If a DHCP default route conflicts with an existing route, traffic-masq selects
 the next free higher metric (lower priority) and logs a warning. The effective
 metric is retained with the lease across renewals and restart; saved settings
-keep the requested metric. To change it from **Router**, select the interface's
+keep the requested metric. To change it from **Route**, select the interface's
 `0.0.0.0/0` route marked `traffic-masq (dhcp)`, press **e**, change **Route metric**,
 and select **Apply DHCP client settings now**. Existing routes are preserved.
 The existing **c** shortcut still enables/resets the client to defaults. Enable
 the DHCP Client tab in Settings if it is hidden.
 
-In **Router**, press **h** for readiness diagnostics and confirmed repair of saved
+In **Route**, press **h** for readiness diagnostics and confirmed repair of saved
 state. Repair applies immediately and has no commit-confirm timer.
 
 ## Uplink and VPN chains
 
-Open **Router → Uplink / VPN** or press **u**. Set the physical uplink and
+Open **Route → Uplink / VPN** or press **u**. Set the physical uplink and
 addressing mode: **External** uses an unmanaged Input interface; **DHCP** uses a
 managed Input with the DHCP client enabled. Import WireGuard profiles in VPN,
 then add, reorder or remove hops. The order is physical uplink → first hop →
 last hop → LAN.
 
-The global VPN chain requires **Global uplink sharing**. Switching to that mode
-replaces explicit Internet sharing rules; the editor and plan show this change.
-Switching back starts with no explicit rules when none were previously present.
+Uplink and VPN chain edits preserve explicit Internet sharing rules. Configure
+those rules in **Route → Internet sharing**, including the VPN egress; an uplink
+or chain alone grants no forwarding or NAT permissions.
 Changes enter the router draft and use the existing Plan → Apply → Commit flow.
 
 Tick **Route router's own traffic through VPN** to send the router's own traffic
@@ -317,9 +299,9 @@ versions; they are omitted from API summaries and redacted from debug output.
 | **Interfaces** | Interface roles, managed IPv4 addresses and address removal |
 | **DHCP Server** | Address pools for local devices and leases |
 | **DHCP Client** | Obtaining an address from an upstream DHCP server |
-| **Router** | Static routes, Internet sharing and topology |
+| **Route** | Static routes, Internet sharing and topology |
 | **Wi-Fi** | Access points, client connections and saved profiles |
-| **VPN** | Enable/disable VPN, WireGuard profiles and VPN traffic policy |
+| **VPN** | WireGuard profiles, standalone tunnels and VPN settings |
 | **Settings** | Application and session preferences |
 
 The Dashboard shows the connection mode, interface count, pending-change count and VPN setting.
@@ -332,18 +314,18 @@ can count forwarded traffic more than once and are not Internet usage totals.
 VPN interface/policy state is observed; Internet, DNS and handshake connectivity
 are not actively tested by the Dashboard.
 
-In **VPN**, press **e** or choose **Enable VPN** even if `vpn.enabled` is false
-in the base configuration. This saves a runtime override and takes effect without
-a daemon restart. Import a profile and choose **Connect selected profile** to
-bring up its tunnel; **Traffic policy** controls routing through it. Disconnect
-and select Direct policy before disabling VPN. A configured router VPN chain
-must also be removed before disabling VPN.
+In **VPN**, open **VPN settings** to enable the subsystem without restarting
+the daemon. Import a profile, open its card and choose **Connect standalone**
+to bring up its tunnel. **Route → Standalone traffic policy** controls routing
+through that tunnel and applies immediately. Disconnect, select Direct policy
+and remove any saved router VPN chain before disabling VPN.
 
-In **Router**, configure a sharing connection or uplink and use **Plan / Apply**.
+In **Route**, configure a sharing connection or uplink and use **Plan / Apply**.
 Apply and commit the change using the normal rollback timer. There is no global
 routing toggle.
 
-In the Router tab, **1 / 2 / 3** selects Routes, Internet sharing or Topology.
+In the Route tab, **1 / 2 / 3 / 4** selects Routes, Internet sharing, Topology
+or Port forwarding.
 Use arrows to select items and Tab/Shift+Tab to move focus forward/backward
 between fields, lists and actions. Enter activates the focused control; Esc
 returns to the list or leaves the editor. Ctrl+P/Ctrl+N selects the previous/next main
@@ -444,9 +426,8 @@ rule with masquerading. The uplink needs a working address and route. See
 
 Yes, with a Linux-compatible adapter that supports AP mode and hostapd installed.
 Configure the access point, its LAN address and DHCP pool, then add an Internet
-sharing rule through the wired uplink. A Wi-Fi uplink and local AP on two separate
-radios can instead be configured with the
-[Wi-Fi setup wizard](#wi-fi-router-setup-wizard).
+sharing rule through the wired uplink. For a Wi-Fi uplink and local AP, use two
+separate radios: configure both in **Wi-Fi**, then add the sharing rule in **Route**.
 
 ### Do LAN devices need WireGuard installed to use the VPN gateway?
 
