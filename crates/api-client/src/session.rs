@@ -308,8 +308,7 @@ struct AuthStatusResponse {
 
 #[derive(Deserialize)]
 struct ErrorResponse {
-    #[serde(alias = "error")]
-    message: String,
+    error: String,
 }
 
 fn serialize_json(value: &(impl Serialize + ?Sized)) -> Result<Vec<u8>> {
@@ -339,7 +338,7 @@ fn into_success_body(response: RawResponse) -> Result<Bytes> {
 
     let message = serde_json::from_slice::<ErrorResponse>(&response.body)
         .ok()
-        .map(|error| error.message)
+        .map(|error| error.error)
         .filter(|message| !message.trim().is_empty());
 
     if let Some(message) = message {
@@ -359,4 +358,19 @@ fn into_success_body(response: RawResponse) -> Result<Bytes> {
         "API request failed with status {}: {fallback}",
         response.status
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_error_uses_the_current_server_envelope() {
+        let response = RawResponse {
+            status: StatusCode::BAD_REQUEST,
+            body: Bytes::from_static(br#"{"error":"invalid configuration"}"#),
+        };
+        let error = into_success_body(response).unwrap_err().to_string();
+        assert!(error.ends_with(": invalid configuration"), "{error}");
+    }
 }
