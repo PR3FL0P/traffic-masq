@@ -15,7 +15,7 @@ netlink-packet-core-rtnetlink = { package = "netlink-packet-core", version = "0.
 netlink-packet-route = "0.19"
 netlink-packet-utils = "0.5"
 netlink-sys = "0.8"
-rtnetlink = "0.14"
+rtnetlink = "0.23"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
