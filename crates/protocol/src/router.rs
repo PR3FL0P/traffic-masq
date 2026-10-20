@@ -6,7 +6,7 @@ use std::net::Ipv4Addr;
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 
-use crate::{InterfaceConfigView, UplinkMode};
+use crate::{InterfaceConfigView, PortForwardConfig, UplinkMode};
 
 fn default_true() -> bool {
     true
@@ -36,6 +36,8 @@ pub struct RouterProposalRequestView {
 pub struct RouterConfigView {
     pub uplink: Option<UplinkConfigView>,
     pub forwarding: Option<Vec<ForwardingConfigView>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub port_forwards: Vec<PortForwardConfig>,
     pub owned_routes: Vec<OwnedIpv4RouteConfigView>,
     pub allow_default_route_change: bool,
     #[serde(default)]
@@ -52,6 +54,7 @@ impl RouterConfigView {
                 .forwarding
                 .as_ref()
                 .is_some_and(|rules| !rules.is_empty())
+            || !self.port_forwards.is_empty()
             || !self.owned_routes.is_empty()
             || !self.vpn_chain.is_empty()
     }

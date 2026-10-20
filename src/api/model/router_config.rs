@@ -41,6 +41,7 @@ impl From<RouterConfigView> for RouterConfig {
             forwarding: value
                 .forwarding
                 .map(|rules| rules.into_iter().map(Into::into).collect()),
+            port_forwards: value.port_forwards,
             owned_routes: value.owned_routes.into_iter().map(Into::into).collect(),
             allow_default_route_change: value.allow_default_route_change,
             vpn_chain: value.vpn_chain.into_iter().map(Into::into).collect(),
@@ -56,6 +57,7 @@ impl From<RouterConfig> for RouterConfigView {
             forwarding: value
                 .forwarding
                 .map(|rules| rules.into_iter().map(Into::into).collect()),
+            port_forwards: value.port_forwards,
             owned_routes: value.owned_routes.into_iter().map(Into::into).collect(),
             allow_default_route_change: value.allow_default_route_change,
             vpn_chain: value.vpn_chain.into_iter().map(Into::into).collect(),

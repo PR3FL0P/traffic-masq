@@ -183,6 +183,7 @@ fn valid_router_config() -> AppConfig {
         ),
     );
     config.router = RouterConfig {
+        port_forwards: Vec::new(),
         forwarding: None,
         vpn_chain: Vec::new(),
         uplink: Some(UplinkConfig {

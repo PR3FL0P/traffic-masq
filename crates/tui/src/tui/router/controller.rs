@@ -2,7 +2,7 @@ use super::plan::{current_router_proposal, lease_counts_for_plan};
 use super::*;
 
 pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
-    if app.router.pane == RouterPane::Sharing {
+    if matches!(app.router.pane, RouterPane::Sharing | RouterPane::Ports) {
         app.router.sharing_actions_focused = true;
         app.router.sharing_action = slot;
         return;
@@ -59,6 +59,10 @@ pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &A
             select_pane(app, RouterPane::Sharing);
             return;
         }
+        KeyCode::Char('4') => {
+            select_pane(app, RouterPane::Ports);
+            return;
+        }
         KeyCode::Char('3') => {
             select_pane(app, RouterPane::Topology);
             return;
@@ -75,6 +79,10 @@ pub(crate) async fn handle_router_key(app: &mut TuiApp, key: KeyCode, client: &A
             return;
         }
         _ => {}
+    }
+    if app.router.pane == RouterPane::Ports {
+        super::super::port_forwarding::handle_list_key(app, key, client).await;
+        return;
     }
     if app.router.pane == RouterPane::Sharing {
         super::super::forwarding::handle_list_key(app, key, client).await;

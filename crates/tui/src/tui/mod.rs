@@ -40,6 +40,7 @@ mod input;
 mod interfaces;
 mod layout;
 mod logs;
+mod port_forwarding;
 mod provisioning;
 mod router;
 mod router_health;
@@ -104,6 +105,7 @@ enum Screen {
     RouterPending,
     RouteEditor,
     Forwarding,
+    PortForwarding,
     Vpn,
     VpnImport,
     VpnPolicy,
@@ -193,7 +195,8 @@ fn section_of(screen: Screen) -> Section {
         | Screen::RouterSettings
         | Screen::RouterPlan
         | Screen::RouterPending
-        | Screen::Forwarding => Section::Router,
+        | Screen::Forwarding
+        | Screen::PortForwarding => Section::Router,
         Screen::Vpn | Screen::VpnImport | Screen::VpnPolicy => Section::Vpn,
         Screen::Wifi
         | Screen::WifiStations
@@ -297,6 +300,7 @@ struct TuiApp {
     provisioning: Option<provisioning::Wizard>,
     router_pending: Option<RouterPendingView>,
     forwarding: Option<forwarding::ForwardingEditor>,
+    port_forwarding: Option<port_forwarding::Editor>,
     router_rollback_timeout_seconds: u64,
     vpn: VpnData,
     vpn_import: Option<VpnImportEditor>,
@@ -364,6 +368,7 @@ impl Default for TuiApp {
             provisioning: None,
             router_pending: None,
             forwarding: None,
+            port_forwarding: None,
             router_rollback_timeout_seconds: 60,
             vpn: VpnData::default(),
             vpn_import: None,
@@ -1282,7 +1287,10 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                                 wifi::open_radio(app, index);
                             }
                             Screen::Router => {
-                                if app.router.pane == router::RouterPane::Sharing {
+                                if app.router.pane == router::RouterPane::Ports {
+                                    app.router.selected_port_forward = index;
+                                    app.router.sharing_actions_focused = false;
+                                } else if app.router.pane == router::RouterPane::Sharing {
                                     app.router.selected_connection = index;
                                     app.router.sharing_actions_focused = false;
                                 } else {
@@ -1646,6 +1654,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp, direct: bool) {
         Screen::RouterPlan => router::render_router_plan(frame, chunks[1], app),
         Screen::RouterPending => router::render_router_pending(frame, chunks[1], app),
         Screen::Forwarding => forwarding::render(frame, chunks[1], app),
+        Screen::PortForwarding => port_forwarding::render(frame, chunks[1], app),
         Screen::Vpn => vpn::render_vpn(frame, chunks[1], app),
         Screen::VpnImport => vpn::render_vpn_import(frame, chunks[1], app),
         Screen::VpnPolicy => vpn_policy::render_vpn_policy(frame, chunks[1], app),
@@ -1681,6 +1690,7 @@ fn focus_action_slot(app: &mut TuiApp, slot: usize) {
         Screen::RouterSettings => router_settings::focus_action(app, slot),
         Screen::Provisioning => provisioning::focus_action(app, slot),
         Screen::Forwarding => forwarding::focus_action(app, slot),
+        Screen::PortForwarding => port_forwarding::focus_action(app, slot),
         Screen::RouteEditor => router::focus_route_editor_action(app, slot),
         Screen::Vpn => vpn::focus_action(app, slot),
         Screen::VpnPolicy => vpn_policy::focus_action(app, slot),
@@ -1794,6 +1804,7 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
             | Screen::Log
             | Screen::Router
             | Screen::Forwarding
+            | Screen::PortForwarding
             | Screen::WifiStations
             | Screen::PendingChange
             | Screen::RouterPending
@@ -1825,8 +1836,10 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
             Screen::Wifi => app.wifi.actions_open,
             Screen::Router => {
                 app.router.focus == RouterFocus::Actions
-                    || (app.router.pane == router::RouterPane::Sharing
-                        && app.router.sharing_actions_focused)
+                    || (matches!(
+                        app.router.pane,
+                        router::RouterPane::Sharing | router::RouterPane::Ports
+                    ) && app.router.sharing_actions_focused)
                     || app.router.topology.open
             }
             _ => false,
@@ -1866,6 +1879,7 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
         Screen::RouterPlan => router::handle_router_plan_key(app, key, client).await,
         Screen::RouterPending => router::handle_router_pending_key(app, key, client).await,
         Screen::Forwarding => forwarding::handle_key(app, key, client).await,
+        Screen::PortForwarding => port_forwarding::handle_key(app, key),
         Screen::Vpn => vpn::handle_vpn_key(app, key, client).await,
         Screen::VpnImport => vpn::handle_vpn_import_key(app, key, client).await,
         Screen::VpnPolicy => vpn_policy::handle_vpn_policy_key(app, key, client).await,

@@ -324,6 +324,7 @@ pub fn derive_router_provisioning(
     };
 
     let router = RouterConfig {
+        port_forwards: Vec::new(),
         uplink: Some(UplinkConfig {
             interface: desired.uplink.interface.clone(),
             mode: UplinkMode::Dhcp,

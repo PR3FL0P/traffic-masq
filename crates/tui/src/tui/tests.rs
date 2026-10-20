@@ -1268,3 +1268,56 @@ async fn tab_then_enter_sends_rollback_for_both_pending_screens() {
         assert!(app.pending.is_some() || app.router_pending.is_some());
     }
 }
+
+#[test]
+fn pending_labels_keep_contrast_on_filled_empty_and_recovery_gauges() {
+    use ratatui::{backend::TestBackend, style::Color, widgets::Block, Terminal};
+
+    for router in [false, true] {
+        for (remaining, recovery) in [(60, false), (5, false), (0, false), (0, true)] {
+            if recovery && !router {
+                continue; // Interface recovery uses diagnostics instead of a gauge.
+            }
+            for background in [Color::Black, Color::White] {
+                let mut app = TuiApp::default();
+                let now = current_unix_time();
+                app.router_pending = Some(RouterPendingView {
+                    token: "contrast".into(),
+                    applied_at_unix: now.saturating_sub(60 - remaining),
+                    rollback_failure: recovery.then(|| vec!["test failure".into()]),
+                    recovery: None,
+                    scroll: 0,
+                    max_scroll: 0,
+                });
+                app.pending = Some(PendingNetworkChange {
+                    token: "contrast".into(),
+                    interface: "lan0".into(),
+                    expires_at_unix: now + remaining,
+                    rollback_timeout_seconds: 60,
+                    phase: Default::default(),
+                    last_error: None,
+                    recovery_progress: None,
+                });
+                let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        let area = frame.area();
+                        frame.render_widget(
+                            Block::default().style(Style::default().bg(background)),
+                            area,
+                        );
+                        if router {
+                            router::render_router_pending(frame, area, &mut app);
+                        } else {
+                            interfaces::render_pending(frame, area, &mut app);
+                        }
+                    })
+                    .unwrap();
+                let cell = &terminal.backend().buffer()[(40, 2)];
+                assert_ne!(cell.symbol(), " ");
+                assert_eq!(cell.fg, Color::White);
+                assert_eq!(cell.bg, Color::Black);
+            }
+        }
+    }
+}

@@ -13,7 +13,9 @@ use std::fs;
 
 use traffic_masq_netlink::NetworkProvider;
 
+mod port_forwarding;
 mod view;
+pub use traffic_masq_protocol::{PortForwardConfig, PortForwardProtocol};
 pub mod vpn;
 
 const IPV4_FORWARDING_PATH: &str = "/proc/sys/net/ipv4/ip_forward";
@@ -142,6 +144,8 @@ fn networks_overlap(left: Ipv4Net, right: Ipv4Net) -> bool {
 pub struct RouterDataplaneDesired {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarding: Option<Vec<ForwardingConfig>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub port_forwards: Vec<PortForwardConfig>,
     pub uplink: String,
     pub outputs: Vec<OutputNetwork>,
 }
@@ -163,6 +167,8 @@ impl RouterDataplaneDesired {
     }
 
     pub fn validate(&self) -> Result<()> {
+        traffic_masq_protocol::validate_port_forwards(&self.port_forwards)
+            .map_err(anyhow::Error::msg)?;
         if let Some(rules) = &self.forwarding {
             if !self.uplink.is_empty() || !self.outputs.is_empty() {
                 bail!("explicit forwarding cannot contain legacy dataplane fields");
@@ -211,24 +217,32 @@ fn retained_firewall(
     target: &RouterDataplaneTarget,
 ) -> Option<RouterDataplaneDesired> {
     let current = current?;
-    let permitted = match target {
+    let target_desired = match target {
         RouterDataplaneTarget::Disabled => return None,
-        RouterDataplaneTarget::Enabled(desired) => desired.forwarding_rules(),
+        RouterDataplaneTarget::Enabled(desired) => desired,
     };
+    let port_forwards: Vec<_> = current
+        .port_forwards
+        .iter()
+        .filter(|rule| target_desired.port_forwards.contains(rule))
+        .cloned()
+        .collect();
+    let permitted = target_desired.forwarding_rules();
     let existing = current.forwarding_rules();
     let retained: Vec<_> = existing
         .iter()
         .filter(|rule| permitted.contains(rule))
         .cloned()
         .collect();
-    if retained.len() == existing.len() {
+    if retained.len() == existing.len() && port_forwards == current.port_forwards {
         return Some(current.clone());
     }
-    if retained.is_empty() {
+    if retained.is_empty() && port_forwards.is_empty() {
         return None;
     }
     Some(RouterDataplaneDesired {
         forwarding: Some(retained),
+        port_forwards,
         uplink: String::new(),
         outputs: Vec::new(),
     })
@@ -421,6 +435,10 @@ fn render_nftables_batch(
             )
         })
         .collect::<String>();
+    let port_rules = port_forwarding::render(desired);
+    let port_prerouting = &port_rules.prerouting;
+    let port_forward_prefix = &port_rules.forward_prefix;
+    let port_guards = &port_rules.guards;
     if let Some(rules) = &desired.forwarding {
         let mut forward = String::new();
         let mut nat = String::new();
@@ -448,7 +466,7 @@ fn render_nftables_batch(
         for interface in ingress {
             forward.push_str(&format!("    meta nfproto ipv4 iifname \"{interface}\" drop\n    meta nfproto ipv4 oifname \"{interface}\" drop\n"));
         }
-        batch.push_str(&format!("table inet {NFT_TABLE} {{\n  comment \"{NFT_TABLE_COMMENT}\"\n  chain metadata {{\n{metadata_rules}  }}\n  chain forward {{\n    type filter hook forward priority filter; policy accept;\n{forward}  }}\n  chain postrouting {{\n    type nat hook postrouting priority srcnat; policy accept;\n{nat}  }}\n}}\n"));
+        batch.push_str(&format!("table inet {NFT_TABLE} {{\n  comment \"{NFT_TABLE_COMMENT}\"\n  chain metadata {{\n{metadata_rules}  }}\n{port_prerouting}  chain forward {{\n    type filter hook forward priority filter; policy accept;\n{port_forward_prefix}{forward}{port_guards}  }}\n  chain postrouting {{\n    type nat hook postrouting priority srcnat; policy accept;\n{nat}  }}\n}}\n"));
         return Ok(batch);
     }
     let output_ifaces = desired
@@ -465,7 +483,7 @@ fn render_nftables_batch(
         .join(", ");
 
     batch.push_str(&format!(
-        "table inet {NFT_TABLE} {{\n  comment \"{NFT_TABLE_COMMENT}\"\n  chain metadata {{\n{metadata_rules}  }}\n  set output_ifaces {{ type ifname; elements = {{ {output_ifaces} }} }}\n  set output_subnets {{ type ipv4_addr; flags interval; elements = {{ {output_subnets} }} }}\n  chain forward {{\n    type filter hook forward priority filter; policy accept;\n    iifname @output_ifaces oifname \"{}\" accept\n    iifname \"{}\" oifname @output_ifaces ct state established,related accept\n    iifname \"{}\" oifname @output_ifaces drop\n  }}\n  chain postrouting {{\n    type nat hook postrouting priority srcnat; policy accept;\n    ip saddr @output_subnets oifname \"{}\" masquerade\n  }}\n}}\n",
+        "table inet {NFT_TABLE} {{\n  comment \"{NFT_TABLE_COMMENT}\"\n  chain metadata {{\n{metadata_rules}  }}\n  set output_ifaces {{ type ifname; elements = {{ {output_ifaces} }} }}\n  set output_subnets {{ type ipv4_addr; flags interval; elements = {{ {output_subnets} }} }}\n{port_prerouting}  chain forward {{\n    type filter hook forward priority filter; policy accept;\n{port_forward_prefix}    iifname @output_ifaces oifname \"{}\" accept\n    iifname \"{}\" oifname @output_ifaces ct state established,related accept\n    iifname \"{}\" oifname @output_ifaces drop\n{port_guards}  }}\n  chain postrouting {{\n    type nat hook postrouting priority srcnat; policy accept;\n    ip saddr @output_subnets oifname \"{}\" masquerade\n  }}\n}}\n",
         desired.uplink, desired.uplink, desired.uplink, desired.uplink
     ));
     Ok(batch)
@@ -576,6 +594,16 @@ fn owned_nftables_structure_is_intact(
     desired: &RouterDataplaneDesired,
     require_metadata_chain: bool,
 ) -> bool {
+    let stripped;
+    let entries = if desired.port_forwards.is_empty() {
+        entries
+    } else {
+        let Some(clean) = port_forwarding::verified_base_entries(entries, desired) else {
+            return false;
+        };
+        stripped = clean;
+        &stripped
+    };
     let chains = entries
         .iter()
         .filter_map(|entry| entry.get("chain"))
@@ -1045,6 +1073,25 @@ where
             .map(|interface| (interface.name, interface.is_up))
             .collect::<HashMap<_, _>>();
 
+        for rule in &desired.port_forwards {
+            validate_active_interface(&interfaces, &rule.from, "port-forward ingress")?;
+            validate_active_interface(&interfaces, &rule.to, "port-forward egress")?;
+        }
+        if !desired.port_forwards.is_empty() {
+            for interface in interfaces.keys() {
+                let addresses = self.network.list_ipv4_addresses(interface).await
+                    .with_context(|| format!("failed to check port-forward targets against local addresses on {interface}"))?;
+                for address in addresses {
+                    if desired
+                        .port_forwards
+                        .iter()
+                        .any(|rule| rule.target_address == address.address)
+                    {
+                        bail!("port forwarding target must be a remote host, not a local router address on {interface}");
+                    }
+                }
+            }
+        }
         if let Some(rules) = &desired.forwarding {
             for rule in rules {
                 validate_active_interface(&interfaces, &rule.from, "ingress")?;

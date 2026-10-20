@@ -113,6 +113,7 @@ fn enabled_config() -> AppConfig {
         );
     }
     config.router = RouterConfig {
+        port_forwards: Vec::new(),
         forwarding: None,
         vpn_chain: Vec::new(),
         uplink: Some(UplinkConfig {
@@ -172,6 +173,7 @@ fn builds_enabled_router_desired_from_one_effective_config() {
     assert_eq!(
         desired.dataplane,
         RouterDataplaneTarget::Enabled(RouterDataplaneDesired {
+            port_forwards: Vec::new(),
             forwarding: None,
             uplink: "wan0".to_string(),
             outputs: vec![
@@ -912,4 +914,67 @@ async fn health_is_ready_when_every_subsystem_succeeds() {
     assert!(report.routes.is_none());
     assert!(report.dhcp.is_none());
     assert!(report.dataplane.is_none());
+}
+
+#[test]
+fn port_forwards_reach_legacy_explicit_and_standalone_dataplanes() {
+    use crate::config::{PortForwardConfig, PortForwardProtocol};
+    let rule = PortForwardConfig {
+        from: "wan0".into(),
+        to: "lan0".into(),
+        protocol: PortForwardProtocol::Tcp,
+        external_port: 8443,
+        target_address: "192.168.10.20".parse().unwrap(),
+        target_port: 443,
+        destination_address: None,
+        source_subnet: None,
+    };
+    for standalone in [false, true] {
+        for explicit in [false, true] {
+            let mut config = if standalone {
+                AppConfig::default()
+            } else {
+                enabled_config()
+            };
+            if explicit {
+                config.router.forwarding = Some(vec![]);
+            }
+            config.router.port_forwards = vec![rule.clone()];
+            let desired = RouterDesired::from_effective_config(&config).unwrap();
+            assert!(desired.enabled);
+            assert!(desired.required_existing_interfaces().contains(&"wan0"));
+            assert!(desired.required_existing_interfaces().contains(&"lan0"));
+            let RouterDataplaneTarget::Enabled(dataplane) = desired.dataplane else {
+                panic!("port forwarding needs an active dataplane");
+            };
+            assert_eq!(dataplane.port_forwards, vec![rule.clone()]);
+            dataplane.validate().unwrap();
+            let decoded: AppConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+            assert_eq!(decoded.router.port_forwards, config.router.port_forwards);
+            let view: traffic_masq_protocol::RouterConfigView = config.router.clone().into();
+            assert!(view.is_active());
+            assert_eq!(crate::config::RouterConfig::from(view), config.router);
+        }
+    }
+    let mut config = enabled_config();
+    config.router.port_forwards = vec![rule];
+    config.router.port_forwards[0].target_address = "192.168.10.1".parse().unwrap();
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("router address"));
+    for ip in ["192.168.10.0", "192.168.10.255"] {
+        config.router.port_forwards[0].target_address = ip.parse().unwrap();
+        assert!(config.validate().is_err());
+    }
+    config.router.port_forwards[0].target_address = "192.168.10.20".parse().unwrap();
+    config.router.vpn_chain = vec![crate::config::VpnHopConfig {
+        profile_name: "vpn.conf".into(),
+    }];
+    assert!(config
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("vpn_chain"));
 }

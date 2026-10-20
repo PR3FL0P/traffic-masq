@@ -479,7 +479,7 @@ pub(crate) fn screen_help_pairs(screen: Screen) -> Vec<(&'static str, &'static s
             ("Enter", "apply at end"),
             ("Esc", "back"),
         ],
-        Screen::Forwarding => vec![
+        Screen::Forwarding | Screen::PortForwarding => vec![
             ("↑/↓", "field"),
             ("←/→", "choose"),
             ("Enter", "select/save"),

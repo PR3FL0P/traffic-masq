@@ -973,7 +973,8 @@ pub(crate) fn render_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
             .label(Span::styled(
                 format!("{seconds}s"),
                 Style::default()
-                    .fg(theme::MUTED)
+                    .fg(theme::TEXT)
+                    .bg(ratatui::style::Color::Black)
                     .add_modifier(Modifier::BOLD),
             )),
         chunks[0],

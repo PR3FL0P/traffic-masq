@@ -10,6 +10,7 @@ use super::*;
 
 fn router_with_one_owned_route() -> RouterConfig {
     RouterConfig {
+        port_forwards: Vec::new(),
         forwarding: None,
         vpn_chain: Vec::new(),
         uplink: None,

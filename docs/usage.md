@@ -432,6 +432,15 @@ timer. Refresh keeps your draft.
 Saving a sharing connection creates routing intent automatically. Review,
 apply and commit the draft; no separate router enable switch is required.
 
+For inbound services, open **4 Ports**. Choose **Add**, enter the incoming and
+target interfaces, TCP or UDP, the external port and the internal IPv4/port.
+Optional external IPv4 and source subnet fields limit the mapping. Choose
+**Save port forward**, then **Review / Apply** and commit the transaction.
+Use **Edit** or **Delete** on a selected mapping to stage a change. See
+[Port forwarding](configuration.md#port-forwarding) for the TOML/API fields,
+return-route requirements and supported scope.
+
+
 Connections refer to existing interfaces, including externally managed Ethernet
 and VPN interfaces. Both must be up when applying. Creating a connection does
 not take ownership of interface addresses, set up Wi-Fi, or configure DHCP.

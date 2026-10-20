@@ -138,6 +138,7 @@ async fn exercise_forwarding(explicit: bool) -> Result<()> {
     );
     let manager = RouterDataplaneManager::new(provider);
     let mut desired = RouterDataplaneDesired {
+        port_forwards: Vec::new(),
         forwarding: None,
         uplink: fixture.uplink_if.clone(),
         outputs: vec![OutputNetwork {

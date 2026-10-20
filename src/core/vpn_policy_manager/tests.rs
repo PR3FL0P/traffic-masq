@@ -46,6 +46,7 @@ fn config_with_managed_output_and_uplink() -> AppConfig {
         },
     );
     config.router = RouterConfig {
+        port_forwards: Vec::new(),
         uplink: Some(UplinkConfig {
             interface: "wan0".to_string(),
             mode: UplinkMode::External,

@@ -75,6 +75,7 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         ("[1 Routes]", RouterPane::Routes),
         ("[2 Internet sharing]", RouterPane::Sharing),
         ("[3 Topology]", RouterPane::Topology),
+        ("[4 Ports]", RouterPane::Ports),
     ] {
         let rect = Rect::new(x, sections[0].y, label.len() as u16, 1);
         app.router.pane_tabs.push((rect, pane));
@@ -91,6 +92,10 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         x += rect.width + 1;
     }
     let area = sections[1];
+    if app.router.pane == RouterPane::Ports {
+        super::super::port_forwarding::render_list(frame, area, app);
+        return;
+    }
     if app.router.pane == RouterPane::Sharing {
         super::super::forwarding::render_list(frame, area, app);
         return;
@@ -595,6 +600,9 @@ pub(super) fn format_forwarding_status(
                 .is_none_or(|rules| rules.iter().any(|rule| rule.masquerade)) =>
         {
             "NAT desired"
+        }
+        RouterDataplaneTargetView::Enabled(desired) if !desired.port_forwards.is_empty() => {
+            "DNAT desired"
         }
         RouterDataplaneTargetView::Enabled(_) => "NAT disabled",
         RouterDataplaneTargetView::Disabled => "NAT disabled",

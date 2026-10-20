@@ -127,7 +127,7 @@ provides no DNS resolver. `lease_seconds` is optional and otherwise uses
 ## Router
 
 `[router]` has no global enabled switch. Routing intent is derived from an
-uplink, non-empty explicit forwarding rules, owned routes, or a VPN chain.
+uplink, non-empty explicit forwarding rules or port forwards, owned routes, or a VPN chain.
 With none of these, the router dataplane remains inactive. Old TOML files with
 `router.enabled` still deserialize, but the key is ignored; remove it when migrating.
 
@@ -147,6 +147,59 @@ and optionally restricts traffic with `source_subnet` (a network CIDR without
 host bits). Overlapping rules for the same interface pair are rejected.
 Forwarding does not create addresses, upstream routes or VPN tunnels.
 See [Internet sharing](usage.md#routes-and-internet-sharing) for firewall behavior.
+
+### Port forwarding
+
+Use **Router → 4 Ports** to add, edit or delete IPv4 TCP/UDP mappings. Edits are
+staged; **Review / Apply** shows the mapping and source restriction before the
+usual confirmed router transaction. Unconfirmed changes roll back. The same
+`port_forwards` field is accepted by router proposals through the API.
+
+```toml
+[router]
+forwarding = [{ from = "lan0", to = "wan0", masquerade = true }]
+
+[[router.port_forwards]]
+from = "wan0"
+to = "lan0"
+protocol = "tcp"                    # tcp or udp; add separate entries for both
+external_port = 8443
+target_address = "192.168.10.20"
+target_port = 443
+# destination_address = "198.51.100.1" # optional, must be a local router address
+# source_subnet = "203.0.113.0/24"      # optional; omitted means any source
+```
+
+The mapping above exposes `wan0:8443` as `192.168.10.20:443` through `lan0`.
+Without `destination_address`, DNAT matches any local IPv4 address reached through
+`from`, including an address obtained by DHCP. Transit destinations are never
+translated. `to` constrains the actual routed egress; configure routes separately.
+If the target route uses another interface, the mapping is blocked even when
+sharing rules would otherwise allow that traffic.
+The target receives the original client IP and needs a return route through this
+router. Use a stable target address or a DHCP reservation managed outside this
+feature.
+
+Port forwards work with legacy uplink sharing and explicit sharing rules. For
+port forwarding alone, use `forwarding = []`; outbound Internet sharing is not
+required. Only the matching DNAT connections, their established replies and related ICMP errors
+are allowed by the added permissions. Unmatched IPv4 traffic between each mapped
+interface pair is dropped unless an existing sharing rule already permits it.
+Other firewalls can still drop traffic accepted by traffic-masq.
+
+Overlapping ingress/protocol/external-port mappings are rejected when their
+source subnets and destination addresses overlap. Ports must be 1–65535.
+An empty `port_forwards = []` removes the mappings. The owned table, metadata,
+health checks, removal-only cleanup, persistence and rollback include port forwards;
+foreign tables are preserved. Conntrack state is not flushed: with existing broad
+sharing permissions, established connections may continue after a mapping is
+removed, while new connections use the current mapping.
+
+This version supports single ports and distinct ingress/egress interfaces.
+IPv6, port ranges and hairpin NAT are not supported. Legacy global VPN chains and
+global VPN mode `vpn` must be replaced by explicit per-interface tunnel routing
+before adding mappings.
+
 
 The optional legacy `[router.uplink]` table contains `interface` and `mode`:
 `external` requires an unmanaged input; `dhcp` requires a managed input with an

@@ -1547,6 +1547,7 @@ fn desired_with_route_and_dataplane() -> RouterDesired {
         },
     );
     config.router = RouterConfig {
+        port_forwards: Vec::new(),
         forwarding: None,
         vpn_chain: Vec::new(),
         uplink: Some(UplinkConfig {

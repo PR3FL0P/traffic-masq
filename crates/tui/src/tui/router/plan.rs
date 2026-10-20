@@ -89,6 +89,20 @@ pub(crate) fn render_router_plan(frame: &mut ratatui::Frame<'_>, area: Rect, app
                 lines.extend(route_lines("Removed route", route));
             }
         }
+        for rule in &preview.config.port_forwards {
+            lines.push(Line::from(super::super::port_forwarding::describe(
+                "Port forward",
+                rule,
+            )));
+        }
+        for rule in &preview.baseline.port_forwards {
+            if !preview.config.port_forwards.contains(rule) {
+                lines.push(Line::from(super::super::port_forwarding::describe(
+                    "Removed port forward",
+                    rule,
+                )));
+            }
+        }
         for rule in preview.config.forwarding.as_deref().unwrap_or(&[]) {
             lines.push(Line::from(format!(
                 "Share: {} → {} ({})",
@@ -159,7 +173,27 @@ pub(crate) fn render_router_plan(frame: &mut ratatui::Frame<'_>, area: Rect, app
             summarize_uplink(&plan.dataplane.target)
         )),
     ];
+    if let Some(old) = &plan.dataplane.snapshot.owned {
+        for rule in &old.port_forwards {
+            let retained = match &plan.dataplane.target {
+                RouterDataplaneTargetView::Enabled(new) => new.port_forwards.contains(rule),
+                _ => false,
+            };
+            if !retained {
+                lines.push(Line::from(super::super::port_forwarding::describe(
+                    "Removed port forward",
+                    rule,
+                )));
+            }
+        }
+    }
     if let RouterDataplaneTargetView::Enabled(desired) = &plan.dataplane.target {
+        for rule in &desired.port_forwards {
+            lines.push(Line::from(super::super::port_forwarding::describe(
+                "Port forward",
+                rule,
+            )));
+        }
         if let Some(connections) = &desired.forwarding {
             for connection in connections {
                 lines.push(Line::from(format!(

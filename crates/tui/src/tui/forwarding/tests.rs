@@ -289,7 +289,7 @@ fn sharing_sections_and_controls_fit_small_and_large_terminals() {
         terminal
             .draw(|frame| super::super::render(frame, &mut app, false))
             .unwrap();
-        assert_eq!(app.router.pane_tabs.len(), 3);
+        assert_eq!(app.router.pane_tabs.len(), 4);
         assert_eq!(app.ui.buttons.len(), 5);
         assert!(app.ui.list_scroll_offset > 0);
         for (rect, _) in &app.ui.buttons {

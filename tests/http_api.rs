@@ -828,6 +828,7 @@ impl RouterSubsystems for FakeRouterSubsystems {
 fn router_proposal() -> RouterProposalRequest {
     RouterProposalRequest {
         set_router: Some(RouterConfig {
+            port_forwards: Vec::new(),
             forwarding: None,
             vpn_chain: Vec::new(),
             uplink: Some(UplinkConfig {
@@ -928,6 +929,7 @@ async fn router_status_test_server(
         },
     );
     config.router = RouterConfig {
+        port_forwards: Vec::new(),
         forwarding: None,
         vpn_chain: Vec::new(),
         uplink: Some(UplinkConfig {
@@ -1828,6 +1830,7 @@ async fn vpn_policy_status_set_mode_clear_mode_over_http() -> Result<()> {
         },
     );
     config.router = RouterConfig {
+        port_forwards: Vec::new(),
         forwarding: None,
         vpn_chain: Vec::new(),
         uplink: Some(UplinkConfig {

@@ -83,6 +83,7 @@ pub(crate) struct RouterData {
     pub(crate) pane: RouterPane,
     pub(crate) pane_tabs: Vec<(Rect, RouterPane)>,
     pub(crate) selected_connection: usize,
+    pub(crate) selected_port_forward: usize,
     pub(crate) sharing_action: usize,
     pub(crate) sharing_actions_focused: bool,
 }
@@ -184,6 +185,7 @@ pub(crate) enum RouterPane {
     #[default]
     Routes,
     Sharing,
+    Ports,
     Topology,
 }
 

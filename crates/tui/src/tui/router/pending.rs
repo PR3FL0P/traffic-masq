@@ -109,7 +109,8 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
                 format!("{remaining}s")
             },
             Style::default()
-                .fg(theme::MUTED)
+                .fg(theme::TEXT)
+                .bg(ratatui::style::Color::Black)
                 .add_modifier(Modifier::BOLD),
         ));
     frame.render_widget(gauge, chunks[0]);

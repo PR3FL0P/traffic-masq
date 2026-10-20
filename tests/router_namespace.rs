@@ -371,6 +371,7 @@ fn build_config(temp: &tempfile::TempDir, lan_if: &str, uplink_if: &str) -> AppC
     );
 
     config.router = RouterConfig {
+        port_forwards: Vec::new(),
         forwarding: None,
         vpn_chain: Vec::new(),
         uplink: Some(UplinkConfig {

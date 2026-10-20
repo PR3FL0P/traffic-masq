@@ -661,6 +661,7 @@ fn router_base_config() -> AppConfig {
 fn router_proposal() -> RouterProposalRequest {
     RouterProposalRequest {
         set_router: Some(RouterConfig {
+            port_forwards: Vec::new(),
             forwarding: None,
             vpn_chain: Vec::new(),
             uplink: Some(UplinkConfig {
@@ -892,6 +893,7 @@ async fn router_enabled_service_with(
 fn router_base_config_with_router_enabled() -> AppConfig {
     let mut config = router_base_config();
     config.router = RouterConfig {
+        port_forwards: Vec::new(),
         forwarding: None,
         vpn_chain: Vec::new(),
         uplink: Some(UplinkConfig {

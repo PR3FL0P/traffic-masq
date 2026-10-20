@@ -47,6 +47,7 @@ impl From<RouterDataplaneDesired> for RouterDataplaneDesiredView {
             forwarding: value
                 .forwarding
                 .map(|rules| rules.into_iter().map(Into::into).collect()),
+            port_forwards: value.port_forwards,
             uplink: value.uplink,
             outputs: value.outputs.into_iter().map(Into::into).collect(),
         }

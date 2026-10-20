@@ -63,6 +63,7 @@ fn router_proposal_view_preserves_nested_config_json() {
 
     let proposal = RouterProposalRequest {
         set_router: Some(RouterConfig {
+            port_forwards: Vec::new(),
             uplink: Some(UplinkConfig {
                 interface: "wan0".into(),
                 mode: UplinkMode::External,
@@ -305,6 +306,7 @@ fn router_plan_view_preserves_complete_wire_shape() {
         masquerade: true,
     }];
     let dataplane = RouterDataplaneDesired {
+        port_forwards: Vec::new(),
         forwarding: Some(forwarding),
         uplink: String::new(),
         outputs: vec![OutputNetwork {

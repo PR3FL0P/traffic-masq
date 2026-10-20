@@ -12,11 +12,13 @@ use traffic_masq_netlink::{Ipv4AddressInfo, NetworkInterface};
 #[derive(Debug, Clone)]
 struct FakeNetworkProvider {
     interfaces: Vec<NetworkInterface>,
+    addresses: Vec<Ipv4AddressInfo>,
 }
 
 impl FakeNetworkProvider {
     fn all_up() -> Self {
         Self {
+            addresses: vec![],
             interfaces: vec![
                 NetworkInterface {
                     is_wireless: false,
@@ -53,8 +55,19 @@ impl NetworkProvider for FakeNetworkProvider {
         Ok(self.interfaces.clone())
     }
 
-    async fn list_ipv4_addresses(&self, _interface: &str) -> Result<Vec<Ipv4AddressInfo>> {
-        unreachable!("not used by dataplane preflight")
+    async fn list_ipv4_addresses(&self, interface: &str) -> Result<Vec<Ipv4AddressInfo>> {
+        let index = self
+            .interfaces
+            .iter()
+            .find(|entry| entry.name == interface)
+            .unwrap()
+            .index;
+        Ok(self
+            .addresses
+            .iter()
+            .filter(|address| address.interface_index == index)
+            .cloned()
+            .collect())
     }
 
     async fn set_link_up(&self, _name: &str) -> Result<()> {
@@ -499,6 +512,7 @@ fn forwarding_restores_exact_original_snapshot() {
 
 fn desired() -> RouterDataplaneDesired {
     RouterDataplaneDesired {
+        port_forwards: Vec::new(),
         forwarding: None,
         uplink: "eth0".to_string(),
         outputs: vec![
@@ -622,6 +636,7 @@ fn nft_render_contains_owned_policy_and_scoped_masquerade() {
 
 fn forwarding_desired() -> RouterDataplaneDesired {
     RouterDataplaneDesired {
+        port_forwards: Vec::new(),
         forwarding: Some(vec![
             ForwardingConfig {
                 from: "lan0".to_string(),
@@ -791,6 +806,7 @@ fn nft_apply_is_idempotent_and_preserves_foreign_tables() {
 fn nft_apply_replaces_only_owned_table_in_one_atomic_batch() {
     let executor = FakeNftExecutor::with_responses(vec![
         Ok(nft_ruleset(Some(&RouterDataplaneDesired {
+            port_forwards: Vec::new(),
             forwarding: None,
             uplink: "old0".to_string(),
             outputs: vec![OutputNetwork {
@@ -1602,6 +1618,7 @@ fn cleanup_removed_firewall_retains_only_existing_permissions_without_devices() 
         masquerade: true,
     });
     let target = RouterDataplaneTarget::Enabled(RouterDataplaneDesired {
+        port_forwards: Vec::new(),
         forwarding: Some(rules),
         uplink: String::new(),
         outputs: vec![],
@@ -1665,4 +1682,244 @@ fn cleanup_removed_firewall_refuses_drifted_or_unproven_ownership() {
             .is_err());
         assert_eq!(backend.executor.calls.lock().unwrap().len(), 1);
     }
+}
+
+fn port_rule() -> PortForwardConfig {
+    PortForwardConfig {
+        from: "wan0".into(),
+        to: "lan0".into(),
+        protocol: PortForwardProtocol::Tcp,
+        external_port: 8443,
+        target_address: "192.0.2.2".parse().unwrap(),
+        target_port: 2222,
+        destination_address: None,
+        source_subnet: None,
+    }
+}
+
+#[test]
+fn port_forward_removal_never_adds_permissions_and_preserves_remaining_rules() {
+    let mut current = forwarding_desired();
+    current.port_forwards = vec![port_rule()];
+    let mut target = current.clone();
+    target.port_forwards.clear();
+    let kept = retained_firewall(
+        Some(&current),
+        &RouterDataplaneTarget::Enabled(target.clone()),
+    )
+    .unwrap();
+    assert!(kept.port_forwards.is_empty());
+    assert_eq!(kept.forwarding_rules(), current.forwarding_rules());
+    assert_eq!(
+        retained_firewall(
+            Some(&current),
+            &RouterDataplaneTarget::Enabled(current.clone())
+        ),
+        Some(current)
+    );
+    let current = RouterDataplaneDesired {
+        forwarding: Some(vec![]),
+        port_forwards: vec![port_rule()],
+        uplink: String::new(),
+        outputs: vec![],
+    };
+    let mut target = current.clone();
+    target.port_forwards[0].target_port += 1;
+    assert!(retained_firewall(Some(&current), &RouterDataplaneTarget::Enabled(target)).is_none());
+}
+
+// Explicit opt-in: creates only unprivileged user/network/mount namespaces.
+// cargo test -p traffic-masq-dataplane port_forward_kernel -- --ignored --nocapture
+#[test]
+#[ignore = "requires Linux unprivileged user namespaces, nft, ip and python3"]
+fn port_forward_kernel_rules_integrity_and_tcp_udp_traffic() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    for mode in ["port_only", "explicit", "legacy"] {
+        for scope in ["any", "host", "subnet"] {
+            let legacy = mode == "legacy";
+            let scoped = scope != "any";
+            let mut desired = if legacy {
+                RouterDataplaneDesired {
+                    forwarding: None,
+                    port_forwards: vec![],
+                    uplink: "wan0".into(),
+                    outputs: vec![OutputNetwork {
+                        interface: "lan0".into(),
+                        subnet: "192.0.2.0/24".parse().unwrap(),
+                    }],
+                }
+            } else {
+                RouterDataplaneDesired {
+                    forwarding: Some(vec![]),
+                    port_forwards: vec![],
+                    uplink: String::new(),
+                    outputs: vec![],
+                }
+            };
+            if mode == "explicit" {
+                desired.forwarding = Some(vec![ForwardingConfig {
+                    from: "lan0".into(),
+                    to: "wan0".into(),
+                    source_subnet: Some("192.0.2.0/24".parse().unwrap()),
+                    masquerade: true,
+                }]);
+            }
+            let mut rule = port_rule();
+            if scoped {
+                rule.destination_address = Some("198.51.100.1".parse().unwrap());
+                rule.source_subnet = Some(
+                    if scope == "host" {
+                        "198.51.100.2/32"
+                    } else {
+                        "198.51.100.0/25"
+                    }
+                    .parse()
+                    .unwrap(),
+                );
+            }
+            desired.port_forwards = vec![
+                rule.clone(),
+                PortForwardConfig {
+                    protocol: PortForwardProtocol::Udp,
+                    ..rule
+                },
+            ];
+            desired.validate().unwrap();
+            let batch = render_nftables_batch(false, Some(&desired)).unwrap();
+            let mut child = Command::new("unshare").args(["-Urnm", "sh", "-ec",
+                "mount -t tmpfs none /run; mkdir /run/netns; nft -f -; python3 \"$1\" \"$2\"; nft -j list ruleset", "port-forward-test",
+                concat!(env!("CARGO_MANIFEST_DIR"), "/src/port_forwarding_kernel_test.py"), if scoped { "scoped" } else { "any" }])
+                .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(batch.as_bytes())
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "legacy={legacy} scoped={scoped}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let observed = parse_owned_nftables_state(&output.stdout).unwrap();
+            assert_eq!(observed.desired, Some(desired.clone()));
+            assert_eq!(
+                observed.integrity,
+                OwnedFirewallIntegrity::Intact,
+                "legacy={legacy} scoped={scoped}: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            // Missing route guards, altered targets, broad accepts and hook drift are unsafe.
+            let original: Value = serde_json::from_slice(&output.stdout).unwrap();
+            for mutation in [
+                "target",
+                "accept",
+                "order",
+                "priority",
+                "missing_nat",
+                "missing_egress_guard",
+            ] {
+                let mut drift = original.clone();
+                let entries = drift["nftables"].as_array_mut().unwrap();
+                match mutation {
+                    "missing_egress_guard" => {
+                        let index = entries
+                            .iter()
+                            .position(|e| {
+                                e.pointer("/rule/chain") == Some(&serde_json::json!("forward"))
+                            })
+                            .unwrap();
+                        entries.remove(index);
+                    }
+                    "target" => {
+                        let r = entries
+                            .iter_mut()
+                            .find(|e| {
+                                e.pointer("/rule/chain") == Some(&serde_json::json!("prerouting"))
+                            })
+                            .unwrap();
+                        r["rule"]["expr"]
+                            .as_array_mut()
+                            .unwrap()
+                            .last_mut()
+                            .unwrap()["dnat"]["port"] = serde_json::json!(2223);
+                    }
+                    "accept" => {
+                        let r = entries
+                            .iter_mut()
+                            .find(|e| {
+                                e.pointer("/rule/chain") == Some(&serde_json::json!("forward"))
+                            })
+                            .unwrap();
+                        r["rule"]["expr"] = serde_json::json!([{"accept": null}]);
+                    }
+                    "order" => {
+                        let indices: Vec<_> = entries
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, e)| {
+                                e.pointer("/rule/chain") == Some(&serde_json::json!("forward"))
+                            })
+                            .map(|(i, _)| i)
+                            .collect();
+                        entries.swap(indices[0], *indices.last().unwrap());
+                    }
+                    "priority" => {
+                        let c = entries
+                            .iter_mut()
+                            .find(|e| {
+                                e.pointer("/chain/name") == Some(&serde_json::json!("prerouting"))
+                            })
+                            .unwrap();
+                        c["chain"]["prio"] = serde_json::json!(-99);
+                    }
+                    _ => entries.retain(|e| {
+                        e.pointer("/rule/chain") != Some(&serde_json::json!("prerouting"))
+                    }),
+                }
+                assert_eq!(
+                    parse_owned_nftables_state(&serde_json::to_vec(&drift).unwrap())
+                        .unwrap()
+                        .integrity,
+                    OwnedFirewallIntegrity::Drifted,
+                    "{mutation}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn port_forward_preflight_rejects_observed_router_addresses_before_firewall_writes() {
+    let mut network = FakeNetworkProvider::all_up();
+    network.addresses.push(Ipv4AddressInfo {
+        interface_index: 1,
+        address: "198.51.100.1".parse().unwrap(),
+        prefix_len: 24,
+        protocol: None,
+    });
+    let provider = LinuxRouterDataplaneProvider::new(
+        Ipv4ForwardingBackend::new(FakeForwardingIo::new(b"0\n")),
+        NftablesBackend::new(FakeNftExecutor::default()),
+        network,
+    );
+    let mut rule = port_rule();
+    rule.from = "eth0".into();
+    rule.target_address = "198.51.100.1".parse().unwrap();
+    let wanted = RouterDataplaneDesired {
+        forwarding: Some(vec![]),
+        port_forwards: vec![rule],
+        uplink: String::new(),
+        outputs: vec![],
+    };
+    assert!(provider
+        .apply_owned(&wanted)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("local router address"));
+    assert!(provider.nftables.executor.calls.lock().unwrap().is_empty());
+    assert!(provider.forwarding.io.writes.lock().unwrap().is_empty());
 }

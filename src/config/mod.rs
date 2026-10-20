@@ -20,6 +20,7 @@ pub use traffic_masq_protocol::{
     InterfaceRole, UplinkMode, VpnPolicyMode, WifiBand, WifiChannelWidth, WifiClientSecurity,
     WifiSecurity,
 };
+pub use traffic_masq_protocol::{PortForwardConfig, PortForwardProtocol};
 
 mod resolver;
 pub use resolver::{ConfigSource, ResolvedConfig, CONFIG_ENV, DEFAULT_CONFIG_PATH};
@@ -161,6 +162,8 @@ pub struct RouterConfig {
     /// Explicit ingress → egress rules. None preserves legacy uplink NAT;
     /// Some(empty) disables forwarding without restoring legacy rules.
     pub forwarding: Option<Vec<ForwardingConfig>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub port_forwards: Vec<PortForwardConfig>,
     pub owned_routes: Vec<OwnedIpv4RouteConfig>,
     pub allow_default_route_change: bool,
     /// Persisted, user-facing VPN hop chain: profile name per hop, ordered
@@ -439,7 +442,9 @@ impl AppConfig {
     pub fn validate(&self) -> Result<()> {
         self.network.validate()?;
         self.router.validate(&self.network)?;
-        if self.router.forwarding.is_some() && self.vpn.policy.default_mode == VpnPolicyMode::Vpn {
+        if (self.router.forwarding.is_some() || !self.router.port_forwards.is_empty())
+            && self.vpn.policy.default_mode == VpnPolicyMode::Vpn
+        {
             bail!("explicit forwarding requires direct global VPN policy; configure routes for each VPN interface separately");
         }
         self.vpn.validate(&self.router)?;
@@ -627,12 +632,40 @@ impl RouterConfig {
                 .forwarding
                 .as_ref()
                 .is_some_and(|rules| !rules.is_empty())
+            || !self.port_forwards.is_empty()
             || !self.owned_routes.is_empty()
             || !self.vpn_chain.is_empty()
     }
 
     /// Validate forwarding/uplink roles, output addressing, route consent/conflicts and VPN chain length.
     fn validate(&self, network: &NetworkConfig) -> Result<()> {
+        traffic_masq_protocol::validate_port_forwards(&self.port_forwards)
+            .map_err(anyhow::Error::msg)?;
+        if !self.port_forwards.is_empty() && !self.vpn_chain.is_empty() {
+            bail!("port forwarding cannot be combined with the legacy global vpn_chain; configure tunnel routing separately");
+        }
+        for rule in &self.port_forwards {
+            if network
+                .interfaces
+                .values()
+                .filter_map(|interface| interface.ipv4)
+                .any(|ip| ip.addr() == rule.target_address)
+            {
+                bail!("port forwarding target must be a remote host, not a router address");
+            }
+            if network
+                .interfaces
+                .get(&rule.to)
+                .and_then(|interface| interface.ipv4)
+                .is_some_and(|net| {
+                    net.prefix_len() < 31
+                        && (rule.target_address == net.network()
+                            || rule.target_address == net.broadcast())
+                })
+            {
+                bail!("port forwarding target must not be a subnet network or broadcast address");
+            }
+        }
         if let Some(rules) = &self.forwarding {
             validate_forwarding(rules)?;
             if !self.vpn_chain.is_empty() {

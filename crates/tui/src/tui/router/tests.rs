@@ -965,6 +965,7 @@ fn summarizes_dhcp_with_known_and_missing_lease_counts() {
 #[test]
 fn summarizes_uplink_for_enabled_and_disabled_dataplane() {
     let enabled = RouterDataplaneTargetView::Enabled(RouterDataplaneDesiredView {
+        port_forwards: Vec::new(),
         forwarding: None,
         uplink: "wan0".to_string(),
         outputs: Vec::new(),
@@ -985,6 +986,7 @@ fn formats_forwarding_status_reflects_snapshot_target_and_drift() {
             owned_firewall_integrity: OwnedFirewallIntegrityView::Intact,
         },
         target: RouterDataplaneTargetView::Enabled(RouterDataplaneDesiredView {
+            port_forwards: Vec::new(),
             forwarding: None,
             uplink: "wan0".to_string(),
             outputs: Vec::new(),
@@ -1007,6 +1009,7 @@ fn forwarding_status_does_not_claim_nat_for_non_masqueraded_rules() {
             owned_firewall_integrity: OwnedFirewallIntegrityView::Intact,
         },
         target: RouterDataplaneTargetView::Enabled(RouterDataplaneDesiredView {
+            port_forwards: Vec::new(),
             forwarding: Some(vec![ForwardingConfigView {
                 source_subnet: None,
                 from: "lan0".to_string(),

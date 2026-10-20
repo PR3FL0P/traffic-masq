@@ -57,6 +57,9 @@ impl RouterDesired {
             .map(|entry| entry.name.as_str())
             .collect();
         if let RouterDataplaneTarget::Enabled(dataplane) = &self.dataplane {
+            for rule in &dataplane.port_forwards {
+                names.extend([rule.from.as_str(), rule.to.as_str()]);
+            }
             if let Some(rules) = &dataplane.forwarding {
                 for rule in rules {
                     names.extend([rule.from.as_str(), rule.to.as_str()]);
@@ -124,7 +127,10 @@ impl RouterDesired {
 
         let managed_outputs = managed_output_interfaces(config);
 
-        if let Some(forwarding) = &config.router.forwarding {
+        if config.router.forwarding.is_some()
+            || (!config.router.port_forwards.is_empty() && config.router.uplink.is_none())
+        {
+            let forwarding = config.router.forwarding.clone().unwrap_or_default();
             let mut interfaces = managed_outputs.clone();
             if let Some(uplink) = &config.router.uplink {
                 let interface = config
@@ -138,11 +144,12 @@ impl RouterDesired {
                 });
             }
             let output_wifi = output_wifi(&interfaces)?;
-            let dataplane = if forwarding.is_empty() {
+            let dataplane = if forwarding.is_empty() && config.router.port_forwards.is_empty() {
                 RouterDataplaneTarget::Disabled
             } else {
                 RouterDataplaneTarget::Enabled(RouterDataplaneDesired {
                     forwarding: Some(forwarding.clone()),
+                    port_forwards: config.router.port_forwards.clone(),
                     uplink: String::new(),
                     outputs: Vec::new(),
                 })
@@ -219,6 +226,7 @@ impl RouterDesired {
             .collect();
         let dataplane = RouterDataplaneDesired {
             forwarding: None,
+            port_forwards: config.router.port_forwards.clone(),
             uplink: uplink.interface.clone(),
             outputs,
         };

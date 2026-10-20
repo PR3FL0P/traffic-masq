@@ -103,6 +103,7 @@ fn enabled_config() -> AppConfig {
         output_interface("192.168.10.1/24", 100, 150),
     );
     config.router = RouterConfig {
+        port_forwards: Vec::new(),
         forwarding: None,
         vpn_chain: Vec::new(),
         uplink: Some(UplinkConfig {
