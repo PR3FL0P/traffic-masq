@@ -1,6 +1,6 @@
 # TUI Module (`crates/tui/src/tui`)
 
-> **Developer & AI Agent Reference Manual**  
+> **Developer Reference Manual**
 > This document details the architecture, design principles, invariants, and best practices for developing and maintaining the Terminal User Interface (`traffic-masq`) module.
 
 ---
