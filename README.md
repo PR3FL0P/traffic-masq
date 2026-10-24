@@ -314,9 +314,12 @@ can count forwarded traffic more than once and are not Internet usage totals.
 VPN interface/policy state is observed; Internet, DNS and handshake connectivity
 are not actively tested by the Dashboard.
 
-In **VPN**, open **VPN settings** to enable the subsystem without restarting
-the daemon. Import a profile, open its card and choose **Connect standalone**
-to bring up its tunnel. **Route → Standalone traffic policy** controls routing
+In **VPN**, import and select a profile, then press **Enter** or **Connect**
+to bring up its tunnel. Connect also enables VPN if it is disabled; no daemon
+restart or visit to Route is needed. Press **Enter** again or **Disconnect**
+to disconnect that profile. **Open profile** shows details and deletion actions.
+**VPN settings** contains the subsystem disable control.
+**Route → Standalone traffic policy** controls routing
 through that tunnel and applies immediately; it requires forwarding managed
 outside traffic-masq. Disconnect, select Direct policy
 and remove any saved router VPN chain before disabling VPN.

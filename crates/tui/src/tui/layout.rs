@@ -396,7 +396,7 @@ pub(crate) fn screen_help_pairs(screen: Screen) -> Vec<(&'static str, &'static s
         Screen::Vpn => vec![
             ("↑/↓", "profile"),
             ("Tab", "actions"),
-            ("Enter", "open profile"),
+            ("Enter", "connect/disconnect"),
             ("r", "refresh"),
             ("Esc", "back"),
         ],

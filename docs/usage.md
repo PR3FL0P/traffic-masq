@@ -876,14 +876,20 @@ managed `input` interface without a static IPv4 address. DHCP configuration
 requires that prepared interface and applies immediately.
 The overview reports whether the VPN subsystem is enabled; this switch alone does not prove a tunnel is connected.
 
-The **VPN** tab lists saved profiles with standalone tunnel state and saved global
-chain membership. **Enter** opens a profile card; **Connect standalone** and
-**Disconnect standalone** are explicit immediate actions. A profile used by the
-saved chain links to **Route**. The profile card also shows membership in an
-unapplied Route draft and offers confirmed deletion. **Import** is a library
-action; **r** refreshes without changing selection by name. Profiles remain
-visible while VPN is disabled. Open **VPN settings** for subsystem Enable/Disable
-and its prerequisites.
+The **VPN** tab lists saved profiles and their connection state. Select a profile
+and press **Enter** or **Connect** to connect it directly. Connect enables a disabled
+VPN subsystem, checks its current connection and activates the selected profile.
+**Enter** on the connected profile or **Disconnect** disconnects it. These operations
+apply immediately and stay in VPN; they do not edit routing or change a Route draft.
+Disconnect the active profile before connecting another.
+
+**Open profile** shows additional details, saved-chain and unapplied-draft membership,
+and confirmed deletion. Chain tunnels are separate from the connection controlled
+here; chain membership does not redirect Connect to Route. **Import** adds profiles;
+**r** refreshes without changing selection by name. Profiles remain visible while
+VPN is disabled. **VPN settings** retains explicit Enable/Disable and the daemon's
+disabling prerequisites. Failed or uncertain operations require a fresh status read
+before another connection attempt.
 
 **Route → Standalone traffic policy** controls the existing immediate Direct/VPN
 policy for the standalone tunnel, over forwarding and direct-mode NAT managed

@@ -236,14 +236,190 @@ fn profile_app() -> TuiApp {
     app
 }
 
+fn activated() -> Response {
+    Response::VpnActivated {
+        active: VpnActiveStatus {
+            profile_name: "home.conf".into(),
+            interface: "tm-wg0".into(),
+            up: true,
+        },
+    }
+}
+
 #[tokio::test]
-async fn enter_opens_a_pinned_profile_without_connecting() {
+async fn enter_connects_from_list_without_route_reads_or_changing_the_router_draft() {
+    for chain in [
+        None,
+        Some(vec![traffic_masq_protocol::VpnHopConfigView {
+            profile_name: "home.conf".into(),
+        }]),
+    ] {
+        let mock = super::super::test_api::mock(vec![activated(), Response::VpnDeactivated]).await;
+        let mut app = profile_app();
+        app.vpn.chain = chain;
+        app.ui.input_enabled = true;
+        app.router.staged = true;
+        app.router.proposed_router_config.route_host_traffic = true;
+        super::super::handle_key(&mut app, KeyCode::Enter, &mock.client, false).await;
+        assert_eq!(app.screen, Screen::Vpn);
+        assert!(standalone_selected(&app));
+        super::super::handle_key(&mut app, KeyCode::Enter, &mock.client, false).await;
+        assert!(app.vpn.active.is_none());
+        assert!(app.router.staged);
+        assert!(app.router.proposed_router_config.route_host_traffic);
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].body["type"], "vpn_activate");
+        assert_eq!(calls[0].body["name"], "home.conf");
+        assert_eq!(calls[1].body["type"], "vpn_deactivate");
+    }
+}
+
+#[tokio::test]
+async fn connect_enables_disabled_vpn_and_checks_runtime_before_activation() {
+    let mock = super::super::test_api::mock(vec![
+        Response::VpnConfig { enabled: true },
+        Response::VpnStatus { active: None },
+        activated(),
+    ])
+    .await;
+    let mut app = profile_app();
+    app.vpn.enabled = Some(false);
+    app.vpn.status_known = false;
+    handle_vpn_key(&mut app, KeyCode::Enter, &mock.client).await;
+    assert_eq!(app.screen, Screen::Vpn);
+    assert_eq!(app.vpn.enabled, Some(true));
+    assert!(standalone_selected(&app));
+    let calls = mock.calls.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0].body["type"], "set_vpn_enabled");
+    assert_eq!(calls[0].body["enabled"], true);
+    assert_eq!(calls[1].body["type"], "vpn_status");
+    assert_eq!(calls[2].body["type"], "vpn_activate");
+}
+
+#[tokio::test]
+async fn settings_can_still_disable_vpn_and_refresh_the_library_without_runtime_or_route_reads() {
+    let profiles = profile_app().vpn.profiles;
+    let mock = super::super::test_api::mock(vec![
+        Response::VpnConfig { enabled: false },
+        Response::VpnConfig { enabled: false },
+        Response::VpnProfiles { profiles },
+    ])
+    .await;
+    let mut app = profile_app();
+    app.screen = Screen::VpnSettings;
+    app.vpn.focus = VpnFocus::ToggleEnabled;
+    handle_vpn_key(&mut app, KeyCode::Enter, &mock.client).await;
+    assert_eq!(app.vpn.enabled, Some(false));
+    assert!(app.vpn.profiles_known);
+    assert!(!app.vpn.status_known);
+    let calls = mock.calls.lock().unwrap();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0].body["type"], "set_vpn_enabled");
+    assert_eq!(calls[0].body["enabled"], false);
+    assert_eq!(calls[1].body["type"], "get_vpn_config");
+    assert_eq!(calls[2].body["type"], "vpn_list_profiles");
+}
+
+#[tokio::test]
+async fn an_empty_library_does_not_enable_vpn_on_enter() {
     let mock = super::super::test_api::mock(vec![]).await;
     let mut app = profile_app();
+    app.vpn.enabled = Some(false);
+    app.vpn.profiles.clear();
+    handle_vpn_key(&mut app, KeyCode::Enter, &mock.client).await;
+    assert_eq!(app.vpn.enabled, Some(false));
+    assert!(mock.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn enable_failure_or_unknown_runtime_never_proceeds_or_retries_connect() {
+    for responses in [
+        vec![Response::Error {
+            message: "enable outcome unknown".into(),
+        }],
+        vec![
+            Response::VpnConfig { enabled: true },
+            Response::Error {
+                message: "runtime unavailable".into(),
+            },
+        ],
+        vec![
+            Response::VpnConfig { enabled: true },
+            Response::VpnStatus {
+                active: Some(VpnActiveStatus {
+                    profile_name: "work.conf".into(),
+                    interface: "tm-wg0".into(),
+                    up: true,
+                }),
+            },
+        ],
+    ] {
+        let expected = responses.len();
+        let mock = super::super::test_api::mock(responses).await;
+        let mut app = profile_app();
+        app.vpn.enabled = Some(false);
+        app.vpn.status_known = false;
+        for _ in 0..2 {
+            handle_vpn_key(&mut app, KeyCode::Enter, &mock.client).await;
+        }
+        assert_eq!(app.screen, Screen::Vpn);
+        assert_eq!(mock.calls.lock().unwrap().len(), expected);
+        assert!(!standalone_selected(&app));
+    }
+}
+
+#[tokio::test]
+async fn mouse_connect_uses_the_same_action_as_enter_in_the_profile_list() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{backend::TestBackend, Terminal};
+    let mock = super::super::test_api::mock(vec![activated()]).await;
+    let mut app = profile_app();
+    app.ui.input_enabled = true;
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| super::super::render(frame, &mut app, false))
+        .unwrap();
+    let (rect, _) = app
+        .ui
+        .buttons
+        .iter()
+        .find(|(_, slot)| *slot == 0)
+        .copied()
+        .unwrap();
+    super::super::handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        },
+        &mock.client,
+        false,
+    )
+    .await;
+    assert_eq!(app.screen, Screen::Vpn);
+    assert!(standalone_selected(&app));
+    assert_eq!(mock.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn details_opens_a_pinned_profile_without_connecting() {
+    let mock = super::super::test_api::mock(vec![Response::RouterConfig {
+        config: Default::default(),
+    }])
+    .await;
+    let mut app = profile_app();
+    app.vpn.focus = VpnFocus::Details;
     handle_vpn_key(&mut app, KeyCode::Enter, &mock.client).await;
     assert_eq!(app.screen, Screen::VpnProfile);
     assert_eq!(selected_name(&app), Some("home.conf"));
-    assert!(mock.calls.lock().unwrap().is_empty());
+    assert_eq!(
+        mock.calls.lock().unwrap()[0].body["type"],
+        "get_router_config"
+    );
     app.vpn.profiles.reverse();
     app.vpn.focus = VpnFocus::Delete;
     handle_vpn_key(&mut app, KeyCode::Enter, &mock.client).await;
@@ -288,7 +464,77 @@ async fn uncertain_activation_requires_refresh_before_another_mutation() {
     assert!(!app.vpn.status_known);
     handle_vpn_key(&mut app, KeyCode::Enter, &mock.client).await;
     assert_eq!(mock.calls.lock().unwrap().len(), 1);
-    assert!(profile_state(&app, "home.conf").contains("standalone: unknown"));
+    assert!(profile_state(&app, "home.conf").contains("status unknown"));
+}
+
+#[tokio::test]
+async fn cancelling_a_background_refresh_preserves_the_last_observation_at_every_read() {
+    use http_body_util::Full;
+    use hyper::{body::Bytes, server::conn::http1, service::service_fn};
+    use hyper_util::rt::TokioIo;
+
+    for stalled_read in 0..4 {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("vpn.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let client = ApiClient::new(socket);
+        let (reached, mut waiting) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            let responses = [
+                Response::VpnConfig { enabled: true },
+                Response::VpnProfiles { profiles: vec![] },
+                Response::VpnStatus { active: None },
+                Response::RouterConfig {
+                    config: Default::default(),
+                },
+            ];
+            for (index, response) in responses.into_iter().enumerate() {
+                let (stream, _) = listener.accept().await.unwrap();
+                let reached = reached.clone();
+                let response = serde_json::to_vec(&response).unwrap();
+                http1::Builder::new()
+                    .serve_connection(
+                        TokioIo::new(stream),
+                        service_fn(move |_| {
+                            let reached = reached.clone();
+                            let response = response.clone();
+                            async move {
+                                if index == stalled_read {
+                                    reached.send(()).unwrap();
+                                    std::future::pending::<()>().await;
+                                }
+                                Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(
+                                    Bytes::from(response),
+                                )))
+                            }
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut app = profile_app();
+        app.screen = Screen::VpnProfile;
+        app.vpn.opened_profile = Some("home.conf".into());
+        app.vpn.error = Some(VpnErrorDetail::NotActive);
+        {
+            let refresh = load_vpn_data(&mut app, &client);
+            tokio::pin!(refresh);
+            tokio::select! {
+                result = waiting.recv() => assert!(result.is_some()),
+                _ = &mut refresh => panic!("refresh must wait for the stalled response"),
+            }
+        }
+        server.abort();
+        assert_eq!(app.vpn.enabled, Some(true));
+        assert!(app.vpn.status_known);
+        assert!(app.vpn.profiles_known);
+        assert_eq!(app.vpn.profiles.len(), 2);
+        assert_eq!(app.vpn.chain, Some(vec![]));
+        assert!(app.vpn.error.is_some());
+        assert_eq!(selected_name(&app), Some("home.conf"));
+        assert!(app.logs.is_empty());
+    }
 }
 
 #[tokio::test]
@@ -313,9 +559,6 @@ async fn disabled_vpn_keeps_the_profile_library_and_never_reads_runtime_status()
     let mock = super::super::test_api::mock(vec![
         Response::VpnConfig { enabled: false },
         Response::VpnProfiles { profiles },
-        Response::RouterConfig {
-            config: Default::default(),
-        },
     ])
     .await;
     let mut app = profile_app();
@@ -325,7 +568,7 @@ async fn disabled_vpn_keeps_the_profile_library_and_never_reads_runtime_status()
     assert_eq!(selected_name(&app), Some("home.conf"));
     assert_eq!(app.vpn.profiles.len(), 2);
     assert!(!app.vpn.status_known);
-    assert_eq!(mock.calls.lock().unwrap().len(), 3);
+    assert_eq!(mock.calls.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -334,9 +577,6 @@ async fn failed_reads_preserve_partial_data_but_never_claim_fresh_runtime_or_cha
         Response::VpnConfig { enabled: true },
         Response::VpnProfiles {
             profiles: profile_app().vpn.profiles,
-        },
-        Response::Error {
-            message: "router unavailable".into(),
         },
         Response::Error {
             message: "status unavailable".into(),
@@ -355,9 +595,9 @@ async fn failed_reads_preserve_partial_data_but_never_claim_fresh_runtime_or_cha
     assert!(app.vpn.chain.is_none());
     assert!(!standalone_selected(&app));
     let state = profile_state(&app, "home.conf");
-    assert!(state.contains("standalone: unknown"));
+    assert!(state.contains("status unknown"));
     assert!(state.contains("chain usage: unknown"));
-    assert!(!state.contains("standalone: up"));
+    assert!(!state.contains("connected"));
 }
 
 #[test]
@@ -367,7 +607,7 @@ fn saved_chain_usage_is_not_reported_as_runtime_connectivity_and_draft_blocks_de
         profile_name: "home.conf".into(),
     }]);
     let state = profile_state(&app, "home.conf");
-    assert!(state.contains("standalone: inactive"));
+    assert!(state.contains("disconnected"));
     assert!(state.contains("saved chain: hop 1"));
     app.router.staged = true;
     app.router.proposed_router_config.vpn_chain = app.vpn.chain.clone().unwrap();

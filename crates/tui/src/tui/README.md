@@ -373,9 +373,13 @@ cursor and error styling with `layout::wrap_styled_lines`.
 
 ### VPN profile and Route boundary
 
-VPN lists profile summaries and standalone state. Enter opens a profile card;
-connect/disconnect is explicit, deletion is in the card, and subsystem availability
-is in VPN settings. Refresh preserves selection by profile name and distinguishes
+VPN lists profiles and connection state. Enter on a profile or Connect/Disconnect
+operates directly, without opening a card or visiting Route. Connect enables a
+disabled subsystem and refreshes runtime status before activation through the same
+VPN API. Open profile is a separate details/deletion action. Basic refresh does
+not query router configuration; only profile details fetch saved-chain usage,
+which never gates connection. VPN settings retains the explicit availability
+control and disabling prerequisites. Refresh preserves selection by profile name and distinguishes
 unavailable observations from inactive tunnels. Saved chain membership and local
 Route drafts are labelled separately from runtime state. Standalone traffic policy
 is entered from Route, while the global chain continues to use the shared router

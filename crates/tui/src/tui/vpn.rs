@@ -76,33 +76,13 @@ fn standalone_selected(app: &TuiApp) -> bool {
             .is_some_and(|active| Some(active.profile_name.as_str()) == selected_name(app))
 }
 
-fn selected_in_chain(app: &TuiApp) -> bool {
-    app.vpn.chain.as_ref().is_some_and(|chain| {
-        chain
-            .iter()
-            .any(|hop| Some(hop.profile_name.as_str()) == selected_name(app))
-    })
-}
-
 async fn open_route(app: &mut TuiApp, client: &ApiClient) {
     super::router::load_router_data(app, client).await;
     app.screen = Screen::Router;
 }
 
 fn profile_state(app: &TuiApp, name: &str) -> String {
-    let tunnel = if app.vpn.enabled == Some(false) {
-        "VPN disabled"
-    } else if !app.vpn.status_known {
-        "standalone: unknown"
-    } else if let Some(active) = app.vpn.active.as_ref().filter(|a| a.profile_name == name) {
-        if active.up {
-            "standalone: up"
-        } else {
-            "standalone: down"
-        }
-    } else {
-        "standalone: inactive"
-    };
+    let tunnel = connection_state(app, name);
     let chain = match &app.vpn.chain {
         None => "chain usage: unknown".into(),
         Some(chain) => {
@@ -120,6 +100,22 @@ fn profile_state(app: &TuiApp, name: &str) -> String {
         }
     };
     format!("{tunnel} | {chain}")
+}
+
+fn connection_state(app: &TuiApp, name: &str) -> &'static str {
+    if app.vpn.enabled == Some(false) {
+        "VPN disabled"
+    } else if !app.vpn.status_known {
+        "status unknown"
+    } else if let Some(active) = app.vpn.active.as_ref().filter(|a| a.profile_name == name) {
+        if active.up {
+            "connected"
+        } else {
+            "interface down"
+        }
+    } else {
+        "disconnected"
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,11 +200,21 @@ pub(crate) fn render_vpn(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
     let mut lines = vec![Line::styled(
         match app.vpn.enabled {
             Some(true) => "VPN enabled",
-            Some(false) => "VPN disabled — open VPN settings to enable",
+            Some(false) => "VPN disabled — Connect also enables VPN",
             None => "VPN availability unknown — r: refresh",
         },
         Style::default().fg(theme::MUTED),
     )];
+    if app.vpn.enabled == Some(true) && app.vpn.status_known {
+        if let Some(active) = &app.vpn.active {
+            lines.push(Line::from(format!(
+                "Active: {} on {} ({})",
+                active.profile_name,
+                active.interface,
+                if active.up { "up" } else { "down" }
+            )));
+        }
+    }
     if let Some(detail) = &app.vpn.error {
         lines.push(Line::styled(
             describe_vpn_error(detail),
@@ -230,7 +236,7 @@ pub(crate) fn render_vpn(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
             ));
             lines.push(Line::from(profile_state(app, name)));
             lines.push(Line::from(
-                "Chain tunnel health and traffic protection: inspect Route.",
+                "Traffic routing and VPN chains are configured in Route.",
             ));
             if app.router.staged {
                 let hops: Vec<_> = app
@@ -252,12 +258,12 @@ pub(crate) fn render_vpn(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
                 )));
             }
             lines.push(Line::from(
-                "Standalone controls apply immediately to tm-wg0 only.",
+                "Connect/disconnect applies immediately to tm-wg0. Chain tunnels are separate.",
             ));
             if let Some(active) = &app.vpn.active {
                 if active.profile_name != name && app.vpn.status_known {
                     lines.push(Line::from(format!(
-                        "Disconnect standalone profile '{}' before connecting another.",
+                        "Disconnect profile '{}' before connecting another.",
                         active.profile_name
                     )));
                 }
@@ -311,7 +317,7 @@ pub(crate) fn render_vpn(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
                     "{} {} — {}",
                     if selected { "▶" } else { " " },
                     profile.name,
-                    profile_state(app, &profile.name)
+                    connection_state(app, &profile.name)
                 ),
                 if selected {
                     Style::default().fg(theme::ACCENT)
@@ -331,9 +337,8 @@ pub(crate) fn render_vpn(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
     let mut y = regions[1].y;
     for (slot, focus) in actions(app.screen).iter().enumerate() {
         let label = match focus {
-            VpnFocus::Connect if standalone_selected(app) => "[Disconnect standalone]",
-            VpnFocus::Connect if selected_in_chain(app) => "[Manage chain in Route]",
-            VpnFocus::Connect => "[Connect standalone]",
+            VpnFocus::Connect if standalone_selected(app) => "[Disconnect]",
+            VpnFocus::Connect => "[Connect]",
             VpnFocus::Details => "[Open profile]",
             VpnFocus::Import => "[Import]",
             VpnFocus::Settings => "[VPN settings]",
@@ -366,8 +371,14 @@ pub(crate) fn render_vpn(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
         x += width + 1;
     }
     frame.render_widget(
-        Paragraph::new("r: refresh | Enter: open / activate | Esc: back")
-            .style(Style::default().fg(theme::MUTED)),
+        Paragraph::new(
+            if app.screen == Screen::Vpn && app.vpn.focus == VpnFocus::List {
+                "r: refresh | Enter: connect / disconnect | Tab: actions | Esc: back"
+            } else {
+                "r: refresh | Enter: activate action | Esc: back"
+            },
+        )
+        .style(Style::default().fg(theme::MUTED)),
         Rect::new(
             regions[1].x,
             regions[1].bottom().saturating_sub(1),
@@ -544,20 +555,19 @@ pub(crate) async fn handle_vpn_key(app: &mut TuiApp, key: KeyCode, client: &ApiC
         KeyCode::Home => app.vpn.selected_profile = 0,
         KeyCode::End => app.vpn.selected_profile = app.vpn.profiles.len().saturating_sub(1),
         KeyCode::Enter => match app.vpn.focus {
-            VpnFocus::List | VpnFocus::Details => {
+            VpnFocus::Details => {
                 if app.vpn.profiles_known {
                     if let Some(name) = selected_name(app).map(str::to_owned) {
                         app.vpn.opened_profile = Some(name);
                         app.screen = Screen::VpnProfile;
                         app.vpn.focus = VpnFocus::Connect;
+                        load_vpn_chain_usage(app, client).await;
                     }
                 }
             }
-            VpnFocus::Connect => {
+            VpnFocus::List | VpnFocus::Connect => {
                 if standalone_selected(app) {
                     vpn_deactivate(app, client).await;
-                } else if selected_in_chain(app) {
-                    open_route(app, client).await;
                 } else {
                     vpn_activate_selected(app, client).await;
                 }
@@ -581,13 +591,16 @@ async fn toggle_vpn_enabled(app: &mut TuiApp, client: &ApiClient) {
         app.push_message(LogLevel::Warn, "Refresh VPN status before changing it");
         return;
     };
+    if set_vpn_enabled(app, client, !enabled).await {
+        load_vpn_data(app, client).await;
+    }
+}
+
+async fn set_vpn_enabled(app: &mut TuiApp, client: &ApiClient, enabled: bool) -> bool {
     app.vpn.enabled = None;
     app.vpn.status_known = false;
-    match client
-        .request(&Request::SetVpnEnabled { enabled: !enabled })
-        .await
-    {
-        Ok(Response::VpnConfig { enabled }) => {
+    match client.request(&Request::SetVpnEnabled { enabled }).await {
+        Ok(Response::VpnConfig { enabled: actual }) if actual == enabled => {
             app.vpn.enabled = Some(enabled);
             app.push_message(
                 LogLevel::Info,
@@ -597,7 +610,7 @@ async fn toggle_vpn_enabled(app: &mut TuiApp, client: &ApiClient) {
                     "VPN disabled and saved"
                 },
             );
-            load_vpn_data(app, client).await;
+            return true;
         }
         Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
         Ok(response) => app.push_message(
@@ -606,6 +619,7 @@ async fn toggle_vpn_enabled(app: &mut TuiApp, client: &ApiClient) {
         ),
         Err(error) => app.push_message(LogLevel::Error, error.to_string()),
     }
+    false
 }
 
 async fn open_vpn_import(app: &mut TuiApp, client: &ApiClient) {
@@ -688,14 +702,26 @@ fn toggle_vpn_import_field(field: VpnImportField) -> VpnImportField {
 
 pub(crate) async fn load_vpn_data(app: &mut TuiApp, client: &ApiClient) {
     let selected = selected_name(app).map(str::to_owned);
+    // The event loop cancels background reads when input arrives. Collect the
+    // observations before replacing known state, so Enter can use the previous
+    // snapshot when it interrupts a refresh. Completed failures still invalidate it.
+    let config = client.request(&Request::GetVpnConfig).await;
+    let profiles = client.request(&Request::VpnListProfiles).await;
+    let status = if matches!(&config, Ok(Response::VpnConfig { enabled: true })) {
+        Some(client.request(&Request::VpnStatus).await)
+    } else {
+        None
+    };
+    let chain = if app.screen == Screen::VpnProfile {
+        Some(client.request(&Request::GetRouterConfig).await)
+    } else {
+        None
+    };
     app.vpn.error = None;
     app.vpn.enabled = None;
     app.vpn.status_known = false;
     app.vpn.profiles_known = false;
     app.vpn.chain = None;
-    let config = client.request(&Request::GetVpnConfig).await;
-    let profiles = client.request(&Request::VpnListProfiles).await;
-    let router = client.request(&Request::GetRouterConfig).await;
     match config {
         Ok(Response::VpnConfig { enabled }) => app.vpn.enabled = Some(enabled),
         result => app.push_message(
@@ -722,72 +748,55 @@ pub(crate) async fn load_vpn_data(app: &mut TuiApp, client: &ApiClient) {
             format!("VPN profile library unavailable: {result:?}"),
         ),
     }
-    match router {
+    if let Some(status) = status {
+        accept_vpn_status(app, status);
+    }
+    if let Some(chain) = chain {
+        accept_vpn_chain_usage(app, chain);
+    }
+}
+
+async fn load_vpn_chain_usage(app: &mut TuiApp, client: &ApiClient) {
+    let result = client.request(&Request::GetRouterConfig).await;
+    accept_vpn_chain_usage(app, result);
+}
+
+fn accept_vpn_chain_usage(app: &mut TuiApp, result: anyhow::Result<Response>) {
+    app.vpn.chain = None;
+    match result {
         Ok(Response::RouterConfig { config }) => app.vpn.chain = Some(config.vpn_chain),
         result => app.push_message(
             LogLevel::Warn,
             format!("VPN chain usage unavailable: {result:?}"),
         ),
     }
-    if app.vpn.enabled == Some(true) {
-        match client.request(&Request::VpnStatus).await {
-            Ok(Response::VpnStatus { active }) => {
-                app.vpn.active = active;
-                app.vpn.status_known = true;
-            }
-            Ok(Response::VpnError { detail }) => app.vpn.error = Some(detail),
-            result => app.push_message(
-                LogLevel::Warn,
-                format!("Standalone VPN status unavailable: {result:?}"),
-            ),
+}
+
+async fn refresh_vpn_status(app: &mut TuiApp, client: &ApiClient) {
+    let result = client.request(&Request::VpnStatus).await;
+    accept_vpn_status(app, result);
+}
+
+fn accept_vpn_status(app: &mut TuiApp, result: anyhow::Result<Response>) {
+    app.vpn.status_known = false;
+    match result {
+        Ok(Response::VpnStatus { active }) => {
+            app.vpn.active = active;
+            app.vpn.status_known = true;
         }
+        Ok(Response::VpnError { detail }) => app.vpn.error = Some(detail),
+        result => app.push_message(
+            LogLevel::Warn,
+            format!("VPN connection status unavailable: {result:?}"),
+        ),
     }
 }
 
 async fn vpn_activate_selected(app: &mut TuiApp, client: &ApiClient) {
-    if app.vpn.enabled != Some(true) || !app.vpn.status_known || !app.vpn.profiles_known {
+    if !app.vpn.profiles_known || app.vpn.enabled.is_none() {
         app.push_message(
             LogLevel::Warn,
-            "Enable VPN in VPN settings and refresh status before connecting",
-        );
-        return;
-    }
-    if let Some(active) = &app.vpn.active {
-        app.push_message(
-            LogLevel::Warn,
-            format!(
-                "Disconnect standalone profile '{}' first",
-                active.profile_name
-            ),
-        );
-        return;
-    }
-    if !app
-        .vpn
-        .profiles
-        .iter()
-        .any(|p| Some(p.name.as_str()) == selected_name(app))
-    {
-        app.push_message(
-            LogLevel::Warn,
-            "Profile is no longer in the library; return to the list",
-        );
-        return;
-    }
-    let Some(chain) = &app.vpn.chain else {
-        app.push_message(
-            LogLevel::Warn,
-            "Refresh saved chain usage before connecting",
-        );
-        return;
-    };
-    if chain
-        .iter()
-        .any(|hop| Some(hop.profile_name.as_str()) == selected_name(app))
-    {
-        app.push_message(
-            LogLevel::Warn,
-            "This profile belongs to the saved VPN chain; manage it in Route",
+            "Refresh VPN availability and profile library before connecting",
         );
         return;
     }
@@ -795,10 +804,38 @@ async fn vpn_activate_selected(app: &mut TuiApp, client: &ApiClient) {
         app.push_message(LogLevel::Warn, "No profile selected");
         return;
     };
+    if !app.vpn.profiles.iter().any(|p| p.name == name) {
+        app.push_message(
+            LogLevel::Warn,
+            "Profile is no longer in the library; return to the list",
+        );
+        return;
+    }
+    if app.vpn.enabled == Some(false) {
+        if !set_vpn_enabled(app, client, true).await {
+            return;
+        }
+        refresh_vpn_status(app, client).await;
+    }
+    if !app.vpn.status_known {
+        app.push_message(
+            LogLevel::Warn,
+            "Refresh VPN connection status before connecting",
+        );
+        return;
+    }
+    if let Some(active) = &app.vpn.active {
+        app.push_message(
+            LogLevel::Warn,
+            format!("Disconnect profile '{}' first", active.profile_name),
+        );
+        return;
+    }
 
     app.vpn.status_known = false;
     match client.request(&Request::VpnActivate { name }).await {
         Ok(Response::VpnActivated { active }) => {
+            app.vpn.error = None;
             app.push_message(
                 LogLevel::Info,
                 format!(
@@ -824,13 +861,14 @@ async fn vpn_deactivate(app: &mut TuiApp, client: &ApiClient) {
     if !app.vpn.status_known {
         app.push_message(
             LogLevel::Warn,
-            "Refresh standalone status before disconnecting",
+            "Refresh VPN connection status before disconnecting",
         );
         return;
     }
     app.vpn.status_known = false;
     match client.request(&Request::VpnDeactivate).await {
         Ok(Response::VpnDeactivated) => {
+            app.vpn.error = None;
             app.push_message(LogLevel::Info, "VPN disconnected");
             app.vpn.active = None;
             app.vpn.status_known = true;

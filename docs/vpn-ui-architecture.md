@@ -49,12 +49,17 @@ forwarding in VPN mode.
 
 ## Guarantees preserved by the UI
 
-1. Opening a profile does not activate it. The card pins its name, so list
+1. Enter on the profile list and the Connect/Disconnect button operate directly
+   on the selected connection. Open profile is a separate details action and does
+   not activate it. The card pins its name, so list
    refreshes cannot silently retarget profile actions or deletion confirmation.
 2. Standalone connect/disconnect only operates on `tm-wg0`. Selecting another
-   profile never implicitly disconnects or replaces the active profile. Profiles
-   in the saved chain direct the operator to Route. A separately active standalone
-   instance can still be disconnected through its own profile.
+   profile never implicitly disconnects or replaces the active profile. Connecting
+   enables a disabled subsystem through SetVpnEnabled, reads VpnStatus, then calls
+   VpnActivate only if no connection is active. Failed or uncertain enable/status
+   results stop this sequence. There is no automatic compensation or mutation retry.
+   Chain membership does not redirect or block connection: per-hop managers own
+   separate interfaces. The daemon remains responsible for resource conflicts.
 3. Chain edits continue through the existing Uplink / VPN editor and shared Route
    draft. The existing plan, confirmation deadline, rollback and recovery flow
    remain in force. Navigating from a profile to Route preserves a staged draft.
@@ -74,7 +79,12 @@ forwarding in VPN mode.
    delete saved profiles. Production startup builds the profile control plane
    while disabled, so the library remains available; an unavailable runtime or
    failed read is displayed as unavailable rather than an empty library.
-7. Reads are separate observations, not an atomic network snapshot. Failed reads
+7. Basic list refresh reads VPN availability, profiles and runtime status without
+   querying Route. Saved-chain usage is fetched only for profile details, and is
+   never a prerequisite for connection. Reads are separate observations, not an
+   atomic network snapshot. Cancelling a background refresh for user input keeps
+   the previous observation; completed reads replace it together, without clearing
+   connection availability midway through a refresh. Failed reads
    preserve useful partial data but invalidate current standalone status and saved
    chain usage. An uncertain connect/disconnect result requires a successful status
    refresh before another standalone mutation. Selection survives refresh by name.
