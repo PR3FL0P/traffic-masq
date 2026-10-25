@@ -1711,3 +1711,32 @@ async fn sharing_apply_carries_the_reviewed_revision_and_observation() {
     assert_eq!(app.screen, Screen::RouterPlan);
     assert!(app.router.plan.is_some());
 }
+
+#[tokio::test]
+async fn vpn_confirmation_returns_to_policy_without_discarding_a_router_draft() {
+    let mut app = TuiApp::default();
+    app.router.staged = true;
+    let draft = app.router.proposed_router_config.clone();
+    super::pending::open_pending(
+        &mut app,
+        "vpn-token".into(),
+        Screen::VpnPolicy,
+        Some(reviewed_test_plan()),
+    );
+    let (_directory, client, server) = router_mock_api(vec![
+        Response::RouterCommitted { revision: 8 },
+        Response::Error {
+            message: "status unavailable".into(),
+        },
+    ])
+    .await;
+    super::pending::handle_router_pending_key(&mut app, KeyCode::Enter, &client).await;
+    let requests = server.await.unwrap();
+    assert_eq!(requests[0].0, "router_commit");
+    assert_eq!(requests[0].1["token"], "vpn-token");
+    assert_eq!(requests[1].0, "vpn_policy_status");
+    assert_eq!(app.screen, Screen::VpnPolicy);
+    assert!(app.router_pending.is_none());
+    assert!(app.router.staged);
+    assert_eq!(app.router.proposed_router_config, draft);
+}

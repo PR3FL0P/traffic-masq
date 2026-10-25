@@ -1,5 +1,40 @@
 use super::*;
 
+pub(crate) fn open_pending(
+    app: &mut TuiApp,
+    token: String,
+    return_screen: Screen,
+    plan: Option<traffic_masq_protocol::RouterPlanView>,
+) {
+    app.router_pending_plan = plan;
+    app.pending_focus = 0;
+    app.router_pending_return_screen = return_screen;
+    app.router_pending = Some(RouterPendingView {
+        token,
+        applied_at_unix: current_unix_time(),
+        rollback_failure: None,
+        recovery: None,
+        scroll: 0,
+        max_scroll: 0,
+    });
+    app.screen = Screen::RouterPending;
+}
+
+async fn return_after_transaction(app: &mut TuiApp, client: &ApiClient) {
+    app.router_pending_plan = None;
+    app.screen = app.router_pending_return_screen;
+    match app.screen {
+        Screen::Vpn | Screen::VpnProfile | Screen::VpnSettings => {
+            super::super::vpn::load_vpn_data(app, client).await
+        }
+        Screen::VpnPolicy => super::super::vpn_policy::refresh_vpn_policy_status(app, client).await,
+        _ => {
+            app.router.staged = false;
+            load_router_data(app, client).await;
+        }
+    }
+}
+
 pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
     if app
         .router_pending
@@ -50,6 +85,24 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
             format!("Applied temporarily — awaiting confirmation. Rollback in {remaining}s / {timeout}s")
         }),
     ];
+    if let Some(vpn) = app
+        .router_pending_plan
+        .as_ref()
+        .and_then(|plan| plan.vpn_chain.standalone.as_ref())
+    {
+        detail_lines.push(Line::from(format!(
+            "Standalone VPN: {}",
+            vpn.profile.as_deref().unwrap_or("disconnected")
+        )));
+        detail_lines.push(Line::from(format!(
+            "Traffic policy: {}",
+            if vpn.protected_traffic {
+                "VPN"
+            } else {
+                "Direct"
+            }
+        )));
+    }
     detail_lines.extend(interface_lines);
     if let Some(recovery) = &view.recovery {
         detail_lines.push(Line::from(""));
@@ -308,16 +361,12 @@ async fn finish_router_pending(app: &mut TuiApp, client: &ApiClient, commit: boo
                 format!("Router changes applied and saved (revision {revision})"),
             );
             app.router_pending = None;
-            app.router.staged = false;
-            app.screen = Screen::Router;
-            load_router_data(app, client).await;
+            return_after_transaction(app, client).await;
         }
         Ok(Response::RouterRolledBack) if !commit => {
             app.push_message(LogLevel::Info, "Router transaction rolled back");
             app.router_pending = None;
-            app.router.staged = false;
-            app.screen = Screen::Router;
-            load_router_data(app, client).await;
+            return_after_transaction(app, client).await;
         }
         Ok(Response::RouterError { detail }) => {
             let rollback_failed = matches!(
@@ -368,10 +417,8 @@ pub(crate) async fn refresh_router_pending_screen(app: &mut TuiApp, client: &Api
             ..
         }) => {
             app.router_pending = None;
-            app.router.staged = false;
             if app.screen == Screen::RouterPending {
-                app.screen = Screen::Router;
-                load_router_data(app, client).await;
+                return_after_transaction(app, client).await;
             }
         }
         Ok(Response::RouterPendingTransaction {

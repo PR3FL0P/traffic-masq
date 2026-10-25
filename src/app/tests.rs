@@ -578,6 +578,7 @@ fn vpn_policy_startup_config() -> AppConfig {
         ..RouterConfig::default()
     };
     config.vpn = VpnConfig {
+        standalone: None,
         enabled: true,
         wireguard_config_dir: std::path::PathBuf::from("/var/lib/traffic-masq/vpn/wireguard"),
         wireguard_import_dir: "/etc/wireguard".into(),
@@ -1626,6 +1627,49 @@ async fn apply_vpn_policy_startup_does_not_touch_legacy_policy_when_router_chain
     config.router.vpn_chain = vec![crate::config::VpnHopConfig {
         profile_name: "chain.conf".to_string(),
     }];
+    let state_dir = tempdir().expect("state dir");
+    let overrides = RuntimeOverrideManager::load(state_dir.path(), &config)
+        .await
+        .expect("overrides");
+    overrides
+        .set_vpn_mode(crate::config::VpnPolicyMode::Vpn)
+        .await
+        .expect("persist vpn mode");
+
+    let network = Arc::new(FakeNetworkProvider::default());
+    network.add_interface(OWNED_INTERFACE_NAME, 42).await;
+    let firewall_executor = FakeNftExecutor::with_responses(vec![
+        Ok(nft_ruleset(None)),
+        Ok(nft_ruleset(None)),
+        Ok(Vec::new()),
+    ]);
+    let (tunnel, _dir) = fake_vpn_manager();
+    tunnel
+        .import_profile("home.conf", valid_vpn_profile().as_bytes())
+        .expect("import");
+    tunnel.activate("home.conf").await.expect("tunnel activate");
+    let vpn_manager = Some(tunnel);
+
+    apply_vpn_policy_startup(
+        &config,
+        &overrides,
+        network.clone(),
+        firewall_executor,
+        &vpn_manager,
+    )
+    .await;
+
+    assert!(network.rules.lock().await.is_empty());
+    assert!(network.routes.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn apply_vpn_policy_startup_does_not_touch_legacy_policy_when_standalone_intent_is_coordinator_owned(
+) {
+    let mut config = vpn_policy_startup_config();
+    config.vpn.standalone = Some(crate::config::StandaloneVpnIntent {
+        profile: Some("home.conf".into()),
+    });
     let state_dir = tempdir().expect("state dir");
     let overrides = RuntimeOverrideManager::load(state_dir.path(), &config)
         .await

@@ -223,7 +223,7 @@ pub(crate) fn render_vpn(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
     }
     if app.screen == Screen::VpnSettings {
         lines.extend([
-            Line::from("Enable/disable changes subsystem availability and is saved immediately."),
+            Line::from("Enable/disable requires confirmation; without it, changes roll back."),
             Line::from("To disable: remove the saved chain in Route, select Direct policy,"),
             Line::from("then disconnect the standalone tunnel. This is not an emergency stop."),
             Line::from("Saved profiles remain in the library while VPN is disabled."),
@@ -258,7 +258,7 @@ pub(crate) fn render_vpn(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
                 )));
             }
             lines.push(Line::from(
-                "Connect/disconnect applies immediately to tm-wg0. Chain tunnels are separate.",
+                "Connect/disconnect uses a confirmed router transaction. Chain tunnels are separate.",
             ));
             if let Some(active) = &app.vpn.active {
                 if active.profile_name != name && app.vpn.status_known {
@@ -611,6 +611,20 @@ async fn set_vpn_enabled(app: &mut TuiApp, client: &ApiClient, enabled: bool) ->
     app.vpn.enabled = None;
     app.vpn.status_known = false;
     match client.request(&Request::SetVpnEnabled { enabled }).await {
+        Ok(Response::RouterError { detail }) => {
+            app.push_message(
+                LogLevel::Error,
+                super::router::describe_router_error(&detail),
+            );
+        }
+        Ok(Response::RouterTransactionPending { token, plan }) => {
+            super::router::open_pending(app, token, app.screen, Some(plan));
+            app.push_message(
+                LogLevel::Info,
+                "VPN availability applied temporarily; confirm before connecting a profile",
+            );
+            return false;
+        }
         Ok(Response::VpnConfig { enabled: actual }) if actual == enabled => {
             app.vpn.enabled = Some(enabled);
             app.push_message(
@@ -845,6 +859,16 @@ async fn vpn_activate_selected(app: &mut TuiApp, client: &ApiClient) {
 
     app.vpn.status_known = false;
     match client.request(&Request::VpnActivate { name }).await {
+        Ok(Response::RouterError { detail }) => {
+            app.push_message(
+                LogLevel::Error,
+                super::router::describe_router_error(&detail),
+            );
+        }
+        Ok(Response::RouterTransactionPending { token, plan }) => {
+            super::router::open_pending(app, token, app.screen, Some(plan));
+        }
+        Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
         Ok(Response::VpnActivated { active }) => {
             app.vpn.error = None;
             app.push_message(
@@ -878,6 +902,16 @@ async fn vpn_deactivate(app: &mut TuiApp, client: &ApiClient) {
     }
     app.vpn.status_known = false;
     match client.request(&Request::VpnDeactivate).await {
+        Ok(Response::RouterError { detail }) => {
+            app.push_message(
+                LogLevel::Error,
+                super::router::describe_router_error(&detail),
+            );
+        }
+        Ok(Response::RouterTransactionPending { token, plan }) => {
+            super::router::open_pending(app, token, app.screen, Some(plan));
+        }
+        Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
         Ok(Response::VpnDeactivated) => {
             app.vpn.error = None;
             app.push_message(LogLevel::Info, "VPN disconnected");

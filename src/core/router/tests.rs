@@ -383,6 +383,7 @@ fn plan_with_vpn_chain() -> RouterPlan {
     let desired = RouterDesired::from_effective_config(&config).unwrap();
     let mut plan = plan();
     plan.vpn_chain = VpnChainPlan {
+        standalone: None,
         hops: desired.vpn_chain.clone(),
     };
     plan.dataplane.target = desired.dataplane.clone();
@@ -633,6 +634,7 @@ async fn crash_recovery_restores_all_stages_with_dhcp_around_interfaces() {
     let mut snapshot = manager.snapshot_for(&plan.desired).await.unwrap();
     let hop = plan.vpn_chain.hops[0].clone();
     snapshot.vpn_chain = VpnChainSnapshot {
+        standalone: None,
         hops: vec![hop.interface.clone()],
         previous_hops: vec![hop],
     };

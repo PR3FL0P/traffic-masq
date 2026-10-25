@@ -375,6 +375,8 @@ pub struct WifiClientConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VpnConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standalone: Option<StandaloneVpnIntent>,
     #[serde(default)]
     pub enabled: bool,
     pub wireguard_config_dir: PathBuf,
@@ -383,6 +385,13 @@ pub struct VpnConfig {
 
     #[serde(default)]
     pub policy: VpnTrafficPolicyConfig,
+}
+
+/// Confirmed standalone tunnel selection; `profile: None` explicitly means disconnected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StandaloneVpnIntent {
+    pub profile: Option<String>,
 }
 
 fn default_wireguard_import_dir() -> PathBuf {
@@ -1186,6 +1195,7 @@ impl Default for AppConfig {
             wifi: WifiConfig::default(),
             wifi_client: WifiClientGlobalConfig::default(),
             vpn: VpnConfig {
+                standalone: None,
                 enabled: false,
                 wireguard_config_dir: PathBuf::from("/var/lib/traffic-masq/vpn/wireguard"),
                 wireguard_import_dir: "/etc/wireguard".into(),

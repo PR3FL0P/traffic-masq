@@ -619,7 +619,7 @@ pub(super) fn format_forwarding_status(
     format!("{forwarding}, {nat}, {apply}")
 }
 
-pub(super) fn describe_router_error(detail: &RouterErrorDetail) -> String {
+pub(crate) fn describe_router_error(detail: &RouterErrorDetail) -> String {
     match detail {
         RouterErrorDetail::RouterDisabled => {
             "Router has no committed intent yet; configure Forwarding / NAT".to_string()

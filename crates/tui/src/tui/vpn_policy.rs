@@ -51,7 +51,7 @@ const VPN_POLICY_APPLY_LABEL: &str = "Apply selected mode";
 const VPN_POLICY_CLEAR_LABEL: &str = "Clear override";
 const VPN_POLICY_RELOAD_LABEL: &str = "Reload";
 
-/// This legacy mode is a separate immediate operation, never part of a router draft.
+/// Standalone policy uses the router coordinator, separately from a local router draft.
 pub(crate) async fn open(app: &mut TuiApp, client: &ApiClient) {
     match client.request(&Request::GetRouterConfig).await {
         Ok(Response::RouterConfig { config }) if config.vpn_chain.is_empty() => {}
@@ -74,7 +74,7 @@ pub(crate) async fn open(app: &mut TuiApp, client: &ApiClient) {
 pub(crate) fn render_vpn_policy(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
     let data = &app.vpn_policy;
     let mut lines = vec![
-        Line::styled("Standalone policy (tm-wg0): applies immediately, outside the Route draft.", Style::default().fg(theme::WARN)),
+        Line::styled("Standalone policy (tm-wg0): apply temporarily, then confirm to save.", Style::default().fg(theme::WARN)),
         Line::from("Unavailable with a saved global VPN chain. Tunnel up does not prove traffic protection."),
     ];
     let stale = data.read_error.is_some() || data.error.is_some();
@@ -107,7 +107,7 @@ pub(crate) fn render_vpn_policy(frame: &mut ratatui::Frame<'_>, area: Rect, app:
                 Style::default().fg(theme::MUTED),
             ));
         }
-        let block = panel("Standalone VPN policy — immediate");
+        let block = panel("Standalone VPN policy — confirmation required");
         let inner = block.inner(area);
         frame.render_widget(block, area);
         let regions = ratatui::layout::Layout::vertical([
@@ -254,7 +254,7 @@ pub(crate) fn render_vpn_policy(frame: &mut ratatui::Frame<'_>, area: Rect, app:
         Line::styled(format!("{marker}{label}"), style)
     };
 
-    let block = panel("Standalone VPN policy — immediate");
+    let block = panel("Standalone VPN policy — confirmation required");
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let chunks = ratatui::layout::Layout::vertical([
@@ -377,6 +377,16 @@ async fn read_policy(app: &mut TuiApp, client: &ApiClient, initialize: bool) {
 async fn vpn_policy_set_mode(app: &mut TuiApp, client: &ApiClient) {
     let mode = app.vpn_policy.pending_mode;
     match client.request(&Request::VpnPolicySetMode { mode }).await {
+        Ok(Response::RouterError { detail }) => {
+            app.push_message(
+                LogLevel::Error,
+                super::router::describe_router_error(&detail),
+            );
+        }
+        Ok(Response::RouterTransactionPending { token, plan }) => {
+            super::router::open_pending(app, token, Screen::VpnPolicy, Some(plan));
+        }
+        Ok(Response::Error { message }) => policy_action_error(app, message),
         Ok(Response::VpnPolicyStatus { status }) => {
             app.push_message(
                 LogLevel::Info,
@@ -403,6 +413,16 @@ async fn vpn_policy_set_mode(app: &mut TuiApp, client: &ApiClient) {
 
 async fn vpn_policy_clear_mode(app: &mut TuiApp, client: &ApiClient) {
     match client.request(&Request::VpnPolicyClearMode).await {
+        Ok(Response::RouterError { detail }) => {
+            app.push_message(
+                LogLevel::Error,
+                super::router::describe_router_error(&detail),
+            );
+        }
+        Ok(Response::RouterTransactionPending { token, plan }) => {
+            super::router::open_pending(app, token, Screen::VpnPolicy, Some(plan));
+        }
+        Ok(Response::Error { message }) => policy_action_error(app, message),
         Ok(Response::VpnPolicyStatus { status }) => {
             app.push_message(LogLevel::Info, "VPN traffic policy mode override cleared");
             app.vpn_policy.pending_mode = status.mode;

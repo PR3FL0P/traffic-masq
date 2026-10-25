@@ -137,7 +137,15 @@ pub struct VpnHopDesiredView {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct VpnChainPlanView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standalone: Option<StandaloneVpnPlanView>,
     pub hops: Vec<VpnHopDesiredView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StandaloneVpnPlanView {
+    pub profile: Option<String>,
+    pub protected_traffic: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,4 +1,3 @@
-use super::runtime::compensation_message;
 use super::*;
 use crate::api::model::{VpnActiveStatus, VpnProfileSummary};
 
@@ -59,12 +58,47 @@ impl ControlService {
                 Ok(None) => {}
             }
         }
-        match self.overrides.set_vpn_enabled(enabled).await {
-            Ok(()) => self.vpn_config().await,
-            Err(error) => Response::Error {
-                message: error.to_string(),
-            },
+        let profile = match self.current_standalone_profile().await {
+            Ok(profile) => profile,
+            Err(response) => return response,
+        };
+        self.apply_standalone_vpn(enabled, profile, self.overrides.snapshot().await.vpn_mode)
+            .await
+    }
+
+    async fn apply_standalone_vpn(
+        &self,
+        enabled: bool,
+        profile: Option<String>,
+        mode: Option<VpnPolicyMode>,
+    ) -> Response {
+        if self.vpn.is_none() {
+            return vpn_disabled();
         }
+        let effective = match self.effective_config().await {
+            Ok(config) => config,
+            Err(message) => return Response::Error { message },
+        };
+        if !effective.router.vpn_chain.is_empty() {
+            return Response::Error { message: "a router VPN chain is configured; use Router settings and its confirmed transaction".into() };
+        }
+        let proposal = crate::core::router_candidate::RouterIntentProposal::new()
+            .set_standalone_vpn(enabled, profile, mode);
+        let candidate = match self.overrides.build_candidate(&proposal).await {
+            Ok(candidate) => candidate,
+            Err(error) => return super::runtime::error_response(error),
+        };
+        self.apply_router_candidate(candidate).await
+    }
+
+    async fn current_standalone_profile(&self) -> Result<Option<String>, Response> {
+        let Some(vpn) = &self.vpn else {
+            return Err(vpn_disabled());
+        };
+        vpn.status()
+            .await
+            .map(|status| status.map(|status| status.profile_name))
+            .map_err(classify_vpn_error)
     }
 
     async fn vpn_is_enabled(&self) -> bool {
@@ -168,7 +202,11 @@ impl ControlService {
         let desired = self.current_router_desired().await.map_err(|error| {
             format!("cannot verify whether VPN profile '{name}' is used by the router: {error:?}")
         })?;
-        Ok(desired.vpn_chain.iter().any(|hop| hop.profile_name == name))
+        Ok(desired.vpn_chain.iter().any(|hop| hop.profile_name == name)
+            || desired
+                .standalone_vpn
+                .as_ref()
+                .is_some_and(|vpn| vpn.profile.as_deref() == Some(name)))
     }
 
     pub(super) async fn vpn_status(&self) -> Response {
@@ -190,34 +228,28 @@ impl ControlService {
         if !self.vpn_is_enabled().await {
             return vpn_disabled();
         }
-        let Some(vpn) = &self.vpn else {
-            return vpn_disabled();
-        };
-        if let Err(error) = vpn.activate(&name).await {
-            return classify_vpn_error(error);
-        }
-        match vpn.status().await {
-            Ok(Some(active)) => Response::VpnActivated {
-                active: vpn_active_status(active),
-            },
-            Ok(None) => {
-                tracing::error!("VPN activation reported success but no interface is active");
-                Response::Error {
-                    message: "VPN activation succeeded but left no active interface".to_string(),
+        if let Some(vpn) = &self.vpn {
+            match vpn.snapshot_profile().await {
+                Err(error) => return classify_vpn_error(error),
+                Ok(Some(active)) if active == name => {
+                    return vpn_error(VpnErrorDetail::AlreadyActive)
                 }
+                Ok(_) => {}
             }
-            Err(error) => classify_vpn_error(error),
         }
+        self.apply_standalone_vpn(true, Some(name), self.overrides.snapshot().await.vpn_mode)
+            .await
     }
 
     pub(super) async fn vpn_deactivate(&self) -> Response {
-        let Some(vpn) = &self.vpn else {
-            return vpn_disabled();
-        };
-        match vpn.deactivate().await {
-            Ok(()) => Response::VpnDeactivated,
-            Err(error) => classify_vpn_error(error),
+        if self.overrides.effective_vpn_mode().await == VpnPolicyMode::Vpn {
+            return Response::Error {
+                message: "Select and confirm Direct traffic policy before disconnecting VPN".into(),
+            };
         }
+        let enabled = self.vpn_is_enabled().await;
+        self.apply_standalone_vpn(enabled, None, self.overrides.snapshot().await.vpn_mode)
+            .await
     }
 
     pub(super) async fn vpn_policy_status(&self) -> Response {
@@ -275,163 +307,26 @@ impl ControlService {
         }
     }
 
-    pub(super) async fn vpn_policy_apply_mode(
-        &self,
-        policy: &VpnPolicyManager<WireGuardVpnDriver, Arc<dyn NftExecutor>>,
-        effective: &AppConfig,
-        target: VpnPolicyMode,
-    ) -> Result<(), Response> {
-        match target {
-            VpnPolicyMode::Vpn => {
-                let Some(desired) = vpn_policy_desired(effective) else {
-                    return Err(vpn_policy_error(VpnPolicyErrorDetail::NoProtectedSubnets));
-                };
-                policy
-                    .activate(&desired)
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| vpn_policy_error(classify_vpn_policy_error(&error)))
-            }
-            VpnPolicyMode::Direct => {
-                let desired =
-                    vpn_policy_desired(effective).unwrap_or_else(vpn_policy_teardown_target);
-                policy.deactivate(&desired).await.map_err(|error| {
-                    vpn_policy_error(VpnPolicyErrorDetail::Other {
-                        message: error.to_string(),
-                    })
-                })
-            }
-        }
-    }
-
     pub(super) async fn vpn_policy_set_mode(&self, mode: VpnPolicyMode) -> Response {
         if !self.vpn_is_enabled().await {
             return vpn_policy_disabled();
         }
-        let (Some(policy), Some(_vpn)) = (&self.vpn_policy, &self.vpn) else {
-            return vpn_policy_disabled();
+        let profile = match self.current_standalone_profile().await {
+            Ok(profile) => profile,
+            Err(response) => return response,
         };
-        // Coexistence-window guard (Landing 1): `vpn_policy_set_mode` bypasses
-        // `RouterTransactionCoordinator` entirely, so it must not race a
-        // pending chain transaction over the same hop-0 reserved-ID band.
-        // Refuse outright while a transaction is
-        // pending or stuck in a failed rollback rather than letting the two
-        // non-coordinated mutation paths touch the same resources at once.
-        if let Some(router) = &self.router {
-            match router.status().await {
-                crate::core::router_transaction::CoordinatorStatus::Idle => {}
-                crate::core::router_transaction::CoordinatorStatus::Pending
-                | crate::core::router_transaction::CoordinatorStatus::CommitIndeterminate
-                | crate::core::router_transaction::CoordinatorStatus::RecoveryRequired
-                | crate::core::router_transaction::CoordinatorStatus::RollbackFailed | crate::core::router_transaction::CoordinatorStatus::RecoveredButJournalCleanupPending => {
-                    return vpn_policy_error(VpnPolicyErrorDetail::Other {
-                        message: "a router transaction is pending; refusing to change VPN mode \
-                                  until it commits or rolls back"
-                            .to_string(),
-                    });
-                }
-            }
-        }
-        let effective = match self.effective_config().await {
-            Ok(effective) => effective,
-            Err(error) => return vpn_policy_error(VpnPolicyErrorDetail::Other { message: error }),
-        };
-        if !effective.router.vpn_chain.is_empty() {
-            return vpn_policy_error(VpnPolicyErrorDetail::Other {
-                message: "a router VPN chain is configured; legacy VPN policy mode cannot \
-                          mutate its reserved routing namespace"
-                    .to_string(),
-            });
-        }
-        let rollback_desired = match vpn_policy_desired_for_mode(&effective, mode) {
-            Ok(desired) => desired,
-            Err(detail) => return vpn_policy_error(detail),
-        };
-        let snapshot = match policy.snapshot(&rollback_desired).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => return vpn_policy_error(classify_vpn_policy_error(&error)),
-        };
-        if let Err(response) = self.vpn_policy_apply_mode(policy, &effective, mode).await {
-            return response;
-        }
-        if let Err(error) = self.overrides.set_vpn_mode(mode).await {
-            if crate::atomic_file::is_indeterminate_write(&error) {
-                return vpn_policy_error(VpnPolicyErrorDetail::Other {
-                    message: format!("{error:#}"),
-                });
-            }
-            let rollback = policy.rollback(&rollback_desired, &snapshot).await;
-            return vpn_policy_error(VpnPolicyErrorDetail::Other {
-                message: compensation_message(
-                    "failed to persist VPN policy mode",
-                    &error,
-                    rollback,
-                ),
-            });
-        }
-        self.vpn_policy_status().await
+        self.apply_standalone_vpn(true, profile, Some(mode)).await
     }
 
     pub(super) async fn vpn_policy_clear_mode(&self) -> Response {
         if !self.vpn_is_enabled().await {
             return vpn_policy_disabled();
         }
-        let (Some(policy), Some(_vpn)) = (&self.vpn_policy, &self.vpn) else {
-            return vpn_policy_disabled();
+        let profile = match self.current_standalone_profile().await {
+            Ok(profile) => profile,
+            Err(response) => return response,
         };
-        let effective = match self.effective_config().await {
-            Ok(effective) => effective,
-            Err(error) => return vpn_policy_error(VpnPolicyErrorDetail::Other { message: error }),
-        };
-        if !effective.router.vpn_chain.is_empty() {
-            return vpn_policy_error(VpnPolicyErrorDetail::Other {
-                message: "a router VPN chain is configured; legacy VPN policy mode cannot \
-                          mutate its reserved routing namespace"
-                    .to_string(),
-            });
-        }
-        let target = effective.vpn.policy.default_mode;
-        let rollback_desired = match vpn_policy_desired_for_mode(&effective, target) {
-            Ok(desired) => desired,
-            Err(detail) => return vpn_policy_error(detail),
-        };
-        let snapshot = match policy.snapshot(&rollback_desired).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => return vpn_policy_error(classify_vpn_policy_error(&error)),
-        };
-        if let Err(response) = self.vpn_policy_apply_mode(policy, &effective, target).await {
-            return response;
-        }
-        if let Err(error) = self.overrides.clear_vpn_mode().await {
-            if crate::atomic_file::is_indeterminate_write(&error) {
-                return vpn_policy_error(VpnPolicyErrorDetail::Other {
-                    message: format!("{error:#}"),
-                });
-            }
-            let rollback = policy.rollback(&rollback_desired, &snapshot).await;
-            return vpn_policy_error(VpnPolicyErrorDetail::Other {
-                message: compensation_message(
-                    "failed to clear VPN policy mode override",
-                    &error,
-                    rollback,
-                ),
-            });
-        }
-        self.vpn_policy_status().await
-    }
-}
-
-fn vpn_policy_desired_for_mode(
-    effective: &AppConfig,
-    target: VpnPolicyMode,
-) -> Result<crate::core::vpn_policy_manager::VpnPolicyDesired, VpnPolicyErrorDetail> {
-    match target {
-        VpnPolicyMode::Vpn => {
-            vpn_policy_desired(effective).ok_or(VpnPolicyErrorDetail::NoProtectedSubnets)
-        }
-        VpnPolicyMode::Direct => {
-            Ok(vpn_policy_desired(effective).unwrap_or_else(vpn_policy_teardown_target))
-        }
+        self.apply_standalone_vpn(true, profile, None).await
     }
 }
 

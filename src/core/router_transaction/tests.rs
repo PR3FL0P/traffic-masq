@@ -618,7 +618,7 @@ async fn unsupported_uncommitted_router_schema_reports_versions_and_action() {
     assert!(diagnostic.contains("recovery_code=TM-REC-205"));
     assert!(diagnostic.contains("invariant=supported_schema"));
     assert!(diagnostic.contains("journal_schema=999"));
-    assert!(diagnostic.contains("supported_schemas=2"));
+    assert!(diagnostic.contains("supported_schemas=2,3"));
     assert!(diagnostic.contains("operator_action=use_compatible_daemon"));
 }
 

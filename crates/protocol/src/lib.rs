@@ -36,9 +36,9 @@ pub use router_plan::{
     hop_interface_name, DhcpClientSpecView, DhcpPlanView, Ipv4RouteInfoView, Ipv4RouteSpecView,
     OwnedFirewallIntegrityView, RoutePlanView, RouterDataplaneDesiredView, RouterDataplanePlanView,
     RouterDataplaneSnapshotView, RouterDataplaneTargetView, RouterDesiredView,
-    RouterInterfaceDesiredView, RouterPlanView, RouterRiskView, VpnChainPlanView,
-    VpnHopDesiredView, VpnHopKindView, VpnHopRoutingDesiredView, VpnPolicyDesiredView,
-    VpnPolicyReservedIdsView, WifiPlanView,
+    RouterInterfaceDesiredView, RouterPlanView, RouterRiskView, StandaloneVpnPlanView,
+    VpnChainPlanView, VpnHopDesiredView, VpnHopKindView, VpnHopRoutingDesiredView,
+    VpnPolicyDesiredView, VpnPolicyReservedIdsView, WifiPlanView,
 };
 pub use wifi_observation::{
     MacAddr, MacAddrParseError, Station, WpaSupplicantScanResult, WpaSupplicantScanSecurity,

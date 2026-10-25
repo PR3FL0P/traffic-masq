@@ -172,6 +172,13 @@ pub(crate) fn render_router_plan(frame: &mut ratatui::Frame<'_>, area: Rect, app
             summarize_uplink(&plan.dataplane.target)
         )),
     ];
+    if let Some(vpn) = &plan.vpn_chain.standalone {
+        lines.push(Line::from(format!(
+            "Standalone VPN: {} · protected traffic: {}",
+            vpn.profile.as_deref().unwrap_or("disconnected"),
+            vpn.protected_traffic
+        )));
+    }
     let mut status_configs = vec![&app.router.proposed_router_config];
     if let Some(saved) = &app.router.saved_router_config {
         status_configs.push(saved);
@@ -644,17 +651,8 @@ async fn router_apply_current_plan(app: &mut TuiApp, client: &ApiClient) {
         proposal.expected_fingerprint = plan.observation_fingerprint.clone();
     }
     match client.request(&Request::RouterApply { proposal }).await {
-        Ok(Response::RouterTransactionPending { token, .. }) => {
-            app.pending_focus = 0;
-            app.router_pending = Some(RouterPendingView {
-                token,
-                applied_at_unix: current_unix_time(),
-                rollback_failure: None,
-                recovery: None,
-                scroll: 0,
-                max_scroll: 0,
-            });
-            app.screen = Screen::RouterPending;
+        Ok(Response::RouterTransactionPending { token, plan }) => {
+            super::open_pending(app, token, Screen::Router, Some(plan));
         }
         Ok(Response::RouterError { detail }) => {
             app.push_message(LogLevel::Error, describe_router_error(&detail));

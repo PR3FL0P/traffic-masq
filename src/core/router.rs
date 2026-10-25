@@ -30,6 +30,8 @@ pub struct RouterInterfaceDesired {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouterDesired {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standalone_vpn: Option<StandaloneVpnDesired>,
     pub enabled: bool,
     pub uplink_wifi: Option<WifiClientSpec>,
 
@@ -44,6 +46,12 @@ pub struct RouterDesired {
     pub vpn_chain: Vec<VpnHopDesired>,
     pub dataplane: RouterDataplaneTarget,
     pub interfaces: Vec<RouterInterfaceDesired>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StandaloneVpnDesired {
+    pub profile: Option<String>,
+    pub policy: Option<VpnPolicyDesired>,
 }
 
 impl RouterDesired {
@@ -90,15 +98,54 @@ impl RouterDesired {
     }
 
     fn from_validated_config(config: &AppConfig) -> Result<Self> {
+        for route in &config.router.owned_routes {
+            anyhow::ensure!(
+                !crate::core::route::reserved_vpn_table(route.table),
+                "routing table {} is reserved for VPN policy",
+                route.table
+            );
+        }
         if config.router.is_active() && !config.vpn.enabled && !config.router.vpn_chain.is_empty() {
             anyhow::bail!("Enable VPN before enabling a router VPN chain");
         }
+        let standalone_vpn = config
+            .vpn
+            .standalone
+            .as_ref()
+            .map(|intent| -> Result<_> {
+                if !config.router.vpn_chain.is_empty() {
+                    anyhow::ensure!(intent.profile.is_none() && config.vpn.policy.default_mode == crate::config::VpnPolicyMode::Direct,
+                        "disconnect standalone VPN and confirm Direct policy before configuring a router VPN chain");
+                    return Ok(None);
+                }
+                anyhow::ensure!(
+                    config.vpn.enabled || intent.profile.is_none(),
+                    "enable VPN before connecting a profile"
+                );
+                let policy = if config.vpn.policy.default_mode == crate::config::VpnPolicyMode::Vpn
+                {
+                    anyhow::ensure!(
+                        config.vpn.enabled && intent.profile.is_some(),
+                        "VPN policy requires an enabled, connected profile"
+                    );
+                    Some(
+                        crate::core::vpn_policy_manager::vpn_policy_desired(config).ok_or_else(
+                            || anyhow::anyhow!("VPN policy has no protected subnets"),
+                        )?,
+                    )
+                } else {
+                    None
+                };
+                Ok(Some(StandaloneVpnDesired { profile: intent.profile.clone(), policy }))
+            })
+            .transpose()?.flatten();
         let mut dhcp = DhcpSupervisor::service_specs(config)?;
         dhcp.sort_by(|left, right| left.interface.cmp(&right.interface));
 
         if !config.router.is_active() {
             return Ok(Self {
                 enabled: false,
+                standalone_vpn,
                 uplink_wifi: None,
                 uplink_dhcp: None,
                 output_wifi: Vec::new(),
@@ -225,6 +272,7 @@ impl RouterDesired {
 
         Ok(Self {
             enabled: true,
+            standalone_vpn,
             uplink_wifi,
             uplink_dhcp,
             output_wifi,
@@ -328,6 +376,8 @@ pub struct WifiSnapshot<T> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct VpnChainPlan {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standalone: Option<StandaloneVpnDesired>,
     pub hops: Vec<VpnHopDesired>,
 }
 
@@ -339,6 +389,8 @@ impl VpnChainPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default, Deserialize)]
 pub struct VpnChainSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standalone: Option<StandaloneVpnSnapshot>,
     /// The interfaces (by name) that were active hops before this
     /// transaction started, in the same order they were applied.
     pub hops: Vec<String>,
@@ -347,6 +399,13 @@ pub struct VpnChainSnapshot {
     /// (profile, kind, reserved IDs) rather than only knowing the names of
     /// the interfaces that used to exist.
     pub previous_hops: Vec<VpnHopDesired>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StandaloneVpnSnapshot {
+    pub interface_index: Option<u32>,
+    pub profile: Option<String>,
+    pub policy: crate::core::vpn_policy_manager::VpnPolicySnapshot,
 }
 
 impl VpnChainSnapshot {
@@ -418,7 +477,7 @@ pub trait RouterSubsystems: Send + Sync {
     /// An implementation without VPN support safely no-ops for an empty
     /// chain and errors when the desired state needs one.
     async fn plan_vpn_chain(&self, desired: &RouterDesired) -> Result<VpnChainPlan> {
-        if !desired.vpn_chain.is_empty() {
+        if !desired.vpn_chain.is_empty() || desired.standalone_vpn.is_some() {
             anyhow::bail!("VPN chain runtime is unavailable")
         }
         Ok(VpnChainPlan::empty())
@@ -474,7 +533,7 @@ pub trait RouterSubsystems: Send + Sync {
     /// rollback only ever calls `rollback_vpn_chain` once, against the
     /// pre-apply snapshot, never mid-chain state.
     async fn apply_vpn_chain(&self, plan: &VpnChainPlan) -> Result<()> {
-        if !plan.hops.is_empty() {
+        if !plan.hops.is_empty() || plan.standalone.is_some() {
             anyhow::bail!("VPN chain runtime is unavailable")
         }
         Ok(())
@@ -516,7 +575,7 @@ pub trait RouterSubsystems: Send + Sync {
     async fn rollback_dhcp_clients(&self, snapshots: &[DhcpClientSnapshot]) -> Result<()>;
     /// Restore the captured chain using recorded launch ownership; refuse foreign links.
     async fn rollback_vpn_chain(&self, snapshot: &VpnChainSnapshot) -> Result<()> {
-        if !snapshot.hops.is_empty() {
+        if !snapshot.hops.is_empty() || snapshot.standalone.is_some() {
             anyhow::bail!("VPN chain runtime is unavailable")
         }
         Ok(())
@@ -540,7 +599,7 @@ pub trait RouterSubsystems: Send + Sync {
     async fn health_uplink_dhcp(&self, desired: &RouterDesired) -> Option<RouterDhcpHealthReason>;
     async fn health_dataplane(&self, desired: &RouterDesired) -> Result<()>;
     async fn health_vpn_chain(&self, desired: &RouterDesired) -> Result<()> {
-        if !desired.vpn_chain.is_empty() {
+        if !desired.vpn_chain.is_empty() || desired.standalone_vpn.is_some() {
             anyhow::bail!("VPN chain runtime is unavailable")
         }
         Ok(())

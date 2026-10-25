@@ -19,6 +19,8 @@ use crate::vpn::store::WireGuardProfileStore;
 use crate::vpn::wireguard::WireGuardVpnDriver;
 use crate::vpn::{ProductionVpnManager, ReconcileOutcome, VpnManager, VpnProvider};
 
+type StandalonePolicyManager = VpnPolicyManager<WireGuardVpnDriver, Arc<dyn NftExecutor>>;
+
 /// Shared dependencies for constructing the per-hop `VpnManager`/
 /// `VpnPolicyManager` instances the VPN hop chain needs. Kept as a single
 /// optional bundle (rather than several optional fields) because they are
@@ -26,6 +28,7 @@ use crate::vpn::{ProductionVpnManager, ReconcileOutcome, VpnManager, VpnProvider
 /// wire up VPN chaining at all should reject a non-empty chain during
 /// planning or apply, like the optional Wi-Fi runtimes.
 pub struct VpnChainDeps {
+    pub standalone: Option<Arc<ProductionVpnManager>>,
     pub vpn_provider: Arc<dyn VpnProvider>,
     pub wireguard_store: WireGuardProfileStore,
     /// Base directory for per-hop `active-profile-<hop_index>.json` files.
@@ -654,19 +657,153 @@ impl VpnChainRuntime {
         Ok(())
     }
 
-    pub(super) async fn snapshot(&self) -> VpnChainSnapshot {
+    fn standalone_runtime(&self) -> Result<(Arc<ProductionVpnManager>, StandalonePolicyManager)> {
+        let deps = self.require_vpn_chain_deps()?;
+        let tunnel = deps
+            .standalone
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("standalone VPN runtime unavailable"))?;
+        let policy = VpnPolicyManager::new(
+            deps.network.clone(),
+            VpnPolicyFirewallBackend::new(deps.nft_executor.clone()),
+            tunnel.clone(),
+        );
+        Ok((tunnel, policy))
+    }
+
+    pub(super) async fn snapshot(&self, standalone: bool) -> Result<VpnChainSnapshot> {
         let previous = self.vpn_active_chain.read().await.clone();
-        VpnChainSnapshot {
+        let standalone = if standalone {
+            let (tunnel, policy) = self.standalone_runtime()?;
+            let profile = tunnel.snapshot_profile().await?;
+            let interface_index = if profile.is_some() {
+                Some(
+                    self.require_vpn_chain_deps()?
+                        .network
+                        .list_interfaces()
+                        .await?
+                        .into_iter()
+                        .find(|interface| {
+                            interface.name == crate::vpn::manager::OWNED_INTERFACE_NAME
+                        })
+                        .map(|interface| interface.index)
+                        .context("owned VPN interface disappeared during snapshot")?,
+                )
+            } else {
+                None
+            };
+            Some(crate::core::router::StandaloneVpnSnapshot {
+                interface_index,
+                profile,
+                policy: policy
+                    .snapshot(&crate::core::vpn_policy_manager::vpn_policy_teardown_target())
+                    .await?,
+            })
+        } else {
+            None
+        };
+        Ok(VpnChainSnapshot {
+            standalone,
             hops: previous.iter().map(|hop| hop.interface.clone()).collect(),
             previous_hops: previous,
+        })
+    }
+
+    async fn apply_standalone(
+        &self,
+        desired: &crate::core::router::StandaloneVpnDesired,
+    ) -> Result<()> {
+        let (tunnel, policy) = self.standalone_runtime()?;
+        tunnel.reconcile().await?;
+        let current = tunnel.status().await?.map(|status| status.profile_name);
+        if desired.policy.is_none() {
+            policy
+                .deactivate(&crate::core::vpn_policy_manager::vpn_policy_teardown_target())
+                .await?;
         }
+        if current != desired.profile {
+            if current.is_some() {
+                tunnel.deactivate().await?;
+            }
+            if let Some(profile) = &desired.profile {
+                tunnel.activate(profile).await?;
+            }
+        }
+        if let Some(desired) = &desired.policy {
+            policy.activate(desired).await?;
+        }
+        Ok(())
+    }
+
+    async fn rollback_standalone(
+        &self,
+        snapshot: &crate::core::router::StandaloneVpnSnapshot,
+    ) -> Result<()> {
+        let (tunnel, policy) = self.standalone_runtime()?;
+        let mut errors = Vec::new();
+        // A tentative Direct mode may have removed protection. Restore the old
+        // kill switch even if tunnel reconstruction or route replay then fails.
+        if let Err(error) = policy.protect_rollback(&snapshot.policy).await {
+            errors.push(error);
+        }
+        let restoration = async {
+            tunnel.reconcile().await?;
+            let current = tunnel.status().await?.map(|status| status.profile_name);
+            if current != snapshot.profile {
+                if current.is_some() {
+                    tunnel.deactivate().await?;
+                }
+                if let Some(profile) = &snapshot.profile {
+                    tunnel.activate(profile).await?;
+                }
+            }
+            let mut restored_policy = snapshot.policy.clone();
+            if let Some(previous) = snapshot.interface_index {
+                let current = self
+                    .require_vpn_chain_deps()?
+                    .network
+                    .list_interfaces()
+                    .await?
+                    .into_iter()
+                    .find(|interface| interface.name == crate::vpn::manager::OWNED_INTERFACE_NAME)
+                    .map(|interface| interface.index)
+                    .ok_or_else(|| anyhow::anyhow!("restored VPN interface is missing"))?;
+                restored_policy.rebind_interface(previous, current);
+            }
+            policy
+                .rollback(
+                    &crate::core::vpn_policy_manager::vpn_policy_teardown_target(),
+                    &restored_policy,
+                )
+                .await
+        }
+        .await;
+        if let Err(error) = restoration {
+            errors.push(error);
+        }
+        crate::core::recovery_control::aggregate(errors, "standalone VPN rollback was incomplete")
     }
 
     pub(super) async fn plan_vpn_chain(&self, desired: &RouterDesired) -> Result<VpnChainPlan> {
         if !desired.vpn_chain.is_empty() && self.deps.is_none() {
             bail!("VPN chain runtime is unavailable");
         }
+        if !desired.vpn_chain.is_empty() {
+            if let Some(tunnel) = self.deps.as_ref().and_then(|deps| deps.standalone.as_ref()) {
+                anyhow::ensure!(tunnel.snapshot_profile().await?.is_none(),
+                    "disconnect and confirm the standalone VPN before configuring a router VPN chain");
+            }
+        }
+        if let Some(standalone) = &desired.standalone_vpn {
+            self.standalone_runtime()?;
+            if let Some(profile) = &standalone.profile {
+                self.require_vpn_chain_deps()?
+                    .wireguard_store
+                    .read(&crate::vpn::wireguard::WireGuardDriver, profile)?;
+            }
+        }
         Ok(VpnChainPlan {
+            standalone: desired.standalone_vpn.clone(),
             hops: desired.vpn_chain.clone(),
         })
     }
@@ -676,6 +813,9 @@ impl VpnChainRuntime {
     /// compensation failure is returned to the outer transaction instead of
     /// being hidden.
     pub(super) async fn apply_vpn_chain(&self, plan: &VpnChainPlan) -> Result<()> {
+        if let Some(desired) = &plan.standalone {
+            self.apply_standalone(desired).await?;
+        }
         let previous = self.vpn_active_chain.read().await.clone();
 
         if plan.hops.is_empty() {
@@ -760,6 +900,11 @@ impl VpnChainRuntime {
     pub(super) async fn rollback_vpn_chain(&self, snapshot: &VpnChainSnapshot) -> Result<()> {
         let current = self.vpn_active_chain.read().await.clone();
         let mut errors = Vec::new();
+        if let Some(standalone) = &snapshot.standalone {
+            if let Err(error) = self.rollback_standalone(standalone).await {
+                errors.push(format!("standalone VPN: {error:#}"));
+            }
+        }
 
         for hop in current.iter().rev() {
             if let Err(error) = self.deactivate_hop(hop).await {
@@ -791,6 +936,24 @@ impl VpnChainRuntime {
     }
 
     pub(super) async fn health_vpn_chain(&self, desired: &RouterDesired) -> Result<()> {
+        if let Some(desired) = &desired.standalone_vpn {
+            let (tunnel, policy) = self.standalone_runtime()?;
+            let current = tunnel.status().await?;
+            anyhow::ensure!(
+                current.as_ref().map(|status| &status.profile_name) == desired.profile.as_ref(),
+                "standalone VPN profile differs from committed intent"
+            );
+            if desired.profile.is_some() {
+                anyhow::ensure!(
+                    current.is_some_and(|status| status.up),
+                    "standalone VPN interface is down"
+                );
+            }
+            match &desired.policy {
+                Some(desired) => policy.health(desired).await?,
+                None => policy.health_inactive().await?,
+            }
+        }
         let active = self.vpn_active_chain.read().await.clone();
         if active.len() != desired.vpn_chain.len() {
             bail!(

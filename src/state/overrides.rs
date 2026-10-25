@@ -12,12 +12,14 @@ use crate::config::{
     VpnPolicyMode,
 };
 
-/// Current persisted intent schema, including interface suppression.
-pub const CURRENT_RUNTIME_OVERRIDES_SCHEMA: u32 = 4;
+/// Current persisted intent schema, including standalone VPN selection.
+pub const CURRENT_RUNTIME_OVERRIDES_SCHEMA: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeOverrides {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub standalone_vpn: Option<crate::config::StandaloneVpnIntent>,
     pub schema_version: u32,
     #[serde(default)]
     pub revision: u64,
@@ -47,6 +49,7 @@ impl Default for RuntimeOverrides {
     fn default() -> Self {
         Self {
             schema_version: CURRENT_RUNTIME_OVERRIDES_SCHEMA,
+            standalone_vpn: None,
             revision: 0,
             committed_router_transaction: None,
             committed_interface_transactions: BTreeMap::new(),
@@ -173,7 +176,23 @@ impl RecoveryCommitProof {
                 .context("invalid interface suppression required for recovery")?,
         };
 
+        let standalone_vpn = self
+            .object
+            .get("standalone_vpn")
+            .filter(|value| !value.is_null())
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .context("invalid standalone VPN recovery intent")?;
+        let vpn_mode = self
+            .object
+            .get("vpn_mode")
+            .filter(|value| !value.is_null())
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()
+            .context("invalid standalone VPN recovery mode")?;
         Ok(RuntimeOverrides {
+            standalone_vpn,
+            vpn_mode,
             suppressed_interfaces,
             revision,
             committed_router_transaction,
@@ -236,6 +255,12 @@ impl RuntimeOverrides {
         if let Some(enabled) = self.vpn_enabled {
             effective.vpn.enabled = enabled;
         }
+        if let Some(intent) = &self.standalone_vpn {
+            effective.vpn.standalone = Some(intent.clone());
+        }
+        if let Some(mode) = self.vpn_mode {
+            effective.vpn.policy.default_mode = mode;
+        }
         effective.validate()?;
         Ok(effective)
     }
@@ -249,6 +274,12 @@ impl RuntimeOverrides {
         }
         if let Some(enabled) = self.vpn_enabled {
             effective.vpn.enabled = enabled;
+        }
+        if let Some(intent) = &self.standalone_vpn {
+            effective.vpn.standalone = Some(intent.clone());
+        }
+        if let Some(mode) = self.vpn_mode {
+            effective.vpn.policy.default_mode = mode;
         }
         effective.validate_router_recovery()?;
         Ok(effective)
@@ -406,7 +437,7 @@ impl RuntimeOverrideStore {
 mod tests;
 
 fn require_current_schema(version: &serde_json::Value) -> Result<()> {
-    anyhow::ensure!(version.as_u64() == Some(u64::from(CURRENT_RUNTIME_OVERRIDES_SCHEMA)),
+    anyhow::ensure!(matches!(version.as_u64(), Some(4) | Some(5)),
         "unsupported runtime override schema {version}; expected {CURRENT_RUNTIME_OVERRIDES_SCHEMA}");
     Ok(())
 }

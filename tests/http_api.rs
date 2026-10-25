@@ -1355,6 +1355,7 @@ fn vpn_test_profile_contents() -> String {
 async fn vpn_profile_list_import_activate_status_deactivate_over_http() -> Result<()> {
     let directory = tempdir()?;
     let mut config = AppConfig::default();
+    config.vpn.wireguard_config_dir = directory.path().join("wireguard");
     config.runtime.socket_path = directory.path().join("traffic-masqd.sock");
     config.runtime.pid_path = directory.path().join("traffic-masqd.pid");
     config.runtime.state_dir = directory.path().join("state");
@@ -1366,7 +1367,7 @@ async fn vpn_profile_list_import_activate_status_deactivate_over_http() -> Resul
 
     let overrides = RuntimeOverrideManager::load(&config.runtime.state_dir, &config).await?;
     let dhcp = DhcpSupervisor::start(&config).await?;
-    let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork);
+    let network = FakePolicyNetwork::with_owned_interface();
 
     let vpn_store =
         traffic_masq::vpn::WireGuardProfileStore::new(directory.path().join("wireguard"));
@@ -1374,14 +1375,24 @@ async fn vpn_profile_list_import_activate_status_deactivate_over_http() -> Resul
         directory.path().join("vpn-active-profile.json"),
     );
     let provider: Arc<dyn traffic_masq::vpn::VpnProvider> = Arc::new(FakeVpnProvider::default());
-    let vpn_driver = traffic_masq::vpn::WireGuardVpnDriver::new(provider, vpn_store);
+    let vpn_driver = traffic_masq::vpn::WireGuardVpnDriver::new(provider.clone(), vpn_store);
     let vpn_manager = Arc::new(traffic_masq::vpn::VpnManager::new(
         vpn_driver,
         active_profile_store,
     ));
 
+    let coordinator = vpn_http_coordinator(
+        &config,
+        overrides.clone(),
+        vpn_manager.clone(),
+        provider,
+        network.clone(),
+        Arc::new(StatefulNftExecutor::default()),
+    )
+    .await?;
     let control = ControlService::new_detached(config.clone(), network, dhcp.clone(), overrides)
-        .with_vpn_manager(vpn_manager);
+        .with_vpn_manager(vpn_manager)
+        .with_router_coordinator(coordinator);
     let auth = AuthService::open(&config.auth).await?;
     auth.initialize_device_password("correct horse battery")
         .await?;
@@ -1411,12 +1422,7 @@ async fn vpn_profile_list_import_activate_status_deactivate_over_http() -> Resul
             detail: VpnErrorDetail::VpnDisabled
         }
     ));
-    assert!(matches!(
-        admin
-            .request(&Request::SetVpnEnabled { enabled: true })
-            .await?,
-        Response::VpnConfig { enabled: true }
-    ));
+    commit_http_vpn(&admin, &Request::SetVpnEnabled { enabled: true }).await?;
     let persisted = RuntimeOverrideManager::load(&config.runtime.state_dir, &config).await?;
     assert!(
         persisted
@@ -1459,18 +1465,13 @@ async fn vpn_profile_list_import_activate_status_deactivate_over_http() -> Resul
         response => panic!("unexpected response: {response:?}"),
     }
 
-    match admin
-        .request(&Request::VpnActivate {
-            name: "home.conf".to_string(),
-        })
-        .await?
-    {
-        Response::VpnActivated { active } => {
-            assert_eq!(active.profile_name, "home.conf");
-            assert!(active.up);
-        }
-        response => panic!("unexpected response: {response:?}"),
-    }
+    commit_http_vpn(
+        &admin,
+        &Request::VpnActivate {
+            name: "home.conf".into(),
+        },
+    )
+    .await?;
 
     match admin.request(&Request::VpnStatus).await? {
         Response::VpnStatus {
@@ -1493,10 +1494,7 @@ async fn vpn_profile_list_import_activate_status_deactivate_over_http() -> Resul
         Response::VpnConfig { enabled: true }
     ));
 
-    match admin.request(&Request::VpnDeactivate).await? {
-        Response::VpnDeactivated => {}
-        response => panic!("unexpected response: {response:?}"),
-    }
+    commit_http_vpn(&admin, &Request::VpnDeactivate).await?;
 
     match admin.request(&Request::VpnStatus).await? {
         Response::VpnStatus { active } => assert!(active.is_none()),
@@ -1513,12 +1511,7 @@ async fn vpn_profile_list_import_activate_status_deactivate_over_http() -> Resul
         response => panic!("unexpected response: {response:?}"),
     }
 
-    assert!(matches!(
-        admin
-            .request(&Request::SetVpnEnabled { enabled: false })
-            .await?,
-        Response::VpnConfig { enabled: false }
-    ));
+    commit_http_vpn(&admin, &Request::SetVpnEnabled { enabled: false }).await?;
     assert!(matches!(
         admin.request(&Request::VpnListProfiles).await?,
         Response::VpnProfiles { profiles } if profiles.is_empty()
@@ -1676,6 +1669,7 @@ struct FakePolicyNetwork {
     interfaces: std::sync::Mutex<Vec<NetworkInterface>>,
     rules: std::sync::Mutex<Vec<traffic_masq::netlink::Ipv4RuleInfo>>,
     routes: std::sync::Mutex<Vec<traffic_masq::netlink::Ipv4RouteInfo>>,
+    addresses: std::sync::Mutex<std::collections::BTreeMap<String, Vec<Ipv4AddressInfo>>>,
 }
 
 impl FakePolicyNetwork {
@@ -1699,8 +1693,14 @@ impl NetworkProvider for FakePolicyNetwork {
         Ok(self.interfaces.lock().unwrap().clone())
     }
 
-    async fn list_ipv4_addresses(&self, _interface: &str) -> Result<Vec<Ipv4AddressInfo>> {
-        Ok(Vec::new())
+    async fn list_ipv4_addresses(&self, interface: &str) -> Result<Vec<Ipv4AddressInfo>> {
+        Ok(self
+            .addresses
+            .lock()
+            .unwrap()
+            .get(interface)
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn set_link_up(&self, _name: &str) -> Result<()> {
@@ -1785,13 +1785,34 @@ impl NetworkProvider for FakePolicyNetwork {
     }
 }
 
-struct AlwaysEmptyNftExecutor;
-
-impl traffic_masq::firewall::NftExecutor for AlwaysEmptyNftExecutor {
-    fn execute(&self, arguments: &[&str], _input: &[u8]) -> Result<Vec<u8>> {
+#[derive(Default)]
+struct StatefulNftExecutor {
+    active: std::sync::Mutex<bool>,
+}
+impl traffic_masq::firewall::NftExecutor for StatefulNftExecutor {
+    fn execute(&self, arguments: &[&str], input: &[u8]) -> Result<Vec<u8>> {
         match arguments {
-            ["--json", "list", "ruleset"] => Ok(br#"{"nftables":[]}"#.to_vec()),
-            ["-f", "-"] => Ok(Vec::new()),
+            ["--json", "list", "ruleset"] => {
+                let desired = traffic_masq::firewall::vpn::VpnPolicyFirewallDesired {
+                    protected_subnets: vec!["192.168.10.0/24".parse().unwrap()],
+                    physical_uplink: "wan0".into(),
+                    vpn_interface: "tm-wg0".into(),
+                    masquerade_forwarded: true,
+                    host_traffic: None,
+                };
+                Ok(traffic_masq::firewall::vpn::test_support::nft_ruleset(
+                    if *self.active.lock().unwrap() {
+                        Some(&desired)
+                    } else {
+                        None
+                    },
+                ))
+            }
+            ["-f", "-"] => {
+                *self.active.lock().unwrap() =
+                    String::from_utf8_lossy(input).contains("table inet traffic_masq_vpn {");
+                Ok(Vec::new())
+            }
             other => anyhow::bail!("unexpected nft invocation: {other:?}"),
         }
     }
@@ -1801,6 +1822,7 @@ impl traffic_masq::firewall::NftExecutor for AlwaysEmptyNftExecutor {
 async fn vpn_policy_status_set_mode_clear_mode_over_http() -> Result<()> {
     let directory = tempdir()?;
     let mut config = AppConfig::default();
+    config.vpn.wireguard_config_dir = directory.path().join("wireguard");
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
@@ -1852,7 +1874,7 @@ async fn vpn_policy_status_set_mode_clear_mode_over_http() -> Result<()> {
 
     let overrides = RuntimeOverrideManager::load(&config.runtime.state_dir, &config).await?;
     let dhcp = DhcpSupervisor::start(&config).await?;
-    let network: Arc<dyn NetworkProvider> = FakePolicyNetwork::with_owned_interface();
+    let network = FakePolicyNetwork::with_owned_interface();
 
     let vpn_store =
         traffic_masq::vpn::WireGuardProfileStore::new(config.vpn.wireguard_config_dir.clone());
@@ -1860,7 +1882,7 @@ async fn vpn_policy_status_set_mode_clear_mode_over_http() -> Result<()> {
         directory.path().join("vpn-active-profile.json"),
     );
     let provider: Arc<dyn traffic_masq::vpn::VpnProvider> = Arc::new(FakeVpnProvider::default());
-    let vpn_driver = traffic_masq::vpn::WireGuardVpnDriver::new(provider, vpn_store);
+    let vpn_driver = traffic_masq::vpn::WireGuardVpnDriver::new(provider.clone(), vpn_store);
     let tunnel = Arc::new(traffic_masq::vpn::VpnManager::new(
         vpn_driver,
         active_profile_store,
@@ -1869,8 +1891,9 @@ async fn vpn_policy_status_set_mode_clear_mode_over_http() -> Result<()> {
     tunnel.activate("home.conf").await?;
 
     let firewall_executor: Arc<dyn traffic_masq::firewall::NftExecutor> =
-        Arc::new(AlwaysEmptyNftExecutor);
-    let firewall = traffic_masq::firewall::vpn::VpnPolicyFirewallBackend::new(firewall_executor);
+        Arc::new(StatefulNftExecutor::default());
+    let firewall =
+        traffic_masq::firewall::vpn::VpnPolicyFirewallBackend::new(firewall_executor.clone());
     let policy = Arc::new(
         traffic_masq::core::vpn_policy_manager::VpnPolicyManager::new(
             network.clone(),
@@ -1879,9 +1902,19 @@ async fn vpn_policy_status_set_mode_clear_mode_over_http() -> Result<()> {
         ),
     );
 
+    let coordinator = vpn_http_coordinator(
+        &config,
+        overrides.clone(),
+        tunnel.clone(),
+        provider,
+        network.clone(),
+        firewall_executor,
+    )
+    .await?;
     let control = ControlService::new_detached(config.clone(), network, dhcp.clone(), overrides)
         .with_vpn_manager(tunnel)
-        .with_vpn_policy_manager(policy);
+        .with_vpn_policy_manager(policy)
+        .with_router_coordinator(coordinator);
     let auth = AuthService::open(&config.auth).await?;
     auth.initialize_device_password("correct horse battery")
         .await?;
@@ -1903,12 +1936,14 @@ async fn vpn_policy_status_set_mode_clear_mode_over_http() -> Result<()> {
         response => panic!("unexpected response: {response:?}"),
     }
 
-    match admin
-        .request(&Request::VpnPolicySetMode {
+    commit_http_vpn(
+        &admin,
+        &Request::VpnPolicySetMode {
             mode: traffic_masq::config::VpnPolicyMode::Vpn,
-        })
-        .await?
-    {
+        },
+    )
+    .await?;
+    match admin.request(&Request::VpnPolicyStatus).await? {
         Response::VpnPolicyStatus { status } => {
             assert_eq!(status.mode, traffic_masq::config::VpnPolicyMode::Vpn);
             assert!(status.mode_override_active);
@@ -1926,7 +1961,8 @@ async fn vpn_policy_status_set_mode_clear_mode_over_http() -> Result<()> {
         response => panic!("unexpected response: {response:?}"),
     }
 
-    match admin.request(&Request::VpnPolicyClearMode).await? {
+    commit_http_vpn(&admin, &Request::VpnPolicyClearMode).await?;
+    match admin.request(&Request::VpnPolicyStatus).await? {
         Response::VpnPolicyStatus { status } => {
             assert_eq!(status.mode, traffic_masq::config::VpnPolicyMode::Direct);
             assert!(!status.mode_override_active);
@@ -2807,5 +2843,112 @@ async fn control_transport_preserves_rest_reads_and_rejects_invalid_requests() -
     shutdown.send(true)?;
     task.await??;
     dhcp.shutdown().await;
+    Ok(())
+}
+
+#[derive(Default)]
+struct HttpDataplane(std::sync::Mutex<Option<RouterDataplaneSnapshot>>);
+#[async_trait]
+impl traffic_masq::firewall::RouterDataplaneProvider for HttpDataplane {
+    async fn observe(&self) -> Result<RouterDataplaneSnapshot> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(fake_dataplane_snapshot))
+    }
+    async fn apply_owned(
+        &self,
+        desired: &traffic_masq::firewall::RouterDataplaneDesired,
+    ) -> Result<()> {
+        *self.0.lock().unwrap() = Some(RouterDataplaneSnapshot {
+            ipv4_forwarding: true,
+            owned: Some(desired.clone()),
+            owned_firewall_integrity: OwnedFirewallIntegrity::Intact,
+        });
+        Ok(())
+    }
+    async fn disable_owned(&self) -> Result<()> {
+        self.0
+            .lock()
+            .unwrap()
+            .get_or_insert_with(fake_dataplane_snapshot)
+            .owned = None;
+        Ok(())
+    }
+    async fn restore_owned(&self, snapshot: &RouterDataplaneSnapshot) -> Result<()> {
+        *self.0.lock().unwrap() = Some(snapshot.clone());
+        Ok(())
+    }
+}
+
+async fn vpn_http_coordinator(
+    config: &AppConfig,
+    overrides: RuntimeOverrideManager,
+    tunnel: Arc<traffic_masq::vpn::ProductionVpnManager>,
+    provider: Arc<dyn traffic_masq::vpn::VpnProvider>,
+    network: Arc<FakePolicyNetwork>,
+    executor: Arc<dyn traffic_masq::firewall::NftExecutor>,
+) -> Result<RouterTransactionCoordinator> {
+    for (index, (name, interface)) in config.network.interfaces.iter().enumerate() {
+        let index = index as u32 + 1;
+        network.interfaces.lock().unwrap().push(NetworkInterface {
+            index,
+            name: name.clone(),
+            is_up: true,
+            is_wireless: false,
+            rx_bytes: 0,
+            tx_bytes: 0,
+        });
+        if let Some(address) = interface.ipv4 {
+            network.addresses.lock().unwrap().insert(
+                name.clone(),
+                vec![Ipv4AddressInfo {
+                    interface_index: index,
+                    address: address.addr(),
+                    prefix_len: address.prefix_len(),
+                    protocol: Some(traffic_masq::netlink::TRAFFIC_MASQ_ADDRESS_PROTOCOL),
+                }],
+            );
+        }
+    }
+    let subsystems = traffic_masq::core::router_subsystems::ProductionRouterSubsystems::new(
+        traffic_masq::core::interface::InterfaceManager::new(
+            network.clone(),
+            traffic_masq::core::ownership::AddressOwnershipJournal::in_memory(),
+        ),
+        traffic_masq::core::route::RouteManager::new(network.clone()),
+        DhcpSupervisor::start(config).await?,
+        traffic_masq::firewall::RouterDataplaneManager::new(HttpDataplane::default()),
+        vec![],
+    )
+    .with_vpn_chain(traffic_masq::core::router_subsystems::VpnChainDeps {
+        standalone: Some(tunnel),
+        vpn_provider: provider,
+        wireguard_store: traffic_masq::vpn::WireGuardProfileStore::new(
+            config.vpn.wireguard_config_dir.clone(),
+        ),
+        state_dir: config.runtime.state_dir.clone(),
+        network,
+        nft_executor: executor,
+    });
+    Ok(RouterTransactionCoordinator::new(
+        RouterManager::new(Arc::new(subsystems)),
+        overrides,
+        Duration::from_secs(60),
+    ))
+}
+
+async fn commit_http_vpn(client: &ApiClient, request: &Request) -> Result<()> {
+    let response = client.request(request).await?;
+    let token = match response {
+        Response::RouterTransactionPending { token, .. } => token,
+        other => panic!("expected pending router change: {other:?}"),
+    };
+    assert!(matches!(
+        client.request(&Request::RouterCommit { token }).await?,
+        Response::RouterCommitted { .. }
+    ));
     Ok(())
 }

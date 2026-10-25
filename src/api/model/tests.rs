@@ -337,6 +337,7 @@ fn router_plan_view_preserves_complete_wire_shape() {
     };
     let plan = RouterPlan {
         desired: RouterDesired {
+            standalone_vpn: None,
             enabled: true,
             uplink_wifi: None,
             uplink_dhcp: None,
@@ -374,7 +375,10 @@ fn router_plan_view_preserves_complete_wire_shape() {
             add: vec![],
             delete: vec![],
         },
-        vpn_chain: VpnChainPlan { hops: vec![hop] },
+        vpn_chain: VpnChainPlan {
+            standalone: None,
+            hops: vec![hop],
+        },
         dataplane: RouterDataplanePlan {
             snapshot: RouterDataplaneSnapshot {
                 ipv4_forwarding: false,

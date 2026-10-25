@@ -438,6 +438,22 @@ pub async fn run_daemon_with_config_file(
     // every router request would answer RouterDisabled and provisioning would
     // be impossible. Building it is pure
     // wiring — it reuses the already-open network provider and touches no data plane.
+    let vpn_manager = match build_vpn_manager(&effective_config).await {
+        Ok(vpn_manager) => vpn_manager,
+        Err(error) => {
+            stack.unwind().await;
+            return Err(error);
+        }
+    };
+    if let Some(vpn) = &vpn_manager {
+        let vpn = vpn.clone();
+        let root = config.runtime.state_dir.clone();
+        stack.push(async move {
+            if let Err(error) = vpn.shutdown(recovery_shutdown_policy(&root)).await {
+                tracing::error!(%error, "failed to shut down VPN manager during startup rollback");
+            }
+        });
+    }
     let router_coordinator = match production_router_coordinator(
         &desired,
         &effective_config.vpn.wireguard_config_dir,
@@ -449,6 +465,7 @@ pub async fn run_daemon_with_config_file(
         wifi_client_supervisor.clone(),
         wifi_supervisor.clone(),
         overrides.clone(),
+        vpn_manager.clone(),
         Duration::from_secs(config.security.rollback_timeout_seconds.max(1)),
     ) {
         Ok(coordinator) => {
@@ -618,21 +635,16 @@ pub async fn run_daemon_with_config_file(
         }
     };
 
-    let vpn_manager = match build_vpn_manager(&effective_config).await {
-        Ok(vpn_manager) => vpn_manager,
-        Err(error) => {
-            stack.unwind().await;
-            return Err(error);
-        }
-    };
-    if let Some(vpn) = &vpn_manager {
-        let vpn = vpn.clone();
-        let root = config.runtime.state_dir.clone();
-        stack.push(async move {
-            if let Err(error) = vpn.shutdown(recovery_shutdown_policy(&root)).await {
-                tracing::error!(%error, "failed to shut down VPN manager during startup rollback");
+    if effective_config.vpn.enabled
+        && effective_config.vpn.standalone.is_none()
+        && !crate::core::recovery_control::preservation_required(&config.runtime.state_dir)
+    {
+        if let Some(vpn) = &vpn_manager {
+            if let Err(error) = vpn.reconcile().await {
+                stack.unwind().await;
+                return Err(error).context("VPN startup reconcile failed");
             }
-        });
+        }
     }
 
     apply_vpn_policy_startup(

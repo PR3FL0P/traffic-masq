@@ -63,6 +63,7 @@ pub fn vpn_policy_desired(config: &AppConfig) -> Option<VpnPolicyDesired> {
         .values()
         .filter(|interface| interface.role == InterfaceRole::Output && interface.managed)
         .filter_map(|interface| interface.ipv4)
+        .map(|network| network.trunc())
         .collect();
     if protected_subnets.is_empty() {
         return None;
@@ -106,7 +107,7 @@ impl VpnPolicyDesired {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct VpnPolicySnapshot {
     rules: Vec<Ipv4RuleInfo>,
     routes: Vec<Ipv4RouteInfo>,
@@ -114,6 +115,14 @@ pub struct VpnPolicySnapshot {
 }
 
 impl VpnPolicySnapshot {
+    pub(crate) fn rebind_interface(&mut self, previous: u32, current: u32) {
+        for route in &mut self.routes {
+            if route.output_interface_index == Some(previous) {
+                route.output_interface_index = Some(current);
+            }
+        }
+    }
+
     pub fn is_active(&self) -> bool {
         !self.rules.is_empty()
     }
@@ -352,6 +361,18 @@ impl<D: VpnDriver, E: NftExecutor> VpnPolicyManager<D, E> {
             .restore_async(None)
             .await
             .context("failed to remove VPN policy firewall state")
+    }
+
+    /// Reinstate previous protection before restoring a tunnel or its routes.
+    /// An unprotected snapshot must wait until network restoration succeeds.
+    pub(crate) async fn protect_rollback(&self, snapshot: &VpnPolicySnapshot) -> Result<()> {
+        if let Some(firewall) = &snapshot.firewall {
+            self.firewall
+                .restore_async(Some(firewall))
+                .await
+                .context("failed to reinstate VPN protection before rollback")?;
+        }
+        Ok(())
     }
 
     /// Restore policy routing and firewall resources from the captured snapshot.

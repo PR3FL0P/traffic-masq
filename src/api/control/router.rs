@@ -424,6 +424,13 @@ impl ControlService {
             .await
     }
 
+    pub(super) async fn apply_router_candidate(
+        &self,
+        candidate: crate::core::router_candidate::RouterCandidate,
+    ) -> Response {
+        self.apply_router_candidate_checked(candidate, None).await
+    }
+
     pub(super) async fn apply_router_candidate_checked(
         &self,
         candidate: crate::core::router_candidate::RouterCandidate,

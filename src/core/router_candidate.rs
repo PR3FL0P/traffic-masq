@@ -24,6 +24,9 @@ pub enum RouterOverrideChange {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RouterIntentProposal {
     router: RouterOverrideChange,
+    vpn_enabled: Option<bool>,
+    vpn_mode: Option<Option<crate::config::VpnPolicyMode>>,
+    standalone_vpn: Option<crate::config::StandaloneVpnIntent>,
     interfaces: BTreeMap<String, Option<InterfaceOverride>>,
     forgotten_interfaces: BTreeSet<String>,
 }
@@ -109,7 +112,28 @@ impl RouterIntentProposal {
         self
     }
 
+    pub(crate) fn set_standalone_vpn(
+        mut self,
+        enabled: bool,
+        profile: Option<String>,
+        mode: Option<crate::config::VpnPolicyMode>,
+    ) -> Self {
+        self.vpn_enabled = Some(enabled);
+        self.vpn_mode = Some(mode);
+        self.standalone_vpn = Some(crate::config::StandaloneVpnIntent { profile });
+        self
+    }
+
     fn apply_to(&self, document: &mut RuntimeOverrides) {
+        if let Some(enabled) = self.vpn_enabled {
+            document.vpn_enabled = Some(enabled);
+        }
+        if let Some(mode) = self.vpn_mode {
+            document.vpn_mode = mode;
+        }
+        if let Some(intent) = &self.standalone_vpn {
+            document.standalone_vpn = Some(intent.clone());
+        }
         match &self.router {
             RouterOverrideChange::Keep => {}
             RouterOverrideChange::Set(router) => document.router = Some(router.clone()),
@@ -141,6 +165,9 @@ impl CandidateDigest {
         #[derive(Serialize)]
         struct CanonicalIntent<'a> {
             schema_version: u32,
+            standalone_vpn: &'a Option<crate::config::StandaloneVpnIntent>,
+            vpn_enabled: Option<bool>,
+            vpn_mode: Option<crate::config::VpnPolicyMode>,
             router: Option<&'a RouterConfig>,
             interfaces: &'a BTreeMap<String, InterfaceOverride>,
             suppressed_interfaces: &'a BTreeSet<String>,
@@ -148,6 +175,9 @@ impl CandidateDigest {
 
         let canonical = serde_json::to_vec(&CanonicalIntent {
             schema_version: document.schema_version,
+            standalone_vpn: &document.standalone_vpn,
+            vpn_enabled: document.vpn_enabled,
+            vpn_mode: document.vpn_mode,
             router: document.router.as_ref(),
             interfaces: &document.interfaces,
             suppressed_interfaces: &document.suppressed_interfaces,

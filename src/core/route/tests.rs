@@ -500,3 +500,47 @@ async fn cleanup_removed_routes_requires_permission_for_default_and_never_adds_r
     manager.cleanup_removed(&[missing], true).await.unwrap();
     assert!(provider.route_snapshot().await.is_empty());
 }
+
+#[tokio::test]
+async fn static_route_apply_health_and_recovery_preserve_vpn_policy_tables() {
+    let provider = Arc::new(FakeNetwork::default());
+    let static_route = route("192.0.2.0/24", TRAFFIC_MASQ_ROUTE_PROTOCOL);
+    let mut vpn_route = route("0.0.0.0/0", TRAFFIC_MASQ_ROUTE_PROTOCOL);
+    vpn_route.table = crate::core::vpn_policy::VPN_POLICY_ROUTE_TABLE_BASE;
+    provider
+        .routes
+        .lock()
+        .await
+        .extend([static_route.clone(), vpn_route.clone()]);
+    let manager = RouteManager::new(provider.clone());
+    let snapshot = manager.snapshot().await.unwrap();
+    assert_eq!(snapshot.owned_routes, vec![static_route.clone()]);
+    let plan = manager.plan(&[], true).await.unwrap();
+    assert_eq!(plan.delete, vec![static_route.clone()]);
+    manager.apply_plan(&plan).await.unwrap();
+    assert!(manager.health(&[]).await.unwrap().is_healthy());
+    vpn_route.output_interface_index = Some(99);
+    *provider.routes.lock().await = vec![vpn_route.clone()];
+    // Older snapshots may also contain policy routes. They belong to the VPN
+    // restoration hook and must never be replayed by the static route owner.
+    let mut legacy = snapshot;
+    let mut obsolete_vpn = vpn_route.clone();
+    obsolete_vpn.output_interface_index = Some(42);
+    legacy.owned_routes.push(obsolete_vpn);
+    manager.rollback(&legacy).await.unwrap();
+    let current = provider.route_snapshot().await;
+    assert_eq!(current.len(), 2);
+    assert!(current.contains(&vpn_route));
+    assert!(current.contains(&static_route));
+    for hop in 0..=crate::core::vpn_policy::MAX_VPN_HOP_INDEX {
+        let mut desired = ManagedIpv4Route {
+            destination: "198.51.100.0/24".parse().unwrap(),
+            gateway: None,
+            output_interface: Some("uplink0".into()),
+            table: 254,
+            metric: None,
+        };
+        desired.table = crate::core::vpn_policy::VPN_POLICY_ROUTE_TABLE_BASE + hop;
+        assert!(manager.plan(&[desired], true).await.is_err());
+    }
+}

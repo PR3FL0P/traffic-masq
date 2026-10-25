@@ -180,6 +180,12 @@ impl From<VpnHopDesired> for VpnHopDesiredView {
 impl From<VpnChainPlan> for VpnChainPlanView {
     fn from(value: VpnChainPlan) -> Self {
         Self {
+            standalone: value.standalone.map(|desired| {
+                traffic_masq_protocol::StandaloneVpnPlanView {
+                    profile: desired.profile,
+                    protected_traffic: desired.policy.is_some(),
+                }
+            }),
             hops: value.hops.into_iter().map(Into::into).collect(),
         }
     }

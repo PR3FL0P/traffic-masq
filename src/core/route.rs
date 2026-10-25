@@ -125,7 +125,7 @@ impl RouteManager {
         let all_routes = self.provider.list_ipv4_routes().await?;
         let mut current: Vec<_> = all_routes
             .iter()
-            .filter(|route| route.protocol == TRAFFIC_MASQ_ROUTE_PROTOCOL)
+            .filter(|route| static_route_owned(route))
             .cloned()
             .collect();
         sort_routes(&mut current);
@@ -299,6 +299,7 @@ impl RouteManager {
         for route in snapshot
             .owned_routes
             .iter()
+            .filter(|route| static_route_owned(route))
             .filter(|route| !current.iter().any(|c| route_info_matches(c, route)))
         {
             if let Err(error) = self.provider.add_ipv4_route(&spec_from_info(route)).await {
@@ -341,7 +342,7 @@ impl RouteManager {
             .list_ipv4_routes()
             .await?
             .into_iter()
-            .filter(|route| route.protocol == TRAFFIC_MASQ_ROUTE_PROTOCOL)
+            .filter(static_route_owned)
             .collect();
         sort_routes(&mut routes);
         Ok(routes)
@@ -358,6 +359,8 @@ impl RouteManager {
         let mut resolved = Vec::with_capacity(desired.len());
 
         for route in desired {
+            anyhow::ensure!(!reserved_vpn_table(route.table),
+                "routing table {} is reserved for VPN policy; configure VPN policy through its coordinator", route.table);
             let output_interface_index = match route.output_interface.as_deref() {
                 Some(name) => Some(*interfaces.get(name).ok_or_else(|| {
                     anyhow::Error::new(crate::netlink::MissingInterface {
@@ -446,6 +449,16 @@ fn sort_routes(routes: &mut [Ipv4RouteInfo]) {
             route.scope,
         )
     });
+}
+
+/// VPN policy shares protocol 201 but has a separate restoration owner.
+pub(crate) fn reserved_vpn_table(table: u32) -> bool {
+    let base = crate::core::vpn_policy::VPN_POLICY_ROUTE_TABLE_BASE;
+    (base..=base + crate::core::vpn_policy::MAX_VPN_HOP_INDEX).contains(&table)
+}
+
+fn static_route_owned(route: &Ipv4RouteInfo) -> bool {
+    route.protocol == TRAFFIC_MASQ_ROUTE_PROTOCOL && !reserved_vpn_table(route.table)
 }
 
 #[cfg(test)]

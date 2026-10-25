@@ -162,6 +162,7 @@ pub(super) fn production_router_coordinator(
     wifi_client: Option<WifiClientSupervisor>,
     wifi: Option<HostapdSupervisor>,
     overrides: RuntimeOverrideManager,
+    standalone_vpn: Option<Arc<crate::vpn::ProductionVpnManager>>,
     rollback_timeout: Duration,
 ) -> Result<RouterTransactionCoordinator> {
     let interfaces = InterfaceManager::new(network.clone(), journal);
@@ -198,6 +199,7 @@ pub(super) fn production_router_coordinator(
     {
         let vpn_provider: Arc<dyn VpnProvider> = Arc::new(LazyNetlinkVpnProvider::new());
         subsystems = subsystems.with_vpn_chain(VpnChainDeps {
+            standalone: standalone_vpn,
             vpn_provider,
             wireguard_store: WireGuardProfileStore::new(vpn_store_dir.to_path_buf()),
             state_dir: state_dir.to_path_buf(),

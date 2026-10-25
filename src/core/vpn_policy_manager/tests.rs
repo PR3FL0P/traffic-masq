@@ -68,7 +68,7 @@ fn vpn_policy_desired_builds_from_managed_output_subnets_and_router_uplink() {
     assert_eq!(desired.physical_uplink, "wan0");
     assert_eq!(
         desired.protected_subnets,
-        vec!["192.168.10.1/24".parse::<Ipv4Net>().unwrap()]
+        vec!["192.168.10.0/24".parse::<Ipv4Net>().unwrap()]
     );
 }
 

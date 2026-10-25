@@ -655,7 +655,10 @@ where
             routes: self.routes.snapshot().await?,
             dhcp,
             dhcp_absent_interfaces,
-            vpn_chain: self.vpn_chain.snapshot().await,
+            vpn_chain: self
+                .vpn_chain
+                .snapshot(desired.standalone_vpn.is_some())
+                .await?,
             dataplane: self.dataplane.snapshot().await?,
         })
     }
@@ -1142,4 +1145,4 @@ where
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

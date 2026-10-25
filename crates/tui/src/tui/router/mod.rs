@@ -39,16 +39,15 @@ pub(crate) use controller::{
 };
 pub(crate) use editor::{focus_route_editor_action, handle_route_editor_key, render_route_editor};
 pub(crate) use pending::{
-    handle_router_pending_key, refresh_router_pending_screen, render_router_pending,
+    handle_router_pending_key, open_pending, refresh_router_pending_screen, render_router_pending,
 };
 pub(crate) use plan::{handle_router_plan_key, open_router_plan, render_router_plan};
 pub(crate) use view::render_router;
 
 // Internal cross-module helpers are re-exported only within the router module tree.
 use editor::{delete_selected_route, open_route_editor_for_add, open_route_editor_for_selected};
-use view::{
-    describe_router_error, format_forwarding_status, recovery_notice_text, summarize_uplink,
-};
+pub(crate) use view::describe_router_error;
+use view::{format_forwarding_status, recovery_notice_text, summarize_uplink};
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct RouterData {

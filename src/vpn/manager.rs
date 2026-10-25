@@ -236,6 +236,28 @@ impl<D: VpnDriver> VpnManager<D> {
         Ok(profile)
     }
 
+    /// Read-only transaction observation: never adopt, clear evidence or clean a launch here.
+    pub(crate) async fn snapshot_profile(&self) -> Result<Option<String>, ManagerError> {
+        let _guard = self.activation_lock.lock().await;
+        let interface = OWNED_INTERFACE_NAME;
+        if !self.driver.link_exists(interface).await? {
+            return Ok(None);
+        }
+        let persisted = self.active_profile_store.load().await?;
+        if let Some(persisted) = persisted.filter(|record| record.interface == interface) {
+            let proof = BASE64
+                .decode(&persisted.ownership_proof_base64)
+                .ok()
+                .and_then(|bytes| self.driver.decode_ownership_proof(&bytes).ok());
+            if let Some(proof) = proof {
+                if self.driver.read_ownership_proof(interface).await?.as_ref() == Some(&proof) {
+                    return Ok(Some(persisted.profile_name));
+                }
+            }
+        }
+        Err(ManagerError::ForeignInterfaceConflict(interface.into()))
+    }
+
     pub async fn snapshot(&self) -> Result<VpnInterfaceSnapshot<D::OwnershipProof>, ManagerError> {
         self.snapshot_on(OWNED_INTERFACE_NAME).await
     }

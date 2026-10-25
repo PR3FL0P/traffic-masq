@@ -221,6 +221,7 @@ fn app_config(state_dir: &Path, runtime_dir: &Path) -> AppConfig {
         },
         wifi_client: Default::default(),
         vpn: VpnConfig {
+            standalone: None,
             enabled: false,
             wireguard_config_dir: state_dir.join("vpn/wireguard"),
             wireguard_import_dir: "/etc/wireguard".into(),

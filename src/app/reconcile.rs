@@ -1216,7 +1216,8 @@ pub(super) fn spawn_router_dataplane_integrity_checks(
                         // reserved namespace as the router VPN chain. Audit it
                         // only when no chain is configured, so the two
                         // coexistence paths never repair over one another.
-                        if effective.vpn.enabled && router_desired.vpn_chain.is_empty() {
+                        if effective.vpn.enabled && effective.vpn.standalone.is_none()
+                            && router_desired.vpn_chain.is_empty() {
                             if let Some(policy) = &vpn_policy {
                                 match overrides.effective_vpn_mode().await {
                                     VpnPolicyMode::Vpn => {

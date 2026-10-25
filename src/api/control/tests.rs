@@ -1388,6 +1388,8 @@ async fn vpn_enabled_service_with_provider(
     let directory = tempdir().expect("tempdir");
     let mut config = router_base_config();
     config.vpn.enabled = true;
+    config.runtime.state_dir = directory.path().into();
+    config.vpn.wireguard_config_dir = directory.path().join("wireguard");
     config.vpn.wireguard_import_dir = directory.path().join("sources");
     let overrides = RuntimeOverrideManager::load(directory.path(), &config)
         .await
@@ -1395,17 +1397,25 @@ async fn vpn_enabled_service_with_provider(
     let dhcp = DhcpSupervisor::start(&config)
         .await
         .expect("dhcp supervisor");
-    let network: Arc<dyn NetworkProvider> = Arc::new(FakeNetwork {
-        addresses: Vec::new(),
-    });
+    let network: Arc<dyn NetworkProvider> = FakePolicyNetwork::with_owned_interface();
     let vpn_store = crate::vpn::WireGuardProfileStore::new(directory.path().join("wireguard"));
     let active_profile_store =
         crate::vpn::ActiveProfileStore::new(directory.path().join("active-profile.json"));
     let provider: Arc<dyn crate::vpn::VpnProvider> = Arc::new(provider);
-    let driver = crate::vpn::WireGuardVpnDriver::new(provider, vpn_store);
+    let driver = crate::vpn::WireGuardVpnDriver::new(provider.clone(), vpn_store);
     let vpn_manager = Arc::new(crate::vpn::VpnManager::new(driver, active_profile_store));
+    let coordinator = crate::core::router_subsystems::tests::standalone_coordinator(
+        &config,
+        overrides.clone(),
+        vpn_manager.clone(),
+        provider,
+        network.clone(),
+        Arc::new(StatefulFakeNftExecutor::default()),
+    )
+    .await;
     let service = ControlService::new_detached(config, network, dhcp, overrides)
-        .with_vpn_manager(vpn_manager);
+        .with_vpn_manager(vpn_manager)
+        .with_router_coordinator(coordinator);
     (service, directory)
 }
 
@@ -1525,18 +1535,13 @@ async fn vpn_activate_status_deactivate_workflow_dispatches_through_control_serv
         other => panic!("unexpected response: {other:?}"),
     }
 
-    match service
-        .dispatch(Request::VpnActivate {
-            name: "home.conf".to_string(),
-        })
-        .await
-    {
-        Response::VpnActivated { active } => {
-            assert_eq!(active.profile_name, "home.conf");
-            assert!(active.up);
-        }
-        other => panic!("unexpected response: {other:?}"),
-    }
+    commit_vpn_request(
+        &service,
+        Request::VpnActivate {
+            name: "home.conf".into(),
+        },
+    )
+    .await;
 
     match service.dispatch(Request::VpnStatus).await {
         Response::VpnStatus {
@@ -1548,10 +1553,7 @@ async fn vpn_activate_status_deactivate_workflow_dispatches_through_control_serv
         other => panic!("unexpected response: {other:?}"),
     }
 
-    match service.dispatch(Request::VpnDeactivate).await {
-        Response::VpnDeactivated => {}
-        other => panic!("unexpected response: {other:?}"),
-    }
+    commit_vpn_request(&service, Request::VpnDeactivate).await;
 
     match service.dispatch(Request::VpnStatus).await {
         Response::VpnStatus { active } => assert!(active.is_none()),
@@ -1596,15 +1598,13 @@ async fn vpn_activate_when_already_active_returns_typed_error() {
             contents: valid_vpn_profile_contents(),
         })
         .await;
-    match service
-        .dispatch(Request::VpnActivate {
-            name: "home.conf".to_string(),
-        })
-        .await
-    {
-        Response::VpnActivated { .. } => {}
-        other => panic!("unexpected response: {other:?}"),
-    }
+    commit_vpn_request(
+        &service,
+        Request::VpnActivate {
+            name: "home.conf".into(),
+        },
+    )
+    .await;
 
     match service
         .dispatch(Request::VpnActivate {
@@ -1625,7 +1625,7 @@ use crate::firewall::vpn::{VpnPolicyFirewallBackend, VpnPolicyFirewallDesired};
 fn vpn_policy_firewall_desired() -> VpnPolicyFirewallDesired {
     VpnPolicyFirewallDesired {
         masquerade_forwarded: true,
-        protected_subnets: vec!["192.168.10.1/24".parse().unwrap()],
+        protected_subnets: vec!["192.168.10.0/24".parse().unwrap()],
         vpn_interface: OWNED_INTERFACE_NAME.to_string(),
         physical_uplink: "wan0".to_string(),
         host_traffic: None,
@@ -1784,6 +1784,8 @@ struct VpnPolicyFixture {
     service: ControlService,
     overrides: RuntimeOverrideManager,
     network: Arc<FakePolicyNetwork>,
+    provider: Arc<dyn crate::vpn::VpnProvider>,
+    executor: Arc<dyn NftExecutor>,
     _directory: tempfile::TempDir,
 }
 
@@ -1802,6 +1804,7 @@ async fn vpn_policy_fixture_with_router_chain(
             profile_name: "chain.conf".to_string(),
         }];
     }
+    config.runtime.state_dir = directory.path().into();
     let overrides = RuntimeOverrideManager::load(directory.path(), &config)
         .await
         .expect("overrides");
@@ -1814,7 +1817,7 @@ async fn vpn_policy_fixture_with_router_chain(
     let active_profile_store =
         crate::vpn::ActiveProfileStore::new(directory.path().join("active-profile.json"));
     let provider: Arc<dyn crate::vpn::VpnProvider> = Arc::new(FakeVpnProvider::default());
-    let driver = crate::vpn::WireGuardVpnDriver::new(provider, vpn_store);
+    let driver = crate::vpn::WireGuardVpnDriver::new(provider.clone(), vpn_store);
     let tunnel = Arc::new(crate::vpn::VpnManager::new(driver, active_profile_store));
 
     if activate_tunnel {
@@ -1825,21 +1828,33 @@ async fn vpn_policy_fixture_with_router_chain(
     }
 
     let executor: Arc<dyn NftExecutor> = Arc::new(StatefulFakeNftExecutor::default());
-    let firewall = VpnPolicyFirewallBackend::new(executor);
+    let firewall = VpnPolicyFirewallBackend::new(executor.clone());
     let policy = Arc::new(VpnPolicyManager::new(
         network.clone(),
         firewall,
         tunnel.clone(),
     ));
 
+    let coordinator = crate::core::router_subsystems::tests::standalone_coordinator(
+        &config,
+        overrides.clone(),
+        tunnel.clone(),
+        provider.clone(),
+        network.clone(),
+        executor.clone(),
+    )
+    .await;
     let service = ControlService::new_detached(config, network.clone(), dhcp, overrides.clone())
         .with_vpn_manager(tunnel)
-        .with_vpn_policy_manager(policy);
+        .with_vpn_policy_manager(policy)
+        .with_router_coordinator(coordinator);
 
     VpnPolicyFixture {
         service,
         overrides,
         network,
+        provider,
+        executor,
         _directory: directory,
     }
 }
@@ -1911,9 +1926,7 @@ async fn legacy_vpn_policy_mutations_are_blocked_when_router_chain_is_configured
         Request::VpnPolicyClearMode,
     ] {
         match fixture.service.dispatch(request).await {
-            Response::VpnPolicyError {
-                detail: VpnPolicyErrorDetail::Other { message },
-            } => assert!(message.contains("router VPN chain")),
+            Response::Error { message } => assert!(message.contains("router VPN chain")),
             other => panic!("unexpected response: {other:?}"),
         }
     }
@@ -1927,12 +1940,13 @@ async fn legacy_vpn_policy_mutations_are_blocked_when_router_chain_is_configured
 async fn vpn_policy_set_mode_vpn_activates_when_tunnel_is_healthy_and_persists() {
     let fixture = vpn_policy_fixture(true).await;
 
-    match fixture
-        .service
-        .dispatch(Request::VpnPolicySetMode {
+    match commit_policy_request(
+        &fixture.service,
+        Request::VpnPolicySetMode {
             mode: VpnPolicyMode::Vpn,
-        })
-        .await
+        },
+    )
+    .await
     {
         Response::VpnPolicyStatus { status } => {
             assert_eq!(status.mode, VpnPolicyMode::Vpn);
@@ -1943,7 +1957,7 @@ async fn vpn_policy_set_mode_vpn_activates_when_tunnel_is_healthy_and_persists()
             assert_eq!(status.physical_uplink.as_deref(), Some("wan0"));
             assert_eq!(
                 status.protected_subnets,
-                vec!["192.168.10.1/24".parse().unwrap()]
+                vec!["192.168.10.0/24".parse().unwrap()]
             );
         }
         other => panic!("unexpected response: {other:?}"),
@@ -1963,25 +1977,41 @@ async fn vpn_policy_set_mode_vpn_activates_when_tunnel_is_healthy_and_persists()
 #[tokio::test]
 async fn vpn_policy_set_mode_restores_runtime_snapshot_when_persistence_fails() {
     let fixture = vpn_policy_fixture(true).await;
-    std::fs::create_dir(fixture._directory.path().join("runtime-overrides.json"))
-        .expect("block override file rename");
 
+    let committed = fixture.overrides.snapshot().await;
+    let path = fixture._directory.path().join("runtime-overrides.json");
+    if path.exists() {
+        std::fs::remove_file(&path).unwrap();
+    }
+    std::fs::create_dir(&path).unwrap();
     let response = fixture
         .service
         .dispatch(Request::VpnPolicySetMode {
             mode: VpnPolicyMode::Vpn,
         })
         .await;
-    assert!(matches!(
-        response,
-        Response::VpnPolicyError {
-            detail: VpnPolicyErrorDetail::Other { .. }
-        }
-    ));
-    assert_eq!(
-        fixture.overrides.effective_vpn_mode().await,
-        VpnPolicyMode::Direct
+    let token = match response {
+        Response::RouterTransactionPending { token, .. } => token,
+        other => panic!("expected pending: {other:?}"),
+    };
+    let response = fixture
+        .service
+        .dispatch(Request::RouterCommit {
+            token: token.clone(),
+        })
+        .await;
+    assert!(
+        matches!(response, Response::RouterError { .. }),
+        "{response:?}"
     );
+    assert_eq!(fixture.overrides.snapshot().await, committed);
+    assert!(matches!(
+        fixture
+            .service
+            .dispatch(Request::RouterRollback { token })
+            .await,
+        Response::RouterRolledBack
+    ));
     match fixture.service.dispatch(Request::VpnPolicyStatus).await {
         Response::VpnPolicyStatus { status } => assert!(!status.policy_active),
         other => panic!("unexpected response: {other:?}"),
@@ -1999,10 +2029,8 @@ async fn vpn_policy_set_mode_vpn_fails_closed_without_active_tunnel() {
         })
         .await
     {
-        Response::VpnPolicyError {
-            detail: VpnPolicyErrorDetail::TunnelUnhealthy { message },
-        } => {
-            assert!(message.contains("no active VPN tunnel"));
+        Response::Error { message } => {
+            assert!(message.contains("connected profile"));
         }
         other => panic!("unexpected response: {other:?}"),
     }
@@ -2027,19 +2055,21 @@ async fn vpn_policy_set_mode_vpn_fails_closed_without_active_tunnel() {
 #[tokio::test]
 async fn vpn_policy_set_mode_direct_after_vpn_deactivates_and_persists() {
     let fixture = vpn_policy_fixture(true).await;
-    fixture
-        .service
-        .dispatch(Request::VpnPolicySetMode {
+    commit_policy_request(
+        &fixture.service,
+        Request::VpnPolicySetMode {
             mode: VpnPolicyMode::Vpn,
-        })
-        .await;
+        },
+    )
+    .await;
 
-    match fixture
-        .service
-        .dispatch(Request::VpnPolicySetMode {
+    match commit_policy_request(
+        &fixture.service,
+        Request::VpnPolicySetMode {
             mode: VpnPolicyMode::Direct,
-        })
-        .await
+        },
+    )
+    .await
     {
         Response::VpnPolicyStatus { status } => {
             assert_eq!(status.mode, VpnPolicyMode::Direct);
@@ -2058,29 +2088,42 @@ async fn vpn_policy_set_mode_direct_after_vpn_deactivates_and_persists() {
 #[tokio::test]
 async fn vpn_policy_clear_mode_restores_runtime_snapshot_when_persistence_fails() {
     let fixture = vpn_policy_fixture(true).await;
+    commit_policy_request(
+        &fixture.service,
+        Request::VpnPolicySetMode {
+            mode: VpnPolicyMode::Vpn,
+        },
+    )
+    .await;
+    let committed = fixture.overrides.snapshot().await;
+    let path = fixture._directory.path().join("runtime-overrides.json");
+    if path.exists() {
+        std::fs::remove_file(&path).unwrap();
+    }
+    std::fs::create_dir(&path).unwrap();
+    let response = fixture.service.dispatch(Request::VpnPolicyClearMode).await;
+    let token = match response {
+        Response::RouterTransactionPending { token, .. } => token,
+        other => panic!("expected pending: {other:?}"),
+    };
     let response = fixture
         .service
-        .dispatch(Request::VpnPolicySetMode {
-            mode: VpnPolicyMode::Vpn,
+        .dispatch(Request::RouterCommit {
+            token: token.clone(),
         })
         .await;
-    assert!(matches!(response, Response::VpnPolicyStatus { .. }));
-
-    let override_path = fixture._directory.path().join("runtime-overrides.json");
-    std::fs::remove_file(&override_path).expect("remove override file");
-    std::fs::create_dir(&override_path).expect("block override file rename");
-
-    let response = fixture.service.dispatch(Request::VpnPolicyClearMode).await;
-    assert!(matches!(
-        response,
-        Response::VpnPolicyError {
-            detail: VpnPolicyErrorDetail::Other { .. }
-        }
-    ));
-    assert_eq!(
-        fixture.overrides.effective_vpn_mode().await,
-        VpnPolicyMode::Vpn
+    assert!(
+        matches!(response, Response::RouterError { .. }),
+        "{response:?}"
     );
+    assert_eq!(fixture.overrides.snapshot().await, committed);
+    assert!(matches!(
+        fixture
+            .service
+            .dispatch(Request::RouterRollback { token })
+            .await,
+        Response::RouterRolledBack
+    ));
     match fixture.service.dispatch(Request::VpnPolicyStatus).await {
         Response::VpnPolicyStatus { status } => assert!(status.policy_active),
         other => panic!("unexpected response: {other:?}"),
@@ -2090,15 +2133,16 @@ async fn vpn_policy_clear_mode_restores_runtime_snapshot_when_persistence_fails(
 #[tokio::test]
 async fn vpn_policy_clear_mode_falls_back_to_base_default() {
     let fixture = vpn_policy_fixture(true).await;
-    fixture
-        .service
-        .dispatch(Request::VpnPolicySetMode {
+    commit_policy_request(
+        &fixture.service,
+        Request::VpnPolicySetMode {
             mode: VpnPolicyMode::Vpn,
-        })
-        .await;
+        },
+    )
+    .await;
     assert!(fixture.overrides.snapshot().await.vpn_mode.is_some());
 
-    match fixture.service.dispatch(Request::VpnPolicyClearMode).await {
+    match commit_policy_request(&fixture.service, Request::VpnPolicyClearMode).await {
         Response::VpnPolicyStatus { status } => {
             assert_eq!(status.mode, VpnPolicyMode::Direct);
             assert!(!status.mode_override_active);
@@ -10545,6 +10589,229 @@ fn network_pending_token(response: Response) -> String {
     }
 }
 
+async fn commit_vpn_request(service: &ControlService, request: Request) {
+    let response = service.dispatch(request).await;
+    let token = match response {
+        Response::RouterTransactionPending { token, .. } => token,
+        other => panic!("expected tentative router change: {other:?}"),
+    };
+    let response = service.dispatch(Request::RouterCommit { token }).await;
+    assert!(
+        matches!(response, Response::RouterCommitted { .. }),
+        "{response:?}"
+    );
+}
+
+async fn commit_policy_request(service: &ControlService, request: Request) -> Response {
+    commit_vpn_request(service, request).await;
+    service.dispatch(Request::VpnPolicyStatus).await
+}
+
+#[tokio::test]
+async fn standalone_vpn_is_tentative_rollback_then_commit_survives_reload() {
+    let (service, directory) = vpn_enabled_service().await;
+    service
+        .dispatch(Request::VpnImportProfile {
+            name: "home.conf".into(),
+            contents: valid_vpn_profile_contents(),
+        })
+        .await;
+    let committed = service.overrides.snapshot().await;
+    let response = service
+        .dispatch(Request::VpnActivate {
+            name: "home.conf".into(),
+        })
+        .await;
+    let token = match response {
+        Response::RouterTransactionPending { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(service.overrides.snapshot().await, committed);
+    assert!(service
+        .vpn
+        .as_ref()
+        .unwrap()
+        .status()
+        .await
+        .unwrap()
+        .is_some());
+    assert!(matches!(
+        service.dispatch(Request::RouterRollback { token }).await,
+        Response::RouterRolledBack
+    ));
+    assert!(service
+        .vpn
+        .as_ref()
+        .unwrap()
+        .status()
+        .await
+        .unwrap()
+        .is_none());
+    commit_vpn_request(
+        &service,
+        Request::VpnActivate {
+            name: "home.conf".into(),
+        },
+    )
+    .await;
+    let reloaded = crate::state::overrides::RuntimeOverrideStore::in_state_dir(directory.path())
+        .load()
+        .await
+        .unwrap();
+    assert_eq!(
+        reloaded.standalone_vpn.unwrap().profile.as_deref(),
+        Some("home.conf")
+    );
+    assert!(reloaded.committed_router_transaction.is_some());
+    assert_eq!(reloaded.revision, committed.revision + 1);
+}
+
+#[tokio::test]
+async fn standalone_vpn_restart_recovers_protected_policy_before_new_commit() {
+    let fixture = vpn_policy_fixture(true).await;
+    commit_policy_request(
+        &fixture.service,
+        Request::VpnPolicySetMode {
+            mode: VpnPolicyMode::Vpn,
+        },
+    )
+    .await;
+    let committed = fixture.overrides.snapshot().await;
+    let response = fixture
+        .service
+        .dispatch(Request::VpnPolicySetMode {
+            mode: VpnPolicyMode::Direct,
+        })
+        .await;
+    assert!(
+        matches!(response, Response::RouterTransactionPending { .. }),
+        "{response:?}"
+    );
+    assert!(fixture.network.rules.lock().unwrap().is_empty());
+    assert_eq!(fixture.overrides.snapshot().await, committed);
+    let config = fixture.service.base_config.clone();
+    let overrides = RuntimeOverrideManager::load(fixture._directory.path(), &config)
+        .await
+        .unwrap();
+    let tunnel = Arc::new(crate::vpn::VpnManager::new(
+        crate::vpn::WireGuardVpnDriver::new(
+            fixture.provider.clone(),
+            crate::vpn::WireGuardProfileStore::new(config.vpn.wireguard_config_dir.clone()),
+        ),
+        crate::vpn::ActiveProfileStore::new(fixture._directory.path().join("active-profile.json")),
+    ));
+    let coordinator = crate::core::router_subsystems::tests::standalone_coordinator(
+        &config,
+        overrides.clone(),
+        tunnel.clone(),
+        fixture.provider.clone(),
+        fixture.network.clone(),
+        fixture.executor.clone(),
+    )
+    .await;
+    coordinator.recover().await.unwrap();
+    assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
+    assert_eq!(
+        tunnel.status().await.unwrap().unwrap().profile_name,
+        "home.conf"
+    );
+    assert!(!fixture.network.rules.lock().unwrap().is_empty());
+    assert_eq!(overrides.snapshot().await, committed);
+    let policy = Arc::new(VpnPolicyManager::new(
+        fixture.network.clone(),
+        VpnPolicyFirewallBackend::new(fixture.executor.clone()),
+        tunnel.clone(),
+    ));
+    let service = ControlService::new_detached(
+        config.clone(),
+        fixture.network.clone(),
+        DhcpSupervisor::start(&config).await.unwrap(),
+        overrides,
+    )
+    .with_vpn_manager(tunnel)
+    .with_vpn_policy_manager(policy)
+    .with_router_coordinator(coordinator);
+    commit_policy_request(
+        &service,
+        Request::VpnPolicySetMode {
+            mode: VpnPolicyMode::Direct,
+        },
+    )
+    .await;
+    let reloaded =
+        crate::state::overrides::RuntimeOverrideStore::in_state_dir(fixture._directory.path())
+            .load()
+            .await
+            .unwrap();
+    assert_eq!(reloaded.vpn_mode, Some(VpnPolicyMode::Direct));
+    assert_eq!(reloaded.revision, committed.revision + 1);
+}
+
+#[tokio::test]
+async fn standalone_vpn_rollback_rebinds_owned_routes_after_tunnel_recreation() {
+    let fixture = vpn_policy_fixture(true).await;
+    commit_policy_request(
+        &fixture.service,
+        Request::VpnPolicySetMode {
+            mode: VpnPolicyMode::Vpn,
+        },
+    )
+    .await;
+    fixture
+        .service
+        .dispatch(Request::VpnImportProfile {
+            name: "other.conf".into(),
+            contents: valid_vpn_profile_contents(),
+        })
+        .await;
+    let response = fixture
+        .service
+        .dispatch(Request::VpnActivate {
+            name: "other.conf".into(),
+        })
+        .await;
+    let token = match response {
+        Response::RouterTransactionPending { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    fixture.network.interfaces.lock().unwrap()[0].index = 99;
+    let response = fixture
+        .service
+        .dispatch(Request::RouterRollback { token })
+        .await;
+    assert!(
+        matches!(response, Response::RouterRolledBack),
+        "{response:?}"
+    );
+    assert_eq!(
+        fixture
+            .service
+            .vpn
+            .as_ref()
+            .unwrap()
+            .status()
+            .await
+            .unwrap()
+            .unwrap()
+            .profile_name,
+        "home.conf"
+    );
+    assert!(fixture
+        .network
+        .routes
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|route| route.output_interface_index == Some(99)));
+    assert!(!fixture
+        .network
+        .routes
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|route| route.output_interface_index == Some(42)));
+}
+
 #[tokio::test]
 async fn reviewed_sharing_plan_rejects_changed_revision_or_observation_before_apply() {
     let fake = Arc::new(FakeRouterSubsystems::default());
@@ -10753,4 +11020,99 @@ async fn client_password_change_converges_and_rollback_restores_secret_before_co
             .unwrap();
     assert_eq!(reloaded.revision, committed.revision + 1);
     worker.abort();
+}
+
+#[tokio::test]
+async fn standalone_failed_tunnel_restore_reinstates_protection_and_retains_recovery() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = vpn_policy_fixture(true).await;
+    commit_policy_request(
+        &fixture.service,
+        Request::VpnPolicySetMode {
+            mode: VpnPolicyMode::Vpn,
+        },
+    )
+    .await;
+    let committed = fixture.overrides.snapshot().await;
+    let response = fixture
+        .service
+        .dispatch(Request::VpnPolicySetMode {
+            mode: VpnPolicyMode::Direct,
+        })
+        .await;
+    let token = match response {
+        Response::RouterTransactionPending { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    let path = fixture
+        .service
+        .base_config
+        .vpn
+        .wireguard_config_dir
+        .join("home.conf");
+    let profile = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    fixture
+        .provider
+        .delete_link(OWNED_INTERFACE_NAME)
+        .await
+        .unwrap();
+    let response = fixture
+        .service
+        .dispatch(Request::RouterRollback {
+            token: token.clone(),
+        })
+        .await;
+    assert!(
+        matches!(response, Response::RouterError { .. }),
+        "{response:?}"
+    );
+    let firewall = VpnPolicyFirewallBackend::new(fixture.executor.clone())
+        .observe()
+        .unwrap();
+    assert!(
+        firewall.desired.is_some(),
+        "previous protection must precede tunnel restoration"
+    );
+    assert_eq!(fixture.overrides.snapshot().await, committed);
+    assert!(fixture
+        ._directory
+        .path()
+        .join("router-transaction.json")
+        .exists());
+    assert!(matches!(
+        fixture
+            .service
+            .dispatch(Request::RouterCommit {
+                token: token.clone()
+            })
+            .await,
+        Response::RouterError { .. }
+    ));
+    std::fs::write(&path, profile).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let response = fixture
+        .service
+        .dispatch(Request::RouterRollback { token })
+        .await;
+    assert!(
+        matches!(response, Response::RouterRolledBack),
+        "{response:?}"
+    );
+    assert!(!fixture
+        ._directory
+        .path()
+        .join("router-transaction.json")
+        .exists());
+    commit_policy_request(
+        &fixture.service,
+        Request::VpnPolicySetMode {
+            mode: VpnPolicyMode::Direct,
+        },
+    )
+    .await;
+    assert_eq!(
+        fixture.overrides.snapshot().await.revision,
+        committed.revision + 1
+    );
 }

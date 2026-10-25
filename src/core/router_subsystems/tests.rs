@@ -919,6 +919,13 @@ async fn build_chain_subsystems(
     let vpn_provider_erased: Arc<dyn VpnProvider> = vpn_provider;
     ProductionRouterSubsystems::new(interfaces, routes, dhcp, dataplane, Vec::new()).with_vpn_chain(
         VpnChainDeps {
+            standalone: Some(Arc::new(crate::vpn::VpnManager::new(
+                crate::vpn::WireGuardVpnDriver::new(
+                    vpn_provider_erased.clone(),
+                    wireguard_store.clone(),
+                ),
+                crate::vpn::ActiveProfileStore::new(dir.join("vpn-active-profile.json")),
+            ))),
             vpn_provider: vpn_provider_erased,
             wireguard_store,
             state_dir: dir.to_path_buf(),
@@ -969,6 +976,7 @@ async fn apply_vpn_chain_activates_hops_in_order() {
     net.add_interface("tm-wg-0", 2).await;
     net.add_interface("tm-wg-1", 3).await;
     let plan = VpnChainPlan {
+        standalone: None,
         hops: vec![
             relay_hop(0, "tm-wg-0", "wan0"),
             relay_hop(1, "tm-wg-1", "tm-wg-0"),
@@ -1000,6 +1008,7 @@ async fn apply_vpn_chain_rolls_back_already_applied_hops_on_mid_chain_failure() 
     vpn_provider.fail_create_link_for("tm-wg-2");
 
     let plan = VpnChainPlan {
+        standalone: None,
         hops: vec![
             relay_hop(0, "tm-wg-0", "wan0"),
             relay_hop(1, "tm-wg-1", "tm-wg-0"),
@@ -1026,6 +1035,7 @@ async fn partial_wireguard_activation_removes_the_created_link() {
     let (subsystems, vpn_provider, _net, _dir) = chain_subsystems().await;
     vpn_provider.fail_set_peers_for("tm-wg-0");
     let plan = VpnChainPlan {
+        standalone: None,
         hops: vec![relay_hop(0, "tm-wg-0", "wan0")],
     };
 
@@ -1047,6 +1057,7 @@ async fn failed_wireguard_cleanup_remains_visible_to_outer_rollback() {
     vpn_provider.fail_delete_link_for("tm-wg-0");
     let hop = relay_hop(0, "tm-wg-0", "wan0");
     let plan = VpnChainPlan {
+        standalone: None,
         hops: vec![hop.clone()],
     };
 
@@ -1073,6 +1084,7 @@ async fn vpn_chain_health_detects_and_repair_reinstalls_relay_rule() {
     net.add_interface("tm-wg-0", 2).await;
     let hop = relay_hop(0, "tm-wg-0", "wan0");
     let plan = VpnChainPlan {
+        standalone: None,
         hops: vec![hop.clone()],
     };
     subsystems
@@ -1101,6 +1113,7 @@ async fn vpn_repair_keeps_obsolete_hops_until_teardown() {
     let hop = relay_hop(0, "tm-wg-0", "wan0");
     subsystems
         .apply_vpn_chain(&VpnChainPlan {
+            standalone: None,
             hops: vec![hop.clone()],
         })
         .await
@@ -1110,7 +1123,10 @@ async fn vpn_repair_keeps_obsolete_hops_until_teardown() {
     subsystems.prepare_recovery(&desired).await.unwrap();
     assert_eq!(chain_snapshot(&subsystems).await.previous_hops, vec![hop]);
     subsystems
-        .apply_vpn_chain(&VpnChainPlan { hops: vec![] })
+        .apply_vpn_chain(&VpnChainPlan {
+            standalone: None,
+            hops: vec![],
+        })
         .await
         .unwrap();
     assert!(!vpn_provider.link_exists("tm-wg-0").await.unwrap());
@@ -1127,7 +1143,10 @@ async fn vpn_repair_keeps_hops_outside_the_recovered_desired_chain() {
     let second = relay_hop(1, "tm-wg-1", "tm-wg-0");
     let hops = vec![first.clone(), second];
     subsystems
-        .apply_vpn_chain(&VpnChainPlan { hops: hops.clone() })
+        .apply_vpn_chain(&VpnChainPlan {
+            standalone: None,
+            hops: hops.clone(),
+        })
         .await
         .unwrap();
     let mut desired = RouterDesired::from_effective_config(&AppConfig::default()).unwrap();
@@ -1141,6 +1160,7 @@ async fn vpn_chain_restart_readopts_owned_hops_and_apply_is_idempotent() {
     let (subsystems, vpn_provider, net, dir) = chain_subsystems().await;
     net.add_interface("tm-wg-0", 2).await;
     let plan = VpnChainPlan {
+        standalone: None,
         hops: vec![relay_hop(0, "tm-wg-0", "wan0")],
     };
     subsystems
@@ -1182,6 +1202,7 @@ async fn vpn_chain_crash_recovery_rolls_candidate_back_to_snapshot() {
     let (subsystems, vpn_provider, net, dir) = chain_subsystems().await;
     net.add_interface("tm-wg-0", 2).await;
     let old_plan = VpnChainPlan {
+        standalone: None,
         hops: vec![relay_hop(0, "tm-wg-0", "wan0")],
     };
     subsystems
@@ -1201,6 +1222,7 @@ async fn vpn_chain_crash_recovery_rolls_candidate_back_to_snapshot() {
     let mut replacement = relay_hop(0, "tm-wg-0", "wan0");
     replacement.profile_name = "new.conf".to_string();
     let candidate = VpnChainPlan {
+        standalone: None,
         hops: vec![replacement.clone()],
     };
     subsystems
@@ -1235,6 +1257,7 @@ async fn vpn_chain_crash_recovery_rolls_candidate_back_to_snapshot() {
 async fn host_policy_uses_live_kernel_endpoints_instead_of_resolving_profiles_again() {
     let (subsystems, provider, _, dir) = chain_subsystems().await;
     let plan = VpnChainPlan {
+        standalone: None,
         hops: vec![relay_hop(0, "tm-wg-0", "wan0")],
     };
     subsystems.apply_vpn_chain(&plan).await.unwrap();
@@ -1335,4 +1358,50 @@ async fn router_mac_change_pauses_station_and_restarts_it_with_the_new_identity(
         *runtime.calls.lock().await,
         vec![("stop", previous), ("start", next)]
     );
+}
+
+/// Real coordinator and VPN adapters shared by API contract tests; only OS I/O is simulated.
+pub(crate) async fn standalone_coordinator(
+    config: &AppConfig,
+    overrides: crate::core::override_manager::RuntimeOverrideManager,
+    tunnel: Arc<crate::vpn::ProductionVpnManager>,
+    provider: Arc<dyn VpnProvider>,
+    network: Arc<dyn NetworkProvider>,
+    executor: Arc<dyn crate::firewall::NftExecutor>,
+) -> crate::core::router_transaction::RouterTransactionCoordinator {
+    let interfaces = Arc::new(FakeNetworkProvider::default());
+    for (index, (name, config)) in config.network.interfaces.iter().enumerate() {
+        interfaces.add_interface(name, index as u32 + 1).await;
+        if let Some(address) = config.ipv4 {
+            interfaces
+                .add_ipv4_address(
+                    name,
+                    address.addr(),
+                    address.prefix_len(),
+                    AddressOwnership::Static,
+                )
+                .await
+                .unwrap();
+        }
+    }
+    let subsystems = ProductionRouterSubsystems::new(
+        InterfaceManager::new(interfaces, AddressOwnershipJournal::in_memory()),
+        RouteManager::new(network.clone()),
+        DhcpSupervisor::start(config).await.unwrap(),
+        RouterDataplaneManager::new(FakeDataplaneProvider::default()),
+        vec![],
+    )
+    .with_vpn_chain(VpnChainDeps {
+        standalone: Some(tunnel),
+        vpn_provider: provider,
+        wireguard_store: WireGuardProfileStore::new(config.vpn.wireguard_config_dir.clone()),
+        state_dir: config.runtime.state_dir.clone(),
+        network,
+        nft_executor: executor,
+    });
+    crate::core::router_transaction::RouterTransactionCoordinator::new(
+        crate::core::router::RouterManager::new(Arc::new(subsystems)),
+        overrides,
+        std::time::Duration::from_secs(config.security.rollback_timeout_seconds),
+    )
 }

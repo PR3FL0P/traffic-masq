@@ -208,11 +208,6 @@ impl<Interface, Proposal> Request<Interface, Proposal> {
             | VpnImportFromSource { .. }
             | VpnImportProfile { .. }
             | VpnDeleteProfile { .. }
-            | SetVpnEnabled { .. }
-            | VpnActivate { .. }
-            | VpnDeactivate
-            | VpnPolicySetMode { .. }
-            | VpnPolicyClearMode
             | SaveWifiApProfile { .. }
             | DeleteWifiApProfile { .. }
             | CreateWifiClientProfile { .. }
@@ -235,16 +230,21 @@ impl<Interface, Proposal> Request<Interface, Proposal> {
                     long_running: true,
                 }
             }
-            RouterApply { .. } | RouterProvisioningApply { .. } | RouterProvisioningRepair => {
-                RequestPolicy {
-                    administrator: true,
-                    mutation: RouterTransaction,
-                    recovery_interface: None,
-                    provisioning_recovery: false,
-                    requires_idle_interfaces: false,
-                    long_running: true,
-                }
-            }
+            RouterApply { .. }
+            | RouterProvisioningApply { .. }
+            | RouterProvisioningRepair
+            | SetVpnEnabled { .. }
+            | VpnActivate { .. }
+            | VpnDeactivate
+            | VpnPolicySetMode { .. }
+            | VpnPolicyClearMode => RequestPolicy {
+                administrator: true,
+                mutation: RouterTransaction,
+                recovery_interface: None,
+                provisioning_recovery: false,
+                requires_idle_interfaces: false,
+                long_running: true,
+            },
             RouterCommit { .. } | RouterRollback { .. } => RequestPolicy {
                 administrator: true,
                 mutation: RouterTransaction,
@@ -337,7 +337,6 @@ mod pending_change_tests {
             Request::DisableDhcpClient {
                 interface: "wan0".into(),
             },
-            Request::VpnDeactivate,
             Request::DeleteWifiClientProfile {
                 id: "office".into(),
             },
@@ -348,6 +347,7 @@ mod pending_change_tests {
         }
         for request in [
             Request::Ping,
+            Request::VpnDeactivate,
             Request::PendingNetworkChanges,
             Request::CommitNetworkChange { token: "t".into() },
             Request::RollbackNetworkChange { token: "t".into() },

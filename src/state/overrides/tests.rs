@@ -304,7 +304,7 @@ async fn only_current_schema_is_readable_for_normal_load_and_recovery() {
         serde_json::json!({"schema_version": 1}),
         serde_json::json!({"schema_version": 2}),
         serde_json::json!({"schema_version": 3}),
-        serde_json::json!({"schema_version": 5}),
+        serde_json::json!({"schema_version": 6}),
         serde_json::json!({"schema_version": "4"}),
     ] {
         tokio::fs::write(store.path(), serde_json::to_vec(&document).unwrap())
@@ -319,4 +319,31 @@ async fn only_current_schema_is_readable_for_normal_load_and_recovery() {
     store.save(&RuntimeOverrides::default()).await.unwrap();
     store.load().await.unwrap();
     store.load_recovery_commit_proof().await.unwrap();
+}
+
+#[tokio::test]
+async fn schema_four_loads_without_standalone_intent_and_next_save_publishes_schema_five() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = RuntimeOverrideStore::in_state_dir(directory.path());
+    tokio::fs::write(store.path(), br#"{"schema_version":4,"revision":7}"#)
+        .await
+        .unwrap();
+    let mut loaded = store.load().await.unwrap();
+    assert!(loaded.standalone_vpn.is_none());
+    loaded.standalone_vpn = Some(crate::config::StandaloneVpnIntent { profile: None });
+    store.save(&loaded).await.unwrap();
+    let reloaded = store.load().await.unwrap();
+    assert_eq!(reloaded.schema_version, 5);
+    assert_eq!(reloaded.revision, 7);
+    assert_eq!(reloaded.standalone_vpn, loaded.standalone_vpn);
+    assert_eq!(
+        store
+            .load_recovery_commit_proof()
+            .await
+            .unwrap()
+            .router_recovery_overrides()
+            .unwrap()
+            .standalone_vpn,
+        loaded.standalone_vpn
+    );
 }

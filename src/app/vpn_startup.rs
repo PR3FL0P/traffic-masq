@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 use crate::config::{AppConfig, VpnPolicyMode};
 use crate::core::override_manager::RuntimeOverrideManager;
@@ -26,17 +26,6 @@ pub(super) async fn build_vpn_manager(
     let driver = WireGuardVpnDriver::new(provider, store);
     let manager = Arc::new(VpnManager::new(driver, active_profile_store));
 
-    // Build the control plane even when disabled; only enabled VPNs reconcile.
-    if config.vpn.enabled {
-        match manager.reconcile().await {
-            Ok(outcome) => {
-                tracing::info!(?outcome, "VPN startup reconcile complete");
-            }
-            Err(error) => {
-                return Err(error).context("VPN startup reconcile failed");
-            }
-        }
-    }
     Ok(Some(manager))
 }
 
@@ -64,6 +53,7 @@ pub(super) async fn apply_vpn_policy_startup<E: NftExecutor>(
     // periodic integrity path has the same coexistence guard.
     if crate::core::recovery_control::preservation_required(&effective_config.runtime.state_dir)
         || !effective_config.vpn.enabled
+        || effective_config.vpn.standalone.is_some()
         || !effective_config.router.vpn_chain.is_empty()
     {
         return;
