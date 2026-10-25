@@ -453,6 +453,30 @@ fn host_rule_expressions(vpn_interface: &str) -> (Vec<Value>, Vec<Value>) {
 /// nft emits prefixes as objects and may reorder anonymous set elements.
 /// Preserve all other expression structure, especially operators and rule order.
 fn normalize_expression(value: &Value) -> Value {
+    // nft 1.0.x emits a masked mark comparison as a numeric prefix;
+    // newer releases retain the explicit bitwise expression.
+    if let Some(condition) = value.get("match") {
+        if condition.get("left") == Some(&serde_json::json!({"meta": {"key": "mark"}})) {
+            if let Some(prefix) = condition.get("right").and_then(|right| right.get("prefix")) {
+                if let (Some(address), Some(length)) = (
+                    prefix.get("addr").and_then(Value::as_u64),
+                    prefix.get("len").and_then(Value::as_u64),
+                ) {
+                    if address <= u64::from(u32::MAX) && length <= 32 {
+                        let mask = u32::MAX.checked_shl(32 - length as u32).unwrap_or(0);
+                        if address & u64::from(mask) == address {
+                            let mut normalized = value.clone();
+                            normalized["match"]["left"] = serde_json::json!({
+                                "&": [{"meta": {"key": "mark"}}, mask]
+                            });
+                            normalized["match"]["right"] = Value::from(address);
+                            return normalized;
+                        }
+                    }
+                }
+            }
+        }
+    }
     // nft represents interface index zero as either a number or the string "0".
     // Normalize only this exact meta-iif comparison, keeping its operator intact.
     if let Some(condition) = value.get("match") {
@@ -657,6 +681,7 @@ fn vpn_firewall_structure_is_intact(entries: &[Value], desired: &VpnPolicyFirewa
     };
     let killswitch_ok = killswitch_rules.len() == 1
         && killswitch_rules.iter().any(|rule| {
+            let rule = &normalize_expression(rule);
             rule_has_tokens(rule, &["oifname", desired.physical_uplink.as_str()])
                 && value_contains_key(rule, "drop")
                 && value_contains_number(rule, fw_mark)

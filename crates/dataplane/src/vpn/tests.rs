@@ -193,6 +193,48 @@ fn nft_observe_reports_intact_rendered_structure() {
 }
 
 #[test]
+fn nft_observe_accepts_numeric_mark_prefixes_without_accepting_changed_nat_policy() {
+    for wanted in [desired(), desired_with_host()] {
+        for (length, operator, integrity) in [
+            (8, "==", VpnFirewallIntegrity::Intact),
+            (9, "==", VpnFirewallIntegrity::Drifted),
+            (8, "!=", VpnFirewallIntegrity::Drifted),
+        ] {
+            let mut ruleset = nft_ruleset_value(&wanted);
+            for entry in owned_entries(&mut ruleset) {
+                let Some(expressions) = entry
+                    .get_mut("rule")
+                    .and_then(|rule| rule.get_mut("expr"))
+                    .and_then(Value::as_array_mut)
+                else {
+                    continue;
+                };
+                for expression in expressions {
+                    let Some(condition) = expression.get_mut("match") else {
+                        continue;
+                    };
+                    if condition["left"]
+                        == serde_json::json!({
+                            "&": [{"meta": {"key": "mark"}}, VPN_POLICY_FWMASK.get()]
+                        })
+                    {
+                        condition["left"] = serde_json::json!({"meta": {"key": "mark"}});
+                        condition["right"] = serde_json::json!({"prefix": {
+                            "addr": VPN_POLICY_FWMARK.get(), "len": length
+                        }});
+                        condition["op"] = Value::from(operator);
+                    }
+                }
+            }
+            let observed = parse_owned_vpn_firewall_state(&serde_json::to_vec(&ruleset).unwrap())
+                .expect("valid nft ruleset");
+            assert_eq!(observed.desired, Some(wanted.clone()));
+            assert_eq!(observed.integrity, integrity);
+        }
+    }
+}
+
+#[test]
 fn nft_observe_rejects_owned_table_without_valid_metadata() {
     let malformed = serde_json::to_vec(&serde_json::json!({
         "nftables": [{
