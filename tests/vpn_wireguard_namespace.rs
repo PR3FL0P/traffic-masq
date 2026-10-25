@@ -418,17 +418,14 @@ async fn run_happy_path(fixture: &mut VpnNamespaceFixture) -> Result<()> {
         })
         .await
         .context("VpnActivate request failed")?;
-    match activate_response {
-        Response::VpnActivated { active } => {
-            assert_eq!(active.interface, "tm-wg0");
-            assert_eq!(active.profile_name, "peer.conf");
-            assert!(
-                active.up,
-                "activated interface must report administratively up"
-            );
+    let activation_token = match activate_response {
+        Response::RouterTransactionPending { token, plan } => {
+            let vpn = plan.vpn_chain.standalone.expect("standalone VPN plan");
+            assert_eq!(vpn.profile.as_deref(), Some("peer.conf"));
+            token
         }
         other => bail!("unexpected response to VpnActivate: {other:?}"),
-    }
+    };
 
     let link = Command::new("ip")
         .args(["-j", "link", "show", "dev", "tm-wg0"])
@@ -472,13 +469,27 @@ async fn run_happy_path(fixture: &mut VpnNamespaceFixture) -> Result<()> {
         other => bail!("unexpected response to VpnStatus: {other:?}"),
     }
 
+    match client
+        .request(&Request::RouterCommit {
+            token: activation_token,
+        })
+        .await?
+    {
+        Response::RouterCommitted { .. } => {}
+        other => bail!("unexpected VPN activation commit response: {other:?}"),
+    }
+
     let deactivate_response = client
         .request(&Request::VpnDeactivate)
         .await
         .context("VpnDeactivate request failed")?;
-    match deactivate_response {
-        Response::VpnDeactivated => {}
+    let token = match deactivate_response {
+        Response::RouterTransactionPending { token, .. } => token,
         other => bail!("unexpected response to VpnDeactivate: {other:?}"),
+    };
+    match client.request(&Request::RouterCommit { token }).await? {
+        Response::RouterCommitted { .. } => {}
+        other => bail!("unexpected VPN deactivation commit response: {other:?}"),
     }
 
     let link_show = Command::new("ip")

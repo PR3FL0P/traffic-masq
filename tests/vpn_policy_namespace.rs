@@ -668,14 +668,15 @@ async fn run_scenario(fixture: &mut VpnPolicyNamespaceFixture) -> Result<()> {
     .await
     .context("WireGuard endpoint traffic stalled after VPN policy activation — possible tunnel recursion")??;
 
-    match client
-        .request(&Request::VpnDeactivate)
-        .await
-        .context("VpnDeactivate request failed")?
-    {
-        Response::VpnDeactivated => {}
-        other => bail!("unexpected response to VpnDeactivate: {other:?}"),
+    match client.request(&Request::VpnDeactivate).await? {
+        Response::Error { message } => assert!(message.contains("Direct")),
+        other => {
+            bail!("protected tunnel disconnect must require confirmed Direct policy: {other:?}")
+        }
     }
+    // Inject an external link outage without changing committed VPN intent.
+    // The policy must continue blocking physical-uplink fallback.
+    run("ip", &["link", "set", "dev", "tm-wg0", "down"])?;
 
     timeout(
         Duration::from_secs(EXPECTED_FAILURE_CONNECT_SECS + 5),
@@ -707,26 +708,14 @@ async fn run_scenario(fixture: &mut VpnPolicyNamespaceFixture) -> Result<()> {
 
     let status_during_outage = fetch_vpn_policy_status(&client).await?;
     if status_during_outage.tunnel_healthy {
-        bail!("VPN policy status reports tunnel_healthy=true after VpnDeactivate tore down tm-wg0");
+        bail!("VPN policy status reports tunnel_healthy=true during the external link outage");
     }
     if !status_during_outage.policy_active {
-        bail!(
-            "VPN policy status reports policy_active=false after tunnel teardown alone — \
-             VpnDeactivate must not implicitly deactivate VPN traffic policy"
-        );
+        bail!("VPN policy status reports policy_active=false during an external link outage");
     }
     assert_management_path_reachable(&client).await?;
 
-    match client
-        .request(&Request::VpnActivate {
-            name: "peer.conf".to_string(),
-        })
-        .await
-        .context("VpnActivate (reconnect) request failed")?
-    {
-        Response::VpnActivated { active } => assert!(active.up, "reconnected interface must be up"),
-        other => bail!("unexpected response to VpnActivate (reconnect): {other:?}"),
-    }
+    run("ip", &["link", "set", "dev", "tm-wg0", "up"])?;
     timeout(WAIT_TIMEOUT, wait_for_handshake())
         .await
         .context("timed out waiting for the post-reconnect WireGuard handshake")??;
@@ -758,17 +747,10 @@ async fn run_scenario(fixture: &mut VpnPolicyNamespaceFixture) -> Result<()> {
     .await
     .context("timed out on post-reconnect VPN-mode echo probe")??;
 
-    match client
-        .request(&Request::VpnPolicyClearMode)
-        .await
-        .context("VpnPolicyClearMode request failed")?
-    {
-        Response::VpnPolicyStatus { status } => {
-            if status.mode != VpnPolicyMode::Direct || status.policy_active {
-                bail!("VpnPolicyClearMode did not restore direct mode: {status:?}");
-            }
-        }
-        other => bail!("unexpected response to VpnPolicyClearMode: {other:?}"),
+    commit_vpn_change(&client, Request::VpnPolicyClearMode).await?;
+    let status = fetch_vpn_policy_status(&client).await?;
+    if status.mode != VpnPolicyMode::Direct || status.policy_active {
+        bail!("VpnPolicyClearMode did not restore direct mode: {status:?}");
     }
     if count_policy_rules()? != 0 {
         bail!("reserved VPN policy IPv4 rule still present after clearing mode to direct");
@@ -857,18 +839,24 @@ async fn assert_vpn_policy_status(
     Ok(())
 }
 
-async fn set_vpn_policy_mode(client: &ApiClient, mode: VpnPolicyMode) -> Result<()> {
-    match client
-        .request(&Request::VpnPolicySetMode { mode })
-        .await
-        .context("VpnPolicySetMode request failed")?
-    {
-        Response::VpnPolicyStatus { status } if status.mode == mode => Ok(()),
-        Response::VpnPolicyStatus { status } => {
-            bail!("VpnPolicySetMode({mode:?}) did not take effect: {status:?}")
-        }
-        other => bail!("unexpected response to VpnPolicySetMode: {other:?}"),
+async fn commit_vpn_change(client: &ApiClient, request: Request) -> Result<()> {
+    let token = match client.request(&request).await? {
+        Response::RouterTransactionPending { token, .. } => token,
+        other => bail!("expected tentative VPN change: {other:?}"),
+    };
+    match client.request(&Request::RouterCommit { token }).await? {
+        Response::RouterCommitted { .. } => Ok(()),
+        other => bail!("unexpected VPN commit response: {other:?}"),
     }
+}
+
+async fn set_vpn_policy_mode(client: &ApiClient, mode: VpnPolicyMode) -> Result<()> {
+    commit_vpn_change(client, Request::VpnPolicySetMode { mode }).await?;
+    let status = fetch_vpn_policy_status(client).await?;
+    if status.mode != mode {
+        bail!("VpnPolicySetMode({mode:?}) did not take effect: {status:?}");
+    }
+    Ok(())
 }
 
 async fn import_and_activate_tunnel(client: &ApiClient, name: &str, contents: &str) -> Result<()> {
@@ -884,14 +872,17 @@ async fn import_and_activate_tunnel(client: &ApiClient, name: &str, contents: &s
         other => bail!("unexpected response to VpnImportProfile: {other:?}"),
     }
 
-    match client
-        .request(&Request::VpnActivate {
+    commit_vpn_change(
+        client,
+        Request::VpnActivate {
             name: name.to_string(),
-        })
-        .await
-        .context("VpnActivate request failed")?
-    {
-        Response::VpnActivated { active } => {
+        },
+    )
+    .await?;
+    match client.request(&Request::VpnStatus).await? {
+        Response::VpnStatus {
+            active: Some(active),
+        } => {
             assert_eq!(active.interface, "tm-wg0");
             assert_eq!(active.profile_name, name);
             assert!(
@@ -899,8 +890,9 @@ async fn import_and_activate_tunnel(client: &ApiClient, name: &str, contents: &s
                 "activated interface must report administratively up"
             );
         }
-        other => bail!("unexpected response to VpnActivate: {other:?}"),
+        other => bail!("unexpected response to VpnStatus: {other:?}"),
     }
+
     Ok(())
 }
 
