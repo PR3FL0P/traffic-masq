@@ -1613,3 +1613,43 @@ async fn indeterminate_commit_never_sends_rollback_even_with_stale_focus() {
         .unwrap()
         .contains("rollback is blocked"));
 }
+
+#[tokio::test]
+async fn route_editor_merges_saved_interfaces_with_observed_standalone_tunnels() {
+    use traffic_masq_protocol::*;
+    let mut app = TuiApp::default();
+    app.router.saved_interfaces = vec![InterfaceInventoryEntry {
+        name: "lan0".into(),
+        observed: None,
+        configured: None,
+        config_source: InterfaceConfigSource::None,
+        presence: InterfacePresence::Missing,
+        observation_stale: false,
+        suppressed: false,
+        readiness: InterfaceReadiness::WaitingDevice,
+        blockers: vec![],
+        references: vec![],
+    }];
+    app.dashboard.interfaces = vec![InterfaceStatusView {
+        interface: NetworkInterfaceView {
+            name: "tm-wg0".into(),
+            index: 10,
+            is_up: true,
+            is_wireless: false,
+            rx_bytes: 0,
+            tx_bytes: 0,
+        },
+        owned_ipv4_addresses: None,
+        ipv4_addresses: vec![],
+        has_default_route: false,
+    }];
+    app.router.proposed_router_config.vpn_chain = vec![VpnHopConfigView {
+        profile_name: "exit.conf".into(),
+    }];
+    let client = ApiClient::new("/must-not-connect");
+    open_route_editor_for_add(&mut app, &client).await;
+    assert_eq!(
+        app.router.editor.as_ref().unwrap().available_interfaces,
+        ["lan0", "tm-wg0"]
+    );
+}

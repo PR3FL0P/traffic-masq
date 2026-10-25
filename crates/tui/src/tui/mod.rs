@@ -1079,7 +1079,7 @@ async fn navigate_to_section(app: &mut TuiApp, section: Section, client: &ApiCli
                 );
             } else {
                 vpn::load_vpn_data(app, client).await;
-                app.screen = Screen::Vpn;
+                vpn::enter_list(app);
             }
         }
         Section::Settings => {
@@ -1693,6 +1693,8 @@ fn focus_action_slot(app: &mut TuiApp, slot: usize) {
         Screen::RouteEditor => router::focus_route_editor_action(app, slot),
         Screen::Vpn | Screen::VpnProfile | Screen::VpnSettings => vpn::focus_action(app, slot),
         Screen::VpnPolicy => vpn_policy::focus_action(app, slot),
+        Screen::VpnImport => vpn::focus_import_submit(app),
+        Screen::SettingsPassword => settings::focus_password_submit(app),
         Screen::WifiEditor => wifi::focus_editor_action(app, slot),
         Screen::WifiApProfiles => {
             if let Some(view) = app.wifi_ap_profiles.as_mut() {
@@ -1800,6 +1802,8 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
         (
             Screen::Dashboard
             | Screen::Vpn
+            | Screen::VpnProfile
+            | Screen::VpnSettings
             | Screen::Log
             | Screen::Router
             | Screen::Forwarding

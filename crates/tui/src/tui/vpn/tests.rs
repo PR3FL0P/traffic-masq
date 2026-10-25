@@ -708,3 +708,95 @@ async fn unknown_enable_outcome_invalidates_availability_and_catalog_has_no_togg
     handle_vpn_key(&mut app, KeyCode::Char('e'), &mock.client).await;
     assert_eq!(mock.calls.lock().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn returning_from_route_restores_list_focus_and_connects_selected_profile() {
+    let mock = super::super::test_api::mock(vec![
+        Response::Error {
+            message: "route status unavailable".into(),
+        },
+        Response::VpnConfig { enabled: true },
+        Response::VpnProfiles {
+            profiles: profile_app().vpn.profiles,
+        },
+        Response::VpnStatus { active: None },
+        activated(),
+    ])
+    .await;
+    let mut app = profile_app();
+    app.ui.input_enabled = true;
+    app.screen = Screen::VpnProfile;
+    app.vpn.opened_profile = Some("home.conf".into());
+    app.vpn.focus = VpnFocus::Route;
+    app.router.staged = true;
+    super::super::handle_key(&mut app, KeyCode::Enter, &mock.client, false).await;
+    assert_eq!(app.screen, Screen::Router);
+    super::super::navigate_to_section(&mut app, super::super::Section::Vpn, &mock.client, false)
+        .await;
+    assert_eq!(app.vpn.focus, VpnFocus::List);
+    assert!(app.vpn.opened_profile.is_none());
+    super::super::handle_key(&mut app, KeyCode::Enter, &mock.client, false).await;
+    assert!(standalone_selected(&app));
+    assert_eq!(
+        mock.calls.lock().unwrap().last().unwrap().body["type"],
+        "vpn_activate"
+    );
+}
+
+#[tokio::test]
+async fn profile_tab_navigation_wraps_through_visible_actions() {
+    let mut app = profile_app();
+    app.ui.input_enabled = true;
+    app.screen = Screen::VpnProfile;
+    app.vpn.focus = VpnFocus::Delete;
+    let client = ApiClient::new("/must-not-connect");
+    super::super::handle_key(&mut app, KeyCode::Tab, &client, false).await;
+    assert_eq!(app.vpn.focus, VpnFocus::Connect);
+    super::super::handle_key(&mut app, KeyCode::BackTab, &client, false).await;
+    assert_eq!(app.vpn.focus, VpnFocus::Delete);
+}
+
+#[tokio::test]
+async fn clicking_import_submits_even_when_name_field_has_focus() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{backend::TestBackend, Terminal};
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), "private test config").unwrap();
+    let mock = super::super::test_api::mock(vec![Response::VpnError {
+        detail: VpnErrorDetail::InvalidProfile {
+            message: "expected test rejection".into(),
+        },
+    }])
+    .await;
+    let mut app = profile_app();
+    app.screen = Screen::VpnImport;
+    app.vpn_import = Some(VpnImportEditor {
+        field: VpnImportField::Name,
+        name: "home.conf".into(),
+        path: file.path().display().to_string(),
+        cursor: 0,
+        sources: None,
+        selected_source: 0,
+    });
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|f| super::super::render(f, &mut app, false))
+        .unwrap();
+    let (button, _) = app.ui.buttons[0];
+    super::super::handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: button.x,
+            row: button.y,
+            modifiers: KeyModifiers::NONE,
+        },
+        &mock.client,
+        false,
+    )
+    .await;
+    let calls = mock.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].body["type"], "vpn_import_profile");
+    assert_eq!(calls[0].body["name"], "home.conf");
+}

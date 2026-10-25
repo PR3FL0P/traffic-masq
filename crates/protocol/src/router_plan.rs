@@ -109,6 +109,9 @@ pub struct VpnHopRoutingDesiredView {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpnPolicyDesiredView {
+    /// Standalone policy supplies NAT; router chains use explicit forwarding NAT instead.
+    #[serde(default = "default_masquerade_forwarded")]
+    pub masquerade_forwarded: bool,
     pub protected_subnets: Vec<Ipv4Net>,
     pub vpn_interface: String,
     pub physical_uplink: String,
@@ -198,4 +201,8 @@ pub struct RouterPlanView {
     pub vpn_chain: VpnChainPlanView,
     pub dataplane: RouterDataplanePlanView,
     pub risk: RouterRiskView,
+}
+
+fn default_masquerade_forwarded() -> bool {
+    true
 }

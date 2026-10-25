@@ -23,6 +23,12 @@ const VPN_POLICY_ROUTE_METRIC: u32 = 50;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpnPolicyDesired {
+    /// Standalone policy supplies NAT; router chains use explicit forwarding NAT instead.
+    #[serde(
+        default = "default_masquerade_forwarded",
+        skip_serializing_if = "masquerades_forwarded"
+    )]
+    pub masquerade_forwarded: bool,
     pub protected_subnets: Vec<Ipv4Net>,
     pub vpn_interface: String,
     pub physical_uplink: String,
@@ -62,6 +68,7 @@ pub fn vpn_policy_desired(config: &AppConfig) -> Option<VpnPolicyDesired> {
         return None;
     }
     Some(VpnPolicyDesired {
+        masquerade_forwarded: true,
         protected_subnets,
         vpn_interface: OWNED_INTERFACE_NAME.to_string(),
         physical_uplink: uplink.interface.clone(),
@@ -75,6 +82,7 @@ pub fn vpn_policy_desired(config: &AppConfig) -> Option<VpnPolicyDesired> {
 /// a previous run installed.
 pub fn vpn_policy_teardown_target() -> VpnPolicyDesired {
     VpnPolicyDesired {
+        masquerade_forwarded: true,
         protected_subnets: Vec::new(),
         vpn_interface: OWNED_INTERFACE_NAME.to_string(),
         physical_uplink: String::new(),
@@ -87,6 +95,7 @@ pub fn vpn_policy_teardown_target() -> VpnPolicyDesired {
 impl VpnPolicyDesired {
     fn firewall(&self) -> VpnPolicyFirewallDesired {
         VpnPolicyFirewallDesired {
+            masquerade_forwarded: self.masquerade_forwarded,
             protected_subnets: self.protected_subnets.clone(),
             vpn_interface: self.vpn_interface.clone(),
             physical_uplink: self.physical_uplink.clone(),
@@ -565,6 +574,15 @@ fn rule_spec_from_info(info: &Ipv4RuleInfo) -> Ipv4RuleSpec {
         input_interface: info.input_interface.clone(),
         output_interface: info.output_interface.clone(),
     }
+}
+
+fn default_masquerade_forwarded() -> bool {
+    true
+}
+
+// Omit the historical default to preserve existing recovery fingerprints/metadata.
+fn masquerades_forwarded(value: &bool) -> bool {
+    *value
 }
 
 #[cfg(test)]

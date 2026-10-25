@@ -994,3 +994,39 @@ fn obsolete_dhcp_snapshot_lease_field_is_rejected() {
     )
     .is_err());
 }
+
+#[tokio::test]
+async fn failed_vpn_chain_health_blocks_router_readiness() {
+    let desired = plan_with_vpn_chain().desired;
+    let fake = FakeSubsystems::new(Some("health_vpn_chain"));
+    let report = RouterManager::new(fake).health(&desired).await;
+    assert!(!report.ready());
+    assert!(report.dataplane.as_deref().unwrap().contains("VPN chain"));
+}
+
+#[test]
+fn chain_nat_is_owned_only_by_explicit_forwarding_rules() {
+    let mut config = enabled_config();
+    config.vpn.enabled = true;
+    config.router.vpn_chain = vec![crate::config::VpnHopConfig {
+        profile_name: "exit.conf".into(),
+    }];
+    let rules = config.router.forwarding.as_mut().unwrap();
+    for rule in rules {
+        rule.to = "tm-wg-0".into();
+        rule.masquerade = false;
+    }
+    let desired = RouterDesired::from_effective_config(&config).unwrap();
+    let VpnHopKind::Exit { policy } = &desired.vpn_chain[0].kind else {
+        panic!("expected exit")
+    };
+    assert!(!policy.masquerade_forwarded);
+    let RouterDataplaneTarget::Enabled(firewall) = desired.dataplane else {
+        panic!("expected forwarding")
+    };
+    assert!(firewall
+        .forwarding
+        .unwrap()
+        .iter()
+        .all(|rule| !rule.masquerade));
+}

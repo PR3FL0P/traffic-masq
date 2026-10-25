@@ -187,6 +187,7 @@ impl RouterDesired {
             let kind = if is_last {
                 VpnHopKind::Exit {
                     policy: VpnPolicyDesired {
+                        masquerade_forwarded: false,
                         protected_subnets: protected_subnets.clone(),
                         vpn_interface: interface.clone(),
                         physical_uplink: upstream.clone(),
@@ -650,12 +651,15 @@ impl RouterManager {
                 .err()
                 .map(|error| format!("{error:#}")),
             uplink_dhcp: self.subsystems.health_uplink_dhcp(desired).await,
-            dataplane: self
-                .subsystems
-                .health_dataplane(desired)
-                .await
-                .err()
-                .map(|error| format!("{error:#}")),
+            dataplane: if let Err(error) = self.subsystems.health_vpn_chain(desired).await {
+                Some(format!("VPN chain: {error:#}"))
+            } else {
+                self.subsystems
+                    .health_dataplane(desired)
+                    .await
+                    .err()
+                    .map(|error| format!("{error:#}"))
+            },
         }
     }
 

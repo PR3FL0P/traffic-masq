@@ -181,3 +181,25 @@ fn topology_lines_rendering_states() {
         .join(" ");
     assert!(text_staged.contains("Includes staged configuration edits"));
 }
+
+#[test]
+fn explicit_forwarding_does_not_hide_chain_or_uplink() {
+    let mut router = RouterData::default();
+    router.proposed_router_config.forwarding = Some(vec![]);
+    router.proposed_router_config.uplink = Some(traffic_masq_protocol::UplinkConfigView {
+        interface: "wan0".into(),
+        mode: traffic_masq_protocol::UplinkMode::External,
+    });
+    router.proposed_router_config.vpn_chain = vec![traffic_masq_protocol::VpnHopConfigView {
+        profile_name: "exit.conf".into(),
+    }];
+    let text = topology_lines(&router, true)
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("No forwarding connections"));
+    assert!(text.contains("VPN: tm-wg-0"));
+    assert!(text.contains("Profile: exit.conf"));
+    assert!(text.contains("Uplink: wan0"));
+}

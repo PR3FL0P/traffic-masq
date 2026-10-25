@@ -45,6 +45,12 @@ pub const VPN_POLICY_FWMASK: FirewallMarkMask = FirewallMarkMask(0xff00_0000);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VpnPolicyFirewallDesired {
+    /// Standalone policy supplies NAT; router chains use explicit forwarding NAT instead.
+    #[serde(
+        default = "default_masquerade_forwarded",
+        skip_serializing_if = "masquerades_forwarded"
+    )]
+    pub masquerade_forwarded: bool,
     pub protected_subnets: Vec<Ipv4Net>,
     pub vpn_interface: String,
     pub physical_uplink: String,
@@ -248,6 +254,22 @@ fn render_vpn_nftables_batch(
     let mark = format!("{:#010x}", VPN_POLICY_FWMARK.get());
     let mask = format!("{:#010x}", VPN_POLICY_FWMASK.get());
 
+    // Host traffic still needs its source translated, but must not override
+    // a forwarding rule's No NAT choice. Locally generated packets have iif 0.
+    let nat = if desired.masquerade_forwarded || desired.host_traffic.is_some() {
+        format!(
+            "    {}meta mark and {mask} == {mark} oifname \"{}\" masquerade\n",
+            if desired.masquerade_forwarded {
+                ""
+            } else {
+                "meta iif 0 "
+            },
+            desired.vpn_interface,
+        )
+    } else {
+        String::new()
+    };
+
     let (host_set, host_chains) = match &desired.host_traffic {
         None => (String::new(), String::new()),
         Some(host) => {
@@ -268,8 +290,7 @@ fn render_vpn_nftables_batch(
     };
 
     batch.push_str(&format!(
-        "table inet {NFT_VPN_TABLE} {{\n  comment \"{NFT_VPN_TABLE_COMMENT}\"\n  chain metadata {{\n{metadata_rules}  }}\n  set protected_subnets {{ type ipv4_addr; flags interval; elements = {{ {subnets} }} }}\n{host_set}  chain vpn_mark {{\n    type filter hook prerouting priority mangle; policy accept;\n    ip saddr @protected_subnets meta mark set {mark}\n  }}\n  chain postrouting {{\n    type nat hook postrouting priority srcnat; policy accept;\n    meta mark and {mask} == {mark} oifname \"{vpn_iface}\" masquerade\n  }}\n  chain killswitch {{\n    type filter hook forward priority filter; policy accept;\n    meta mark and {mask} == {mark} oifname \"{uplink}\" drop\n  }}\n{host_chains}}}\n",
-        vpn_iface = desired.vpn_interface,
+        "table inet {NFT_VPN_TABLE} {{\n  comment \"{NFT_VPN_TABLE_COMMENT}\"\n  chain metadata {{\n{metadata_rules}  }}\n  set protected_subnets {{ type ipv4_addr; flags interval; elements = {{ {subnets} }} }}\n{host_set}  chain vpn_mark {{\n    type filter hook prerouting priority mangle; policy accept;\n    ip saddr @protected_subnets meta mark set {mark}\n  }}\n  chain postrouting {{\n    type nat hook postrouting priority srcnat; policy accept;\n{nat}  }}\n  chain killswitch {{\n    type filter hook forward priority filter; policy accept;\n    meta mark and {mask} == {mark} oifname \"{uplink}\" drop\n  }}\n{host_chains}}}\n",
         uplink = desired.physical_uplink,
     ));
     Ok(batch)
@@ -431,7 +452,18 @@ fn host_rule_expressions(vpn_interface: &str) -> (Vec<Value>, Vec<Value>) {
 
 /// nft emits prefixes as objects and may reorder anonymous set elements.
 /// Preserve all other expression structure, especially operators and rule order.
-fn normalize_host_expression(value: &Value) -> Value {
+fn normalize_expression(value: &Value) -> Value {
+    // nft represents interface index zero as either a number or the string "0".
+    // Normalize only this exact meta-iif comparison, keeping its operator intact.
+    if let Some(condition) = value.get("match") {
+        if condition.get("left") == Some(&serde_json::json!({"meta": {"key": "iif"}}))
+            && condition.get("right").and_then(Value::as_str) == Some("0")
+        {
+            let mut normalized = value.clone();
+            normalized["match"]["right"] = Value::from(0);
+            return normalized;
+        }
+    }
     if let Some(prefix) = value.get("prefix") {
         if let (Some(address), Some(length)) = (
             prefix.get("addr").and_then(Value::as_str),
@@ -441,14 +473,12 @@ fn normalize_host_expression(value: &Value) -> Value {
         }
     }
     match value {
-        Value::Array(values) => {
-            Value::Array(values.iter().map(normalize_host_expression).collect())
-        }
+        Value::Array(values) => Value::Array(values.iter().map(normalize_expression).collect()),
         Value::Object(fields) => Value::Object(
             fields
                 .iter()
                 .map(|(key, value)| {
-                    let mut value = normalize_host_expression(value);
+                    let mut value = normalize_expression(value);
                     if key == "set" {
                         if let Value::Array(elements) = &mut value {
                             elements.sort_by_key(Value::to_string);
@@ -460,6 +490,24 @@ fn normalize_host_expression(value: &Value) -> Value {
         ),
         other => other.clone(),
     }
+}
+
+fn nat_rule_expression(desired: &VpnPolicyFirewallDesired) -> Option<Value> {
+    use serde_json::json;
+    if !desired.masquerade_forwarded && desired.host_traffic.is_none() {
+        return None;
+    }
+    let mut expressions = Vec::new();
+    if !desired.masquerade_forwarded {
+        expressions
+            .push(json!({"match": {"op": "==", "left": {"meta": {"key": "iif"}}, "right": 0}}));
+    }
+    expressions.extend([
+        json!({"match": {"op": "==", "left": {"&": [{"meta": {"key": "mark"}}, VPN_POLICY_FWMASK.get()]}, "right": VPN_POLICY_FWMARK.get()}}),
+        json!({"match": {"op": "==", "left": {"meta": {"key": "oifname"}}, "right": desired.vpn_interface}}),
+        json!({"masquerade": null}),
+    ]);
+    Some(Value::Array(expressions))
 }
 
 fn vpn_firewall_structure_is_intact(entries: &[Value], desired: &VpnPolicyFirewallDesired) -> bool {
@@ -568,7 +616,7 @@ fn vpn_firewall_structure_is_intact(entries: &[Value], desired: &VpnPolicyFirewa
             rules.len() == expected.len()
                 && rules.iter().zip(expected).all(|(rule, expression)| {
                     rule.get("expr").is_some_and(|actual| {
-                        normalize_host_expression(actual) == normalize_host_expression(expression)
+                        normalize_expression(actual) == normalize_expression(expression)
                     })
                 })
         };
@@ -597,13 +645,16 @@ fn vpn_firewall_structure_is_intact(entries: &[Value], desired: &VpnPolicyFirewa
                 && value_contains_key(rule, "mangle")
                 && value_contains_number(rule, fw_mark)
         });
-    let masquerade_ok = postrouting_rules.len() == 1
-        && postrouting_rules.iter().any(|rule| {
-            rule_has_tokens(rule, &["oifname", desired.vpn_interface.as_str()])
-                && value_contains_key(rule, "masquerade")
-                && value_contains_number(rule, fw_mark)
-                && value_contains_number(rule, fw_mask)
-        });
+    let expected_nat = nat_rule_expression(desired);
+    let masquerade_ok = match expected_nat {
+        None => postrouting_rules.is_empty(),
+        Some(expected) => {
+            postrouting_rules.len() == 1
+                && postrouting_rules[0]
+                    .get("expr")
+                    .is_some_and(|actual| normalize_expression(actual) == expected)
+        }
+    };
     let killswitch_ok = killswitch_rules.len() == 1
         && killswitch_rules.iter().any(|rule| {
             rule_has_tokens(rule, &["oifname", desired.physical_uplink.as_str()])
@@ -730,17 +781,15 @@ pub mod test_support {
                     { "match": { "op": "==", "left": { "payload": { "protocol": "ip", "field": "saddr" } }, "right": "@protected_subnets" } },
                     { "mangle": { "key": { "meta": { "key": "mark" } }, "value": fw_mark } }
                 ])),
-                vpn_rule("postrouting", serde_json::json!([
-                    { "match": { "op": "==", "left": { "&": [{ "meta": { "key": "mark" } }, fw_mask] }, "right": fw_mark } },
-                    { "match": { "op": "==", "left": { "meta": { "key": "oifname" } }, "right": desired.vpn_interface } },
-                    { "masquerade": null }
-                ])),
                 vpn_rule("killswitch", serde_json::json!([
                     { "match": { "op": "==", "left": { "&": [{ "meta": { "key": "mark" } }, fw_mask] }, "right": fw_mark } },
                     { "match": { "op": "==", "left": { "meta": { "key": "oifname" } }, "right": desired.physical_uplink } },
                     { "drop": null }
                 ])),
             ]);
+            if let Some(expression) = nat_rule_expression(desired) {
+                entries.push(vpn_rule("postrouting", expression));
+            }
             if let Some(host) = &desired.host_traffic {
                 entries.extend([
                     serde_json::json!({ "chain": {
@@ -772,6 +821,15 @@ pub mod test_support {
         }
         serde_json::to_vec(&serde_json::json!({ "nftables": entries })).expect("ruleset")
     }
+}
+
+fn default_masquerade_forwarded() -> bool {
+    true
+}
+
+// Omit the historical default to preserve existing recovery fingerprints/metadata.
+fn masquerades_forwarded(value: &bool) -> bool {
+    *value
 }
 
 #[cfg(test)]

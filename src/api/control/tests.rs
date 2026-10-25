@@ -1622,6 +1622,7 @@ use crate::firewall::vpn::{VpnPolicyFirewallBackend, VpnPolicyFirewallDesired};
 
 fn vpn_policy_firewall_desired() -> VpnPolicyFirewallDesired {
     VpnPolicyFirewallDesired {
+        masquerade_forwarded: true,
         protected_subnets: vec!["192.168.10.1/24".parse().unwrap()],
         vpn_interface: OWNED_INTERFACE_NAME.to_string(),
         physical_uplink: "wan0".to_string(),

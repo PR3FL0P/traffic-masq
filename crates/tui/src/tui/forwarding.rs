@@ -169,21 +169,7 @@ async fn open(app: &mut TuiApp, client: &ApiClient, edit: bool, egress: Option<S
     } else {
         None
     };
-    let mut interfaces: Vec<_> = app
-        .dashboard
-        .interfaces
-        .iter()
-        .map(|status| status.interface.name.clone())
-        .collect();
-    interfaces.extend(
-        app.router
-            .saved_interfaces
-            .iter()
-            .map(|entry| entry.name.clone()),
-    );
-    for rule in &rules {
-        interfaces.extend([rule.from.clone(), rule.to.clone()]);
-    }
+    let mut interfaces = super::router::sharing_interface_names(app);
     if let Some(egress) = &egress {
         interfaces.push(egress.clone());
     }

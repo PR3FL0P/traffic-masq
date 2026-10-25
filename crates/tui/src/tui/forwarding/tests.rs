@@ -399,3 +399,37 @@ async fn source_error_focuses_input_and_enter_can_reach_save_after_correction() 
     assert!(app.router.staged);
     assert!(app.message.as_deref().unwrap().contains("not applied"));
 }
+
+#[tokio::test]
+async fn new_connection_can_target_tunnels_from_the_unapplied_chain() {
+    let mut app = TuiApp::default();
+    app.router.staged = true;
+    app.router.proposed_router_config.forwarding = Some(vec![]);
+    app.router.proposed_router_config.vpn_chain = vec![
+        traffic_masq_protocol::VpnHopConfigView {
+            profile_name: "first.conf".into(),
+        },
+        traffic_masq_protocol::VpnHopConfigView {
+            profile_name: "exit.conf".into(),
+        },
+    ];
+    app.dashboard.interfaces = vec![
+        interface_status("lan0", false),
+        interface_status("wan0", true),
+    ];
+    open(&mut app, &ApiClient::new("/must-not-connect"), false, None).await;
+    let form = app.forwarding.as_mut().unwrap();
+    assert!(form.interfaces.iter().any(|name| name == "tm-wg-0"));
+    form.to = form
+        .interfaces
+        .iter()
+        .position(|name| name == "tm-wg-1")
+        .unwrap();
+    form.from = form
+        .interfaces
+        .iter()
+        .position(|name| name == "lan0")
+        .unwrap();
+    let rules = form.save().unwrap();
+    assert_eq!(rules[0].to, "tm-wg-1");
+}

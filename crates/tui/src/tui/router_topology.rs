@@ -154,178 +154,183 @@ fn topology_lines(router: &RouterData, expanded: bool) -> Vec<Line<'static>> {
                 )));
             }
         }
-    } else {
-        lines.push(note("Local networks / Wi-Fi"));
-        let mut has_lan = false;
-        for interface in interfaces
-            .iter()
-            .filter(|interface| interface.config.role == InterfaceRole::Output)
-        {
-            has_lan = true;
-            lines.push(node(
-                format!(
-                    "{}{}",
-                    interface.name,
-                    if interface.config.managed {
-                        ""
-                    } else {
-                        " [ext]"
-                    }
-                ),
-                Some(interface.config.managed),
-                related(&interface.name),
-            ));
-            if let Some(address) = interface.config.ipv4 {
-                lines.push(note(format!("    {}", address.trunc())));
-            }
-        }
-        if !has_lan {
-            lines.push(note(if desired.is_some() {
-                "  No configured LAN"
-            } else {
-                "  LAN data unavailable"
-            }));
-        }
-        lines.push(arrow());
+    }
+    if router.proposed_router_config.forwarding.is_none() {
+        lines.push(note(
+            "No forwarding connections; uplink and VPN grant no sharing permissions.",
+        ));
+    }
+    lines.push(note("Local networks / Wi-Fi"));
+    let mut has_lan = false;
+    for interface in interfaces
+        .iter()
+        .filter(|interface| interface.config.role == InterfaceRole::Output)
+    {
+        has_lan = true;
         lines.push(node(
             format!(
-                "Router: {}",
-                if router.enabled {
-                    "enabled"
+                "{}{}",
+                interface.name,
+                if interface.config.managed {
+                    ""
                 } else {
-                    "disabled"
+                    " [ext]"
                 }
             ),
-            None,
-            false,
+            Some(interface.config.managed),
+            related(&interface.name),
         ));
-        lines.push(note(match &router.plan {
-            Some(plan) => format!(
-                "  Forwarding: {} (snapshot)",
-                if plan.dataplane.snapshot.ipv4_forwarding {
-                    "on"
-                } else {
-                    "off"
-                }
-            ),
-            None => "  Forwarding: unknown".into(),
-        }));
-
-        // Configuration orders hops from the physical uplink towards the LAN.
-        // Display the reverse order for outbound LAN traffic / tunnel transport.
-        let chain = &router.proposed_router_config.vpn_chain;
-        if chain.is_empty() {
-            lines.push(note("  VPN: none configured"));
+        if let Some(address) = interface.config.ipv4 {
+            lines.push(note(format!("    {}", address.trunc())));
+        }
+    }
+    if !has_lan {
+        lines.push(note(if desired.is_some() {
+            "  No configured LAN"
         } else {
-            for (index, hop) in chain.iter().enumerate().rev() {
-                lines.push(arrow());
-                let interface = hop_interface_name(index as u32);
-                lines.push(node(
-                    format!("VPN: {interface}"),
-                    Some(true),
-                    related(&interface),
-                ));
-                if expanded {
-                    lines.push(note(format!("    Profile: {}", hop.profile_name)));
-                }
+            "  LAN data unavailable"
+        }));
+    }
+    lines.push(arrow());
+    lines.push(node(
+        format!(
+            "Router: {}",
+            if router.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ),
+        None,
+        false,
+    ));
+    lines.push(note(match &router.plan {
+        Some(plan) => format!(
+            "  Forwarding: {} (snapshot)",
+            if plan.dataplane.snapshot.ipv4_forwarding {
+                "on"
+            } else {
+                "off"
+            }
+        ),
+        None => "  Forwarding: unknown".into(),
+    }));
+
+    // Configuration orders hops from the physical uplink towards the LAN.
+    // Display the reverse order for outbound LAN traffic / tunnel transport.
+    let chain = &router.proposed_router_config.vpn_chain;
+    if chain.is_empty() {
+        lines.push(note("  VPN: none configured"));
+    } else {
+        for (index, hop) in chain.iter().enumerate().rev() {
+            lines.push(arrow());
+            let interface = hop_interface_name(index as u32);
+            lines.push(node(
+                format!("VPN: {interface}"),
+                Some(true),
+                related(&interface),
+            ));
+            if expanded {
+                lines.push(note(format!("    Profile: {}", hop.profile_name)));
             }
         }
-        lines.push(arrow());
-        let uplink = router
-            .proposed_router_config
-            .uplink
-            .as_ref()
-            .map(|uplink| uplink.interface.as_str());
-        if let Some(uplink) = uplink {
-            let managed = interfaces
-                .iter()
-                .find(|interface| interface.name == uplink)
-                .map(|interface| interface.config.managed);
+    }
+    lines.push(arrow());
+    let uplink = router
+        .proposed_router_config
+        .uplink
+        .as_ref()
+        .map(|uplink| uplink.interface.as_str());
+    if let Some(uplink) = uplink {
+        let managed = interfaces
+            .iter()
+            .find(|interface| interface.name == uplink)
+            .map(|interface| interface.config.managed);
+        lines.push(node(
+            format!(
+                "Uplink: {uplink}{}",
+                match managed {
+                    Some(true) => "",
+                    Some(false) => " [ext]",
+                    None => " [?]",
+                }
+            ),
+            Some(managed.unwrap_or(false)),
+            related(uplink),
+        ));
+        let gateways: Vec<_> = router
+            .routes
+            .iter()
+            .filter(|route| {
+                route.destination.prefix_len() == 0
+                    && route.output_interface.as_deref() == Some(uplink)
+            })
+            .collect();
+        lines.push(note(format!("  Default candidates: {}", gateways.len())));
+        for route in gateways {
+            lines.push(node(
+                route.gateway.map_or_else(
+                    || "Direct (no gateway)".into(),
+                    |gateway| format!("Gateway: {gateway}"),
+                ),
+                Some(route.owner.is_owned()),
+                selected.is_some_and(|selected| {
+                    selected.destination == route.destination
+                        && selected.output_interface == route.output_interface
+                }),
+            ));
+            lines.push(note(format!(
+                "    table {} / metric {}",
+                route.table,
+                route.metric.unwrap_or(0)
+            )));
+        }
+    } else {
+        lines.push(node("Uplink: not configured", Some(false), false));
+        lines.push(note("  Observed default routes:"));
+        let mut found = false;
+        for route in router
+            .routes
+            .iter()
+            .filter(|route| route.destination.prefix_len() == 0)
+        {
+            found = true;
             lines.push(node(
                 format!(
-                    "Uplink: {uplink}{}",
-                    match managed {
-                        Some(true) => "",
-                        Some(false) => " [ext]",
-                        None => " [?]",
-                    }
+                    "dev {}",
+                    route.output_interface.as_deref().unwrap_or("unknown")
                 ),
-                Some(managed.unwrap_or(false)),
-                related(uplink),
+                Some(route.owner.is_owned()),
+                selected.is_some_and(|selected| {
+                    selected.destination == route.destination
+                        && selected.output_interface == route.output_interface
+                }),
             ));
-            let gateways: Vec<_> = router
-                .routes
-                .iter()
-                .filter(|route| {
-                    route.destination.prefix_len() == 0
-                        && route.output_interface.as_deref() == Some(uplink)
-                })
-                .collect();
-            lines.push(note(format!("  Default candidates: {}", gateways.len())));
-            for route in gateways {
-                lines.push(node(
-                    route.gateway.map_or_else(
-                        || "Direct (no gateway)".into(),
-                        |gateway| format!("Gateway: {gateway}"),
-                    ),
-                    Some(route.owner.is_owned()),
-                    selected.is_some_and(|selected| {
-                        selected.destination == route.destination
-                            && selected.output_interface == route.output_interface
-                    }),
-                ));
-                lines.push(note(format!(
-                    "    table {} / metric {}",
-                    route.table,
-                    route.metric.unwrap_or(0)
-                )));
-            }
-        } else {
-            lines.push(node("Uplink: not configured", Some(false), false));
-            lines.push(note("  Observed default routes:"));
-            let mut found = false;
-            for route in router
-                .routes
-                .iter()
-                .filter(|route| route.destination.prefix_len() == 0)
-            {
-                found = true;
-                lines.push(node(
-                    format!(
-                        "dev {}",
-                        route.output_interface.as_deref().unwrap_or("unknown")
-                    ),
-                    Some(route.owner.is_owned()),
-                    selected.is_some_and(|selected| {
-                        selected.destination == route.destination
-                            && selected.output_interface == route.output_interface
-                    }),
-                ));
-                lines.push(node(
-                    route.gateway.map_or_else(
-                        || "Direct (no gateway)".into(),
-                        |gateway| format!("Gateway: {gateway}"),
-                    ),
-                    Some(route.owner.is_owned()),
-                    selected.is_some_and(|selected| {
-                        selected.destination == route.destination
-                            && selected.output_interface == route.output_interface
-                    }),
-                ));
-                lines.push(note(format!(
-                    "    table {} / metric {}",
-                    route.table,
-                    route.metric.unwrap_or(0)
-                )));
-            }
-            if !found {
-                lines.push(note("    None in route list"));
-            }
+            lines.push(node(
+                route.gateway.map_or_else(
+                    || "Direct (no gateway)".into(),
+                    |gateway| format!("Gateway: {gateway}"),
+                ),
+                Some(route.owner.is_owned()),
+                selected.is_some_and(|selected| {
+                    selected.destination == route.destination
+                        && selected.output_interface == route.output_interface
+                }),
+            ));
+            lines.push(note(format!(
+                "    table {} / metric {}",
+                route.table,
+                route.metric.unwrap_or(0)
+            )));
         }
-        // A dotted edge explicitly leaves Internet reachability unresolved.
-        lines.push(note("      ⋮"));
-        lines.push(node("Internet: not tested", None, false));
+        if !found {
+            lines.push(note("    None in route list"));
+        }
     }
+    // A dotted edge explicitly leaves Internet reachability unresolved.
+    lines.push(note("      ⋮"));
+    lines.push(node("Internet: not tested", None, false));
+
     lines.push(Line::default());
     lines.push(note("Selected route (route list)"));
     if let Some(route) = selected {

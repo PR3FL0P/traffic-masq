@@ -359,5 +359,47 @@ impl RouterPendingView {
 const ROUTER_APPLY_LABEL: &str = "[Apply temporarily] (Enter)";
 const ROUTER_CANCEL_LABEL: &str = "[Cancel] return without applying (Esc)";
 
+/// Saved intent and kernel observations are complementary interface inventories.
+pub(crate) fn known_interface_names(app: &TuiApp) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    names.extend(
+        app.dashboard
+            .interfaces
+            .iter()
+            .map(|entry| entry.interface.name.clone()),
+    );
+    names.extend(
+        app.router
+            .saved_interfaces
+            .iter()
+            .map(|entry| entry.name.clone()),
+    );
+    names
+}
+
+/// Sharing rules can refer to tunnels created during the same transaction.
+/// Static route plans, unlike forwarding rules, need a current kernel ifindex.
+pub(crate) fn sharing_interface_names(app: &TuiApp) -> Vec<String> {
+    let mut names = known_interface_names(app);
+    let config = &app.router.proposed_router_config;
+    names.extend(
+        (0..config.vpn_chain.len())
+            .map(|index| traffic_masq_protocol::hop_interface_name(index as u32)),
+    );
+    for rule in config.forwarding.iter().flatten() {
+        names.extend([rule.from.clone(), rule.to.clone()]);
+    }
+    for rule in &config.port_forwards {
+        names.extend([rule.from.clone(), rule.to.clone()]);
+    }
+    names.extend(
+        config
+            .owned_routes
+            .iter()
+            .filter_map(|route| route.output_interface.clone()),
+    );
+    names.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests;

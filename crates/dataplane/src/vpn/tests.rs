@@ -40,6 +40,7 @@ async fn rebuilt_vpn_backend_waits_for_a_cancelled_apply_worker() {
 
 fn desired() -> VpnPolicyFirewallDesired {
     VpnPolicyFirewallDesired {
+        masquerade_forwarded: true,
         protected_subnets: vec![
             "192.168.10.0/24".parse().expect("subnet"),
             "192.168.20.0/24".parse().expect("subnet"),
@@ -135,6 +136,7 @@ fn nft_apply_is_idempotent_and_preserves_foreign_tables() {
 fn nft_apply_replaces_only_owned_vpn_table_in_one_atomic_batch() {
     let executor = FakeNftExecutor::with_responses(vec![
         Ok(nft_ruleset(Some(&VpnPolicyFirewallDesired {
+            masquerade_forwarded: true,
             protected_subnets: vec!["10.0.0.0/24".parse().expect("subnet")],
             vpn_interface: "tm-wg0".to_string(),
             physical_uplink: "old0".to_string(),
@@ -445,4 +447,111 @@ fn host_integrity_accepts_nft_prefix_objects_and_set_order() {
             .integrity,
         VpnFirewallIntegrity::Intact
     );
+}
+
+#[test]
+fn router_chain_keeps_forwarding_nat_separate_from_host_nat() {
+    let mut wanted = desired();
+    wanted.masquerade_forwarded = false;
+    let batch = render_vpn_nftables_batch(false, Some(&wanted)).unwrap();
+    assert!(!batch.contains("masquerade"));
+    let observed = parse_owned_vpn_firewall_state(&nft_ruleset(Some(&wanted))).unwrap();
+    assert_eq!(observed.integrity, VpnFirewallIntegrity::Intact);
+    wanted.host_traffic = desired_with_host().host_traffic;
+    let batch = render_vpn_nftables_batch(false, Some(&wanted)).unwrap();
+    assert_eq!(batch.matches("masquerade").count(), 1);
+    assert!(batch.contains("meta iif 0 meta mark"));
+    let observed = parse_owned_vpn_firewall_state(&nft_ruleset(Some(&wanted))).unwrap();
+    assert_eq!(observed.integrity, VpnFirewallIntegrity::Intact);
+
+    // Losing the host-only restriction must be observed as drift.
+    let mut ruleset = nft_ruleset_value(&wanted);
+    let rule = owned_entries(&mut ruleset)
+        .iter_mut()
+        .find_map(|entry| {
+            let rule = entry.get_mut("rule")?;
+            (rule["chain"] == "postrouting").then_some(rule)
+        })
+        .unwrap();
+    rule["expr"].as_array_mut().unwrap().remove(0);
+    let observed = parse_owned_vpn_firewall_state(&serde_json::to_vec(&ruleset).unwrap()).unwrap();
+    assert_eq!(observed.integrity, VpnFirewallIntegrity::Drifted);
+}
+
+#[test]
+fn persisted_policy_without_nat_flag_retains_standalone_nat() {
+    let document = serde_json::to_value(desired()).unwrap();
+    assert!(document.get("masquerade_forwarded").is_none());
+    let restored: VpnPolicyFirewallDesired = serde_json::from_value(document).unwrap();
+    assert!(restored.masquerade_forwarded);
+}
+
+// Explicit opt-in: all interfaces, rules and sysctls live in private namespaces.
+#[test]
+#[ignore = "requires Linux unprivileged user namespaces, nft, ip and python3"]
+fn vpn_nat_kernel_preserves_no_nat_and_host_nat_independently() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    for (standalone, explicit_nat, host) in [
+        (false, false, false),
+        (false, true, false),
+        (false, false, true),
+        (false, true, true),
+        (true, false, false),
+    ] {
+        let mut policy = desired();
+        policy.masquerade_forwarded = standalone;
+        policy.protected_subnets = vec!["192.0.2.0/24".parse().unwrap()];
+        policy.vpn_interface = "tm-wg-0".into();
+        if host {
+            policy.host_traffic = desired_with_host().host_traffic;
+        }
+        let forwarding = crate::RouterDataplaneDesired {
+            forwarding: Some(vec![crate::ForwardingConfig {
+                from: "lan0".into(),
+                to: "tm-wg-0".into(),
+                source_subnet: Some("192.0.2.0/24".parse().unwrap()),
+                masquerade: explicit_nat,
+            }]),
+            port_forwards: vec![],
+        };
+        let batch = crate::render_nftables_batch(false, Some(&forwarding)).unwrap()
+            + &render_vpn_nftables_batch(false, Some(&policy)).unwrap();
+        let expected = if standalone || explicit_nat {
+            "198.51.100.1"
+        } else {
+            "192.0.2.2"
+        };
+        let mut child = Command::new("unshare").args([
+            "-Urnm", "sh", "-ec",
+            "mount -t tmpfs none /run; mkdir /run/netns; nft -f -; python3 \"$1\" \"$2\" \"$3\"; nft -j list ruleset",
+            "vpn-nat-test", concat!(env!("CARGO_MANIFEST_DIR"), "/src/vpn_nat_kernel_test.py"),
+            expected, if host { "host" } else { "forwarded" },
+        ]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(batch.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "standalone={standalone}, explicit_nat={explicit_nat}, host={host}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let observed = parse_owned_vpn_firewall_state(&output.stdout).unwrap();
+        assert_eq!(observed.desired.as_ref(), Some(&policy));
+        assert_eq!(
+            observed.integrity,
+            VpnFirewallIntegrity::Intact,
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let forwarding_observed = crate::parse_owned_nftables_state(&output.stdout).unwrap();
+        assert_eq!(
+            forwarding_observed.integrity,
+            crate::OwnedFirewallIntegrity::Intact
+        );
+    }
 }

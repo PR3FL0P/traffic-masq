@@ -218,6 +218,7 @@ impl NetworkProvider for FakeNetwork {
 
 fn desired() -> VpnPolicyDesired {
     VpnPolicyDesired {
+        masquerade_forwarded: true,
         protected_subnets: vec!["192.168.10.0/24".parse().expect("subnet")],
         vpn_interface: OWNED_INTERFACE_NAME.to_string(),
         physical_uplink: "eth0".to_string(),
@@ -596,4 +597,14 @@ async fn deactivate_is_robust_when_tunnel_interface_is_already_gone() {
 
     assert!(network.list_ipv4_rules().await.unwrap().is_empty());
     assert!(network.list_ipv4_routes().await.unwrap().is_empty());
+}
+
+#[test]
+fn persisted_standalone_policy_retains_its_shape_and_nat_default() {
+    let original = desired();
+    let document = serde_json::to_value(&original).unwrap();
+    assert!(document.get("masquerade_forwarded").is_none());
+    let restored: VpnPolicyDesired = serde_json::from_value(document).unwrap();
+    assert_eq!(restored, original);
+    assert!(restored.firewall().masquerade_forwarded);
 }

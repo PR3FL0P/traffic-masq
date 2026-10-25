@@ -471,3 +471,46 @@ async fn session_preferences_submit_on_first_enter() {
         .unwrap()
         .contains("whole number of minutes"));
 }
+
+#[tokio::test]
+async fn clicking_password_submit_validates_form_regardless_of_focused_input() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{backend::TestBackend, Terminal};
+    for field in PASSWORD_FIELDS {
+        let mut app = TuiApp {
+            screen: Screen::SettingsPassword,
+            settings_password: Some(PasswordChangeEditor {
+                field,
+                current: "current".into(),
+                new_password: "new".into(),
+                confirm: "mismatch".into(),
+                cursor: 0,
+            }),
+            ..Default::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| super::super::render(f, &mut app, false))
+            .unwrap();
+        let (button, _) = app.ui.buttons[0];
+        super::super::handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: button.x,
+                row: button.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &ApiClient::new("/must-not-connect"),
+            false,
+        )
+        .await;
+        assert!(
+            app.message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("do not match"),
+            "{field:?}"
+        );
+    }
+}

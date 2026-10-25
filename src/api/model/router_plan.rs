@@ -142,6 +142,7 @@ impl From<VpnHopRoutingDesired> for VpnHopRoutingDesiredView {
 impl From<VpnPolicyDesired> for VpnPolicyDesiredView {
     fn from(value: VpnPolicyDesired) -> Self {
         Self {
+            masquerade_forwarded: value.masquerade_forwarded,
             protected_subnets: value.protected_subnets,
             vpn_interface: value.vpn_interface,
             physical_uplink: value.physical_uplink,

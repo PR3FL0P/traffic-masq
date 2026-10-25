@@ -439,21 +439,9 @@ pub(super) async fn open_route_editor_for_add(app: &mut TuiApp, client: &ApiClie
 }
 
 pub(super) async fn fetch_available_interfaces(app: &TuiApp, client: &ApiClient) -> Vec<String> {
-    if !app.router.saved_interfaces.is_empty() {
-        return app
-            .router
-            .saved_interfaces
-            .iter()
-            .map(|entry| entry.name.clone())
-            .collect();
-    }
-    if !app.dashboard.interfaces.is_empty() {
-        return app
-            .dashboard
-            .interfaces
-            .iter()
-            .map(|i| i.interface.name.clone())
-            .collect();
+    let names = known_interface_names(app);
+    if !names.is_empty() {
+        return names.into_iter().collect();
     }
     match client.request(&Request::ListInterfaces).await {
         Ok(Response::Interfaces { interfaces }) => {

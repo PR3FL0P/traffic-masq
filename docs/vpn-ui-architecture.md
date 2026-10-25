@@ -35,7 +35,11 @@ There is one ordered global chain, with at most eight hops. The first hop is
 closest to the physical uplink. Relay hops route subsequent tunnels through
 preceding hops; the exit hop applies protected-subnet policy and the kill switch.
 The chain editor preserves explicit forwarding rules. Uplink and chain configuration
-do not add forwarding or NAT permissions; configure those in Internet sharing. External uplinks
+do not add forwarding or NAT permissions; configure those in Internet sharing.
+For chain traffic, each sharing rule owns its NAT choice: No NAT preserves the
+client source address. Enabling router host traffic adds NAT only for locally
+generated packets and does not override a sharing rule. Chain health participates
+in router readiness even when forwarding itself is healthy. External uplinks
 must be unmanaged Input interfaces; DHCP uplinks require managed Input interfaces
 with an enabled DHCP client. Validation remains authoritative in the daemon.
 

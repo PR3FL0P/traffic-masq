@@ -1768,6 +1768,7 @@ async fn apply_vpn_policy_startup_deactivates_leftover_policy_in_direct_mode() {
         scope: 253,
     });
     let leftover_firewall = crate::firewall::vpn::VpnPolicyFirewallDesired {
+        masquerade_forwarded: true,
         protected_subnets: vec!["192.168.10.0/24".parse().unwrap()],
         vpn_interface: OWNED_INTERFACE_NAME.to_string(),
         physical_uplink: "wan0".to_string(),

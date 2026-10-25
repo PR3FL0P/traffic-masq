@@ -803,6 +803,13 @@ pub(crate) fn render_settings_password(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+pub(crate) fn focus_password_submit(app: &mut TuiApp) {
+    if let Some(editor) = app.settings_password.as_mut() {
+        editor.field = PasswordField::Confirm;
+        editor.reset_cursor();
+    }
+}
+
 pub(crate) async fn handle_settings_password_key(
     app: &mut TuiApp,
     key: KeyCode,

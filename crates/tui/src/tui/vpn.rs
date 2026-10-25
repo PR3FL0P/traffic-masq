@@ -495,6 +495,19 @@ pub(crate) fn render_vpn_import(frame: &mut ratatui::Frame<'_>, area: Rect, app:
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+pub(crate) fn enter_list(app: &mut TuiApp) {
+    app.screen = Screen::Vpn;
+    app.vpn.opened_profile = None;
+    app.vpn.focus = VpnFocus::List;
+}
+
+pub(crate) fn focus_import_submit(app: &mut TuiApp) {
+    if let Some(editor) = app.vpn_import.as_mut() {
+        editor.field = VpnImportField::Path;
+        editor.reset_cursor();
+    }
+}
+
 pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
     if let Some(focus) = actions(app.screen).get(slot) {
         app.vpn.focus = *focus;
@@ -527,9 +540,7 @@ pub(crate) async fn handle_vpn_key(app: &mut TuiApp, key: KeyCode, client: &ApiC
     match key {
         KeyCode::Char('r') => load_vpn_data(app, client).await,
         KeyCode::Esc if app.screen != Screen::Vpn => {
-            app.screen = Screen::Vpn;
-            app.vpn.opened_profile = None;
-            app.vpn.focus = VpnFocus::List;
+            enter_list(app);
         }
         KeyCode::Esc if app.vpn.focus != VpnFocus::List => app.vpn.focus = VpnFocus::List,
         KeyCode::Esc => app.screen = Screen::Dashboard,
@@ -651,7 +662,7 @@ async fn open_vpn_import(app: &mut TuiApp, client: &ApiClient) {
 
 pub(crate) async fn handle_vpn_import_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
     let Some(editor) = app.vpn_import.as_mut() else {
-        app.screen = Screen::Vpn;
+        enter_list(app);
         return;
     };
 
@@ -667,7 +678,7 @@ pub(crate) async fn handle_vpn_import_key(app: &mut TuiApp, key: KeyCode, client
             KeyCode::Enter => vpn_import_submit(app, client).await,
             KeyCode::Esc => {
                 app.vpn_import = None;
-                app.screen = Screen::Vpn;
+                enter_list(app);
             }
             _ => {}
         }
@@ -676,7 +687,7 @@ pub(crate) async fn handle_vpn_import_key(app: &mut TuiApp, key: KeyCode, client
     match key {
         KeyCode::Esc => {
             app.vpn_import = None;
-            app.screen = Screen::Vpn;
+            enter_list(app);
         }
         KeyCode::Up | KeyCode::Down | KeyCode::Tab | KeyCode::BackTab => {
             editor.field = toggle_vpn_import_field(editor.field);
@@ -916,9 +927,7 @@ async fn vpn_delete_profile(app: &mut TuiApp, client: &ApiClient, name: String) 
         Ok(Response::VpnProfileDeleted { name }) => {
             app.push_message(LogLevel::Info, format!("Deleted profile {name}"));
             load_vpn_data(app, client).await;
-            app.screen = Screen::Vpn;
-            app.vpn.opened_profile = None;
-            app.vpn.focus = VpnFocus::List;
+            enter_list(app);
         }
         Ok(Response::VpnError { detail }) => {
             app.push_message(LogLevel::Error, describe_vpn_error(&detail))
@@ -933,7 +942,7 @@ async fn vpn_delete_profile(app: &mut TuiApp, client: &ApiClient, name: String) 
 
 pub(crate) async fn vpn_import_submit(app: &mut TuiApp, client: &ApiClient) {
     let Some(editor) = &app.vpn_import else {
-        app.screen = Screen::Vpn;
+        enter_list(app);
         return;
     };
     if let Some((_, names)) = &editor.sources {
@@ -944,7 +953,7 @@ pub(crate) async fn vpn_import_submit(app: &mut TuiApp, client: &ApiClient) {
             Ok(Response::VpnProfileImported { name }) => {
                 app.push_message(LogLevel::Info, format!("Imported profile {name}"));
                 app.vpn_import = None;
-                app.screen = Screen::Vpn;
+                enter_list(app);
                 load_vpn_data(app, client).await;
             }
             Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
@@ -988,7 +997,7 @@ pub(crate) async fn vpn_import_submit(app: &mut TuiApp, client: &ApiClient) {
         Ok(Response::VpnProfileImported { name }) => {
             app.push_message(LogLevel::Info, format!("Imported profile {name}"));
             app.vpn_import = None;
-            app.screen = Screen::Vpn;
+            enter_list(app);
             load_vpn_data(app, client).await;
         }
         Ok(Response::VpnError { detail }) => {

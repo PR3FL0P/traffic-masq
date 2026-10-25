@@ -1239,6 +1239,7 @@ async fn host_policy_uses_live_kernel_endpoints_instead_of_resolving_profiles_ag
     };
     subsystems.apply_vpn_chain(&plan).await.unwrap();
     let mut policy = crate::core::vpn_policy_manager::VpnPolicyDesired {
+        masquerade_forwarded: true,
         route_host_traffic: true,
         chain_profiles: vec!["chain.conf".into()],
         protected_subnets: vec!["192.0.2.0/24".parse().unwrap()],
