@@ -893,41 +893,12 @@ impl RouterManager {
 
     /// Attempt subsystem restoration from the snapshot and collect all rollback failures.
     pub async fn rollback_to(&self, snapshot: &RouterSnapshot) -> Vec<String> {
-        self.rollback_stages(
-            snapshot,
-            &[
-                Stage::UplinkDhcpRestore,
-                Stage::Interfaces,
-                Stage::UplinkWifi,
-                Stage::UplinkDhcpCandidate,
-                Stage::VpnChain,
-                Stage::OutputWifi,
-                Stage::Dhcp,
-                Stage::Routes,
-                Stage::Dataplane,
-            ],
-        )
-        .await
+        self.rollback_stages(snapshot, Stage::ALL).await
     }
 
     /// Preserve error types until the recovery policy has classified the failure.
     pub async fn rollback_to_classified(&self, snapshot: &RouterSnapshot) -> Result<()> {
-        let errors = self
-            .rollback_stages_classified(
-                snapshot,
-                &[
-                    Stage::UplinkDhcpRestore,
-                    Stage::Interfaces,
-                    Stage::UplinkWifi,
-                    Stage::UplinkDhcpCandidate,
-                    Stage::VpnChain,
-                    Stage::OutputWifi,
-                    Stage::Dhcp,
-                    Stage::Routes,
-                    Stage::Dataplane,
-                ],
-            )
-            .await;
+        let errors = self.rollback_stages_classified(snapshot, Stage::ALL).await;
         crate::core::recovery_control::aggregate(errors, "router rollback was incomplete")
     }
 
@@ -1009,6 +980,20 @@ enum Stage {
 }
 
 impl Stage {
+    /// Forward dependency order; every full rollback traverses this in reverse.
+    /// Keep startup, timeout and explicit recovery on the same complete chain.
+    const ALL: &'static [Self] = &[
+        Self::UplinkDhcpRestore,
+        Self::Interfaces,
+        Self::UplinkWifi,
+        Self::UplinkDhcpCandidate,
+        Self::VpnChain,
+        Self::OutputWifi,
+        Self::Dhcp,
+        Self::Routes,
+        Self::Dataplane,
+    ];
+
     fn name(self) -> &'static str {
         match self {
             Self::UplinkDhcpRestore => "uplink_dhcp_restore",

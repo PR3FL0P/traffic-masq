@@ -18,6 +18,10 @@ pub struct RequestPolicy<'a> {
     pub mutation: MutationKind,
     pub recovery_interface: Option<&'a str>,
     pub provisioning_recovery: bool,
+    /// Reject overlapping direct/convenience writes while an interface change
+    /// is pending. Scoped interface owners and router coordinator requests
+    /// enforce their own transaction ownership instead.
+    pub requires_idle_interfaces: bool,
     /// Preserve the longer deadline for writes, scans and dry-run plans.
     pub long_running: bool,
 }
@@ -87,6 +91,7 @@ impl<Interface, Proposal> Request<Interface, Proposal> {
                 mutation: ReadOnly,
                 recovery_interface: None,
                 provisioning_recovery: false,
+                requires_idle_interfaces: false,
                 long_running: false,
             },
             DaemonLogs { .. } | VpnListSources => RequestPolicy {
@@ -94,6 +99,7 @@ impl<Interface, Proposal> Request<Interface, Proposal> {
                 mutation: ReadOnly,
                 recovery_interface: None,
                 provisioning_recovery: false,
+                requires_idle_interfaces: false,
                 long_running: false,
             },
             ConfigureApiHttpsSettings { .. }
@@ -104,6 +110,7 @@ impl<Interface, Proposal> Request<Interface, Proposal> {
                 mutation: Settings,
                 recovery_interface: None,
                 provisioning_recovery: false,
+                requires_idle_interfaces: false,
                 long_running: true,
             },
             SaveWifiClientProfile { interface, .. }
@@ -112,21 +119,22 @@ impl<Interface, Proposal> Request<Interface, Proposal> {
             | ForgetInterfaceConfig { interface, .. }
             | ResetInterfaceOverride { interface, .. }
             | DisableDhcpClient { interface, .. }
-            | RenewDhcpClient { interface, .. }
-            | ReleaseDhcpClient { interface, .. }
             | ConfigureDhcpSettings { interface, .. }
             | ConfigureDhcp { interface, .. }
             | DisableDhcp { interface, .. }
             | WifiSetPassphrase { interface, .. }
+            | WifiClientSetPassphrase { interface, .. }
+            | RenewDhcpClient { interface, .. }
+            | ReleaseDhcpClient { interface, .. }
             | WifiDeauthStation { interface, .. }
             | WifiReload { interface, .. }
-            | WifiClientSetPassphrase { interface, .. }
             | WifiClientReconnect { interface, .. }
             | WifiClientScan { interface, .. } => RequestPolicy {
                 administrator: true,
                 mutation: Direct,
                 recovery_interface: Some(interface),
                 provisioning_recovery: false,
+                requires_idle_interfaces: true,
                 long_running: true,
             },
             GetInterfaceConfig { interface, .. }
@@ -140,11 +148,10 @@ impl<Interface, Proposal> Request<Interface, Proposal> {
                 mutation: ReadOnly,
                 recovery_interface: Some(interface),
                 provisioning_recovery: false,
+                requires_idle_interfaces: false,
                 long_running: false,
             },
             ConfigureDhcpClient { interface, .. }
-            | ApplyInterface { interface, .. }
-            | ApplyInterfaceEdit { interface, .. }
             | ConfigureWifi { interface, .. }
             | ProvisionWifiAccessPoint { interface, .. }
             | DisableWifi { interface, .. }
@@ -158,14 +165,26 @@ impl<Interface, Proposal> Request<Interface, Proposal> {
                 mutation: InterfaceTransaction,
                 recovery_interface: Some(interface),
                 provisioning_recovery: false,
+                requires_idle_interfaces: true,
                 long_running: true,
             },
+            ApplyInterface { interface, .. } | ApplyInterfaceEdit { interface, .. } => {
+                RequestPolicy {
+                    administrator: true,
+                    mutation: InterfaceTransaction,
+                    recovery_interface: Some(interface),
+                    provisioning_recovery: false,
+                    requires_idle_interfaces: false,
+                    long_running: true,
+                }
+            }
             DryRunInterface { interface, .. } | DryRunInterfaceEdit { interface, .. } => {
                 RequestPolicy {
                     administrator: false,
                     mutation: ReadOnly,
                     recovery_interface: Some(interface),
                     provisioning_recovery: false,
+                    requires_idle_interfaces: false,
                     long_running: true,
                 }
             }
@@ -174,6 +193,7 @@ impl<Interface, Proposal> Request<Interface, Proposal> {
                 mutation: InterfaceTransaction,
                 recovery_interface: None,
                 provisioning_recovery: false,
+                requires_idle_interfaces: false,
                 long_running: true,
             },
             RollbackNetworkChange { .. } => RequestPolicy {
@@ -181,6 +201,7 @@ impl<Interface, Proposal> Request<Interface, Proposal> {
                 mutation: InterfaceTransaction,
                 recovery_interface: None,
                 provisioning_recovery: true,
+                requires_idle_interfaces: false,
                 long_running: true,
             },
             SaveRouterIntent { .. }
@@ -201,6 +222,7 @@ impl<Interface, Proposal> Request<Interface, Proposal> {
                 mutation: Direct,
                 recovery_interface: None,
                 provisioning_recovery: false,
+                requires_idle_interfaces: true,
                 long_running: true,
             },
             RouterIntentPreview { .. } | RouterPlan { .. } | RouterProvisioningPreview { .. } => {
@@ -209,6 +231,7 @@ impl<Interface, Proposal> Request<Interface, Proposal> {
                     mutation: ReadOnly,
                     recovery_interface: None,
                     provisioning_recovery: false,
+                    requires_idle_interfaces: false,
                     long_running: true,
                 }
             }
@@ -218,6 +241,7 @@ impl<Interface, Proposal> Request<Interface, Proposal> {
                     mutation: RouterTransaction,
                     recovery_interface: None,
                     provisioning_recovery: false,
+                    requires_idle_interfaces: false,
                     long_running: true,
                 }
             }
@@ -226,6 +250,7 @@ impl<Interface, Proposal> Request<Interface, Proposal> {
                 mutation: RouterTransaction,
                 recovery_interface: None,
                 provisioning_recovery: true,
+                requires_idle_interfaces: false,
                 long_running: true,
             },
         }
@@ -293,5 +318,51 @@ mod tests {
                 .policy()
                 .provisioning_recovery
         );
+    }
+}
+
+#[cfg(test)]
+mod pending_change_tests {
+    use crate::ControlRequest as Request;
+
+    #[test]
+    fn overlapping_writes_require_idle_but_reads_and_transaction_owners_remain_available() {
+        for request in [
+            Request::WifiReload {
+                interface: "lan0".into(),
+            },
+            Request::DisableWifi {
+                interface: "lan0".into(),
+            },
+            Request::DisableDhcpClient {
+                interface: "wan0".into(),
+            },
+            Request::VpnDeactivate,
+            Request::DeleteWifiClientProfile {
+                id: "office".into(),
+            },
+        ] {
+            let policy = request.policy();
+            assert!(policy.network_mutation(), "{request:?}");
+            assert!(policy.requires_idle_interfaces, "{request:?}");
+        }
+        for request in [
+            Request::Ping,
+            Request::PendingNetworkChanges,
+            Request::CommitNetworkChange { token: "t".into() },
+            Request::RollbackNetworkChange { token: "t".into() },
+            Request::ApplyInterfaceEdit {
+                interface: "lan0".into(),
+                edit: crate::InterfaceEditRequest {
+                    mac_address: None,
+                    cidr: "192.0.2.1/24".into(),
+                    role: crate::InterfaceRole::Output,
+                    managed: true,
+                    allow_management_change: true,
+                },
+            },
+        ] {
+            assert!(!request.policy().requires_idle_interfaces, "{request:?}");
+        }
     }
 }

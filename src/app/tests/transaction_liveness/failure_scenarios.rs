@@ -343,3 +343,101 @@ async fn repro_shutdown_after_disconnected_lan_editor_must_have_bounded_drain() 
     assert!(stopped.is_ok(),
         "stopping the service must reach a bounded drain/recovery decision after an accepted LAN edit stalls, even if its client disconnected");
 }
+
+#[tokio::test]
+async fn lan_rollback_restores_runtime_and_storage_then_allows_a_confirmed_edit() {
+    for expires in [false, true] {
+        let fixture = Fixture::start(0, Duration::ZERO, if expires { 1 } else { 60 }).await;
+        let applied = request(&fixture.service, edit_lan(NEW_LAN)).await;
+        let Response::NetworkChangePending { change } = applied else {
+            panic!("{applied:?}");
+        };
+        let addresses = fixture.network.list_ipv4_addresses("eth0").await.unwrap();
+        assert!(addresses
+            .iter()
+            .any(|a| a.address == Ipv4Addr::new(192, 0, 2, 99)));
+        assert_eq!(fixture.overrides.committed_revision().await, 0);
+        let journal = fixture
+            ._directory
+            .path()
+            .join("interface-transactions/eth0.json");
+        assert!(journal.exists());
+        // Reads and recovery remain usable through the normal admission path;
+        // convenience writes cannot change the compensation target meanwhile.
+        assert!(matches!(
+            request(&fixture.service, Request::Ping).await,
+            Response::Pong
+        ));
+        let blocked = request(
+            &fixture.service,
+            Request::WifiReload {
+                interface: "eth0".into(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(blocked, Response::Error { message } if message.contains("transaction is pending"))
+        );
+        if expires {
+            // No confirmation request: the daemon owns rollback even when the
+            // operator has left. Wait for completion, not an assumed delay.
+            tokio::time::timeout(WATCHDOG, async {
+                loop {
+                    let pending = request(&fixture.service, Request::PendingNetworkChanges).await;
+                    if matches!(pending, Response::PendingNetworkChanges { ref changes } if changes.is_empty()) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.expect("daemon timeout must finish rollback");
+        } else {
+            rollback_if_pending(&fixture.service, &Response::NetworkChangePending { change }).await;
+        }
+        expect_lan(&fixture.service, ORIGINAL_LAN).await;
+        let addresses = fixture.network.list_ipv4_addresses("eth0").await.unwrap();
+        assert!(addresses
+            .iter()
+            .any(|a| a.address == Ipv4Addr::new(192, 0, 2, 1)));
+        assert!(!addresses
+            .iter()
+            .any(|a| a.address == Ipv4Addr::new(192, 0, 2, 99)));
+        assert!(!journal.exists());
+        assert!(!crate::core::recovery_control::control_path(&journal).exists());
+        let base = fixture.desired.committed_config().await.unwrap();
+        let disk = RuntimeOverrideManager::load(fixture._directory.path(), &base)
+            .await
+            .unwrap();
+        assert_eq!(disk.committed_revision().await, 0);
+
+        let next = request(&fixture.service, edit_lan(NEW_LAN)).await;
+        let Response::NetworkChangePending { change } = next else {
+            panic!("new edit must be admitted after rollback: {next:?}");
+        };
+        let committed = request(
+            &fixture.service,
+            Request::CommitNetworkChange {
+                token: change.token,
+            },
+        )
+        .await;
+        assert!(
+            matches!(committed, Response::NetworkChangeCommitted { .. }),
+            "{committed:?}"
+        );
+        expect_lan(&fixture.service, NEW_LAN).await;
+        let disk = RuntimeOverrideManager::load(fixture._directory.path(), &base)
+            .await
+            .unwrap();
+        assert_eq!(disk.committed_revision().await, 1);
+        assert_eq!(
+            disk.snapshot()
+                .await
+                .effective_config(&base)
+                .unwrap()
+                .network
+                .interfaces["eth0"]
+                .ipv4,
+            Some(NEW_LAN.parse().unwrap())
+        );
+    }
+}

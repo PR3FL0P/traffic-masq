@@ -18,6 +18,8 @@ use crate::firewall::{RouterDataplanePlan, RouterDataplaneSnapshot};
 use super::*;
 use crate::wifi::PassphraseStore;
 
+mod recovery_chain;
+
 fn output_interface(address: &str, pool_start: u8, pool_end: u8) -> InterfaceConfig {
     let ipv4: ipnet::Ipv4Net = address.parse().expect("IPv4 network");
     let octet = ipv4.addr().octets()[2];
@@ -85,6 +87,7 @@ struct FakeSubsystems {
     events: StdMutex<Vec<String>>,
     apply_fail: StdMutex<Option<&'static str>>,
     rollback_fail: StdMutex<Option<&'static str>>,
+    rollback_failure_kind: StdMutex<Option<recovery_control::FailureKind>>,
     pause_apply: std::sync::atomic::AtomicBool,
     apply_entered: tokio::sync::Notify,
     apply_release: tokio::sync::Notify,
@@ -105,6 +108,7 @@ impl FakeSubsystems {
             events: StdMutex::new(Vec::new()),
             apply_fail: StdMutex::new(None),
             rollback_fail: StdMutex::new(None),
+            rollback_failure_kind: StdMutex::new(None),
             pause_apply: std::sync::atomic::AtomicBool::new(false),
             apply_entered: tokio::sync::Notify::new(),
             apply_release: tokio::sync::Notify::new(),
@@ -118,6 +122,24 @@ impl FakeSubsystems {
             retained: StdMutex::new(Vec::new()),
             rollback_secret: StdMutex::new(None),
         })
+    }
+
+    fn check_rollback_credentials(&self) -> Result<()> {
+        if let Some(root) = self.rollback_secret.lock().unwrap().as_ref() {
+            let store = crate::wifi::store::PassphraseStore::new(root.join("wifi/psk-ap"));
+            let restored = store
+                .get("wlan0")?
+                .is_some_and(|secret| secret.expose() == "old-password");
+            self.rollback_credentials_restored
+                .lock()
+                .unwrap()
+                .push(restored);
+            anyhow::ensure!(
+                restored,
+                "runtime rollback needs the original Wi-Fi credential"
+            );
+        }
+        Ok(())
     }
 
     fn fail_apply(&self, stage: &'static str) {
@@ -257,21 +279,25 @@ impl RouterSubsystems for FakeSubsystems {
             self.rollback_entered.notify_one();
             self.rollback_release.notified().await;
         }
-        if let Some(root) = self.rollback_secret.lock().unwrap().as_ref() {
-            let store = crate::wifi::store::PassphraseStore::new(root.join("wifi/psk-ap"));
-            let restored = store
-                .get("wlan0")?
-                .is_some_and(|secret| secret.expose() == "old-password");
-            self.rollback_credentials_restored
-                .lock()
-                .unwrap()
-                .push(restored);
-            anyhow::ensure!(
-                restored,
-                "runtime rollback needs the original Wi-Fi credential"
-            );
-        }
+        self.check_rollback_credentials()?;
         self.fail_if_matched("rollback_interfaces", &self.rollback_fail)
+    }
+    async fn rollback_uplink_wifi(
+        &self,
+        _: &[crate::core::router::WifiSnapshot<crate::wifi::client::WifiClientSpec>],
+    ) -> Result<()> {
+        self.check_rollback_credentials()?;
+        self.fail_if_matched("rollback_uplink_wifi", &self.rollback_fail)
+    }
+    async fn rollback_output_wifi(
+        &self,
+        _: &[crate::core::router::WifiSnapshot<crate::wifi::WifiApSpec>],
+    ) -> Result<()> {
+        self.check_rollback_credentials()?;
+        self.fail_if_matched("rollback_output_wifi", &self.rollback_fail)
+    }
+    async fn rollback_vpn_chain(&self, _: &VpnChainSnapshot) -> Result<()> {
+        self.fail_if_matched("rollback_vpn_chain", &self.rollback_fail)
     }
     async fn rollback_routes(&self, _: &RouteSnapshot) -> Result<()> {
         self.fail_if_matched("rollback_routes", &self.rollback_fail)
@@ -315,7 +341,7 @@ impl RouterSubsystems for FakeSubsystems {
         Ok(false)
     }
     async fn rollback_candidate_uplink_dhcp(&self) -> Result<()> {
-        Ok(())
+        self.fail_if_matched("rollback_candidate_uplink_dhcp", &self.rollback_fail)
     }
     async fn rollback_dhcp_clients(
         &self,
@@ -325,7 +351,7 @@ impl RouterSubsystems for FakeSubsystems {
             snapshots.is_empty(),
             "DHCP client restoration is unavailable"
         );
-        Ok(())
+        self.fail_if_matched("rollback_uplink_dhcp", &self.rollback_fail)
     }
     async fn health_uplink_dhcp(
         &self,
@@ -347,6 +373,14 @@ impl FakeSubsystems {
     ) -> Result<()> {
         self.record(event)?;
         if *switch.lock().unwrap() == Some(event) {
+            if event.starts_with("rollback_") {
+                if let Some(kind) = *self.rollback_failure_kind.lock().unwrap() {
+                    return Err(recovery_control::failure(
+                        kind,
+                        format!("injected {event} failure"),
+                    ));
+                }
+            }
             anyhow::bail!("injected {event} failure");
         }
         Ok(())
@@ -1036,11 +1070,12 @@ async fn provisioning_secret_restore_failure_blocks_commit_and_can_be_retried() 
     let fake = FakeSubsystems::new();
     let (_, overrides, directory) = coordinator_with(fake.clone()).await;
     let coordinator = RouterTransactionCoordinator::new(
-        RouterManager::new(fake),
+        RouterManager::new(fake.clone()),
         overrides.clone(),
         Duration::from_secs(60),
     );
     let secrets = stage_test_secret(directory.path()).await;
+    *fake.rollback_secret.lock().unwrap() = Some(directory.path().into());
     let plan = coordinator
         .plan(build_candidate(&overrides).await)
         .await
@@ -1051,7 +1086,18 @@ async fn provisioning_secret_restore_failure_blocks_commit_and_can_be_retried() 
     std::fs::remove_file(&secret_path).unwrap();
     std::fs::create_dir(&secret_path).unwrap();
 
+    let before = fake.events();
     assert!(coordinator.rollback_with_token(&token).await.is_err());
+    assert_eq!(
+        fake.events(),
+        before,
+        "failed credential restoration must not invoke runtime rollback hooks"
+    );
+    assert!(fake
+        .rollback_credentials_restored
+        .lock()
+        .unwrap()
+        .is_empty());
     assert_eq!(
         coordinator.status().await,
         CoordinatorStatus::RecoveryRequired
@@ -1064,6 +1110,11 @@ async fn provisioning_secret_restore_failure_blocks_commit_and_can_be_retried() 
 
     std::fs::remove_dir(&secret_path).unwrap();
     coordinator.rollback_with_token(&token).await.unwrap();
+    assert_eq!(
+        *fake.rollback_credentials_restored.lock().unwrap(),
+        vec![true; 3],
+        "explicit retry restores credentials before both Wi-Fi hooks and interfaces"
+    );
     assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
     assert!(!secrets
         .unresolved_after_committed_cleanup(None)
@@ -1086,8 +1137,8 @@ async fn provisioning_apply_failure_restores_unbound_secret_before_compensation(
     assert!(coordinator.apply(plan).await.is_err());
     assert_eq!(
         *fake.rollback_credentials_restored.lock().unwrap(),
-        vec![true],
-        "the first runtime rollback must see restored credentials; do not compensate twice"
+        vec![true; 3],
+        "Wi-Fi and interface rollback must see restored credentials; do not compensate twice"
     );
     assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
     assert!(!secrets

@@ -100,14 +100,7 @@ impl ControlService {
             }
         }
         if policy.direct_network_mutation() {
-            if !matches!(
-                &request,
-                Request::ApplyInterface { .. }
-                    | Request::ApplyInterfaceEdit { .. }
-                    | Request::CommitNetworkChange { .. }
-                    | Request::RollbackNetworkChange { .. }
-            ) && !self.transactions.pending().await.is_empty()
-            {
+            if policy.requires_idle_interfaces && !self.transactions.pending().await.is_empty() {
                 return Response::Error {
                     message: "an interface transaction is pending; direct network mutations are blocked until it commits or rolls back".to_owned(),
                 };
