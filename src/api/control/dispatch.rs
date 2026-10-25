@@ -1,4 +1,3 @@
-use super::dhcp::{build_effective_dhcp_service, configure_dhcp_persisted, disable_dhcp_persisted};
 use super::interfaces::{interface_statuses, InterfaceChangeInput};
 use super::runtime::error_response;
 use super::*;
@@ -275,32 +274,11 @@ impl ControlService {
             | Request::ConfigureDhcpSettings {
                 interface,
                 settings: dhcp_config,
-            } => match build_effective_dhcp_service(
-                &interface,
-                dhcp_config.into(),
-                &self.overrides,
-                self.network.as_ref(),
-                self.base_config.dhcp.default_lease_seconds,
-            )
-            .await
-            {
-                Ok(spec) => {
-                    let _mutation = self.dhcp_mutations.lock().await;
-                    match configure_dhcp_persisted(&self.dhcp, &self.overrides, spec.clone()).await
-                    {
-                        Ok(()) => Response::DhcpConfigured { spec: spec.into() },
-                        Err(error) => error_response(error),
-                    }
-                }
-                Err(error) => error_response(error),
-            },
-            Request::DisableDhcp { interface } => {
-                let _mutation = self.dhcp_mutations.lock().await;
-                match disable_dhcp_persisted(&self.dhcp, &self.overrides, &interface).await {
-                    Ok(()) => Response::DhcpDisabled { interface },
-                    Err(error) => error_response(error),
-                }
+            } => {
+                self.apply_dhcp_settings(interface, Some(dhcp_config.into()))
+                    .await
             }
+            Request::DisableDhcp { interface } => self.apply_dhcp_settings(interface, None).await,
             Request::ListLeases { interface } => {
                 if self.dhcp.spec(&interface).await.is_none() {
                     return Response::Error {

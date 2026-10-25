@@ -1,4 +1,3 @@
-use super::runtime::compensation_message;
 use super::*;
 use crate::core::transaction::InterfaceChange;
 
@@ -48,9 +47,9 @@ impl ControlService {
         interface: String,
         request: DhcpClientConfigRequest,
     ) -> Response {
-        let Some(supervisor) = &self.dhcp_client else {
+        if self.dhcp_client.is_none() {
             return dhcp_client_error(DhcpClientErrorDetail::DhcpClientDisabled);
-        };
+        }
         let _mutation = self.dhcp_client_mutations.lock().await;
         let effective = match self.effective_config().await {
             Ok(config) => config,
@@ -75,17 +74,12 @@ impl ControlService {
             });
         }
         let previous_config = interface_config.clone();
-        let changes_route_policy = previous_config.dhcp_client.as_ref().is_some_and(|policy| {
-            policy.enabled
-                && (policy.route_metric != request.route_metric
-                    || policy.install_default_route != request.install_default_route)
-        });
         interface_config.dhcp_client = Some(dhcp_client_request_to_config(&request, true));
         if let Some(previous) = &previous_config.dhcp_client {
             interface_config.dhcp_client.as_mut().unwrap().wifi_owned = previous.wifi_owned;
         }
-        let spec = match DhcpClientSpec::from_interface_config(&interface, &interface_config) {
-            Ok(Some(spec)) => spec,
+        match DhcpClientSpec::from_interface_config(&interface, &interface_config) {
+            Ok(Some(_)) => (),
             Ok(None) => return dhcp_client_error(DhcpClientErrorDetail::Disabled),
             Err(error) => {
                 return dhcp_client_error(DhcpClientErrorDetail::InvalidConfig {
@@ -103,89 +97,26 @@ impl ControlService {
                 message: error.to_string(),
             });
         }
-        if changes_route_policy {
-            return match self
-                .transactions
-                .apply(
-                    &interface,
-                    InterfaceChange {
-                        config: &interface_config,
-                        previous: Some(&previous_config),
-                        current_role: Some(previous_config.role),
-                        allow_management_change: true,
-                        passphrase: crate::wifi::WifiPassphraseUpdate::Keep,
-                    },
-                )
-                .await
-            {
-                Ok(change) => Response::NetworkChangePending { change },
-                Err(error) => super::runtime::error_response(error),
-            };
-        }
-        // Dispatch retains admission but releases execution for the confirmed
-        // path above. Immediate DHCP writes must reserve execution themselves.
-        let _execution = self.network_mutations.execute().await;
-        let previous = supervisor.spec(&interface).await;
-        let link_ready = match &self.wifi_client {
-            Some(wifi) => match wifi.status(&interface).await {
-                Some(status) => status.wpa_state.is_connected(),
-                None => true,
-            },
-            None => true,
-        };
-        if let Err(error) =
-            configure_dhcp_client_checked(supervisor, spec.clone(), link_ready).await
-        {
-            let restoration =
-                restore_dhcp_client(supervisor, &interface, previous, link_ready).await;
-            return dhcp_client_error(DhcpClientErrorDetail::RuntimeFailure {
-                message: match restoration {
-                    Ok(()) => format!(
-                        "failed to configure DHCP client: {error:#}; prior runtime state was restored"
-                    ),
-                    Err(rollback) => format!(
-                        "failed to configure DHCP client: {error:#}; rollback also failed: {rollback:#}; recovery required"
-                    ),
+        self.transactions
+            .apply(
+                &interface,
+                InterfaceChange {
+                    config: &interface_config,
+                    previous: Some(&previous_config),
+                    current_role: Some(previous_config.role),
+                    allow_management_change: true,
+                    passphrase: crate::wifi::WifiPassphraseUpdate::Keep,
                 },
-            });
-        }
-        if let Err(error) = self
-            .overrides
-            .set_interface(interface.clone(), interface_config, false)
+            )
             .await
-        {
-            if crate::atomic_file::is_indeterminate_write(&error) {
-                return dhcp_client_error(DhcpClientErrorDetail::PersistenceFailure {
-                    message: format!("{error:#}"),
-                });
-            }
-            let restoration =
-                restore_dhcp_client(supervisor, &interface, previous, link_ready).await;
-            return dhcp_client_error(DhcpClientErrorDetail::PersistenceFailure {
-                message: match restoration {
-                    Ok(()) => format!(
-                        "failed to persist DHCP client intent; runtime state was restored: {error}"
-                    ),
-                    Err(rollback_error) => format!(
-                        "failed to persist DHCP client intent: {error}; runtime restoration failed: {rollback_error}; recovery required"
-                    ),
-                },
-            });
-        }
-        match supervisor.status(&interface).await {
-            Some(status) => Response::DhcpClientInterface {
-                status: dhcp_client_status_view(status),
-            },
-            None => dhcp_client_error(DhcpClientErrorDetail::RuntimeFailure {
-                message: "DHCP client disappeared after configuration".to_string(),
-            }),
-        }
+            .map(|change| Response::NetworkChangePending { change })
+            .unwrap_or_else(super::runtime::error_response)
     }
 
     pub(super) async fn disable_dhcp_client(&self, interface: String) -> Response {
-        let Some(supervisor) = &self.dhcp_client else {
+        if self.dhcp_client.is_none() {
             return dhcp_client_error(DhcpClientErrorDetail::DhcpClientDisabled);
-        };
+        }
         let _mutation = self.dhcp_client_mutations.lock().await;
         let effective = match self.effective_config().await {
             Ok(config) => config,
@@ -196,14 +127,7 @@ impl ControlService {
         let Some(mut config) = effective.network.interfaces.get(&interface).cloned() else {
             return dhcp_client_error(DhcpClientErrorDetail::InterfaceNotFound);
         };
-        let previous = supervisor.spec(&interface).await;
-        let link_ready = match &self.wifi_client {
-            Some(wifi) => match wifi.status(&interface).await {
-                Some(status) => status.wpa_state.is_connected(),
-                None => true,
-            },
-            None => true,
-        };
+        let previous_config = config.clone();
         config
             .dhcp_client
             .get_or_insert_with(Default::default)
@@ -218,37 +142,20 @@ impl ControlService {
                 message: error.to_string(),
             });
         }
-        if let Err(error) = supervisor.disable(&interface).await {
-            let restoration =
-                restore_dhcp_client(supervisor, &interface, previous.clone(), link_ready).await;
-            return dhcp_client_error(DhcpClientErrorDetail::OwnershipConflict {
-                message: compensation_message("failed to disable DHCP client", &error, restoration),
-            });
-        }
-        if let Err(error) = self
-            .overrides
-            .set_interface(interface.clone(), config, false)
-            .await
-        {
-            if crate::atomic_file::is_indeterminate_write(&error) {
-                return dhcp_client_error(DhcpClientErrorDetail::PersistenceFailure {
-                    message: format!("{error:#}"),
-                });
-            }
-            let restoration =
-                restore_dhcp_client(supervisor, &interface, previous, link_ready).await;
-            return dhcp_client_error(DhcpClientErrorDetail::PersistenceFailure {
-                message: match restoration {
-                    Ok(()) => format!(
-                        "failed to persist DHCP client disable; runtime state was restored: {error}"
-                    ),
-                    Err(rollback) => format!(
-                        "failed to persist DHCP client disable: {error}; runtime restoration failed: {rollback:#}; recovery required"
-                    ),
+        self.transactions
+            .apply(
+                &interface,
+                InterfaceChange {
+                    config: &config,
+                    previous: Some(&previous_config),
+                    current_role: Some(previous_config.role),
+                    allow_management_change: true,
+                    passphrase: crate::wifi::WifiPassphraseUpdate::Keep,
                 },
-            });
-        }
-        Response::DhcpClientDisabled { interface }
+            )
+            .await
+            .map(|change| Response::NetworkChangePending { change })
+            .unwrap_or_else(super::runtime::error_response)
     }
 
     pub(super) async fn renew_dhcp_client(&self, interface: String) -> Response {

@@ -91,7 +91,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
     );
 
     frame.render_widget(
-        Paragraph::new("Route policy changes require confirmation. Other actions are immediate. [c] resets DHCP policy.")
+        Paragraph::new("Configuration and disable require confirmation. Renew/reacquire are immediate. [c] resets DHCP policy.")
             .style(Style::default().fg(theme::WARN)),
         Rect::new(
             inner.x,
@@ -351,7 +351,10 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClien
     match client.request(&request).await {
         Ok(Response::NetworkChangePending { change })
             if change.interface == interface
-                && matches!(request, Request::ConfigureDhcpClient { .. }) =>
+                && matches!(
+                    request,
+                    Request::ConfigureDhcpClient { .. } | Request::DisableDhcpClient { .. }
+                ) =>
         {
             app.pending_focus = 0;
             app.pending = Some(change);

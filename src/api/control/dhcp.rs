@@ -13,82 +13,52 @@ pub(super) fn default_dhcp_settings(cidr: ipnet::Ipv4Net) -> Result<DhcpEditRequ
     })
 }
 
-pub(super) async fn configure_dhcp_persisted(
-    dhcp: &DhcpSupervisor,
-    overrides: &RuntimeOverrideManager,
-    spec: DhcpServiceSpec,
-) -> Result<()> {
-    let interface = spec.interface.clone();
-    let previous = dhcp.spec(&interface).await;
-    let mut interface_config = overrides
-        .effective_interface(&interface)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("interface {interface} is not configured"))?;
-    interface_config.dhcp = Some(DhcpInterfaceConfig {
-        pool_start: spec.pool_start,
-        pool_end: spec.pool_end,
-        router: spec.router,
-        dns_servers: spec.dns_servers.clone(),
-        lease_seconds: Some(spec.lease_seconds),
-    });
-    dhcp.configure(spec).await?;
-
-    if let Err(error) = overrides
-        .set_interface(interface.clone(), interface_config, false)
-        .await
-    {
-        if crate::atomic_file::is_indeterminate_write(&error) {
-            return Err(error);
+impl ControlService {
+    pub(super) async fn apply_dhcp_settings(
+        &self,
+        interface: String,
+        settings: Option<DhcpInterfaceConfig>,
+    ) -> Response {
+        let _mutation = self.dhcp_mutations.lock().await;
+        let previous = match self.overrides.effective_interface(&interface).await {
+            Ok(Some(config)) => config,
+            Ok(None) => {
+                return super::runtime::error_response(anyhow::anyhow!(
+                    "interface {interface} is not configured"
+                ))
+            }
+            Err(error) => return super::runtime::error_response(error),
+        };
+        let mut next = previous.clone();
+        if let Some(settings) = &settings {
+            if let Err(error) = build_effective_dhcp_service(
+                &interface,
+                settings.clone(),
+                &self.overrides,
+                self.network.as_ref(),
+                self.base_config.dhcp.default_lease_seconds,
+            )
+            .await
+            {
+                return super::runtime::error_response(error);
+            }
         }
-        let restoration = match previous {
-            Some(previous) => dhcp.configure(previous).await,
-            None => dhcp.disable(&interface).await.map(|_| ()),
-        };
-        return match restoration {
-            Ok(()) => Err(error).context("failed to persist DHCP override; runtime state was restored"),
-            Err(rollback) => Err(error).context(format!(
-                "failed to persist DHCP override; runtime restoration also failed: {rollback:#}; recovery required"
-            )),
-        };
+        next.dhcp = settings;
+        self.transactions
+            .apply(
+                &interface,
+                crate::core::transaction::InterfaceChange {
+                    config: &next,
+                    previous: Some(&previous),
+                    current_role: Some(previous.role),
+                    allow_management_change: true,
+                    passphrase: crate::wifi::WifiPassphraseUpdate::Keep,
+                },
+            )
+            .await
+            .map(|change| Response::NetworkChangePending { change })
+            .unwrap_or_else(super::runtime::error_response)
     }
-
-    Ok(())
-}
-
-pub(super) async fn disable_dhcp_persisted(
-    dhcp: &DhcpSupervisor,
-    overrides: &RuntimeOverrideManager,
-    interface: &str,
-) -> Result<()> {
-    let previous = dhcp.spec(interface).await;
-    let mut interface_config = overrides
-        .effective_interface(interface)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("interface {interface} is not configured"))?;
-    interface_config.dhcp = None;
-    dhcp.disable(interface).await?;
-
-    if let Err(error) = overrides
-        .set_interface(interface.to_string(), interface_config, false)
-        .await
-    {
-        if crate::atomic_file::is_indeterminate_write(&error) {
-            return Err(error);
-        }
-        let restoration = match previous {
-            Some(previous) => dhcp.configure(previous).await,
-            None => Ok(()),
-        };
-        return match restoration {
-            Ok(()) => Err(error)
-                .context("failed to persist DHCP disable override; runtime state was restored"),
-            Err(rollback) => Err(error).context(format!(
-                "failed to persist DHCP disable override; runtime restoration also failed: {rollback:#}; recovery required"
-            )),
-        };
-    }
-
-    Ok(())
 }
 
 pub(super) async fn build_effective_dhcp_service(

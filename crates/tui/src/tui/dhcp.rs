@@ -246,7 +246,7 @@ pub(crate) fn render_dhcp_interface_list(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-const DHCP_SAVE_LABEL: &str = "Apply DHCP now";
+const DHCP_SAVE_LABEL: &str = "Apply DHCP temporarily";
 const DHCP_LEASES_LABEL: &str = "View leases";
 const DHCP_DISABLE_LABEL: &str = "Disable DHCP";
 
@@ -330,7 +330,7 @@ pub(crate) fn render_dhcp_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
             if offline {
                 "Device missing: saves settings for when it returns."
             } else {
-                "Applies immediately; no automatic rollback timer."
+                "Applies temporarily; confirmation is required to save."
             },
             Style::default().fg(theme::MUTED),
         ),
@@ -850,6 +850,12 @@ async fn disable_dhcp_for_current_editor(app: &mut TuiApp, client: &ApiClient) {
         return;
     }
     match client.request(&Request::DisableDhcp { interface }).await {
+        Ok(Response::NetworkChangePending { change }) => {
+            app.pending = Some(change);
+            app.pending_focus = 0;
+            app.pending_return_screen = Screen::DhcpInterfaceList;
+            app.screen = Screen::PendingChange;
+        }
         Ok(Response::DhcpDisabled { interface }) => {
             app.push_message(LogLevel::Info, format!("DHCP disabled on {interface}"));
             app.screen = Screen::DhcpInterfaceList;
@@ -893,6 +899,12 @@ pub(crate) async fn submit_dhcp_config(app: &mut TuiApp, client: &ApiClient) {
         })
         .await
     {
+        Ok(Response::NetworkChangePending { change }) => {
+            app.pending = Some(change);
+            app.pending_focus = 0;
+            app.pending_return_screen = Screen::DhcpInterfaceList;
+            app.screen = Screen::PendingChange;
+        }
         Ok(Response::DhcpConfigured { spec }) => {
             app.push_message(
                 LogLevel::Info,

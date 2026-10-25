@@ -118,12 +118,6 @@ impl<Interface, Proposal> Request<Interface, Proposal> {
             | SaveInterfaceConfig { interface, .. }
             | ForgetInterfaceConfig { interface, .. }
             | ResetInterfaceOverride { interface, .. }
-            | DisableDhcpClient { interface, .. }
-            | ConfigureDhcpSettings { interface, .. }
-            | ConfigureDhcp { interface, .. }
-            | DisableDhcp { interface, .. }
-            | WifiSetPassphrase { interface, .. }
-            | WifiClientSetPassphrase { interface, .. }
             | RenewDhcpClient { interface, .. }
             | ReleaseDhcpClient { interface, .. }
             | WifiDeauthStation { interface, .. }
@@ -152,6 +146,12 @@ impl<Interface, Proposal> Request<Interface, Proposal> {
                 long_running: false,
             },
             ConfigureDhcpClient { interface, .. }
+            | DisableDhcpClient { interface, .. }
+            | ConfigureDhcpSettings { interface, .. }
+            | ConfigureDhcp { interface, .. }
+            | DisableDhcp { interface, .. }
+            | WifiSetPassphrase { interface, .. }
+            | WifiClientSetPassphrase { interface, .. }
             | ConfigureWifi { interface, .. }
             | ProvisionWifiAccessPoint { interface, .. }
             | DisableWifi { interface, .. }

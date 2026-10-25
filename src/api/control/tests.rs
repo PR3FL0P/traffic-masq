@@ -3099,7 +3099,7 @@ async fn configure_wifi_to_wpa2_without_a_passphrase_is_refused_and_changes_noth
 }
 
 #[tokio::test]
-async fn wifi_set_passphrase_applies_live_via_reload() {
+async fn wifi_passphrase_is_tentative_and_restored_or_committed() {
     let directory = tempdir().expect("tempdir");
     let mut config = wifi_base_config(directory.path());
     config.network.interfaces.insert(
@@ -3143,16 +3143,46 @@ async fn wifi_set_passphrase_applies_live_via_reload() {
     let service =
         ControlService::new_detached(config, network, dhcp, overrides).with_wifi_supervisor(wifi);
 
-    match service
+    let response = service
         .dispatch(Request::WifiSetPassphrase {
             interface: "wlan0".to_string(),
             passphrase: "second passphrase".to_string(),
         })
-        .await
-    {
-        Response::WifiConfigured { spec } => assert_eq!(spec.security, WifiSecurity::Wpa2),
-        other => panic!("unexpected response: {other:?}"),
-    }
+        .await;
+    let token = network_pending_token(response);
+    assert_eq!(
+        passphrase_store.get("wlan0").unwrap().unwrap().expose(),
+        "second passphrase"
+    );
+    let response = service
+        .dispatch(Request::RollbackNetworkChange { token })
+        .await;
+    assert!(
+        matches!(response, Response::NetworkChangeRolledBack { .. }),
+        "{response:?}"
+    );
+    assert_eq!(
+        passphrase_store.get("wlan0").unwrap().unwrap().expose(),
+        "first passphrase"
+    );
+    let token = network_pending_token(
+        service
+            .dispatch(Request::WifiSetPassphrase {
+                interface: "wlan0".into(),
+                passphrase: "third passphrase".into(),
+            })
+            .await,
+    );
+    assert!(matches!(
+        service
+            .dispatch(Request::CommitNetworkChange { token })
+            .await,
+        Response::NetworkChangeCommitted { .. }
+    ));
+    assert_eq!(
+        passphrase_store.get("wlan0").unwrap().unwrap().expose(),
+        "third passphrase"
+    );
 }
 
 #[test]
@@ -3601,8 +3631,32 @@ impl NetworkProvider for FakeWirelessNetwork {
 }
 
 async fn wifi_client_enabled_fixture() -> WifiClientFixture {
+    wifi_client_fixture_with_security(WifiClientSecurity::Open).await
+}
+
+async fn wifi_client_fixture_with_security(security: WifiClientSecurity) -> WifiClientFixture {
     let directory = tempdir().expect("tempdir");
-    let config = wifi_client_base_config(directory.path());
+    let mut config = wifi_client_base_config(directory.path());
+    config
+        .network
+        .interfaces
+        .get_mut("wlan1")
+        .unwrap()
+        .wifi_client
+        .as_mut()
+        .unwrap()
+        .security = security;
+    if security.requires_passphrase() {
+        crate::wifi::PassphraseStore::for_role(
+            directory.path(),
+            crate::wifi::store::WifiCredentialRole::Client,
+        )
+        .set(
+            "wlan1",
+            &crate::wifi::WifiPassphrase::new("first client secret").unwrap(),
+        )
+        .unwrap();
+    }
     let overrides = RuntimeOverrideManager::load(directory.path(), &config)
         .await
         .expect("overrides");
@@ -4797,7 +4851,7 @@ async fn dhcp_client_control_rejects_interface_transitions_without_mutation() {
 
 #[tokio::test]
 async fn dhcp_client_control_configure_preserves_wifi_client() {
-    let fixture = dhcp_client_control_fixture(false).await;
+    let (fixture, worker) = dhcp_confirm_fixture(false, 30).await;
     let response = fixture
         .service
         .dispatch(Request::ConfigureDhcpClient {
@@ -4808,10 +4862,14 @@ async fn dhcp_client_control_configure_preserves_wifi_client() {
             },
         })
         .await;
-    assert!(
-        matches!(response, Response::DhcpClientInterface { .. }),
-        "{response:?}"
-    );
+    let token = network_pending_token(response);
+    assert!(matches!(
+        fixture
+            .service
+            .dispatch(Request::CommitNetworkChange { token })
+            .await,
+        Response::NetworkChangeCommitted { .. }
+    ));
     let persisted = fixture
         .overrides
         .effective_interface("wan0")
@@ -4822,6 +4880,7 @@ async fn dhcp_client_control_configure_preserves_wifi_client() {
     assert_eq!(persisted.wifi_client.unwrap().ssid, "upstream");
     assert!(persisted.managed);
     assert_eq!(persisted.role, InterfaceRole::Input);
+    worker.abort();
 }
 
 // Exercise real admission/execution gates, interface journals and the DHCP
@@ -4830,15 +4889,16 @@ async fn dhcp_client_control_configure_preserves_wifi_client() {
 async fn dhcp_route_policy_fixture(
     timeout_seconds: u64,
 ) -> (DhcpClientControlFixture, tokio::task::JoinHandle<()>) {
-    let mut fixture = dhcp_client_control_fixture(true).await;
+    dhcp_confirm_fixture(true, timeout_seconds).await
+}
+
+async fn dhcp_confirm_fixture(
+    enabled: bool,
+    timeout_seconds: u64,
+) -> (DhcpClientControlFixture, tokio::task::JoinHandle<()>) {
+    let mut fixture = dhcp_client_control_fixture(enabled).await;
     let mut config = fixture.service.base_config.clone();
     config.security.rollback_timeout_seconds = timeout_seconds;
-    config
-        .network
-        .interfaces
-        .get_mut("wan0")
-        .unwrap()
-        .wifi_client = None;
     let network = Arc::new(crate::test_support::FakeNetworkProvider::default());
     network.add_interface("wan0", 1).await;
     let desired = DesiredNetworkState::new(config.clone(), fixture.overrides.clone());
@@ -4872,9 +4932,13 @@ async fn dhcp_route_policy_fixture(
                     "wan0",
                     &config.network.interfaces["wan0"],
                 )
-                .unwrap()
                 .unwrap();
-                supervisor.configure(spec).await;
+                match spec {
+                    Some(spec) => supervisor.configure(spec).await,
+                    None => {
+                        supervisor.disable("wan0").await.unwrap();
+                    }
+                }
                 desired.report_result(version, Ok(BTreeMap::new()));
             }
             desired.changed().await;
@@ -5137,7 +5201,7 @@ async fn interrupted_dhcp_route_policy_is_recovered_from_committed_intent() {
 
 #[tokio::test]
 async fn dhcp_client_control_configure_compensates_runtime_when_persistence_fails() {
-    let fixture = dhcp_client_control_fixture(false).await;
+    let (fixture, worker) = dhcp_confirm_fixture(false, 30).await;
     std::fs::create_dir(fixture.directory.path().join("runtime-overrides.json"))
         .expect("block override file rename");
     let response = fixture
@@ -5147,21 +5211,31 @@ async fn dhcp_client_control_configure_compensates_runtime_when_persistence_fail
             config: DhcpClientConfigRequest::default(),
         })
         .await;
+    let token = network_pending_token(response);
+    let response = fixture
+        .service
+        .dispatch(Request::CommitNetworkChange {
+            token: token.clone(),
+        })
+        .await;
+    assert!(matches!(response, Response::Error { .. }), "{response:?}");
+    assert!(fixture.supervisor.spec("wan0").await.is_some());
+    assert!(fixture.overrides.snapshot().await.interfaces.is_empty());
+    let response = fixture
+        .service
+        .dispatch(Request::RollbackNetworkChange { token })
+        .await;
     assert!(
-        matches!(
-            response,
-            Response::DhcpClientError {
-                detail: DhcpClientErrorDetail::PersistenceFailure { .. }
-            }
-        ),
+        matches!(response, Response::NetworkChangeRolledBack { .. }),
         "{response:?}"
     );
     assert!(fixture.supervisor.spec("wan0").await.is_none());
+    worker.abort();
 }
 
 #[tokio::test]
 async fn dhcp_client_control_delete_cleans_runtime_and_persists_disabled_intent() {
-    let fixture = dhcp_client_control_fixture(true).await;
+    let (fixture, worker) = dhcp_confirm_fixture(true, 30).await;
     let mut original = fixture
         .overrides
         .effective_interface("wan0")
@@ -5186,7 +5260,14 @@ async fn dhcp_client_control_delete_cleans_runtime_and_persists_disabled_intent(
             interface: "wan0".into(),
         })
         .await;
-    assert!(matches!(response, Response::DhcpClientDisabled { interface } if interface == "wan0"));
+    let token = network_pending_token(response);
+    assert!(matches!(
+        fixture
+            .service
+            .dispatch(Request::CommitNetworkChange { token })
+            .await,
+        Response::NetworkChangeCommitted { .. }
+    ));
     assert!(fixture.supervisor.spec("wan0").await.is_none());
     let persisted = fixture
         .overrides
@@ -5200,6 +5281,7 @@ async fn dhcp_client_control_delete_cleans_runtime_and_persists_disabled_intent(
     );
     assert_eq!(persisted.dhcp_client.unwrap(), expected);
     assert_eq!(persisted.wifi_client.unwrap().ssid, "upstream");
+    worker.abort();
 }
 
 #[tokio::test]
@@ -7397,7 +7479,7 @@ async fn hotspot_provision_uses_preassigned_output_role_and_subnet_atomically() 
 
 #[tokio::test]
 async fn uncertain_dhcp_commit_preserves_candidate_and_blocks_subsequent_mutations() {
-    let fixture = dhcp_client_control_fixture(false).await;
+    let (fixture, worker) = dhcp_confirm_fixture(false, 30).await;
     fixture
         .overrides
         .save_committed(fixture.overrides.snapshot().await)
@@ -7411,12 +7493,14 @@ async fn uncertain_dhcp_commit_preserves_candidate_and_blocks_subsequent_mutatio
             config: DhcpClientConfigRequest::default(),
         })
         .await;
-    assert!(
-        matches!(response, Response::DhcpClientError {
-        detail: DhcpClientErrorDetail::PersistenceFailure { ref message }
-    } if message.contains("commit_indeterminate")),
-        "{response:?}"
-    );
+    let token = network_pending_token(response);
+    let response = fixture
+        .service
+        .dispatch(Request::CommitNetworkChange {
+            token: token.clone(),
+        })
+        .await;
+    assert!(matches!(response, Response::Error { .. }), "{response:?}");
     assert!(fixture.supervisor.spec("wan0").await.is_some());
     let response = fixture
         .service
@@ -7429,6 +7513,7 @@ async fn uncertain_dhcp_commit_preserves_candidate_and_blocks_subsequent_mutatio
         "{response:?}"
     );
     assert!(fixture.supervisor.spec("wan0").await.is_some());
+    worker.abort();
 }
 
 #[tokio::test]
@@ -7745,55 +7830,8 @@ async fn operator_profile_activation_is_tentative_and_rollback_restores_committe
 async fn client_configuration_converges_before_reply_and_rollback_restores_runtime_without_deadlock(
 ) {
     let fixture = wifi_client_enabled_fixture().await;
-    let desired = DesiredNetworkState::new(
-        fixture.service.base_config.clone(),
-        fixture.service.overrides.clone(),
-    );
-    desired.attach_converger();
-    let service = ControlService::from_runtime(
-        ControlRuntime {
-            active_config: fixture.service.config.clone(),
-            base_config: fixture.service.base_config.clone(),
-            network: fixture.service.network.clone(),
-            dhcp: fixture.service.dhcp.clone(),
-            overrides: fixture.service.overrides.clone(),
-            baselines: Vec::new(),
-            ownership_journal: AddressOwnershipJournal::in_memory(),
-            desired_state: desired.clone(),
-            mutation_gate: Arc::new(NetworkMutationGate::default()),
-        },
-        ControlSubsystems {
-            wifi_client: fixture.service.wifi_client.clone(),
-            ..ControlSubsystems::default()
-        },
-    );
+    let (service, worker) = client_convergence_service(&fixture).await;
     let runtime = service.wifi_client.as_ref().unwrap().clone();
-    let gate = service.network_mutations.clone();
-    let worker_desired = desired.clone();
-    let worker_runtime = runtime.clone();
-    let worker = tokio::spawn(async move {
-        loop {
-            let version = worker_desired.version();
-            {
-                // Same gate as the daemon's convergence pass: dispatch must
-                // release exclusive execution while retaining API admission.
-                let _execution = gate.read().await;
-                let config = worker_desired.effective().await.unwrap();
-                let spec = WifiClientSpec::from_interface_config(
-                    "wlan1",
-                    &config.network.interfaces["wlan1"],
-                )
-                .unwrap()
-                .unwrap();
-                let result = worker_runtime
-                    .configure(spec)
-                    .await
-                    .map_err(anyhow::Error::from);
-                worker_desired.report_result(version, result.map(|_| BTreeMap::new()));
-            }
-            worker_desired.changed().await;
-        }
-    });
     let response = tokio::time::timeout(
         Duration::from_secs(5),
         service.dispatch(Request::ConfigureWifiClient {
@@ -8110,7 +8148,7 @@ async fn inventory_observation_failure_retains_cache_and_blocks_offline_writes()
 
 #[tokio::test]
 async fn dhcp_client_disable_persists_when_runtime_spec_is_absent() {
-    let fixture = dhcp_client_control_fixture(true).await;
+    let (fixture, worker) = dhcp_confirm_fixture(true, 30).await;
     fixture.supervisor.disable("wan0").await.unwrap();
     assert!(fixture.supervisor.spec("wan0").await.is_none());
     let response = fixture
@@ -8119,10 +8157,14 @@ async fn dhcp_client_disable_persists_when_runtime_spec_is_absent() {
             interface: "wan0".into(),
         })
         .await;
-    assert!(
-        matches!(response, Response::DhcpClientDisabled { .. }),
-        "{response:?}"
-    );
+    let token = network_pending_token(response);
+    assert!(matches!(
+        fixture
+            .service
+            .dispatch(Request::CommitNetworkChange { token })
+            .await,
+        Response::NetworkChangeCommitted { .. }
+    ));
     assert!(
         !fixture
             .overrides
@@ -8147,6 +8189,7 @@ async fn dhcp_client_disable_persists_when_runtime_spec_is_absent() {
             .unwrap()
             .enabled
     );
+    worker.abort();
 }
 
 #[tokio::test]
@@ -10489,6 +10532,19 @@ async fn router_status_endpoints_bound_health_observation() {
     assert!(health.ready(), "a later request must observe fresh health");
 }
 
+fn network_pending_token(response: Response) -> String {
+    match response {
+        Response::NetworkChangePending { change } => {
+            assert_eq!(
+                change.phase,
+                traffic_masq_protocol::NetworkChangePhase::AwaitingCommit
+            );
+            change.token
+        }
+        other => panic!("expected tentative network change: {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn reviewed_sharing_plan_rejects_changed_revision_or_observation_before_apply() {
     let fake = Arc::new(FakeRouterSubsystems::default());
@@ -10575,4 +10631,126 @@ async fn reviewed_sharing_plan_rejects_changed_revision_or_observation_before_ap
         service.dispatch(Request::RouterCommit { token }).await,
         Response::RouterCommitted { .. }
     ));
+}
+
+async fn client_convergence_service(
+    fixture: &WifiClientFixture,
+) -> (ControlService, tokio::task::JoinHandle<()>) {
+    let desired = DesiredNetworkState::new(
+        fixture.service.base_config.clone(),
+        fixture.service.overrides.clone(),
+    );
+    desired.attach_converger();
+    let service = ControlService::from_runtime(
+        ControlRuntime {
+            active_config: fixture.service.config.clone(),
+            base_config: fixture.service.base_config.clone(),
+            network: fixture.service.network.clone(),
+            dhcp: fixture.service.dhcp.clone(),
+            overrides: fixture.service.overrides.clone(),
+            baselines: Vec::new(),
+            ownership_journal: AddressOwnershipJournal::in_memory(),
+            desired_state: desired.clone(),
+            mutation_gate: Arc::new(NetworkMutationGate::default()),
+        },
+        ControlSubsystems {
+            wifi_client: fixture.service.wifi_client.clone(),
+            ..ControlSubsystems::default()
+        },
+    );
+    let runtime = service.wifi_client.as_ref().unwrap().clone();
+    let gate = service.network_mutations.clone();
+    let worker_desired = desired.clone();
+    let worker_runtime = runtime.clone();
+    let worker = tokio::spawn(async move {
+        loop {
+            let version = worker_desired.version();
+            {
+                // Same gate as the daemon's convergence pass: dispatch must
+                // release exclusive execution while retaining API admission.
+                let _execution = gate.read().await;
+                let config = worker_desired.effective().await.unwrap();
+                let spec = WifiClientSpec::from_interface_config(
+                    "wlan1",
+                    &config.network.interfaces["wlan1"],
+                )
+                .unwrap()
+                .unwrap();
+                let result = worker_runtime
+                    .configure(spec)
+                    .await
+                    .map_err(anyhow::Error::from);
+                worker_desired.report_result(version, result.map(|_| BTreeMap::new()));
+            }
+            worker_desired.changed().await;
+        }
+    });
+    (service, worker)
+}
+
+#[tokio::test]
+async fn client_password_change_converges_and_rollback_restores_secret_before_consumers() {
+    let fixture = wifi_client_fixture_with_security(WifiClientSecurity::Wpa2).await;
+    let (service, worker) = client_convergence_service(&fixture).await;
+    let store = crate::wifi::PassphraseStore::for_role(
+        fixture._directory.path(),
+        crate::wifi::store::WifiCredentialRole::Client,
+    );
+    let committed = service.overrides.snapshot().await;
+    let token = network_pending_token(
+        service
+            .dispatch(Request::WifiClientSetPassphrase {
+                interface: "wlan1".into(),
+                passphrase: "second client secret".into(),
+            })
+            .await,
+    );
+    assert_eq!(
+        store.get("wlan1").unwrap().unwrap().expose(),
+        "second client secret"
+    );
+    assert_eq!(service.overrides.snapshot().await, committed);
+    let response = service
+        .dispatch(Request::RollbackNetworkChange { token })
+        .await;
+    assert!(
+        matches!(response, Response::NetworkChangeRolledBack { .. }),
+        "{response:?}"
+    );
+    assert_eq!(
+        store.get("wlan1").unwrap().unwrap().expose(),
+        "first client secret"
+    );
+    assert!(service
+        .wifi_client
+        .as_ref()
+        .unwrap()
+        .status("wlan1")
+        .await
+        .is_some());
+    let token = network_pending_token(
+        service
+            .dispatch(Request::WifiClientSetPassphrase {
+                interface: "wlan1".into(),
+                passphrase: "confirmed client secret".into(),
+            })
+            .await,
+    );
+    assert!(matches!(
+        service
+            .dispatch(Request::CommitNetworkChange { token })
+            .await,
+        Response::NetworkChangeCommitted { .. }
+    ));
+    assert_eq!(
+        store.get("wlan1").unwrap().unwrap().expose(),
+        "confirmed client secret"
+    );
+    let reloaded =
+        crate::state::overrides::RuntimeOverrideStore::in_state_dir(fixture._directory.path())
+            .load()
+            .await
+            .unwrap();
+    assert_eq!(reloaded.revision, committed.revision + 1);
+    worker.abort();
 }

@@ -318,43 +318,38 @@ impl ControlService {
                 })
             }
         };
-        let Some(status) = wifi.status(&interface).await else {
+        let Some(_) = wifi.status(&interface).await else {
             return wifi_error(WifiErrorDetail::InterfaceNotFound);
         };
-        let spec = status.spec;
-        let previous_secret = match wifi.stored_passphrase(&interface).await {
-            Ok(previous) => previous,
-            Err(error) => return classify_wifi_error(error),
+        let previous = match self.overrides.effective_interface(&interface).await {
+            Ok(Some(config)) => config,
+            Ok(None) => return wifi_error(WifiErrorDetail::InterfaceNotFound),
+            Err(error) => return super::runtime::error_response(error),
         };
-
-        if let Err(error) = wifi.set_passphrase(&interface, &passphrase).await {
-            return classify_wifi_error(error);
+        let mut next = previous.clone();
+        let Some(settings) = &mut next.wifi else {
+            return wifi_error(WifiErrorDetail::InterfaceNotFound);
+        };
+        if !settings.security.requires_passphrase() {
+            return wifi_error(WifiErrorDetail::InvalidSpec {
+                message: "an open network cannot use a passphrase".into(),
+            });
         }
-
-        match wifi.configure(spec.clone()).await {
-            Ok(()) => Response::WifiConfigured { spec: spec.into() },
-            Err(error) => {
-                let secret_restore = match previous_secret.as_ref() {
-                    Some(previous) => wifi.set_passphrase(&interface, previous).await,
-                    None => wifi.clear_passphrase(&interface).await,
-                };
-                if let Err(restore_error) = secret_restore {
-                    return wifi_error(WifiErrorDetail::Other {
-                        message: format!(
-                            "failed to apply Wi-Fi passphrase: {error}; failed to restore previous secret: {restore_error}; recovery required"
-                        ),
-                    });
-                }
-                if let Err(restore_error) = wifi.configure(spec).await {
-                    return wifi_error(WifiErrorDetail::Other {
-                        message: format!(
-                            "failed to apply Wi-Fi passphrase: {error}; previous secret was restored but hostapd restoration failed: {restore_error}; recovery required"
-                        ),
-                    });
-                }
-                classify_wifi_error(error)
-            }
-        }
+        settings.passphrase_file = None;
+        self.transactions
+            .apply(
+                &interface,
+                crate::core::transaction::InterfaceChange {
+                    config: &next,
+                    previous: Some(&previous),
+                    current_role: Some(previous.role),
+                    allow_management_change: true,
+                    passphrase: crate::wifi::WifiPassphraseUpdate::Set(passphrase),
+                },
+            )
+            .await
+            .map(|change| Response::NetworkChangePending { change })
+            .unwrap_or_else(super::runtime::error_response)
     }
 
     pub(super) async fn list_wifi_stations(&self, interface: String) -> Response {
