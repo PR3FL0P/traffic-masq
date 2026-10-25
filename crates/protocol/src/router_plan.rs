@@ -192,6 +192,10 @@ pub struct RouterDesiredView {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouterPlanView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_fingerprint: Option<String>,
     pub desired: RouterDesiredView,
     pub interfaces: Vec<InterfaceChangePlanView>,
     pub uplink_wifi: Vec<WifiPlanView<WifiClientSpecView>>,

@@ -47,6 +47,10 @@ pub struct InterfaceOverrideRequest {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RouterProposalRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_fingerprint: Option<String>,
     #[serde(default)]
     pub set_router: Option<RouterConfig>,
     #[serde(default)]

@@ -647,6 +647,8 @@ fn router_base_config() -> AppConfig {
 
 fn router_proposal() -> RouterProposalRequest {
     RouterProposalRequest {
+        expected_revision: None,
+        expected_fingerprint: None,
         set_router: Some(RouterConfig {
             port_forwards: Vec::new(),
             forwarding: Some(vec![traffic_masq_dataplane::ForwardingConfig {
@@ -10485,4 +10487,92 @@ async fn router_status_endpoints_bound_health_observation() {
         panic!("expected router status after observation recovers");
     };
     assert!(health.ready(), "a later request must observe fresh health");
+}
+
+#[tokio::test]
+async fn reviewed_sharing_plan_rejects_changed_revision_or_observation_before_apply() {
+    let fake = Arc::new(FakeRouterSubsystems::default());
+    let (service, _directory) = router_enabled_service_with(fake.clone()).await;
+    let mut proposal = router_proposal();
+    let plan = match service
+        .dispatch(Request::RouterPlan {
+            proposal: proposal.clone().into(),
+        })
+        .await
+    {
+        Response::RouterPlan { plan } => plan,
+        other => panic!("{other:?}"),
+    };
+    proposal.expected_revision = plan.base_revision;
+    proposal.expected_fingerprint = plan.observation_fingerprint;
+    let committed = service.overrides.snapshot().await;
+    let mut changed = proposal.clone();
+    changed.expected_fingerprint = Some("changed-observation".into());
+    let response = service
+        .dispatch(Request::RouterApply {
+            proposal: changed.into(),
+        })
+        .await;
+    assert!(
+        matches!(
+            response,
+            Response::RouterError {
+                detail: RouterErrorDetail::StalePlan
+            }
+        ),
+        "{response:?}"
+    );
+    assert_eq!(service.overrides.snapshot().await, committed);
+    assert_eq!(
+        service.router.as_ref().unwrap().status().await,
+        CoordinatorStatus::Idle
+    );
+    service
+        .overrides
+        .save_committed(committed.clone())
+        .await
+        .unwrap();
+    let response = service
+        .dispatch(Request::RouterApply {
+            proposal: proposal.into(),
+        })
+        .await;
+    assert!(
+        matches!(
+            response,
+            Response::RouterError {
+                detail: RouterErrorDetail::StaleCandidate { .. }
+            }
+        ),
+        "{response:?}"
+    );
+    assert_eq!(
+        service.router.as_ref().unwrap().status().await,
+        CoordinatorStatus::Idle
+    );
+    let plan = match service
+        .dispatch(Request::RouterPlan {
+            proposal: router_proposal().into(),
+        })
+        .await
+    {
+        Response::RouterPlan { plan } => plan,
+        other => panic!("{other:?}"),
+    };
+    let mut fresh = router_proposal();
+    fresh.expected_revision = plan.base_revision;
+    fresh.expected_fingerprint = plan.observation_fingerprint;
+    let response = service
+        .dispatch(Request::RouterApply {
+            proposal: fresh.into(),
+        })
+        .await;
+    let token = match response {
+        Response::RouterTransactionPending { token, .. } => token,
+        other => panic!("{other:?}"),
+    };
+    assert!(matches!(
+        service.dispatch(Request::RouterCommit { token }).await,
+        Response::RouterCommitted { .. }
+    ));
 }

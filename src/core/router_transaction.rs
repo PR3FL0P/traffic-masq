@@ -41,6 +41,14 @@ impl TransactionPlan {
     }
 
     /// Return the plan already built by the coordinator.
+    pub(crate) fn observation_fingerprint(&self) -> String {
+        self.fingerprint
+            .0
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
     pub fn plan(&self) -> &RouterPlan {
         &self.plan
     }

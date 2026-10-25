@@ -87,6 +87,8 @@ impl From<InterfaceOverrideRequest> for InterfaceOverrideRequestView {
 impl From<RouterProposalRequestView> for RouterProposalRequest {
     fn from(value: RouterProposalRequestView) -> Self {
         Self {
+            expected_revision: value.expected_revision,
+            expected_fingerprint: value.expected_fingerprint,
             set_router: value.set_router.map(Into::into),
             clear_router: value.clear_router,
             set_interfaces: value
@@ -102,6 +104,8 @@ impl From<RouterProposalRequestView> for RouterProposalRequest {
 impl From<RouterProposalRequest> for RouterProposalRequestView {
     fn from(value: RouterProposalRequest) -> Self {
         Self {
+            expected_revision: value.expected_revision,
+            expected_fingerprint: value.expected_fingerprint,
             set_router: value.set_router.map(Into::into),
             clear_router: value.clear_router,
             set_interfaces: value

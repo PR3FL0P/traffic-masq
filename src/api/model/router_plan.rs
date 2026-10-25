@@ -215,6 +215,8 @@ impl From<RouterDesired> for RouterDesiredView {
 impl From<RouterPlan> for RouterPlanView {
     fn from(value: RouterPlan) -> Self {
         Self {
+            base_revision: None,
+            observation_fingerprint: None,
             desired: value.desired.into(),
             interfaces: value.interfaces.into_iter().map(Into::into).collect(),
             uplink_wifi: value.uplink_wifi.into_iter().map(wifi_plan_view).collect(),

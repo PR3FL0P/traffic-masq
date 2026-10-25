@@ -369,6 +369,7 @@ impl ControlService {
         let Some(router) = &self.router else {
             return router_disabled();
         };
+        let expected_revision = proposal.expected_revision;
         let candidate = match self
             .overrides
             .build_candidate(&build_router_proposal(proposal))
@@ -377,16 +378,24 @@ impl ControlService {
             Ok(candidate) => candidate,
             Err(error) => return classify_router_error(error),
         };
+        if let Some(expected) = expected_revision {
+            if let Err(error) = candidate.ensure_base_revision(expected) {
+                return classify_router_error(error.into());
+            }
+        }
         match router.plan(candidate).await {
-            Ok(plan) => Response::RouterPlan {
-                plan: plan.plan().clone().into(),
-            },
+            Ok(plan) => {
+                let mut preview: traffic_masq_protocol::RouterPlanView = plan.plan().clone().into();
+                preview.base_revision = Some(plan.candidate().base_revision());
+                preview.observation_fingerprint = Some(plan.observation_fingerprint());
+                Response::RouterPlan { plan: preview }
+            }
             Err(error) => classify_router_error(error),
         }
     }
 
     pub(super) async fn router_apply(&self, proposal: RouterProposalRequest) -> Response {
-        let Some(router) = &self.router else {
+        let Some(_) = &self.router else {
             return router_disabled();
         };
         if !self.transactions.pending().await.is_empty() {
@@ -396,6 +405,8 @@ impl ControlService {
                 },
             };
         }
+        let expected_revision = proposal.expected_revision;
+        let expected_fingerprint = proposal.expected_fingerprint.clone();
         let candidate = match self
             .overrides
             .build_candidate(&build_router_proposal(proposal))
@@ -404,10 +415,35 @@ impl ControlService {
             Ok(candidate) => candidate,
             Err(error) => return classify_router_error(error),
         };
+        if let Some(expected) = expected_revision {
+            if let Err(error) = candidate.ensure_base_revision(expected) {
+                return classify_router_error(error.into());
+            }
+        }
+        self.apply_router_candidate_checked(candidate, expected_fingerprint.as_deref())
+            .await
+    }
+
+    pub(super) async fn apply_router_candidate_checked(
+        &self,
+        candidate: crate::core::router_candidate::RouterCandidate,
+        expected_fingerprint: Option<&str>,
+    ) -> Response {
+        let Some(router) = &self.router else {
+            return router_disabled();
+        };
+        if !self.transactions.pending().await.is_empty() {
+            return Response::RouterError { detail: RouterErrorDetail::Other { message: "an interface transaction is pending; commit or roll it back before starting a router transaction".into() } };
+        }
         let transaction_plan = match router.plan(candidate).await {
             Ok(plan) => plan,
             Err(error) => return classify_router_error(error),
         };
+        if expected_fingerprint
+            .is_some_and(|expected| expected != transaction_plan.observation_fingerprint())
+        {
+            return classify_router_error(crate::core::router_transaction::StalePlanError.into());
+        }
         let plan_preview = transaction_plan.plan().clone();
         match router.apply(transaction_plan).await {
             Ok(token) => Response::RouterTransactionPending {

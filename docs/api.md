@@ -787,3 +787,12 @@ Plan before apply where a plan endpoint exists. After applying a tentative
 network change, verify connectivity and commit before the deadline. Keep a
 local recovery path available when changing the management interface, routing,
 firewall policy, Wi-Fi uplink, or HTTPS listener.
+
+### Binding apply to a reviewed router plan
+
+Router proposals accept optional `expected_revision` and `expected_fingerprint`.
+`RouterPlan` returns `base_revision` and `observation_fingerprint`; send both back
+with the same proposal when applying a reviewed plan. A changed committed revision
+or observed snapshot rejects apply before effects. The coordinator also repeats
+its snapshot validation under transaction ownership. TUI internet sharing uses
+this protocol; clients omitting the optional expectations retain direct apply.

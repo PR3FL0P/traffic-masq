@@ -61,6 +61,8 @@ fn router_proposal_view_preserves_nested_config_json() {
     };
 
     let proposal = RouterProposalRequest {
+        expected_revision: None,
+        expected_fingerprint: None,
         set_router: Some(RouterConfig {
             port_forwards: Vec::new(),
             uplink: Some(UplinkConfig {

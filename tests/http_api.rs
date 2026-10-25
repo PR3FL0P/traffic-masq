@@ -819,6 +819,8 @@ impl RouterSubsystems for FakeRouterSubsystems {
 
 fn router_proposal() -> RouterProposalRequest {
     RouterProposalRequest {
+        expected_revision: None,
+        expected_fingerprint: None,
         set_router: Some(RouterConfig {
             port_forwards: Vec::new(),
             forwarding: Some(vec![traffic_masq::config::ForwardingConfig {

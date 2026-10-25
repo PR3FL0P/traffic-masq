@@ -1653,3 +1653,61 @@ async fn route_editor_merges_saved_interfaces_with_observed_standalone_tunnels()
         ["lan0", "tm-wg0"]
     );
 }
+
+fn reviewed_test_plan() -> traffic_masq_protocol::RouterPlanView {
+    let Response::RouterIntentPreview { desired, .. } = intent_preview(
+        RouterConfig::default(),
+        7,
+        traffic_masq_protocol::InterfaceReadiness::Ready,
+    ) else {
+        unreachable!()
+    };
+    traffic_masq_protocol::RouterPlanView {
+        base_revision: Some(7),
+        observation_fingerprint: Some("reviewed-snapshot".into()),
+        desired,
+        interfaces: vec![],
+        uplink_wifi: vec![],
+        output_wifi: vec![],
+        dhcp: vec![],
+        routes: traffic_masq_protocol::RoutePlanView {
+            add: vec![],
+            delete: vec![],
+        },
+        vpn_chain: Default::default(),
+        dataplane: RouterDataplanePlanView {
+            snapshot: RouterDataplaneSnapshotView {
+                ipv4_forwarding: false,
+                owned: None,
+                owned_firewall_integrity: OwnedFirewallIntegrityView::Intact,
+            },
+            target: RouterDataplaneTargetView::Disabled,
+            requires_apply: false,
+        },
+        risk: Default::default(),
+    }
+}
+
+#[tokio::test]
+async fn sharing_apply_carries_the_reviewed_revision_and_observation() {
+    let mut app = TuiApp {
+        screen: Screen::RouterPlan,
+        ..Default::default()
+    };
+    app.router.editor_revision = Some(6);
+    app.router.plan = Some(reviewed_test_plan());
+    let (_directory, client, server) = router_mock_api(vec![Response::RouterError {
+        detail: RouterErrorDetail::StalePlan,
+    }])
+    .await;
+    super::plan::handle_router_plan_key(&mut app, KeyCode::Enter, &client).await;
+    let requests = server.await.unwrap();
+    assert_eq!(requests[0].0, "router_apply");
+    assert_eq!(requests[0].1["proposal"]["expected_revision"], 7);
+    assert_eq!(
+        requests[0].1["proposal"]["expected_fingerprint"],
+        "reviewed-snapshot"
+    );
+    assert_eq!(app.screen, Screen::RouterPlan);
+    assert!(app.router.plan.is_some());
+}

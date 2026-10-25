@@ -3,6 +3,7 @@ use super::*;
 pub(super) fn current_router_proposal(app: &TuiApp) -> RouterProposalRequest {
     RouterProposalRequest {
         set_router: Some(app.router.proposed_router_config.clone()),
+        expected_revision: app.router.editor_revision,
         ..Default::default()
     }
 }
@@ -637,7 +638,11 @@ async fn router_apply_current_plan(app: &mut TuiApp, client: &ApiClient) {
         }
         return;
     }
-    let proposal = current_router_proposal(app);
+    let mut proposal = current_router_proposal(app);
+    if let Some(plan) = &app.router.plan {
+        proposal.expected_revision = plan.base_revision.or(proposal.expected_revision);
+        proposal.expected_fingerprint = plan.observation_fingerprint.clone();
+    }
     match client.request(&Request::RouterApply { proposal }).await {
         Ok(Response::RouterTransactionPending { token, .. }) => {
             app.pending_focus = 0;
