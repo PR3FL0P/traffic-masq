@@ -215,14 +215,14 @@ Body names in the tables refer to the [request schemas](#request-schemas).
 | `POST` | `/network-transactions/rollback` | `Transaction` | Roll back a pending change | Administrator |
 | `GET` | `/dhcp` | — | DHCP server health summary | Authenticated |
 | `GET` | `/dhcp/{interface}` | — | DHCP server configuration/specification | Authenticated |
-| `PUT` | `/dhcp/{interface}` | `DhcpInterfaceConfig` | Configure DHCP server immediately | Administrator |
-| `DELETE` | `/dhcp/{interface}` | — | Disable DHCP server immediately | Administrator |
+| `PUT` | `/dhcp/{interface}` | `DhcpInterfaceConfig` | Tentatively configure DHCP server; requires network confirmation | Administrator |
+| `DELETE` | `/dhcp/{interface}` | — | Tentatively disable DHCP server; requires network confirmation | Administrator |
 | `PUT` | `/dhcp/{interface}/settings` | `DhcpEdit` | Configure DHCP through the edit model | Administrator |
 | `GET` | `/dhcp/{interface}/leases` | — | Active leases | Authenticated |
 | `GET` | `/dhcp-client` | — | DHCP client status for all configured interfaces | Authenticated |
 | `GET` | `/dhcp-client/{interface}` | — | One DHCP client status | Authenticated |
-| `PUT` | `/dhcp-client/{interface}` | `DhcpClientConfig` | Configure DHCP client; enabled-client route policy changes require confirmation | Administrator |
-| `DELETE` | `/dhcp-client/{interface}` | — | Disable DHCP client immediately | Administrator |
+| `PUT` | `/dhcp-client/{interface}` | `DhcpClientConfig` | Tentatively configure DHCP client; requires network confirmation | Administrator |
+| `DELETE` | `/dhcp-client/{interface}` | — | Tentatively disable DHCP client; requires network confirmation | Administrator |
 | `POST` | `/dhcp-client/{interface}/renew` | — | Renew the lease | Administrator |
 | `POST` | `/dhcp-client/{interface}/release` | — | Release the lease | Administrator |
 | `GET` | `/route-inventory?include_local_table=false` | — | Saved router configuration/revision and configured/observed route inventory | Authenticated |
@@ -314,13 +314,13 @@ endpoints. Use the endpoint corresponding to the apply response.
 | `POST` | `/vpn/profiles` | `{ "name": string, "contents": string }` | Import a WireGuard configuration | Administrator |
 | `DELETE` | `/vpn/profiles/{name}` | — | Delete an inactive profile | Administrator |
 | `GET` | `/vpn/config` | — | Whether the VPN subsystem is enabled | Authenticated |
-| `PUT` | `/vpn/config` | `{ "enabled": bool }` | Save enabled override | Administrator |
+| `PUT` | `/vpn/config` | `{ "enabled": bool }` | Tentatively change VPN availability; requires router confirmation | Administrator |
 | `GET` | `/vpn/status` | — | Active profile/interface, if any | Authenticated |
-| `POST` | `/vpn/activate` | `{ "name": string }` | Activate a profile immediately | Administrator |
-| `POST` | `/vpn/deactivate` | — | Deactivate the current profile | Administrator |
+| `POST` | `/vpn/activate` | `{ "name": string }` | Tentatively activate a profile; requires router confirmation | Administrator |
+| `POST` | `/vpn/deactivate` | — | Tentatively disconnect; requires router confirmation | Administrator |
 | `GET` | `/vpn-policy/status` | — | Policy mode, tunnel health and protected subnets | Authenticated |
-| `PUT` | `/vpn-policy/mode` | `{ "mode": "direct" | "vpn" }` | Set runtime policy override | Administrator |
-| `DELETE` | `/vpn-policy/mode` | — | Clear policy override | Administrator |
+| `PUT` | `/vpn-policy/mode` | `{ "mode": "direct" | "vpn" }` | Tentatively set policy; requires router confirmation | Administrator |
+| `DELETE` | `/vpn-policy/mode` | — | Tentatively clear policy override; requires router confirmation | Administrator |
 
 ### Wi-Fi access point
 
@@ -446,13 +446,13 @@ changes through the interface transaction endpoints first. The DHCP endpoint
 changes only DHCP policy; it does not convert the interface or remove other
 services.
 
-Changing `route_metric` or `install_default_route` on an enabled client returns
+Enabling, configuring or disabling a DHCP client returns
 `NetworkChangePending` through the existing interface transaction. Confirm with
 `CommitNetworkChange` or cancel with `RollbackNetworkChange`; timeout restores
 the previous policy. Saved configuration changes only on commit. Recovery uses
 the interface transaction journal and DHCP supervisor, without replaying an
-expired lease. Initial enablement and changes to other options remain immediate
-and return `DhcpClientInterface`.
+expired lease. DHCP server configure/disable uses the same confirmation endpoints.
+Renew and release-and-reacquire remain immediate operational actions.
 
 ```json
 {
@@ -765,11 +765,13 @@ connection does not prove that a mutation failed; inspect the matching pending
 endpoint and current state before retrying. Never automatically retry a
 mutation whose outcome is unknown.
 
-Changing DHCP route metric or default-route installation on an enabled client
-requires confirmation through the network transaction endpoints. Other DHCP
-controls, VPN controls, Wi-Fi passphrase updates and runtime controls such as
-reconnect and reload apply immediately; their successful responses do not
-require a commit. Wi-Fi configuration, profile activation, and
+DHCP client/server configuration and disable, and live AP/client passphrase
+updates return `NetworkChangePending` and require network confirmation.
+Standalone VPN enable/disable, connect/disconnect and Direct/VPN policy changes
+return `RouterTransactionPending` and use the router commit/rollback endpoints.
+Confirm Direct policy before disconnecting a protected tunnel. DHCP renew and
+release-and-reacquire, Wi-Fi reconnect/reload and station deauthentication remain
+immediate operational actions. Wi-Fi configuration, profile activation, and
 operator-triggered AP/client deactivation on a present adapter require
 confirmation even through non-provisioning endpoints. On an absent adapter
 with a saved role, DELETE saves intent after verified cleanup and returns

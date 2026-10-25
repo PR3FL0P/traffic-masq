@@ -1,5 +1,8 @@
 # Recovery runbook
 
+The [connectivity change contract](change-safety.md) defines the common rules
+for admission, confirmation and verification of the complete recovery chain.
+
 For resource ownership conflicts and diagnostic limits, see the
 [external resource coverage matrix](resource-conflicts.md).
 
@@ -642,3 +645,20 @@ ownership, and stale cleanup intent is rejected before mutation. API success
 includes `cleanup_blockers` if deletion fails; saved intent remains authoritative.
 Inspect router health and the reported ownership/storage cause, repair it, and
 let convergence retry. Existing transaction/recovery fences remain in effect.
+
+## State compatibility when upgrading or downgrading
+
+Current runtime overrides write schema 5 and accept schemas 4 and 5. Schema 5
+stores standalone VPN profile selection together with enablement, traffic policy,
+revision and the router commit token. Schema 4 loads without a standalone intent;
+its existing ownership record continues to govern the legacy tunnel until an
+operator confirms a standalone change. Router transaction journals write schema 3
+and accept 2 and 3; schema 3 adds standalone tunnel and policy snapshots. Interface
+journals remain schema 3, provisioning secret journals schema 2, and Wi-Fi process
+ownership records schema 2. Unsupported unresolved evidence is retained and fenced.
+
+Before upgrading, back up the complete state directory and configuration. Resolve
+pending transactions before downgrading, then restore a coherent backup supported
+by the older daemon. Older readers cannot safely ignore standalone VPN intent or
+its recovery snapshots. Never edit schema numbers or delete a journal to make a
+downgrade start.

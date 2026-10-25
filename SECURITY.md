@@ -21,6 +21,9 @@ ownership record.
 
 ## Rollback and recovery
 
+The [connectivity change contract](docs/change-safety.md) defines shared admission,
+confirmation, recovery ordering and the failure-verification matrix for changes.
+
 The daemon runs the confirmation timer. Disconnecting the client does not stop
 an accepted operation. On normal shutdown, the daemon stops admitting operations
 and waits up to 30 seconds for accepted operations. It then cancels remaining
@@ -35,11 +38,13 @@ understood but rollback itself fails, the daemon can keep the control plane
 available in `RollbackFailed` while retaining the record for diagnosis and an
 explicit retry.
 
-`runtime-overrides.json` writes schema version 4 and reads versions 2, 3 and 4.
-Version 4 adds independent interface suppression. Binaries supporting only older
-schemas cannot read newly saved version 4 records; back up state before upgrading
-and restore compatible state before downgrading. Interface, router and secret
-journals have independent schema versions. If recovery
+`runtime-overrides.json` writes schema version 5 and reads versions 4 and 5.
+Version 5 adds committed standalone VPN selection. Older binaries cannot read
+newly saved version 5 records; back up state before upgrading and restore a
+coherent compatible backup before downgrading. Router journals write version 3
+and read versions 2 and 3; interface journals remain version 3 and provisioning
+secret journals remain version 2. Never downgrade with unresolved transactions.
+These independent schemas must not be edited by hand. If recovery
 fails, keep `router-transaction.json` and the state directory. Deleting them to
 get past the error also removes information needed for recovery.
 
@@ -50,10 +55,11 @@ configuration.
 Wi-Fi configuration, AP/STA provisioning and profile activation, and live
 operator deactivation use commit-confirm. Editing an absent adapter instead
 saves durable intent after verified cleanup, without a confirmation timer.
-DHCP route metric and default-route policy changes on enabled clients also use
-the interface commit-confirm transaction. Other standalone DHCP and VPN actions,
-Wi-Fi runtime commands, passphrase updates and
-profile-library edits apply immediately.
+DHCP client/server configuration and disable, and live AP/client passphrase
+updates require interface confirmation. Standalone VPN enable/disable,
+connection and policy changes require router confirmation. DHCP lease refresh,
+Wi-Fi scan/reconnect/reload, station deauthentication and profile-library edits
+remain immediate.
 Their runtime effects are protected by write-ahead ownership records: DHCP
 leases record the route policy under which they were applied, Wi-Fi daemon
 records are namespaced by process kind and written before launch, and WireGuard

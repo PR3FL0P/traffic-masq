@@ -75,6 +75,7 @@ audit](AUDIT.md) for reproducing tests, fixes, and the reviewed boundaries.
 | Successful apply permits confirmation | Interface `AwaitingCommit` / router `Pending`, with confirmation deadline present |
 | Commit admission and persistence | Interface `commit` and its private `commit_with` helper; router `commit`; `src/core/desired.rs` and override persistence |
 | Commit uncertainty fence | `src/core/recovery.rs`: `check_commit`, `fence_commit`; interface pending phase and router status overlay |
+| Standalone VPN runtime and intent | The existing router registration/commit/rollback states also own standalone VPN operations; `RouterSnapshot.vpn_chain.standalone` captures the prior profile and policy. `RouterCandidate` commits VPN availability, profile selection, mode and token in the same override document. Previous protection is reinstated before tunnel restoration; route replay remaps the restored tunnel ifindex, and failed restoration retains recovery ownership. |
 | Compensation and credential evidence | Interface `rollback_locked`; router `rollback_snapshot`; `src/core/provisioning_secret_transaction.rs` |
 | Stopped recovery and explicit retry | `src/core/recovery_control.rs` |
 | Retirement after outcome | Interface `clear_journal`; router `clear_journal` and committed-token recovery paths |
@@ -111,3 +112,10 @@ The correspondence table is maintained by review. There is no automatic Rust
 extraction or refinement proof. Protocol changes should update the model and
 proofs together with the relevant Rust regression tests. CI builds this package
 when the formalization or transaction/recovery implementation changes.
+
+Standalone VPN broadens the runtime adapter obligations without adding protocol
+phases. Read-only snapshots validate tunnel ownership, recovery re-observes the
+restored link and rebinds owned route ifindices, and unsupported adapters reject
+nonempty standalone intent. These OS/ownership properties remain Rust test
+obligations under the model's existing restoration-success assumption. Router
+preview revision/fingerprint checks precede the abstract registration boundary.

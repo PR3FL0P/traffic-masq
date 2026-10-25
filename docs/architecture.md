@@ -83,7 +83,9 @@ auth/session behavior without importing the daemon crate. Public availability
 checks still use `GET /status`. REST adapters remain available and share the
 same authorization and dispatcher. An exhaustive protocol request policy owns
 administrative access, mutation execution discipline, recovery scope and client
-deadline classification; adding a command requires selecting its policy.
+deadline classification and pending-interface admission; adding a command
+requires selecting its policy. See the [connectivity change contract](change-safety.md)
+for confirmation rules and recovery verification.
 
 ## Applying changes
 
@@ -150,9 +152,10 @@ Explicit completion waits still join the operation owner before reporting idle.
 Operator AP/client configuration, saved profile activation, and operator-triggered
 AP/client deactivation use the same commit-confirm interface transactions as
 provisioning. Internal autoconnect activation and timeout cleanup remain
-immediate. DHCP route metric and default-route policy edits on enabled clients
-use interface transactions; other DHCP and VPN controls plus Wi-Fi passphrase/reconnect/reload runtime
-controls also remain immediate. Since runtime
+immediate. DHCP client enable/configure/disable, DHCP server configuration and live Wi-Fi
+passphrase changes use interface transactions. Standalone VPN connection and
+policy changes use the router coordinator and its VPN snapshot stage. DHCP
+renew/release-and-reacquire and Wi-Fi scan/reconnect/reload remain immediate. Since runtime
 effects can survive a daemon crash, subsystems establish durable ownership
 proof before persistent runtime state is created: DHCP lease records include the applied route policy, Wi-Fi launches use
 write-ahead process records, and WireGuard activation uses a durable intent plus
@@ -185,7 +188,7 @@ reservation across router and VPN backends, including rebuilt VPN hop adapters.
 Private state directory creation syncs the directory and its ancestors, including
 on retries after a failed sync, before a caller can rely on durable records.
 
-Immediate DHCP client configuration edits only DHCP policy on an already
+DHCP client configuration edits only DHCP policy on an already
 managed input interface without a static address. Interface role, management
 and static-address changes must pass through interface transactions first.
 Runtime interface and router dataplane convergence retry unsuccessful passes
@@ -251,8 +254,14 @@ Interface secret journals (version 3) and router provisioning secret journals
 (version 2) record the credential role. Rollback and crash recovery restore only
 that namespace. Previous journal schemas and the old shared credential namespace
 are unsupported; startup does not migrate credentials. Wi-Fi process records
-must use schema 2 and the AP/client/scan namespaces. Runtime overrides must use
-schema 4, interface journals schema 3, router journals schema 2, and provisioning
+must use schema 2 and the AP/client/scan namespaces. Runtime overrides write schema 5 (readers also support schema 4), interface journals schema 3, router journals schema 3 (readers also support schema 2), and provisioning
 secret journals schema 2. Unsupported uncommitted journals remain on disk and
 block recovery; transaction tokens already proven committed can still retire
 obsolete journal files without replaying them.
+
+Standalone VPN operations use the router coordinator's VPN snapshot stage.
+Static router routes exclude all reserved VPN policy tables, even though both
+use protocol 201. Each owner restores its own namespace; old route snapshots
+containing policy-table entries cannot replay obsolete VPN ifindices. Committed
+standalone intent bypasses legacy immediate startup/integrity writers and is
+repaired under the router journal.

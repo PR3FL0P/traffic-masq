@@ -17,7 +17,7 @@ The TUI serves as the primary operational console for the `traffic-masq` network
    - Communicates with `traffic-masqd` over a local Unix domain socket (`/run/traffic-masq/traffic-masqd.sock`) or verified HTTPS (`--server` / `--connection`).
    - Fully interactive: supports all tabs (Interfaces, DHCP Server, DHCP Client (configurable in Settings), Route, VPN, Wi-Fi, Settings, Logs).
    - Authenticated via shared device password; supports secure session caching in `$XDG_STATE_HOME`.
-   - Interface/router applies, Wi-Fi client Connect, AP provisioning/profile activation, and operator-triggered Wi-Fi deactivation use commit-confirm rollback timers; standalone DHCP, Wi-Fi runtime controls such as reconnect/reload/passphrase updates, and VPN mutations apply immediately and rely on daemon-side ownership recovery.
+   - Interface/router applies, Wi-Fi client Connect, AP provisioning/profile activation, and operator-triggered Wi-Fi deactivation use commit-confirm rollback timers; DHCP client/server configuration, disable and live passphrase updates use interface confirmation; standalone VPN connection, enablement and policy changes use router confirmation. Lease refresh and Wi-Fi reconnect/reload remain immediate.
 
 2. **Direct / Recovery Mode (`--direct`):**
    - Directly binds to Linux Netlink via `RtnetlinkNetworkProvider`.
@@ -39,7 +39,7 @@ The TUI serves as the primary operational console for the `traffic-masq` network
 | [`interfaces.rs`](interfaces.rs) | Network interface list and editor; address ownership tags (`[ext]`, `[?]`), default route risk warnings, dry-run change plan previews. | `InterfaceEditor`, `InterfaceEditorField`, `render_interface_list`, `render_preview` |
 | [`interface_status.rs`](interface_status.rs) | Shared current interface status for lists, sharing, settings, reviews, DHCP and Wi-Fi. | `describe`, `summary`, `cell`, `render_context` |
 | [`dhcp.rs`](dhcp.rs) | Downstream DHCP server configuration per interface, pool range validation, DNS settings, active lease viewer. | `DhcpEditor`, `DhcpField`, `DhcpLeasesView` |
-| [`dhcp_client_editor.rs`](dhcp_client_editor.rs) | Saved DHCP client policy editor; immediate apply with error-preserving draft. | `Editor` |
+| [`dhcp_client_editor.rs`](dhcp_client_editor.rs) | Saved DHCP client policy editor; tentative apply with confirmation and error-preserving draft. | `Editor` |
 | [`wifi_stations.rs`](wifi_stations.rs) | AP station inventory, active DHCP lease correlation and confirmed deauthentication. | `View` |
 | [`dhcp_client.rs`](dhcp_client.rs) | Uplink DHCP client supervision view with interface-name-based selection, scrolling, lease renewal/release, and defaults configuration. | `render`, `refresh`, `handle_key` |
 | [`router/mod.rs`](router/mod.rs) | Router façade and shared state; route editing, controller/API orchestration, rendering, pending transaction views, and tests are split into `router/` submodules. | `RouterData`, `RouteEditorField`, `RouterPendingView`, `render_router` |
@@ -357,7 +357,7 @@ async fn resize_clears_hit_regions() {
   or continuing editing. Interface and AP drafts retain their original revision
   and stay memory-only. AP draft credentials still zeroize on drop.
 - Load profile opens a selectable list. Save edited settings before loading another profile or applying a loaded profile.
-- DHCP's Apply DHCP now action changes the running service immediately, without a confirmation timer.
+- DHCP's Apply DHCP temporarily action opens the shared network confirmation timer.
 
 ### Dashboard data and layout
 
