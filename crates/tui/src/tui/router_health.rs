@@ -95,6 +95,12 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
         );
         return;
     }
+    let interface_lines = app
+        .router
+        .saved_router_config
+        .as_ref()
+        .map(|config| super::interface_status::router_lines(app, &[config]))
+        .unwrap_or_default();
     let view = &mut app.router_health;
     let block = panel("Router health | saved configuration");
     let inner = block.inner(area);
@@ -108,6 +114,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
             Style::default().fg(theme::WARN),
         ));
     }
+    lines.extend(interface_lines);
     if app.router.staged {
         lines.push(Line::from(
             "Draft retained. Apply or discard it in Route before repair.",

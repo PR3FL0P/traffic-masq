@@ -37,6 +37,7 @@ mod dhcp_client;
 mod dhcp_client_editor;
 mod forwarding;
 mod input;
+mod interface_status;
 mod interfaces;
 mod layout;
 mod logs;

@@ -741,7 +741,7 @@ pub(crate) fn render_wifi(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
                 } else {
                     "  "
                 },
-                row.interface,
+                super::interface_status::describe(app, &row.interface),
                 role_label(row.role),
                 describe_row_state(row)
             ),

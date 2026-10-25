@@ -37,6 +37,7 @@ The TUI serves as the primary operational console for the `traffic-masq` network
 | [`session.rs`](session.rs) | Per-endpoint persistent session caching, XDG state management, strict file permissions (`0700`/`0600`, `O_NOFOLLOW`), zeroization. | `SessionStore`, `SessionPreferences`, `remember`, `SessionStore::restore` |
 | [`dashboard.rs`](dashboard.rs) | Original Overview cards (mode, interfaces, pending, VPN); full-width interface list with per-interface RX/TX graphs and scrollable numeric statistics. No DHCP cards or sidebar. | `DashboardData`, `DashboardPane`, `TrafficHistory`, `TrafficSample` |
 | [`interfaces.rs`](interfaces.rs) | Network interface list and editor; address ownership tags (`[ext]`, `[?]`), default route risk warnings, dry-run change plan previews. | `InterfaceEditor`, `InterfaceEditorField`, `render_interface_list`, `render_preview` |
+| [`interface_status.rs`](interface_status.rs) | Shared current interface status for lists, sharing, settings, reviews, DHCP and Wi-Fi. | `describe`, `summary`, `cell`, `render_context` |
 | [`dhcp.rs`](dhcp.rs) | Downstream DHCP server configuration per interface, pool range validation, DNS settings, active lease viewer. | `DhcpEditor`, `DhcpField`, `DhcpLeasesView` |
 | [`dhcp_client_editor.rs`](dhcp_client_editor.rs) | Saved DHCP client policy editor; immediate apply with error-preserving draft. | `Editor` |
 | [`wifi_stations.rs`](wifi_stations.rs) | AP station inventory, active DHCP lease correlation and confirmed deauthentication. | `View` |
@@ -91,6 +92,16 @@ In a terminal application, performing long-running network operations directly i
 4. **Resize-Safe Progress Rendering:** At the same terminal size, the progress banner reuses the last rendered frame so footer/status context stays intact. After a resize, the stale snapshot is discarded and progress is rendered against the new geometry instead of replaying old coordinates.
 
 ### 3.2. Commit-Confirm & Immediate Mutation Flows
+
+Interface labels show current `UP`/`DOWN`, `traffic-masq:on/off/?`, and configuration
+readiness or pending/recovery phase. `UP` is the observed administrative flag;
+`config ready` means the configured dependencies are available, not that a Wi-Fi
+association or Internet probe succeeded. Missing devices, unknown observations
+and stale cached observations have distinct labels. A failed inventory refresh
+marks retained observations stale. Reviews display current status separately
+from proposed changes, so a draft cannot make an interface appear managed or up.
+Sharing rows use `tm:on/off/?` for traffic-masq control and keep three lines per
+connection; list hit testing and scrolling use the same row height.
 
 Because misconfiguring an IP address or firewall rule can sever SSH access, interface and router changes use a strict rollback pattern:
 1. **Dry-Run Preview:** Before modifying transactional interface/router state, the daemon calculates a diff (`InterfaceChangePlan`, `RouterPlan`). The TUI presents this plan on a dedicated preview screen (`Screen::Preview`, `Screen::RouterPlan`).

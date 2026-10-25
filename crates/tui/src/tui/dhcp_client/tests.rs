@@ -285,7 +285,7 @@ fn client_list_shows_failure_reason_and_scrolls_with_correct_mouse_rows() {
         .collect();
     assert!(text.contains("DHCP socket unavailable"));
     assert!(text.contains("[d] disable"));
-    assert_eq!(app.ui.list_row_height, 4);
+    assert_eq!(app.ui.list_row_height, 5);
     assert_eq!(app.ui.list_scroll_offset, 1);
     assert_eq!(app.ui.list_area.unwrap().y, 3);
 }

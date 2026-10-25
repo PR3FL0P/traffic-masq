@@ -108,7 +108,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
     );
     let names = row_names(app);
     let selected = selected_row(app, &names);
-    let visible_items = (list_area.height / 4).max(1) as usize;
+    let visible_items = (list_area.height / 5).max(1) as usize;
     if selected < app.dhcp_client_scroll {
         app.dhcp_client_scroll = selected;
     } else if selected >= app.dhcp_client_scroll.saturating_add(visible_items) {
@@ -118,7 +118,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
     app.dhcp_client_scroll = app.dhcp_client_scroll.min(max_scroll);
 
     app.ui.list_area = Some(list_area);
-    app.ui.list_row_height = 4;
+    app.ui.list_row_height = 5;
     app.ui.list_count = names.len();
     app.ui.list_scroll_offset = app.dhcp_client_scroll;
 
@@ -255,6 +255,10 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
             ));
             lines.push(Line::from(""));
         }
+        lines.push(Line::from(format!(
+            "  {}",
+            super::interface_status::summary(app, name)
+        )));
     }
     frame.render_widget(Paragraph::new(lines), list_area);
 }

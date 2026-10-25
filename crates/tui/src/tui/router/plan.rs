@@ -46,6 +46,10 @@ pub(crate) fn render_router_plan(frame: &mut ratatui::Frame<'_>, area: Rect, app
             )),
             Line::from("Saved settings will wait for dependencies; no new rules are applied."),
         ];
+        lines.extend(super::super::interface_status::router_lines(
+            app,
+            &[&preview.config, &preview.baseline],
+        ));
         for blocker in &preview.blockers {
             lines.push(Line::from(match blocker {
                 traffic_masq_protocol::InterfaceReadinessBlocker::MissingInterface {
@@ -167,6 +171,14 @@ pub(crate) fn render_router_plan(frame: &mut ratatui::Frame<'_>, area: Rect, app
             summarize_uplink(&plan.dataplane.target)
         )),
     ];
+    let mut status_configs = vec![&app.router.proposed_router_config];
+    if let Some(saved) = &app.router.saved_router_config {
+        status_configs.push(saved);
+    }
+    lines.extend(super::super::interface_status::router_lines(
+        app,
+        &status_configs,
+    ));
     if let Some(old) = &plan.dataplane.snapshot.owned {
         for rule in &old.port_forwards {
             let retained = match &plan.dataplane.target {

@@ -228,6 +228,10 @@ pub(crate) fn render_dhcp_interface_list(
             Line::from(vec![
                 Span::styled(format!("{marker} {:<12}", status.interface.name), style),
                 dhcp_span,
+                Span::raw(format!(
+                    " · {}",
+                    super::interface_status::summary(app, &status.interface.name)
+                )),
             ])
         })
         .collect::<Vec<_>>();
@@ -297,7 +301,10 @@ pub(crate) fn render_dhcp_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
         DHCP_DISABLE_LABEL
     };
     let mut lines = vec![
-        Line::from(format!("Interface: {}", editor.interface)),
+        Line::from(format!(
+            "Interface: {}",
+            super::interface_status::describe(app, &editor.interface)
+        )),
         field(
             "Pool start",
             &editor.pool_start,
@@ -363,6 +370,11 @@ pub(crate) fn render_dhcp_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
 }
 
 pub(crate) fn render_dhcp_leases(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
+    let interface_status = app
+        .dhcp_leases
+        .as_ref()
+        .map(|view| super::interface_status::describe(app, &view.interface))
+        .unwrap_or_default();
     let Some(view) = &mut app.dhcp_leases else {
         return;
     };
@@ -384,10 +396,7 @@ pub(crate) fn render_dhcp_leases(frame: &mut ratatui::Frame<'_>, area: Rect, app
     ));
     let status = match &view.error {
         Some(error) => Line::styled(format!("STALE: {error}"), Style::default().fg(theme::WARN)),
-        None => Line::from(format!(
-            "Updated {}s ago",
-            now.saturating_sub(view.updated_at)
-        )),
+        None => Line::from(interface_status),
     };
     frame.render_widget(
         Paragraph::new(vec![

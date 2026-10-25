@@ -144,6 +144,16 @@ pub(crate) fn render_router(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         ),
     ])];
 
+    if let Some(name) = router
+        .route_rows()
+        .get(router.selected_route)
+        .and_then(row_config)
+        .and_then(|route| route.output_interface)
+    {
+        status_lines.push(Line::from(super::super::interface_status::describe(
+            app, &name,
+        )));
+    }
     if let Some(plan) = &router.plan {
         status_lines.push(Line::from(vec![
             Span::styled("Uplink: ", Style::default().fg(theme::MUTED)),

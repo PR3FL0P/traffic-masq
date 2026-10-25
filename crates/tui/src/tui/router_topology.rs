@@ -414,7 +414,13 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
         inner.width,
         inner.height.saturating_sub(3),
     );
-    let lines = wrap_lines(topology_lines(&app.router, expanded), content.width);
+    let mut lines = topology_lines(&app.router, expanded);
+    let mut configs = vec![&app.router.proposed_router_config];
+    if let Some(saved) = &app.router.saved_router_config {
+        configs.push(saved);
+    }
+    lines.extend(super::interface_status::router_lines(app, &configs));
+    let lines = wrap_lines(lines, content.width);
     let max_width = lines
         .iter()
         .map(Line::width)

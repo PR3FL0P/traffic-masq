@@ -165,6 +165,11 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
         );
         return;
     }
+    let interface_status = app
+        .wifi_stations
+        .as_ref()
+        .map(|view| super::interface_status::describe(app, &view.interface))
+        .unwrap_or_default();
     let Some(view) = &mut app.wifi_stations else {
         return;
     };
@@ -180,6 +185,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
             "unknown".into()
         }
     ))];
+    lines.push(Line::from(interface_status));
     if let Some(error) = &view.error {
         lines.push(Line::styled(
             format!("STALE / unavailable: {error}"),

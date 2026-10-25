@@ -271,6 +271,7 @@ pub(crate) fn render_wifi_connect_prompt(
     let Some(prompt) = &app.wifi_connect else {
         return;
     };
+    let interface_status = crate::tui::interface_status::describe(app, &prompt.interface);
     if prompt.reviewing {
         let after = match prompt.choice {
             WifiIpChoice::Dhcp => "DHCP".to_string(),
@@ -283,7 +284,7 @@ pub(crate) fn render_wifi_connect_prompt(
             &mut app.ui,
             "Wi-Fi · Review changes",
             vec![
-                format!("Device: {}", prompt.interface),
+                format!("Device: {}", interface_status),
                 format!(
                     "Connect profile: {} (SSID: {})",
                     prompt.profile_id, prompt.ssid
@@ -322,7 +323,7 @@ pub(crate) fn render_wifi_connect_prompt(
         prompt.ssid,
         prompt.interface
     ));
-    let mut lines = Vec::new();
+    let mut lines = vec![Line::from(interface_status)];
 
     lines.push(Line::from(format!(
         "Selected IPv4 policy: {}",

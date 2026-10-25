@@ -156,7 +156,10 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let mut lines = vec![
-        Line::from(format!("Interface: {}", editor.interface)),
+        Line::from(format!(
+            "Interface: {}",
+            super::interface_status::describe(app, &editor.interface)
+        )),
         Line::styled(
             "Route policy changes on an enabled client require confirmation with a rollback timer.",
             Style::default().fg(theme::WARN),

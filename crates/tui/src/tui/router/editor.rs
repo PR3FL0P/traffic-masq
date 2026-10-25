@@ -563,7 +563,13 @@ pub(crate) fn render_route_editor(frame: &mut ratatui::Frame<'_>, area: Rect, ap
             editor.allow_default_route_change,
             editor.field == RouteEditorField::AllowDefaultRouteChange,
         ),
-        Line::from(""),
+        Line::from(
+            editor
+                .output_interface
+                .as_deref()
+                .map(|name| super::super::interface_status::describe(app, name))
+                .unwrap_or_default(),
+        ),
     ];
 
     let save_row = lines.len() as u16;

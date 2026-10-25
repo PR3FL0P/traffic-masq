@@ -62,9 +62,10 @@ fn interface_list_keeps_selected_row_visible_and_click_offset_correct() {
     terminal
         .draw(|frame| render_interface_list(frame, frame.area(), &mut app))
         .unwrap();
-    assert_eq!(app.ui.list_scroll_offset, 16);
+    assert_eq!(app.ui.list_scroll_offset, 18);
+    assert_eq!(app.ui.list_row_height, 2);
     let buffer = terminal.backend().buffer();
-    let last_row: String = (0..80).map(|x| buffer[(x, 4)].symbol()).collect();
+    let last_row: String = (0..80).map(|x| buffer[(x, 3)].symbol()).collect();
     assert!(last_row.contains("eth19"));
 }
 

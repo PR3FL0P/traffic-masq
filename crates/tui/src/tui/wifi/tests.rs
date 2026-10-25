@@ -1092,8 +1092,8 @@ fn wifi_profile_actions_list_area_excludes_header_for_mouse_clicks() {
     let list_area = app.ui.list_area.expect("list_area must be populated");
     assert_eq!(app.ui.list_count, WifiProfileAction::ALL.len());
     assert_eq!(app.ui.list_scroll_offset, 0);
-    // Header height is 2 lines, panel top border is 1 line, so list_area starts at y = 3
-    assert_eq!(list_area.y, 3);
+    // Interface context, two profile header lines, and one panel border precede actions.
+    assert_eq!(list_area.y, 4);
 }
 
 #[test]

@@ -8,6 +8,8 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
     {
         app.pending_focus = 0;
     }
+    let interface_lines =
+        super::super::interface_status::router_lines(app, &[&app.router.proposed_router_config]);
     let Some(view) = app.router_pending.as_mut() else {
         return;
     };
@@ -48,6 +50,7 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
             format!("Applied temporarily — awaiting confirmation. Rollback in {remaining}s / {timeout}s")
         }),
     ];
+    detail_lines.extend(interface_lines);
     if let Some(recovery) = &view.recovery {
         detail_lines.push(Line::from(""));
         for (index, text) in recovery_notice_text(recovery, None).into_iter().enumerate() {

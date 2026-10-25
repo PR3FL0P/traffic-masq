@@ -268,18 +268,18 @@ pub(crate) fn render_interface_inventory(
             ..inner
         };
         app.ui.list_area = Some(rows);
-        app.ui.list_row_height = 1;
+        app.ui.list_row_height = 2;
         app.ui.list_count = entries.len();
         let offset = app
             .selected_inventory_interface
-            .saturating_sub((rows.height as usize).saturating_sub(1));
+            .saturating_sub((rows.height as usize / 2).saturating_sub(1));
         app.ui.list_scroll_offset = offset;
         let lines: Vec<Line> = entries
             .iter()
             .enumerate()
             .skip(offset)
-            .take(rows.height as usize)
-            .map(|(index, entry)| {
+            .take(rows.height as usize / 2)
+            .flat_map(|(index, entry)| {
                 let marker = if index == app.selected_inventory_interface {
                     "▶"
                 } else {
@@ -290,7 +290,9 @@ pub(crate) fn render_interface_inventory(
                     traffic_masq_protocol::InterfacePresence::Missing => "missing",
                     traffic_masq_protocol::InterfacePresence::Unknown => "unknown",
                 };
-                let link = if presence == "present" {
+                let link = if entry.observation_stale {
+                    "stale"
+                } else if presence == "present" {
                     match entry.observed.as_ref() {
                         Some(status) if status.interface.is_up => "up",
                         Some(_) => "down",
@@ -395,7 +397,13 @@ pub(crate) fn render_interface_inventory(
                     ));
                 }
                 spans.push(Span::raw(format!("{addresses}{configured}")));
-                Line::from(spans)
+                [
+                    Line::from(spans),
+                    Line::from(format!(
+                        "  {}",
+                        super::interface_status::summary(app, &entry.name)
+                    )),
+                ]
             })
             .collect();
         frame.render_widget(Paragraph::new(lines), rows);
@@ -406,9 +414,9 @@ pub(crate) fn render_interface_inventory(
     frame.render_widget(block, area);
 
     app.ui.list_area = Some(inner);
-    app.ui.list_row_height = 1;
+    app.ui.list_row_height = 2;
     app.ui.list_count = app.dashboard.interfaces.len();
-    let visible = inner.height as usize;
+    let visible = inner.height as usize / 2;
     let offset = app
         .selected_interface
         .saturating_sub(visible.saturating_sub(1));
@@ -421,7 +429,7 @@ pub(crate) fn render_interface_inventory(
         .enumerate()
         .skip(offset)
         .take(visible)
-        .map(|(index, status)| {
+        .flat_map(|(index, status)| {
             let selected = index == app.selected_interface;
             let marker = if selected { "▶" } else { " " };
             let addresses = format_addresses(status);
@@ -451,7 +459,13 @@ pub(crate) fn render_interface_inventory(
                 Span::raw("  "),
             ]);
             line.spans.extend(addresses);
-            line
+            [
+                line,
+                Line::from(format!(
+                    "  {}",
+                    super::interface_status::summary(app, &status.interface.name)
+                )),
+            ]
         })
         .collect::<Vec<_>>();
 
@@ -564,13 +578,8 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
     };
     let mut lines = vec![
         Line::from(format!(
-            "Device: {} · {}",
-            editor.interface,
-            if editor.offline_revision.is_some() {
-                "absent"
-            } else {
-                "present"
-            }
+            "Device: {}",
+            super::interface_status::describe(app, &editor.interface)
         )),
         Line::styled("Main settings", Style::default().fg(theme::MUTED)),
         super::layout::text_field_row(
@@ -746,7 +755,7 @@ pub(crate) fn render_preview(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
         .map(|address| format!("{}/{}", address.address, address.prefix_len))
         .unwrap_or_else(|| "none".to_string());
     let mut lines = vec![
-        Line::from(format!("Interface: {}", plan.interface)),
+        Line::from(format!("Current: {}", super::interface_status::describe(app, &plan.interface))),
         Line::from(format!("Delete IPv4: {delete}")),
         Line::from(format!("Claim existing IPv4: {retag}")),
         Line::from(format!("Add IPv4: {add}")),
@@ -913,7 +922,10 @@ pub(crate) fn render_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
                 .fg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
-        Line::from(format!("Interface: {}", change.interface)),
+        Line::from(format!(
+            "Interface: {}",
+            super::interface_status::describe(app, &change.interface)
+        )),
         Line::from(format!("Rollback scheduled in: {seconds}s / {timeout}s")),
         Line::from(
             "Network already changed temporarily. Without confirmation, rollback is scheduled.",

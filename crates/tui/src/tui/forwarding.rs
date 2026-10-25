@@ -303,7 +303,7 @@ pub(crate) fn render_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
         Paragraph::new(if app.router.staged {
             "Draft — not applied. Review / Apply to continue"
         } else {
-            "Sharing permissions and NAT; routes choose the path"
+            "Sharing permissions and NAT; tm:on/off = traffic-masq control"
         })
         .style(Style::default().fg(theme::MUTED)),
         chunks[0],
@@ -316,7 +316,7 @@ pub(crate) fn render_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
         .router
         .selected_connection
         .min(rules_slice.len().saturating_sub(1));
-    let visible = usize::from(inner.height.saturating_sub(1));
+    let visible = usize::from(inner.height.saturating_sub(1) / 3);
     let scroll = app
         .router
         .selected_connection
@@ -369,8 +369,10 @@ pub(crate) fn render_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
                 } else {
                     " "
                 }),
-                Cell::from(rule.from.clone()).style(interface_style(from_missing)),
-                Cell::from(rule.to.clone()).style(interface_style(to_missing)),
+                Cell::from(super::interface_status::cell(app, &rule.from))
+                    .style(interface_style(from_missing)),
+                Cell::from(super::interface_status::cell(app, &rule.to))
+                    .style(interface_style(to_missing)),
                 Cell::from(if rule.masquerade { "On" } else { "Off" }),
                 Cell::from(
                     rule.source_subnet
@@ -378,6 +380,7 @@ pub(crate) fn render_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
                 ),
                 Cell::from(status).style(interface_style(from_missing || to_missing)),
             ])
+            .height(3)
             .style(
                 if index == app.router.selected_connection && !app.router.sharing_actions_focused {
                     Style::default()
@@ -411,7 +414,7 @@ pub(crate) fn render_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
         inner.width,
         inner.height.saturating_sub(1),
     ));
-    app.ui.list_row_height = 1;
+    app.ui.list_row_height = 3;
     app.ui.list_count = rules_slice.len();
     app.ui.list_scroll_offset = scroll;
     if rules_slice.is_empty() {
@@ -544,8 +547,14 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
             Style::default().fg(theme::TEXT)
         };
         let label = match field {
-            Field::From => format!("Traffic from: {}", editor.interfaces[editor.from]),
-            Field::To => format!("Internet through: {}", editor.interfaces[editor.to]),
+            Field::From => format!(
+                "Traffic from: {}",
+                super::interface_status::describe(app, &editor.interfaces[editor.from])
+            ),
+            Field::To => format!(
+                "Internet through: {}",
+                super::interface_status::describe(app, &editor.interfaces[editor.to])
+            ),
             Field::Masquerade => format!(
                 "Masquerade: {}",
                 if editor.masquerade { "on" } else { "off" }

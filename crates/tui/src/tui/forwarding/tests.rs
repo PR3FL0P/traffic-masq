@@ -433,3 +433,107 @@ async fn new_connection_can_target_tunnels_from_the_unapplied_chain() {
     let rules = form.save().unwrap();
     assert_eq!(rules[0].to, "tm-wg-1");
 }
+
+#[test]
+fn sharing_editor_and_preview_show_both_current_endpoint_states_at_minimum_size() {
+    use ratatui::{backend::TestBackend, Terminal};
+    let mut app = TuiApp::default();
+    app.dashboard.interfaces = vec![
+        interface_status("lan0", false),
+        interface_status("wan0", true),
+    ];
+    app.dashboard.interfaces[1].interface.is_up = false;
+    app.dashboard.managed.insert("lan0".into(), true);
+    app.dashboard.managed.insert("wan0".into(), false);
+    let mut form = editor();
+    form.to = 1;
+    form.field = Field::From;
+    app.forwarding = Some(form);
+    app.screen = Screen::Forwarding;
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let text = |terminal: &Terminal<TestBackend>| {
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+    };
+    terminal
+        .draw(|frame| super::super::render(frame, &mut app, false))
+        .unwrap();
+    let rendered = text(&terminal);
+    assert!(rendered.contains("lan0 · UP · traffic-masq:on"));
+    assert!(rendered.contains("wan0 · DOWN · traffic-masq:off"));
+    assert!(
+        app.ui.buttons.iter().any(|(_, slot)| *slot == 0),
+        "Save remains reachable"
+    );
+
+    app.router.offline_preview = Some(super::super::router::OfflineRouterPreview {
+        baseline: Default::default(),
+        config: traffic_masq_protocol::RouterConfigView {
+            forwarding: Some(vec![connection("lan0", "wan0")]),
+            ..Default::default()
+        },
+        revision: 1,
+        blockers: vec![],
+    });
+    app.screen = Screen::RouterPlan;
+    terminal
+        .draw(|frame| super::super::render(frame, &mut app, false))
+        .unwrap();
+    let rendered = text(&terminal);
+    assert!(rendered.contains("Current: lan0 · UP · traffic-masq:on"));
+    assert!(rendered.contains("Current: wan0 · DOWN · traffic-masq:off"));
+}
+
+#[tokio::test]
+async fn sharing_status_rows_keep_mouse_selection_aligned() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{backend::TestBackend, Terminal};
+    let mut app = TuiApp {
+        screen: Screen::Router,
+        ..Default::default()
+    };
+    app.router.pane = super::super::router::RouterPane::Sharing;
+    app.router.staged = true;
+    app.router.proposed_router_config.forwarding =
+        Some(vec![connection("lan0", "wan0"), connection("lan1", "wan1")]);
+    app.dashboard.interfaces = vec![
+        interface_status("lan0", false),
+        interface_status("wan0", true),
+    ];
+    app.dashboard.interfaces[1].interface.is_up = false;
+    app.dashboard.managed.insert("lan0".into(), true);
+    app.dashboard.managed.insert("wan0".into(), false);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| super::super::render(frame, &mut app, false))
+        .unwrap();
+    let rendered = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(rendered.contains("UP tm:on"));
+    assert!(rendered.contains("DOWN tm:off"));
+    assert_eq!(app.ui.list_row_height, 3);
+    let area = app.ui.list_area.unwrap();
+    super::super::handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: area.x,
+            row: area.y + 4,
+            modifiers: KeyModifiers::NONE,
+        },
+        &ApiClient::new("/must-not-be-used.sock"),
+        false,
+    )
+    .await;
+    assert_eq!(app.router.selected_connection, 1);
+}

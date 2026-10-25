@@ -2,6 +2,7 @@ use super::*;
 
 pub(crate) fn render_wifi_scan(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
     let Some(scan) = &app.wifi_scan else { return };
+    let area = crate::tui::interface_status::render_context(frame, area, app, &scan.interface);
     let block = panel(&format!("Scan results on {}", scan.interface));
     let inner = block.inner(area);
     let offset = scan

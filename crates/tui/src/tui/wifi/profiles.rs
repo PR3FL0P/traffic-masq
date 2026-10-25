@@ -84,6 +84,7 @@ pub(crate) fn render_wifi_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, a
         }
         return;
     }
+    let area = crate::tui::interface_status::render_context(frame, area, app, &view.interface);
     match view.mode {
         WifiProfilesMode::Menu => render_profiles_menu(frame, area, &mut app.ui, view),
         WifiProfilesMode::Management | WifiProfilesMode::Connect => {

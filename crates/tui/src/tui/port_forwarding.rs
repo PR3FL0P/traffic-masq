@@ -298,14 +298,24 @@ pub(crate) fn render_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
         .enumerate()
         .map(|(i, rule)| {
             wrap_lines(
-                vec![Line::from(describe(
-                    if i == app.router.selected_port_forward {
-                        "▶"
-                    } else {
-                        " "
-                    },
-                    rule,
-                ))],
+                vec![
+                    Line::from(describe(
+                        if i == app.router.selected_port_forward {
+                            "▶"
+                        } else {
+                            " "
+                        },
+                        rule,
+                    )),
+                    Line::from(format!(
+                        "  From: {}",
+                        super::interface_status::describe(app, &rule.from)
+                    )),
+                    Line::from(format!(
+                        "  Through: {}",
+                        super::interface_status::describe(app, &rule.to)
+                    )),
+                ],
                 inner.width,
             )
         })
@@ -455,6 +465,15 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
             focus_row = lines.len();
         }
         lines.extend(wrap_lines(vec![Line::from(spans)], inner.width));
+        if i < 2 && !e.values[i].trim().is_empty() {
+            lines.extend(wrap_lines(
+                vec![Line::from(format!(
+                    "  Current: {}",
+                    super::interface_status::summary(app, e.values[i].trim())
+                ))],
+                inner.width,
+            ));
+        }
         if e.error_field == Some(i) {
             if let Some(error) = &e.error {
                 lines.extend(wrap_lines(

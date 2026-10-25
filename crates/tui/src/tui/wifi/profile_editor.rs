@@ -19,6 +19,7 @@ pub(crate) fn render_wifi_profile_editor(
     let Some(editor) = &app.wifi_profile_editor else {
         return;
     };
+    let area = crate::tui::interface_status::render_context(frame, area, app, &editor.interface);
     let values = [
         (ProfileField::Id, "Id", editor.id.clone()),
         (ProfileField::Ssid, "SSID", editor.ssid.clone()),

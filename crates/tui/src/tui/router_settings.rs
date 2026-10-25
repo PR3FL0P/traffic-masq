@@ -239,6 +239,11 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
         );
         return;
     }
+    let uplink_status = app
+        .router_settings
+        .as_ref()
+        .filter(|e| !e.uplink.trim().is_empty())
+        .map(|e| super::interface_status::describe(app, e.uplink.trim()));
     let Some(e) = &mut app.router_settings else {
         return;
     };
@@ -247,19 +252,20 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
     frame.render_widget(block, area);
     let note = "Sharing requires explicit rules in Internet sharing; uplink and VPN add no rules.";
     let heading = vec![
+        Line::from(uplink_status.unwrap_or_else(|| "Physical uplink: none".into())),
         Line::styled(note, Style::default().fg(theme::WARN)),
         Line::from("Chain order: physical uplink -> hop 1 -> ... -> last hop -> LAN."),
         Line::from("Enter cycles choices; Left/Right selects profile/hop. Esc cancels editor."),
     ];
     frame.render_widget(
         Paragraph::new(heading),
-        Rect::new(inner.x, inner.y, inner.width, inner.height.min(3)),
+        Rect::new(inner.x, inner.y, inner.width, inner.height.min(4)),
     );
     let body = Rect::new(
         inner.x,
-        inner.y + 3,
+        inner.y + 4,
         inner.width,
-        inner.height.saturating_sub(3),
+        inner.height.saturating_sub(4),
     );
     let visible = body.height.max(1) as usize;
     let selected = FIELDS.iter().position(|f| *f == e.field).unwrap_or(0);

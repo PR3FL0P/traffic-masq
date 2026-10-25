@@ -335,6 +335,11 @@ pub(crate) fn accept_update(app: &mut TuiApp, mut updated: DashboardData) {
     }
     if updated.inventory.is_none() {
         updated.inventory = app.dashboard.inventory.clone();
+        if let Some(entries) = &mut updated.inventory {
+            for entry in entries {
+                entry.observation_stale = true;
+            }
+        }
         updated.intent_revision = app.dashboard.intent_revision;
         updated.base_config = app.dashboard.base_config.clone();
     }
@@ -1066,6 +1071,7 @@ pub(crate) fn render_dashboard_traffic(
             history,
             managed,
             index == selected_interface,
+            super::interface_status::state_label(app, &status.interface.name),
         );
     }
 }
@@ -1077,6 +1083,7 @@ fn render_traffic_row(
     history: Option<&TrafficHistory>,
     managed: Option<bool>,
     selected: bool,
+    state: &str,
 ) {
     let marker = if selected { "▶" } else { " " };
     let name_style = if selected {
@@ -1114,7 +1121,7 @@ fn render_traffic_row(
                 theme::WARN
             }),
         ),
-        Span::raw("   "),
+        Span::raw(format!(" · {state}   ")),
         Span::styled(
             format!("↓ {:>10}", format_rate(rx_rate)),
             Style::default().fg(theme::ACCENT),

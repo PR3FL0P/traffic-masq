@@ -21,7 +21,10 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
     if editor.reviewing {
         let settings = ap_settings(editor);
         let mut lines = vec![
-            format!("Device: {}", editor.interface),
+            format!(
+                "Device: {}",
+                crate::tui::interface_status::describe(app, &editor.interface)
+            ),
             format!(
                 "SSID: {} → {}",
                 editor
@@ -95,7 +98,14 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
         area
     };
 
-    let mut lines = Vec::new();
+    let mut lines = if editor.profile_mode {
+        Vec::new()
+    } else {
+        vec![Line::from(crate::tui::interface_status::describe(
+            app,
+            &editor.interface,
+        ))]
+    };
     let settings = ap_settings(editor);
     let values = [
         (
