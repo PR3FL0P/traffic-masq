@@ -914,6 +914,7 @@ fn summarizes_only_output_interfaces_with_subnet() {
         RouterInterfaceDesiredView {
             name: "wan0".to_string(),
             config: InterfaceConfigView {
+                wifi_concurrent: false,
                 mac_address: None,
                 role: InterfaceRole::Input,
                 managed: false,
@@ -927,6 +928,7 @@ fn summarizes_only_output_interfaces_with_subnet() {
         RouterInterfaceDesiredView {
             name: "lan0".to_string(),
             config: InterfaceConfigView {
+                wifi_concurrent: false,
                 mac_address: None,
                 role: InterfaceRole::Output,
                 managed: true,

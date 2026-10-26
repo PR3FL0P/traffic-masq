@@ -8,6 +8,7 @@ use super::*;
 
 fn interface(address: &str) -> InterfaceConfig {
     InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,

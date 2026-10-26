@@ -366,6 +366,31 @@ impl NetworkTransactionManager {
         self.inner
             .interface_manager
             .validate_wifi_radio_policy(&network)?;
+        if config.wifi_concurrent {
+            crate::wifi::concurrent::validate(interface).await?;
+        }
+        if previous_config.is_some_and(|previous| previous.wifi_concurrent)
+            && !config.wifi_concurrent
+        {
+            let ap = crate::wifi::concurrent::ap_name(interface);
+            anyhow::ensure!(
+                !network
+                    .interfaces
+                    .get(&ap)
+                    .is_some_and(|c| c.managed || c.wifi.is_some() || c.dhcp.is_some()),
+                "disable and unmanage virtual AP {ap} before leaving Receive + share"
+            );
+        }
+        if let Some(parent) = crate::wifi::concurrent::parent_for(&network, interface) {
+            anyhow::ensure!(
+                !self.desired().is_tentative(parent).await,
+                "Commit Receive + share on {parent} before configuring its virtual AP"
+            );
+            anyhow::ensure!(
+                config.mac_address.is_none(),
+                "virtual AP MAC is managed by Receive + share"
+            );
+        }
         let mut plan = self
             .inner
             .interface_manager
@@ -1182,6 +1207,7 @@ impl NetworkTransactionManager {
             }
             let previous_config = desired.committed_interface(name).await?;
             let target = previous_config.clone().unwrap_or(InterfaceConfig {
+                wifi_concurrent: false,
                 mac_address: None,
                 role: InterfaceRole::Output,
                 managed: false,

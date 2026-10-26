@@ -12,6 +12,7 @@ fn client_config(ssid: &str) -> ClientConfig {
 
 fn interface(wifi_client: Option<ClientConfig>) -> InterfaceConfig {
     InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Input,
         managed: true,

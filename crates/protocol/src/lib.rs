@@ -18,8 +18,9 @@ mod wifi_observation;
 mod wifi_status;
 pub use dhcp_pool::suggest_pool;
 pub use interface::{
-    DhcpClientInterfaceConfigView, DhcpInterfaceConfigView, InterfaceConfigView, WifiApConfigView,
-    WifiClientConfigView, WifiClientSpecView, MAX_WIFI_STATIONS,
+    concurrent_ap_name, DhcpClientInterfaceConfigView, DhcpInterfaceConfigView,
+    InterfaceConfigView, WifiApConfigView, WifiClientConfigView, WifiClientSpecView,
+    MAX_WIFI_STATIONS,
 };
 pub use interface_plan::{DhcpChangeActionView, InterfaceChangePlanView};
 pub use network::{
@@ -829,6 +830,9 @@ pub enum RouterProvisioningErrorDetail {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InterfaceEditRequest {
+    /// Receive Wi-Fi and expose a virtual AP on the same physical radio.
+    #[serde(default)]
+    pub wifi_concurrent: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac_address: Option<crate::MacAddr>,
     #[serde(default)]

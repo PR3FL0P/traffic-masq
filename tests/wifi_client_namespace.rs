@@ -141,6 +141,7 @@ impl WifiClientNamespaceFixture {
         self.config.network.interfaces.insert(
             STA_IF.to_string(),
             InterfaceConfig {
+                wifi_concurrent: false,
                 mac_address: None,
                 role: InterfaceRole::Input,
                 managed: false,

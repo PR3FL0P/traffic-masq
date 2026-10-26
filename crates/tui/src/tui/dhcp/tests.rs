@@ -310,6 +310,7 @@ async fn missing_dhcp_editor_saves_revision_checked_intent_without_live_apply() 
         })).await.unwrap();
     });
     let config = traffic_masq_protocol::InterfaceConfigView {
+        wifi_concurrent: false,
         mac_address: None,
         role: traffic_masq_protocol::InterfaceRole::Output,
         managed: true,

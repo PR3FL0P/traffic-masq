@@ -125,6 +125,7 @@ impl RouterNamespaceFixture {
             config.network.interfaces.insert(
                 management_if.clone(),
                 InterfaceConfig {
+                    wifi_concurrent: false,
                     mac_address: None,
                     role: InterfaceRole::None,
                     managed: true,
@@ -524,6 +525,7 @@ fn build_config(temp: &tempfile::TempDir, lan_if: &str, uplink_if: &str) -> AppC
     config.network.interfaces.insert(
         uplink_if.to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: false,
@@ -537,6 +539,7 @@ fn build_config(temp: &tempfile::TempDir, lan_if: &str, uplink_if: &str) -> AppC
     config.network.interfaces.insert(
         lan_if.to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Output,
             managed: true,
@@ -857,6 +860,7 @@ async fn invalid_overlapping_output_subnet_is_rejected_before_any_mutation() -> 
         config.network.interfaces.insert(
             lan_b.clone(),
             InterfaceConfig {
+                wifi_concurrent: false,
                 mac_address: None,
                 role: InterfaceRole::Output,
                 managed: true,

@@ -104,6 +104,7 @@ fn vpn_directory_validation_does_not_require_daemon_permissions() {
 
 fn input_interface() -> InterfaceConfig {
     InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Input,
         managed: false,
@@ -117,6 +118,7 @@ fn input_interface() -> InterfaceConfig {
 
 fn output_interface(ipv4: &str, pool_start: Ipv4Addr, pool_end: Ipv4Addr) -> InterfaceConfig {
     InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -424,6 +426,7 @@ fn rejects_route_ownership_violations() {
     config.network.interfaces.insert(
         "unmanaged0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::None,
             managed: false,
@@ -948,6 +951,7 @@ fn client_association(ssid: &str) -> WifiClientConfig {
 
 fn client_interface(wifi_client: WifiClientConfig) -> InterfaceConfig {
     InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Input,
         managed: true,
@@ -1370,4 +1374,34 @@ nat = true"#,
     ] {
         assert!(toml::from_str::<InterfaceConfig>(document).is_err());
     }
+}
+
+#[test]
+fn concurrent_mode_requires_managed_input_and_keeps_separate_output() {
+    let mut input = client_interface(client_association("upstream"));
+    input.wifi_concurrent = true;
+    input.validate("wlan0").unwrap();
+    input.managed = false;
+    assert!(input
+        .validate("wlan0")
+        .unwrap_err()
+        .to_string()
+        .contains("Receive + share"));
+    input.managed = true;
+    input.role = InterfaceRole::Output;
+    assert!(input.validate("wlan0").is_err());
+    input.role = InterfaceRole::Input;
+    let mut output = input.clone();
+    output.wifi_concurrent = false;
+    output.wifi_client = None;
+    output.dhcp_client = None;
+    output.role = InterfaceRole::Output;
+    let ap = traffic_masq_protocol::concurrent_ap_name("wlan0");
+    let mut network = NetworkConfig::default();
+    network.interfaces.insert("wlan0".into(), input);
+    network.interfaces.insert(ap.clone(), output);
+    network.validate().unwrap();
+    network.interfaces.get_mut(&ap).unwrap().mac_address =
+        Some("02:11:22:33:44:55".parse().unwrap());
+    assert!(network.validate().unwrap_err().to_string().contains("MAC"));
 }

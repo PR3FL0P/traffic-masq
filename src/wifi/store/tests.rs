@@ -151,6 +151,7 @@ fn spec_with_security(
     use crate::config::{InterfaceConfig, InterfaceRole, WifiApConfig, WifiBand, WifiChannelWidth};
 
     let config = InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,

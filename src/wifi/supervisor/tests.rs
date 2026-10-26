@@ -183,6 +183,7 @@ fn ap_config(ssid: &str) -> WifiApConfig {
 
 fn spec(interface: &str, ssid: &str) -> WifiApSpec {
     let config = InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -244,6 +245,7 @@ async fn test_supervisor(
         .await
         .expect("create runtime dir");
     let inner = Inner {
+        client_runtime_dir: runtime_dir.join("client"),
         hostapd_binary: PathBuf::from("/usr/sbin/hostapd"),
         runtime_dir: runtime_dir.to_path_buf(),
         passphrase_store: PassphraseStore::new(state_dir.join("wifi/psk-ap")),
@@ -268,6 +270,7 @@ async fn effective_specs_derives_one_spec_per_access_point_interface() {
     config.network.interfaces.insert(
         "wlan0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Output,
             managed: true,
@@ -281,6 +284,7 @@ async fn effective_specs_derives_one_spec_per_access_point_interface() {
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: false,

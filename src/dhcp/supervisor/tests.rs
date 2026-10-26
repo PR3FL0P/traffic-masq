@@ -46,6 +46,7 @@ fn service_spec_is_derived_from_the_complete_interface_config() {
 #[test]
 fn service_spec_is_absent_for_an_output_without_dhcp() {
     let interface = InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -71,6 +72,7 @@ async fn start_skips_absent_configured_dhcp_interface_instead_of_failing() {
     config.network.interfaces.insert(
         "tm-test-absent0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Output,
             managed: true,

@@ -20,6 +20,7 @@ fn config_with_managed_output_and_uplink() -> AppConfig {
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: false,
@@ -33,6 +34,7 @@ fn config_with_managed_output_and_uplink() -> AppConfig {
     config.network.interfaces.insert(
         "lan0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Output,
             managed: true,

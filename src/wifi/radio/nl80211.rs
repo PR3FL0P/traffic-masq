@@ -49,7 +49,7 @@ impl Drop for ProbeConnection {
     }
 }
 
-async fn dump(
+pub(crate) async fn dump(
     command: Nl80211Command,
     attributes: Vec<Nl80211Attr>,
 ) -> Result<Vec<Vec<Nl80211Attr>>, RadioError> {

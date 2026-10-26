@@ -132,6 +132,9 @@ pub struct NetworkConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InterfaceConfig {
+    /// Receive Wi-Fi and expose a virtual AP on the same physical radio.
+    #[serde(default)]
+    pub wifi_concurrent: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac_address: Option<traffic_masq_protocol::MacAddr>,
     pub role: InterfaceRole,
@@ -613,6 +616,22 @@ impl NetworkConfig {
                 .map_err(|error| anyhow::anyhow!("interface {name}: {error}"))?;
         }
 
+        for (parent, config) in &self.interfaces {
+            if !config.wifi_concurrent {
+                continue;
+            }
+            let ap = traffic_masq_protocol::concurrent_ap_name(parent);
+            if let Some(child) = self.interfaces.get(&ap) {
+                anyhow::ensure!(
+                    child.mac_address.is_none(),
+                    "virtual AP {ap} MAC is managed by Receive + share"
+                );
+                anyhow::ensure!(
+                    !child.managed || child.role == InterfaceRole::Output,
+                    "virtual AP {ap} requires the output role"
+                );
+            }
+        }
         let configured: Vec<(&str, Ipv4Net)> = self
             .interfaces
             .iter()
@@ -805,6 +824,10 @@ impl OwnedIpv4RouteConfig {
 impl InterfaceConfig {
     /// Validate role/management, IPv4 and role-specific DHCP/AP/STA compatibility; no device probing.
     pub fn validate(&self, name: &str) -> Result<()> {
+        anyhow::ensure!(
+            !self.wifi_concurrent || (self.managed && self.role == InterfaceRole::Input),
+            "Receive + share requires a managed input interface"
+        );
         if let Some(mac) = self.mac_address {
             anyhow::ensure!(self.managed, "MAC address requires a managed interface");
             anyhow::ensure!(
@@ -838,7 +861,7 @@ impl InterfaceConfig {
         }
 
         if self.wifi.is_some() && self.wifi_client.is_some() {
-            bail!("an interface cannot be both a Wi-Fi access point and a Wi-Fi client (non-goal: concurrent AP+STA)");
+            bail!("an interface cannot be both a Wi-Fi access point and a Wi-Fi client (use Receive + share to create a separate virtual AP)");
         }
 
         if let Some(hostname) = self

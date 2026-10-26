@@ -126,6 +126,7 @@ fn editor_recovers_only_proven_static_addresses_after_settings_are_removed() {
 fn editor_keeps_explicit_saved_configuration_and_does_not_choose_between_owned_addresses() {
     let mut status = observed_address(Some(201), Some(true));
     let config = traffic_masq_protocol::InterfaceConfigView {
+        wifi_concurrent: false,
         mac_address: None,
         managed: false,
         role: InterfaceRole::None,
@@ -238,7 +239,7 @@ async fn keyboard_ip_and_mac_edit_previews_applies_and_confirms_the_typed_addres
     for character in "198.18.0.1/24".chars() {
         handle_editor_key(&mut app, KeyCode::Char(character), &client).await;
     }
-    for _ in 0..4 {
+    for _ in 0..5 {
         super::super::handle_key(&mut app, KeyCode::Tab, &client, false).await;
     }
     assert_eq!(
@@ -278,6 +279,7 @@ async fn keyboard_ip_and_mac_edit_previews_applies_and_confirms_the_typed_addres
 
 fn default_route_editor(allow_management_change: bool) -> InterfaceEditor {
     InterfaceEditor {
+        wifi_concurrent: false,
         mac_address: String::new(),
         saved_config: None,
         offline_revision: None,
@@ -627,6 +629,8 @@ async fn mac_controls_require_management_and_switching_it_off_clears_the_mac() {
     handle_editor_key(&mut app, KeyCode::Backspace, &client).await;
     assert_eq!(app.editor.as_ref().unwrap().mac_address.len(), 16);
     handle_editor_key(&mut app, KeyCode::Up, &client).await;
+    handle_editor_key(&mut app, KeyCode::Up, &client).await;
+    assert_eq!(app.editor.as_ref().unwrap().field, InterfaceEditorField::WifiMode);
     handle_editor_key(&mut app, KeyCode::Up, &client).await;
     assert_eq!(
         app.editor.as_ref().unwrap().field,
@@ -1083,4 +1087,16 @@ async fn failed_draft_observation_keeps_edits_and_does_not_open_stale_editor() {
         assert_eq!(app.interface_drafts["wlan0"].offline_revision, Some(7));
         assert_eq!(mock.calls.lock().unwrap().len(), 1);
     }
+}
+
+#[test]
+fn receive_and_share_is_preserved_in_interface_edit_request() {
+    let mut editor = default_route_editor(true);
+    editor.managed = true;
+    editor.role = InterfaceRole::Input;
+    editor.wifi_concurrent = true;
+    let request = editor.edit_request().unwrap();
+    assert!(request.wifi_concurrent);
+    assert_eq!(request.role, InterfaceRole::Input);
+    assert!(editor.dirty());
 }

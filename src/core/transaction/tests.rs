@@ -175,6 +175,7 @@ const PROPOSED: &str = "192.168.50.1/24";
 
 fn interface_config(cidr: &str) -> InterfaceConfig {
     InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,

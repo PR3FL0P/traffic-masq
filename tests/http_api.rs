@@ -182,6 +182,7 @@ async fn authenticated_http_client_controls_daemon_over_unix_socket() -> Result<
     config.network.interfaces.insert(
         "test0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Output,
             managed: true,
@@ -328,6 +329,7 @@ async fn authenticated_http_client_controls_daemon_over_unix_socket() -> Result<
     assert!(overrides.snapshot().await.security.is_none());
 
     let interface_config = InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -338,6 +340,7 @@ async fn authenticated_http_client_controls_daemon_over_unix_socket() -> Result<
         wifi_client: None,
     };
     let interface_edit = traffic_masq::api::model::InterfaceEditRequest {
+        wifi_concurrent: false,
         mac_address: None,
         cidr: "192.168.100.1/24".to_string(),
         role: InterfaceRole::Output,
@@ -427,6 +430,7 @@ async fn authenticated_http_client_controls_daemon_over_unix_socket() -> Result<
         .request(&Request::DryRunInterfaceEdit {
             interface: "test0".to_string(),
             edit: traffic_masq::api::model::InterfaceEditRequest {
+                wifi_concurrent: false,
                 mac_address: None,
                 cidr: String::new(),
                 role: InterfaceRole::Output,
@@ -455,11 +459,13 @@ async fn authenticated_http_client_controls_daemon_over_unix_socket() -> Result<
     // interface carries no traffic-masq IPv4, and an edit that tried to keep
     // one would be refused.
     let managed_false = InterfaceConfig {
+        wifi_concurrent: false,
         managed: false,
         ipv4: None,
         ..interface_config.clone()
     };
     let managed_false_edit = traffic_masq::api::model::InterfaceEditRequest {
+        wifi_concurrent: false,
         mac_address: None,
         cidr: String::new(),
         role: InterfaceRole::Output,
@@ -843,6 +849,7 @@ fn router_proposal() -> RouterProposalRequest {
             "lan0".to_string(),
             InterfaceOverrideRequest {
                 config: InterfaceConfig {
+                    wifi_concurrent: false,
                     mac_address: None,
                     role: InterfaceRole::Output,
                     managed: true,
@@ -873,6 +880,7 @@ async fn router_enabled_test_server() -> Result<(
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: false,
@@ -900,6 +908,7 @@ async fn router_status_test_server(
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: false,
@@ -913,6 +922,7 @@ async fn router_status_test_server(
     config.network.interfaces.insert(
         "lan0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Output,
             managed: true,
@@ -1826,6 +1836,7 @@ async fn vpn_policy_status_set_mode_clear_mode_over_http() -> Result<()> {
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: false,
@@ -1839,6 +1850,7 @@ async fn vpn_policy_status_set_mode_clear_mode_over_http() -> Result<()> {
     config.network.interfaces.insert(
         "lan0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Output,
             managed: true,

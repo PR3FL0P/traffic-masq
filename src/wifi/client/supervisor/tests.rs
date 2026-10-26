@@ -207,6 +207,7 @@ fn client_config(ssid: &str) -> WifiClientConfig {
 
 fn spec(interface: &str, ssid: &str) -> WifiClientSpec {
     let config = InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Input,
         managed: true,

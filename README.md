@@ -430,8 +430,24 @@ rule with masquerading. The uplink needs a working address and route. See
 
 Yes, with a Linux-compatible adapter that supports AP mode and hostapd installed.
 Configure the access point, its LAN address and DHCP pool, then add an Internet
-sharing rule through the wired uplink. For a Wi-Fi uplink and local AP, use two
-separate radios: configure both in **Wi-Fi**, then add the sharing rule in **Route**.
+sharing rule through the wired uplink. For a Wi-Fi uplink and local AP, use separate radios, or enable
+**Receive + share** on a compatible adapter:
+
+1. In **Interfaces**, edit the Wi-Fi input, select **Wi-Fi mode → Receive + share**,
+   then Apply and Commit. The driver must advertise simultaneous station + AP support.
+2. Connect the input to the upstream network in **Wi-Fi**.
+3. The new `ap…` interface appears in **Interfaces**. Assign it a managed **Output**
+   role, Apply and Commit, then configure its SSID, password, LAN subnet and DHCP in **Wi-Fi**.
+4. Add the sharing rule from that output to the Wi-Fi input in **Route**.
+
+The AP follows the upstream channel at 20 MHz width and waits for the upstream
+connection when it is disconnected. A channel change can interrupt AP clients.
+Both directions share airtime. Drivers requiring matching beacon intervals or a
+minimum beacon-interval GCD are currently rejected; DFS/no-IR channel restrictions
+still apply. Hardware support is checked again when restoring the virtual interface.
+To disable the mode, first disable AP/DHCP and unmanage the virtual output, then
+switch the input back to **Single role**. Virtual interfaces are recreated after
+restart and removed on rollback or shutdown with interface restoration enabled.
 
 ### Do LAN devices need WireGuard installed to use the VPN gateway?
 

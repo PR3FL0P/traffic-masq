@@ -39,7 +39,7 @@ pub(crate) trait WifiCapabilitiesProvider: Send + Sync {
     async fn regulatory_domain(&self) -> Result<RegulatoryDomain, RadioError>;
 }
 
-mod nl80211;
+pub(crate) mod nl80211;
 pub(crate) use nl80211::Nl80211CapabilitiesProvider;
 
 pub(crate) struct CapabilitiesRadioValidator {

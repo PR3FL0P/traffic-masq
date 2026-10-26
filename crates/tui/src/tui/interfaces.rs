@@ -19,6 +19,7 @@ pub(crate) enum InterfaceEditorField {
     Cidr,
     RemoveIpv4,
     Role,
+    WifiMode,
     Managed,
     Advanced,
     MacAddress,
@@ -28,11 +29,12 @@ pub(crate) enum InterfaceEditorField {
     Reset,
 }
 
-const INTERFACE_EDITOR_FIELDS: [InterfaceEditorField; 10] = [
+const INTERFACE_EDITOR_FIELDS: [InterfaceEditorField; 11] = [
     InterfaceEditorField::Cidr,
     InterfaceEditorField::RemoveIpv4,
     InterfaceEditorField::Role,
     InterfaceEditorField::Managed,
+    InterfaceEditorField::WifiMode,
     InterfaceEditorField::Advanced,
     InterfaceEditorField::MacAddress,
     InterfaceEditorField::RandomizeMac,
@@ -43,6 +45,7 @@ const INTERFACE_EDITOR_FIELDS: [InterfaceEditorField; 10] = [
 
 #[derive(Debug, Clone)]
 pub(crate) struct InterfaceEditor {
+    pub(crate) wifi_concurrent: bool,
     pub(crate) mac_address: String,
     pub(crate) interface: String,
     pub(crate) saved_config: Option<traffic_masq_protocol::InterfaceConfigView>,
@@ -75,7 +78,12 @@ pub(crate) struct InterfaceEditor {
 
 impl InterfaceEditor {
     fn dirty(&self) -> bool {
-        self.cidr != self.original_cidr
+        self.wifi_concurrent
+            != self
+                .saved_config
+                .as_ref()
+                .is_some_and(|c| c.wifi_concurrent)
+            || self.cidr != self.original_cidr
             || self.managed
                 != self
                     .saved_config
@@ -171,6 +179,7 @@ impl InterfaceEditor {
             );
         }
         Ok(InterfaceEditRequest {
+            wifi_concurrent: self.wifi_concurrent,
             mac_address,
             cidr: if self.managed {
                 self.cidr.trim().to_string()
@@ -623,6 +632,26 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         ),
         InterfaceEditorField::Managed,
     ));
+    lines.push(row(
+        &format!(
+            "Wi-Fi mode: {}",
+            if editor.wifi_concurrent {
+                "Receive + share"
+            } else {
+                "Single role"
+            }
+        ),
+        InterfaceEditorField::WifiMode,
+    ));
+    if editor.wifi_concurrent {
+        lines.push(Line::styled(
+            format!(
+                "  AP interface: {} — configure Wi-Fi and Route after Commit",
+                traffic_masq_protocol::concurrent_ap_name(&editor.interface)
+            ),
+            Style::default().fg(theme::MUTED),
+        ));
+    }
     let advanced_row = lines.len();
     lines.push(row(
         if editor.advanced {
@@ -661,6 +690,7 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         InterfaceEditorField::Managed if editor.original_managed && !editor.managed =>
             "Applying removes traffic-masq-owned settings and stops managing this interface.",
         InterfaceEditorField::Managed => "Enables address and MAC configuration independently of routing.",
+        InterfaceEditorField::WifiMode => "Receive + share uses one Wi-Fi adapter for Internet and a virtual AP. Driver support is checked on Apply. Channel follows the uplink.",
         InterfaceEditorField::Role => "Enter/Space changes router participation. None keeps this interface outside routing.",
         InterfaceEditorField::MacAddress | InterfaceEditorField::RandomizeMac if !editor.managed =>
             "MAC editing disabled: enable Configure with traffic-masq first.",
@@ -1262,6 +1292,7 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
                 .map(|dhcp| format!("DHCP pool {}-{}", dhcp.pool_start, dhcp.pool_end));
             let cursor = super::input::grapheme_count(&cidr);
             app.editor = Some(InterfaceEditor {
+                wifi_concurrent: config.as_ref().is_some_and(|c| c.wifi_concurrent),
                 mac_address: config
                     .as_ref()
                     .and_then(|config| config.mac_address)
@@ -1511,10 +1542,23 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
                     unmanaged_ip_attempt = true;
                 }
             }
-            InterfaceEditorField::Role => editor.role = next_role(editor.role),
+            InterfaceEditorField::Role => {
+                editor.role = next_role(editor.role);
+                if editor.role != InterfaceRole::Input {
+                    editor.wifi_concurrent = false;
+                }
+            }
+            InterfaceEditorField::WifiMode => {
+                editor.wifi_concurrent = !editor.wifi_concurrent;
+                if editor.wifi_concurrent {
+                    editor.role = InterfaceRole::Input;
+                    editor.managed = true;
+                }
+            }
             InterfaceEditorField::Managed => {
                 editor.managed = !editor.managed;
                 if !editor.managed {
+                    editor.wifi_concurrent = false;
                     editor.mac_address.clear();
                 }
             }
@@ -1656,6 +1700,7 @@ pub(crate) async fn submit_dry_run(app: &mut TuiApp, client: &ApiClient) {
             edit.cidr.parse().ok()
         };
         config.role = edit.role;
+        config.wifi_concurrent = edit.wifi_concurrent;
         config.managed = edit.managed;
         config.mac_address = edit.mac_address;
         if config.role != InterfaceRole::Output || !config.managed {

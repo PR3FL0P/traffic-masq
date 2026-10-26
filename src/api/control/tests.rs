@@ -98,6 +98,7 @@ fn dhcp_config() -> DhcpInterfaceConfig {
 #[test]
 fn interface_edit_preserves_client_and_nat_settings() {
     let existing = InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Input,
         managed: true,
@@ -114,6 +115,7 @@ fn interface_edit_preserves_client_and_nat_settings() {
     };
     let (config, _) = interface_edit_request_to_config(
         InterfaceEditRequest {
+            wifi_concurrent: false,
             mac_address: None,
             cidr: String::new(),
             role: InterfaceRole::Input,
@@ -132,6 +134,7 @@ fn interface_edit_preserves_client_and_nat_settings() {
 fn interface_edit_request_preserves_existing_dhcp_settings() {
     let existing_dhcp = dhcp_config();
     let existing = InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -142,6 +145,7 @@ fn interface_edit_request_preserves_existing_dhcp_settings() {
         wifi_client: None,
     };
     let edit = InterfaceEditRequest {
+        wifi_concurrent: false,
         mac_address: None,
         cidr: "192.168.60.1/24".to_string(),
         role: InterfaceRole::Output,
@@ -179,6 +183,7 @@ fn wifi_ap_config_fixture(ssid: &str) -> crate::config::WifiApConfig {
 fn interface_edit_request_preserves_existing_wifi_settings_while_managed() {
     let existing_wifi = wifi_ap_config_fixture("home-net");
     let existing = InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -189,6 +194,7 @@ fn interface_edit_request_preserves_existing_wifi_settings_while_managed() {
         wifi_client: None,
     };
     let edit = InterfaceEditRequest {
+        wifi_concurrent: false,
         mac_address: None,
         cidr: "192.168.60.1/24".to_string(),
         role: InterfaceRole::Output,
@@ -209,6 +215,7 @@ fn interface_edit_request_preserves_existing_wifi_settings_while_managed() {
 #[test]
 fn interface_edit_request_drops_wifi_settings_when_unmanaged() {
     let existing = InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -219,6 +226,7 @@ fn interface_edit_request_drops_wifi_settings_when_unmanaged() {
         wifi_client: None,
     };
     let edit = InterfaceEditRequest {
+        wifi_concurrent: false,
         mac_address: None,
         cidr: String::new(),
         role: InterfaceRole::Output,
@@ -235,6 +243,7 @@ fn interface_edit_request_drops_wifi_settings_when_unmanaged() {
 #[test]
 fn unmanaging_an_interface_with_a_running_ap_requires_explicit_confirmation() {
     let current = InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -269,6 +278,7 @@ fn unmanaging_an_interface_with_a_running_ap_requires_explicit_confirmation() {
 #[test]
 fn unmanaging_an_interface_with_no_router_services_needs_no_confirmation() {
     let current = InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -293,6 +303,7 @@ fn unmanaging_an_interface_with_no_router_services_needs_no_confirmation() {
 #[test]
 fn an_empty_cidr_removes_the_configured_address() {
     let existing = InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -303,6 +314,7 @@ fn an_empty_cidr_removes_the_configured_address() {
         wifi_client: None,
     };
     let edit = InterfaceEditRequest {
+        wifi_concurrent: false,
         mac_address: None,
         cidr: String::new(),
         role: InterfaceRole::Output,
@@ -323,6 +335,7 @@ fn an_empty_cidr_removes_the_configured_address() {
 #[test]
 fn removing_the_address_under_a_dhcp_server_says_what_to_disable_first() {
     let existing = InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -333,6 +346,7 @@ fn removing_the_address_under_a_dhcp_server_says_what_to_disable_first() {
         wifi_client: None,
     };
     let edit = InterfaceEditRequest {
+        wifi_concurrent: false,
         mac_address: None,
         cidr: String::new(),
         role: InterfaceRole::Output,
@@ -618,6 +632,7 @@ fn router_base_config() -> AppConfig {
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: false,
@@ -632,6 +647,7 @@ fn router_base_config() -> AppConfig {
     config.network.interfaces.insert(
         "lan0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Output,
             managed: true,
@@ -686,6 +702,7 @@ async fn removing_an_interface_override_falls_back_to_the_file_configuration() {
         .expect("overrides");
 
     let overridden = InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -1104,6 +1121,7 @@ async fn dhcp_uplink_plan_preserves_explicit_interface_override_while_enabling_d
         .get("wan0")
         .map(|request| request.config.clone())
         .unwrap_or_else(|| InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: true,
@@ -2401,6 +2419,7 @@ fn wifi_base_config(directory: &std::path::Path) -> AppConfig {
     config.network.interfaces.insert(
         "wlan0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Output,
             managed: true,
@@ -2599,6 +2618,7 @@ async fn get_wifi_config_reports_none_for_an_interface_without_a_wifi_block() {
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: false,
@@ -3149,6 +3169,7 @@ async fn wifi_passphrase_is_tentative_and_restored_or_committed() {
     config.network.interfaces.insert(
         "wlan0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Output,
             managed: true,
@@ -3256,6 +3277,7 @@ async fn wifi_configured_response_never_serializes_the_passphrase_that_was_just_
     config.network.interfaces.insert(
         "wlan0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Output,
             managed: true,
@@ -3603,6 +3625,7 @@ fn wifi_client_base_config(directory: &std::path::Path) -> AppConfig {
     config.network.interfaces.insert(
         "wlan1".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: true,
@@ -4088,6 +4111,7 @@ async fn autoconnect_is_blocked_by_pending_transaction_on_another_interface() {
     assert!(matches!(created, Response::WifiClientProfile { .. }));
 
     let target = InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Input,
         managed: true,
@@ -4434,6 +4458,7 @@ async fn configuring_a_client_on_an_output_interface_is_an_invalid_spec() {
     config.network.interfaces.insert(
         "wlan2".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Output,
             managed: true,
@@ -4752,6 +4777,7 @@ async fn dhcp_client_control_fixture_with_router(
         config.network.interfaces.insert(
             "lan0".to_string(),
             InterfaceConfig {
+                wifi_concurrent: false,
                 mac_address: None,
                 role: InterfaceRole::Output,
                 managed: true,
@@ -4766,6 +4792,7 @@ async fn dhcp_client_control_fixture_with_router(
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: true,
@@ -6368,6 +6395,7 @@ async fn provisioning_rejects_a_management_interface_without_confirmation() {
     config.network.interfaces.insert(
         "wlan-up".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::None,
             managed: false,
@@ -7114,6 +7142,7 @@ async fn unrelated_recovery_does_not_block_interface_commit_or_rollback() {
     config.runtime.state_dir = directory.path().to_path_buf();
     config.dhcp.leases_dir = directory.path().join("leases");
     let interface = InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,

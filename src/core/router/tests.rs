@@ -74,6 +74,7 @@ fn enabled_config() -> AppConfig {
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: false,
@@ -93,6 +94,7 @@ fn enabled_config() -> AppConfig {
         config.network.interfaces.insert(
             name.to_string(),
             InterfaceConfig {
+                wifi_concurrent: false,
                 mac_address: None,
                 role: InterfaceRole::Output,
                 managed: true,

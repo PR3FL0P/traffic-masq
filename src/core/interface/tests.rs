@@ -48,6 +48,7 @@ async fn owned_addresses_remain_editable_after_restart_without_saved_interface_s
         assert!(manager.owns_address("eth0", &observed[1]).await);
         assert!(!manager.owns_address("eth0", &external).await);
         let target = InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             managed: true,
             role: InterfaceRole::None,
@@ -234,6 +235,7 @@ impl NetworkProvider for FakeNetworkProvider {
 
 fn config(role: InterfaceRole, address: &str) -> InterfaceConfig {
     InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role,
         managed: true,
@@ -627,6 +629,7 @@ async fn a_leftover_owned_address_is_cleaned_up_after_the_release_transition() {
     // Both sides already unmanaged: the managed -> unmanaged edge is long
     // gone, but our address is still sitting on the link.
     let unmanaged = InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: false,

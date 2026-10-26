@@ -86,6 +86,7 @@ impl DhcpClientSpec {
     pub fn validate(&self) -> Result<()> {
         crate::config::validate_interface_name(&self.interface)?;
         let config = InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: true,

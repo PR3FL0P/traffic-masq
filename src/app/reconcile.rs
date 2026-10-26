@@ -131,6 +131,10 @@ pub(super) trait WifiRuntimeReconciler: Send + Sync {
         Ok(())
     }
 
+    async fn association_frequency(&self, _interface: &str) -> Option<u32> {
+        None
+    }
+
     async fn association_ready(&self, _interface: &str) -> Option<bool> {
         None
     }
@@ -159,6 +163,14 @@ impl WifiRuntimeReconciler for HostapdSupervisor {
 
 #[async_trait]
 impl WifiRuntimeReconciler for WifiClientSupervisor {
+    async fn association_frequency(&self, interface: &str) -> Option<u32> {
+        let status = self.status(interface).await?;
+        if status.wpa_state.is_connected() {
+            status.freq
+        } else {
+            None
+        }
+    }
     async fn ensure_alive(&self) -> Result<bool> {
         Ok(WifiClientSupervisor::ensure_alive(self).await?)
     }
@@ -391,6 +403,48 @@ pub(super) async fn reconcile_network_runtime_once<
     )
     .await?;
     drop(credential_updates);
+    // Clean up modes withdrawn by rollback, Forget, or base-file edits. Stop
+    // consumers before deleting the link, and re-read intent under reservations.
+    for parent in crate::wifi::concurrent::recorded_parents(desired.state_dir()).await? {
+        let ap = crate::wifi::concurrent::ap_name(&parent);
+        let _radio = match network.wireless_phy(&parent) {
+            Some(phy) => Some(desired.radio_locks.lock(&phy).await),
+            None => None,
+        };
+        let _parent_lane = desired.runtime_locks.lock(&parent).await;
+        let _ap_lane = desired.runtime_locks.lock(&ap).await;
+        let latest = desired.effective().await?;
+        if latest
+            .network
+            .interfaces
+            .get(&parent)
+            .is_some_and(|c| c.wifi_concurrent)
+        {
+            continue;
+        }
+        let disabled = InterfaceConfig {
+            wifi_concurrent: false,
+            mac_address: None,
+            role: crate::config::InterfaceRole::None,
+            managed: false,
+            ipv4: None,
+            dhcp: None,
+            dhcp_client: None,
+            wifi: None,
+            wifi_client: None,
+        };
+        dhcp.disable(&ap).await?;
+        if let Some(client) = dhcp_client {
+            client.disable(&ap).await?;
+        }
+        if let Some(client) = wifi_client {
+            client.reconcile_interface(&ap, &disabled).await?;
+        }
+        if let Some(ap_runtime) = wifi {
+            ap_runtime.reconcile_interface(&ap, &disabled).await?;
+        }
+        crate::wifi::concurrent::remove_ap(desired.state_dir(), &parent).await?;
+    }
     let observed_interfaces: HashMap<_, _> = network
         .list_interfaces()
         .await?
@@ -543,6 +597,33 @@ async fn reconcile_interface_runtime_once(
             // Canceling it restores configuration, not the availability of an
             // external Wi-Fi network or DHCP server.
             let restoring = restorations.contains_key(name);
+            if config.wifi_concurrent {
+                crate::wifi::concurrent::ensure_ap(desired.state_dir(), name).await?;
+            } else if crate::wifi::concurrent::has_record(desired.state_dir(), name)
+                .await?
+            {
+                let ap = crate::wifi::concurrent::ap_name(name);
+                let _ap_lane = desired.runtime_locks.lock(&ap).await;
+                let mut disabled = config.clone();
+                disabled.managed = false;
+                disabled.ipv4 = None;
+                disabled.mac_address = None;
+                disabled.wifi = None;
+                disabled.wifi_client = None;
+                disabled.dhcp = None;
+                disabled.dhcp_client = None;
+                dhcp.disable(&ap).await?;
+                if let Some(client) = dhcp_client {
+                    client.disable(&ap).await?;
+                }
+                if let Some(client) = wifi_client {
+                    client.reconcile_interface(&ap, &disabled).await?;
+                }
+                if let Some(runtime) = wifi {
+                    runtime.reconcile_interface(&ap, &disabled).await?;
+                }
+                crate::wifi::concurrent::remove_ap(desired.state_dir(), name).await?;
+            }
             let strict = desired.is_tentative(name).await && !restoring;
             let desired_dhcp = DhcpServiceSpec::from_interface_config(
                 name,
@@ -563,6 +644,7 @@ async fn reconcile_interface_runtime_once(
                     // completing cancellation; committed intent can be edited
                     // or applied normally if the device returns later.
                     let disabled = InterfaceConfig {
+                        wifi_concurrent: false,
                         mac_address: None,
                         managed: false,
                         ipv4: None,
@@ -740,7 +822,31 @@ async fn reconcile_interface_runtime_once(
             };
             if config.wifi.is_some() {
                 let access_point = wifi.context("Wi-Fi access point runtime is unavailable")?;
-                access_point.reconcile_interface(name, config).await?;
+                if let Some(parent) = crate::wifi::concurrent::parent_for(&effective.network, name)
+                {
+                    let frequency = match wifi_client {
+                        Some(client) => client.association_frequency(parent).await,
+                        None => None,
+                    };
+                    let mut resolved = config.clone();
+                    let Some(frequency) = frequency else {
+                        resolved.wifi = None;
+                        access_point.reconcile_interface(name, &resolved).await?;
+                        bail!("virtual AP {name} is waiting for Wi-Fi connection on {parent}");
+                    };
+                    let result = async {
+                        crate::wifi::concurrent::follow_channel(&mut resolved, frequency)?;
+                        access_point.reconcile_interface(name, &resolved).await
+                    }
+                    .await;
+                    if let Err(error) = result {
+                        resolved.wifi = None;
+                        access_point.reconcile_interface(name, &resolved).await?;
+                        return Err(error);
+                    }
+                } else {
+                    access_point.reconcile_interface(name, config).await?;
+                }
             }
             ensure_current()?;
             apply_dhcp_reconcile_action(
@@ -1140,6 +1246,9 @@ pub(super) fn spawn_process_liveness_checks(
                         Ok(config) => config,
                         Err(error) => { tracing::warn!(error = %format!("{error:#}"), "process restart blocked by invalid desired state"); continue; }
                     };
+                    if config.network.interfaces.values().any(|c| c.wifi_concurrent) {
+                        desired.request_convergence();
+                    }
                     let wifi_admitted = match crate::wifi::policy::WifiRadioPolicy::validate_system(&config.network) {
                             Ok(()) => true,
                             Err(error) => {

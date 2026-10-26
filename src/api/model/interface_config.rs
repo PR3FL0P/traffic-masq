@@ -12,6 +12,7 @@ use traffic_masq_protocol::{
 impl From<InterfaceConfigView> for InterfaceConfig {
     fn from(value: InterfaceConfigView) -> Self {
         Self {
+            wifi_concurrent: value.wifi_concurrent,
             mac_address: value.mac_address,
             role: value.role,
             managed: value.managed,
@@ -27,6 +28,7 @@ impl From<InterfaceConfigView> for InterfaceConfig {
 impl From<InterfaceConfig> for InterfaceConfigView {
     fn from(value: InterfaceConfig) -> Self {
         Self {
+            wifi_concurrent: value.wifi_concurrent,
             mac_address: value.mac_address,
             role: value.role,
             managed: value.managed,

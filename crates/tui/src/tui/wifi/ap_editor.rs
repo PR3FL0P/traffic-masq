@@ -44,7 +44,13 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
                 describe_ap_security(editor.security)
             ),
         ];
-        lines.extend(radio_review_lines(editor.original_spec.as_ref(), &settings));
+        if let Some(parent) = &editor.concurrent_parent {
+            lines.push(format!(
+                "Receive + share: channel follows {parent}, width 20 MHz"
+            ));
+        } else {
+            lines.extend(radio_review_lines(editor.original_spec.as_ref(), &settings));
+        }
         lines.extend([
             format!(
                 "IPv4 subnet: {}",
@@ -106,6 +112,11 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
             &editor.interface,
         ))]
     };
+    if let Some(parent) = &editor.concurrent_parent {
+        lines.push(Line::from(format!(
+            "Receive + share: channel follows {parent}, width 20 MHz"
+        )));
+    }
     let settings = ap_settings(editor);
     let values = [
         (

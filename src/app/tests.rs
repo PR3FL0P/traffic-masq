@@ -100,6 +100,7 @@ impl ReconcileRetryFixture {
             config.network.interfaces.insert(
                 "wan0".into(),
                 InterfaceConfig {
+                    wifi_concurrent: false,
                     mac_address: None,
                     role: InterfaceRole::Input,
                     managed: true,
@@ -547,6 +548,7 @@ fn vpn_policy_startup_config() -> AppConfig {
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: false,
@@ -560,6 +562,7 @@ fn vpn_policy_startup_config() -> AppConfig {
     config.network.interfaces.insert(
         "lan0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Output,
             managed: true,
@@ -592,6 +595,7 @@ fn hotplug_reconcile_config() -> AppConfig {
     config.network.interfaces.insert(
         "lan0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Output,
             managed: true,
@@ -844,6 +848,7 @@ async fn a_proposal_carries_its_own_permission_to_touch_a_management_interface()
     config.network.interfaces.insert(
         "mgmt0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::None,
             managed: true,
@@ -931,6 +936,7 @@ async fn convergence_takes_our_addresses_off_an_unmanaged_interface() {
     config.network.interfaces.insert(
         "lan0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Output,
             managed: false,
@@ -1107,6 +1113,7 @@ fn dhcp_client_reconcile_config() -> AppConfig {
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: true,
@@ -1267,6 +1274,7 @@ async fn managed_wifi_dhcp_tracks_completed_while_wired_stays_ready() {
     config.network.interfaces.insert(
         "eth0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: true,
@@ -1375,6 +1383,7 @@ async fn runtime_reconcile_disables_a_dhcp_client_whose_intent_was_removed() {
     config.network.interfaces.insert(
         "wan0".to_string(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: false,
@@ -1447,6 +1456,7 @@ fn desired_with_route_and_dataplane() -> RouterDesired {
     config.network.interfaces.insert(
         "wan0".to_string(),
         crate::config::InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: crate::config::InterfaceRole::Input,
             managed: false,
@@ -1460,6 +1470,7 @@ fn desired_with_route_and_dataplane() -> RouterDesired {
     config.network.interfaces.insert(
         "lan0".to_string(),
         crate::config::InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: crate::config::InterfaceRole::Output,
             managed: true,
@@ -1885,6 +1896,7 @@ fn sharing_config() -> AppConfig {
         config.network.interfaces.insert(
             name.into(),
             InterfaceConfig {
+                wifi_concurrent: false,
                 mac_address: None,
                 role,
                 managed: true,
@@ -2105,6 +2117,7 @@ async fn startup_cancels_removed_device_transaction_without_replaying_it_after_r
     config.network.interfaces.insert(
         "eth0".into(),
         InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::None,
             managed: false,
@@ -2309,6 +2322,7 @@ async fn rollback_without_external_connectivity(device_present: bool) {
     let mut config = AppConfig::default();
     config.runtime.state_dir = directory.path().to_path_buf();
     let previous = InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Input,
         managed: true,

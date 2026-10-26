@@ -72,6 +72,7 @@ impl DhcpServiceSpec {
             anyhow::bail!("DHCP subnet mask does not match prefix length");
         }
         let config = InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Output,
             managed: true,

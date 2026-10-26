@@ -155,6 +155,23 @@ impl<P: RouterDataplaneProvider + Send + Sync> ShutdownResources<'_, P> {
             wifi_client.shutdown(plan.policy).await;
         }
 
+        if plan.policy == ShutdownPolicy::RestoreInterfaces {
+            let cleanup = async {
+                for parent in
+                    crate::wifi::concurrent::recorded_parents(&self.config.runtime.state_dir)
+                        .await?
+                {
+                    crate::wifi::concurrent::remove_ap(&self.config.runtime.state_dir, &parent)
+                        .await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            if let Err(error) = cleanup {
+                cleanup_errors.push(format!("virtual AP cleanup: {error:#}"));
+            }
+        }
+
         if let Err(error) = api_result {
             cleanup_errors.push(format!("HTTP API failed: {error:#}"));
         }

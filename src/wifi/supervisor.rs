@@ -117,6 +117,7 @@ pub struct HostapdSupervisor {
 }
 
 struct Inner {
+    client_runtime_dir: PathBuf,
     hostapd_binary: PathBuf,
     runtime_dir: PathBuf,
     records_dir: PathBuf,
@@ -144,6 +145,7 @@ impl HostapdSupervisor {
         let records_dir = config.runtime.state_dir.join("wifi");
         Self {
             inner: Arc::new(Inner {
+                client_runtime_dir: config.wifi_client.runtime_dir.clone(),
                 hostapd_binary: config.wifi.hostapd_binary.clone(),
                 runtime_dir: config.wifi.runtime_dir.clone(),
                 passphrase_store: PassphraseStore::for_role(
@@ -169,8 +171,11 @@ impl HostapdSupervisor {
         crate::wifi::policy::WifiRadioPolicy::validate_system(&config.network)
             .map_err(anyhow::Error::from)?;
         let specs = Self::effective_specs(config)?;
-        let configured_interfaces: HashSet<String> =
-            specs.iter().map(|spec| spec.interface.clone()).collect();
+        let configured_interfaces: HashSet<String> = specs.iter()
+            // Stop preserved paired AP processes before station recovery: an
+            // old channel must not prevent the uplink from associating.
+            .filter(|spec| crate::wifi::concurrent::parent_for(&config.network, &spec.interface).is_none())
+            .map(|spec| spec.interface.clone()).collect();
         let configured_clients: HashSet<String> = config
             .network
             .interfaces
@@ -207,6 +212,11 @@ impl HostapdSupervisor {
         .map_err(SupervisorError::Configuration)?;
 
         for spec in specs {
+            // The network converger starts paired APs after station association
+            // and resolves their channel from the live upstream connection.
+            if crate::wifi::concurrent::parent_for(&config.network, &spec.interface).is_some() {
+                continue;
+            }
             if resolve_interface_index(&spec.interface).is_err() {
                 tracing::warn!(
                     interface = %spec.interface,
@@ -255,7 +265,7 @@ impl HostapdSupervisor {
                 self.configure(spec).await?;
                 Ok(())
             }
-            None if self.status(interface).await.is_some() => {
+            None if self.status(interface).await.is_some() || self.record_store(interface).load().await?.is_some() => {
                 self.disable(interface).await?;
                 Ok(())
             }
@@ -291,6 +301,7 @@ impl HostapdSupervisor {
         // radio capabilities rather than depending on the host machine PHY.
         let supervisor = Self {
             inner: Arc::new(Inner {
+                client_runtime_dir: config.wifi_client.runtime_dir.clone(),
                 hostapd_binary: supervisor.inner.hostapd_binary.clone(),
                 runtime_dir: supervisor.inner.runtime_dir.clone(),
                 records_dir: supervisor.inner.records_dir.clone(),
@@ -402,14 +413,70 @@ impl HostapdSupervisor {
         Ok(())
     }
 
+    pub(crate) async fn resolve_radio_spec(&self, spec: &WifiApSpec) -> anyhow::Result<WifiApSpec> {
+        let mut resolved = spec.clone();
+        let root = self.inner.records_dir.parent().expect("state directory");
+        let Some(parent) = crate::wifi::concurrent::owned_parent(root, &spec.interface).await?
+        else {
+            return Ok(resolved);
+        };
+        crate::wifi::concurrent::validate(&parent).await?;
+        let record = WifiRecordStore::for_client(
+            &self.inner.records_dir,
+            &self.inner.client_runtime_dir,
+            &parent,
+        )
+        .load()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("virtual AP is waiting for Wi-Fi connection on {parent}"))?;
+        let binary = record
+            .binary_path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("station executable identity is missing"))?;
+        anyhow::ensure!(
+            record.pid != 0
+                && self
+                    .inner
+                    .process
+                    .identity_matches_record(&record, WifiProcessKind::Client, binary)
+                    .await?
+                && self
+                    .inner
+                    .process
+                    .owns_unix_socket(record.pid, &record.ctrl_path)
+                    .await?,
+            "station control socket is not owned by traffic-masq"
+        );
+        let client = crate::wifi::WpaSupplicantCtrlClient::connect(
+            &record.ctrl_path,
+            self.inner.ctrl_timeout,
+        )
+        .await?;
+        let status = client.status().await?;
+        anyhow::ensure!(
+            status.wpa_state.is_connected(),
+            "virtual AP is waiting for Wi-Fi connection on {parent}"
+        );
+        let frequency = status
+            .freq
+            .ok_or_else(|| anyhow::anyhow!("upstream frequency is unavailable"))?;
+        let (band, channel) = crate::wifi::concurrent::channel_for(frequency)?;
+        resolved.band = band;
+        resolved.channel = channel;
+        resolved.channel_width = crate::config::WifiChannelWidth::Ht20;
+        Ok(resolved)
+    }
+
     pub async fn validate_radio(&self, spec: &WifiApSpec) -> Result<(), SupervisorError> {
-        self.inner.radio.validate(spec).await?;
+        let resolved = self.resolve_radio_spec(spec).await?;
+        self.inner.radio.validate(&resolved).await?;
         Ok(())
     }
 
     /// Serialize configuration changes and reconcile the requested interface with hostapd.
     /// Reuse matching state or restart the owned process as needed; propagate setup failures.
     pub async fn configure(&self, spec: WifiApSpec) -> Result<(), SupervisorError> {
+        let spec = self.resolve_radio_spec(&spec).await?;
         crate::core::recovery::check_scope(
             self.inner.records_dir.parent().expect("state directory"),
             Some(&spec.interface),
@@ -418,7 +485,7 @@ impl HostapdSupervisor {
         let interface = spec.interface.clone();
         let _interface_operation = self.inner.interface_operations.lock(&interface).await;
         crate::wifi::process::check_radio_unblocked(&interface).await?;
-        self.validate_radio(&spec).await?;
+        self.inner.radio.validate(&spec).await?;
         let ctrl_path = self.ctrl_path(&interface);
         let rendered = self.render_for(&spec).await?;
 
@@ -1183,7 +1250,12 @@ impl HostapdSupervisor {
         &self,
         config: &AppConfig,
     ) -> Result<bool, SupervisorError> {
-        let desired = Self::effective_specs(config)?;
+        let desired: Vec<_> = Self::effective_specs(config)?
+            .into_iter()
+            .filter(|spec| {
+                crate::wifi::concurrent::parent_for(&config.network, &spec.interface).is_none()
+            })
+            .collect();
         self.ensure_alive_matching(Some(&desired)).await
     }
 

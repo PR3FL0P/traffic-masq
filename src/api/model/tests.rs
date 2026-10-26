@@ -9,6 +9,7 @@ fn interface_request_view_preserves_nested_config_json() {
     };
 
     let config = InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -93,6 +94,7 @@ fn router_proposal_view_preserves_nested_config_json() {
             "lan0".into(),
             InterfaceOverrideRequest {
                 config: InterfaceConfig {
+                    wifi_concurrent: false,
                     mac_address: None,
                     role: InterfaceRole::Output,
                     managed: true,
@@ -356,6 +358,7 @@ fn router_plan_view_preserves_complete_wire_shape() {
             interfaces: vec![RouterInterfaceDesired {
                 name: "lan0".into(),
                 config: InterfaceConfig {
+                    wifi_concurrent: false,
                     mac_address: None,
                     role: crate::config::InterfaceRole::Output,
                     managed: true,
@@ -427,6 +430,7 @@ fn validated_ap_config_derives_the_same_client_spec() {
     use crate::config::{InterfaceRole, WifiApConfig};
 
     let config = InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -760,4 +764,15 @@ fn dhcp_hostname_survives_config_wire_and_persistence_roundtrips() {
     let serialized = toml::to_string(&policy).unwrap();
     let restored: crate::config::DhcpClientInterfaceConfig = toml::from_str(&serialized).unwrap();
     assert_eq!(restored, policy);
+}
+
+#[test]
+fn concurrent_wifi_mode_survives_wire_config_round_trip() {
+    let view: traffic_masq_protocol::InterfaceConfigView = serde_json::from_value(
+        serde_json::json!({"role":"input", "managed":true, "wifi_concurrent":true})
+    ).unwrap();
+    let config: crate::config::InterfaceConfig = view.clone().into();
+    assert!(config.wifi_concurrent);
+    let restored: traffic_masq_protocol::InterfaceConfigView = config.into();
+    assert_eq!(restored, view);
 }

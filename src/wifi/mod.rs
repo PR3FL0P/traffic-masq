@@ -5,6 +5,7 @@
 
 pub mod ap_profile;
 pub mod client;
+pub(crate) mod concurrent;
 pub mod ctrl;
 mod ctrl_transport;
 pub(crate) mod lifecycle;
@@ -107,6 +108,7 @@ impl WifiApSpec {
         crate::config::validate_interface_name(&self.interface)?;
 
         let config = InterfaceConfig {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Output,
             managed: true,

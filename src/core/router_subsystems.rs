@@ -112,6 +112,9 @@ impl RouterDhcpClientRuntime for DhcpClientSupervisor {
 
 #[async_trait]
 pub trait RouterApRuntime: Send + Sync {
+    async fn resolve_spec(&self, spec: &WifiApSpec) -> Result<WifiApSpec> {
+        Ok(spec.clone())
+    }
     async fn status(&self, interface: &str) -> Option<(WifiApSpec, bool)>;
     async fn configure(&self, spec: WifiApSpec) -> Result<()>;
     async fn disable(&self, interface: &str) -> Result<()>;
@@ -119,6 +122,9 @@ pub trait RouterApRuntime: Send + Sync {
 
 #[async_trait]
 impl RouterApRuntime for HostapdSupervisor {
+    async fn resolve_spec(&self, spec: &WifiApSpec) -> Result<WifiApSpec> {
+        self.resolve_radio_spec(spec).await
+    }
     async fn status(&self, interface: &str) -> Option<(WifiApSpec, bool)> {
         HostapdSupervisor::status(self, interface)
             .await
@@ -454,7 +460,10 @@ where
         let mut plans = Vec::new();
         for name in names {
             let current = runtime.status(&name).await.map(|(spec, _)| spec);
-            let target = targets.get(name.as_str()).map(|spec| (*spec).clone());
+            let target = match targets.get(name.as_str()) {
+                Some(spec) => Some(runtime.resolve_spec(spec).await?),
+                None => None,
+            };
             match (current, target) {
                 (None, None) => {}
                 (None, Some(desired)) => plans.push(WifiPlan::Start { desired }),
@@ -1007,10 +1016,11 @@ where
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("output Wi-Fi runtime is unavailable"))?;
         for expected in &desired.output_wifi {
+            let expected = runtime.resolve_spec(expected).await?;
             let Some((current, ready)) = runtime.status(&expected.interface).await else {
                 bail!("output Wi-Fi intent is missing on {}", expected.interface);
             };
-            if current != *expected {
+            if current != expected {
                 bail!(
                     "output Wi-Fi intent does not match on {}",
                     expected.interface

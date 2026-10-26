@@ -62,3 +62,20 @@ fn hotplug_revalidation_rejects_newly_observable_conflicts() {
     network.interfaces.get_mut("vif0").unwrap().managed = false;
     assert!(WifiRadioPolicy::validate(&network, |_| Some("phy0".into())).is_ok());
 }
+
+#[test]
+fn explicit_pair_is_allowed_but_third_interface_is_not() {
+    let mut network = NetworkConfig::default();
+    let mut client = interface(WifiRadioRole::Client);
+    client.wifi_concurrent = true;
+    network.interfaces.insert("wlan0".into(), client);
+    let ap = traffic_masq_protocol::concurrent_ap_name("wlan0");
+    network.interfaces.insert(ap, interface(WifiRadioRole::Ap));
+    assert!(WifiRadioPolicy::validate(&network, |_| Some("phy0".into())).is_ok());
+    assert!(WifiRadioPolicy::validate_scan(&network, "wlan0", |_| Some("phy0".into())).is_ok());
+    assert!(WifiRadioPolicy::validate_scan(&network, "other0", |_| Some("phy0".into())).is_err());
+    network
+        .interfaces
+        .insert("extra-ap".into(), interface(WifiRadioRole::Ap));
+    assert!(WifiRadioPolicy::validate(&network, |_| Some("phy0".into())).is_err());
+}

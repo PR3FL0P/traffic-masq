@@ -198,13 +198,23 @@ Changes to operator intent or recovery state wake the worker immediately;
 successful passes return to waiting for events. An absent router interface is
 checked before a repair journal is opened, leaving healthy LAN services intact.
 
-Wi-Fi radio admission uses a shared policy: managed AP and STA interfaces may
-not share a known physical PHY, including a temporary STA used for scanning.
-The rule applies to interface transactions, router provisioning, profile
-activation, autoconnect, startup and runtime reconciliation. Router provisioning
-also checks allocations outside the selected interface pair. Unknown PHYs are
-skipped and checked again during reconciliation when devices appear; this is
-not capability-based support for concurrent AP/STA VIFs.
+Wi-Fi radio admission rejects AP/STA sharing a PHY unless the input explicitly
+sets `wifi_concurrent = true` and the AP uses its derived virtual interface name.
+The physical input retains its input role; the virtual AP has its own output
+configuration, subnet and DHCP service. The legacy combined router provisioning
+request still requires separate radios; Receive + share is enabled through the
+interface transaction flow before configuring the AP and forwarding rule.
+
+`wifi/concurrent.rs` validates one complete nl80211 interface combination,
+including group limits, total count and available channels. Beacon-interval
+matching/GCD constraints are currently unsupported and rejected. A private,
+durable record stores a random local MAC before creating the VIF, allowing
+restart recovery while refusing adoption/deletion of a foreign same-name link.
+The network converger creates the VIF, tears down withdrawn modes after stopping
+consumers, and recreates links lost during hotplug. AP startup and router health
+resolve the upstream channel through an owned supplicant control socket. Paired
+APs use 20 MHz width, stop while the station is disconnected, and are reconciled
+periodically so channel changes do not depend on driver link notifications.
 
 ## Terminal client
 

@@ -1965,6 +1965,7 @@ fn ap_profile_actions_fit_small_terminal_and_mouse_skips_header() {
 fn configured_network_role_determines_wifi_role_before_activation() {
     use traffic_masq_protocol::{InterfaceConfigView, InterfaceRole};
     let mut config = InterfaceConfigView {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Input,
         managed: true,
@@ -2813,4 +2814,17 @@ async fn cursor_only_profile_navigation_does_not_prompt_to_discard() {
     handle_wifi_profile_editor_key(&mut app, KeyCode::Esc, &client).await;
     assert!(app.wifi_profile_editor.is_none());
     assert_eq!(app.screen, Screen::Wifi);
+}
+
+#[test]
+fn paired_ap_channel_controls_are_automatic_but_profiles_remain_editable() {
+    let mut editor = WifiEditor::from_row(&radio("wlan0"));
+    editor.concurrent_parent = Some("upstream0".into());
+    let fields = editor.fields();
+    assert!(!fields.contains(&WifiField::Channel));
+    assert!(!fields.contains(&WifiField::Band));
+    assert!(!fields.contains(&WifiField::ChannelWidth));
+    assert!(fields.contains(&WifiField::Ssid));
+    editor.profile_mode = true;
+    assert!(editor.fields().contains(&WifiField::Channel));
 }

@@ -318,6 +318,7 @@ async fn an_unconfirmed_change_converges_and_expires_on_a_live_kernel() -> Resul
     let proposed: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 51);
 
     let interface = |address: Ipv4Addr| InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -467,6 +468,7 @@ async fn the_journal_and_the_kernel_tag_agree_about_who_owns_an_address() -> Res
     let interfaces = InterfaceManager::new(provider.clone(), journal);
 
     let config = InterfaceConfig {
+        wifi_concurrent: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,

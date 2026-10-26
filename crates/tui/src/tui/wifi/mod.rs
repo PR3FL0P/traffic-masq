@@ -184,6 +184,7 @@ fn move_field<T: Copy + PartialEq>(fields: &[T], field: T, forward: bool) -> T {
 
 #[derive(Clone)]
 pub(crate) struct WifiEditor {
+    concurrent_parent: Option<String>,
     offline_intent: Option<(u64, traffic_masq_protocol::InterfaceConfigView)>,
     pub(crate) interface: String,
     pub(crate) field: WifiField,
@@ -242,6 +243,7 @@ impl WifiEditor {
         );
         let cursor = super::input::grapheme_count(&ssid);
         Self {
+            concurrent_parent: None,
             offline_intent: if row.presence == traffic_masq_protocol::InterfacePresence::Missing {
                 row.revision.zip(row.configured.clone())
             } else {
@@ -279,6 +281,11 @@ impl WifiEditor {
             .iter()
             .copied()
             .filter(|field| match field {
+                WifiField::Band | WifiField::Channel | WifiField::ChannelWidth
+                    if self.concurrent_parent.is_some() && !self.profile_mode =>
+                {
+                    false
+                }
                 WifiField::ProfileId => self.profile_mode && self.original_profile_id.is_none(),
                 WifiField::SaveProfile => self.profile_mode,
                 WifiField::Apply => !self.profile_mode,
@@ -1079,6 +1086,19 @@ async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
                         None
                     };
                 editor.reviewing = false;
+                editor.concurrent_parent = app
+                    .wifi
+                    .rows
+                    .iter()
+                    .find(|candidate| {
+                        candidate
+                            .configured
+                            .as_ref()
+                            .is_some_and(|c| c.wifi_concurrent)
+                            && traffic_masq_protocol::concurrent_ap_name(&candidate.interface)
+                                == editor.interface
+                    })
+                    .map(|row| row.interface.clone());
                 app.wifi_editor = Some(editor);
                 app.screen = Screen::WifiEditor;
                 return;
@@ -1115,11 +1135,40 @@ async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
                         editor.subnet = config.ipv4.map(|ip| ip.to_string()).unwrap_or_default();
                         editor.original_spec = spec;
                         editor.reset_cursor();
+                        editor.concurrent_parent = app
+                            .wifi
+                            .rows
+                            .iter()
+                            .find(|candidate| {
+                                candidate
+                                    .configured
+                                    .as_ref()
+                                    .is_some_and(|c| c.wifi_concurrent)
+                                    && traffic_masq_protocol::concurrent_ap_name(
+                                        &candidate.interface,
+                                    ) == editor.interface
+                            })
+                            .map(|row| row.interface.clone());
                         app.wifi_editor = Some(editor);
                         app.screen = Screen::WifiEditor;
                     }
                     Ok(Response::InterfaceConfig { config: None, .. }) => {
-                        app.wifi_editor = Some(WifiEditor::from_row(&row));
+                        let mut editor = WifiEditor::from_row(&row);
+                        editor.concurrent_parent = app
+                            .wifi
+                            .rows
+                            .iter()
+                            .find(|candidate| {
+                                candidate
+                                    .configured
+                                    .as_ref()
+                                    .is_some_and(|c| c.wifi_concurrent)
+                                    && traffic_masq_protocol::concurrent_ap_name(
+                                        &candidate.interface,
+                                    ) == editor.interface
+                            })
+                            .map(|row| row.interface.clone());
+                        app.wifi_editor = Some(editor);
                         app.screen = Screen::WifiEditor;
                     }
                     Ok(response) => report_unexpected(app, response),

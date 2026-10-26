@@ -1,5 +1,6 @@
 //! Radio admission shared by API transactions, autoconnect and reconciliation.
-//! Concurrent AP/STA VIFs are deliberately unsupported, matching router provisioning.
+//! Shared radios require explicit Receive + share intent. Hardware admission is
+//! performed before creating or starting the virtual AP.
 use crate::config::{InterfaceConfig, NetworkConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9,7 +10,7 @@ pub enum WifiRadioRole {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("AP {ap_interface} and client {client_interface} share wireless PHY {phy}; concurrent AP/STA on one radio is unsupported; inspect `iw dev`; disable one configured role or select a separate physical radio before retrying")]
+#[error("AP {ap_interface} and client {client_interface} share wireless PHY {phy}; enable Receive + share on the input and use its virtual AP, or select a separate physical radio")]
 pub struct WifiRadioConflict {
     pub phy: String,
     pub ap_interface: String,
@@ -75,7 +76,35 @@ impl WifiRadioPolicy {
         network: &NetworkConfig,
         phy_for: impl Fn(&str) -> Option<String>,
     ) -> Result<(), WifiRadioConflict> {
-        Self::validate_roles(Self::allocations(network), phy_for)
+        let allocations = Self::allocations(network);
+        // Only the explicitly paired AP/client may share a PHY. Other radios
+        // retain the ordinary conflict checks, including third interfaces.
+        for (ap, role) in &allocations {
+            if *role != WifiRadioRole::Ap {
+                continue;
+            }
+            for (client, role) in &allocations {
+                if *role != WifiRadioRole::Client {
+                    continue;
+                }
+                let (Some(ap_phy), Some(client_phy)) = (phy_for(ap), phy_for(client)) else {
+                    continue;
+                };
+                if ap_phy == client_phy
+                    && !network.interfaces.get(*client).is_some_and(|config| {
+                        config.wifi_concurrent
+                            && traffic_masq_protocol::concurrent_ap_name(client) == *ap
+                    })
+                {
+                    return Err(WifiRadioConflict {
+                        phy: ap_phy,
+                        ap_interface: (*ap).into(),
+                        client_interface: (*client).into(),
+                    });
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn validate_transition(
@@ -98,9 +127,22 @@ impl WifiRadioPolicy {
     ) -> Result<(), WifiRadioConflict> {
         // A scan may launch a temporary station process. Include it even when
         // the interface has no committed station configuration yet.
-        let mut allocations = Self::allocations(network);
-        allocations.push((interface, WifiRadioRole::Client));
-        Self::validate_roles(allocations, phy_for)
+        if network
+            .interfaces
+            .get(interface)
+            .is_some_and(|config| config.wifi_concurrent)
+        {
+            Self::validate(network, &phy_for)?;
+            let paired_ap = traffic_masq_protocol::concurrent_ap_name(interface);
+            let mut allocations = Self::allocations(network);
+            allocations.retain(|(name, role)| !(*name == paired_ap && *role == WifiRadioRole::Ap));
+            allocations.push((interface, WifiRadioRole::Client));
+            Self::validate_roles(allocations, phy_for)
+        } else {
+            let mut allocations = Self::allocations(network);
+            allocations.push((interface, WifiRadioRole::Client));
+            Self::validate_roles(allocations, phy_for)
+        }
     }
 
     pub fn validate_system(network: &NetworkConfig) -> Result<(), WifiRadioConflict> {

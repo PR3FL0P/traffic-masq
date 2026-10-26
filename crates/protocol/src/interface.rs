@@ -18,6 +18,9 @@ fn default_max_stations() -> u16 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InterfaceConfigView {
+    /// Receive Wi-Fi and expose a virtual AP on the same physical radio.
+    #[serde(default)]
+    pub wifi_concurrent: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac_address: Option<crate::MacAddr>,
     pub role: InterfaceRole,
@@ -111,4 +114,26 @@ pub struct WifiClientSpecView {
     pub country_code: Option<String>,
     pub security: WifiClientSecurity,
     pub passphrase_file: Option<PathBuf>,
+}
+
+/// Stable Linux interface name (14 bytes) for the AP half of Receive + share.
+pub fn concurrent_ap_name(parent: &str) -> String {
+    let hash = parent.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+    });
+    format!("ap{:012x}", hash & 0xffffffffffff)
+}
+
+#[cfg(test)]
+mod concurrent_tests {
+    use super::*;
+
+    #[test]
+    fn virtual_names_fit_linux_limits_and_are_stable() {
+        let name = concurrent_ap_name("wlan0");
+        assert_eq!(name, concurrent_ap_name("wlan0"));
+        assert_ne!(name, concurrent_ap_name("wlan1"));
+        assert_eq!(concurrent_ap_name("abcdefghijklmno").len(), 14);
+        assert!(name.bytes().all(|c| c.is_ascii_alphanumeric()));
+    }
 }

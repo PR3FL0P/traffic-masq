@@ -318,6 +318,7 @@ async fn explicit_sharing_can_be_edited_from_saved_settings_without_devices() {
         name: "unplugged_lan".into(),
         observed: None,
         configured: Some(InterfaceConfigView {
+            wifi_concurrent: false,
             mac_address: None,
             role: InterfaceRole::Output,
             managed: true,
