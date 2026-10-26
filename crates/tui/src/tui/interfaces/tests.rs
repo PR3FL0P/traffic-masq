@@ -630,7 +630,10 @@ async fn mac_controls_require_management_and_switching_it_off_clears_the_mac() {
     assert_eq!(app.editor.as_ref().unwrap().mac_address.len(), 16);
     handle_editor_key(&mut app, KeyCode::Up, &client).await;
     handle_editor_key(&mut app, KeyCode::Up, &client).await;
-    assert_eq!(app.editor.as_ref().unwrap().field, InterfaceEditorField::WifiMode);
+    assert_eq!(
+        app.editor.as_ref().unwrap().field,
+        InterfaceEditorField::WifiMode
+    );
     handle_editor_key(&mut app, KeyCode::Up, &client).await;
     assert_eq!(
         app.editor.as_ref().unwrap().field,

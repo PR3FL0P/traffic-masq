@@ -599,9 +599,7 @@ async fn reconcile_interface_runtime_once(
             let restoring = restorations.contains_key(name);
             if config.wifi_concurrent {
                 crate::wifi::concurrent::ensure_ap(desired.state_dir(), name).await?;
-            } else if crate::wifi::concurrent::has_record(desired.state_dir(), name)
-                .await?
-            {
+            } else if crate::wifi::concurrent::has_record(desired.state_dir(), name).await? {
                 let ap = crate::wifi::concurrent::ap_name(name);
                 let _ap_lane = desired.runtime_locks.lock(&ap).await;
                 let mut disabled = config.clone();

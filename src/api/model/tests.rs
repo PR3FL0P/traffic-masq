@@ -769,8 +769,9 @@ fn dhcp_hostname_survives_config_wire_and_persistence_roundtrips() {
 #[test]
 fn concurrent_wifi_mode_survives_wire_config_round_trip() {
     let view: traffic_masq_protocol::InterfaceConfigView = serde_json::from_value(
-        serde_json::json!({"role":"input", "managed":true, "wifi_concurrent":true})
-    ).unwrap();
+        serde_json::json!({"role":"input", "managed":true, "wifi_concurrent":true}),
+    )
+    .unwrap();
     let config: crate::config::InterfaceConfig = view.clone().into();
     assert!(config.wifi_concurrent);
     let restored: traffic_masq_protocol::InterfaceConfigView = config.into();

@@ -171,11 +171,15 @@ impl HostapdSupervisor {
         crate::wifi::policy::WifiRadioPolicy::validate_system(&config.network)
             .map_err(anyhow::Error::from)?;
         let specs = Self::effective_specs(config)?;
-        let configured_interfaces: HashSet<String> = specs.iter()
+        let configured_interfaces: HashSet<String> = specs
+            .iter()
             // Stop preserved paired AP processes before station recovery: an
             // old channel must not prevent the uplink from associating.
-            .filter(|spec| crate::wifi::concurrent::parent_for(&config.network, &spec.interface).is_none())
-            .map(|spec| spec.interface.clone()).collect();
+            .filter(|spec| {
+                crate::wifi::concurrent::parent_for(&config.network, &spec.interface).is_none()
+            })
+            .map(|spec| spec.interface.clone())
+            .collect();
         let configured_clients: HashSet<String> = config
             .network
             .interfaces
@@ -265,7 +269,9 @@ impl HostapdSupervisor {
                 self.configure(spec).await?;
                 Ok(())
             }
-            None if self.status(interface).await.is_some() || self.record_store(interface).load().await?.is_some() => {
+            None if self.status(interface).await.is_some()
+                || self.record_store(interface).load().await?.is_some() =>
+            {
                 self.disable(interface).await?;
                 Ok(())
             }
