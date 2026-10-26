@@ -285,3 +285,45 @@ fn missing_source_directory_is_empty_without_being_created() {
     assert!(list_source_profiles(&missing).unwrap().is_empty());
     assert!(!missing.exists());
 }
+
+#[test]
+fn oversized_stored_profile_is_rejected_without_overwriting_it() {
+    let dir = tempdir().unwrap();
+    let store = WireGuardProfileStore::new(dir.path());
+    let path = dir.path().join("large.conf");
+    File::create(&path)
+        .unwrap()
+        .set_len(MAX_PROFILE_BYTES + 1)
+        .unwrap();
+    assert!(
+        matches!(store.read(&WireGuardDriver, "large.conf"), Err(StoreError::Io(e)) if e.kind() == ErrorKind::InvalidData)
+    );
+    assert!(store
+        .import(&WireGuardDriver, "large.conf", valid_config().as_bytes())
+        .is_err());
+    assert_eq!(fs::metadata(path).unwrap().len(), MAX_PROFILE_BYTES + 1);
+}
+
+#[test]
+fn stored_fifo_is_rejected_as_non_regular() {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("pipe.conf");
+    nix::unistd::mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+    // Keep a writer briefly so a regression fails rather than hanging forever.
+    let mut writer = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(nix::libc::O_NONBLOCK)
+        .open(&path)
+        .unwrap();
+    writer.write_all(valid_config().as_bytes()).unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        drop(writer);
+    });
+    let result = WireGuardProfileStore::new(dir.path()).read(&WireGuardDriver, "pipe.conf");
+    release.join().unwrap();
+    assert!(matches!(result, Err(StoreError::Io(e)) if e.kind() == ErrorKind::InvalidData));
+}

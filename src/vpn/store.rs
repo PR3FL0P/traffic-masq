@@ -16,6 +16,8 @@ use crate::vpn::wireguard::{
     validate_wireguard_profile_name, ProfileError, WireGuardDriver, WireGuardProfile,
 };
 
+const MAX_PROFILE_BYTES: u64 = 1024 * 1024;
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error(transparent)]
@@ -101,6 +103,13 @@ impl WireGuardProfileStore {
         name: &str,
         raw: &[u8],
     ) -> Result<WireGuardProfile, StoreError> {
+        if raw.len() as u64 > MAX_PROFILE_BYTES {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "WireGuard profile exceeds 1 MiB",
+            )
+            .into());
+        }
         let profile = driver.parse_named_profile(name, raw)?;
 
         let canonical_dir = self.ensure_directory()?;
@@ -143,18 +152,8 @@ impl WireGuardProfileStore {
         let canonical_dir = self.ensure_directory()?;
         let target = self.safe_target(&canonical_dir, name)?;
 
-        let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
-        let raw_fd = match open(&target, flags, Mode::empty()) {
-            Ok(fd) => fd,
-            Err(Errno::ENOENT) => return Err(StoreError::NotFound(name.to_string())),
-            Err(Errno::ELOOP) => return Err(StoreError::SymlinkRejected(target)),
-            Err(error) => return Err(error.into()),
-        };
-
-        let mut file = unsafe { File::from_raw_fd(raw_fd) };
-
-        let mut raw = Zeroizing::new(Vec::new());
-        file.read_to_end(&mut raw)?;
+        let raw =
+            read_optional_regular(&target)?.ok_or_else(|| StoreError::NotFound(name.to_owned()))?;
 
         Ok(driver.parse_named_profile(name, &raw)?)
     }
@@ -222,16 +221,26 @@ impl WireGuardProfileStore {
 }
 
 fn read_optional_regular(path: &Path) -> Result<Option<Zeroizing<Vec<u8>>>, StoreError> {
-    let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK;
     let raw_fd = match open(path, flags, Mode::empty()) {
         Ok(fd) => fd,
         Err(Errno::ENOENT) => return Ok(None),
         Err(Errno::ELOOP) => return Err(StoreError::SymlinkRejected(path.to_path_buf())),
         Err(error) => return Err(error.into()),
     };
-    let mut file = unsafe { File::from_raw_fd(raw_fd) };
+    let file = unsafe { File::from_raw_fd(raw_fd) };
+    if !file.metadata()?.is_file() {
+        return Err(
+            std::io::Error::new(ErrorKind::InvalidData, "profile must be a regular file").into(),
+        );
+    }
     let mut raw = Zeroizing::new(Vec::new());
-    file.read_to_end(&mut raw)?;
+    file.take(MAX_PROFILE_BYTES + 1).read_to_end(&mut raw)?;
+    if raw.len() as u64 > MAX_PROFILE_BYTES {
+        return Err(
+            std::io::Error::new(ErrorKind::InvalidData, "WireGuard profile exceeds 1 MiB").into(),
+        );
+    }
     Ok(Some(raw))
 }
 
