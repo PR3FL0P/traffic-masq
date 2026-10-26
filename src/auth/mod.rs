@@ -206,17 +206,22 @@ impl AuthService {
         set_private_file_permissions(&config.database_path).await?;
         initialize_schema(&pool).await?;
 
-        let dummy_password_hash =
-            hash_password(argon2_params.clone(), random_dummy_password()).await?;
         let max_concurrent_logins = usize::try_from(config.max_concurrent_logins)
             .map_err(|_| AuthError::InvalidConfig("max_concurrent_logins is too large".into()))?;
+        let login_semaphore = Arc::new(Semaphore::new(max_concurrent_logins));
+        let dummy_password_hash = hash_password(
+            login_semaphore.clone(),
+            argon2_params.clone(),
+            random_dummy_password(),
+        )
+        .await?;
 
         Ok(Self {
             inner: Arc::new(AuthServiceInner {
                 pool,
                 argon2_params,
                 dummy_password_hash,
-                login_semaphore: Arc::new(Semaphore::new(max_concurrent_logins)),
+                login_semaphore,
                 login_budget: tokio::sync::Mutex::new(LoginBudget::new()),
                 session_idle_seconds,
                 session_absolute_seconds,
@@ -239,8 +244,12 @@ impl AuthService {
     /// Disable other users and remove existing sessions in the same database transaction.
     pub async fn initialize_device_password(&self, password: &str) -> Result<Principal, AuthError> {
         validate_password(password)?;
-        let password_hash =
-            hash_password(self.inner.argon2_params.clone(), password.to_owned()).await?;
+        let password_hash = hash_password(
+            self.inner.login_semaphore.clone(),
+            self.inner.argon2_params.clone(),
+            password.to_owned(),
+        )
+        .await?;
         let now = unix_timestamp()?;
         let mut transaction = self.inner.pool.begin().await?;
         let initialized: i64 = sqlx::query_scalar(
@@ -295,8 +304,12 @@ impl AuthService {
         expected: Option<&VerifiedDeviceCredentials>,
     ) -> Result<Principal, AuthError> {
         validate_password(password)?;
-        let password_hash =
-            hash_password(self.inner.argon2_params.clone(), password.to_owned()).await?;
+        let password_hash = hash_password(
+            self.inner.login_semaphore.clone(),
+            self.inner.argon2_params.clone(),
+            password.to_owned(),
+        )
+        .await?;
         let now = unix_timestamp()?;
         let mut transaction = self.inner.pool.begin().await?;
         if let Some(expected) = expected {
@@ -663,16 +676,20 @@ async fn password_worker<T: Send + 'static>(
 }
 
 /// Generate a salted Argon2 password hash on a blocking worker.
-async fn hash_password(params: Params, password: String) -> Result<String, AuthError> {
-    tokio::task::spawn_blocking(move || {
+async fn hash_password(
+    semaphore: Arc<Semaphore>,
+    params: Params,
+    password: String,
+) -> Result<String, AuthError> {
+    let password = zeroize::Zeroizing::new(password);
+    password_worker(semaphore, move || {
         let salt = SaltString::generate(&mut OsRng);
         Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
             .hash_password(password.as_bytes(), &salt)
             .map(|hash| hash.to_string())
             .map_err(|_| AuthError::PasswordHash)
     })
-    .await
-    .map_err(|_| AuthError::Worker)?
+    .await?
 }
 
 /// Check a password against its encoded hash; malformed hashes fail verification.

@@ -491,3 +491,58 @@ async fn new_database_is_private() {
         & 0o777;
     assert_eq!(mode, 0o600);
 }
+
+#[tokio::test]
+async fn password_creation_and_replacement_share_the_verification_worker_limit() {
+    let (_directory, service) = service().await;
+    let permits = service.inner.login_semaphore.available_permits() as u32;
+    let reservation = service
+        .inner
+        .login_semaphore
+        .acquire_many(permits)
+        .await
+        .unwrap();
+    assert!(matches!(
+        service
+            .initialize_device_password("a secure password")
+            .await,
+        Err(AuthError::Busy)
+    ));
+    assert!(!service.is_initialized().await.unwrap());
+    drop(reservation);
+    service
+        .initialize_device_password("a secure password")
+        .await
+        .unwrap();
+    let session = service
+        .login_device("a secure password", None, None)
+        .await
+        .unwrap();
+    let reservation = service
+        .inner
+        .login_semaphore
+        .acquire_many(permits)
+        .await
+        .unwrap();
+    assert!(matches!(
+        service
+            .reset_device_password("another secure password")
+            .await,
+        Err(AuthError::Busy)
+    ));
+    // A rejected hash must not change credentials or revoke existing sessions.
+    service.authenticate(&session.token).await.unwrap();
+    drop(reservation);
+    service
+        .login_device("a secure password", None, None)
+        .await
+        .unwrap();
+    service
+        .reset_device_password("another secure password")
+        .await
+        .unwrap();
+    assert!(matches!(
+        service.authenticate(&session.token).await,
+        Err(AuthError::InvalidSession)
+    ));
+}
