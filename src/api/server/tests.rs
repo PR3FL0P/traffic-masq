@@ -172,6 +172,7 @@ fn every_control_request_has_the_expected_authorization_class() {
         Request::PendingNetworkChanges,
         Request::VpnPolicyStatus,
         Request::GetSecurityConfig,
+        Request::GetDhcpDnsDefaults,
         Request::WifiClientStatus,
         Request::GetWifiClientConfig {
             interface: "wlan0".to_owned(),
@@ -188,6 +189,9 @@ fn every_control_request_has_the_expected_authorization_class() {
     }
 
     let mutation_requests = [
+        Request::ConfigureDhcpDnsDefaults {
+            settings: traffic_masq_protocol::DhcpDnsDefaults::default(),
+        },
         Request::SaveWifiClientProfile {
             interface: "wlan0".into(),
             settings: traffic_masq_protocol::ProvisionWifiClientRequest {

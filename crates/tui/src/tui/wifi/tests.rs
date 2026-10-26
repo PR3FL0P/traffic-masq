@@ -1684,7 +1684,7 @@ fn ap_warnings_and_focused_action_fit_minimum_terminal() {
         .map(|c| c.symbol())
         .collect();
     assert!(text.contains("Review AP + passphrase + DHCP"));
-    assert!(text.contains("DNS is not advertised"));
+    assert!(text.contains("Settings DNS defaults"));
     assert!(text.contains("confirm before the rollback timer expires"));
 }
 

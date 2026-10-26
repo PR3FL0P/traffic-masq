@@ -238,6 +238,7 @@ fn app_config(state_dir: &Path, runtime_dir: &Path) -> AppConfig {
         network: NetworkConfig::default(),
         router: RouterConfig::default(),
         dhcp: DhcpConfig {
+            default_dns_servers: traffic_masq_protocol::DhcpDnsDefaults::default().servers,
             leases_dir: state_dir.join("dhcp/leases"),
             default_lease_seconds: 86_400,
         },

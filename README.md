@@ -169,6 +169,13 @@ allows forwarding and NAT; it does not obtain an upstream address or create a
 route. Configure those separately if the Linux machine cannot reach the
 Internet yet.
 
+**Settings → Default DNS for new DHCP servers** controls the DNS addresses suggested
+for a new DHCP server and used by automatic Wi-Fi AP setup. The default is
+`1.1.1.1`. Enter comma-separated IPv4 addresses, or leave the field empty to omit
+DNS advertisement. Saving takes effect immediately for new servers and survives
+restart. Existing DHCP servers retain their own DNS settings; edit those in
+**DHCP Server**.
+
 For a Wi-Fi LAN, configure an access point in **Wi-Fi** as well. Assigning an
 address and a DHCP pool to a wireless interface alone does not create an AP.
 

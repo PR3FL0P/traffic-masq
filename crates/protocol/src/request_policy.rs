@@ -65,6 +65,7 @@ impl<Interface, Proposal> Request<Interface, Proposal> {
         match self {
             Ping
             | GetApiHttpsConfig
+            | GetDhcpDnsDefaults
             | GetSecurityConfig
             | ListInterfaces
             | ListInterfaceInventory
@@ -105,6 +106,7 @@ impl<Interface, Proposal> Request<Interface, Proposal> {
             ConfigureApiHttpsSettings { .. }
             | ResetApiHttpsSettings
             | ConfigureSecuritySettings { .. }
+            | ConfigureDhcpDnsDefaults { .. }
             | ResetSecuritySettings => RequestPolicy {
                 administrator: true,
                 mutation: Settings,

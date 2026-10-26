@@ -1405,3 +1405,25 @@ fn concurrent_mode_requires_managed_input_and_keeps_separate_output() {
         Some("02:11:22:33:44:55".parse().unwrap());
     assert!(network.validate().unwrap_err().to_string().contains("MAC"));
 }
+
+#[test]
+fn dhcp_dns_defaults_are_backward_compatible_and_allow_no_dns() {
+    let config = AppConfig::default();
+    let mut value = toml::Value::try_from(&config).unwrap();
+    value["dhcp"]
+        .as_table_mut()
+        .unwrap()
+        .remove("default_dns_servers");
+    let loaded: AppConfig = value.clone().try_into().unwrap();
+    assert_eq!(
+        loaded.dhcp.default_dns_servers,
+        vec![std::net::Ipv4Addr::new(1, 1, 1, 1)]
+    );
+    value["dhcp"]
+        .as_table_mut()
+        .unwrap()
+        .insert("default_dns_servers".into(), toml::Value::Array(vec![]));
+    let loaded: AppConfig = value.try_into().unwrap();
+    assert!(loaded.dhcp.default_dns_servers.is_empty());
+    loaded.validate().unwrap();
+}

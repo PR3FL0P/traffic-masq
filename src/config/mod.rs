@@ -253,8 +253,14 @@ pub struct DhcpInterfaceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DhcpConfig {
+    #[serde(default = "default_dhcp_dns_servers")]
+    pub default_dns_servers: Vec<Ipv4Addr>,
     pub leases_dir: PathBuf,
     pub default_lease_seconds: u32,
+}
+
+fn default_dhcp_dns_servers() -> Vec<Ipv4Addr> {
+    traffic_masq_protocol::DhcpDnsDefaults::default().servers
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -472,6 +478,11 @@ impl AppConfig {
         self.wifi_client.validate()?;
         self.api.validate()?;
         self.auth.validate()?;
+        traffic_masq_protocol::DhcpDnsDefaults {
+            servers: self.dhcp.default_dns_servers.clone(),
+        }
+        .validate()
+        .map_err(anyhow::Error::msg)?;
 
         if self.dhcp.default_lease_seconds == 0 {
             bail!("dhcp.default_lease_seconds must be greater than zero");
@@ -1212,6 +1223,7 @@ impl Default for AppConfig {
             network: NetworkConfig::default(),
             router: RouterConfig::default(),
             dhcp: DhcpConfig {
+                default_dns_servers: default_dhcp_dns_servers(),
                 leases_dir: PathBuf::from("/var/lib/traffic-masq/dhcp/leases"),
                 default_lease_seconds: 86_400,
             },

@@ -22,18 +22,20 @@ pub(crate) enum SettingsField {
     SaveSession,
     ChangePassword,
     Access,
+    DnsDefaults,
     Reset,
     Save,
     Reload,
 }
 
-const SETTINGS_FIELDS: [SettingsField; 10] = [
+const SETTINGS_FIELDS: [SettingsField; 11] = [
     SettingsField::RollbackTimeout,
     SettingsField::RememberSession,
     SettingsField::RememberMinutes,
     SettingsField::ShowDhcpClient,
     SettingsField::SaveSession,
     SettingsField::ChangePassword,
+    SettingsField::DnsDefaults,
     SettingsField::Access,
     SettingsField::Reset,
     SettingsField::Save,
@@ -258,6 +260,13 @@ pub(crate) fn render_settings(frame: &mut ratatui::Frame<'_>, area: Rect, app: &
         Style::default().fg(theme::ACCENT),
     ));
 
+    button_rows.push((lines.len() as u16, "Default DNS for new DHCP servers", 9));
+    lines.push(row(
+        "Default DNS for new DHCP servers".into(),
+        SettingsField::DnsDefaults,
+        Style::default().fg(theme::ACCENT),
+    ));
+
     button_rows.push((lines.len() as u16, SECURITY_ACCESS_LABEL, 7));
     lines.push(row(
         SECURITY_ACCESS_LABEL.to_string(),
@@ -320,6 +329,7 @@ pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
             6 => SettingsField::SaveSession,
             7 => SettingsField::Access,
             8 => SettingsField::ShowDhcpClient,
+            9 => SettingsField::DnsDefaults,
             _ => SettingsField::Reload,
         };
         editor.editing = false;
@@ -385,6 +395,7 @@ pub(crate) async fn handle_settings_key(app: &mut TuiApp, key: KeyCode, client: 
                 app.settings_password = Some(PasswordChangeEditor::new());
                 app.screen = Screen::SettingsPassword;
             }
+            SettingsField::DnsDefaults => super::dns_defaults::open(app, client).await,
             SettingsField::Access => {
                 super::access::open_access_editor(app, client).await;
             }

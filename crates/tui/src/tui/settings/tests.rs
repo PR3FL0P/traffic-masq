@@ -102,7 +102,15 @@ fn settings_field_clamps_at_both_ends_instead_of_wrapping() {
     );
     assert_eq!(
         next_settings_field(SettingsField::ChangePassword),
+        SettingsField::DnsDefaults
+    );
+    assert_eq!(
+        next_settings_field(SettingsField::DnsDefaults),
         SettingsField::Access
+    );
+    assert_eq!(
+        previous_settings_field(SettingsField::DnsDefaults),
+        SettingsField::ChangePassword
     );
     assert_eq!(
         next_settings_field(SettingsField::Access),
@@ -134,7 +142,7 @@ fn settings_field_clamps_at_both_ends_instead_of_wrapping() {
     );
     assert_eq!(
         previous_settings_field(SettingsField::Access),
-        SettingsField::ChangePassword
+        SettingsField::DnsDefaults
     );
     assert_eq!(
         previous_settings_field(SettingsField::SaveSession),

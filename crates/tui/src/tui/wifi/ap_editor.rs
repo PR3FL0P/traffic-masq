@@ -271,7 +271,7 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
         Rect::new(inner.x, inner.y, inner.width, body_height),
     );
     let warning = if editor.configure_dhcp {
-        "DHCP: derive pool from LAN subnet; DNS is not advertised."
+        "DHCP: derive pool from LAN subnet; new servers use Settings DNS defaults."
     } else if editor.disable_dhcp {
         "DHCP: stop the server on this interface."
     } else {
@@ -593,11 +593,21 @@ async fn apply_ap_editor(app: &mut TuiApp, client: &ApiClient) {
                     return;
                 }
             };
+            let dns_servers = match config.dhcp.as_ref() {
+                Some(dhcp) => dhcp.dns_servers.clone(),
+                None => match super::super::dns_defaults::fetch(client).await {
+                    Ok(defaults) => defaults.servers,
+                    Err(error) => {
+                        app.push_message(LogLevel::Error, error.to_string());
+                        return;
+                    }
+                },
+            };
             config.dhcp = Some(traffic_masq_protocol::DhcpInterfaceConfigView {
                 pool_start,
                 pool_end,
                 router: cidr.addr(),
-                dns_servers: Vec::new(),
+                dns_servers,
                 lease_seconds: None,
             });
         }

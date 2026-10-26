@@ -777,3 +777,75 @@ fn cancelled_persistence_fences_mutations_until_commit_proof_is_reloaded() {
         blocker.await.unwrap();
     });
 }
+
+#[tokio::test]
+async fn dhcp_dns_defaults_persist_without_changing_existing_servers() {
+    use traffic_masq_protocol::DhcpDnsDefaults;
+    let directory = tempdir().unwrap();
+    let mut base = base_config();
+    let mut lan = InterfaceConfig {
+        managed: true,
+        role: InterfaceRole::Output,
+        ipv4: Some("192.168.50.1/24".parse().unwrap()),
+        dhcp: Some(DhcpInterfaceConfig {
+            pool_start: "192.168.50.100".parse().unwrap(),
+            pool_end: "192.168.50.200".parse().unwrap(),
+            router: "192.168.50.1".parse().unwrap(),
+            dns_servers: vec![],
+            lease_seconds: None,
+        }),
+        wifi_concurrent: false,
+        mac_address: None,
+        dhcp_client: None,
+        wifi: None,
+        wifi_client: None,
+    };
+    base.network.interfaces.insert("lan0".into(), lan.clone());
+    let manager = RuntimeOverrideManager::load(directory.path(), &base)
+        .await
+        .unwrap();
+    assert_eq!(
+        manager.effective_dhcp_dns_defaults().await.unwrap(),
+        DhcpDnsDefaults::default()
+    );
+    for servers in [vec![Ipv4Addr::new(9, 9, 9, 9)], vec![]] {
+        let settings = DhcpDnsDefaults { servers };
+        manager
+            .set_dhcp_dns_defaults(settings.clone())
+            .await
+            .unwrap();
+        let restored = RuntimeOverrideManager::load(directory.path(), &base)
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.effective_dhcp_dns_defaults().await.unwrap(),
+            settings
+        );
+        assert_eq!(
+            restored.effective_interface("lan0").await.unwrap(),
+            Some(lan.clone())
+        );
+    }
+    // A server with its own DNS also remains independent of the global setting.
+    lan.dhcp.as_mut().unwrap().dns_servers = vec![Ipv4Addr::new(8, 8, 8, 8)];
+    manager
+        .set_interface("lan0".into(), lan.clone(), false)
+        .await
+        .unwrap();
+    manager
+        .set_dhcp_dns_defaults(DhcpDnsDefaults::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        manager.effective_interface("lan0").await.unwrap(),
+        Some(lan)
+    );
+    let before = manager.snapshot().await;
+    assert!(manager
+        .set_dhcp_dns_defaults(DhcpDnsDefaults {
+            servers: vec![Ipv4Addr::UNSPECIFIED]
+        })
+        .await
+        .is_err());
+    assert_eq!(manager.snapshot().await, before);
+}

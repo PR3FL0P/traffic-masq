@@ -609,6 +609,13 @@ pub(crate) async fn open_dhcp_editor(app: &mut TuiApp, client: &ApiClient) {
             app.screen = Screen::DhcpEditor;
         }
         Ok(Response::DhcpConfig { spec: None, .. }) => {
+            let defaults = match super::dns_defaults::fetch(client).await {
+                Ok(defaults) => defaults,
+                Err(error) => {
+                    app.push_message(LogLevel::Error, error.to_string());
+                    return;
+                }
+            };
             // Read the effective configuration at editor-open time: the dashboard
             // can still contain addresses from before the user's last edit.
             let configured_cidr = match client
@@ -654,7 +661,7 @@ pub(crate) async fn open_dhcp_editor(app: &mut TuiApp, client: &ApiClient) {
                 pool_start,
                 pool_end,
                 router,
-                dns_servers: "8.8.8.8".to_string(),
+                dns_servers: super::dns_defaults::format_servers(&defaults),
                 lease_seconds: "86400".to_string(),
                 cursor,
             });

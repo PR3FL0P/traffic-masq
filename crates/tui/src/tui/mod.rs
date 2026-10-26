@@ -35,6 +35,7 @@ mod dashboard;
 mod dhcp;
 mod dhcp_client;
 mod dhcp_client_editor;
+mod dns_defaults;
 mod forwarding;
 mod input;
 mod interface_status;
@@ -117,6 +118,7 @@ enum Screen {
     WifiConnectPrompt,
     Settings,
     SettingsPassword,
+    DnsDefaults,
     Log,
     DaemonLogs,
 }
@@ -205,7 +207,9 @@ fn section_of(screen: Screen) -> Section {
         | Screen::WifiApProfiles
         | Screen::WifiProfileEditor
         | Screen::WifiConnectPrompt => Section::Wifi,
-        Screen::Settings | Screen::SettingsPassword | Screen::Access => Section::Settings,
+        Screen::Settings | Screen::SettingsPassword | Screen::Access | Screen::DnsDefaults => {
+            Section::Settings
+        }
         Screen::Log | Screen::DaemonLogs => Section::Log,
     }
 }
@@ -313,6 +317,7 @@ struct TuiApp {
     wifi_profile_editor: Option<wifi::WifiProfileEditor>,
     wifi_connect: Option<wifi::WifiConnectPrompt>,
     settings: Option<SecurityEditor>,
+    dns_defaults: Option<dns_defaults::Editor>,
     settings_password: Option<PasswordChangeEditor>,
     pub(crate) show_dhcp_client: bool,
     traffic: HashMap<u32, dashboard::TrafficHistory>,
@@ -382,6 +387,7 @@ impl Default for TuiApp {
             wifi_profile_editor: None,
             wifi_connect: None,
             settings: None,
+            dns_defaults: None,
             settings_password: None,
             show_dhcp_client: false,
             traffic: HashMap::new(),
@@ -1639,6 +1645,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp, direct: bool) {
 
     match app.screen {
         Screen::Dashboard => dashboard::render_dashboard(frame, chunks[1], app, direct),
+        Screen::DnsDefaults => dns_defaults::render(frame, chunks[1], app),
         Screen::Access => access::render_access(frame, chunks[1], app),
         Screen::InterfaceList => interfaces::render_interface_list(frame, chunks[1], app),
         Screen::InterfaceEditor => interfaces::render_editor(frame, chunks[1], app),
@@ -1686,6 +1693,7 @@ fn focus_action_slot(app: &mut TuiApp, slot: usize) {
     match app.screen {
         Screen::Dashboard => {}
         Screen::PendingChange | Screen::RouterPending => app.pending_focus = slot.min(1),
+        Screen::DnsDefaults => dns_defaults::focus_action(app, slot),
         Screen::Access => access::focus_action(app, slot),
         Screen::InterfaceEditor => interfaces::focus_action(app, slot),
         Screen::DhcpEditor => dhcp::focus_action(app, slot),
@@ -1866,6 +1874,7 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
 
     match app.screen {
         Screen::Dashboard => dashboard::handle_dashboard_key(app, key, client, direct).await,
+        Screen::DnsDefaults => dns_defaults::handle_key(app, key, client).await,
         Screen::Access => access::handle_access_key(app, key, client).await,
         Screen::InterfaceList => {
             interfaces::handle_interface_list_key(app, key, client, direct).await

@@ -45,6 +45,8 @@ allow_default_route_change = false
 [dhcp]
 leases_dir = "/var/lib/traffic-masq/dhcp/leases"
 default_lease_seconds = 86400
+# Used only when creating a DHCP server; [] disables DNS advertisement.
+default_dns_servers = ["1.1.1.1"]
 
 [wifi]
 enabled = false

@@ -1,6 +1,9 @@
 use super::*;
 
-pub(super) fn default_dhcp_settings(cidr: ipnet::Ipv4Net) -> Result<DhcpEditRequest, String> {
+pub(super) fn default_dhcp_settings(
+    cidr: ipnet::Ipv4Net,
+    dns_servers: Vec<std::net::Ipv4Addr>,
+) -> Result<DhcpEditRequest, String> {
     let (start, end) = crate::dhcp::defaults::suggest_pool(cidr)?;
     let router = cidr.addr();
 
@@ -8,7 +11,7 @@ pub(super) fn default_dhcp_settings(cidr: ipnet::Ipv4Net) -> Result<DhcpEditRequ
         pool_start: start,
         pool_end: end,
         router,
-        dns_servers: Vec::new(),
+        dns_servers,
         lease_seconds: None,
     })
 }

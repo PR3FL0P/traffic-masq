@@ -154,6 +154,18 @@ impl ControlService {
                 .reset_api_https_settings()
                 .await
                 .unwrap_or_else(error_response),
+            Request::GetDhcpDnsDefaults => self
+                .overrides
+                .effective_dhcp_dns_defaults()
+                .await
+                .map(|settings| Response::DhcpDnsDefaults { settings })
+                .unwrap_or_else(error_response),
+            Request::ConfigureDhcpDnsDefaults { settings } => {
+                match self.overrides.set_dhcp_dns_defaults(settings.clone()).await {
+                    Ok(()) => Response::DhcpDnsDefaults { settings },
+                    Err(error) => error_response(error),
+                }
+            }
             Request::GetSecurityConfig => self
                 .security_config_response()
                 .await

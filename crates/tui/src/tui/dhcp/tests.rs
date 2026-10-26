@@ -9,6 +9,7 @@ async fn editor_uses_saved_address_even_when_dashboard_is_empty() {
     let server = tokio::spawn(async move {
         for body in [
             serde_json::json!({"type": "dhcp_config", "interface": "lan0", "spec": null}),
+            serde_json::json!({"type": "dhcp_dns_defaults", "settings": {"servers": ["1.1.1.1"]}}),
             serde_json::json!({"type": "interface_config", "interface": "lan0",
                 "allow_management_change": false,
                 "config": {"managed": true, "role": "output", "ipv4": "192.168.50.128/24"}}),
@@ -42,6 +43,7 @@ async fn editor_uses_saved_address_even_when_dashboard_is_empty() {
     open_dhcp_editor(&mut app, &client).await;
     server.await.unwrap();
     let editor = app.dhcp_editor.as_ref().expect("DHCP editor should open");
+    assert_eq!(editor.dns_servers, "1.1.1.1");
     assert_eq!(editor.router, "192.168.50.128");
     assert_eq!(editor.pool_start, "192.168.50.1");
     assert_eq!(editor.pool_end, "192.168.50.127");
@@ -60,6 +62,7 @@ async fn editor_falls_back_to_status_address_ignoring_link_local() {
     let server = tokio::spawn(async move {
         for body in [
             serde_json::json!({"type": "dhcp_config", "interface": "lan0", "spec": null}),
+            serde_json::json!({"type": "dhcp_dns_defaults", "settings": {"servers": ["9.9.9.9", "8.8.8.8"]}}),
             serde_json::json!({"type": "interface_config", "interface": "lan0",
                 "allow_management_change": false,
                 "config": null}),
@@ -106,6 +109,7 @@ async fn editor_falls_back_to_status_address_ignoring_link_local() {
     open_dhcp_editor(&mut app, &client).await;
     server.await.unwrap();
     let editor = app.dhcp_editor.as_ref().expect("DHCP editor should open");
+    assert_eq!(editor.dns_servers, "9.9.9.9, 8.8.8.8");
     assert_eq!(editor.router, "192.168.1.1");
     assert_eq!(editor.pool_start, "192.168.1.2");
     assert_eq!(editor.pool_end, "192.168.1.254");
@@ -120,6 +124,7 @@ async fn editor_leaves_fields_empty_if_only_link_local_address_present() {
     let server = tokio::spawn(async move {
         for body in [
             serde_json::json!({"type": "dhcp_config", "interface": "lan0", "spec": null}),
+            serde_json::json!({"type": "dhcp_dns_defaults", "settings": {"servers": []}}),
             serde_json::json!({"type": "interface_config", "interface": "lan0",
                 "allow_management_change": false,
                 "config": null}),
@@ -158,6 +163,7 @@ async fn editor_leaves_fields_empty_if_only_link_local_address_present() {
     open_dhcp_editor(&mut app, &client).await;
     server.await.unwrap();
     let editor = app.dhcp_editor.as_ref().expect("DHCP editor should open");
+    assert!(editor.dns_servers.is_empty());
     assert_eq!(editor.router, "");
     assert_eq!(editor.pool_start, "");
     assert_eq!(editor.pool_end, "");

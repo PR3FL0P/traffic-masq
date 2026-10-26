@@ -445,6 +445,7 @@ pub(crate) fn screen_help_pairs(screen: Screen) -> Vec<(&'static str, &'static s
             ("Esc", "back"),
         ],
         Screen::Access
+        | Screen::DnsDefaults
         | Screen::InterfaceEditor
         | Screen::DhcpEditor
         | Screen::DhcpClientEditor

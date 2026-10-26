@@ -248,8 +248,11 @@ impl RuntimeOverrideManager {
         network_candidate.revision = state.revision;
         network_candidate.api = state.api.clone();
         network_candidate.security = state.security.clone();
+        network_candidate.dhcp_dns_defaults = state.dhcp_dns_defaults.clone();
         let settings_only = network_candidate == *state
-            && (candidate.api != state.api || candidate.security != state.security);
+            && (candidate.api != state.api
+                || candidate.security != state.security
+                || candidate.dhcp_dns_defaults != state.dhcp_dns_defaults);
         let mut guard = CommitPersistenceGuard {
             root,
             armed: true,
@@ -301,6 +304,33 @@ impl RuntimeOverrideManager {
         let mut state = self.state.lock().await;
         let mut candidate = state.clone();
         candidate.api = None;
+        self.save_locked(&mut state, candidate).await
+    }
+
+    /// DNS defaults for newly created servers; existing interface settings stay explicit.
+    pub async fn effective_dhcp_dns_defaults(
+        &self,
+    ) -> Result<traffic_masq_protocol::DhcpDnsDefaults> {
+        Ok(traffic_masq_protocol::DhcpDnsDefaults {
+            servers: self
+                .state
+                .lock()
+                .await
+                .effective_config(&self.base)?
+                .dhcp
+                .default_dns_servers,
+        })
+    }
+
+    /// Persist defaults without rewriting any configured DHCP server.
+    pub async fn set_dhcp_dns_defaults(
+        &self,
+        settings: traffic_masq_protocol::DhcpDnsDefaults,
+    ) -> Result<()> {
+        settings.validate().map_err(anyhow::Error::msg)?;
+        let mut state = self.state.lock().await;
+        let mut candidate = state.clone();
+        candidate.dhcp_dns_defaults = Some(settings);
         self.save_locked(&mut state, candidate).await
     }
 

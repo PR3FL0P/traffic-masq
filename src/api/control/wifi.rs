@@ -195,7 +195,14 @@ impl ControlService {
                 ap_passphrase_file_update(previous.passphrase_file.as_ref(), &passphrase_update);
         }
         if configure_dhcp {
-            let settings = match default_dhcp_settings(cidr) {
+            let settings = match default_dhcp_settings(
+                cidr,
+                target
+                    .dhcp
+                    .as_ref()
+                    .map(|dhcp| dhcp.dns_servers.clone())
+                    .unwrap_or_else(|| effective.dhcp.default_dns_servers.clone()),
+            ) {
                 Ok(settings) => settings,
                 Err(message) => return wifi_error(WifiErrorDetail::InvalidSpec { message }),
             };

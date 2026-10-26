@@ -35,6 +35,9 @@ pub struct RuntimeOverrides {
     #[serde(default)]
     pub security: Option<SecurityConfig>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dhcp_dns_defaults: Option<traffic_masq_protocol::DhcpDnsDefaults>,
+
     #[serde(default)]
     pub vpn_mode: Option<VpnPolicyMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -56,6 +59,7 @@ impl Default for RuntimeOverrides {
             router: None,
             api: None,
             security: None,
+            dhcp_dns_defaults: None,
             vpn_mode: None,
             vpn_enabled: None,
             interfaces: BTreeMap::new(),
@@ -248,6 +252,9 @@ impl RuntimeOverrides {
         }
         if let Some(api) = &self.api {
             effective.api = api.clone();
+        }
+        if let Some(dns) = &self.dhcp_dns_defaults {
+            effective.dhcp.default_dns_servers = dns.servers.clone();
         }
         if let Some(security) = &self.security {
             effective.security = security.clone();

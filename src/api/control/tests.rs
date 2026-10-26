@@ -13,24 +13,36 @@ use super::*;
 
 #[test]
 fn default_ap_dhcp_pool_uses_larger_side_of_router_in_24() {
-    let settings = default_dhcp_settings("192.168.50.128/24".parse().unwrap()).unwrap();
+    let settings = default_dhcp_settings(
+        "192.168.50.128/24".parse().unwrap(),
+        traffic_masq_protocol::DhcpDnsDefaults::default().servers,
+    )
+    .unwrap();
     assert_eq!(settings.router, Ipv4Addr::new(192, 168, 50, 128));
     assert_eq!(settings.pool_start, Ipv4Addr::new(192, 168, 50, 1));
     assert_eq!(settings.pool_end, Ipv4Addr::new(192, 168, 50, 127));
-    assert!(settings.dns_servers.is_empty());
+    assert_eq!(settings.dns_servers, vec![Ipv4Addr::new(1, 1, 1, 1)]);
     assert_eq!(settings.lease_seconds, None);
 }
 
 #[test]
 fn default_ap_dhcp_pool_supports_30() {
-    let settings = default_dhcp_settings("192.168.50.1/30".parse().unwrap()).unwrap();
+    let settings = default_dhcp_settings(
+        "192.168.50.1/30".parse().unwrap(),
+        traffic_masq_protocol::DhcpDnsDefaults::default().servers,
+    )
+    .unwrap();
     assert_eq!(settings.pool_start, Ipv4Addr::new(192, 168, 50, 2));
     assert_eq!(settings.pool_end, Ipv4Addr::new(192, 168, 50, 2));
 }
 
 #[test]
 fn default_ap_dhcp_pool_rejects_31() {
-    let error = default_dhcp_settings("192.168.50.0/31".parse().unwrap()).unwrap_err();
+    let error = default_dhcp_settings(
+        "192.168.50.0/31".parse().unwrap(),
+        traffic_masq_protocol::DhcpDnsDefaults::default().servers,
+    )
+    .unwrap_err();
     assert!(error.contains("/31"));
 }
 
@@ -11144,4 +11156,45 @@ async fn standalone_failed_tunnel_restore_reinstates_protection_and_retains_reco
         fixture.overrides.snapshot().await.revision,
         committed.revision + 1
     );
+}
+
+#[tokio::test]
+async fn dhcp_dns_defaults_dispatch_uses_saved_settings_immediately() {
+    use traffic_masq_protocol::DhcpDnsDefaults;
+    let directory = tempdir().unwrap();
+    let config = router_base_config();
+    let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+        .await
+        .unwrap();
+    let dhcp = DhcpSupervisor::start(&config).await.unwrap();
+    let service = ControlService::new_detached(
+        config,
+        Arc::new(FakeNetwork {
+            addresses: Vec::new(),
+        }),
+        dhcp,
+        overrides.clone(),
+    );
+    assert!(
+        matches!(service.dispatch(Request::GetDhcpDnsDefaults).await,
+        Response::DhcpDnsDefaults { settings } if settings == DhcpDnsDefaults::default())
+    );
+    for servers in [vec![Ipv4Addr::new(9, 9, 9, 9)], vec![]] {
+        let desired = DhcpDnsDefaults { servers };
+        assert!(
+            matches!(service.dispatch(Request::ConfigureDhcpDnsDefaults { settings: desired.clone() }).await,
+            Response::DhcpDnsDefaults { settings } if settings == desired)
+        );
+        let effective = service.effective_config().await.unwrap();
+        let dhcp = default_dhcp_settings(
+            "192.168.50.1/24".parse().unwrap(),
+            effective.dhcp.default_dns_servers,
+        )
+        .unwrap();
+        assert_eq!(dhcp.dns_servers, desired.servers);
+        assert!(
+            matches!(service.dispatch(Request::GetDhcpDnsDefaults).await,
+            Response::DhcpDnsDefaults { settings } if settings == desired)
+        );
+    }
 }

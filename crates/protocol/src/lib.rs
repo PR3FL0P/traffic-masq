@@ -260,6 +260,37 @@ impl Default for ApiHttpsSettings {
     }
 }
 
+/// DNS addresses copied into newly configured DHCP servers; empty means no DNS option.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DhcpDnsDefaults {
+    pub servers: Vec<Ipv4Addr>,
+}
+
+impl Default for DhcpDnsDefaults {
+    fn default() -> Self {
+        Self {
+            servers: vec![Ipv4Addr::new(1, 1, 1, 1)],
+        }
+    }
+}
+
+impl DhcpDnsDefaults {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.servers.len() > 63 {
+            return Err("At most 63 DNS servers can be advertised by DHCP".into());
+        }
+        if self
+            .servers
+            .iter()
+            .any(|ip| ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast())
+        {
+            return Err("DNS servers must be IPv4 unicast addresses".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecuritySettings {
     pub rollback_timeout_seconds: u64,
@@ -1197,6 +1228,10 @@ pub enum Request<Interface, Proposal> {
         settings: ApiHttpsSettings,
     },
     ResetApiHttpsSettings,
+    GetDhcpDnsDefaults,
+    ConfigureDhcpDnsDefaults {
+        settings: DhcpDnsDefaults,
+    },
     GetSecurityConfig,
     ConfigureSecuritySettings {
         settings: SecuritySettings,
@@ -1493,6 +1528,9 @@ pub enum Response<
         desired: ApiHttpsSettings,
         override_active: bool,
         restart_required: bool,
+    },
+    DhcpDnsDefaults {
+        settings: DhcpDnsDefaults,
     },
     SecurityConfig {
         active: SecuritySettings,
