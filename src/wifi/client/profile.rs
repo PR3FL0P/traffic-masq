@@ -543,6 +543,7 @@ fn read_regular_bytes(path: &Path) -> Result<Vec<u8>, WifiClientProfileError> {
     let mut file = open_read(path)?;
     let mut contents = Vec::new();
     file.read_to_end(&mut contents)?;
+    check_file_size(contents.len())?;
     Ok(contents)
 }
 
@@ -550,6 +551,7 @@ fn read_metadata(path: &Path) -> Result<WifiClientProfileMetadata, WifiClientPro
     let mut file = open_read(path)?;
     let mut contents = String::new();
     file.read_to_string(&mut contents)?;
+    check_file_size(contents.len())?;
     Ok(serde_json::from_str(&contents)?)
 }
 
@@ -563,13 +565,37 @@ fn read_passphrase(path: &Path) -> Result<Option<WifiPassphrase>, WifiClientProf
     };
     let mut contents = Zeroizing::new(String::new());
     file.read_to_string(&mut contents)?;
+    check_file_size(contents.len())?;
     Ok(Some(WifiPassphrase::new(contents.as_str())?))
 }
 
-fn open_read(path: &Path) -> Result<File, WifiClientProfileError> {
-    let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+const MAX_PROFILE_FILE_BYTES: u64 = 1024 * 1024;
+
+fn check_file_size(size: usize) -> std::io::Result<()> {
+    if size as u64 > MAX_PROFILE_FILE_BYTES {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "Wi-Fi profile file exceeds 1 MiB",
+        ));
+    }
+    Ok(())
+}
+
+fn open_read(path: &Path) -> Result<std::io::Take<File>, WifiClientProfileError> {
+    let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK;
     match open(path, flags, Mode::empty()) {
-        Ok(fd) => Ok(unsafe { File::from_raw_fd(fd) }),
+        Ok(fd) => {
+            let file = unsafe { File::from_raw_fd(fd) };
+            let metadata = file.metadata()?;
+            if !metadata.is_file() || metadata.len() > MAX_PROFILE_FILE_BYTES {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "Wi-Fi profile must be a regular file no larger than 1 MiB",
+                )
+                .into());
+            }
+            Ok(file.take(MAX_PROFILE_FILE_BYTES + 1))
+        }
         Err(Errno::ELOOP) => Err(WifiClientProfileError::SymlinkRejected(path.to_path_buf())),
         Err(error) => Err(WifiClientProfileError::Io(std::io::Error::from(error))),
     }

@@ -204,3 +204,24 @@ fn every_profile_operation_rejects_metadata_with_a_different_id() {
     assert!(store.delete("home").is_err());
     assert!(store.root().join("secrets/home.psk").exists());
 }
+
+#[test]
+fn profile_reads_reject_non_regular_and_oversized_files() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("oversized");
+    File::create(&path)
+        .unwrap()
+        .set_len(MAX_PROFILE_FILE_BYTES + 1)
+        .unwrap();
+    for path in [&path, dir.path()] {
+        assert!(
+            matches!(read_regular_bytes(path), Err(WifiClientProfileError::Io(e)) if e.kind() == ErrorKind::InvalidData)
+        );
+        assert!(
+            matches!(read_metadata(path), Err(WifiClientProfileError::Io(e)) if e.kind() == ErrorKind::InvalidData)
+        );
+        assert!(
+            matches!(read_passphrase(path), Err(WifiClientProfileError::Io(e)) if e.kind() == ErrorKind::InvalidData)
+        );
+    }
+}

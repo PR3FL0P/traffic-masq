@@ -177,6 +177,7 @@ impl PassphraseStore {
 
         let mut contents = Zeroizing::new(String::new());
         file.read_to_string(&mut contents)?;
+        check_secret_size(contents.len())?;
         Ok(Some(WifiPassphrase::new(contents.as_str())?))
     }
 
@@ -197,15 +198,40 @@ impl PassphraseStore {
     }
 }
 
-fn open_secret_file(path: &Path) -> Result<Option<File>, PassphraseStoreError> {
-    let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+const MAX_SECRET_FILE_BYTES: u64 = 64 * 1024;
+
+fn validate_secret_file(file: &File) -> std::io::Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > MAX_SECRET_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "passphrase must be a regular file no larger than 64 KiB",
+        ));
+    }
+    Ok(())
+}
+
+fn check_secret_size(size: usize) -> std::io::Result<()> {
+    if size as u64 > MAX_SECRET_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "passphrase file exceeds 64 KiB",
+        ));
+    }
+    Ok(())
+}
+
+fn open_secret_file(path: &Path) -> Result<Option<std::io::Take<File>>, PassphraseStoreError> {
+    let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK;
     let raw_fd = match open(path, flags, Mode::empty()) {
         Ok(fd) => fd,
         Err(Errno::ENOENT) => return Ok(None),
         Err(Errno::ELOOP) => return Err(PassphraseStoreError::SymlinkRejected(path.to_path_buf())),
         Err(error) => return Err(error.into()),
     };
-    Ok(Some(unsafe { File::from_raw_fd(raw_fd) }))
+    let file = unsafe { File::from_raw_fd(raw_fd) };
+    validate_secret_file(&file)?;
+    Ok(Some(file.take(MAX_SECRET_FILE_BYTES + 1)))
 }
 
 fn read_secret_bytes(path: &Path) -> Result<Option<Zeroizing<Vec<u8>>>, PassphraseStoreError> {
@@ -214,6 +240,7 @@ fn read_secret_bytes(path: &Path) -> Result<Option<Zeroizing<Vec<u8>>>, Passphra
     };
     let mut bytes = Zeroizing::new(Vec::new());
     file.read_to_end(&mut bytes)?;
+    check_secret_size(bytes.len())?;
     Ok(Some(bytes))
 }
 
@@ -291,7 +318,7 @@ pub fn resolve_passphrase_parts(
 }
 
 fn read_passphrase_file(path: &Path) -> Result<WifiPassphrase, ResolvePassphraseError> {
-    let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK;
     let raw_fd = match open(path, flags, Mode::empty()) {
         Ok(fd) => fd,
         Err(Errno::ELOOP) => {
@@ -305,7 +332,7 @@ fn read_passphrase_file(path: &Path) -> Result<WifiPassphrase, ResolvePassphrase
         }
     };
 
-    let mut file = unsafe { File::from_raw_fd(raw_fd) };
+    let file = unsafe { File::from_raw_fd(raw_fd) };
 
     let metadata = file
         .metadata()
@@ -319,13 +346,22 @@ fn read_passphrase_file(path: &Path) -> Result<WifiPassphrase, ResolvePassphrase
         ));
     }
 
+    validate_secret_file(&file).map_err(|source| ResolvePassphraseError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
     let mut contents = Zeroizing::new(String::new());
-    file.read_to_string(&mut contents)
+    file.take(MAX_SECRET_FILE_BYTES + 1)
+        .read_to_string(&mut contents)
         .map_err(|source| ResolvePassphraseError::Io {
             path: path.to_path_buf(),
             source,
         })?;
 
+    check_secret_size(contents.len()).map_err(|source| ResolvePassphraseError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
     let first_line = contents
         .split('\n')
         .next()

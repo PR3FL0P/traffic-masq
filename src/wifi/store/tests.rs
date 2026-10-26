@@ -334,3 +334,48 @@ fn role_stores_never_resolve_or_clear_another_roles_secret() {
         "legacy-password"
     );
 }
+
+#[test]
+fn oversized_passphrase_files_are_rejected_without_replacing_them() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wlan0");
+    File::create(&path)
+        .unwrap()
+        .set_len(MAX_SECRET_FILE_BYTES + 1)
+        .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(
+        matches!(read_passphrase_file(&path), Err(ResolvePassphraseError::Io { source, .. }) if source.kind() == std::io::ErrorKind::InvalidData)
+    );
+    let store = PassphraseStore::new(dir.path());
+    assert!(store.get("wlan0").is_err());
+    assert!(store
+        .set("wlan0", &passphrase("replacement password"))
+        .is_err());
+    assert_eq!(fs::metadata(path).unwrap().len(), MAX_SECRET_FILE_BYTES + 1);
+}
+
+#[test]
+fn external_fifo_is_rejected_without_waiting_for_a_writer() {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("secret");
+    nix::unistd::mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+    let mut writer = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(nix::libc::O_NONBLOCK)
+        .open(&path)
+        .unwrap();
+    writer.write_all(b"valid password").unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        drop(writer);
+    });
+    let result = read_passphrase_file(&path);
+    release.join().unwrap();
+    assert!(
+        matches!(result, Err(ResolvePassphraseError::Io { source, .. }) if source.kind() == std::io::ErrorKind::InvalidData)
+    );
+}
