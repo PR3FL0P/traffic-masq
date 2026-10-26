@@ -378,17 +378,17 @@ impl NetworkTransactionManager {
                     .interfaces
                     .get(&ap)
                     .is_some_and(|c| c.managed || c.wifi.is_some() || c.dhcp.is_some()),
-                "disable and unmanage virtual AP {ap} before leaving Receive + share"
+                "disable and unmanage virtual AP {ap} before leaving Input + Output"
             );
         }
         if let Some(parent) = crate::wifi::concurrent::parent_for(&network, interface) {
             anyhow::ensure!(
                 !self.desired().is_tentative(parent).await,
-                "Commit Receive + share on {parent} before configuring its virtual AP"
+                "Commit Input + Output on {parent} before configuring its virtual AP"
             );
             anyhow::ensure!(
                 config.mac_address.is_none(),
-                "virtual AP MAC is managed by Receive + share"
+                "virtual AP MAC is managed by Input + Output"
             );
         }
         let mut plan = self

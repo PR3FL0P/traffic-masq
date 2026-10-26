@@ -373,6 +373,7 @@ mod tests {
         let config = serde_json::from_value(serde_json::json!({"role":"input","managed":true,"ipv4":null,"dhcp":null,"dhcp_client":{"hostname":"saved-router","route_metric":777,"install_default_route":false,"request_dns":false,"send_release_on_shutdown":true}})).unwrap();
         let mock = super::super::test_api::mock(vec![
             Response::InterfaceConfig {
+                wifi_concurrent_support: None,
                 interface: "wan9".into(),
                 config: Some(config),
                 allow_management_change: false,

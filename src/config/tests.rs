@@ -1386,7 +1386,7 @@ fn concurrent_mode_requires_managed_input_and_keeps_separate_output() {
         .validate("wlan0")
         .unwrap_err()
         .to_string()
-        .contains("Receive + share"));
+        .contains("Input + Output"));
     input.managed = true;
     input.role = InterfaceRole::Output;
     assert!(input.validate("wlan0").is_err());

@@ -1,5 +1,5 @@
 //! Radio admission shared by API transactions, autoconnect and reconciliation.
-//! Shared radios require explicit Receive + share intent. Hardware admission is
+//! Shared radios require explicit Input + Output intent. Hardware admission is
 //! performed before creating or starting the virtual AP.
 use crate::config::{InterfaceConfig, NetworkConfig};
 
@@ -10,7 +10,7 @@ pub enum WifiRadioRole {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("AP {ap_interface} and client {client_interface} share wireless PHY {phy}; enable Receive + share on the input and use its virtual AP, or select a separate physical radio")]
+#[error("AP {ap_interface} and client {client_interface} share wireless PHY {phy}; enable Input + Output on the input and use its virtual AP, or select a separate physical radio")]
 pub struct WifiRadioConflict {
     pub phy: String,
     pub ap_interface: String,

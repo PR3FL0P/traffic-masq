@@ -83,7 +83,7 @@ async fn phy_index(parent: &str) -> Result<u32> {
             .join("phy80211/index"),
     )
     .await
-    .context("Receive + share requires a present Wi-Fi adapter")?
+    .context("Input + Output requires a present Wi-Fi adapter")?
     .trim()
     .parse()
     .context("invalid wireless PHY index")

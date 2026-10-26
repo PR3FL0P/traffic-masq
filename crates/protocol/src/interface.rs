@@ -116,7 +116,7 @@ pub struct WifiClientSpecView {
     pub passphrase_file: Option<PathBuf>,
 }
 
-/// Stable Linux interface name (14 bytes) for the AP half of Receive + share.
+/// Stable Linux interface name (14 bytes) for the AP half of Input + Output.
 pub fn concurrent_ap_name(parent: &str) -> String {
     let hash = parent.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)

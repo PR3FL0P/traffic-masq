@@ -195,3 +195,31 @@ fn dhcp_inventory_has_its_own_title_and_colored_server_status() {
         .iter()
         .any(|cell| cell.symbol() == "a" && cell.fg == theme::GOOD));
 }
+
+#[test]
+fn virtual_ap_inventory_identifies_the_parent_at_80_columns() {
+    let mut app = TuiApp::default();
+    let ap = traffic_masq_protocol::concurrent_ap_name("wlan0");
+    let entry = |name: &str, concurrent| {
+        serde_json::from_value(serde_json::json!({
+        "name": name, "configured": {"role": if concurrent {"input"} else {"output"}, "managed": true, "wifi_concurrent": concurrent},
+        "config_source": "override", "presence": "present", "observation_stale": false,
+        "suppressed": false, "readiness": "ready", "blockers": [], "references": []
+    })).unwrap()
+    };
+    app.dashboard.inventory = Some(vec![entry("wlan0", true), entry(&ap, false)]);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal
+        .draw(|frame| render_interface_list(frame, frame.area(), &mut app))
+        .unwrap();
+    let text: String = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect();
+    assert!(text.contains(&format!("Wi-Fi input; AP: {ap}")));
+    assert!(text.contains("Wi-Fi AP of wlan0"));
+    assert_eq!(app.ui.list_row_height, 2);
+}

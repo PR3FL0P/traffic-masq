@@ -1504,6 +1504,7 @@ async fn plan_distinguishes_unavailable_lease_counts_from_an_empty_lease_list() 
 #[tokio::test]
 async fn editing_dhcp_default_route_opens_client_metric_settings() {
     let (_directory, client, server) = router_mock_api(vec![Response::InterfaceConfig {
+        wifi_concurrent_support: None,
         interface: "eth0".into(),
         config: None,
         allow_management_change: false,

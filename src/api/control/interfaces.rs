@@ -468,7 +468,26 @@ impl ControlService {
             .get(&interface)
             .map(|value| value.allow_management_change)
             .unwrap_or(false);
+        let wifi_concurrent_support = if self.network.wireless_phy(&interface).is_some() {
+            let result =
+                if crate::wifi::concurrent::parent_for(&effective.network, &interface).is_some() {
+                    Err(anyhow::anyhow!(
+                        "this is already the output of an Input + Output adapter"
+                    ))
+                } else {
+                    crate::wifi::concurrent::validate(&interface)
+                        .await
+                        .map(|_| ())
+                };
+            Some(traffic_masq_protocol::WifiConcurrentSupport {
+                supported: result.is_ok(),
+                reason: result.err().map(|error| format!("{error:#}")),
+            })
+        } else {
+            None
+        };
         Ok(Response::InterfaceConfig {
+            wifi_concurrent_support,
             interface,
             config: config.map(Into::into),
             allow_management_change,

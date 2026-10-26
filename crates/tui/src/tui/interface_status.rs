@@ -1,7 +1,11 @@
 //! Current interface observations, kept separate from editor drafts and plans.
 use traffic_masq_protocol::{InterfacePresence, InterfaceReadiness, NetworkChangePhase};
 
-use super::TuiApp;
+use super::{theme, TuiApp};
+use ratatui::{
+    style::{Color, Style},
+    text::{Line, Span},
+};
 
 struct Status {
     link: &'static str,
@@ -95,6 +99,97 @@ pub(super) fn summary(app: &TuiApp, name: &str) -> String {
     )
 }
 
+/// One palette for observed links across lists, sharing and editors.
+pub(super) fn link_color(link: &str) -> Color {
+    match link.to_ascii_uppercase().as_str() {
+        "UP" => theme::GOOD,
+        "DOWN" => theme::MUTED,
+        _ => theme::WARN,
+    }
+}
+
+fn state_color(state: &str) -> Color {
+    match state {
+        "config ready" => theme::GOOD,
+        "disabled" => theme::MUTED,
+        "rollback required" | "recovery required" | "commit indeterminate" => theme::BAD,
+        _ => theme::WARN,
+    }
+}
+
+/// Derive the relationship from saved intent, never from an AP-looking name alone.
+pub(super) fn relationship(app: &TuiApp, name: &str) -> Option<String> {
+    let entries = app
+        .dashboard
+        .inventory
+        .as_deref()
+        .unwrap_or(&app.router.saved_interfaces);
+    // These are complete snapshots. Combining them can resurrect a relationship
+    // removed in a newer revision, including after the parent was forgotten.
+    let inventory_revision = if app.dashboard.inventory.is_some() {
+        app.dashboard.intent_revision
+    } else {
+        app.router.editor_revision
+    };
+    let wifi_revision = app
+        .wifi
+        .intent_revision
+        .or_else(|| app.wifi.rows.iter().filter_map(|row| row.revision).max());
+    let use_wifi = wifi_revision > inventory_revision
+        || (app.dashboard.inventory.is_none() && entries.is_empty());
+    let parents = entries
+        .iter()
+        .filter(|_| !use_wifi)
+        .filter_map(|entry| {
+            entry
+                .configured
+                .as_ref()
+                .filter(|config| config.wifi_concurrent)
+                .map(|_| entry.name.as_str())
+        })
+        .chain(app.wifi.rows.iter().filter(|_| use_wifi).filter_map(|row| {
+            row.configured
+                .as_ref()
+                .filter(|config| config.wifi_concurrent)
+                .map(|_| row.interface.as_str())
+        }));
+    for parent in parents {
+        let ap = traffic_masq_protocol::concurrent_ap_name(parent);
+        if name == ap {
+            return Some(format!("Wi-Fi AP of {parent}"));
+        }
+        if name == parent {
+            return Some(format!("Wi-Fi input; AP: {ap}"));
+        }
+    }
+    None
+}
+
+pub(super) fn context_lines(app: &TuiApp, name: &str) -> Vec<Line<'static>> {
+    let mut header = summary_line(app, name);
+    header.spans.insert(0, Span::raw(format!("{name} · ")));
+    let mut lines = vec![header];
+    if let Some(relation) = relationship(app, name) {
+        let is_ap = relation.starts_with("Wi-Fi AP of ");
+        lines.push(Line::styled(relation, Style::default().fg(theme::ACCENT)));
+        lines.push(Line::from(if is_ap {
+            "Shared radio: channel follows the input. Interfaces: Output + LAN address; Wi-Fi: SSID/password + DHCP; Internet sharing: From this AP, Through its input."
+        } else {
+            "Connect this input in Wi-Fi. Configure the linked AP for local clients; both share one radio and channel."
+        }));
+    }
+    lines
+}
+
+pub(super) fn summary_line(app: &TuiApp, name: &str) -> Line<'static> {
+    let status = status(app, name);
+    Line::from(vec![
+        Span::styled(status.link, Style::default().fg(link_color(status.link))),
+        Span::raw(format!(" · traffic-masq:{} · ", status.owner)),
+        Span::styled(status.state, Style::default().fg(state_color(status.state))),
+    ])
+}
+
 pub(super) fn cell(app: &TuiApp, name: &str) -> ratatui::text::Text<'static> {
     let status = status(app, name);
     let link = if status.link.contains("stale") {
@@ -110,15 +205,29 @@ pub(super) fn cell(app: &TuiApp, name: &str) -> ratatui::text::Text<'static> {
         "waiting for device" => "waiting device",
         state => state,
     };
-    ratatui::text::Text::from(vec![
-        ratatui::text::Line::from(name.to_owned()),
-        ratatui::text::Line::from(format!("{link} tm:{}", status.owner)),
-        ratatui::text::Line::from(state),
-    ])
+    let mut lines = vec![
+        Line::from(name.to_owned()),
+        Line::from(vec![
+            Span::styled(link, Style::default().fg(link_color(status.link))),
+            Span::raw(format!(" tm:{}", status.owner)),
+        ]),
+        Line::styled(state, Style::default().fg(state_color(status.state))),
+    ];
+    if let Some(relation) = relationship(app, name) {
+        lines.push(Line::styled(
+            relation.trim_start_matches("Wi-Fi ").to_owned(),
+            Style::default().fg(theme::ACCENT),
+        ));
+    }
+    ratatui::text::Text::from(lines)
 }
 
 pub(super) fn describe(app: &TuiApp, name: &str) -> String {
-    format!("{name} · {}", summary(app, name))
+    format!(
+        "{name}{} · {}",
+        relationship(app, name).map_or_else(String::new, |relation| format!(" ({relation})")),
+        summary(app, name)
+    )
 }
 
 pub(super) fn render_context(
@@ -130,10 +239,7 @@ pub(super) fn render_context(
     if name.is_empty() {
         return area;
     }
-    let lines = super::layout::wrap_lines(
-        vec![ratatui::text::Line::from(describe(app, name))],
-        area.width,
-    );
+    let lines = super::layout::wrap_styled_lines(context_lines(app, name), area.width);
     let height = (lines.len() as u16).min(area.height);
     frame.render_widget(
         ratatui::widgets::Paragraph::new(lines),
@@ -192,6 +298,116 @@ mod tests {
             "config_source": "override", "presence": "present", "observation_stale": false,
             "suppressed": false, "readiness": "ready", "blockers": [], "references": []
         })).unwrap()
+    }
+
+    #[test]
+    fn shared_status_palette_keeps_unknown_and_recovery_distinct() {
+        let mut app = TuiApp::default();
+        let mut row = entry();
+        for (up, stale, expected) in [
+            (true, false, theme::GOOD),
+            (false, false, theme::MUTED),
+            (true, true, theme::WARN),
+        ] {
+            row.observed.as_mut().unwrap().interface.is_up = up;
+            row.observation_stale = stale;
+            app.dashboard.inventory = Some(vec![row.clone()]);
+            assert_eq!(
+                cell(&app, "lan0").lines[1].spans[0].style.fg,
+                Some(expected)
+            );
+            assert_eq!(summary_line(&app, "lan0").spans[0].style.fg, Some(expected));
+        }
+        assert_eq!(state_color("config ready"), theme::GOOD);
+        assert_eq!(state_color("awaiting confirmation"), theme::WARN);
+        assert_eq!(state_color("recovery required"), theme::BAD);
+        assert_eq!(state_color("disabled"), theme::MUTED);
+    }
+
+    #[test]
+    fn concurrent_ap_relationship_is_bidirectional_and_explains_configuration() {
+        let mut app = TuiApp::default();
+        let mut parent = entry();
+        parent.name = "wlan0".into();
+        parent.configured.as_mut().unwrap().wifi_concurrent = true;
+        app.router.saved_interfaces = vec![parent];
+        let ap = traffic_masq_protocol::concurrent_ap_name("wlan0");
+        assert_eq!(
+            relationship(&app, &ap).as_deref(),
+            Some("Wi-Fi AP of wlan0")
+        );
+        assert!(relationship(&app, "wlan0").unwrap().contains(&ap));
+        assert_eq!(relationship(&app, "ap-foreign"), None);
+        assert_eq!(cell(&app, &ap).lines.len(), 4);
+        let hints = context_lines(&app, &ap).last().unwrap().to_string();
+        for hint in [
+            "SSID/password",
+            "DHCP",
+            "From this AP",
+            "Through its input",
+            "channel",
+        ] {
+            assert!(hints.contains(hint));
+        }
+        app.router.saved_interfaces[0]
+            .configured
+            .as_mut()
+            .unwrap()
+            .wifi_concurrent = false;
+        assert_eq!(relationship(&app, &ap), None);
+    }
+
+    #[test]
+    fn concurrent_relationship_uses_the_latest_snapshot() {
+        use super::super::wifi::{WifiRole, WifiRow};
+        let mut app = TuiApp::default();
+        let mut parent = entry();
+        parent.name = "wlan0".into();
+        parent.configured.as_mut().unwrap().wifi_concurrent = true;
+        app.wifi.rows.push(WifiRow {
+            execution_available: true,
+            presence: InterfacePresence::Present,
+            configured: parent.configured.clone(),
+            revision: Some(1),
+            interface: parent.name.clone(),
+            role: WifiRole::Client,
+            ap: None,
+            client: None,
+        });
+        parent.configured.as_mut().unwrap().wifi_concurrent = false;
+        app.dashboard.inventory = Some(vec![parent]);
+        app.dashboard.intent_revision = Some(2);
+        let ap = traffic_masq_protocol::concurrent_ap_name("wlan0");
+        assert_eq!(relationship(&app, &ap), None);
+        assert_eq!(relationship(&app, "wlan0"), None);
+
+        // Forgetting the parent must also suppress its cached relationship.
+        app.dashboard.inventory = Some(vec![]);
+        assert_eq!(relationship(&app, &ap), None);
+
+        // A newer Wi-Fi snapshot can enable the relationship again.
+        app.wifi.rows[0].revision = Some(3);
+        assert_eq!(
+            relationship(&app, &ap).as_deref(),
+            Some("Wi-Fi AP of wlan0")
+        );
+        assert!(relationship(&app, "wlan0").unwrap().contains(&ap));
+
+        let mut older_parent = entry();
+        older_parent.name = "wlan0".into();
+        older_parent.configured = app.wifi.rows[0].configured.clone();
+        app.dashboard.inventory = Some(vec![older_parent]);
+        app.wifi.rows[0]
+            .configured
+            .as_mut()
+            .unwrap()
+            .wifi_concurrent = false;
+        assert_eq!(relationship(&app, &ap), None);
+
+        // Even an empty newer snapshot supersedes the old parent.
+        app.wifi.rows.clear();
+        app.wifi.intent_revision = Some(4);
+        assert_eq!(relationship(&app, &ap), None);
     }
 
     #[test]

@@ -587,6 +587,7 @@ fn section_of_maps_sub_screens_to_their_parent_tab() {
     assert_eq!(section_of(Screen::Settings), Section::Settings);
     assert_eq!(section_of(Screen::SettingsPassword), Section::Settings);
     assert_eq!(section_of(Screen::Access), Section::Settings);
+    assert_eq!(section_of(Screen::DnsDefaults), Section::Settings);
     assert_eq!(section_of(Screen::Log), Section::Log);
 }
 

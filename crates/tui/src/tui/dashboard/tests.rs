@@ -397,6 +397,7 @@ async fn partial_api_failure_does_not_clear_other_status_or_fetch_dhcp() {
                                     interfaces: vec![status(1)],
                                 },
                                 "get_interface_config" => Response::InterfaceConfig {
+                                    wifi_concurrent_support: None,
                                     interface: "eth1".into(),
                                     config: None,
                                     allow_management_change: false,

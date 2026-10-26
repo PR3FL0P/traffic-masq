@@ -1102,6 +1102,7 @@ fn render_wifi_displays_conflict_advice_when_competing_managers_present() {
 
     let mut app = TuiApp {
         wifi: WifiData {
+            intent_revision: None,
             rows: vec![WifiRow {
                 execution_available: true,
                 presence: traffic_masq_protocol::InterfacePresence::Present,
@@ -1327,6 +1328,7 @@ fn render_wifi_client_conflict_advice_when_ap_also_present() {
 
     let mut app = TuiApp {
         wifi: WifiData {
+            intent_revision: None,
             rows: vec![WifiRow {
                 execution_available: true,
                 presence: traffic_masq_protocol::InterfacePresence::Present,

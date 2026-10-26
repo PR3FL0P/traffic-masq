@@ -19,7 +19,6 @@ pub(crate) enum InterfaceEditorField {
     Cidr,
     RemoveIpv4,
     Role,
-    WifiMode,
     Managed,
     Advanced,
     MacAddress,
@@ -29,12 +28,11 @@ pub(crate) enum InterfaceEditorField {
     Reset,
 }
 
-const INTERFACE_EDITOR_FIELDS: [InterfaceEditorField; 11] = [
+const INTERFACE_EDITOR_FIELDS: [InterfaceEditorField; 10] = [
     InterfaceEditorField::Cidr,
     InterfaceEditorField::RemoveIpv4,
     InterfaceEditorField::Role,
     InterfaceEditorField::Managed,
-    InterfaceEditorField::WifiMode,
     InterfaceEditorField::Advanced,
     InterfaceEditorField::MacAddress,
     InterfaceEditorField::RandomizeMac,
@@ -45,6 +43,7 @@ const INTERFACE_EDITOR_FIELDS: [InterfaceEditorField; 11] = [
 
 #[derive(Debug, Clone)]
 pub(crate) struct InterfaceEditor {
+    pub(crate) wifi_concurrent_support: Option<traffic_masq_protocol::WifiConcurrentSupport>,
     pub(crate) wifi_concurrent: bool,
     pub(crate) mac_address: String,
     pub(crate) interface: String,
@@ -77,6 +76,24 @@ pub(crate) struct InterfaceEditor {
 }
 
 impl InterfaceEditor {
+    fn cycle_role(&mut self) {
+        if self.wifi_concurrent {
+            self.role = InterfaceRole::None;
+            self.wifi_concurrent = false;
+        } else if self.role == InterfaceRole::Output
+            && self
+                .wifi_concurrent_support
+                .as_ref()
+                .is_some_and(|s| s.supported)
+        {
+            self.role = InterfaceRole::Input;
+            self.wifi_concurrent = true;
+            self.managed = true;
+        } else {
+            self.role = next_role(self.role);
+        }
+    }
+
     fn dirty(&self) -> bool {
         self.wifi_concurrent
             != self
@@ -358,11 +375,7 @@ pub(crate) fn render_interface_inventory(
                     ),
                     Span::styled(
                         format!("{link:<6} "),
-                        Style::default().fg(if link == "up" {
-                            theme::GOOD
-                        } else {
-                            theme::MUTED
-                        }),
+                        Style::default().fg(super::interface_status::link_color(link)),
                     ),
                 ];
                 if !dhcp {
@@ -406,13 +419,21 @@ pub(crate) fn render_interface_inventory(
                     ));
                 }
                 spans.push(Span::raw(format!("{addresses}{configured}")));
-                [
-                    Line::from(spans),
-                    Line::from(format!(
-                        "  {}",
-                        super::interface_status::summary(app, &entry.name)
-                    )),
-                ]
+                let mut detail = super::interface_status::summary_line(app, &entry.name);
+                detail.spans.insert(0, Span::raw("  "));
+                if let Some(relation) = super::interface_status::relationship(app, &entry.name) {
+                    detail.spans.insert(
+                        1,
+                        Span::styled(format!("{relation} · "), Style::default().fg(theme::ACCENT)),
+                    );
+                }
+                if let Some(config) = &entry.configured {
+                    detail.spans.push(Span::raw(format!(
+                        " · Router role: {}",
+                        role_label(config.role, config.wifi_concurrent)
+                    )));
+                }
+                [Line::from(spans), detail]
             })
             .collect();
         frame.render_widget(Paragraph::new(lines), rows);
@@ -617,6 +638,8 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         &format!(
             "Router role: {}",
             match editor.role {
+                InterfaceRole::Input if editor.wifi_concurrent =>
+                    "Input + Output — Wi-Fi Internet + LAN",
                 InterfaceRole::Input => "Input — Internet / WAN",
                 InterfaceRole::Output => "Output — local network / LAN",
                 InterfaceRole::None => "None — outside the router",
@@ -632,17 +655,6 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         ),
         InterfaceEditorField::Managed,
     ));
-    lines.push(row(
-        &format!(
-            "Wi-Fi mode: {}",
-            if editor.wifi_concurrent {
-                "Receive + share"
-            } else {
-                "Single role"
-            }
-        ),
-        InterfaceEditorField::WifiMode,
-    ));
     if editor.wifi_concurrent {
         lines.push(Line::styled(
             format!(
@@ -650,6 +662,29 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
                 traffic_masq_protocol::concurrent_ap_name(&editor.interface)
             ),
             Style::default().fg(theme::MUTED),
+        ));
+    }
+    if let Some(support) = &editor.wifi_concurrent_support {
+        if !support.supported {
+            lines.push(Line::styled(
+                format!(
+                    "  Input + Output unavailable: {}",
+                    support
+                        .reason
+                        .as_deref()
+                        .unwrap_or("driver support could not be verified")
+                ),
+                Style::default().fg(theme::MUTED),
+            ));
+        }
+    }
+    if super::interface_status::relationship(app, &editor.interface).is_some() {
+        lines.extend(super::layout::wrap_styled_lines(
+            super::interface_status::context_lines(app, &editor.interface)
+                .into_iter()
+                .skip(1)
+                .collect(),
+            chunks[0].width,
         ));
     }
     let advanced_row = lines.len();
@@ -690,8 +725,8 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         InterfaceEditorField::Managed if editor.original_managed && !editor.managed =>
             "Applying removes traffic-masq-owned settings and stops managing this interface.",
         InterfaceEditorField::Managed => "Enables address and MAC configuration independently of routing.",
-        InterfaceEditorField::WifiMode => "Receive + share uses one Wi-Fi adapter for Internet and a virtual AP. Driver support is checked on Apply. Channel follows the uplink.",
-        InterfaceEditorField::Role => "Enter/Space changes router participation. None keeps this interface outside routing.",
+        InterfaceEditorField::Role if editor.wifi_concurrent_support.as_ref().is_some_and(|s| s.supported) => "Enter/Space: None → Input → Output → Input + Output. Combined role receives Wi-Fi and creates a virtual AP; channel follows the uplink.",
+        InterfaceEditorField::Role => "Enter/Space changes router participation. Input + Output requires verified Wi-Fi AP + station support.",
         InterfaceEditorField::MacAddress | InterfaceEditorField::RandomizeMac if !editor.managed =>
             "MAC editing disabled: enable Configure with traffic-masq first.",
         InterfaceEditorField::MacAddress | InterfaceEditorField::RandomizeMac =>
@@ -854,8 +889,15 @@ pub(crate) fn render_preview(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
         lines.insert(
             2,
             Line::from(format!(
-                "Router role: {:?} → {:?}",
-                editor.original_role, editor.role
+                "Router role: {} → {}",
+                role_label(
+                    editor.original_role,
+                    editor
+                        .saved_config
+                        .as_ref()
+                        .is_some_and(|c| c.wifi_concurrent)
+                ),
+                role_label(editor.role, editor.wifi_concurrent)
             )),
         );
         if !editor.current_addresses.is_empty() {
@@ -1173,8 +1215,39 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
             .configured
             .as_ref()
             .map_or(InterfaceRole::None, |config| config.role);
-        if draft.role == draft.original_role {
+        if draft.role == draft.original_role
+            && draft.wifi_concurrent
+                == draft
+                    .saved_config
+                    .as_ref()
+                    .is_some_and(|c| c.wifi_concurrent)
+        {
             draft.role = role;
+            draft.wifi_concurrent = entry.configured.as_ref().is_some_and(|c| c.wifi_concurrent);
+        }
+        // A draft opened while the adapter was absent has no capability data.
+        // Recheck the current device after hotplug as well as known Wi-Fi drafts.
+        if entry.presence == traffic_masq_protocol::InterfacePresence::Missing {
+            draft.wifi_concurrent_support = None;
+        } else if draft.wifi_concurrent_support.is_some()
+            || draft.wifi_concurrent
+            || entry
+                .observed
+                .as_ref()
+                .is_some_and(|status| status.interface.is_wireless)
+        {
+            draft.wifi_concurrent_support = match client
+                .request(&Request::GetInterfaceConfig {
+                    interface: name.clone(),
+                })
+                .await
+            {
+                Ok(Response::InterfaceConfig {
+                    wifi_concurrent_support,
+                    ..
+                }) => wifi_concurrent_support,
+                _ => None,
+            };
         }
         let mac = entry
             .configured
@@ -1265,6 +1338,7 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
         .await
     {
         Ok(Response::InterfaceConfig {
+            wifi_concurrent_support,
             config,
             allow_management_change,
             ..
@@ -1292,6 +1366,7 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
                 .map(|dhcp| format!("DHCP pool {}-{}", dhcp.pool_start, dhcp.pool_end));
             let cursor = super::input::grapheme_count(&cidr);
             app.editor = Some(InterfaceEditor {
+                wifi_concurrent_support,
                 wifi_concurrent: config.as_ref().is_some_and(|c| c.wifi_concurrent),
                 mac_address: config
                     .as_ref()
@@ -1542,19 +1617,7 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
                     unmanaged_ip_attempt = true;
                 }
             }
-            InterfaceEditorField::Role => {
-                editor.role = next_role(editor.role);
-                if editor.role != InterfaceRole::Input {
-                    editor.wifi_concurrent = false;
-                }
-            }
-            InterfaceEditorField::WifiMode => {
-                editor.wifi_concurrent = !editor.wifi_concurrent;
-                if editor.wifi_concurrent {
-                    editor.role = InterfaceRole::Input;
-                    editor.managed = true;
-                }
-            }
+            InterfaceEditorField::Role => editor.cycle_role(),
             InterfaceEditorField::Managed => {
                 editor.managed = !editor.managed;
                 if !editor.managed {
@@ -1886,6 +1949,16 @@ async fn finish_pending(app: &mut TuiApp, client: &ApiClient, commit: bool) {
             format!("Unexpected response: {response:?}"),
         ),
         Err(error) => app.push_message(LogLevel::Error, error.to_string()),
+    }
+}
+
+fn role_label(role: InterfaceRole, concurrent: bool) -> &'static str {
+    match role {
+        InterfaceRole::Input if concurrent => "Input + Output",
+        InterfaceRole::Input => "Input",
+        InterfaceRole::Output => "Output",
+        InterfaceRole::None => "None",
+        InterfaceRole::Middle => "Middle",
     }
 }
 

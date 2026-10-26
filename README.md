@@ -438,9 +438,9 @@ rule with masquerading. The uplink needs a working address and route. See
 Yes, with a Linux-compatible adapter that supports AP mode and hostapd installed.
 Configure the access point, its LAN address and DHCP pool, then add an Internet
 sharing rule through the wired uplink. For a Wi-Fi uplink and local AP, use separate radios, or enable
-**Receive + share** on a compatible adapter:
+**Input + Output** on a compatible adapter:
 
-1. In **Interfaces**, edit the Wi-Fi input, select **Wi-Fi mode → Receive + share**,
+1. In **Interfaces**, edit the Wi-Fi input, select **Router role → Input + Output**,
    then Apply and Commit. The driver must advertise simultaneous station + AP support.
 2. Connect the input to the upstream network in **Wi-Fi**.
 3. The new `ap…` interface appears in **Interfaces**. Assign it a managed **Output**
@@ -453,7 +453,7 @@ Both directions share airtime. Drivers requiring matching beacon intervals or a
 minimum beacon-interval GCD are currently rejected; DFS/no-IR channel restrictions
 still apply. Hardware support is checked again when restoring the virtual interface.
 To disable the mode, first disable AP/DHCP and unmanage the virtual output, then
-switch the input back to **Single role**. Virtual interfaces are recreated after
+switch the adapter back to **Input** (or **None**). Virtual interfaces are recreated after
 restart and removed on rollback or shutdown with interface restoration enabled.
 
 ### Do LAN devices need WireGuard installed to use the VPN gateway?

@@ -538,3 +538,39 @@ async fn sharing_status_rows_keep_mouse_selection_aligned() {
     .await;
     assert_eq!(app.router.selected_connection, 1);
 }
+
+#[test]
+fn sharing_keeps_up_green_and_shows_virtual_ap_parent_at_terminal_widths() {
+    use ratatui::{backend::TestBackend, Terminal};
+    for width in [80, 120] {
+        let mut app = TuiApp::default();
+        let ap = traffic_masq_protocol::concurrent_ap_name("wlan0");
+        app.router.proposed_router_config.forwarding = Some(vec![connection(&ap, "wlan0")]);
+        app.dashboard.interfaces = vec![
+            interface_status(&ap, false),
+            interface_status("wlan0", true),
+        ];
+        app.router.saved_interfaces = vec![serde_json::from_value(serde_json::json!({
+            "name": "wlan0", "configured": {"role": "input", "managed": true, "wifi_concurrent": true},
+            "config_source": "override", "presence": "present", "observation_stale": false,
+            "suppressed": false, "readiness": "ready", "blockers": [], "references": []
+        })).unwrap()];
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        terminal
+            .draw(|frame| render_list(frame, frame.area(), &mut app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("AP of wlan0"), "{width}: {text}");
+        assert_eq!(app.ui.list_row_height, 4);
+        let up_positions: Vec<_> = (0..24)
+            .flat_map(|y| (0..width - 1).map(move |x| (x, y)))
+            .filter(|&(x, y)| buffer[(x, y)].symbol() == "U" && buffer[(x + 1, y)].symbol() == "P")
+            .collect();
+        assert_eq!(up_positions.len(), 2);
+        for (x, y) in up_positions {
+            assert_eq!(buffer[(x, y)].fg, theme::GOOD);
+            assert_eq!(buffer[(x + 1, y)].fg, theme::GOOD);
+        }
+    }
+}

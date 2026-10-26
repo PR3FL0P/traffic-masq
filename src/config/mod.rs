@@ -635,7 +635,7 @@ impl NetworkConfig {
             if let Some(child) = self.interfaces.get(&ap) {
                 anyhow::ensure!(
                     child.mac_address.is_none(),
-                    "virtual AP {ap} MAC is managed by Receive + share"
+                    "virtual AP {ap} MAC is managed by Input + Output"
                 );
                 anyhow::ensure!(
                     !child.managed || child.role == InterfaceRole::Output,
@@ -837,7 +837,7 @@ impl InterfaceConfig {
     pub fn validate(&self, name: &str) -> Result<()> {
         anyhow::ensure!(
             !self.wifi_concurrent || (self.managed && self.role == InterfaceRole::Input),
-            "Receive + share requires a managed input interface"
+            "Input + Output requires a managed input interface"
         );
         if let Some(mac) = self.mac_address {
             anyhow::ensure!(self.managed, "MAC address requires a managed interface");
@@ -872,7 +872,7 @@ impl InterfaceConfig {
         }
 
         if self.wifi.is_some() && self.wifi_client.is_some() {
-            bail!("an interface cannot be both a Wi-Fi access point and a Wi-Fi client (use Receive + share to create a separate virtual AP)");
+            bail!("an interface cannot be both a Wi-Fi access point and a Wi-Fi client (use Input + Output to create a separate virtual AP)");
         }
 
         if let Some(hostname) = self

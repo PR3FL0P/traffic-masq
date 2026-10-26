@@ -169,6 +169,7 @@ async fn keyboard_ip_and_mac_edit_previews_applies_and_confirms_the_typed_addres
     };
     let responses = vec![
         Response::InterfaceConfig {
+            wifi_concurrent_support: None,
             interface: "wlp1s0".into(),
             config: None,
             allow_management_change: false,
@@ -239,7 +240,7 @@ async fn keyboard_ip_and_mac_edit_previews_applies_and_confirms_the_typed_addres
     for character in "198.18.0.1/24".chars() {
         handle_editor_key(&mut app, KeyCode::Char(character), &client).await;
     }
-    for _ in 0..5 {
+    for _ in 0..4 {
         super::super::handle_key(&mut app, KeyCode::Tab, &client, false).await;
     }
     assert_eq!(
@@ -279,6 +280,7 @@ async fn keyboard_ip_and_mac_edit_previews_applies_and_confirms_the_typed_addres
 
 fn default_route_editor(allow_management_change: bool) -> InterfaceEditor {
     InterfaceEditor {
+        wifi_concurrent_support: None,
         wifi_concurrent: false,
         mac_address: String::new(),
         saved_config: None,
@@ -632,11 +634,6 @@ async fn mac_controls_require_management_and_switching_it_off_clears_the_mac() {
     handle_editor_key(&mut app, KeyCode::Up, &client).await;
     assert_eq!(
         app.editor.as_ref().unwrap().field,
-        InterfaceEditorField::WifiMode
-    );
-    handle_editor_key(&mut app, KeyCode::Up, &client).await;
-    assert_eq!(
-        app.editor.as_ref().unwrap().field,
         InterfaceEditorField::Managed
     );
     handle_editor_key(&mut app, KeyCode::Enter, &client).await;
@@ -845,11 +842,15 @@ async fn interface_exit_keeps_or_discards_draft_with_keyboard_focus() {
         .interfaces
         .push(observed_address(None, Some(false)));
     app.dashboard.interfaces[0].interface.name = "wlan0".into();
-    let refreshed = crate::tui::test_api::mock(vec![draft_inventory_response(
-        traffic_masq_protocol::InterfacePresence::Present,
-        8,
-        None,
-    )])
+    let refreshed = crate::tui::test_api::mock(vec![
+        draft_inventory_response(traffic_masq_protocol::InterfacePresence::Present, 8, None),
+        Response::InterfaceConfig {
+            interface: "wlan0".into(),
+            config: None,
+            allow_management_change: false,
+            wifi_concurrent_support: None,
+        },
+    ])
     .await;
     open_editor(&mut app, &refreshed.client).await;
     assert_eq!(app.screen, Screen::InterfaceEditor);
@@ -1000,11 +1001,17 @@ async fn resumed_interface_draft_refreshes_execution_mode_revision_and_review_ba
                 missing_dependencies: vec!["wlan0".into()],
             }
         };
-        let mock = crate::tui::test_api::mock(vec![
-            draft_inventory_response(presence, 9, Some(config)),
-            response,
-        ])
-        .await;
+        let mut responses = vec![draft_inventory_response(presence, 9, Some(config))];
+        if presence == InterfacePresence::Present {
+            responses.push(Response::InterfaceConfig {
+                interface: "wlan0".into(),
+                config: None,
+                allow_management_change: false,
+                wifi_concurrent_support: None,
+            });
+        }
+        responses.push(response);
+        let mock = crate::tui::test_api::mock(responses).await;
         let mut app = TuiApp {
             screen: Screen::InterfaceList,
             ..Default::default()
@@ -1034,9 +1041,14 @@ async fn resumed_interface_draft_refreshes_execution_mode_revision_and_review_ba
         }
         submit_dry_run(&mut app, &mock.client).await;
         let calls = mock.calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
+        let submit_index = if presence == InterfacePresence::Present {
+            2
+        } else {
+            1
+        };
+        assert_eq!(calls.len(), submit_index + 1);
         assert_eq!(
-            calls[1].body["type"],
+            calls[submit_index].body["type"],
             if presence == InterfacePresence::Present {
                 "dry_run_interface_edit"
             } else {
@@ -1044,7 +1056,7 @@ async fn resumed_interface_draft_refreshes_execution_mode_revision_and_review_ba
             }
         );
         if presence == InterfacePresence::Missing {
-            assert_eq!(calls[1].body["expected_revision"], 9);
+            assert_eq!(calls[submit_index].body["expected_revision"], 9);
         }
     }
 }
@@ -1102,4 +1114,144 @@ fn receive_and_share_is_preserved_in_interface_edit_request() {
     assert!(request.wifi_concurrent);
     assert_eq!(request.role, InterfaceRole::Input);
     assert!(editor.dirty());
+}
+
+#[tokio::test]
+async fn returning_wifi_adapter_refreshes_combined_role_support_for_offline_draft() {
+    use traffic_masq_protocol::{InterfacePresence, WifiConcurrentSupport};
+    let mut inventory = draft_inventory_response(InterfacePresence::Present, 8, None);
+    if let Response::InterfaceInventory { interfaces, .. } = &mut inventory {
+        interfaces[0]
+            .observed
+            .as_mut()
+            .unwrap()
+            .interface
+            .is_wireless = true;
+    }
+    let mock = super::super::test_api::mock(vec![
+        inventory,
+        Response::InterfaceConfig {
+            interface: "wlan0".into(),
+            config: None,
+            allow_management_change: false,
+            wifi_concurrent_support: Some(WifiConcurrentSupport {
+                supported: true,
+                reason: None,
+            }),
+        },
+    ])
+    .await;
+    let mut draft = unmanaged_editor();
+    draft.interface = "wlan0".into();
+    draft.offline_revision = Some(7);
+    draft.wifi_concurrent_support = None;
+    let mut app = TuiApp::default();
+    let mut observed = observed_address(None, Some(false));
+    observed.interface.name = "wlan0".into();
+    app.dashboard.interfaces.push(observed);
+    app.interface_drafts.insert("wlan0".into(), draft);
+
+    open_editor(&mut app, &mock.client).await;
+
+    let editor = app.editor.as_mut().unwrap();
+    assert_eq!(editor.offline_revision, None);
+    editor.role = InterfaceRole::Output;
+    editor.cycle_role();
+    assert!(editor.wifi_concurrent);
+    assert!(editor.managed);
+    assert_eq!(editor.role, InterfaceRole::Input);
+    let calls = mock.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].body["type"], "get_interface_config");
+}
+
+#[tokio::test]
+async fn combined_role_keyboard_selection_requires_driver_support_and_enables_management() {
+    for supported in [false, true] {
+        let mut editor = unmanaged_editor();
+        editor.role = InterfaceRole::Output;
+        editor.field = InterfaceEditorField::Role;
+        editor.wifi_concurrent_support = Some(traffic_masq_protocol::WifiConcurrentSupport {
+            supported,
+            reason: (!supported).then(|| "driver does not support AP + STA".into()),
+        });
+        let mut app = TuiApp {
+            editor: Some(editor),
+            ..Default::default()
+        };
+        let client = ApiClient::new("/unused-role-test.sock");
+        handle_editor_key(&mut app, KeyCode::Enter, &client).await;
+        let editor = app.editor.as_ref().unwrap();
+        assert_eq!(editor.wifi_concurrent, supported);
+        assert_eq!(
+            editor.role,
+            if supported {
+                InterfaceRole::Input
+            } else {
+                InterfaceRole::None
+            }
+        );
+        if supported {
+            assert!(editor.managed);
+            assert_eq!(
+                role_label(editor.role, editor.wifi_concurrent),
+                "Input + Output"
+            );
+            app.editor.as_mut().unwrap().allow_management_change = true;
+            let request = app.editor.as_ref().unwrap().edit_request().unwrap();
+            assert!(request.wifi_concurrent);
+            assert_eq!(request.role, InterfaceRole::Input);
+            handle_editor_key(&mut app, KeyCode::Char(' '), &client).await;
+            assert!(!app.editor.as_ref().unwrap().wifi_concurrent);
+            assert_eq!(app.editor.as_ref().unwrap().role, InterfaceRole::None);
+        }
+    }
+}
+
+#[test]
+fn saved_combined_role_can_be_left_when_adapter_support_is_unavailable() {
+    let mut editor = default_route_editor(true);
+    editor.role = InterfaceRole::Input;
+    editor.wifi_concurrent = true;
+    editor.wifi_concurrent_support = None;
+    editor.cycle_role();
+    assert_eq!(editor.role, InterfaceRole::None);
+    assert!(!editor.wifi_concurrent);
+    editor.role = InterfaceRole::Output;
+    editor.cycle_role();
+    assert_eq!(
+        editor.role,
+        InterfaceRole::None,
+        "unknown support must not offer a combined role"
+    );
+}
+
+#[tokio::test]
+async fn opening_editor_uses_daemon_capability_and_restores_saved_combined_role() {
+    let config: traffic_masq_protocol::InterfaceConfigView = serde_json::from_value(
+        serde_json::json!({"role": "input", "managed": true, "wifi_concurrent": true}),
+    )
+    .unwrap();
+    let support = traffic_masq_protocol::WifiConcurrentSupport {
+        supported: true,
+        reason: None,
+    };
+    let mock = super::super::test_api::mock(vec![Response::InterfaceConfig {
+        interface: "wlp1s0".into(),
+        config: Some(config),
+        allow_management_change: false,
+        wifi_concurrent_support: Some(support.clone()),
+    }])
+    .await;
+    let mut app = TuiApp::default();
+    app.dashboard
+        .interfaces
+        .push(observed_address(None, Some(false)));
+    open_editor(&mut app, &mock.client).await;
+    let editor = app.editor.as_ref().unwrap();
+    assert_eq!(editor.wifi_concurrent_support, Some(support));
+    assert_eq!(
+        role_label(editor.role, editor.wifi_concurrent),
+        "Input + Output"
+    );
 }

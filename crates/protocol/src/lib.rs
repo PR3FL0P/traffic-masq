@@ -859,6 +859,13 @@ pub enum RouterProvisioningErrorDetail {
     },
 }
 
+/// Read-only driver admission result for the Input + Output router role.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WifiConcurrentSupport {
+    pub supported: bool,
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InterfaceEditRequest {
     /// Receive Wi-Fi and expose a virtual AP on the same physical radio.
@@ -1563,6 +1570,8 @@ pub enum Response<
         missing_dependencies: Vec<String>,
     },
     InterfaceConfig {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wifi_concurrent_support: Option<WifiConcurrentSupport>,
         interface: String,
         config: Option<InterfaceConfig>,
         allow_management_change: bool,

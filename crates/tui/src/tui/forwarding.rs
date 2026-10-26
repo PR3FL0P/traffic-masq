@@ -316,7 +316,15 @@ pub(crate) fn render_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
         .router
         .selected_connection
         .min(rules_slice.len().saturating_sub(1));
-    let visible = usize::from(inner.height.saturating_sub(1) / 3);
+    let row_height = if rules_slice.iter().any(|rule| {
+        super::interface_status::relationship(app, &rule.from).is_some()
+            || super::interface_status::relationship(app, &rule.to).is_some()
+    }) {
+        4
+    } else {
+        3
+    };
+    let visible = usize::from(inner.height.saturating_sub(1) / row_height);
     let scroll = app
         .router
         .selected_connection
@@ -380,7 +388,7 @@ pub(crate) fn render_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
                 ),
                 Cell::from(status).style(interface_style(from_missing || to_missing)),
             ])
-            .height(3)
+            .height(row_height)
             .style(
                 if index == app.router.selected_connection && !app.router.sharing_actions_focused {
                     Style::default()
@@ -414,7 +422,7 @@ pub(crate) fn render_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
         inner.width,
         inner.height.saturating_sub(1),
     ));
-    app.ui.list_row_height = 3;
+    app.ui.list_row_height = row_height;
     app.ui.list_count = rules_slice.len();
     app.ui.list_scroll_offset = scroll;
     if rules_slice.is_empty() {

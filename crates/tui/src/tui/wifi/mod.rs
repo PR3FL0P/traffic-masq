@@ -80,6 +80,7 @@ pub(crate) struct WifiRow {
 #[derive(Debug, Default, Clone)]
 pub(crate) struct WifiData {
     pub(crate) rows: Vec<WifiRow>,
+    pub(crate) intent_revision: Option<u64>,
 
     pub(crate) selected: usize,
 
@@ -740,20 +741,29 @@ pub(crate) fn render_wifi(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
         ));
     }
     for (index, row) in app.wifi.rows.iter().enumerate() {
-        lines.push(Line::styled(
-            format!(
-                "{}{}  {:<12} {}",
+        let mut line = super::interface_status::summary_line(app, &row.interface);
+        let relation = super::interface_status::relationship(app, &row.interface)
+            .map_or_else(String::new, |relation| format!(" ({relation})"));
+        line.spans.insert(
+            0,
+            Span::raw(format!(
+                "{}{}{} · ",
                 if index == app.wifi.selected {
                     "▶ "
                 } else {
                     "  "
                 },
-                super::interface_status::describe(app, &row.interface),
-                role_label(row.role),
-                describe_row_state(row)
-            ),
-            selected_style(index == app.wifi.selected),
-        ));
+                row.interface,
+                relation,
+            )),
+        );
+        line.spans.push(Span::raw(format!(
+            "  {:<12} {}",
+            role_label(row.role),
+            describe_row_state(row)
+        )));
+        line.style = selected_style(index == app.wifi.selected);
+        lines.push(line);
     }
     let radio_start = usize::from(app.wifi.error.is_some());
     let mut button_rows = Vec::new();
@@ -1379,6 +1389,7 @@ pub(crate) async fn load_wifi_data(app: &mut TuiApp, client: &ApiClient) {
                 })
                 .collect();
             app.wifi.error = observation_error;
+            app.wifi.intent_revision = Some(revision);
             app.wifi.ap_disabled = !ap_execution_available;
             app.wifi.client_disabled = !client_execution_available;
             app.wifi.replace_rows(rows);

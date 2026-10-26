@@ -202,8 +202,11 @@ Wi-Fi radio admission rejects AP/STA sharing a PHY unless the input explicitly
 sets `wifi_concurrent = true` and the AP uses its derived virtual interface name.
 The physical input retains its input role; the virtual AP has its own output
 configuration, subnet and DHCP service. The legacy combined router provisioning
-request still requires separate radios; Receive + share is enabled through the
+request still requires separate radios; Input + Output is enabled through the
 interface transaction flow before configuring the AP and forwarding rule.
+The editor probes nl80211 through `GetInterfaceConfig` and offers the combined
+role only after a positive capability result. The wire configuration retains
+`role = input` plus `wifi_concurrent = true`; the output VIF remains separate.
 
 `wifi/concurrent.rs` validates one complete nl80211 interface combination,
 including group limits, total count and available channels. Beacon-interval
