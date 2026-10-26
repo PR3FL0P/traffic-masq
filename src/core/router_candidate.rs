@@ -82,6 +82,7 @@ impl RouterIntentProposal {
     /// use traffic_masq::state::overrides::RuntimeOverrides;
     /// let mut base = AppConfig::default();
     /// base.network.interfaces.insert("wlan0".into(), InterfaceConfig {
+    ///     wifi_concurrent: false,
     ///     mac_address: None,
     ///     role: InterfaceRole::Input, managed: false, ipv4: None, dhcp: None,
     ///     dhcp_client: None, wifi: None, wifi_client: None,
