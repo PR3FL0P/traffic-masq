@@ -25,7 +25,7 @@ path = "src/bin/traffic-masqd.rs"
 
 [dependencies]
 anyhow = "1"
-argon2 = "0.5"
+argon2 = "0.6"
 async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
