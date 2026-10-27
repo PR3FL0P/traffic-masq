@@ -37,7 +37,7 @@ traffic-masq-host-observation = { path = "../host-observation" }
 traffic-masq-protocol = { path = "../protocol" }
 
 [dev-dependencies]
-rcgen = "0.13"
+rcgen = "0.14"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["server", "service", "tokio"] }
