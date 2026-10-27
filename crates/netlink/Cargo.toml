@@ -14,7 +14,7 @@ ipnet = { version = "2", features = ["serde"] }
 netlink-packet-core-rtnetlink = { package = "netlink-packet-core", version = "0.7" }
 netlink-packet-route = "0.19"
 netlink-packet-utils = "0.5"
-netlink-sys = "0.8"
+netlink-sys = "0.9"
 rtnetlink = "0.14.1"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
