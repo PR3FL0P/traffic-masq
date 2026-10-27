@@ -70,7 +70,7 @@ zeroize = { version = "1", features = ["serde"] }
 [dev-dependencies]
 traffic-masq-atomic-file = { path = "crates/atomic-file", features = ["fault-injection"] }
 traffic-masq-dataplane = { path = "crates/dataplane", features = ["test-support"] }
-rcgen = "0.13"
+rcgen = "0.14"
 tempfile = "3"
 # Test-only tokio clock control (`start_paused`), so the DHCP client
 # supervisor's restart backoff is asserted deterministically instead of by
