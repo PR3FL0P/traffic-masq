@@ -798,3 +798,28 @@ with the same proposal when applying a reviewed plan. A changed committed revisi
 or observed snapshot rejects apply before effects. The coordinator also repeats
 its snapshot validation under transaction ownership. TUI internet sharing uses
 this protocol; clients omitting the optional expectations retain direct apply.
+
+### Internet sharing diagnostic snapshot
+
+Administrators can send this read-only request to `POST /api/v1/control`:
+
+```json
+{"type":"sharing_diagnostics","from":"ap0","to":"wan0"}
+```
+
+The `sharing_diagnostics` response contains `report` with `from`, `to`,
+`captured_at_unix` and ordered `sections` (`title`, `detail`). It observes saved
+intent and current runtime without acquiring network mutation gates, changing
+settings, repairing rules, resetting counters or capturing packets. It sends
+one router-originated ICMP echo to `1.1.1.1`, bound to the selected egress.
+This probe does not establish forwarded-client or DNS connectivity. A routing
+lookup uses the first unexpired DHCP lease, when available, and does not send a
+client packet; static clients may be absent. Missing tools, command errors,
+output limits and timeouts are reported explicitly. Collection has a 12-second
+deadline, two concurrent collectors, and bounded subprocess output.
+
+New sharing rules include outbound, established-return, drop and NAT counters.
+The firewall observer accepts legacy rules without counters and ignores counter
+values when checking rule integrity. Existing rules gain counters when replaced
+by a subsequent configuration change. NAT counters count new connections only;
+a successful accept does not rule out a drop by another firewall chain.

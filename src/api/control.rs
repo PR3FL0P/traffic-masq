@@ -7,6 +7,7 @@ mod provisioning;
 mod router;
 mod runtime;
 mod settings;
+mod sharing_diagnostics;
 mod vpn;
 mod wifi;
 mod wifi_ap_profiles;

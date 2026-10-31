@@ -378,6 +378,7 @@ impl ControlService {
                 changes: self.transactions.pending().await,
             },
             Request::RouterStatus => self.router_status().await,
+            Request::SharingDiagnostics { from, to } => self.sharing_diagnostics(from, to).await,
             Request::SaveRouterIntent {
                 config,
                 expected_revision,

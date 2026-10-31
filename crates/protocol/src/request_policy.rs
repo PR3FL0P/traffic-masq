@@ -95,6 +95,14 @@ impl<Interface, Proposal> Request<Interface, Proposal> {
                 requires_idle_interfaces: false,
                 long_running: false,
             },
+            SharingDiagnostics { .. } => RequestPolicy {
+                administrator: true,
+                mutation: ReadOnly,
+                recovery_interface: None,
+                provisioning_recovery: false,
+                requires_idle_interfaces: false,
+                long_running: true,
+            },
             DaemonLogs { .. } | VpnListSources => RequestPolicy {
                 administrator: true,
                 mutation: ReadOnly,

@@ -260,6 +260,33 @@ the normal device password. Cached sessions are isolated by HTTPS origin and
 trusted CA bundle; the selected server appears in the TUI header. The existing
 Unix-socket and `--direct` modes remain available.
 
+## Diagnose Internet sharing
+
+In **Router → Internet sharing**, select a connection and press **d** or choose
+**Diagnose** (administrator access). The scrollable report shows saved intent,
+transaction state, AP association count, DHCP gateway/DNS and unexpired leases,
+interface addresses, overlapping subnets, kernel IPv4 forwarding, routing policy,
+client neighbours, live firewall rules/counters and an ICMP probe to `1.1.1.1`
+through the selected egress. It changes no network settings. Missing tools,
+errors and timeouts are reported as unavailable observations.
+
+A connected phone and a working Internet connection on the router are separate
+checks. In AP + client mode, **From** must be the AP virtual interface, while
+**Through** is the upstream interface. If `net.ipv4.ip_forward` is `0`, client
+packets cannot be routed even when the router itself can reach the Internet.
+LAN and upstream subnets must not overlap. DHCP must advertise the AP's router
+address and a reachable DNS server; traffic-masq does not provide a DNS resolver.
+
+Run Diagnose again while the phone opens a new website and compare packet
+counts. Outbound counts without return traffic suggest an upstream, NAT or
+return-path problem; drop counts suggest a route/rule mismatch. Counters are
+shared by clients and do not prove a particular phone's connectivity. Other
+firewall chains can still drop traffic accepted by traffic-masq. NAT counters
+count new flows, not every packet. Counters reset when rules are replaced;
+existing rules gain counters on a subsequent sharing configuration change.
+The report includes manual packet-capture commands and a client-side checklist
+to distinguish gateway, Internet and DNS failures.
+
 ## Saved access-point profiles
 
 In **Wi-Fi**, open **Saved AP profiles**, then **Create new profile** or

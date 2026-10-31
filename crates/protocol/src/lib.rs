@@ -10,9 +10,11 @@ pub use request_policy::{MutationKind, RequestPolicy};
 mod port_forwarding;
 mod route;
 mod router;
+mod sharing_diagnostics;
 pub use port_forwarding::{
     validate_port_forward_address, validate_port_forwards, PortForwardConfig, PortForwardProtocol,
 };
+pub use sharing_diagnostics::{SharingDiagnosticSection, SharingDiagnostics};
 mod router_plan;
 mod wifi_observation;
 mod wifi_status;
@@ -1337,6 +1339,10 @@ pub enum Request<Interface, Proposal> {
     },
     PendingNetworkChanges,
     RouterStatus,
+    SharingDiagnostics {
+        from: String,
+        to: String,
+    },
     SaveRouterIntent {
         config: RouterConfigView,
         expected_revision: u64,
@@ -1635,6 +1641,9 @@ pub enum Response<
         health: RouterHealthReport,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recovery: Option<RouterRecoveryNotice>,
+    },
+    SharingDiagnostics {
+        report: SharingDiagnostics,
     },
     RouterIntentSaved {
         revision: u64,

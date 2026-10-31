@@ -284,12 +284,13 @@ fn stage(app: &mut TuiApp, rules: Vec<ForwardingConfig>) {
     app.router.error = None;
 }
 
-const ACTIONS: [&str; 5] = [
+const ACTIONS: [&str; 6] = [
     "[Add]",
     "[Edit]",
     "[Delete]",
     "[Review / Apply]",
     "[Refresh]",
+    "[Diagnose]",
 ];
 
 pub(crate) fn render_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
@@ -303,7 +304,7 @@ pub(crate) fn render_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
         Paragraph::new(if app.router.staged {
             "Draft — not applied. Review / Apply to continue"
         } else {
-            "Sharing permissions and NAT; tm:on/off = traffic-masq control"
+            "d: Diagnose (includes router ICMP probe); tm:on/off = traffic-masq control"
         })
         .style(Style::default().fg(theme::MUTED)),
         chunks[0],
@@ -472,6 +473,7 @@ pub(crate) async fn handle_list_key(app: &mut TuiApp, key: KeyCode, client: &Api
             app.router.sharing_actions_focused = !app.router.sharing_actions_focused
         }
         KeyCode::Char('a') => open(app, client, false, None).await,
+        KeyCode::Char('d') => diagnose(app, client).await,
         KeyCode::Delete => delete(app, client).await,
         KeyCode::Up if !app.router.sharing_actions_focused => {
             app.router.selected_connection = app.router.selected_connection.saturating_sub(1)
@@ -503,11 +505,47 @@ pub(crate) async fn handle_list_key(app: &mut TuiApp, key: KeyCode, client: &Api
                 }
                 2 => delete(app, client).await,
                 3 => super::router::open_router_plan(app, client).await,
+                5 => diagnose(app, client).await,
                 _ => super::router::refresh_router_data(app, client).await,
             }
         }
         _ => {}
     }
+}
+
+async fn diagnose(app: &mut TuiApp, client: &ApiClient) {
+    let selected = displayed_rules(&app.router)
+        .and_then(|rules| rules.get(app.router.selected_connection).cloned());
+    let Some(rule) = selected else {
+        app.message = Some("Select an Internet sharing connection to diagnose".into());
+        return;
+    };
+    let response = client
+        .request(&traffic_masq_protocol::ControlRequest::SharingDiagnostics {
+            from: rule.from,
+            to: rule.to,
+        })
+        .await;
+    let text = match response {
+        Ok(traffic_masq_protocol::ControlResponse::SharingDiagnostics { report }) => {
+            let mut text = format!(
+                "Internet sharing diagnostics: {} -> {}\nSnapshot (Unix seconds): {}\n",
+                report.from, report.to, report.captured_at_unix
+            );
+            for section in report.sections {
+                text.push_str(&format!("\n{}\n{}\n", section.title, section.detail));
+            }
+            text
+        }
+        Ok(traffic_masq_protocol::ControlResponse::Error { message }) => {
+            format!("Sharing diagnostics unavailable: {message}")
+        }
+        Ok(_) => "Sharing diagnostics unavailable: unexpected daemon response".into(),
+        Err(error) => format!("Sharing diagnostics unavailable: {error}"),
+    };
+    app.message = Some(text);
+    app.message_open = true;
+    app.message_scroll = 0;
 }
 
 async fn delete(app: &mut TuiApp, client: &ApiClient) {

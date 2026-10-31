@@ -644,11 +644,11 @@ fn nft_render_contains_owned_policy_and_scoped_masquerade() {
         .lines()
         .filter_map(|line| line.split_once("comment \"").map(|(_, value)| value))
         .all(|comment| comment.trim_end_matches('"').len() <= 128));
-    assert!(rendered.contains("iifname \"lan0\" oifname \"eth0\" ip saddr 192.168.10.0/24 accept"));
-    assert!(rendered.contains("iifname \"eth0\" oifname \"lan0\" ip daddr 192.168.10.0/24 ct state established,related accept"));
-    assert!(
-        rendered.contains("iifname \"lan0\" oifname \"eth0\" ip saddr 192.168.10.0/24 masquerade")
-    );
+    assert!(rendered
+        .contains("iifname \"lan0\" oifname \"eth0\" ip saddr 192.168.10.0/24 counter accept"));
+    assert!(rendered.contains("iifname \"eth0\" oifname \"lan0\" ip daddr 192.168.10.0/24 ct state established,related counter accept"));
+    assert!(rendered
+        .contains("iifname \"lan0\" oifname \"eth0\" ip saddr 192.168.10.0/24 counter masquerade"));
     assert!(rendered.contains("192.168.20.0/24"));
 }
 
@@ -681,21 +681,23 @@ fn nft_render_forwarding_batch_contains_rules_and_drops() {
     assert!(rendered.contains("chain forward"));
     assert!(rendered.contains("chain postrouting"));
     assert!(rendered.contains(
-        "meta nfproto ipv4 iifname \"lan0\" oifname \"wan0\" ip saddr 192.168.10.0/24 accept"
+        "meta nfproto ipv4 iifname \"lan0\" oifname \"wan0\" ip saddr 192.168.10.0/24 counter accept"
     ));
-    assert!(rendered.contains("meta nfproto ipv4 iifname \"wan0\" oifname \"lan0\" ip daddr 192.168.10.0/24 ct state established,related accept"));
+    assert!(rendered.contains("meta nfproto ipv4 iifname \"wan0\" oifname \"lan0\" ip daddr 192.168.10.0/24 ct state established,related counter accept"));
     assert!(rendered.contains(
-        "meta nfproto ipv4 iifname \"lan0\" oifname \"wan0\" ip saddr 192.168.10.0/24 masquerade"
+        "meta nfproto ipv4 iifname \"lan0\" oifname \"wan0\" ip saddr 192.168.10.0/24 counter masquerade"
     ));
-    assert!(rendered.contains("meta nfproto ipv4 iifname \"lan1\" oifname \"wg0\" accept"));
+    assert!(rendered.contains("meta nfproto ipv4 iifname \"lan1\" oifname \"wg0\" counter accept"));
     assert!(rendered.contains(
-        "meta nfproto ipv4 iifname \"wg0\" oifname \"lan1\" ct state established,related accept"
+        "meta nfproto ipv4 iifname \"wg0\" oifname \"lan1\" ct state established,related counter accept"
     ));
-    assert!(!rendered.contains("meta nfproto ipv4 iifname \"lan1\" oifname \"wg0\" masquerade"));
-    assert!(rendered.contains("meta nfproto ipv4 iifname \"lan0\" drop"));
-    assert!(rendered.contains("meta nfproto ipv4 oifname \"lan0\" drop"));
-    assert!(rendered.contains("meta nfproto ipv4 iifname \"lan1\" drop"));
-    assert!(rendered.contains("meta nfproto ipv4 oifname \"lan1\" drop"));
+    assert!(
+        !rendered.contains("meta nfproto ipv4 iifname \"lan1\" oifname \"wg0\" counter masquerade")
+    );
+    assert!(rendered.contains("meta nfproto ipv4 iifname \"lan0\" counter drop"));
+    assert!(rendered.contains("meta nfproto ipv4 oifname \"lan0\" counter drop"));
+    assert!(rendered.contains("meta nfproto ipv4 iifname \"lan1\" counter drop"));
+    assert!(rendered.contains("meta nfproto ipv4 oifname \"lan1\" counter drop"));
     assert!(!rendered.contains("set output_ifaces"));
     assert!(!rendered.contains("set output_subnets"));
 }
@@ -960,6 +962,41 @@ fn nft_observe_detects_missing_or_changed_owned_objects_and_rules() {
 
 fn nft_ruleset_value(desired: &RouterDataplaneDesired) -> Value {
     serde_json::from_slice(&nft_ruleset(Some(desired))).expect("ruleset JSON")
+}
+
+#[test]
+fn forwarding_counters_do_not_hide_verdict_drift_or_break_legacy_rules() {
+    let wanted = desired();
+    let mut ruleset = nft_ruleset_value(&wanted);
+    let observe = |value: &Value| {
+        parse_owned_nftables_state(&serde_json::to_vec(value).unwrap())
+            .unwrap()
+            .integrity
+    };
+    assert_eq!(observe(&ruleset), OwnedFirewallIntegrity::Intact);
+    for entry in owned_entries(&mut ruleset) {
+        if let Some(expr) = entry
+            .pointer_mut("/rule/expr")
+            .and_then(Value::as_array_mut)
+        {
+            expr.insert(
+                expr.len().saturating_sub(1),
+                serde_json::json!({"counter": {"packets": 123, "bytes": 4567}}),
+            );
+        }
+    }
+    assert_eq!(observe(&ruleset), OwnedFirewallIntegrity::Intact);
+    let rule = owned_entries(&mut ruleset)
+        .iter_mut()
+        .find(|entry| entry.pointer("/rule/chain").and_then(Value::as_str) == Some("forward"))
+        .unwrap();
+    let expressions = rule
+        .pointer_mut("/rule/expr")
+        .unwrap()
+        .as_array_mut()
+        .unwrap();
+    *expressions.last_mut().unwrap() = serde_json::json!({"drop": null});
+    assert_eq!(observe(&ruleset), OwnedFirewallIntegrity::Drifted);
 }
 
 fn owned_entries(ruleset: &mut Value) -> &mut Vec<Value> {

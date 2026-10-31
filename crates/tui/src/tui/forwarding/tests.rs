@@ -1,5 +1,54 @@
 use super::*;
 
+#[tokio::test]
+async fn diagnostics_failure_is_visible_without_changing_sharing_intent() {
+    let mut app = TuiApp::default();
+    app.router.topology.loaded = true;
+    app.router.proposed_router_config.forwarding = Some(vec![connection("ap0", "wan0")]);
+    let before = app.router.proposed_router_config.clone();
+    let client = ApiClient::new("/missing/sharing-diagnostics.sock");
+    handle_list_key(&mut app, KeyCode::Char('d'), &client).await;
+    assert!(app.message_open);
+    assert!(app
+        .message
+        .as_deref()
+        .unwrap()
+        .contains("diagnostics unavailable"));
+    assert_eq!(app.router.proposed_router_config, before);
+    assert!(!app.router.staged);
+}
+
+#[tokio::test]
+async fn diagnostics_query_selected_pair_and_show_observations_without_staging() {
+    use traffic_masq_protocol::{ControlResponse, SharingDiagnosticSection, SharingDiagnostics};
+    let mock = super::super::test_api::mock(vec![ControlResponse::SharingDiagnostics {
+        report: SharingDiagnostics {
+            from: "ap0".into(),
+            to: "wan0".into(),
+            captured_at_unix: 123,
+            sections: vec![SharingDiagnosticSection {
+                title: "Kernel forwarding".into(),
+                detail: "BLOCKED: IPv4 forwarding is disabled".into(),
+            }],
+        },
+    }])
+    .await;
+    let mut app = TuiApp::default();
+    app.router.topology.loaded = true;
+    app.router.proposed_router_config.forwarding =
+        Some(vec![connection("lan0", "wan0"), connection("ap0", "wan0")]);
+    app.router.selected_connection = 1;
+    handle_list_key(&mut app, KeyCode::Char('d'), &mock.client).await;
+    assert!(app.message_open);
+    assert!(app.message.as_deref().unwrap().contains("BLOCKED"));
+    assert!(!app.router.staged);
+    let calls = mock.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].body["type"], "sharing_diagnostics");
+    assert_eq!(calls[0].body["from"], "ap0");
+    assert_eq!(calls[0].body["to"], "wan0");
+}
+
 fn connection(from: &str, to: &str) -> ForwardingConfig {
     ForwardingConfig {
         from: from.into(),
@@ -291,7 +340,7 @@ fn sharing_sections_and_controls_fit_small_and_large_terminals() {
             .draw(|frame| super::super::render(frame, &mut app, false))
             .unwrap();
         assert_eq!(app.router.pane_tabs.len(), 4);
-        assert_eq!(app.ui.buttons.len(), 5);
+        assert_eq!(app.ui.buttons.len(), 6);
         assert!(app.ui.list_scroll_offset > 0);
         for (rect, _) in &app.ui.buttons {
             assert!(rect.right() <= width);

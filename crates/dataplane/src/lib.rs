@@ -391,13 +391,13 @@ fn render_nftables_batch(
                 .source_subnet
                 .map_or(String::new(), |subnet| format!(" ip daddr {subnet}"));
             forward.push_str(&format!(
-                "    meta nfproto ipv4 iifname \"{}\" oifname \"{}\"{source} accept\n",
+                "    meta nfproto ipv4 iifname \"{}\" oifname \"{}\"{source} counter accept\n",
                 rule.from, rule.to
             ));
-            forward.push_str(&format!("    meta nfproto ipv4 iifname \"{}\" oifname \"{}\"{destination} ct state established,related accept\n", rule.to, rule.from));
+            forward.push_str(&format!("    meta nfproto ipv4 iifname \"{}\" oifname \"{}\"{destination} ct state established,related counter accept\n", rule.to, rule.from));
             if rule.masquerade {
                 nat.push_str(&format!(
-                    "    meta nfproto ipv4 iifname \"{}\" oifname \"{}\"{source} masquerade\n",
+                    "    meta nfproto ipv4 iifname \"{}\" oifname \"{}\"{source} counter masquerade\n",
                     rule.from, rule.to
                 ));
             }
@@ -405,7 +405,7 @@ fn render_nftables_batch(
         // All permissions precede drops, including intentionally bidirectional links.
         let ingress: std::collections::BTreeSet<_> = rules.iter().map(|rule| &rule.from).collect();
         for interface in ingress {
-            forward.push_str(&format!("    meta nfproto ipv4 iifname \"{interface}\" drop\n    meta nfproto ipv4 oifname \"{interface}\" drop\n"));
+            forward.push_str(&format!("    meta nfproto ipv4 iifname \"{interface}\" counter drop\n    meta nfproto ipv4 oifname \"{interface}\" counter drop\n"));
         }
         batch.push_str(&format!("table inet {NFT_TABLE} {{\n  comment \"{NFT_TABLE_COMMENT}\"\n  chain metadata {{\n{metadata_rules}  }}\n{port_prerouting}  chain forward {{\n    type filter hook forward priority filter; policy accept;\n{port_forward_prefix}{forward}{port_guards}  }}\n  chain postrouting {{\n    type nat hook postrouting priority srcnat; policy accept;\n{nat}  }}\n}}\n"));
         return Ok(batch);
@@ -636,6 +636,9 @@ fn forwarding_structure_is_intact(rules: &[&Value], connections: &[ForwardingCon
                 let mut expr = rule.get("expr").cloned().unwrap_or(Value::Null);
                 // nft versions encode a state list as either an array or an anonymous set.
                 if let Some(items) = expr.as_array_mut() {
+                    // Counters do not change packet matching or verdicts. Accept
+                    // old rules without counters and ignore runtime increments.
+                    items.retain(|item| item.get("counter").is_none());
                     if items.iter().any(|item| {
                         item.pointer("/match/left/payload/protocol")
                             .and_then(Value::as_str)
