@@ -262,6 +262,10 @@ Unix-socket and `--direct` modes remain available.
 
 ## Diagnose Internet sharing
 
+The Sharing screen shows saved devices that are currently missing and router
+health failures above the connection list, including failures involving other
+adapters. Stale or unknown observations are not labeled as missing devices.
+
 In **Router → Internet sharing**, select a connection and press **d** or choose
 **Diagnose** (administrator access). The scrollable report shows saved intent,
 transaction state, AP association count, DHCP gateway/DNS and unexpired leases,

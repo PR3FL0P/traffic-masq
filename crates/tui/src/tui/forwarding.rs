@@ -293,22 +293,81 @@ const ACTIONS: [&str; 6] = [
     "[Diagnose]",
 ];
 
+fn sharing_notices(app: &TuiApp) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if app.router.staged {
+        lines.push(Line::styled(
+            "Draft — not applied. Review / Apply to continue",
+            Style::default().fg(theme::WARN),
+        ));
+    }
+    let mut missing: Vec<_> = app
+        .dashboard
+        .inventory
+        .as_deref()
+        .unwrap_or(&app.router.saved_interfaces)
+        .iter()
+        .filter(|entry| {
+            entry.configured.is_some()
+                && entry.presence == traffic_masq_protocol::InterfacePresence::Missing
+                && !entry.observation_stale
+        })
+        .map(|entry| entry.name.as_str())
+        .collect();
+    missing.sort_unstable();
+    missing.dedup();
+    if !missing.is_empty() {
+        lines.push(Line::styled(
+            format!(
+                "Saved, not connected: {}. See Interfaces.",
+                missing.join(", ")
+            ),
+            Style::default().fg(theme::WARN),
+        ));
+    }
+    for (label, reason) in [
+        ("Router interfaces", &app.router.health.interfaces),
+        ("Router routes", &app.router.health.routes),
+        ("Router DHCP", &app.router.health.dhcp),
+        ("Router firewall / NAT", &app.router.health.dataplane),
+    ] {
+        if let Some(reason) = reason {
+            lines.push(Line::styled(
+                format!("{label}: {reason}"),
+                Style::default().fg(theme::WARN),
+            ));
+        }
+    }
+    if let Some(reason) = &app.router.health.uplink_dhcp {
+        lines.push(Line::styled(
+            format!("Upstream DHCP: {reason:?}"),
+            Style::default().fg(theme::WARN),
+        ));
+    }
+    lines.push(Line::styled(
+        "d: Diagnose (includes router ICMP probe); table shows device presence, not Internet access",
+        Style::default().fg(theme::MUTED),
+    ));
+    lines
+}
+
 pub(crate) fn render_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
+    let mut notices = wrap_lines(sharing_notices(app), area.width);
+    let max_lines = usize::from(area.height.saturating_sub(10).clamp(1, 8));
+    if notices.len() > max_lines {
+        notices.truncate(max_lines);
+        notices[max_lines - 1] = Line::styled(
+            "More router details: Diagnose (d)",
+            Style::default().fg(theme::WARN),
+        );
+    }
     let chunks = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(notices.len() as u16),
         Constraint::Min(3),
         Constraint::Length(3),
     ])
     .split(area);
-    frame.render_widget(
-        Paragraph::new(if app.router.staged {
-            "Draft — not applied. Review / Apply to continue"
-        } else {
-            "d: Diagnose (includes router ICMP probe); tm:on/off = traffic-masq control"
-        })
-        .style(Style::default().fg(theme::MUTED)),
-        chunks[0],
-    );
+    frame.render_widget(Paragraph::new(notices), chunks[0]);
     let block = panel("Internet sharing");
     let inner = block.inner(chunks[1]);
     let rules = displayed_rules(&app.router);

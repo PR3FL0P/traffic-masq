@@ -1,5 +1,95 @@
 use super::*;
 
+fn saved_missing_device() -> traffic_masq_protocol::InterfaceInventoryEntry {
+    serde_json::from_value(serde_json::json!({
+        "name": "enp5s0f3u3", "configured": {"role": "output", "managed": true},
+        "config_source": "override", "presence": "missing", "observation_stale": false,
+        "suppressed": false, "readiness": "waiting_device", "blockers": [], "references": []
+    }))
+    .unwrap()
+}
+
+#[test]
+fn sharing_shows_missing_saved_device_and_global_blocker_with_both_endpoints_present() {
+    use ratatui::{backend::TestBackend, Terminal};
+    for width in [80, 120] {
+        let mut app = TuiApp::default();
+        app.router.topology.loaded = true;
+        app.router.proposed_router_config.forwarding = Some(vec![connection("ap0", "wan0")]);
+        app.dashboard.interfaces = vec![
+            interface_status("ap0", false),
+            interface_status("wan0", true),
+        ];
+        app.dashboard.interfaces_updated = Some(std::time::Instant::now());
+        app.router.saved_interfaces.push(saved_missing_device());
+        app.router.health.interfaces =
+            Some("Waiting for configured router device enp5s0f3u3".into());
+        let mut terminal = Terminal::new(TestBackend::new(width, 20)).unwrap();
+        terminal
+            .draw(|frame| render_list(frame, frame.area(), &mut app))
+            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Saved, not connected: enp5s0f3u3"));
+        assert!(text.contains("Waiting for configured router device enp5s0f3u3"));
+        assert!(text.contains("Present"));
+        assert_eq!(app.ui.buttons.len(), 6);
+        for (rect, _) in &app.ui.buttons {
+            assert!(rect.right() <= width);
+            assert!(rect.bottom() <= 20);
+        }
+    }
+}
+
+#[test]
+fn sharing_does_not_claim_stale_unknown_or_unconfigured_devices_are_saved_and_missing() {
+    let mut app = TuiApp::default();
+    let mut stale = saved_missing_device();
+    stale.observation_stale = true;
+    let mut unknown = saved_missing_device();
+    unknown.presence = traffic_masq_protocol::InterfacePresence::Unknown;
+    let mut unconfigured = saved_missing_device();
+    unconfigured.configured = None;
+    app.router.saved_interfaces = vec![stale, unknown, unconfigured];
+    let text: String = sharing_notices(&app)
+        .iter()
+        .map(|line| line.to_string())
+        .collect();
+    assert!(!text.contains("Saved, not connected"));
+    assert!(!text.contains("waiting"));
+}
+
+#[test]
+fn sharing_exposes_firewall_failures_without_a_missing_device() {
+    let mut app = TuiApp::default();
+    app.router.health.dataplane = Some("ForwardingDisabled; OwnedFirewallMissing".into());
+    let text: String = sharing_notices(&app)
+        .iter()
+        .map(|line| line.to_string())
+        .collect();
+    assert!(text.contains("Router firewall / NAT: ForwardingDisabled; OwnedFirewallMissing"));
+    assert!(!text.contains("Saved, not connected"));
+}
+
+#[test]
+fn sharing_uses_refreshed_inventory_after_a_saved_device_reappears() {
+    let mut app = TuiApp::default();
+    app.router.saved_interfaces.push(saved_missing_device());
+    let mut present = saved_missing_device();
+    present.presence = traffic_masq_protocol::InterfacePresence::Present;
+    app.dashboard.inventory = Some(vec![present]);
+    let text: String = sharing_notices(&app)
+        .iter()
+        .map(|line| line.to_string())
+        .collect();
+    assert!(!text.contains("Saved, not connected"));
+}
+
 #[tokio::test]
 async fn diagnostics_failure_is_visible_without_changing_sharing_intent() {
     let mut app = TuiApp::default();
