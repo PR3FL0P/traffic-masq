@@ -523,12 +523,12 @@ async fn authenticated_http_client_controls_daemon_over_unix_socket() -> Result<
 #[tokio::test]
 async fn optional_tcp_listener_serves_http_only_after_tls_handshake() -> Result<()> {
     let directory = tempdir()?;
-    let CertifiedKey { cert, key_pair } =
+    let CertifiedKey { cert, signing_key } =
         generate_simple_self_signed(vec!["localhost".to_string()])?;
     let certificate_path = directory.path().join("server.pem");
     let private_key_path = directory.path().join("server-key.pem");
     std::fs::write(&certificate_path, cert.pem())?;
-    std::fs::write(&private_key_path, key_pair.serialize_pem())?;
+    std::fs::write(&private_key_path, signing_key.serialize_pem())?;
 
     let mut config = AppConfig::default();
     config.runtime.socket_path = directory.path().join("traffic-masqd.sock");
@@ -2682,11 +2682,11 @@ async fn ap_profiles_roundtrip_over_http_without_disclosing_credentials() -> Res
 #[tokio::test]
 async fn verified_https_client_reads_daemon_logs_only_as_administrator() -> Result<()> {
     let directory = tempdir()?;
-    let CertifiedKey { cert, key_pair } = generate_simple_self_signed(vec!["localhost".into()])?;
+    let CertifiedKey { cert, signing_key } = generate_simple_self_signed(vec!["localhost".into()])?;
     let ca = directory.path().join("server.pem");
     let key = directory.path().join("server-key.pem");
     std::fs::write(&ca, cert.pem())?;
-    std::fs::write(&key, key_pair.serialize_pem())?;
+    std::fs::write(&key, signing_key.serialize_pem())?;
     let mut config = AppConfig::default();
     config.runtime.socket_path = directory.path().join("daemon.sock");
     config.runtime.pid_path = directory.path().join("daemon.pid");

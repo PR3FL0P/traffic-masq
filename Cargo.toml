@@ -25,7 +25,7 @@ path = "src/bin/traffic-masqd.rs"
 
 [dependencies]
 anyhow = "1"
-argon2 = "0.5"
+argon2 = "0.6"
 async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
@@ -70,7 +70,7 @@ zeroize = { version = "1", features = ["serde"] }
 [dev-dependencies]
 traffic-masq-atomic-file = { path = "crates/atomic-file", features = ["fault-injection"] }
 traffic-masq-dataplane = { path = "crates/dataplane", features = ["test-support"] }
-rcgen = "0.13"
+rcgen = "0.14.10"
 tempfile = "3"
 # Test-only tokio clock control (`start_paused`), so the DHCP client
 # supervisor's restart backoff is asserted deterministically instead of by

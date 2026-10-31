@@ -6,7 +6,7 @@ use std::{
 };
 
 use argon2::{
-    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    password_hash::{phc::PasswordHash, PasswordHasher, PasswordVerifier},
     Algorithm, Argon2, Params, Version,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -683,9 +683,8 @@ async fn hash_password(
 ) -> Result<String, AuthError> {
     let password = zeroize::Zeroizing::new(password);
     password_worker(semaphore, move || {
-        let salt = SaltString::generate(&mut OsRng);
         Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-            .hash_password(password.as_bytes(), &salt)
+            .hash_password(password.as_bytes())
             .map(|hash| hash.to_string())
             .map_err(|_| AuthError::PasswordHash)
     })

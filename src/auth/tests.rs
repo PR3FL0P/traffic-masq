@@ -546,3 +546,14 @@ async fn password_creation_and_replacement_share_the_verification_worker_limit()
         Err(AuthError::InvalidSession)
     ));
 }
+
+#[test]
+fn verifies_existing_argon2_phc_hash_after_dependency_upgrade() {
+    // Argon2 0.5's upstream PHC vector for "password". Keep this fixed so a
+    // hasher/verifier round trip cannot hide incompatibility with saved hashes.
+    let hash =
+        "$argon2id$v=19$m=65536,t=2,p=1$c29tZXNhbHQ$CTFhFdXPJO1aFaMaO6Mm5c8y7cJHAph8ArZWb2GRPPc";
+    assert!(verify_password(hash, "password"));
+    assert!(!verify_password(hash, "wrong password"));
+    assert!(!verify_password("invalid hash", "password"));
+}

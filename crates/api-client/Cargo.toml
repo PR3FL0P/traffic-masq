@@ -22,5 +22,5 @@ traffic-masq-protocol = { path = "../protocol" }
 zeroize = { version = "1", features = ["serde"] }
 
 [dev-dependencies]
-rcgen = "0.13"
+rcgen = "0.14.10"
 tempfile = "3"

@@ -14,6 +14,8 @@ ipnet = { version = "2", features = ["serde"] }
 netlink-packet-core-rtnetlink = { package = "netlink-packet-core", version = "0.7" }
 netlink-packet-route = "0.19"
 netlink-packet-utils = "0.5"
+# Must match rtnetlink 0.14: its TokioSocket implements the 0.8 AsyncSocket trait.
+# Upgrade together with rtnetlink, rather than independently (Dependabot #10).
 netlink-sys = "0.8"
 rtnetlink = "0.14.1"
 serde = { version = "1", features = ["derive"] }

@@ -19,11 +19,11 @@ impl Drop for Server {
 }
 async fn server(status: &str, body: &str) -> Server {
     let dir = tempfile::tempdir().unwrap();
-    let CertifiedKey { cert, key_pair } =
+    let CertifiedKey { cert, signing_key } =
         generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let ca = dir.path().join("ca.pem");
     std::fs::write(&ca, cert.pem()).unwrap();
-    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der());
+    let key = rustls::pki_types::PrivatePkcs8KeyDer::from(signing_key.serialize_der());
     let config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![cert.der().clone()], key.into())
