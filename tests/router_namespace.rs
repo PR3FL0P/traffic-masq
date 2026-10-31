@@ -388,6 +388,21 @@ fn build_config(temp: &tempfile::TempDir, lan_if: &str, uplink_if: &str) -> AppC
         route_host_traffic: false,
     };
 
+    // Saved, unplugged LAN with DHCP intent must not block the active pair.
+    let mut unplugged = config.network.interfaces[lan_if].clone();
+    unplugged.ipv4 = Some("203.0.113.1/24".parse().unwrap());
+    unplugged.dhcp = Some(DhcpInterfaceConfig {
+        pool_start: "203.0.113.100".parse().unwrap(),
+        pool_end: "203.0.113.150".parse().unwrap(),
+        router: "203.0.113.1".parse().unwrap(),
+        dns_servers: vec![CLIENT_DNS.parse().unwrap()],
+        lease_seconds: Some(120),
+    });
+    config
+        .network
+        .interfaces
+        .insert("tm_unplugged0".into(), unplugged);
+
     config
 }
 
@@ -426,6 +441,28 @@ async fn run_happy_path(fixture: &mut RouterNamespaceFixture) -> Result<()> {
         .context("timed out acquiring DHCP lease")??;
 
     assert_lease_matches_config(fixture)?;
+
+    // Reproduce the reported failure: intent is saved, but NAT and forwarding
+    // are absent. The daemon must repair them despite the unrelated missing LAN.
+    run("nft", &["delete", "table", "inet", "traffic_masq"])?;
+    fs::write("/proc/sys/net/ipv4/ip_forward", "0")?;
+    timeout(WAIT_TIMEOUT, async {
+        loop {
+            let forwarding = fs::read_to_string("/proc/sys/net/ipv4/ip_forward")?;
+            let firewall_present = Command::new("nft")
+                .args(["list", "table", "inet", "traffic_masq"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()?
+                .success();
+            if forwarding.trim() == "1" && firewall_present {
+                return Ok::<_, anyhow::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .context("unplugged unrelated LAN must not block automatic NAT repair")??;
 
     let server = spawn_echo_server(fixture).await?;
 

@@ -2110,6 +2110,152 @@ async fn sharing_repair_defers_before_mutations_and_resumes_after_replug() {
 }
 
 #[tokio::test]
+async fn sharing_ignores_unplugged_unrelated_lan_but_retains_its_dhcp_and_ap_intent() {
+    use crate::core::route::RouteManager;
+    use crate::core::router::RouterManager;
+    use crate::core::router_candidate::RouterIntentProposal;
+    use crate::core::router_subsystems::ProductionRouterSubsystems;
+    use crate::core::router_transaction::RouterTransactionCoordinator;
+    use crate::firewall::{RouterDataplaneManager, RouterDataplaneTarget};
+
+    for with_ap in [false, true] {
+        let directory = tempdir().unwrap();
+        let mut config = sharing_config();
+        config.runtime.state_dir = directory.path().to_path_buf();
+        config.dhcp.leases_dir = directory.path().join("leases");
+        config
+            .router
+            .forwarding
+            .as_mut()
+            .unwrap()
+            .retain(|rule| rule.from == "lan0");
+        let offline = config.network.interfaces.get_mut("lan1").unwrap();
+        offline.dhcp = Some(DhcpInterfaceConfig {
+            pool_start: "192.168.111.100".parse().unwrap(),
+            pool_end: "192.168.111.150".parse().unwrap(),
+            router: "192.168.111.1".parse().unwrap(),
+            dns_servers: vec!["1.1.1.1".parse().unwrap()],
+            lease_seconds: Some(600),
+        });
+        if with_ap {
+            offline.wifi = Some(serde_json::from_value(serde_json::json!({"ssid": "saved-offline-ap", "security": "open", "channel": 1})).unwrap());
+            config.wifi.enabled = true;
+        }
+        let saved_offline = config.network.interfaces["lan1"].clone();
+        let desired = RouterDesired::from_effective_config(&config).unwrap();
+        let network = Arc::new(FakeNetworkProvider::default());
+        network.add_interface("lan0", 1).await;
+        network.add_interface("wan0", 2).await;
+        assert!(missing_router_repair_interfaces(&desired, network.as_ref())
+            .await
+            .unwrap()
+            .is_empty());
+        let provider = FakeDataplaneProvider::default();
+        let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+            .await
+            .unwrap();
+        let dhcp = DhcpSupervisor::start(&config).await.unwrap();
+        let subsystems = ProductionRouterSubsystems::new(
+            InterfaceManager::new(network.clone(), AddressOwnershipJournal::in_memory()),
+            RouteManager::new(network.clone()),
+            dhcp,
+            RouterDataplaneManager::new(provider.clone()),
+            desired
+                .interfaces
+                .iter()
+                .map(|entry| entry.name.clone())
+                .collect(),
+        );
+        let router = RouterTransactionCoordinator::new(
+            RouterManager::new(Arc::new(subsystems)),
+            overrides.clone(),
+            Duration::from_secs(60),
+        );
+
+        // Full live Apply/rollback/Commit must work too, not just background repair.
+        for commit in [false, true] {
+            let candidate = overrides
+                .build_candidate(&RouterIntentProposal::new())
+                .await
+                .unwrap();
+            let plan = router.plan(candidate).await.unwrap();
+            assert!(plan
+                .plan()
+                .interfaces
+                .iter()
+                .all(|entry| entry.interface != "lan1"));
+            assert!(plan.plan().dhcp.is_empty());
+            assert!(plan.plan().output_wifi.is_empty());
+            assert!(router
+                .manager()
+                .snapshot_for(&desired)
+                .await
+                .unwrap()
+                .interfaces
+                .iter()
+                .all(|entry| entry.name != "lan1"));
+            let token = router.apply(plan).await.unwrap();
+            assert!(provider.state.lock().await.ipv4_forwarding);
+            assert_eq!(
+                provider.state.lock().await.owned.as_ref(),
+                match &desired.dataplane {
+                    RouterDataplaneTarget::Enabled(value) => Some(value),
+                    _ => None,
+                }
+            );
+            if commit {
+                router.commit(&token).await.unwrap();
+            } else {
+                router.rollback_with_token(&token).await.unwrap();
+            }
+        }
+        router.repair(desired.clone()).await.unwrap();
+        provider.state.lock().await.owned = None;
+        super::reconcile::reconcile_router_dataplane(&router, desired.clone(), network.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(
+            overrides.effective_interface("lan1").await.unwrap(),
+            Some(saved_offline)
+        );
+        assert!(router.manager().health(&desired).await.ready());
+        assert!(!directory.path().join("router-transaction.json").exists());
+
+        // Removing the last sharing rule must not try to start the saved DHCP
+        // service on the missing LAN either; its settings remain independent.
+        for enabled in [false, true] {
+            let mut sharing = config.router.clone();
+            if !enabled {
+                sharing.forwarding = Some(Vec::new());
+            }
+            let candidate = overrides
+                .build_candidate(&RouterIntentProposal::new().set_router(sharing))
+                .await
+                .unwrap();
+            let plan = router.plan(candidate).await.unwrap();
+            assert!(plan.plan().dhcp.is_empty());
+            let token = router.apply(plan).await.unwrap();
+            router.commit(&token).await.unwrap();
+            assert_eq!(provider.state.lock().await.owned.is_some(), enabled);
+        }
+        assert_eq!(
+            overrides.effective_interface("lan1").await.unwrap(),
+            Some(config.network.interfaces["lan1"].clone())
+        );
+
+        if !with_ap {
+            network.add_interface("lan1", 3).await;
+            let plan = router.manager().plan(desired).await.unwrap();
+            assert!(plan
+                .interfaces
+                .iter()
+                .any(|entry| entry.interface == "lan1"));
+            assert!(plan.dhcp.iter().any(|entry| matches!(entry, crate::core::router::DhcpPlan::Start { desired } if desired.interface == "lan1")));
+        }
+    }
+}
+
+#[tokio::test]
 async fn startup_cancels_removed_device_transaction_without_replaying_it_after_replug() {
     let directory = tempdir().unwrap();
     let mut config = AppConfig::default();

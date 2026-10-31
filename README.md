@@ -266,6 +266,12 @@ The Sharing screen shows saved devices that are currently missing and router
 health failures above the connection list, including failures involving other
 adapters. Stale or unknown observations are not labeled as missing devices.
 
+A saved LAN adapter that is unplugged and unused by the active sharing, routes
+or VPN chain does not prevent sharing on other interfaces. Its interface, DHCP
+and AP settings are retained and wait for the device to return. Missing devices
+required by an active sharing rule, route, uplink or VPN chain still block that
+router intent; unknown observations are reported as errors.
+
 In **Router → Internet sharing**, select a connection and press **d** or choose
 **Diagnose** (administrator access). The scrollable report shows saved intent,
 transaction state, AP association count, DHCP gateway/DNS and unexpired leases,

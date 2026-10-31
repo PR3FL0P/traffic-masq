@@ -204,6 +204,42 @@ fn builds_enabled_router_desired_from_one_effective_config() {
 }
 
 #[test]
+fn router_requires_only_referenced_lans_but_keeps_saved_services() {
+    let mut config = enabled_config();
+    config
+        .router
+        .forwarding
+        .as_mut()
+        .unwrap()
+        .retain(|rule| rule.from == "lan0");
+    let desired = RouterDesired::from_effective_config(&config).unwrap();
+    assert_eq!(desired.required_existing_interfaces(), ["lan0", "wan0"]);
+    assert!(desired.interfaces.iter().any(|entry| entry.name == "lan1"));
+    assert!(desired.dhcp.iter().any(|spec| spec.interface == "lan1"));
+
+    // The same saved LAN becomes mandatory as soon as an active route uses it.
+    config.router.owned_routes[0].output_interface = Some("lan1".into());
+    assert_eq!(
+        RouterDesired::from_effective_config(&config)
+            .unwrap()
+            .required_existing_interfaces(),
+        ["lan0", "lan1", "wan0"]
+    );
+
+    config.router.owned_routes.clear();
+    config.router.vpn_chain = vec![crate::config::VpnHopConfig {
+        profile_name: "exit.conf".into(),
+    }];
+    config.vpn.enabled = true;
+    assert_eq!(
+        RouterDesired::from_effective_config(&config)
+            .unwrap()
+            .required_existing_interfaces(),
+        ["lan0", "lan1", "wan0"]
+    );
+}
+
+#[test]
 fn dhcp_uplink_desired_requires_the_exact_client_intent() {
     let mut config = enabled_config();
     let uplink = config.network.interfaces.get_mut("wan0").unwrap();

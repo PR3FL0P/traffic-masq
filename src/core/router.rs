@@ -55,12 +55,16 @@ pub struct StandaloneVpnDesired {
 }
 
 impl RouterDesired {
-    /// Interfaces that must already exist before applying intent. Router-owned
-    /// VPN hops are created during apply; externally managed tunnels are not.
+    /// Required dependencies of active router intent, not every saved LAN.
+    /// Unreferenced output interfaces may remain saved while unplugged.
+    /// VPN chains protect all managed LANs, so retain their strict dependency set.
     pub(crate) fn required_existing_interfaces(&self) -> Vec<&str> {
         let mut names: Vec<&str> = self
             .interfaces
             .iter()
+            .filter(|entry| {
+                entry.config.role != InterfaceRole::Output || !self.vpn_chain.is_empty()
+            })
             .map(|entry| entry.name.as_str())
             .collect();
         if let RouterDataplaneTarget::Enabled(dataplane) = &self.dataplane {

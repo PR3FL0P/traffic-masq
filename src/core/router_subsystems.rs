@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
@@ -328,12 +328,45 @@ where
         owned.dedup();
     }
 
-    async fn scoped_names(&self, desired: &RouterDesired) -> Vec<String> {
+    /// Like standalone interface/DHCP convergence, preserve unplugged saved
+    /// LAN settings without applying or health-checking their absent hardware.
+    /// Observation errors propagate; an unknown device is never silently skipped.
+    async fn absent_optional_interfaces(
+        &self,
+        desired: &RouterDesired,
+    ) -> Result<BTreeSet<String>> {
+        let required = desired.required_existing_interfaces();
+        let mut optional: Vec<_> = desired
+            .interfaces
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .chain(desired.dhcp.iter().map(|spec| spec.interface.as_str()))
+            .filter(|name| {
+                !required.contains(name)
+                    && !desired.vpn_chain.iter().any(|hop| hop.interface == *name)
+            })
+            .collect();
+        optional.sort_unstable();
+        optional.dedup();
+        if optional.is_empty() {
+            return Ok(BTreeSet::new());
+        }
+        Ok(self
+            .interfaces
+            .missing_interfaces(&optional)
+            .await?
+            .into_iter()
+            .collect())
+    }
+
+    async fn scoped_names(&self, desired: &RouterDesired) -> Result<Vec<String>> {
         let mut names = self.owned_interfaces().await;
         names.extend(desired.interfaces.iter().map(|entry| entry.name.clone()));
+        let absent = self.absent_optional_interfaces(desired).await?;
+        names.retain(|name| !absent.contains(name));
         names.sort();
         names.dedup();
-        names
+        Ok(names)
     }
 
     pub fn with_event_sink(
@@ -391,16 +424,21 @@ where
     E: RouterDataplaneEventSink,
 {
     async fn plan_interfaces(&self, desired: &RouterDesired) -> Result<Vec<InterfaceChangePlan>> {
+        let absent = self.absent_optional_interfaces(desired).await?;
         let network = crate::config::NetworkConfig {
             interfaces: desired
                 .interfaces
                 .iter()
+                .filter(|entry| !absent.contains(&entry.name))
                 .map(|entry| (entry.name.clone(), entry.config.clone()))
                 .collect(),
         };
         self.interfaces.validate_wifi_radio_policy(&network)?;
         let mut plans = Vec::with_capacity(desired.interfaces.len());
         for entry in &desired.interfaces {
+            if absent.contains(&entry.name) {
+                continue;
+            }
             let plan = self
                 .interfaces
                 .plan_interface(&entry.name, &entry.config, Some(entry.config.role), false)
@@ -420,7 +458,7 @@ where
             }
             return Ok(Vec::new());
         };
-        let names = self.scoped_names(desired).await;
+        let names = self.scoped_names(desired).await?;
         let mut plans = Vec::new();
         for name in names {
             let current = runtime.status(&name).await.map(|(spec, _)| spec);
@@ -445,8 +483,13 @@ where
     }
 
     async fn plan_output_wifi(&self, desired: &RouterDesired) -> Result<Vec<WifiPlan<WifiApSpec>>> {
+        let absent = self.absent_optional_interfaces(desired).await?;
         let Some(runtime) = &self.access_points else {
-            if !desired.output_wifi.is_empty() {
+            if desired
+                .output_wifi
+                .iter()
+                .any(|spec| !absent.contains(&spec.interface))
+            {
                 bail!("output Wi-Fi runtime is unavailable");
             }
             return Ok(Vec::new());
@@ -456,7 +499,7 @@ where
             .iter()
             .map(|spec| (spec.interface.as_str(), spec))
             .collect();
-        let names = self.scoped_names(desired).await;
+        let names = self.scoped_names(desired).await?;
         let mut plans = Vec::new();
         for name in names {
             let current = runtime.status(&name).await.map(|(spec, _)| spec);
@@ -485,7 +528,7 @@ where
             .iter()
             .map(|spec| (spec.interface.as_str(), spec))
             .collect();
-        let interfaces = self.scoped_names(desired).await;
+        let interfaces = self.scoped_names(desired).await?;
 
         let mut plans = Vec::new();
         for name in interfaces {
@@ -515,6 +558,7 @@ where
     E: RouterDataplaneEventSink + Send + Sync,
 {
     async fn preflight(&self, desired: &RouterDesired) -> Result<()> {
+        let absent = self.absent_optional_interfaces(desired).await?;
         anyhow::ensure!(
             desired.uplink_dhcp.is_none() || self.dhcp_client.is_some(),
             "embedded DHCP client runtime is unavailable"
@@ -524,7 +568,11 @@ where
             "uplink Wi-Fi runtime is unavailable"
         );
         anyhow::ensure!(
-            desired.output_wifi.is_empty() || self.access_points.is_some(),
+            desired
+                .output_wifi
+                .iter()
+                .all(|spec| absent.contains(&spec.interface))
+                || self.access_points.is_some(),
             "output Wi-Fi runtime is unavailable"
         );
         let missing = self
@@ -601,7 +649,7 @@ where
         &self,
         desired: &RouterDesired,
     ) -> Result<crate::core::router::RouterSnapshot> {
-        let names = self.scoped_names(desired).await;
+        let names = self.scoped_names(desired).await?;
         let mut interfaces = Vec::with_capacity(names.len());
         for name in &names {
             // An interface that is gone has nothing to restore, so skipping it
@@ -966,8 +1014,9 @@ where
     }
 
     async fn health_interfaces(&self, desired: &RouterDesired) -> Result<()> {
+        let absent = self.absent_optional_interfaces(desired).await?;
         for entry in &desired.interfaces {
-            if !entry.config.managed {
+            if !entry.config.managed || absent.contains(&entry.name) {
                 continue;
             }
             if let Some(mac) = entry.config.mac_address {
@@ -1008,7 +1057,12 @@ where
     }
 
     async fn health_output_wifi(&self, desired: &RouterDesired) -> Result<()> {
-        if desired.output_wifi.is_empty() {
+        let absent = self.absent_optional_interfaces(desired).await?;
+        if desired
+            .output_wifi
+            .iter()
+            .all(|spec| absent.contains(&spec.interface))
+        {
             return Ok(());
         }
         let runtime = self
@@ -1016,6 +1070,9 @@ where
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("output Wi-Fi runtime is unavailable"))?;
         for expected in &desired.output_wifi {
+            if absent.contains(&expected.interface) {
+                continue;
+            }
             let expected = runtime.resolve_spec(expected).await?;
             let Some((current, ready)) = runtime.status(&expected.interface).await else {
                 bail!("output Wi-Fi intent is missing on {}", expected.interface);
@@ -1046,9 +1103,13 @@ where
     }
 
     async fn health_dhcp(&self, desired: &RouterDesired) -> Result<()> {
+        let absent = self.absent_optional_interfaces(desired).await?;
         let running = self.dhcp.running_interfaces().await;
         let unhealthy = self.dhcp.unhealthy_interfaces().await;
         for spec in &desired.dhcp {
+            if absent.contains(&spec.interface) {
+                continue;
+            }
             if unhealthy.iter().any(|name| name == &spec.interface) {
                 bail!("DHCP service on {} is unhealthy", spec.interface);
             }
