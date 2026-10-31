@@ -12,7 +12,7 @@
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
-use netlink_packet_core_rtnetlink::{NetlinkMessage, NetlinkPayload};
+use netlink_packet_core::{NetlinkMessage, NetlinkPayload};
 use netlink_packet_route::RouteNetlinkMessage;
 use netlink_sys::AsyncSocket;
 use rtnetlink::new_connection;

@@ -13,14 +13,13 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
 use netlink_packet_route::{
-    address::{AddressAttribute, AddressMessage},
-    link::{LinkAttribute, LinkFlag},
+    address::{AddressAttribute, AddressFlags, AddressMessage},
+    link::{LinkAttribute, LinkFlags},
     route::{RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteScope, RouteType},
     rule::{RuleAction, RuleAttribute, RuleMessage},
     AddressFamily,
 };
-use netlink_packet_utils::nla::{DefaultNla, Nla};
-use rtnetlink::{new_connection, Handle, IpVersion};
+use rtnetlink::{new_connection, Handle, IpVersion, LinkUnspec, RouteMessageBuilder};
 use serde::{Deserialize, Serialize};
 use tokio::{sync::Mutex, task::JoinHandle};
 
@@ -107,9 +106,18 @@ impl Ipv4AddressInfo {
 
 pub const TRAFFIC_MASQ_ADDRESS_PROTOCOL: u8 = 201;
 pub const TRAFFIC_MASQ_DHCP_ADDRESS_PROTOCOL: u8 = 202;
-const IFA_PROTO: u16 = 11;
-const IFA_FLAGS: u16 = 8;
-const IFA_F_NOPREFIXROUTE: u32 = 0x200;
+
+// A dump must include local, policy and VPN tables, with every protocol/type.
+// RouteMessageBuilder defaults describe route creation (main/static/unicast).
+fn ipv4_route_dump_message() -> RouteMessage {
+    let mut message = RouteMessage::default();
+    message.header.address_family = AddressFamily::Inet;
+    message.header.table = 0;
+    message.header.protocol = RouteProtocol::Unspec;
+    message.header.kind = RouteType::Unspec;
+    message.header.scope = RouteScope::Universe;
+    message
+}
 
 pub const TRAFFIC_MASQ_ROUTE_PROTOCOL: u8 = 201;
 
@@ -668,7 +676,7 @@ impl RtnetlinkNetworkProvider {
     fn ownership_attribute(ownership: AddressOwnership) -> Option<AddressAttribute> {
         ownership
             .protocol()
-            .map(|protocol| AddressAttribute::Other(DefaultNla::new(IFA_PROTO, vec![protocol])))
+            .map(|protocol| AddressAttribute::Protocol(protocol.into()))
     }
 
     /// Resolve an interface index while the caller holds `request_lock`.
@@ -715,13 +723,7 @@ impl RtnetlinkNetworkProvider {
                     | AddressAttribute::Address(IpAddr::V4(address)) => {
                         ipv4.get_or_insert(*address);
                     }
-                    AddressAttribute::Other(other)
-                        if other.kind() == IFA_PROTO && other.value_len() == 1 =>
-                    {
-                        let mut value = [0u8; 1];
-                        other.emit_value(&mut value);
-                        protocol = Some(value[0]);
-                    }
+                    AddressAttribute::Protocol(value) => protocol = Some(u8::from(*value)),
                     _ => {}
                 }
             }
@@ -932,8 +934,11 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
         let index = self.link_index_unlocked(interface).await?;
         self.handle
             .link()
-            .set(index)
-            .address(address.to_vec())
+            .set(
+                LinkUnspec::new_with_index(index)
+                    .address(address.to_vec())
+                    .build(),
+            )
             .execute()
             .await
             .with_context(|| format!("RTM_NEWLINK while setting MAC on {interface}"))?;
@@ -1004,7 +1009,7 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
             if let Some(name) = name {
                 interfaces.push(NetworkInterface {
                     index: link.header.index,
-                    is_up: link.header.flags.contains(&LinkFlag::Up),
+                    is_up: link.header.flags.contains(LinkFlags::Up),
                     is_wireless: interface_is_wireless(&name),
                     name,
                     rx_bytes,
@@ -1026,8 +1031,7 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
         let index = self.link_index_unlocked(name).await?;
         self.handle
             .link()
-            .set(index)
-            .up()
+            .set(LinkUnspec::new_with_index(index).up().build())
             .execute()
             .await
             .with_context(|| format!("RTM_NEWLINK while setting {name} up"))?;
@@ -1039,8 +1043,7 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
         let index = self.link_index_unlocked(name).await?;
         self.handle
             .link()
-            .set(index)
-            .down()
+            .set(LinkUnspec::new_with_index(index).down().build())
             .execute()
             .await
             .with_context(|| format!("RTM_NEWLINK while setting {name} down"))?;
@@ -1064,10 +1067,7 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
             request
                 .message_mut()
                 .attributes
-                .push(AddressAttribute::Other(DefaultNla::new(
-                    IFA_FLAGS,
-                    IFA_F_NOPREFIXROUTE.to_ne_bytes().to_vec(),
-                )));
+                .push(AddressAttribute::Flags(AddressFlags::Noprefixroute));
         }
         if let Some(attribute) = Self::ownership_attribute(ownership) {
             request.message_mut().attributes.push(attribute);
@@ -1160,7 +1160,7 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
 
     async fn list_ipv4_routes(&self) -> Result<Vec<Ipv4RouteInfo>> {
         let _request = self.request_lock.lock().await;
-        let mut messages = self.handle.route().get(IpVersion::V4).execute();
+        let mut messages = self.handle.route().get(ipv4_route_dump_message()).execute();
         let mut routes = Vec::new();
         while let Some(message) = messages
             .try_next()
@@ -1189,11 +1189,7 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
     async fn add_ipv4_route(&self, route: &Ipv4RouteSpec) -> Result<()> {
         route.validate()?;
         let _request = self.request_lock.lock().await;
-        let mut request = self
-            .handle
-            .route()
-            .add()
-            .v4()
+        let mut request = RouteMessageBuilder::<Ipv4Addr>::new()
             .destination_prefix(route.destination.network(), route.destination.prefix_len())
             .table_id(route.table)
             .protocol(RouteProtocol::Other(route.protocol));
@@ -1208,7 +1204,7 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
         if let Some(metric) = route.metric {
             request = request.priority(metric);
         }
-        request.execute().await.with_context(|| {
+        self.handle.route().add(request.build()).execute().await.with_context(|| {
             format!(
                 "RTM_NEWROUTE while adding {}/{} in table {} (gateway={:?}, ifindex={:?}, metric={:?}, protocol={})",
                 route.destination.network(),
@@ -1225,7 +1221,7 @@ impl NetworkProvider for RtnetlinkNetworkProvider {
 
     async fn delete_ipv4_route(&self, route: &Ipv4RouteInfo) -> Result<()> {
         let _request = self.request_lock.lock().await;
-        let mut messages = self.handle.route().get(IpVersion::V4).execute();
+        let mut messages = self.handle.route().get(ipv4_route_dump_message()).execute();
         let mut matched = None;
         while let Some(message) = messages
             .try_next()

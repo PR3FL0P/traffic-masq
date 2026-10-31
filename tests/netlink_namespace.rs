@@ -93,7 +93,7 @@ async fn rtnetlink_can_manage_ipv4_on_veth() -> Result<()> {
         destination: "198.51.100.0/24".parse()?,
         gateway: None,
         output_interface_index: Some(host_index),
-        table: 254,
+        table: 42420,
         metric: Some(4242),
         protocol: TRAFFIC_MASQ_ROUTE_PROTOCOL,
     };
@@ -105,7 +105,7 @@ async fn rtnetlink_can_manage_ipv4_on_veth() -> Result<()> {
         .find(|route| {
             route.destination == route_spec.destination
                 && route.output_interface_index == Some(host_index)
-                && route.table == 254
+                && route.table == 42420
                 && route.metric == Some(4242)
                 && route.protocol == TRAFFIC_MASQ_ROUTE_PROTOCOL
         })

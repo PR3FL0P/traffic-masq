@@ -7,12 +7,12 @@ use genetlink::GenetlinkHandle;
 use ipnet::IpNet;
 use netlink_packet_core::{NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_DUMP, NLM_F_REQUEST};
 use netlink_packet_generic::GenlMessage;
-use netlink_packet_route::link::{LinkAttribute, LinkFlag, LinkMessage};
+use netlink_packet_route::link::{LinkAttribute, LinkFlags, LinkMessage};
 use netlink_packet_wireguard::{
     WireguardAddressFamily, WireguardAllowedIp, WireguardAllowedIpAttr, WireguardAttribute,
     WireguardCmd, WireguardDeviceFlags, WireguardMessage, WireguardPeer, WireguardPeerAttribute,
 };
-use rtnetlink::{new_connection, Handle};
+use rtnetlink::{new_connection, Handle, LinkUnspec, LinkWireguard};
 use thiserror::Error;
 use tokio::task::JoinHandle;
 
@@ -423,12 +423,9 @@ impl VpnProvider for NetlinkVpnProvider {
         // The alias is part of the same RTM_NEWLINK request as interface
         // creation. A crash can therefore never leave a newly-created link
         // without the durable launch marker needed to prove ownership.
-        let mut request = self.rt_handle.link().add().wireguard(name.to_string());
-        request
-            .message_mut()
-            .attributes
-            .push(LinkAttribute::IfAlias(launch_marker.to_string()));
-        request
+        self.rt_handle
+            .link()
+            .add(LinkWireguard::new(name).alias(launch_marker).build())
             .execute()
             .await
             .map_err(|error| ProviderError::Netlink(error.to_string()))?;
@@ -475,8 +472,7 @@ impl VpnProvider for NetlinkVpnProvider {
         let index = self.link_index(name).await?;
         self.rt_handle
             .link()
-            .set(index)
-            .mtu(mtu)
+            .set(LinkUnspec::new_with_index(index).mtu(mtu).build())
             .execute()
             .await
             .map_err(|error| ProviderError::Netlink(error.to_string()))
@@ -525,8 +521,7 @@ impl VpnProvider for NetlinkVpnProvider {
         let index = self.link_index(name).await?;
         self.rt_handle
             .link()
-            .set(index)
-            .up()
+            .set(LinkUnspec::new_with_index(index).up().build())
             .execute()
             .await
             .map_err(|error| ProviderError::Netlink(error.to_string()))
@@ -536,8 +531,7 @@ impl VpnProvider for NetlinkVpnProvider {
         let index = self.link_index(name).await?;
         self.rt_handle
             .link()
-            .set(index)
-            .down()
+            .set(LinkUnspec::new_with_index(index).down().build())
             .execute()
             .await
             .map_err(|error| ProviderError::Netlink(error.to_string()))
@@ -576,7 +570,7 @@ impl VpnProvider for NetlinkVpnProvider {
         Ok(self
             .get_link(name)
             .await
-            .is_some_and(|link| link.header.flags.contains(&LinkFlag::Up)))
+            .is_some_and(|link| link.header.flags.contains(LinkFlags::Up)))
     }
 }
 

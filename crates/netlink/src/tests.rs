@@ -412,3 +412,13 @@ fn ethernet_mac_allows_interfaces_without_ethernet_addresses() {
         Some(mac)
     );
 }
+
+#[test]
+fn route_dump_does_not_inherit_route_creation_filters() {
+    let message = ipv4_route_dump_message();
+    assert_eq!(message.header.address_family, AddressFamily::Inet);
+    assert_eq!(message.header.table, 0);
+    assert_eq!(message.header.protocol, RouteProtocol::Unspec);
+    assert_eq!(message.header.kind, RouteType::Unspec);
+    assert!(message.attributes.is_empty());
+}

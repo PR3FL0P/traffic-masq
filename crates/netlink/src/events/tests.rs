@@ -1,4 +1,4 @@
-use netlink_packet_core_rtnetlink::NetlinkHeader;
+use netlink_packet_core::NetlinkHeader;
 
 use super::*;
 
