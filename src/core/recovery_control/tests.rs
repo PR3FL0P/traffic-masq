@@ -391,3 +391,27 @@ async fn independent_session_loads_durable_stop_without_inheriting_cached_budget
     assert!(second.progress(&path).is_none());
     assert!(first.stopped(&path));
 }
+
+#[tokio::test]
+async fn global_runtime_fence_ignores_only_interface_scoped_stops() {
+    let state = crate::core::recovery::RecoveryState::default();
+    let (root, router) = journal().await;
+    let interfaces = root.path().join("interface-transactions");
+    std::fs::create_dir_all(&interfaces).unwrap();
+    let interface = interfaces.join("wlan1.json");
+    std::fs::write(&interface, b"interface snapshot").unwrap();
+    state
+        .stop(&interface, FailureKind::Transient, "rollback exhausted")
+        .await
+        .unwrap();
+    assert!(state.check_runtime(root.path(), None).is_err());
+    assert!(state.check_global_runtime(root.path()).is_ok());
+    assert!(state.check_runtime(root.path(), Some("wlan0")).is_ok());
+    assert!(state.check_runtime(root.path(), Some("wlan1")).is_err());
+    state
+        .stop(&router, FailureKind::Transient, "router rollback exhausted")
+        .await
+        .unwrap();
+    assert!(state.check_global_runtime(root.path()).is_err());
+    assert!(state.check_runtime(root.path(), Some("wlan0")).is_err());
+}

@@ -1124,7 +1124,7 @@ pub(super) fn spawn_runtime_network_reconcile_with_recovery_events(
 /// Split from the task that drives it so it can be exercised against fakes.
 pub(super) async fn check_process_liveness<D, W, C, L>(
     desired_config: Option<&AppConfig>,
-    dhcp: &D,
+    dhcp: Option<&D>,
     wifi: Option<&W>,
     wifi_client: Option<&C>,
     dhcp_client: Option<&L>,
@@ -1134,8 +1134,10 @@ pub(super) async fn check_process_liveness<D, W, C, L>(
     C: WifiRuntimeReconciler,
     L: DhcpClientRuntimeReconciler,
 {
-    if let Err(error) = dhcp.ensure_runtime_alive().await {
-        tracing::warn!(error = %format!("{error:#}"), "failed to restart the shared DHCP runtime");
+    if let Some(dhcp) = dhcp {
+        if let Err(error) = dhcp.ensure_runtime_alive().await {
+            tracing::warn!(error = %format!("{error:#}"), "failed to restart the shared DHCP runtime");
+        }
     }
     if let Some(wifi) = wifi {
         let result = match desired_config {
@@ -1197,6 +1199,40 @@ pub(super) async fn check_process_liveness<D, W, C, L>(
     }
 }
 
+/// Retain only scopes whose recovery permits autonomous runtime writes. Shared
+/// DHCP restart rebuilds all its handlers, so defer it if any server is fenced.
+pub(super) fn liveness_config(
+    desired: &DesiredNetworkState,
+    mut config: AppConfig,
+) -> (AppConfig, bool) {
+    let blocked: std::collections::HashSet<_> = config
+        .network
+        .interfaces
+        .keys()
+        .filter(|name| {
+            desired
+                .recovery()
+                .check_scope(desired.state_dir(), Some(name))
+                .is_err()
+        })
+        .cloned()
+        .collect();
+    let mut shared_dhcp_allowed = true;
+    let network = config.network.clone();
+    config.network.interfaces.retain(|name, interface| {
+        let allowed = !blocked.contains(name)
+            && !(interface.wifi_concurrent
+                && blocked.contains(&crate::wifi::concurrent::ap_name(name)))
+            && !crate::wifi::concurrent::parent_for(&network, name)
+                .is_some_and(|parent| blocked.contains(parent));
+        if !allowed && interface.dhcp.is_some() {
+            shared_dhcp_allowed = false;
+        }
+        allowed
+    });
+    (config, shared_dhcp_allowed)
+}
+
 /// Monitor supervised network processes and retry recoverable failures until shutdown.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_process_liveness_checks(
@@ -1231,7 +1267,7 @@ pub(super) fn spawn_process_liveness_checks(
                     if let Ok((interface, pid)) = event {
                         let _network_mutation = network_mutations.execute().await;
                     if desired.recovery().check_commit(&state_dir).is_err()
-                        || desired.recovery().check_runtime(&state_dir, None).is_err() { continue; }
+                        || desired.recovery().check_scope(&state_dir, Some(&interface)).is_err() { continue; }
                         if let Some(router) = &router {
                             if router.status().await != crate::core::router_transaction::CoordinatorStatus::Idle { continue; }
                         }
@@ -1264,7 +1300,7 @@ pub(super) fn spawn_process_liveness_checks(
                     // observed just before a transaction converged.
                     let _network_mutation = network_mutations.execute().await;
                     if desired.recovery().check_commit(&state_dir).is_err()
-                        || desired.recovery().check_runtime(&state_dir, None).is_err() { continue; }
+                        || desired.recovery().check_global_runtime(&state_dir).is_err() { continue; }
                     let router_busy = match &router {
                         Some(router) => router.status().await
                             != crate::core::router_transaction::CoordinatorStatus::Idle,
@@ -1278,6 +1314,10 @@ pub(super) fn spawn_process_liveness_checks(
                         Ok(config) => config,
                         Err(error) => { tracing::warn!(error = %format!("{error:#}"), "process restart blocked by invalid desired state"); continue; }
                     };
+                    let (config, shared_dhcp_allowed) = liveness_config(&desired, config);
+                    let shared_dhcp_allowed = shared_dhcp_allowed
+                        && dhcp.configured_interfaces().await.iter().all(|name|
+                            desired.recovery().check_scope(&state_dir, Some(name)).is_ok());
                     if config.network.interfaces.values().any(|c| c.wifi_concurrent) {
                         desired.request_convergence();
                     }
@@ -1290,7 +1330,7 @@ pub(super) fn spawn_process_liveness_checks(
                         };
                     check_process_liveness(
                         Some(&config),
-                        &dhcp,
+                        shared_dhcp_allowed.then_some(&dhcp),
                         wifi.as_ref().filter(|_| wifi_admitted),
                         wifi_client.as_ref().filter(|_| wifi_admitted),
                         Some(&dhcp_client),

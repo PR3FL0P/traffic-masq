@@ -486,6 +486,18 @@ impl RecoveryState {
             .collect()
     }
 
+    /// Interface recovery fences must not disable unrelated runtime supervision.
+    /// Unscoped journals (for example router transactions) still fence all writers.
+    pub(crate) fn check_global_runtime(&self, root: &Path) -> Result<()> {
+        let interfaces = root.join("interface-transactions");
+        for path in self.stopped_journals(root) {
+            if path.parent() != Some(interfaces.as_path()) {
+                anyhow::bail!("state=recovery_required; journal={}; automatic recovery stopped; explicit retry required", path.display());
+            }
+        }
+        Ok(())
+    }
+
     pub fn check_runtime(&self, root: &Path, interface: Option<&str>) -> Result<()> {
         self.check_runtime_except(root, interface, None)
     }

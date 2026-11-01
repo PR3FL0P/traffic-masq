@@ -284,6 +284,11 @@ impl DhcpSupervisor {
         self.configure(spec).await
     }
 
+    /// Include configured handlers even when the shared receive task has died.
+    pub(crate) async fn configured_interfaces(&self) -> Vec<String> {
+        self.inner.tasks.lock().await.keys().cloned().collect()
+    }
+
     pub async fn running_interfaces(&self) -> Vec<String> {
         let runtime_healthy = self
             .inner

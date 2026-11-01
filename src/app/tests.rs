@@ -1037,7 +1037,7 @@ async fn liveness_checks_the_wifi_client_independently_of_the_access_point() {
 
     check_process_liveness(
         None,
-        &dhcp,
+        Some(&dhcp),
         None::<&FakeWifiReconciler>,
         Some(&wifi_client),
         None::<&FakeDhcpClientReconciler>,
@@ -1057,7 +1057,7 @@ async fn liveness_covers_every_supervised_runtime() {
 
     check_process_liveness(
         None,
-        &dhcp,
+        Some(&dhcp),
         Some(&wifi),
         Some(&wifi_client),
         Some(&dhcp_client),
@@ -1101,7 +1101,7 @@ async fn liveness_resynchronizes_wifi_association_into_dhcp_link_ready() {
 
     check_process_liveness(
         None,
-        &dhcp,
+        Some(&dhcp),
         None::<&FakeWifiReconciler>,
         Some(&wifi_client),
         Some(&dhcp_client),
@@ -2471,7 +2471,7 @@ async fn liveness_does_not_replay_dhcp_association_from_withdrawn_desired_policy
     wifi.associations.lock().await.insert("wlan0".into(), true);
     check_process_liveness(
         Some(&AppConfig::default()),
-        &dhcp,
+        Some(&dhcp),
         None::<&FakeWifiReconciler>,
         Some(&wifi),
         Some(&client),
@@ -2661,4 +2661,43 @@ async fn mac_change_restarts_an_existing_dhcp_server_and_then_settles() {
     assert_eq!(*dhcp.disable_calls.lock().await, vec!["lan0"]);
     assert_eq!(dhcp.configure_calls.lock().await.len(), 1);
     assert_eq!(dhcp.spec("lan0").await, Some(spec));
+}
+
+#[tokio::test]
+async fn stopped_interface_recovery_keeps_unrelated_liveness_enabled() {
+    let directory = tempdir().unwrap();
+    let config = dhcp_client_reconcile_config();
+    let overrides = RuntimeOverrideManager::load(directory.path(), &config)
+        .await
+        .unwrap();
+    let desired = DesiredNetworkState::new(config.clone(), overrides);
+    let journals = directory.path().join("interface-transactions");
+    std::fs::create_dir_all(&journals).unwrap();
+    let journal = journals.join("wan0.json");
+    std::fs::write(&journal, b"rollback snapshot").unwrap();
+    desired
+        .recovery()
+        .stop(
+            &journal,
+            crate::core::recovery_control::FailureKind::Transient,
+            "rollback exhausted",
+        )
+        .await
+        .unwrap();
+    let (allowed, dhcp_allowed) = reconcile::liveness_config(&desired, config.clone());
+    assert!(!allowed.network.interfaces.contains_key("wan0"));
+    assert!(allowed.network.interfaces.contains_key("lan0"));
+    assert!(
+        dhcp_allowed,
+        "a stopped client must not prevent unrelated DHCP server restart"
+    );
+    desired
+        .recovery()
+        .block_interface(directory.path(), "lan0", "server recovery blocked".into());
+    let (allowed, dhcp_allowed) = reconcile::liveness_config(&desired, config);
+    assert!(allowed.network.interfaces.is_empty());
+    assert!(
+        !dhcp_allowed,
+        "shared DHCP restart must not rebuild a fenced server"
+    );
 }
