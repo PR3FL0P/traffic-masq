@@ -59,6 +59,7 @@ fn status(app: &TuiApp, name: &str) -> Status {
         None => "?",
     };
     let state = if let Some(change) = app
+        .confirmation
         .pending
         .as_ref()
         .filter(|change| change.interface == name)

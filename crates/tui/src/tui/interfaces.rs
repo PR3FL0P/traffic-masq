@@ -213,29 +213,29 @@ impl InterfaceEditor {
 pub(crate) fn selected_interface_name(app: &TuiApp) -> Option<String> {
     match &app.dashboard.inventory {
         Some(entries) => entries
-            .get(app.selected_inventory_interface)
+            .get(app.interface_ui.selected_inventory_interface)
             .map(|entry| entry.name.clone()),
         None => app
             .dashboard
             .interfaces
-            .get(app.selected_interface)
+            .get(app.interface_ui.selected_interface)
             .map(|status| status.interface.name.clone()),
     }
 }
 
 pub(crate) fn interface_selection(app: &TuiApp) -> usize {
     if app.dashboard.inventory.is_some() {
-        app.selected_inventory_interface
+        app.interface_ui.selected_inventory_interface
     } else {
-        app.selected_interface
+        app.interface_ui.selected_interface
     }
 }
 
 pub(crate) fn set_interface_selection(app: &mut TuiApp, index: usize) {
     if app.dashboard.inventory.is_some() {
-        app.selected_inventory_interface = index;
+        app.interface_ui.selected_inventory_interface = index;
     } else {
-        app.selected_interface = index;
+        app.interface_ui.selected_interface = index;
     }
 }
 
@@ -297,6 +297,7 @@ pub(crate) fn render_interface_inventory(
         app.ui.list_row_height = 2;
         app.ui.list_count = entries.len();
         let offset = app
+            .interface_ui
             .selected_inventory_interface
             .saturating_sub((rows.height as usize / 2).saturating_sub(1));
         app.ui.list_scroll_offset = offset;
@@ -306,7 +307,7 @@ pub(crate) fn render_interface_inventory(
             .skip(offset)
             .take(rows.height as usize / 2)
             .flat_map(|(index, entry)| {
-                let marker = if index == app.selected_inventory_interface {
+                let marker = if index == app.interface_ui.selected_inventory_interface {
                     "▶"
                 } else {
                     " "
@@ -345,7 +346,7 @@ pub(crate) fn render_interface_inventory(
                             .join(", ")
                     })
                     .unwrap_or_default();
-                let style = if index == app.selected_inventory_interface {
+                let style = if index == app.interface_ui.selected_inventory_interface {
                     Style::default()
                         .fg(theme::ACCENT)
                         .add_modifier(Modifier::BOLD)
@@ -401,7 +402,11 @@ pub(crate) fn render_interface_inventory(
                     ));
                 }
                 if dhcp {
-                    let active = app.dhcp_interfaces.iter().any(|name| name == &entry.name);
+                    let active = app
+                        .dhcp_ui
+                        .dhcp_interfaces
+                        .iter()
+                        .any(|name| name == &entry.name);
                     let saved = entry
                         .configured
                         .as_ref()
@@ -448,6 +453,7 @@ pub(crate) fn render_interface_inventory(
     app.ui.list_count = app.dashboard.interfaces.len();
     let visible = inner.height as usize / 2;
     let offset = app
+        .interface_ui
         .selected_interface
         .saturating_sub(visible.saturating_sub(1));
     app.ui.list_scroll_offset = offset;
@@ -460,7 +466,7 @@ pub(crate) fn render_interface_inventory(
         .skip(offset)
         .take(visible)
         .flat_map(|(index, status)| {
-            let selected = index == app.selected_interface;
+            let selected = index == app.interface_ui.selected_interface;
             let marker = if selected { "▶" } else { " " };
             let addresses = format_addresses(status);
             let style = if selected {
@@ -512,7 +518,7 @@ const FORGET_LABEL: &str = "[Delete saved settings]";
 const RESET_LABEL: &str = "[Restore settings from file]";
 
 pub(super) fn confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> {
-    let editor = app.editor.as_ref()?;
+    let editor = app.interface_ui.editor.as_ref()?;
     if editor.exit_requested {
         return Some(super::confirmation::Dialog {
             title: "Leave interface editor?", action: "Keep draft", secondary: Some("Discard edits"),
@@ -565,7 +571,7 @@ pub(super) fn confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> 
 }
 
 pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
-    let Some(editor) = &app.editor else {
+    let Some(editor) = &app.interface_ui.editor else {
         return;
     };
 
@@ -574,8 +580,8 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
             frame,
             area,
             &mut app.ui,
-            app.confirmation_focus,
-            app.confirmation_scroll,
+            app.confirmation.confirmation_focus,
+            app.confirmation.confirmation_scroll,
         );
         return;
     }
@@ -797,7 +803,7 @@ const PREVIEW_RELEASE_LABEL: &str = "[Apply temporarily] stop managing (Enter)";
 const PREVIEW_CANCEL_LABEL: &str = "[Cancel] return without applying (Esc)";
 
 pub(crate) fn render_preview(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
-    let Some(plan) = &app.preview else {
+    let Some(plan) = &app.interface_ui.preview else {
         return;
     };
     let delete = if plan.delete_ipv4.is_empty() {
@@ -846,7 +852,7 @@ pub(crate) fn render_preview(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
         Line::from(""),
     ];
 
-    if let Some(editor) = &app.editor {
+    if let Some(editor) = &app.interface_ui.editor {
         if editor.has_default_route {
             lines.push(Line::styled(
                 "This interface carries the default route; connectivity may be interrupted.",
@@ -869,7 +875,7 @@ pub(crate) fn render_preview(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
         }
     }
 
-    if let Some(editor) = &app.editor {
+    if let Some(editor) = &app.interface_ui.editor {
         let before = if editor.original_cidr.is_empty() {
             "none"
         } else {
@@ -941,9 +947,12 @@ pub(crate) fn render_preview(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
     ));
 
     let visible_rows = inner.height.max(1) as usize;
-    app.preview_max_scroll = lines.len().saturating_sub(visible_rows);
-    app.preview_scroll = app.preview_scroll.min(app.preview_max_scroll);
-    let offset = app.preview_scroll;
+    app.interface_ui.preview_max_scroll = lines.len().saturating_sub(visible_rows);
+    app.interface_ui.preview_scroll = app
+        .interface_ui
+        .preview_scroll
+        .min(app.interface_ui.preview_max_scroll);
+    let offset = app.interface_ui.preview_scroll;
     for (row, label, slot) in [
         (cancel_row, PREVIEW_CANCEL_LABEL, 1),
         (apply_row, apply_label, 0),
@@ -970,7 +979,7 @@ const PENDING_COMMIT_LABEL: &str = "[Confirm changes]";
 const PENDING_ROLLBACK_LABEL: &str = "[Roll back now]";
 
 pub(crate) fn render_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
-    let Some(change) = &app.pending else {
+    let Some(change) = &app.confirmation.pending else {
         return;
     };
     let seconds = change.expires_at_unix.saturating_sub(current_unix_time());
@@ -1090,7 +1099,11 @@ pub(crate) fn render_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
             Line::styled(
                 format!(
                     "{}[Confirm changes] (Enter)",
-                    if app.pending_focus == 0 { "▶ " } else { "  " }
+                    if app.confirmation.pending_focus == 0 {
+                        "▶ "
+                    } else {
+                        "  "
+                    }
                 ),
                 Style::default()
                     .fg(theme::SELECTED_FG)
@@ -1100,7 +1113,11 @@ pub(crate) fn render_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
             Line::styled(
                 format!(
                     "{}[Roll back now] (Esc)",
-                    if app.pending_focus == 1 { "▶ " } else { "  " }
+                    if app.confirmation.pending_focus == 1 {
+                        "▶ "
+                    } else {
+                        "  "
+                    }
                 ),
                 Style::default()
                     .fg(theme::SELECTED_FG)
@@ -1117,7 +1134,7 @@ pub(crate) fn render_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
 }
 
 pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
-    if let Some(editor) = app.editor.as_mut() {
+    if let Some(editor) = app.interface_ui.editor.as_mut() {
         editor.field = match slot {
             ADVANCED_BUTTON_SLOT => InterfaceEditorField::Advanced,
             REMOVE_IPV4_BUTTON_SLOT => InterfaceEditorField::RemoveIpv4,
@@ -1192,11 +1209,11 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
     let Some(name) = selected_interface_name(app) else {
         return;
     };
-    if app.interface_drafts.contains_key(&name) {
+    if app.interface_ui.interface_drafts.contains_key(&name) {
         let Some((entry, revision)) = refresh_draft_interface(app, client, &name).await else {
             return;
         };
-        let mut draft = app.interface_drafts.remove(&name).unwrap();
+        let mut draft = app.interface_ui.interface_drafts.remove(&name).unwrap();
         let (cidr, managed) =
             editor_address_defaults(entry.configured.as_ref(), entry.observed.as_ref());
         // Preserve edits, but use current settings for unchanged fields and the review baseline.
@@ -1307,8 +1324,8 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
         draft.intent_confirmation = None;
         draft.exit_requested = false;
         draft.reset_cursor();
-        app.editor = Some(draft);
-        app.preview = None;
+        app.interface_ui.editor = Some(draft);
+        app.interface_ui.preview = None;
         app.screen = Screen::InterfaceEditor;
         app.push_message(
             LogLevel::Info,
@@ -1365,7 +1382,7 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
                 .and_then(|interface| interface.dhcp.as_ref())
                 .map(|dhcp| format!("DHCP pool {}-{}", dhcp.pool_start, dhcp.pool_end));
             let cursor = super::input::grapheme_count(&cidr);
-            app.editor = Some(InterfaceEditor {
+            app.interface_ui.editor = Some(InterfaceEditor {
                 wifi_concurrent_support,
                 wifi_concurrent: config.as_ref().is_some_and(|c| c.wifi_concurrent),
                 mac_address: config
@@ -1404,7 +1421,7 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
                 current_dhcp_summary,
                 cursor,
             });
-            app.preview = None;
+            app.interface_ui.preview = None;
             app.screen = Screen::InterfaceEditor;
         }
         Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
@@ -1455,7 +1472,7 @@ fn editor_address_defaults(
 }
 
 fn restore_unavailable(app: &TuiApp) -> Option<&'static str> {
-    let editor = app.editor.as_ref()?;
+    let editor = app.interface_ui.editor.as_ref()?;
     let Some(base) = app.dashboard.base_config.as_ref() else {
         return Some("Restore unavailable: daemon did not report the base file");
     };
@@ -1470,7 +1487,7 @@ fn restore_unavailable(app: &TuiApp) -> Option<&'static str> {
 
 pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
     let restore_reason = restore_unavailable(app);
-    let Some(editor) = app.editor.as_mut() else {
+    let Some(editor) = app.interface_ui.editor.as_mut() else {
         app.screen = Screen::InterfaceList;
         return;
     };
@@ -1479,13 +1496,15 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
         match key {
             KeyCode::Esc => editor.exit_requested = false,
             KeyCode::Delete => {
-                app.editor = None;
+                app.interface_ui.editor = None;
                 app.screen = Screen::InterfaceList;
             }
             KeyCode::Enter => {
-                let mut draft = app.editor.take().unwrap();
+                let mut draft = app.interface_ui.editor.take().unwrap();
                 draft.exit_requested = false;
-                app.interface_drafts.insert(draft.interface.clone(), draft);
+                app.interface_ui
+                    .interface_drafts
+                    .insert(draft.interface.clone(), draft);
                 app.screen = Screen::InterfaceList;
                 app.push_message(
                     LogLevel::Info,
@@ -1550,7 +1569,7 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
     match key {
         KeyCode::Esc if editor.dirty() => editor.exit_requested = true,
         KeyCode::Esc => {
-            app.editor = None;
+            app.interface_ui.editor = None;
             app.screen = Screen::InterfaceList;
         }
         KeyCode::Up | KeyCode::Char('k')
@@ -1732,7 +1751,7 @@ fn next_editor_field(
 }
 
 pub(crate) async fn submit_dry_run(app: &mut TuiApp, client: &ApiClient) {
-    let Some(editor) = &mut app.editor else {
+    let Some(editor) = &mut app.interface_ui.editor else {
         return;
     };
     // Preview is read-only. The separate Apply action confirms these risks.
@@ -1802,9 +1821,9 @@ pub(crate) async fn submit_dry_run(app: &mut TuiApp, client: &ApiClient) {
         .await
     {
         Ok(Response::InterfacePlan { plan }) => {
-            app.preview = Some(plan);
-            app.preview_scroll = 0;
-            app.preview_max_scroll = 0;
+            app.interface_ui.preview = Some(plan);
+            app.interface_ui.preview_scroll = 0;
+            app.interface_ui.preview_max_scroll = 0;
             app.screen = Screen::Preview;
         }
         Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
@@ -1821,24 +1840,30 @@ pub(crate) async fn handle_preview_key(app: &mut TuiApp, key: KeyCode, client: &
     match key {
         KeyCode::Esc => app.screen = Screen::InterfaceEditor,
         KeyCode::Up | KeyCode::Char('k') => {
-            app.preview_scroll = app.preview_scroll.saturating_sub(1);
+            app.interface_ui.preview_scroll = app.interface_ui.preview_scroll.saturating_sub(1);
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            app.preview_scroll = app
+            app.interface_ui.preview_scroll = app
+                .interface_ui
                 .preview_scroll
                 .saturating_add(1)
-                .min(app.preview_max_scroll);
+                .min(app.interface_ui.preview_max_scroll);
         }
-        KeyCode::PageUp => app.preview_scroll = app.preview_scroll.saturating_sub(PAGE),
+        KeyCode::PageUp => {
+            app.interface_ui.preview_scroll = app.interface_ui.preview_scroll.saturating_sub(PAGE)
+        }
         KeyCode::PageDown => {
-            app.preview_scroll = app
+            app.interface_ui.preview_scroll = app
+                .interface_ui
                 .preview_scroll
                 .saturating_add(PAGE)
-                .min(app.preview_max_scroll);
+                .min(app.interface_ui.preview_max_scroll);
         }
-        KeyCode::Home => app.preview_scroll = 0,
-        KeyCode::End => app.preview_scroll = app.preview_max_scroll,
-        KeyCode::Enter if app.preview_scroll >= app.preview_max_scroll => {
+        KeyCode::Home => app.interface_ui.preview_scroll = 0,
+        KeyCode::End => app.interface_ui.preview_scroll = app.interface_ui.preview_max_scroll,
+        KeyCode::Enter
+            if app.interface_ui.preview_scroll >= app.interface_ui.preview_max_scroll =>
+        {
             apply_preview(app, client).await;
         }
         KeyCode::Enter => app.push_message(
@@ -1850,7 +1875,7 @@ pub(crate) async fn handle_preview_key(app: &mut TuiApp, key: KeyCode, client: &
 }
 
 async fn apply_preview(app: &mut TuiApp, client: &ApiClient) {
-    let Some(editor) = &app.editor else {
+    let Some(editor) = &app.interface_ui.editor else {
         app.screen = Screen::InterfaceList;
         return;
     };
@@ -1870,9 +1895,9 @@ async fn apply_preview(app: &mut TuiApp, client: &ApiClient) {
         .await
     {
         Ok(Response::NetworkChangePending { change }) => {
-            app.pending_focus = 0;
-            app.pending = Some(change);
-            app.pending_return_screen = Screen::InterfaceList;
+            app.confirmation.pending_focus = 0;
+            app.confirmation.pending = Some(change);
+            app.confirmation.pending_return_screen = Screen::InterfaceList;
             app.screen = Screen::PendingChange;
         }
         Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
@@ -1894,25 +1919,25 @@ pub(crate) async fn handle_pending_key(app: &mut TuiApp, key: KeyCode, client: &
             | KeyCode::Left
             | KeyCode::Right
     ) {
-        app.pending_focus = 1 - app.pending_focus.min(1);
+        app.confirmation.pending_focus = 1 - app.confirmation.pending_focus.min(1);
         return;
     }
 
     match key {
-        KeyCode::Enter => finish_pending(app, client, app.pending_focus == 0).await,
+        KeyCode::Enter => finish_pending(app, client, app.confirmation.pending_focus == 0).await,
         KeyCode::Esc => finish_pending(app, client, false).await,
         _ => {}
     }
 }
 
 async fn finish_pending(app: &mut TuiApp, client: &ApiClient, commit: bool) {
-    let Some(change) = &app.pending else {
-        app.screen = app.pending_return_screen;
+    let Some(change) = &app.confirmation.pending else {
+        app.screen = app.confirmation.pending_return_screen;
         return;
     };
     if (commit && !change.can_commit()) || (!commit && !change.can_rollback()) {
         if !commit {
-            app.screen = app.pending_return_screen;
+            app.screen = app.confirmation.pending_return_screen;
         }
         return;
     }
@@ -1929,17 +1954,17 @@ async fn finish_pending(app: &mut TuiApp, client: &ApiClient, commit: bool) {
     match client.request(&request).await {
         Ok(Response::NetworkChangeCommitted { .. }) if commit => {
             app.push_message(LogLevel::Info, "Network changes applied and saved");
-            app.pending = None;
-            app.preview = None;
-            app.editor = None;
-            app.screen = app.pending_return_screen;
+            app.confirmation.pending = None;
+            app.interface_ui.preview = None;
+            app.interface_ui.editor = None;
+            app.screen = app.confirmation.pending_return_screen;
         }
         Ok(Response::NetworkChangeRolledBack { .. }) if !commit => {
             app.push_message(LogLevel::Info, "Network change rolled back");
-            app.pending = None;
-            app.preview = None;
-            app.editor = None;
-            app.screen = app.pending_return_screen;
+            app.confirmation.pending = None;
+            app.interface_ui.preview = None;
+            app.interface_ui.editor = None;
+            app.screen = app.confirmation.pending_return_screen;
         }
         Ok(Response::Error { message }) => {
             app.push_message(LogLevel::Error, message);

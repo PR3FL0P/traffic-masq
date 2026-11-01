@@ -23,7 +23,7 @@ fn traffic_dashboard_keeps_selection_visible() {
     app.dashboard.interfaces = (0..12).map(status).collect();
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     for selected in [0, 5, 11] {
-        app.selected_interface = selected;
+        app.interface_ui.selected_interface = selected;
         terminal
             .draw(|frame| super::super::render(frame, &mut app, false))
             .unwrap();
@@ -58,7 +58,7 @@ async fn dashboard_switches_between_traffic_and_numeric_statistics() {
         terminal
             .draw(|frame| super::super::render(frame, &mut app, false))
             .unwrap();
-        assert_eq!(app.dashboard_pane, pane);
+        assert_eq!(app.dashboard_ui.dashboard_pane, pane);
         let buffer = terminal.backend().buffer();
         let text: String = (0..24)
             .flat_map(|y| (0..100).map(move |x| buffer[(x, y)].symbol()))
@@ -209,7 +209,7 @@ fn dashboard_graphs_follow_each_interface_and_hide_in_small_windows() {
             let now = Instant::now();
             history.record(0, 0, now);
             history.record(2048, 4096, now + Duration::from_secs(1));
-            app.traffic.insert(index, history);
+            app.dashboard_ui.traffic.insert(index, history);
         }
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
@@ -263,7 +263,7 @@ fn failed_update_retains_samples_and_reports_error() {
     app.dashboard.last_success = Some(Instant::now());
     let mut history = TrafficHistory::default();
     history.record(100, 200, Instant::now());
-    app.traffic.insert(1, history);
+    app.dashboard_ui.traffic.insert(1, history);
     accept_update(
         &mut app,
         DashboardData {
@@ -273,7 +273,14 @@ fn failed_update_retains_samples_and_reports_error() {
     );
     record_traffic_samples(&mut app);
     assert_eq!(app.dashboard.interfaces.len(), 1);
-    assert_eq!(app.traffic[&1].first.as_ref().unwrap().rx_bytes, 100);
+    assert_eq!(
+        app.dashboard_ui.traffic[&1]
+            .first
+            .as_ref()
+            .unwrap()
+            .rx_bytes,
+        100
+    );
     let text = render_text(&mut app, 80, 24);
     assert!(text.contains("disconnected"), "{text}");
     assert!(!text.contains("No interfaces detected"));
@@ -329,7 +336,7 @@ fn initial_selection_prefers_wan_and_refresh_preserves_interface_identity() {
     };
     data.roles.insert("eth2".into(), InterfaceRole::Input);
     accept_update(&mut app, data);
-    assert_eq!(app.selected_interface, 1);
+    assert_eq!(app.interface_ui.selected_interface, 1);
     accept_update(
         &mut app,
         DashboardData {
@@ -338,7 +345,7 @@ fn initial_selection_prefers_wan_and_refresh_preserves_interface_identity() {
             ..Default::default()
         },
     );
-    assert_eq!(app.selected_interface, 0);
+    assert_eq!(app.interface_ui.selected_interface, 0);
 }
 
 #[test]

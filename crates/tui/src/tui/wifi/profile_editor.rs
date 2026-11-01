@@ -11,12 +11,12 @@ pub(crate) fn render_wifi_profile_editor(
             frame,
             area,
             &mut app.ui,
-            app.confirmation_focus,
-            app.confirmation_scroll,
+            app.confirmation.confirmation_focus,
+            app.confirmation.confirmation_scroll,
         );
         return;
     }
-    let Some(editor) = &app.wifi_profile_editor else {
+    let Some(editor) = &app.wifi_ui.wifi_profile_editor else {
         return;
     };
     let area = crate::tui::interface_status::render_context(frame, area, app, &editor.interface);
@@ -111,7 +111,7 @@ pub(crate) async fn handle_wifi_profile_editor_key(
     key: KeyCode,
     client: &ApiClient,
 ) {
-    let Some(editor) = app.wifi_profile_editor.as_mut() else {
+    let Some(editor) = app.wifi_ui.wifi_profile_editor.as_mut() else {
         app.screen = Screen::WifiProfiles;
         return;
     };
@@ -177,7 +177,7 @@ pub(crate) async fn handle_wifi_profile_editor_key(
 }
 
 async fn save_profile(app: &mut TuiApp, client: &ApiClient) {
-    let Some(editor) = app.wifi_profile_editor.clone() else {
+    let Some(editor) = app.wifi_ui.wifi_profile_editor.clone() else {
         return;
     };
     let profile = match editor.request() {
@@ -202,7 +202,7 @@ async fn save_profile(app: &mut TuiApp, client: &ApiClient) {
             let is_new = editor.original_id.is_none();
             let profile_id = saved_profile.id.clone();
             let ssid = saved_profile.ssid.clone();
-            app.wifi_profile_editor = None;
+            app.wifi_ui.wifi_profile_editor = None;
             app.screen = Screen::Wifi;
             if is_new && !interface.is_empty() {
                 open_wifi_connect_prompt(app, client, interface, profile_id, ssid).await;
@@ -219,7 +219,7 @@ async fn save_profile(app: &mut TuiApp, client: &ApiClient) {
 }
 
 pub(in crate::tui) fn exit_confirmation(app: &TuiApp) -> Option<crate::tui::confirmation::Dialog> {
-    let editor = app.wifi_profile_editor.as_ref()?;
+    let editor = app.wifi_ui.wifi_profile_editor.as_ref()?;
     editor.exit_requested.then(|| {
         crate::tui::confirmation::discard_edits_dialog(
             "Leave Wi-Fi profile editor?",
@@ -228,10 +228,10 @@ pub(in crate::tui) fn exit_confirmation(app: &TuiApp) -> Option<crate::tui::conf
     })
 }
 fn close_editor(app: &mut TuiApp) {
-    app.wifi_profile_editor = None;
-    app.screen = if app.wifi_profiles.is_some() {
+    app.wifi_ui.wifi_profile_editor = None;
+    app.screen = if app.wifi_ui.wifi_profiles.is_some() {
         Screen::WifiProfiles
-    } else if app.wifi_scan.is_some() {
+    } else if app.wifi_ui.wifi_scan.is_some() {
         Screen::WifiScan
     } else {
         Screen::Wifi

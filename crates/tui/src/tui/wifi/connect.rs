@@ -58,7 +58,7 @@ pub(crate) async fn open_wifi_connect_prompt(
         };
     let mut prompt = WifiConnectPrompt::new(interface, profile_id, ssid, current_static_ip);
     prompt.expected_revision = expected_revision;
-    app.wifi_connect = Some(prompt);
+    app.wifi_ui.wifi_connect = Some(prompt);
     app.screen = Screen::WifiConnectPrompt;
 }
 
@@ -67,13 +67,17 @@ pub(crate) async fn handle_wifi_connect_prompt_key(
     key: KeyCode,
     client: &ApiClient,
 ) {
-    let Some(prompt) = app.wifi_connect.as_mut() else {
+    let Some(prompt) = app.wifi_ui.wifi_connect.as_mut() else {
         app.screen = Screen::Wifi;
         return;
     };
 
     if prompt.reviewing {
-        if layout::scroll_change_review(key, &mut app.preview_scroll, app.preview_max_scroll) {
+        if layout::scroll_change_review(
+            key,
+            &mut app.interface_ui.preview_scroll,
+            app.interface_ui.preview_max_scroll,
+        ) {
             return;
         }
         match key {
@@ -98,8 +102,8 @@ pub(crate) async fn handle_wifi_connect_prompt_key(
     }
     match key {
         KeyCode::Esc => {
-            app.wifi_connect = None;
-            app.screen = if app.wifi_profiles.is_some() {
+            app.wifi_ui.wifi_connect = None;
+            app.screen = if app.wifi_ui.wifi_profiles.is_some() {
                 Screen::WifiProfiles
             } else {
                 Screen::Wifi
@@ -153,11 +157,11 @@ pub(crate) async fn handle_wifi_connect_prompt_key(
             }
             WifiConnectField::Submit => {
                 prompt.reviewing = true;
-                app.preview_scroll = 0;
+                app.interface_ui.preview_scroll = 0;
             }
             WifiConnectField::Cancel => {
-                app.wifi_connect = None;
-                app.screen = if app.wifi_profiles.is_some() {
+                app.wifi_ui.wifi_connect = None;
+                app.screen = if app.wifi_ui.wifi_profiles.is_some() {
                     Screen::WifiProfiles
                 } else {
                     Screen::Wifi
@@ -174,7 +178,7 @@ pub(crate) async fn handle_wifi_connect_prompt_key(
 }
 
 pub(super) async fn submit_wifi_connect(app: &mut TuiApp, client: &ApiClient) {
-    let Some(prompt) = app.wifi_connect.clone() else {
+    let Some(prompt) = app.wifi_ui.wifi_connect.clone() else {
         return;
     };
     if let Some(change) = app
@@ -184,10 +188,10 @@ pub(super) async fn submit_wifi_connect(app: &mut TuiApp, client: &ApiClient) {
         .find(|change| change.interface == prompt.interface)
         .cloned()
     {
-        app.pending_focus = 0;
-        app.pending = Some(change);
-        app.pending_return_screen = Screen::Wifi;
-        app.wifi_connect = None;
+        app.confirmation.pending_focus = 0;
+        app.confirmation.pending = Some(change);
+        app.confirmation.pending_return_screen = Screen::Wifi;
+        app.wifi_ui.wifi_connect = None;
         app.screen = Screen::PendingChange;
         app.push_message(
             LogLevel::Warn,
@@ -238,7 +242,7 @@ pub(super) async fn submit_wifi_connect(app: &mut TuiApp, client: &ApiClient) {
     };
     match client.request(&request).await {
         Ok(Response::InterfaceIntentSaved { interface, .. }) => {
-            app.wifi_connect = None;
+            app.wifi_ui.wifi_connect = None;
             app.screen = Screen::Wifi;
             app.push_message(
                 LogLevel::Info,
@@ -247,10 +251,10 @@ pub(super) async fn submit_wifi_connect(app: &mut TuiApp, client: &ApiClient) {
             load_wifi_data(app, client).await;
         }
         Ok(Response::NetworkChangePending { change }) => {
-            app.pending_focus = 0;
-            app.pending = Some(change);
-            app.pending_return_screen = Screen::Wifi;
-            app.wifi_connect = None;
+            app.confirmation.pending_focus = 0;
+            app.confirmation.pending = Some(change);
+            app.confirmation.pending_return_screen = Screen::Wifi;
+            app.wifi_ui.wifi_connect = None;
             app.screen = Screen::PendingChange;
             app.push_message(LogLevel::Info, "Wi-Fi candidate applied. Verify connectivity before confirming; otherwise it will roll back.");
         }
@@ -268,7 +272,7 @@ pub(crate) fn render_wifi_connect_prompt(
     area: Rect,
     app: &mut TuiApp,
 ) {
-    let Some(prompt) = &app.wifi_connect else {
+    let Some(prompt) = &app.wifi_ui.wifi_connect else {
         return;
     };
     let interface_status = crate::tui::interface_status::describe(app, &prompt.interface);
@@ -301,8 +305,8 @@ pub(crate) fn render_wifi_connect_prompt(
             layout::ChangeReviewState {
                 offline: prompt.expected_revision.is_some(),
                 cancel_selected: prompt.field == WifiConnectField::Cancel,
-                scroll: &mut app.preview_scroll,
-                max_scroll: &mut app.preview_max_scroll,
+                scroll: &mut app.interface_ui.preview_scroll,
+                max_scroll: &mut app.interface_ui.preview_max_scroll,
             },
         );
         return;

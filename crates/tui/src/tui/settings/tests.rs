@@ -19,21 +19,24 @@ fn session_fields_are_reachable_and_save_stays_visible_on_small_terminal() {
         SettingsField::ChangePassword
     );
     let mut app = TuiApp {
-        settings: Some(SecurityEditor {
-            field: SettingsField::SaveSession,
-            active: SecuritySettings {
-                rollback_timeout_seconds: 30,
-            },
-            rollback_timeout_input: "30".into(),
-            override_active: false,
-            restart_required: false,
-            remember_session: true,
-            remember_minutes_input: "5".into(),
-            show_dhcp_client: false,
-            confirmation: None,
-            cursor: 0,
-            editing: false,
-        }),
+        settings_ui: crate::tui::state::SettingsUiState {
+            settings: Some(SecurityEditor {
+                field: SettingsField::SaveSession,
+                active: SecuritySettings {
+                    rollback_timeout_seconds: 30,
+                },
+                rollback_timeout_input: "30".into(),
+                override_active: false,
+                restart_required: false,
+                remember_session: true,
+                remember_minutes_input: "5".into(),
+                show_dhcp_client: false,
+                confirmation: None,
+                cursor: 0,
+                editing: false,
+            }),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 10)).unwrap();
@@ -56,21 +59,24 @@ fn session_fields_are_reachable_and_save_stays_visible_on_small_terminal() {
 async fn mutating_settings_require_a_second_enter() {
     for field in [SettingsField::Reset, SettingsField::Save] {
         let mut app = TuiApp {
-            settings: Some(SecurityEditor {
-                field,
-                active: SecuritySettings {
-                    rollback_timeout_seconds: 30,
-                },
-                rollback_timeout_input: "30".into(),
-                override_active: false,
-                restart_required: false,
-                remember_session: true,
-                remember_minutes_input: "5".into(),
-                show_dhcp_client: false,
-                confirmation: None,
-                cursor: 0,
-                editing: false,
-            }),
+            settings_ui: crate::tui::state::SettingsUiState {
+                settings: Some(SecurityEditor {
+                    field,
+                    active: SecuritySettings {
+                        rollback_timeout_seconds: 30,
+                    },
+                    rollback_timeout_input: "30".into(),
+                    override_active: false,
+                    restart_required: false,
+                    remember_session: true,
+                    remember_minutes_input: "5".into(),
+                    show_dhcp_client: false,
+                    confirmation: None,
+                    cursor: 0,
+                    editing: false,
+                }),
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -81,7 +87,10 @@ async fn mutating_settings_require_a_second_enter() {
         )
         .await;
 
-        assert_eq!(app.settings.as_ref().unwrap().confirmation, Some(field));
+        assert_eq!(
+            app.settings_ui.settings.as_ref().unwrap().confirmation,
+            Some(field)
+        );
         assert!(app.message.is_none(), "first Enter must not submit");
     }
 }
@@ -161,50 +170,59 @@ fn settings_field_clamps_at_both_ends_instead_of_wrapping() {
 #[test]
 fn clicking_access_action_focuses_access_field() {
     let mut app = TuiApp {
-        settings: Some(SecurityEditor {
-            field: SettingsField::RollbackTimeout,
-            active: SecuritySettings {
-                rollback_timeout_seconds: 30,
-            },
-            rollback_timeout_input: "30".into(),
-            override_active: false,
-            restart_required: false,
-            remember_session: true,
-            remember_minutes_input: "5".into(),
-            show_dhcp_client: false,
-            confirmation: None,
-            cursor: 0,
-            editing: false,
-        }),
+        settings_ui: crate::tui::state::SettingsUiState {
+            settings: Some(SecurityEditor {
+                field: SettingsField::RollbackTimeout,
+                active: SecuritySettings {
+                    rollback_timeout_seconds: 30,
+                },
+                rollback_timeout_input: "30".into(),
+                override_active: false,
+                restart_required: false,
+                remember_session: true,
+                remember_minutes_input: "5".into(),
+                show_dhcp_client: false,
+                confirmation: None,
+                cursor: 0,
+                editing: false,
+            }),
+            ..Default::default()
+        },
         ..Default::default()
     };
     focus_action(&mut app, 7);
-    assert_eq!(app.settings.as_ref().unwrap().field, SettingsField::Access);
+    assert_eq!(
+        app.settings_ui.settings.as_ref().unwrap().field,
+        SettingsField::Access
+    );
 }
 
 #[test]
 fn clicking_dhcp_client_action_focuses_show_dhcp_client_field() {
     let mut app = TuiApp {
-        settings: Some(SecurityEditor {
-            field: SettingsField::RollbackTimeout,
-            active: SecuritySettings {
-                rollback_timeout_seconds: 30,
-            },
-            rollback_timeout_input: "30".into(),
-            override_active: false,
-            restart_required: false,
-            remember_session: true,
-            remember_minutes_input: "5".into(),
-            show_dhcp_client: false,
-            confirmation: None,
-            cursor: 0,
-            editing: false,
-        }),
+        settings_ui: crate::tui::state::SettingsUiState {
+            settings: Some(SecurityEditor {
+                field: SettingsField::RollbackTimeout,
+                active: SecuritySettings {
+                    rollback_timeout_seconds: 30,
+                },
+                rollback_timeout_input: "30".into(),
+                override_active: false,
+                restart_required: false,
+                remember_session: true,
+                remember_minutes_input: "5".into(),
+                show_dhcp_client: false,
+                confirmation: None,
+                cursor: 0,
+                editing: false,
+            }),
+            ..Default::default()
+        },
         ..Default::default()
     };
     focus_action(&mut app, 8);
     assert_eq!(
-        app.settings.as_ref().unwrap().field,
+        app.settings_ui.settings.as_ref().unwrap().field,
         SettingsField::ShowDhcpClient
     );
 }
@@ -212,22 +230,25 @@ fn clicking_dhcp_client_action_focuses_show_dhcp_client_field() {
 #[tokio::test]
 async fn enter_on_access_setting_attempts_to_open_access_editor() {
     let mut app = TuiApp {
+        settings_ui: crate::tui::state::SettingsUiState {
+            settings: Some(SecurityEditor {
+                field: SettingsField::Access,
+                active: SecuritySettings {
+                    rollback_timeout_seconds: 30,
+                },
+                rollback_timeout_input: "30".into(),
+                override_active: false,
+                restart_required: false,
+                remember_session: true,
+                remember_minutes_input: "5".into(),
+                show_dhcp_client: false,
+                confirmation: None,
+                cursor: 0,
+                editing: false,
+            }),
+            ..Default::default()
+        },
         screen: Screen::Settings,
-        settings: Some(SecurityEditor {
-            field: SettingsField::Access,
-            active: SecuritySettings {
-                rollback_timeout_seconds: 30,
-            },
-            rollback_timeout_input: "30".into(),
-            override_active: false,
-            restart_required: false,
-            remember_session: true,
-            remember_minutes_input: "5".into(),
-            show_dhcp_client: false,
-            confirmation: None,
-            cursor: 0,
-            editing: false,
-        }),
         ..Default::default()
     };
 
@@ -299,70 +320,90 @@ fn zeroize_all_clears_every_buffer() {
 #[tokio::test]
 async fn settings_editor_cursor_navigation_and_editing() {
     let mut app = TuiApp {
+        settings_ui: crate::tui::state::SettingsUiState {
+            settings: Some(SecurityEditor {
+                field: SettingsField::RollbackTimeout,
+                active: SecuritySettings {
+                    rollback_timeout_seconds: 30,
+                },
+                rollback_timeout_input: "30".into(),
+                override_active: false,
+                restart_required: false,
+                remember_session: true,
+                remember_minutes_input: "5".into(),
+                show_dhcp_client: false,
+                confirmation: None,
+                cursor: 2,
+                editing: true,
+            }),
+            ..Default::default()
+        },
         screen: Screen::Settings,
-        settings: Some(SecurityEditor {
-            field: SettingsField::RollbackTimeout,
-            active: SecuritySettings {
-                rollback_timeout_seconds: 30,
-            },
-            rollback_timeout_input: "30".into(),
-            override_active: false,
-            restart_required: false,
-            remember_session: true,
-            remember_minutes_input: "5".into(),
-            show_dhcp_client: false,
-            confirmation: None,
-            cursor: 2,
-            editing: true,
-        }),
         ..Default::default()
     };
     let client = ApiClient::new("/socket-that-must-not-be-opened");
 
     handle_settings_key(&mut app, KeyCode::Left, &client).await;
-    assert_eq!(app.settings.as_ref().unwrap().cursor, 1);
+    assert_eq!(app.settings_ui.settings.as_ref().unwrap().cursor, 1);
 
     handle_settings_key(&mut app, KeyCode::Char('5'), &client).await;
-    assert_eq!(app.settings.as_ref().unwrap().rollback_timeout_input, "350");
-    assert_eq!(app.settings.as_ref().unwrap().cursor, 2);
+    assert_eq!(
+        app.settings_ui
+            .settings
+            .as_ref()
+            .unwrap()
+            .rollback_timeout_input,
+        "350"
+    );
+    assert_eq!(app.settings_ui.settings.as_ref().unwrap().cursor, 2);
 
     handle_settings_key(&mut app, KeyCode::Backspace, &client).await;
-    assert_eq!(app.settings.as_ref().unwrap().rollback_timeout_input, "30");
-    assert_eq!(app.settings.as_ref().unwrap().cursor, 1);
+    assert_eq!(
+        app.settings_ui
+            .settings
+            .as_ref()
+            .unwrap()
+            .rollback_timeout_input,
+        "30"
+    );
+    assert_eq!(app.settings_ui.settings.as_ref().unwrap().cursor, 1);
 }
 
 #[tokio::test]
 async fn settings_enter_advances_text_fields_with_or_without_edits() {
     let mut app = TuiApp {
+        settings_ui: crate::tui::state::SettingsUiState {
+            settings: Some(SecurityEditor {
+                field: SettingsField::RollbackTimeout,
+                active: SecuritySettings {
+                    rollback_timeout_seconds: 30,
+                },
+                rollback_timeout_input: "30".into(),
+                override_active: false,
+                restart_required: false,
+                remember_session: true,
+                remember_minutes_input: "5".into(),
+                show_dhcp_client: false,
+                confirmation: None,
+                cursor: 0,
+                editing: false,
+            }),
+            ..Default::default()
+        },
         screen: Screen::Settings,
-        settings: Some(SecurityEditor {
-            field: SettingsField::RollbackTimeout,
-            active: SecuritySettings {
-                rollback_timeout_seconds: 30,
-            },
-            rollback_timeout_input: "30".into(),
-            override_active: false,
-            restart_required: false,
-            remember_session: true,
-            remember_minutes_input: "5".into(),
-            show_dhcp_client: false,
-            confirmation: None,
-            cursor: 0,
-            editing: false,
-        }),
         ..Default::default()
     };
     let client = ApiClient::new("/socket-that-must-not-be-opened");
 
-    assert!(!app.settings.as_ref().unwrap().is_editing());
+    assert!(!app.settings_ui.settings.as_ref().unwrap().is_editing());
 
     // Typing enters editing; Enter advances without sending a request.
     handle_settings_key(&mut app, KeyCode::Char('1'), &client).await;
-    assert!(app.settings.as_ref().unwrap().is_editing());
+    assert!(app.settings_ui.settings.as_ref().unwrap().is_editing());
     handle_settings_key(&mut app, KeyCode::Enter, &client).await;
-    assert!(!app.settings.as_ref().unwrap().is_editing());
+    assert!(!app.settings_ui.settings.as_ref().unwrap().is_editing());
     assert_eq!(
-        app.settings.as_ref().unwrap().field,
+        app.settings_ui.settings.as_ref().unwrap().field,
         SettingsField::RememberSession
     );
     assert!(app.message.is_none());
@@ -370,20 +411,20 @@ async fn settings_enter_advances_text_fields_with_or_without_edits() {
     handle_settings_key(&mut app, KeyCode::Up, &client).await;
     handle_settings_key(&mut app, KeyCode::Enter, &client).await;
     assert_eq!(
-        app.settings.as_ref().unwrap().field,
+        app.settings_ui.settings.as_ref().unwrap().field,
         SettingsField::RememberSession
     );
 
     handle_settings_key(&mut app, KeyCode::Down, &client).await;
     assert_eq!(
-        app.settings.as_ref().unwrap().field,
+        app.settings_ui.settings.as_ref().unwrap().field,
         SettingsField::RememberMinutes
     );
     handle_settings_key(&mut app, KeyCode::Char('2'), &client).await;
-    assert!(app.settings.as_ref().unwrap().is_editing());
+    assert!(app.settings_ui.settings.as_ref().unwrap().is_editing());
     handle_settings_key(&mut app, KeyCode::Enter, &client).await;
     assert_eq!(
-        app.settings.as_ref().unwrap().field,
+        app.settings_ui.settings.as_ref().unwrap().field,
         SettingsField::ShowDhcpClient
     );
 }
@@ -397,73 +438,91 @@ async fn password_editor_cursor_navigation_and_editing() {
     let mut editor = PasswordChangeEditor::new();
     editor.current = "secret".into();
     editor.cursor = 6;
-    app.settings_password = Some(editor);
+    app.settings_ui.settings_password = Some(editor);
     let client = ApiClient::new("/socket-that-must-not-be-opened");
 
     handle_settings_password_key(&mut app, KeyCode::Left, &client).await;
-    assert_eq!(app.settings_password.as_ref().unwrap().cursor, 5);
+    assert_eq!(
+        app.settings_ui.settings_password.as_ref().unwrap().cursor,
+        5
+    );
 
     handle_settings_password_key(&mut app, KeyCode::Home, &client).await;
-    assert_eq!(app.settings_password.as_ref().unwrap().cursor, 0);
+    assert_eq!(
+        app.settings_ui.settings_password.as_ref().unwrap().cursor,
+        0
+    );
 
     handle_settings_password_key(&mut app, KeyCode::Char('a'), &client).await;
-    assert_eq!(app.settings_password.as_ref().unwrap().current, "asecret");
-    assert_eq!(app.settings_password.as_ref().unwrap().cursor, 1);
+    assert_eq!(
+        app.settings_ui.settings_password.as_ref().unwrap().current,
+        "asecret"
+    );
+    assert_eq!(
+        app.settings_ui.settings_password.as_ref().unwrap().cursor,
+        1
+    );
 }
 
 #[tokio::test]
 async fn toggling_dhcp_client_tab_updates_editor_and_app_state() {
     let mut app = TuiApp {
+        settings_ui: crate::tui::state::SettingsUiState {
+            settings: Some(SecurityEditor {
+                field: SettingsField::ShowDhcpClient,
+                active: SecuritySettings {
+                    rollback_timeout_seconds: 30,
+                },
+                rollback_timeout_input: "30".into(),
+                override_active: false,
+                restart_required: false,
+                remember_session: true,
+                remember_minutes_input: "5".into(),
+                show_dhcp_client: false,
+                confirmation: None,
+                cursor: 0,
+                editing: false,
+            }),
+            ..Default::default()
+        },
         screen: Screen::Settings,
         show_dhcp_client: false,
-        settings: Some(SecurityEditor {
-            field: SettingsField::ShowDhcpClient,
-            active: SecuritySettings {
-                rollback_timeout_seconds: 30,
-            },
-            rollback_timeout_input: "30".into(),
-            override_active: false,
-            restart_required: false,
-            remember_session: true,
-            remember_minutes_input: "5".into(),
-            show_dhcp_client: false,
-            confirmation: None,
-            cursor: 0,
-            editing: false,
-        }),
         ..Default::default()
     };
     let client = ApiClient::new("/socket-that-must-not-be-opened");
 
     // Pressing Space toggles on
     handle_settings_key(&mut app, KeyCode::Char(' '), &client).await;
-    assert!(app.settings.as_ref().unwrap().show_dhcp_client);
+    assert!(app.settings_ui.settings.as_ref().unwrap().show_dhcp_client);
     assert!(app.show_dhcp_client);
 
     // Pressing Enter toggles off
     handle_settings_key(&mut app, KeyCode::Enter, &client).await;
-    assert!(!app.settings.as_ref().unwrap().show_dhcp_client);
+    assert!(!app.settings_ui.settings.as_ref().unwrap().show_dhcp_client);
     assert!(!app.show_dhcp_client);
 }
 
 #[tokio::test]
 async fn session_preferences_submit_on_first_enter() {
     let mut app = TuiApp {
-        settings: Some(SecurityEditor {
-            field: SettingsField::SaveSession,
-            active: SecuritySettings {
-                rollback_timeout_seconds: 30,
-            },
-            rollback_timeout_input: "30".into(),
-            override_active: false,
-            restart_required: false,
-            remember_session: true,
-            remember_minutes_input: "invalid".into(),
-            show_dhcp_client: false,
-            confirmation: None,
-            cursor: 0,
-            editing: false,
-        }),
+        settings_ui: crate::tui::state::SettingsUiState {
+            settings: Some(SecurityEditor {
+                field: SettingsField::SaveSession,
+                active: SecuritySettings {
+                    rollback_timeout_seconds: 30,
+                },
+                rollback_timeout_input: "30".into(),
+                override_active: false,
+                restart_required: false,
+                remember_session: true,
+                remember_minutes_input: "invalid".into(),
+                show_dhcp_client: false,
+                confirmation: None,
+                cursor: 0,
+                editing: false,
+            }),
+            ..Default::default()
+        },
         ..Default::default()
     };
     handle_settings_key(
@@ -472,7 +531,13 @@ async fn session_preferences_submit_on_first_enter() {
         &ApiClient::new("/nonexistent.sock"),
     )
     .await;
-    assert!(app.settings.as_ref().unwrap().confirmation.is_none());
+    assert!(app
+        .settings_ui
+        .settings
+        .as_ref()
+        .unwrap()
+        .confirmation
+        .is_none());
     assert!(app
         .message
         .as_ref()
@@ -486,14 +551,17 @@ async fn clicking_password_submit_validates_form_regardless_of_focused_input() {
     use ratatui::{backend::TestBackend, Terminal};
     for field in PASSWORD_FIELDS {
         let mut app = TuiApp {
+            settings_ui: crate::tui::state::SettingsUiState {
+                settings_password: Some(PasswordChangeEditor {
+                    field,
+                    current: "current".into(),
+                    new_password: "new".into(),
+                    confirm: "mismatch".into(),
+                    cursor: 0,
+                }),
+                ..Default::default()
+            },
             screen: Screen::SettingsPassword,
-            settings_password: Some(PasswordChangeEditor {
-                field,
-                current: "current".into(),
-                new_password: "new".into(),
-                confirm: "mismatch".into(),
-                cursor: 0,
-            }),
             ..Default::default()
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();

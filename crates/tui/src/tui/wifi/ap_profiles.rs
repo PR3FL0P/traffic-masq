@@ -52,6 +52,7 @@ pub(super) async fn open_ap_profiles(
         Ok(Response::WifiApProfiles { mut profiles }) => {
             profiles.sort_by(|a, b| a.id.cmp(&b.id));
             let previous = app
+                .wifi_ui
                 .wifi_ap_profiles
                 .as_ref()
                 .filter(|v| v.interface == interface);
@@ -68,7 +69,7 @@ pub(super) async fn open_ap_profiles(
             } else {
                 mode
             };
-            app.wifi_ap_profiles = Some(WifiApProfilesView {
+            app.wifi_ui.wifi_ap_profiles = Some(WifiApProfilesView {
                 interface,
                 profiles,
                 mode,
@@ -125,10 +126,11 @@ pub(super) fn open_ap_profile_editor(
     }
     editor.reset_cursor();
     let editor = app
+        .wifi_ui
         .ap_drafts
         .remove(&super::ap_editor::draft_key(&editor))
         .unwrap_or(editor);
-    app.wifi_editor = Some(editor);
+    app.wifi_ui.wifi_editor = Some(editor);
     app.screen = Screen::WifiEditor;
 }
 
@@ -137,7 +139,7 @@ pub(crate) fn render_wifi_ap_profiles(
     area: Rect,
     app: &mut TuiApp,
 ) {
-    let Some(view) = &app.wifi_ap_profiles else {
+    let Some(view) = &app.wifi_ui.wifi_ap_profiles else {
         return;
     };
     if view.apply_review {
@@ -184,8 +186,8 @@ pub(crate) fn render_wifi_ap_profiles(
                 super::super::layout::ChangeReviewState {
                     offline: false,
                     cancel_selected: view.review_cancel,
-                    scroll: &mut app.preview_scroll,
-                    max_scroll: &mut app.preview_max_scroll,
+                    scroll: &mut app.interface_ui.preview_scroll,
+                    max_scroll: &mut app.interface_ui.preview_max_scroll,
                 },
             );
         }
@@ -197,8 +199,8 @@ pub(crate) fn render_wifi_ap_profiles(
                 frame,
                 area,
                 &mut app.ui,
-                app.confirmation_focus,
-                app.confirmation_scroll,
+                app.confirmation.confirmation_focus,
+                app.confirmation.confirmation_scroll,
             );
         }
         return;
@@ -297,15 +299,15 @@ pub(crate) async fn handle_wifi_ap_profiles_key(
     key: KeyCode,
     client: &ApiClient,
 ) {
-    let Some(view) = app.wifi_ap_profiles.as_mut() else {
+    let Some(view) = app.wifi_ui.wifi_ap_profiles.as_mut() else {
         app.screen = Screen::Wifi;
         return;
     };
     if view.apply_review {
         if super::super::layout::scroll_change_review(
             key,
-            &mut app.preview_scroll,
-            app.preview_max_scroll,
+            &mut app.interface_ui.preview_scroll,
+            app.interface_ui.preview_max_scroll,
         ) {
             return;
         }
@@ -364,7 +366,7 @@ pub(crate) async fn handle_wifi_ap_profiles_key(
         KeyCode::End => view.select(usize::MAX),
         KeyCode::Esc => match view.mode {
             WifiProfilesMode::Menu => {
-                app.wifi_ap_profiles = None;
+                app.wifi_ui.wifi_ap_profiles = None;
                 app.screen = Screen::Wifi;
             }
             WifiProfilesMode::Management | WifiProfilesMode::Connect => {
@@ -424,7 +426,7 @@ pub(crate) async fn handle_wifi_ap_profiles_key(
                         if !view.apply_review {
                             view.apply_review = true;
                             view.review_cancel = false;
-                            app.preview_scroll = 0;
+                            app.interface_ui.preview_scroll = 0;
                             return;
                         }
                         match client
@@ -437,9 +439,9 @@ pub(crate) async fn handle_wifi_ap_profiles_key(
                             Ok(Response::NetworkChangePending { change }) => {
                                 view.apply_review = false;
                                 view.review_cancel = false;
-                                app.pending_focus = 0;
-                                app.pending = Some(change);
-                                app.pending_return_screen = Screen::WifiApProfiles;
+                                app.confirmation.pending_focus = 0;
+                                app.confirmation.pending = Some(change);
+                                app.confirmation.pending_return_screen = Screen::WifiApProfiles;
                                 app.screen = Screen::PendingChange;
                                 app.push_message(LogLevel::Info, "AP profile applied tentatively; confirm before the rollback timer expires");
                             }

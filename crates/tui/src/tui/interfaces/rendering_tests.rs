@@ -57,7 +57,7 @@ fn mixed_addresses_have_individual_ownership_colors() {
 fn interface_list_keeps_selected_row_visible_and_click_offset_correct() {
     let mut app = TuiApp::default();
     app.dashboard.interfaces = (0..20).map(status).collect();
-    app.selected_interface = 19;
+    app.interface_ui.selected_interface = 19;
     let mut terminal = Terminal::new(TestBackend::new(80, 6)).unwrap();
     terminal
         .draw(|frame| render_interface_list(frame, frame.area(), &mut app))
@@ -72,18 +72,21 @@ fn interface_list_keeps_selected_row_visible_and_click_offset_correct() {
 #[test]
 fn preview_buttons_are_visible_and_cancel_has_a_click_target() {
     let mut app = TuiApp {
-        preview: Some(traffic_masq_protocol::InterfaceChangePlanView {
-            mac_address: None,
-            interface: "eth0".into(),
-            delete_ipv4: vec![],
-            retag_ipv4: None,
-            add_ipv4: None,
-            set_link_up: false,
-            management_change: false,
-            dhcp_action: traffic_masq_protocol::DhcpChangeActionView::Unchanged,
-            releasing_management: false,
-        }),
-        preview_scroll: usize::MAX,
+        interface_ui: crate::tui::state::InterfaceUiState {
+            preview: Some(traffic_masq_protocol::InterfaceChangePlanView {
+                mac_address: None,
+                interface: "eth0".into(),
+                delete_ipv4: vec![],
+                retag_ipv4: None,
+                add_ipv4: None,
+                set_link_up: false,
+                management_change: false,
+                dhcp_action: traffic_masq_protocol::DhcpChangeActionView::Unchanged,
+                releasing_management: false,
+            }),
+            preview_scroll: usize::MAX,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
@@ -105,8 +108,11 @@ fn preview_buttons_are_visible_and_cancel_has_a_click_target() {
 #[tokio::test]
 async fn interface_plan_requires_reaching_the_end_before_apply() {
     let mut app = TuiApp {
+        interface_ui: crate::tui::state::InterfaceUiState {
+            preview_max_scroll: 7,
+            ..Default::default()
+        },
         screen: Screen::Preview,
-        preview_max_scroll: 7,
         ..Default::default()
     };
     let client = ApiClient::new("/socket-that-must-not-be-opened");
@@ -118,9 +124,9 @@ async fn interface_plan_requires_reaching_the_end_before_apply() {
         .is_some_and(|message| message.contains("Review the complete interface plan")));
 
     handle_preview_key(&mut app, KeyCode::PageDown, &client).await;
-    assert_eq!(app.preview_scroll, 7);
+    assert_eq!(app.interface_ui.preview_scroll, 7);
     handle_preview_key(&mut app, KeyCode::Up, &client).await;
-    assert_eq!(app.preview_scroll, 6);
+    assert_eq!(app.interface_ui.preview_scroll, 6);
 }
 
 #[test]
@@ -180,7 +186,7 @@ fn dhcp_inventory_has_its_own_title_and_colored_server_status() {
         suppressed: false,
         references: Vec::new(),
     }]);
-    app.dhcp_interfaces = vec!["wlan0".into()];
+    app.dhcp_ui.dhcp_interfaces = vec!["wlan0".into()];
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal
         .draw(|frame| super::super::dhcp::render_dhcp_interface_list(frame, frame.area(), &mut app))

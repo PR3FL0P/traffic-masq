@@ -102,7 +102,7 @@ fn note(text: impl Into<String>, style: Style) -> Line<'static> {
 }
 
 pub(super) fn confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> {
-    let editor = app.settings.as_ref()?;
+    let editor = app.settings_ui.settings.as_ref()?;
     let (title, action, lines) = match editor.confirmation? {
         SettingsField::Reset => (
             "Reset security settings?",
@@ -142,12 +142,12 @@ pub(crate) fn render_settings(frame: &mut ratatui::Frame<'_>, area: Rect, app: &
             frame,
             area,
             &mut app.ui,
-            app.confirmation_focus,
-            app.confirmation_scroll,
+            app.confirmation.confirmation_focus,
+            app.confirmation.confirmation_scroll,
         );
         return;
     }
-    let Some(editor) = &app.settings else {
+    let Some(editor) = &app.settings_ui.settings else {
         return;
     };
 
@@ -319,7 +319,7 @@ pub(crate) fn render_settings(frame: &mut ratatui::Frame<'_>, area: Rect, app: &
 }
 
 pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
-    if let Some(editor) = app.settings.as_mut() {
+    if let Some(editor) = app.settings_ui.settings.as_mut() {
         editor.field = match slot {
             0 => SettingsField::ChangePassword,
             1 => SettingsField::Reset,
@@ -338,7 +338,7 @@ pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
 }
 
 pub(crate) async fn handle_settings_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
-    let Some(editor) = app.settings.as_mut() else {
+    let Some(editor) = app.settings_ui.settings.as_mut() else {
         app.screen = Screen::Dashboard;
         return;
     };
@@ -392,7 +392,7 @@ pub(crate) async fn handle_settings_key(app: &mut TuiApp, key: KeyCode, client: 
                 save_session_preferences(app, client).await;
             }
             SettingsField::ChangePassword => {
-                app.settings_password = Some(PasswordChangeEditor::new());
+                app.settings_ui.settings_password = Some(PasswordChangeEditor::new());
                 app.screen = Screen::SettingsPassword;
             }
             SettingsField::DnsDefaults => super::dns_defaults::open(app, client).await,
@@ -425,7 +425,7 @@ pub(crate) async fn handle_settings_key(app: &mut TuiApp, key: KeyCode, client: 
 }
 
 async fn save_session_preferences(app: &mut TuiApp, client: &ApiClient) {
-    let Some(editor) = &app.settings else {
+    let Some(editor) = &app.settings_ui.settings else {
         return;
     };
     let Ok(minutes) = editor.remember_minutes_input.trim().parse::<u64>() else {
@@ -493,7 +493,7 @@ pub(crate) async fn load_settings_data(app: &mut TuiApp, client: &ApiClient) {
             app.show_dhcp_client = preferences.show_dhcp_client;
             let rollback_timeout_input = desired.rollback_timeout_seconds.to_string();
             let cursor = super::input::grapheme_count(&rollback_timeout_input);
-            app.settings = Some(SecurityEditor {
+            app.settings_ui.settings = Some(SecurityEditor {
                 remember_session: preferences.remember,
                 remember_minutes_input: preferences.minutes.to_string(),
                 show_dhcp_client: preferences.show_dhcp_client,
@@ -517,7 +517,7 @@ pub(crate) async fn load_settings_data(app: &mut TuiApp, client: &ApiClient) {
 }
 
 pub(crate) async fn refresh_settings_status(app: &mut TuiApp, client: &ApiClient) {
-    let Some(editor) = app.settings.as_mut() else {
+    let Some(editor) = app.settings_ui.settings.as_mut() else {
         return;
     };
     if let Ok(Response::SecurityConfig {
@@ -534,7 +534,7 @@ pub(crate) async fn refresh_settings_status(app: &mut TuiApp, client: &ApiClient
 }
 
 pub(crate) async fn submit_security_settings(app: &mut TuiApp, client: &ApiClient) {
-    let Some(editor) = &app.settings else {
+    let Some(editor) = &app.settings_ui.settings else {
         return;
     };
     let Ok(rollback_timeout_seconds) = editor.rollback_timeout_input.trim().parse::<u64>() else {
@@ -574,7 +574,7 @@ pub(crate) async fn submit_security_settings(app: &mut TuiApp, client: &ApiClien
             app.show_dhcp_client = preferences.show_dhcp_client;
             let rollback_timeout_input = desired.rollback_timeout_seconds.to_string();
             let cursor = super::input::grapheme_count(&rollback_timeout_input);
-            app.settings = Some(SecurityEditor {
+            app.settings_ui.settings = Some(SecurityEditor {
                 remember_session: preferences.remember,
                 remember_minutes_input: preferences.minutes.to_string(),
                 show_dhcp_client: preferences.show_dhcp_client,
@@ -624,7 +624,7 @@ async fn reset_security_settings(app: &mut TuiApp, client: &ApiClient) {
             app.show_dhcp_client = preferences.show_dhcp_client;
             let rollback_timeout_input = desired.rollback_timeout_seconds.to_string();
             let cursor = super::input::grapheme_count(&rollback_timeout_input);
-            app.settings = Some(SecurityEditor {
+            app.settings_ui.settings = Some(SecurityEditor {
                 remember_session: preferences.remember,
                 remember_minutes_input: preferences.minutes.to_string(),
                 show_dhcp_client: preferences.show_dhcp_client,
@@ -746,7 +746,7 @@ pub(crate) fn render_settings_password(
     area: Rect,
     app: &mut TuiApp,
 ) {
-    let Some(editor) = &app.settings_password else {
+    let Some(editor) = &app.settings_ui.settings_password else {
         return;
     };
 
@@ -815,7 +815,7 @@ pub(crate) fn render_settings_password(
 }
 
 pub(crate) fn focus_password_submit(app: &mut TuiApp) {
-    if let Some(editor) = app.settings_password.as_mut() {
+    if let Some(editor) = app.settings_ui.settings_password.as_mut() {
         editor.field = PasswordField::Confirm;
         editor.reset_cursor();
     }
@@ -826,17 +826,17 @@ pub(crate) async fn handle_settings_password_key(
     key: KeyCode,
     client: &ApiClient,
 ) {
-    let Some(editor) = app.settings_password.as_mut() else {
+    let Some(editor) = app.settings_ui.settings_password.as_mut() else {
         app.screen = Screen::Settings;
         return;
     };
 
     match key {
         KeyCode::Esc => {
-            if let Some(editor) = app.settings_password.as_mut() {
+            if let Some(editor) = app.settings_ui.settings_password.as_mut() {
                 editor.zeroize_all();
             }
-            app.settings_password = None;
+            app.settings_ui.settings_password = None;
             app.screen = Screen::Settings;
         }
         KeyCode::Down => {
@@ -859,7 +859,7 @@ pub(crate) async fn handle_settings_password_key(
 }
 
 async fn submit_password_change(app: &mut TuiApp, client: &ApiClient) {
-    let Some(editor) = &app.settings_password else {
+    let Some(editor) = &app.settings_ui.settings_password else {
         return;
     };
     if editor.current.is_empty() || editor.new_password.is_empty() {
@@ -881,10 +881,10 @@ async fn submit_password_change(app: &mut TuiApp, client: &ApiClient) {
         Ok(()) => {
             let login_result = client.login(&new_password).await;
             new_password.zeroize();
-            if let Some(editor) = app.settings_password.as_mut() {
+            if let Some(editor) = app.settings_ui.settings_password.as_mut() {
                 editor.zeroize_all();
             }
-            app.settings_password = None;
+            app.settings_ui.settings_password = None;
             app.screen = Screen::Settings;
             match login_result {
                 Ok(_) => match super::session::remember(client).await {
@@ -905,7 +905,7 @@ async fn submit_password_change(app: &mut TuiApp, client: &ApiClient) {
         }
         Err(error) => {
             new_password.zeroize();
-            if let Some(editor) = app.settings_password.as_mut() {
+            if let Some(editor) = app.settings_ui.settings_password.as_mut() {
                 editor.zeroize_all();
             }
             app.push_message(LogLevel::Error, error.to_string());

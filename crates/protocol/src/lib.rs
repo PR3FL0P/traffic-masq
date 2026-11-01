@@ -1512,25 +1512,10 @@ impl<Interface: Serialize, Proposal: Serialize> fmt::Debug for Request<Interface
     }
 }
 
+/// Complete control response with protocol-owned payloads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(
-    tag = "type",
-    rename_all = "snake_case",
-    bound(
-        deserialize = "InterfaceStatus: Deserialize<'de>, InterfaceConfig: Deserialize<'de>, InterfaceChangePlan: Deserialize<'de>, RouterPlan: Deserialize<'de>, RouteStatus: Deserialize<'de>, RouterConfig: Deserialize<'de>, WifiApStatus: Deserialize<'de>, WifiClientStatus: Deserialize<'de>, WifiClientSpec: Deserialize<'de>"
-    )
-)]
-pub enum Response<
-    InterfaceStatus,
-    InterfaceConfig,
-    InterfaceChangePlan,
-    RouterPlan,
-    RouteStatus,
-    RouterConfig,
-    WifiApStatus,
-    WifiClientStatus,
-    WifiClientSpec,
-> {
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Response {
     Pong,
     DaemonLogs {
         snapshot: DaemonLogSnapshot,
@@ -1551,7 +1536,7 @@ pub enum Response<
         restart_required: bool,
     },
     Interfaces {
-        interfaces: Vec<InterfaceStatus>,
+        interfaces: Vec<InterfaceStatusView>,
     },
     InterfaceInventory {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1578,7 +1563,7 @@ pub enum Response<
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wifi_concurrent_support: Option<WifiConcurrentSupport>,
         interface: String,
-        config: Option<InterfaceConfig>,
+        config: Option<InterfaceConfigView>,
         allow_management_change: bool,
     },
     DhcpStatus {
@@ -1612,7 +1597,7 @@ pub enum Response<
         leases: Vec<DhcpLeaseView>,
     },
     InterfacePlan {
-        plan: InterfaceChangePlan,
+        plan: InterfaceChangePlanView,
     },
     NetworkChangePending {
         change: PendingNetworkChange,
@@ -1654,18 +1639,18 @@ pub enum Response<
     /// Structurally validated intent; device readiness is not runtime preflight.
     RouterIntentPreview {
         revision: u64,
-        config: RouterConfig,
+        config: RouterConfigView,
         desired: RouterDesiredView,
         device_readiness: InterfaceReadiness,
         blockers: Vec<InterfaceReadinessBlocker>,
         execution_available: bool,
     },
     RouterPlan {
-        plan: RouterPlan,
+        plan: RouterPlanView,
     },
     RouterTransactionPending {
         token: String,
-        plan: RouterPlan,
+        plan: RouterPlanView,
     },
     RouterCommitted {
         revision: u64,
@@ -1680,15 +1665,15 @@ pub enum Response<
     },
     RouteInventory {
         revision: u64,
-        config: RouterConfig,
+        config: RouterConfigView,
         routes: Vec<RouteInventoryEntry>,
         observation_error: Option<String>,
     },
     Routes {
-        routes: Vec<RouteStatus>,
+        routes: Vec<RouteStatusView>,
     },
     RouterConfig {
-        config: RouterConfig,
+        config: RouterConfigView,
     },
     RouterError {
         detail: RouterErrorDetail,
@@ -1743,7 +1728,7 @@ pub enum Response<
         detail: VpnPolicyErrorDetail,
     },
     WifiStatus {
-        interfaces: Vec<WifiApStatus>,
+        interfaces: Vec<WifiApStatusView>,
     },
     WifiConfig {
         interface: String,
@@ -1763,14 +1748,14 @@ pub enum Response<
         detail: WifiErrorDetail,
     },
     WifiClientStatus {
-        interfaces: Vec<WifiClientStatus>,
+        interfaces: Vec<WifiClientStatusView>,
     },
     WifiClientConfig {
         interface: String,
-        spec: Option<WifiClientSpec>,
+        spec: Option<WifiClientSpecView>,
     },
     WifiClientConfigured {
-        spec: WifiClientSpec,
+        spec: WifiClientSpecView,
     },
     WifiClientDisabled {
         interface: String,
@@ -1802,7 +1787,7 @@ pub enum Response<
         phase: WifiClientActivationPhase,
         interface: String,
         profile: WifiClientProfileSummary,
-        status: WifiClientStatus,
+        status: WifiClientStatusView,
     },
     WifiClientProfileError {
         detail: WifiClientProfileErrorDetail,
@@ -1816,17 +1801,7 @@ pub enum Response<
 }
 
 /// Complete control response decoded by a client without daemon model types.
-pub type ControlResponse = Response<
-    InterfaceStatusView,
-    InterfaceConfigView,
-    InterfaceChangePlanView,
-    RouterPlanView,
-    RouteStatusView,
-    RouterConfigView,
-    WifiApStatusView,
-    WifiClientStatusView,
-    WifiClientSpecView,
->;
+pub type ControlResponse = Response;
 
 #[cfg(test)]
 mod tests {

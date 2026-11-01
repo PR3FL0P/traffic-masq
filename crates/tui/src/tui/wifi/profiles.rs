@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) fn open_create_profile(app: &mut TuiApp, interface: String) {
-    app.wifi_profile_editor = Some(WifiProfileEditor {
+    app.wifi_ui.wifi_profile_editor = Some(WifiProfileEditor {
         dirty: false,
         exit_requested: false,
         interface,
@@ -29,7 +29,7 @@ pub(super) async fn open_profiles(
     match client.request(&Request::ListWifiClientProfiles).await {
         Ok(Response::WifiClientProfiles { mut profiles }) => {
             profiles.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.id.cmp(&b.id)));
-            let previous = app.wifi_profiles.as_ref();
+            let previous = app.wifi_ui.wifi_profiles.as_ref();
             let previous_id = previous
                 .and_then(|view| view.profiles.get(view.selected_profile))
                 .map(|profile| &profile.id);
@@ -50,7 +50,7 @@ pub(super) async fn open_profiles(
                 WifiProfilesMode::Management | WifiProfilesMode::Connect => selected_profile,
                 WifiProfilesMode::ProfileActions => 0,
             };
-            app.wifi_profiles = Some(WifiProfilesView {
+            app.wifi_ui.wifi_profiles = Some(WifiProfilesView {
                 delete_confirmation: None,
                 interface,
                 profiles,
@@ -69,7 +69,7 @@ pub(super) async fn open_profiles(
 }
 
 pub(crate) fn render_wifi_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
-    let Some(view) = &app.wifi_profiles else {
+    let Some(view) = &app.wifi_ui.wifi_profiles else {
         return;
     };
     if view.delete_confirmation.is_some() {
@@ -78,8 +78,8 @@ pub(crate) fn render_wifi_profiles(frame: &mut ratatui::Frame<'_>, area: Rect, a
                 frame,
                 area,
                 &mut app.ui,
-                app.confirmation_focus,
-                app.confirmation_scroll,
+                app.confirmation.confirmation_focus,
+                app.confirmation.confirmation_scroll,
             );
         }
         return;
@@ -298,7 +298,7 @@ fn render_profile_actions(
 }
 
 pub(crate) async fn handle_wifi_profiles_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
-    let Some(view) = app.wifi_profiles.as_mut() else {
+    let Some(view) = app.wifi_ui.wifi_profiles.as_mut() else {
         app.screen = Screen::Wifi;
         return;
     };
@@ -324,7 +324,7 @@ pub(crate) async fn handle_wifi_profiles_key(app: &mut TuiApp, key: KeyCode, cli
     match view.mode {
         WifiProfilesMode::Menu => match key {
             KeyCode::Esc => {
-                app.wifi_profiles = None;
+                app.wifi_ui.wifi_profiles = None;
                 app.screen = Screen::Wifi;
             }
             KeyCode::Up => {
@@ -418,6 +418,7 @@ async fn activate_profile_action(app: &mut TuiApp, client: &ApiClient, action: W
         action,
         WifiProfileAction::Activate | WifiProfileAction::Deactivate
     ) && app
+        .wifi_ui
         .wifi_profiles
         .as_ref()
         .is_none_or(|view| view.interface.is_empty())
@@ -430,13 +431,14 @@ async fn activate_profile_action(app: &mut TuiApp, client: &ApiClient, action: W
     }
     match action {
         WifiProfileAction::Back => {
-            if let Some(current) = app.wifi_profiles.as_mut() {
+            if let Some(current) = app.wifi_ui.wifi_profiles.as_mut() {
                 current.mode = WifiProfilesMode::Management;
                 current.selected = current.selected_profile;
             }
         }
         WifiProfileAction::Deactivate => {
             let interface = app
+                .wifi_ui
                 .wifi_profiles
                 .as_ref()
                 .map(|v| v.interface.clone())
@@ -449,7 +451,7 @@ async fn activate_profile_action(app: &mut TuiApp, client: &ApiClient, action: W
             .await;
         }
         WifiProfileAction::Activate | WifiProfileAction::Edit | WifiProfileAction::Delete => {
-            let Some((interface, profile)) = app.wifi_profiles.as_ref().and_then(|v| {
+            let Some((interface, profile)) = app.wifi_ui.wifi_profiles.as_ref().and_then(|v| {
                 v.profiles
                     .get(v.selected_profile)
                     .cloned()
@@ -465,12 +467,12 @@ async fn activate_profile_action(app: &mut TuiApp, client: &ApiClient, action: W
                         .await;
                 }
                 WifiProfileAction::Edit => {
-                    app.wifi_profile_editor =
+                    app.wifi_ui.wifi_profile_editor =
                         Some(WifiProfileEditor::from_profile(interface, &profile));
                     app.screen = Screen::WifiProfileEditor;
                 }
                 WifiProfileAction::Delete => {
-                    if let Some(current) = app.wifi_profiles.as_mut() {
+                    if let Some(current) = app.wifi_ui.wifi_profiles.as_mut() {
                         current.delete_confirmation = Some(profile.id.clone());
                     }
                 }
@@ -481,7 +483,7 @@ async fn activate_profile_action(app: &mut TuiApp, client: &ApiClient, action: W
 }
 
 async fn activate_profile_row(app: &mut TuiApp, client: &ApiClient) {
-    let Some((mode, selected, is_empty, interface)) = app.wifi_profiles.as_ref().map(|v| {
+    let Some((mode, selected, is_empty, interface)) = app.wifi_ui.wifi_profiles.as_ref().map(|v| {
         (
             v.mode,
             v.selected,
@@ -494,7 +496,7 @@ async fn activate_profile_row(app: &mut TuiApp, client: &ApiClient) {
     match mode {
         WifiProfilesMode::Menu => match WifiProfilesMenuAction::from_index(selected) {
             Some(WifiProfilesMenuAction::Management) => {
-                if let Some(current) = app.wifi_profiles.as_mut() {
+                if let Some(current) = app.wifi_ui.wifi_profiles.as_mut() {
                     current.mode = WifiProfilesMode::Management;
                     current.selected = if current.profiles.is_empty() {
                         0
@@ -514,7 +516,7 @@ async fn activate_profile_row(app: &mut TuiApp, client: &ApiClient) {
         WifiProfilesMode::Management | WifiProfilesMode::Connect => {
             if is_empty {
                 open_create_profile(app, interface);
-            } else if let Some(current) = app.wifi_profiles.as_mut() {
+            } else if let Some(current) = app.wifi_ui.wifi_profiles.as_mut() {
                 current.mode = WifiProfilesMode::ProfileActions;
                 current.selected = 0;
             }
@@ -544,9 +546,9 @@ async fn profile_request(
     };
     match client.request(&request).await {
         Ok(Response::NetworkChangePending { change }) => {
-            app.pending_focus = 0;
-            app.pending = Some(change);
-            app.pending_return_screen = Screen::WifiProfiles;
+            app.confirmation.pending_focus = 0;
+            app.confirmation.pending = Some(change);
+            app.confirmation.pending_return_screen = Screen::WifiProfiles;
             app.screen = Screen::PendingChange;
             app.push_message(
                 LogLevel::Info,
@@ -565,11 +567,13 @@ async fn profile_request(
         | Ok(Response::WifiClientDisabled { .. }) => {
             app.push_message(LogLevel::Info, "Wi-Fi profile action applied");
             let interface = app
+                .wifi_ui
                 .wifi_profiles
                 .as_ref()
                 .map(|v| v.interface.clone())
                 .unwrap_or_default();
             let mode = app
+                .wifi_ui
                 .wifi_profiles
                 .as_ref()
                 .map(|v| v.mode)
@@ -579,6 +583,7 @@ async fn profile_request(
         Ok(Response::WifiClientProfileDeleted { .. }) => {
             app.push_message(LogLevel::Info, "Wi-Fi profile action applied");
             let interface = app
+                .wifi_ui
                 .wifi_profiles
                 .as_ref()
                 .map(|v| v.interface.clone())

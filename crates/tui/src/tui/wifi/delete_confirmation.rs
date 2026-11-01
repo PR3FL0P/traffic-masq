@@ -3,8 +3,8 @@ use crate::tui::confirmation::Dialog;
 
 pub(in crate::tui) fn profile_delete_dialog(app: &TuiApp) -> Option<Dialog> {
     match app.screen {
-        Screen::WifiProfiles => client_dialog(app.wifi_profiles.as_ref()?),
-        Screen::WifiApProfiles => ap_dialog(app.wifi_ap_profiles.as_ref()?),
+        Screen::WifiProfiles => client_dialog(app.wifi_ui.wifi_profiles.as_ref()?),
+        Screen::WifiApProfiles => ap_dialog(app.wifi_ui.wifi_ap_profiles.as_ref()?),
         _ => None,
     }
 }

@@ -183,8 +183,8 @@ pub(crate) fn render_vpn(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
             frame,
             area,
             &mut app.ui,
-            app.confirmation_focus,
-            app.confirmation_scroll,
+            app.confirmation.confirmation_focus,
+            app.confirmation.confirmation_scroll,
         );
         return;
     }

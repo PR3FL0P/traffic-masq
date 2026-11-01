@@ -85,27 +85,27 @@ impl View {
 
 pub(crate) async fn open(app: &mut TuiApp, client: &ApiClient) {
     app.screen = Screen::DaemonLogs;
-    app.daemon_logs.follow = true;
+    app.log_view.daemon_logs.follow = true;
     refresh(app, client).await;
 }
 pub(crate) async fn refresh(app: &mut TuiApp, client: &ApiClient) {
     match client.request(&Request::DaemonLogs { limit: 1000 }).await {
         Ok(Response::DaemonLogs { snapshot }) => {
-            app.daemon_logs.snapshot = Some(snapshot);
-            app.daemon_logs.error = None;
+            app.log_view.daemon_logs.snapshot = Some(snapshot);
+            app.log_view.daemon_logs.error = None;
         }
-        Ok(Response::Error { message }) => app.daemon_logs.error = Some(message),
-        Ok(_) => app.daemon_logs.error = Some("Unexpected daemon log response".into()),
-        Err(error) => app.daemon_logs.error = Some(error.to_string()),
+        Ok(Response::Error { message }) => app.log_view.daemon_logs.error = Some(message),
+        Ok(_) => app.log_view.daemon_logs.error = Some("Unexpected daemon log response".into()),
+        Err(error) => app.log_view.daemon_logs.error = Some(error.to_string()),
     }
 }
 pub(crate) async fn tick(app: &mut TuiApp, client: &ApiClient) {
-    if app.daemon_logs.follow && !app.daemon_logs.editing {
+    if app.log_view.daemon_logs.follow && !app.log_view.daemon_logs.editing {
         refresh(app, client).await;
     }
 }
 pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
-    let view = &mut app.daemon_logs;
+    let view = &mut app.log_view.daemon_logs;
     let block = panel("Daemon logs | Esc/1: session log");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -174,7 +174,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
     }
 }
 pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
-    let view = &mut app.daemon_logs;
+    let view = &mut app.log_view.daemon_logs;
     if view.editing {
         match key {
             KeyCode::Esc | KeyCode::Enter => view.editing = false,
@@ -289,7 +289,7 @@ mod tests {
             screen: Screen::DaemonLogs,
             ..Default::default()
         };
-        app.daemon_logs.snapshot = Some(DaemonLogSnapshot {
+        app.log_view.daemon_logs.snapshot = Some(DaemonLogSnapshot {
             lines: vec!["WARN saved".into()],
             sources: vec![],
             truncated: false,
@@ -297,11 +297,11 @@ mod tests {
         tick(&mut app, &mock.client).await;
         assert!(mock.calls.lock().unwrap().is_empty());
         handle_key(&mut app, KeyCode::Char('r'), &mock.client).await;
-        assert_eq!(app.daemon_logs.lines(), ["WARN saved"]);
-        assert!(app.daemon_logs.error.is_some());
+        assert_eq!(app.log_view.daemon_logs.lines(), ["WARN saved"]);
+        assert!(app.log_view.daemon_logs.error.is_some());
         handle_key(&mut app, KeyCode::Char('/'), &mock.client).await;
         handle_key(&mut app, KeyCode::Char('W'), &mock.client).await;
-        assert_eq!(app.daemon_logs.filter, "W");
+        assert_eq!(app.log_view.daemon_logs.filter, "W");
         assert_eq!(mock.calls.lock().unwrap().len(), 1);
         handle_key(&mut app, KeyCode::Esc, &mock.client).await;
         assert_eq!(app.screen, Screen::DaemonLogs);

@@ -115,7 +115,7 @@ pub(crate) async fn open(app: &mut TuiApp, client: &ApiClient, interface: String
             config,
             ..
         }) if returned == interface => {
-            app.dhcp_client_editor = Some(Editor::new(interface, saved_policy(config)));
+            app.dhcp_ui.dhcp_client_editor = Some(Editor::new(interface, saved_policy(config)));
             app.screen = Screen::DhcpClientEditor;
         }
         Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
@@ -128,7 +128,8 @@ pub(crate) async fn open(app: &mut TuiApp, client: &ApiClient, interface: String
 }
 
 pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
-    if let (Some(editor), Some(field)) = (app.dhcp_client_editor.as_mut(), FIELDS.get(slot)) {
+    if let (Some(editor), Some(field)) = (app.dhcp_ui.dhcp_client_editor.as_mut(), FIELDS.get(slot))
+    {
         editor.field = *field;
         editor.cursor = input::grapheme_count(if editor.field == Field::Hostname {
             &editor.hostname
@@ -144,12 +145,12 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
             frame,
             area,
             &mut app.ui,
-            app.confirmation_focus,
-            app.confirmation_scroll,
+            app.confirmation.confirmation_focus,
+            app.confirmation.confirmation_scroll,
         );
         return;
     }
-    let Some(editor) = &app.dhcp_client_editor else {
+    let Some(editor) = &app.dhcp_ui.dhcp_client_editor else {
         return;
     };
     let block = panel("DHCP Client settings");
@@ -216,14 +217,14 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
 }
 
 pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
-    let Some(editor) = app.dhcp_client_editor.as_mut() else {
+    let Some(editor) = app.dhcp_ui.dhcp_client_editor.as_mut() else {
         return;
     };
     if editor.exit_requested {
         match key {
             KeyCode::Esc => editor.exit_requested = false,
             KeyCode::Enter => {
-                app.dhcp_client_editor = None;
+                app.dhcp_ui.dhcp_client_editor = None;
                 app.screen = Screen::DhcpClient;
             }
             _ => {}
@@ -260,14 +261,14 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClien
                 let interface = editor.interface.clone();
                 match client.request(&request).await {
                     Ok(Response::NetworkChangePending { change }) if change.interface == interface => {
-                        app.dhcp_client_editor = None;
-                        app.pending_focus = 0;
-                        app.pending = Some(change);
-                        app.pending_return_screen = Screen::DhcpClient;
+                        app.dhcp_ui.dhcp_client_editor = None;
+                        app.confirmation.pending_focus = 0;
+                        app.confirmation.pending = Some(change);
+                        app.confirmation.pending_return_screen = Screen::DhcpClient;
                         app.screen = Screen::PendingChange;
                     }
                     Ok(Response::DhcpClientInterface { status }) if status.interface == interface => {
-                        app.dhcp_client_editor = None;
+                        app.dhcp_ui.dhcp_client_editor = None;
                         app.screen = Screen::DhcpClient;
                         app.push_message(LogLevel::Info, format!("DHCP client settings applied on {interface}"));
                         super::dhcp_client::refresh(app, client).await;
@@ -354,14 +355,17 @@ mod tests {
         let mut editor = Editor::new("wan0".into(), DhcpClientConfigRequest::default());
         editor.config.install_default_route = false;
         editor.field = Field::Apply;
-        app.dhcp_client_editor = Some(editor);
+        app.dhcp_ui.dhcp_client_editor = Some(editor);
         handle_key(&mut app, KeyCode::Enter, &mock.client).await;
         assert_eq!(app.screen, Screen::PendingChange);
-        assert_eq!(app.pending.as_ref().unwrap().token, "dhcp-policy");
-        assert_eq!(app.pending_return_screen, Screen::DhcpClient);
+        assert_eq!(
+            app.confirmation.pending.as_ref().unwrap().token,
+            "dhcp-policy"
+        );
+        assert_eq!(app.confirmation.pending_return_screen, Screen::DhcpClient);
         super::super::interfaces::handle_pending_key(&mut app, KeyCode::Esc, &mock.client).await;
         assert_eq!(app.screen, Screen::DhcpClient);
-        assert!(app.pending.is_none());
+        assert!(app.confirmation.pending.is_none());
         assert_eq!(
             mock.calls.lock().unwrap()[1].body["type"],
             "rollback_network_change"
@@ -386,15 +390,21 @@ mod tests {
         let mut app = TuiApp::default();
         open(&mut app, &mock.client, "wan9".into()).await;
         assert_eq!(app.screen, Screen::DhcpClientEditor);
-        assert_eq!(app.dhcp_client_editor.as_ref().unwrap().metric, "777");
-        let editor = app.dhcp_client_editor.as_mut().unwrap();
+        assert_eq!(
+            app.dhcp_ui.dhcp_client_editor.as_ref().unwrap().metric,
+            "777"
+        );
+        let editor = app.dhcp_ui.dhcp_client_editor.as_mut().unwrap();
         assert_eq!(editor.hostname, "saved-router");
         editor.hostname = "new-router".into();
         editor.metric = "42".into();
         editor.field = Field::Apply;
         handle_key(&mut app, KeyCode::Enter, &mock.client).await;
         assert_eq!(app.screen, Screen::DhcpClientEditor);
-        assert_eq!(app.dhcp_client_editor.as_ref().unwrap().metric, "42");
+        assert_eq!(
+            app.dhcp_ui.dhcp_client_editor.as_ref().unwrap().metric,
+            "42"
+        );
         {
             let calls = mock.calls.lock().unwrap();
             assert_eq!(calls[1].method, "POST");
@@ -407,9 +417,15 @@ mod tests {
             );
         }
         handle_key(&mut app, KeyCode::Esc, &mock.client).await;
-        assert!(app.dhcp_client_editor.as_ref().unwrap().exit_requested);
+        assert!(
+            app.dhcp_ui
+                .dhcp_client_editor
+                .as_ref()
+                .unwrap()
+                .exit_requested
+        );
         handle_key(&mut app, KeyCode::Enter, &mock.client).await;
-        assert!(app.dhcp_client_editor.is_none());
+        assert!(app.dhcp_ui.dhcp_client_editor.is_none());
     }
 }
 
@@ -440,10 +456,13 @@ mod hostname_tests {
     async fn hostname_field_accepts_text_and_keeps_cursor_on_focus_changes() {
         let client = ApiClient::new(std::path::PathBuf::from("/unused-hostname-test.sock"));
         let mut app = TuiApp {
-            dhcp_client_editor: Some(Editor::new(
-                "wan0".into(),
-                DhcpClientConfigRequest::default(),
-            )),
+            dhcp_ui: crate::tui::state::DhcpUiState {
+                dhcp_client_editor: Some(Editor::new(
+                    "wan0".into(),
+                    DhcpClientConfigRequest::default(),
+                )),
+                ..Default::default()
+            },
             ..Default::default()
         };
         handle_key(&mut app, KeyCode::Down, &client).await;
@@ -452,12 +471,15 @@ mod hostname_tests {
         handle_key(&mut app, KeyCode::Up, &client).await;
         handle_key(&mut app, KeyCode::Down, &client).await;
         handle_key(&mut app, KeyCode::Backspace, &client).await;
-        assert_eq!(app.dhcp_client_editor.as_ref().unwrap().hostname, "a");
+        assert_eq!(
+            app.dhcp_ui.dhcp_client_editor.as_ref().unwrap().hostname,
+            "a"
+        );
     }
 }
 
 pub(super) fn exit_confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> {
-    let editor = app.dhcp_client_editor.as_ref()?;
+    let editor = app.dhcp_ui.dhcp_client_editor.as_ref()?;
     editor.exit_requested.then(|| {
         super::confirmation::discard_edits_dialog(
             "Leave DHCP client editor?",
@@ -466,10 +488,19 @@ pub(super) fn exit_confirmation(app: &TuiApp) -> Option<super::confirmation::Dia
     })
 }
 fn request_exit(app: &mut TuiApp) {
-    if app.dhcp_client_editor.as_ref().is_some_and(Editor::dirty) {
-        app.dhcp_client_editor.as_mut().unwrap().exit_requested = true;
+    if app
+        .dhcp_ui
+        .dhcp_client_editor
+        .as_ref()
+        .is_some_and(Editor::dirty)
+    {
+        app.dhcp_ui
+            .dhcp_client_editor
+            .as_mut()
+            .unwrap()
+            .exit_requested = true;
     } else {
-        app.dhcp_client_editor = None;
+        app.dhcp_ui.dhcp_client_editor = None;
         app.screen = Screen::DhcpClient;
     }
 }
@@ -484,8 +515,11 @@ mod exit_tests {
         editor.metric = "invalid metric".into();
         editor.field = Field::Cancel;
         let mut app = TuiApp {
+            dhcp_ui: crate::tui::state::DhcpUiState {
+                dhcp_client_editor: Some(editor),
+                ..Default::default()
+            },
             screen: Screen::DhcpClientEditor,
-            dhcp_client_editor: Some(editor),
             ..Default::default()
         };
         app.ui.input_enabled = true;
@@ -495,12 +529,12 @@ mod exit_tests {
         crate::tui::handle_key(&mut app, KeyCode::Enter, &client, false).await;
         assert!(exit_confirmation(&app).is_none());
         assert_eq!(
-            app.dhcp_client_editor.as_ref().unwrap().metric,
+            app.dhcp_ui.dhcp_client_editor.as_ref().unwrap().metric,
             "invalid metric"
         );
         handle_key(&mut app, KeyCode::Esc, &client).await;
         crate::tui::handle_key(&mut app, KeyCode::Enter, &client, false).await;
-        assert!(app.dhcp_client_editor.is_none());
+        assert!(app.dhcp_ui.dhcp_client_editor.is_none());
         assert_eq!(app.screen, Screen::DhcpClient);
     }
 }

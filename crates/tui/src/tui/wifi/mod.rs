@@ -1060,7 +1060,7 @@ async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
     match action {
         PrimaryAction::Stations => super::wifi_stations::open(app, client, row.interface).await,
         PrimaryAction::ConfigureAp => {
-            if app.ap_drafts.contains_key(&row.interface) {
+            if app.wifi_ui.ap_drafts.contains_key(&row.interface) {
                 let Some((entry, revision)) =
                     super::interfaces::refresh_draft_interface(app, client, &row.interface).await
                 else {
@@ -1072,7 +1072,7 @@ async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
                     app.push_message(LogLevel::Warn, "Saved AP configuration no longer exists; draft retained. Configure the device before resuming.");
                     return;
                 }
-                let mut editor = app.ap_drafts.remove(&row.interface).unwrap();
+                let mut editor = app.wifi_ui.ap_drafts.remove(&row.interface).unwrap();
                 // Keep the desired radio settings while refreshing the review baseline,
                 // credential availability and saved-intent revision from one observation.
                 let settings = ap_settings(&editor);
@@ -1109,7 +1109,7 @@ async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
                                 == editor.interface
                     })
                     .map(|row| row.interface.clone());
-                app.wifi_editor = Some(editor);
+                app.wifi_ui.wifi_editor = Some(editor);
                 app.screen = Screen::WifiEditor;
                 return;
             }
@@ -1159,7 +1159,7 @@ async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
                                     ) == editor.interface
                             })
                             .map(|row| row.interface.clone());
-                        app.wifi_editor = Some(editor);
+                        app.wifi_ui.wifi_editor = Some(editor);
                         app.screen = Screen::WifiEditor;
                     }
                     Ok(Response::InterfaceConfig { config: None, .. }) => {
@@ -1178,7 +1178,7 @@ async fn activate_primary(app: &mut TuiApp, client: &ApiClient) {
                                     ) == editor.interface
                             })
                             .map(|row| row.interface.clone());
-                        app.wifi_editor = Some(editor);
+                        app.wifi_ui.wifi_editor = Some(editor);
                         app.screen = Screen::WifiEditor;
                     }
                     Ok(response) => report_unexpected(app, response),
@@ -1281,9 +1281,9 @@ fn subsystem_disabled(app: &mut TuiApp, role: WifiRole) -> bool {
 async fn request_simple(app: &mut TuiApp, client: &ApiClient, request: Request, success: &str) {
     match client.request(&request).await {
         Ok(Response::NetworkChangePending { change }) => {
-            app.pending_focus = 0;
-            app.pending = Some(change);
-            app.pending_return_screen = Screen::Wifi;
+            app.confirmation.pending_focus = 0;
+            app.confirmation.pending = Some(change);
+            app.confirmation.pending_return_screen = Screen::Wifi;
             app.screen = Screen::PendingChange;
             app.push_message(
                 LogLevel::Info,
@@ -1345,8 +1345,8 @@ async fn start_scan(app: &mut TuiApp, client: &ApiClient, interface: String) {
     {
         Ok(Response::WifiClientScanResults { mut results, .. }) => {
             sort_scan_results(&mut results);
-            app.wifi_profiles = None;
-            app.wifi_scan = Some(WifiScanPicker {
+            app.wifi_ui.wifi_profiles = None;
+            app.wifi_ui.wifi_scan = Some(WifiScanPicker {
                 interface,
                 networks: results,
                 selected: 0,
@@ -1670,7 +1670,7 @@ fn report_unexpected(app: &mut TuiApp, response: Response) {
 mod tests;
 
 pub(crate) fn focus_editor_action(app: &mut TuiApp, slot: usize) {
-    if let Some(editor) = app.wifi_editor.as_mut() {
+    if let Some(editor) = app.wifi_ui.wifi_editor.as_mut() {
         editor.field = if slot == 0 && editor.profile_mode {
             WifiField::SaveProfile
         } else if slot == 0 {
@@ -1684,14 +1684,17 @@ pub(crate) fn focus_editor_action(app: &mut TuiApp, slot: usize) {
 pub(crate) fn change_review_open(app: &TuiApp) -> bool {
     match app.screen {
         Screen::WifiEditor => app
+            .wifi_ui
             .wifi_editor
             .as_ref()
             .is_some_and(|editor| editor.reviewing),
         Screen::WifiConnectPrompt => app
+            .wifi_ui
             .wifi_connect
             .as_ref()
             .is_some_and(|prompt| prompt.reviewing),
         Screen::WifiApProfiles => app
+            .wifi_ui
             .wifi_ap_profiles
             .as_ref()
             .is_some_and(|view| view.apply_review),

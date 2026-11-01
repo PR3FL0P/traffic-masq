@@ -32,8 +32,11 @@ fn uplink_dhcp_render_shows_status_details_and_separates_server_terminology() {
         (DhcpClientOperationalState::Degraded, "degraded"),
     ] {
         let mut app = TuiApp {
-            dhcp_clients: vec![status(state)],
-            dhcp_client_selected: Some("wan0".into()),
+            dhcp_ui: crate::tui::state::DhcpUiState {
+                dhcp_clients: vec![status(state)],
+                dhcp_client_selected: Some("wan0".into()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let backend = TestBackend::new(100, 10);
@@ -74,17 +77,20 @@ fn uplink_dhcp_actions_use_the_selected_interface_name() {
 #[test]
 fn selection_is_by_interface_name_not_status_index() {
     let mut app = TuiApp {
-        dhcp_clients: vec![
-            status(DhcpClientOperationalState::Running),
-            status_named("lan9", DhcpClientOperationalState::Waiting),
-        ],
-        dhcp_client_selected: Some("lan9".into()),
+        dhcp_ui: crate::tui::state::DhcpUiState {
+            dhcp_clients: vec![
+                status(DhcpClientOperationalState::Running),
+                status_named("lan9", DhcpClientOperationalState::Waiting),
+            ],
+            dhcp_client_selected: Some("lan9".into()),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let names = row_names(&app);
     assert_eq!(names, vec!["wan0", "lan9"]);
     move_selection(&mut app, false);
-    assert_eq!(app.dhcp_client_selected.as_deref(), Some("wan0"));
+    assert_eq!(app.dhcp_ui.dhcp_client_selected.as_deref(), Some("wan0"));
 }
 
 fn inventory_entry(
@@ -169,8 +175,11 @@ async fn action_errors_and_unexpected_responses_never_report_success() {
     ] {
         let (_dir, client, server) = mock_api(vec![response]).await;
         let mut app = TuiApp {
-            dhcp_client_selected: Some("wan0".into()),
-            dhcp_clients: vec![status(DhcpClientOperationalState::Running)],
+            dhcp_ui: crate::tui::state::DhcpUiState {
+                dhcp_client_selected: Some("wan0".into()),
+                dhcp_clients: vec![status(DhcpClientOperationalState::Running)],
+                ..Default::default()
+            },
             ..Default::default()
         };
         handle_key(&mut app, KeyCode::Char('r'), &client).await;
@@ -179,8 +188,12 @@ async fn action_errors_and_unexpected_responses_never_report_success() {
             .unwrap()
             .unwrap();
         assert_eq!(paths.len(), 1);
-        assert_eq!(app.logs.back().unwrap().level, LogLevel::Error);
-        assert!(!app.logs.iter().any(|entry| entry.level == LogLevel::Info));
+        assert_eq!(app.log_view.logs.back().unwrap().level, LogLevel::Error);
+        assert!(!app
+            .log_view
+            .logs
+            .iter()
+            .any(|entry| entry.level == LogLevel::Info));
     }
 }
 
@@ -194,8 +207,11 @@ async fn successful_disable_refreshes_status_and_preserves_selection() {
     ])
     .await;
     let mut app = TuiApp {
-        dhcp_client_selected: Some("wan0".into()),
-        dhcp_clients: vec![status(DhcpClientOperationalState::Running)],
+        dhcp_ui: crate::tui::state::DhcpUiState {
+            dhcp_client_selected: Some("wan0".into()),
+            dhcp_clients: vec![status(DhcpClientOperationalState::Running)],
+            ..Default::default()
+        },
         ..Default::default()
     };
     app.dashboard.inventory = Some(vec![inventory_entry("wan0", Some(false))]);
@@ -207,8 +223,8 @@ async fn successful_disable_refreshes_status_and_preserves_selection() {
     assert_eq!(paths.len(), 2);
     assert_eq!(paths[0], "disable_dhcp_client wan0");
     assert_eq!(paths[1], "dhcp_client_status ");
-    assert!(app.dhcp_clients.is_empty());
-    assert_eq!(app.dhcp_client_selected.as_deref(), Some("wan0"));
+    assert!(app.dhcp_ui.dhcp_clients.is_empty());
+    assert_eq!(app.dhcp_ui.dhcp_client_selected.as_deref(), Some("wan0"));
     assert!(app.message.as_deref().unwrap().contains("disabled on wan0"));
 }
 
@@ -228,14 +244,20 @@ async fn resetting_route_policy_opens_network_confirmation() {
     }])
     .await;
     let mut app = TuiApp {
-        dhcp_client_selected: Some("wan0".into()),
-        dhcp_clients: vec![status(DhcpClientOperationalState::Running)],
+        dhcp_ui: crate::tui::state::DhcpUiState {
+            dhcp_client_selected: Some("wan0".into()),
+            dhcp_clients: vec![status(DhcpClientOperationalState::Running)],
+            ..Default::default()
+        },
         ..Default::default()
     };
     handle_key(&mut app, KeyCode::Char('c'), &client).await;
     assert_eq!(app.screen, Screen::PendingChange);
-    assert_eq!(app.pending_return_screen, Screen::DhcpClient);
-    assert_eq!(app.pending.as_ref().unwrap().token, "dhcp-reset");
+    assert_eq!(app.confirmation.pending_return_screen, Screen::DhcpClient);
+    assert_eq!(
+        app.confirmation.pending.as_ref().unwrap().token,
+        "dhcp-reset"
+    );
     assert_eq!(server.await.unwrap(), vec!["configure_dhcp_client wan0"]);
 }
 
@@ -244,9 +266,12 @@ async fn section_navigation_uses_inventory_selection_including_missing_devices()
     let (_dir, client, server) =
         mock_api(vec![Response::DhcpClientStatus { interfaces: vec![] }]).await;
     let mut app = TuiApp {
+        interface_ui: crate::tui::state::InterfaceUiState {
+            selected_inventory_interface: 1,
+            ..Default::default()
+        },
         screen: Screen::InterfaceList,
         show_dhcp_client: true,
-        selected_inventory_interface: 1,
         ..Default::default()
     };
     app.dashboard.inventory = Some(vec![
@@ -259,7 +284,7 @@ async fn section_navigation_uses_inventory_selection_including_missing_devices()
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(app.dhcp_client_selected.as_deref(), Some("usb0"));
+    assert_eq!(app.dhcp_ui.dhcp_client_selected.as_deref(), Some("usb0"));
     assert_eq!(row_names(&app), vec!["wan0", "usb0"]);
 }
 
@@ -268,8 +293,11 @@ fn client_list_shows_failure_reason_and_scrolls_with_correct_mouse_rows() {
     let mut failed = status_named("wan9", DhcpClientOperationalState::Degraded);
     failed.degraded_reason = Some("DHCP socket unavailable".into());
     let mut app = TuiApp {
-        dhcp_clients: vec![status(DhcpClientOperationalState::Running), failed],
-        dhcp_client_selected: Some("wan9".into()),
+        dhcp_ui: crate::tui::state::DhcpUiState {
+            dhcp_clients: vec![status(DhcpClientOperationalState::Running), failed],
+            dhcp_client_selected: Some("wan9".into()),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();

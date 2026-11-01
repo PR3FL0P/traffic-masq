@@ -1520,7 +1520,7 @@ async fn editing_dhcp_default_route_opens_client_metric_settings() {
     )];
     super::editor::open_route_editor_for_selected(&mut app, &client).await;
     assert_eq!(app.screen, Screen::DhcpClientEditor);
-    assert!(app.dhcp_client_editor.is_some());
+    assert!(app.dhcp_ui.dhcp_client_editor.is_some());
     assert!(app.router.editor.is_none());
     assert!(!app.router.staged);
     server.await.unwrap();
@@ -1546,31 +1546,42 @@ async fn recovery_cannot_keep_an_invisible_back_selection() {
     ])
     .await;
     let mut app = TuiApp {
+        router_ui: crate::tui::state::RouterUiState {
+            router_pending: Some(RouterPendingView {
+                token: "recover".into(),
+                applied_at_unix: current_unix_time(),
+                rollback_failure: None,
+                recovery: None,
+                scroll: 0,
+                max_scroll: 0,
+            }),
+            ..Default::default()
+        },
+        confirmation: crate::tui::state::ConfirmationState {
+            pending_focus: 1,
+            ..Default::default()
+        },
         screen: Screen::RouterPending,
-        pending_focus: 1,
-        router_pending: Some(RouterPendingView {
-            token: "recover".into(),
-            applied_at_unix: current_unix_time(),
-            rollback_failure: None,
-            recovery: None,
-            scroll: 0,
-            max_scroll: 0,
-        }),
         ..Default::default()
     };
     // The operator chose Roll back; failure must clear that old selection
     // before another input event, even if no frame has been drawn yet.
     handle_router_pending_key(&mut app, KeyCode::Enter, &mock.client).await;
-    assert!(app.router_pending.as_ref().unwrap().recovery_required());
-    assert_eq!(app.pending_focus, 0);
+    assert!(app
+        .router_ui
+        .router_pending
+        .as_ref()
+        .unwrap()
+        .recovery_required());
+    assert_eq!(app.confirmation.pending_focus, 0);
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
     terminal
         .draw(|frame| crate::tui::render(frame, &mut app, false))
         .unwrap();
-    assert_eq!(app.pending_focus, 0);
+    assert_eq!(app.confirmation.pending_focus, 0);
     for key in [KeyCode::Tab, KeyCode::BackTab, KeyCode::Right] {
         crate::tui::handle_key(&mut app, key, &mock.client, false).await;
-        assert_eq!(app.pending_focus, 0);
+        assert_eq!(app.confirmation.pending_focus, 0);
     }
     crate::tui::handle_key(&mut app, KeyCode::Enter, &mock.client, false).await;
     assert_eq!(app.screen, Screen::RouterPending);
@@ -1584,26 +1595,32 @@ async fn recovery_cannot_keep_an_invisible_back_selection() {
 async fn indeterminate_commit_never_sends_rollback_even_with_stale_focus() {
     let client = ApiClient::new("/must-not-connect.sock");
     let mut app = TuiApp {
-        screen: Screen::RouterPending,
-        pending_focus: 1,
-        router_pending: Some(RouterPendingView {
-            token: "unknown".into(),
-            applied_at_unix: current_unix_time(),
-            rollback_failure: None,
-            recovery: Some(RouterRecoveryNotice {
-                recovery_progress: None,
-                recovery_code: "unknown".into(),
-                invariant: "commit_indeterminate".into(),
-                summary: "unknown commit".into(),
-                blocked_operation: "rollback".into(),
-                operator_action: "restart".into(),
-                operator_guidance: "repair storage".into(),
-                runbook: String::new(),
-                failures: vec![],
+        router_ui: crate::tui::state::RouterUiState {
+            router_pending: Some(RouterPendingView {
+                token: "unknown".into(),
+                applied_at_unix: current_unix_time(),
+                rollback_failure: None,
+                recovery: Some(RouterRecoveryNotice {
+                    recovery_progress: None,
+                    recovery_code: "unknown".into(),
+                    invariant: "commit_indeterminate".into(),
+                    summary: "unknown commit".into(),
+                    blocked_operation: "rollback".into(),
+                    operator_action: "restart".into(),
+                    operator_guidance: "repair storage".into(),
+                    runbook: String::new(),
+                    failures: vec![],
+                }),
+                scroll: 0,
+                max_scroll: 0,
             }),
-            scroll: 0,
-            max_scroll: 0,
-        }),
+            ..Default::default()
+        },
+        confirmation: crate::tui::state::ConfirmationState {
+            pending_focus: 1,
+            ..Default::default()
+        },
+        screen: Screen::RouterPending,
         ..Default::default()
     };
     app.ui.input_enabled = true;
@@ -1739,7 +1756,7 @@ async fn vpn_confirmation_returns_to_policy_without_discarding_a_router_draft() 
     assert_eq!(requests[0].1["token"], "vpn-token");
     assert_eq!(requests[1].0, "vpn_policy_status");
     assert_eq!(app.screen, Screen::VpnPolicy);
-    assert!(app.router_pending.is_none());
+    assert!(app.router_ui.router_pending.is_none());
     assert!(app.router.staged);
     assert_eq!(app.router.proposed_router_config, draft);
 }

@@ -16,6 +16,7 @@ use super::{Screen, TuiApp};
 
 fn row_names(app: &TuiApp) -> Vec<String> {
     let mut names = app
+        .dhcp_ui
         .dhcp_clients
         .iter()
         .map(|status| status.interface.clone())
@@ -32,7 +33,7 @@ fn row_names(app: &TuiApp) -> Vec<String> {
             }
         }
     }
-    if let Some(selected) = app.dhcp_client_selected.as_ref() {
+    if let Some(selected) = app.dhcp_ui.dhcp_client_selected.as_ref() {
         let known = app.dashboard.inventory.as_ref().map_or_else(
             || {
                 app.dashboard
@@ -50,7 +51,8 @@ fn row_names(app: &TuiApp) -> Vec<String> {
 }
 
 fn selected_row(app: &TuiApp, names: &[String]) -> usize {
-    app.dhcp_client_selected
+    app.dhcp_ui
+        .dhcp_client_selected
         .as_ref()
         .and_then(|selected| names.iter().position(|name| name == selected))
         .unwrap_or(0)
@@ -58,7 +60,7 @@ fn selected_row(app: &TuiApp, names: &[String]) -> usize {
 
 pub(crate) fn select_row(app: &mut TuiApp, index: usize) {
     if let Some(name) = row_names(app).get(index).cloned() {
-        app.dhcp_client_selected = Some(name);
+        app.dhcp_ui.dhcp_client_selected = Some(name);
     }
 }
 
@@ -73,7 +75,7 @@ pub(crate) fn move_selection(app: &mut TuiApp, forward: bool) {
     } else {
         current.saturating_sub(1)
     };
-    app.dhcp_client_selected = Some(names[next].clone());
+    app.dhcp_ui.dhcp_client_selected = Some(names[next].clone());
 }
 
 pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
@@ -109,18 +111,18 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
     let names = row_names(app);
     let selected = selected_row(app, &names);
     let visible_items = (list_area.height / 5).max(1) as usize;
-    if selected < app.dhcp_client_scroll {
-        app.dhcp_client_scroll = selected;
-    } else if selected >= app.dhcp_client_scroll.saturating_add(visible_items) {
-        app.dhcp_client_scroll = selected + 1 - visible_items;
+    if selected < app.dhcp_ui.dhcp_client_scroll {
+        app.dhcp_ui.dhcp_client_scroll = selected;
+    } else if selected >= app.dhcp_ui.dhcp_client_scroll.saturating_add(visible_items) {
+        app.dhcp_ui.dhcp_client_scroll = selected + 1 - visible_items;
     }
     let max_scroll = names.len().saturating_sub(visible_items);
-    app.dhcp_client_scroll = app.dhcp_client_scroll.min(max_scroll);
+    app.dhcp_ui.dhcp_client_scroll = app.dhcp_ui.dhcp_client_scroll.min(max_scroll);
 
     app.ui.list_area = Some(list_area);
     app.ui.list_row_height = 5;
     app.ui.list_count = names.len();
-    app.ui.list_scroll_offset = app.dhcp_client_scroll;
+    app.ui.list_scroll_offset = app.dhcp_ui.dhcp_client_scroll;
 
     if names.is_empty() {
         frame.render_widget(
@@ -136,7 +138,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
     let mut lines = Vec::new();
     for name in names
         .iter()
-        .skip(app.dhcp_client_scroll)
+        .skip(app.dhcp_ui.dhcp_client_scroll)
         .take(visible_items)
     {
         let is_selected = names.get(selected) == Some(name);
@@ -154,6 +156,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
             _ => "",
         };
         let status = app
+            .dhcp_ui
             .dhcp_clients
             .iter()
             .find(|status| status.interface.as_str() == name.as_str());
@@ -266,14 +269,15 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
 pub(crate) async fn refresh(app: &mut TuiApp, client: &ApiClient) {
     match client.request(&Request::DhcpClientStatus).await {
         Ok(Response::DhcpClientStatus { interfaces }) => {
-            app.dhcp_clients = interfaces;
+            app.dhcp_ui.dhcp_clients = interfaces;
             let names = row_names(app);
             if !app
+                .dhcp_ui
                 .dhcp_client_selected
                 .as_ref()
                 .is_some_and(|selected| names.iter().any(|name| name == selected))
             {
-                app.dhcp_client_selected = names.first().cloned();
+                app.dhcp_ui.dhcp_client_selected = names.first().cloned();
             }
         }
         Ok(Response::DhcpClientError { detail }) => app.push_message(
@@ -324,12 +328,13 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClien
         }
         return;
     };
-    app.dhcp_client_selected = Some(interface.clone());
+    app.dhcp_ui.dhcp_client_selected = Some(interface.clone());
     if matches!(key, KeyCode::Char('e') | KeyCode::Enter) {
         super::dhcp_client_editor::open(app, client, interface).await;
         return;
     }
     let configured = app
+        .dhcp_ui
         .dhcp_clients
         .iter()
         .any(|status| status.interface.as_str() == interface.as_str());
@@ -356,9 +361,9 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClien
                     Request::ConfigureDhcpClient { .. } | Request::DisableDhcpClient { .. }
                 ) =>
         {
-            app.pending_focus = 0;
-            app.pending = Some(change);
-            app.pending_return_screen = Screen::DhcpClient;
+            app.confirmation.pending_focus = 0;
+            app.confirmation.pending = Some(change);
+            app.confirmation.pending_return_screen = Screen::DhcpClient;
             app.screen = Screen::PendingChange;
         }
         Ok(Response::DhcpClientError { detail }) => app.push_message(

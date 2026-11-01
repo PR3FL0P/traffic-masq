@@ -68,7 +68,7 @@ pub(crate) async fn open(app: &mut TuiApp, client: &ApiClient) {
     match fetch(client).await {
         Ok(settings) => {
             let servers = format_servers(&settings);
-            app.dns_defaults = Some(Editor {
+            app.settings_ui.dns_defaults = Some(Editor {
                 field: Field::Servers,
                 cursor: super::input::grapheme_count(&servers),
                 servers,
@@ -81,7 +81,7 @@ pub(crate) async fn open(app: &mut TuiApp, client: &ApiClient) {
 }
 
 pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
-    let Some(editor) = &app.dns_defaults else {
+    let Some(editor) = &app.settings_ui.dns_defaults else {
         return;
     };
     let style = Style::default().fg(theme::ACCENT);
@@ -125,13 +125,13 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
 }
 
 pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
-    if let Some(editor) = &mut app.dns_defaults {
+    if let Some(editor) = &mut app.settings_ui.dns_defaults {
         editor.field = FIELDS[slot.min(2)];
     }
 }
 
 pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
-    let Some(editor) = &mut app.dns_defaults else {
+    let Some(editor) = &mut app.settings_ui.dns_defaults else {
         return;
     };
     match key {

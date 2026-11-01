@@ -58,8 +58,8 @@ pub(super) async fn restore(app: &mut TuiApp, store: &super::session::SessionSto
             while entries.len() > LOG_HISTORY_LEN {
                 entries.pop_front();
             }
-            app.logs = entries;
-            app.logs_scroll = usize::MAX;
+            app.log_view.logs = entries;
+            app.log_view.logs_scroll = usize::MAX;
         }
         Ok(None) => {}
         Err(error) => app.push_message(
@@ -71,11 +71,11 @@ pub(super) async fn restore(app: &mut TuiApp, store: &super::session::SessionSto
 
 /// Serialize writes on the blocking pool, outside cancellable UI operations.
 pub(super) async fn flush(app: &mut TuiApp, store: &super::session::SessionStore) {
-    if !app.logs_dirty {
+    if !app.log_view.logs_dirty {
         return;
     }
     let store = store.clone();
-    let entries = app.logs.clone();
+    let entries = app.log_view.logs.clone();
     let result =
         tokio::task::spawn_blocking(move || store.write_bounded("logs", &entries, LOG_FILE_LIMIT))
             .await
@@ -88,7 +88,7 @@ pub(super) async fn flush(app: &mut TuiApp, store: &super::session::SessionStore
         );
     }
     // Retry on the next real message, rather than logging failures forever.
-    app.logs_dirty = false;
+    app.log_view.logs_dirty = false;
 }
 
 pub(crate) fn with_troubleshooting_hint(level: LogLevel, message: String) -> String {
@@ -143,7 +143,7 @@ const LOG_ACTION_LABELS: [&str; 2] = ["Export log to a file", "Clear log"];
 
 pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
     if let Some(focus) = LOG_ACTIONS.get(slot) {
-        app.logs_focus = *focus;
+        app.log_view.logs_focus = *focus;
     }
 }
 
@@ -154,7 +154,7 @@ fn render_log_actions(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiA
 
     let mut lines = Vec::with_capacity(LOG_ACTIONS.len());
     for (slot, (focus, label)) in LOG_ACTIONS.iter().zip(LOG_ACTION_LABELS.iter()).enumerate() {
-        let selected = app.logs_focus == *focus;
+        let selected = app.log_view.logs_focus == *focus;
         let style = if selected {
             Style::default()
                 .fg(theme::SELECTED_FG)
@@ -194,8 +194,8 @@ pub(crate) fn render_log(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
             frame,
             area,
             &mut app.ui,
-            app.confirmation_focus,
-            app.confirmation_scroll,
+            app.confirmation.confirmation_focus,
+            app.confirmation.confirmation_scroll,
         );
         return;
     }
@@ -209,9 +209,9 @@ pub(crate) fn render_log(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
     let area = sections[0];
     render_log_actions(frame, sections[1], app);
 
-    if app.logs.is_empty() {
-        app.logs_scroll = 0;
-        app.logs_max_scroll = 0;
+    if app.log_view.logs.is_empty() {
+        app.log_view.logs_scroll = 0;
+        app.log_view.logs_max_scroll = 0;
         let block = panel("Session log | 2: daemon logs");
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -225,6 +225,7 @@ pub(crate) fn render_log(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
     // Scroll visual rows so long diagnostics and their hints remain readable.
     let width = area.width.saturating_sub(2).max(1) as usize;
     let lines: Vec<Line> = app
+        .log_view
         .logs
         .iter()
         .flat_map(|entry| {
@@ -243,9 +244,9 @@ pub(crate) fn render_log(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut T
     let visible = (area.height.saturating_sub(2) as usize).max(1).min(total);
     let max_offset = total.saturating_sub(visible);
 
-    app.logs_max_scroll = max_offset;
-    app.logs_scroll = app.logs_scroll.min(max_offset);
-    let offset = app.logs_scroll;
+    app.log_view.logs_max_scroll = max_offset;
+    app.log_view.logs_scroll = app.log_view.logs_scroll.min(max_offset);
+    let offset = app.log_view.logs_scroll;
 
     let title = if visible < total {
         format!(
@@ -302,73 +303,80 @@ pub(super) fn wrap_log_message(message: &str, width: usize) -> Vec<String> {
 }
 
 pub(crate) fn handle_log_key(app: &mut TuiApp, key: KeyCode) {
-    if app.logs_clear_confirmation {
+    if app.log_view.logs_clear_confirmation {
         match key {
-            KeyCode::Esc => app.logs_clear_confirmation = false,
+            KeyCode::Esc => app.log_view.logs_clear_confirmation = false,
             KeyCode::Enter => {
-                app.logs_clear_confirmation = false;
-                app.logs.clear();
-                app.logs_scroll = 0;
-                app.logs_max_scroll = 0;
+                app.log_view.logs_clear_confirmation = false;
+                app.log_view.logs.clear();
+                app.log_view.logs_scroll = 0;
+                app.log_view.logs_max_scroll = 0;
                 app.push_message(LogLevel::Info, "Log cleared");
-                app.logs_scroll = 0;
+                app.log_view.logs_scroll = 0;
             }
             _ => {}
         }
         return;
     }
     const PAGE: usize = 10;
-    let max_scroll = app.logs_max_scroll;
+    let max_scroll = app.log_view.logs_max_scroll;
 
     let key = match key {
-        KeyCode::Left if app.logs_focus != LogFocus::Scroll => KeyCode::Up,
-        KeyCode::Right if app.logs_focus != LogFocus::Scroll => KeyCode::Down,
+        KeyCode::Left if app.log_view.logs_focus != LogFocus::Scroll => KeyCode::Up,
+        KeyCode::Right if app.log_view.logs_focus != LogFocus::Scroll => KeyCode::Down,
         _ => key,
     };
     match key {
         KeyCode::Tab | KeyCode::BackTab => {
             let fields = [LogFocus::Scroll, LogFocus::Export, LogFocus::Clear];
-            app.logs_focus =
-                super::input::move_wrapped(&fields, app.logs_focus, key == KeyCode::Tab);
+            app.log_view.logs_focus =
+                super::input::move_wrapped(&fields, app.log_view.logs_focus, key == KeyCode::Tab);
         }
-        KeyCode::Esc if app.logs_focus != LogFocus::Scroll => {
-            app.logs_focus = LogFocus::Scroll;
+        KeyCode::Esc if app.log_view.logs_focus != LogFocus::Scroll => {
+            app.log_view.logs_focus = LogFocus::Scroll;
         }
         KeyCode::Esc => app.screen = Screen::Dashboard,
-        KeyCode::Down => match app.logs_focus {
-            LogFocus::Scroll if app.logs_scroll < max_scroll => {
-                app.logs_scroll = app.logs_scroll.saturating_add(1).min(max_scroll);
+        KeyCode::Down => match app.log_view.logs_focus {
+            LogFocus::Scroll if app.log_view.logs_scroll < max_scroll => {
+                app.log_view.logs_scroll =
+                    app.log_view.logs_scroll.saturating_add(1).min(max_scroll);
             }
-            LogFocus::Scroll => app.logs_focus = LogFocus::Export,
-            LogFocus::Export => app.logs_focus = LogFocus::Clear,
+            LogFocus::Scroll => app.log_view.logs_focus = LogFocus::Export,
+            LogFocus::Export => app.log_view.logs_focus = LogFocus::Clear,
             LogFocus::Clear => {}
         },
-        KeyCode::Up => match app.logs_focus {
-            LogFocus::Scroll => app.logs_scroll = app.logs_scroll.saturating_sub(1),
-            LogFocus::Export => app.logs_focus = LogFocus::Scroll,
-            LogFocus::Clear => app.logs_focus = LogFocus::Export,
+        KeyCode::Up => match app.log_view.logs_focus {
+            LogFocus::Scroll => {
+                app.log_view.logs_scroll = app.log_view.logs_scroll.saturating_sub(1)
+            }
+            LogFocus::Export => app.log_view.logs_focus = LogFocus::Scroll,
+            LogFocus::Clear => app.log_view.logs_focus = LogFocus::Export,
         },
         KeyCode::PageDown => {
-            app.logs_focus = LogFocus::Scroll;
-            app.logs_scroll = app.logs_scroll.saturating_add(PAGE).min(max_scroll);
+            app.log_view.logs_focus = LogFocus::Scroll;
+            app.log_view.logs_scroll = app
+                .log_view
+                .logs_scroll
+                .saturating_add(PAGE)
+                .min(max_scroll);
         }
         KeyCode::PageUp => {
-            app.logs_focus = LogFocus::Scroll;
-            app.logs_scroll = app.logs_scroll.saturating_sub(PAGE);
+            app.log_view.logs_focus = LogFocus::Scroll;
+            app.log_view.logs_scroll = app.log_view.logs_scroll.saturating_sub(PAGE);
         }
         KeyCode::Home => {
-            app.logs_focus = LogFocus::Scroll;
-            app.logs_scroll = 0;
+            app.log_view.logs_focus = LogFocus::Scroll;
+            app.log_view.logs_scroll = 0;
         }
         KeyCode::End => {
-            app.logs_focus = LogFocus::Scroll;
-            app.logs_scroll = max_scroll;
+            app.log_view.logs_focus = LogFocus::Scroll;
+            app.log_view.logs_scroll = max_scroll;
         }
-        KeyCode::Enter => match app.logs_focus {
+        KeyCode::Enter => match app.log_view.logs_focus {
             LogFocus::Scroll => {}
             LogFocus::Export => export_log(app),
             LogFocus::Clear => {
-                app.logs_clear_confirmation = true;
+                app.log_view.logs_clear_confirmation = true;
             }
         },
         _ => {}
@@ -377,6 +385,7 @@ pub(crate) fn handle_log_key(app: &mut TuiApp, key: KeyCode) {
 
 fn export_log(app: &mut TuiApp) {
     let contents: String = app
+        .log_view
         .logs
         .iter()
         .map(|entry| {

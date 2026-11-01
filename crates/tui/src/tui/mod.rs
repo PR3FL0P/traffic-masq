@@ -49,6 +49,7 @@ mod router_settings;
 mod router_topology;
 mod session;
 mod settings;
+mod state;
 #[cfg(test)]
 mod test_api;
 mod vpn;
@@ -64,6 +65,7 @@ use layout::UiLayout;
 use logs::LogLevel;
 use router::{RouterData, RouterFocus, RouterPendingView};
 use settings::{PasswordChangeEditor, SecurityEditor};
+use state::*;
 use vpn::{VpnData, VpnImportEditor};
 use vpn_policy::VpnPolicyData;
 
@@ -216,7 +218,7 @@ fn section_of(screen: Screen) -> Section {
 
 fn section_of_app(app: &TuiApp) -> Section {
     if app.screen == Screen::PendingChange {
-        section_of(app.pending_return_screen)
+        section_of(app.confirmation.pending_return_screen)
     } else {
         section_of(app.screen)
     }
@@ -272,68 +274,27 @@ struct TuiApp {
     connected_endpoint: Option<String>,
     last_drawn_view: Option<ViewIdentity>,
     dashboard: DashboardData,
-    selected_interface: usize,
-    selected_inventory_interface: usize,
-
-    dashboard_pane: dashboard::DashboardPane,
-    dashboard_statistics_index: usize,
     api_access: Option<AccessEditor>,
-    editor: Option<InterfaceEditor>,
-    interface_drafts: HashMap<String, InterfaceEditor>,
-    ap_drafts: HashMap<String, wifi::WifiEditor>,
-    confirmation_focus: usize,
-    confirmation_scroll: u16,
-    dhcp_editor: Option<DhcpEditor>,
-    dhcp_leases: Option<DhcpLeasesView>,
-    dhcp_clients: Vec<DhcpClientStatusView>,
-    dhcp_interfaces: Vec<String>,
-    dhcp_client_selected: Option<String>,
-    dhcp_client_scroll: usize,
-    dhcp_client_editor: Option<dhcp_client_editor::Editor>,
-    wifi_stations: Option<wifi_stations::View>,
-    preview: Option<InterfaceChangePlanView>,
-    preview_scroll: usize,
-    preview_max_scroll: usize,
-    pending: Option<PendingNetworkChange>,
-    pending_return_screen: Screen,
-    pending_focus: usize,
     router: RouterData,
-    router_settings: Option<router_settings::Editor>,
-    router_health: router_health::View,
-    router_pending: Option<RouterPendingView>,
-    router_pending_return_screen: Screen,
-    router_pending_plan: Option<traffic_masq_protocol::RouterPlanView>,
-    forwarding: Option<forwarding::ForwardingEditor>,
-    port_forwarding: Option<port_forwarding::Editor>,
-    router_rollback_timeout_seconds: u64,
     vpn: VpnData,
     vpn_import: Option<VpnImportEditor>,
     vpn_policy: VpnPolicyData,
     wifi: wifi::WifiData,
-    wifi_editor: Option<wifi::WifiEditor>,
-    wifi_scan: Option<wifi::WifiScanPicker>,
-    wifi_profiles: Option<wifi::WifiProfilesView>,
-    wifi_ap_profiles: Option<wifi::WifiApProfilesView>,
-    wifi_profile_editor: Option<wifi::WifiProfileEditor>,
-    wifi_connect: Option<wifi::WifiConnectPrompt>,
-    settings: Option<SecurityEditor>,
-    dns_defaults: Option<dns_defaults::Editor>,
-    settings_password: Option<PasswordChangeEditor>,
     pub(crate) show_dhcp_client: bool,
-    traffic: HashMap<u32, dashboard::TrafficHistory>,
     ui: UiLayout,
     message: Option<String>,
     help_open: bool,
     message_open: bool,
     message_scroll: u16,
     should_quit: bool,
-    logs: VecDeque<logs::LogEntry>,
-    logs_dirty: bool,
-    logs_clear_confirmation: bool,
-    logs_scroll: usize,
-    logs_max_scroll: usize,
-    logs_focus: logs::LogFocus,
-    daemon_logs: daemon_logs::View,
+    interface_ui: InterfaceUiState,
+    confirmation: ConfirmationState,
+    dhcp_ui: DhcpUiState,
+    router_ui: RouterUiState,
+    wifi_ui: WifiUiState,
+    log_view: LogViewState,
+    settings_ui: SettingsUiState,
+    dashboard_ui: DashboardUiState,
 }
 
 impl Default for TuiApp {
@@ -343,90 +304,50 @@ impl Default for TuiApp {
             connected_endpoint: None,
             last_drawn_view: None,
             dashboard: DashboardData::default(),
-            selected_interface: 0,
-            selected_inventory_interface: 0,
-            dashboard_pane: dashboard::DashboardPane::default(),
-            dashboard_statistics_index: 0,
             api_access: None,
-            editor: None,
-            interface_drafts: HashMap::new(),
-            ap_drafts: HashMap::new(),
-            confirmation_focus: 0,
-            confirmation_scroll: 0,
-            dhcp_editor: None,
-            dhcp_leases: None,
-            dhcp_clients: Vec::new(),
-            dhcp_interfaces: Vec::new(),
-            dhcp_client_selected: None,
-            dhcp_client_scroll: 0,
-            dhcp_client_editor: None,
-            wifi_stations: None,
-            preview: None,
-            preview_scroll: 0,
-            preview_max_scroll: 0,
-            pending: None,
-            pending_return_screen: Screen::Dashboard,
-            pending_focus: 0,
             router: RouterData::default(),
-            router_settings: None,
-            router_health: router_health::View::default(),
-            router_pending: None,
-            router_pending_return_screen: Screen::Router,
-            router_pending_plan: None,
-            forwarding: None,
-            port_forwarding: None,
-            router_rollback_timeout_seconds: 60,
             vpn: VpnData::default(),
             vpn_import: None,
             vpn_policy: VpnPolicyData::default(),
             wifi: wifi::WifiData::default(),
-            wifi_editor: None,
-            wifi_scan: None,
-            wifi_profiles: None,
-            wifi_ap_profiles: None,
-            wifi_profile_editor: None,
-            wifi_connect: None,
-            settings: None,
-            dns_defaults: None,
-            settings_password: None,
             show_dhcp_client: false,
-            traffic: HashMap::new(),
             ui: UiLayout::default(),
             message: None,
             help_open: false,
             message_open: false,
             message_scroll: 0,
             should_quit: false,
-            logs: VecDeque::new(),
-            logs_dirty: false,
-            logs_clear_confirmation: false,
-            logs_scroll: 0,
-            logs_max_scroll: 0,
-            logs_focus: logs::LogFocus::default(),
-            daemon_logs: daemon_logs::View::default(),
+            interface_ui: InterfaceUiState::default(),
+            confirmation: ConfirmationState::default(),
+            dhcp_ui: DhcpUiState::default(),
+            router_ui: RouterUiState::default(),
+            wifi_ui: WifiUiState::default(),
+            log_view: LogViewState::default(),
+            settings_ui: SettingsUiState::default(),
+            dashboard_ui: DashboardUiState::default(),
         }
     }
 }
 
 impl TuiApp {
     pub(crate) fn push_message(&mut self, level: logs::LogLevel, text: impl Into<String>) {
-        let follow_log_tail = self.logs_scroll >= self.logs_max_scroll;
+        let follow_log_tail = self.log_view.logs_scroll >= self.log_view.logs_max_scroll;
         let text = logs::with_troubleshooting_hint(level, text.into());
         self.message = Some(text.clone());
-        self.logs.push_back(logs::LogEntry {
+        self.log_view.logs.push_back(logs::LogEntry {
             at_unix: current_unix_time(),
             level,
             message: text,
         });
-        self.logs_dirty = true;
-        if self.logs.len() > logs::LOG_HISTORY_LEN {
-            self.logs.pop_front();
+        self.log_view.logs_dirty = true;
+        if self.log_view.logs.len() > logs::LOG_HISTORY_LEN {
+            self.log_view.logs.pop_front();
         }
         if follow_log_tail {
             // The exact maximum depends on the rendered viewport. A sentinel
             // is clamped to that maximum on the next render, preserving
             // follow-tail without snapping back after a deliberate Up.
-            self.logs_scroll = usize::MAX;
+            self.log_view.logs_scroll = usize::MAX;
         }
     }
 }
@@ -685,7 +606,7 @@ async fn run_loop(
                             running_interfaces, ..
                         }) = client.request(&Request::DhcpStatus).await
                         {
-                            app.dhcp_interfaces = running_interfaces;
+                            app.dhcp_ui.dhcp_interfaces = running_interfaces;
                         }
                     }
                     normalize_selection(&mut app);
@@ -797,18 +718,20 @@ async fn run_loop(
 // Reads may be cancelled to prioritize input. Actions are never cancelled or
 // retried: a lost response does not imply that a mutation was not applied.
 fn pending_deadline(app: &TuiApp) -> Option<u64> {
-    app.pending
+    app.confirmation
+        .pending
         .as_ref()
         .filter(|p| p.can_commit())
         .map(|p| p.expires_at_unix)
         .or_else(|| {
-            app.router_pending
+            app.router_ui
+                .router_pending
                 .as_ref()
                 .filter(|pending| !pending.recovery_required())
                 .map(|pending| {
                     pending
                         .applied_at_unix
-                        .saturating_add(app.router_rollback_timeout_seconds)
+                        .saturating_add(app.router_ui.router_rollback_timeout_seconds)
                 })
         })
 }
@@ -1050,8 +973,8 @@ async fn navigate_to_section(app: &mut TuiApp, section: Section, client: &ApiCli
                     "DHCP Client management requires the daemon API",
                 );
             } else {
-                app.dhcp_client_selected = interfaces::selected_interface_name(app);
-                app.dhcp_client_scroll = 0;
+                app.dhcp_ui.dhcp_client_selected = interfaces::selected_interface_name(app);
+                app.dhcp_ui.dhcp_client_scroll = 0;
                 app.screen = Screen::DhcpClient;
                 dhcp_client::refresh(app, client).await;
             }
@@ -1128,11 +1051,13 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
     if confirmation::current(app).is_some() {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                app.confirmation_scroll = app.confirmation_scroll.saturating_sub(1);
+                app.confirmation.confirmation_scroll =
+                    app.confirmation.confirmation_scroll.saturating_sub(1);
                 return;
             }
             MouseEventKind::ScrollDown => {
-                app.confirmation_scroll = app
+                app.confirmation.confirmation_scroll = app
+                    .confirmation
                     .confirmation_scroll
                     .saturating_add(1)
                     .min(app.ui.dialog_max_scroll);
@@ -1153,7 +1078,7 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                 .find(|(rect, _)| layout::point_in_rect(point, *rect))
                 .and_then(|(_, slot)| confirmation::key_for_slot(*slot))
             {
-                app.confirmation_focus = if key == KeyCode::Delete {
+                app.confirmation.confirmation_focus = if key == KeyCode::Delete {
                     2
                 } else if key == KeyCode::Esc {
                     1
@@ -1182,14 +1107,15 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
     if wifi::change_review_open(app) {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                app.preview_scroll = app.preview_scroll.saturating_sub(1);
+                app.interface_ui.preview_scroll = app.interface_ui.preview_scroll.saturating_sub(1);
                 return;
             }
             MouseEventKind::ScrollDown => {
-                app.preview_scroll = app
+                app.interface_ui.preview_scroll = app
+                    .interface_ui
                     .preview_scroll
                     .saturating_add(1)
-                    .min(app.preview_max_scroll);
+                    .min(app.interface_ui.preview_max_scroll);
                 return;
             }
             _ => {}
@@ -1209,11 +1135,14 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                 app.router.sharing_actions_focused = false;
             }
             Screen::Log => {
-                app.logs_focus = logs::LogFocus::Scroll;
-                app.logs_scroll = if mouse.kind == MouseEventKind::ScrollUp {
-                    app.logs_scroll.saturating_sub(1)
+                app.log_view.logs_focus = logs::LogFocus::Scroll;
+                app.log_view.logs_scroll = if mouse.kind == MouseEventKind::ScrollUp {
+                    app.log_view.logs_scroll.saturating_sub(1)
                 } else {
-                    app.logs_scroll.saturating_add(1).min(app.logs_max_scroll)
+                    app.log_view
+                        .logs_scroll
+                        .saturating_add(1)
+                        .min(app.log_view.logs_max_scroll)
                 };
                 return;
             }
@@ -1231,9 +1160,10 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                     .find(|(rect, _)| layout::point_in_rect(point, *rect))
                     .copied()
                 {
-                    app.dashboard_pane = pane;
+                    app.dashboard_ui.dashboard_pane = pane;
                     if pane == dashboard::DashboardPane::Statistics {
-                        app.dashboard_statistics_index = app.selected_interface + 1;
+                        app.dashboard_ui.dashboard_statistics_index =
+                            app.interface_ui.selected_interface + 1;
                         app.dashboard.statistics_scroll = 0;
                     }
                     return;
@@ -1281,8 +1211,8 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                     if index < app.ui.list_count {
                         match app.screen {
                             Screen::Dashboard => {
-                                app.selected_interface = index;
-                                app.dashboard_pane = dashboard::DashboardPane::Traffic;
+                                app.interface_ui.selected_interface = index;
+                                app.dashboard_ui.dashboard_pane = dashboard::DashboardPane::Traffic;
                             }
                             Screen::InterfaceList | Screen::DhcpInterfaceList => {
                                 interfaces::set_interface_selection(app, index);
@@ -1311,17 +1241,17 @@ async fn handle_mouse(app: &mut TuiApp, mouse: MouseEvent, client: &ApiClient, d
                                 }
                             }
                             Screen::WifiScan => {
-                                if let Some(scan) = app.wifi_scan.as_mut() {
+                                if let Some(scan) = app.wifi_ui.wifi_scan.as_mut() {
                                     scan.selected = index;
                                 }
                             }
                             Screen::WifiApProfiles => {
-                                if let Some(view) = app.wifi_ap_profiles.as_mut() {
+                                if let Some(view) = app.wifi_ui.wifi_ap_profiles.as_mut() {
                                     view.select(index);
                                 }
                             }
                             Screen::WifiProfiles => {
-                                if let Some(view) = app.wifi_profiles.as_mut() {
+                                if let Some(view) = app.wifi_ui.wifi_profiles.as_mut() {
                                     match view.mode {
                                         wifi::WifiProfilesMode::Menu => {
                                             if index < wifi::WifiProfilesMenuAction::ALL.len() {
@@ -1475,8 +1405,8 @@ fn draw_app<'a, B: ratatui::backend::Backend>(
         router_pane: app.router.pane,
         topology_open: app.router.topology.open,
         wifi_actions_open: app.wifi.actions_open,
-        wifi_profiles_mode: app.wifi_profiles.as_ref().map(|view| view.mode),
-        wifi_ap_profiles_mode: app.wifi_ap_profiles.as_ref().map(|view| view.mode),
+        wifi_profiles_mode: app.wifi_ui.wifi_profiles.as_ref().map(|view| view.mode),
+        wifi_ap_profiles_mode: app.wifi_ui.wifi_ap_profiles.as_ref().map(|view| view.mode),
     };
     if app.last_drawn_view != Some(view) {
         terminal.clear()?;
@@ -1522,7 +1452,7 @@ async fn handle_key_event(app: &mut TuiApp, key: KeyEvent, client: &ApiClient, d
                 navigate_to_section(app, target, client, direct).await;
             }
             KeyCode::Char('o') if app.screen == Screen::WifiConnectPrompt => {
-                if let Some(prompt) = app.wifi_connect.as_mut() {
+                if let Some(prompt) = app.wifi_ui.wifi_connect.as_mut() {
                     prompt.field = wifi::WifiConnectField::Submit;
                 }
                 handle_key(app, KeyCode::Enter, client, direct).await;
@@ -1551,10 +1481,10 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp, direct: bool) {
     frame.render_widget(ratatui::widgets::Clear, area);
     app.ui = UiLayout::default();
     if area.width < MIN_TERMINAL_WIDTH || area.height < MIN_TERMINAL_HEIGHT {
-        let recovery_hint = app.pending.as_ref().filter(|change| !change.can_commit()).map(|change| {
+        let recovery_hint = app.confirmation.pending.as_ref().filter(|change| !change.can_commit()).map(|change| {
             if change.can_rollback() { "Rollback recovery required. Esc: retry rollback. Q: exit." }
             else { "Commit outcome unknown. Repair storage and restart the daemon. Esc: back. Q: exit." }
-        }).or_else(|| app.router_pending.as_ref().filter(|view| view.recovery_required()).map(|view| {
+        }).or_else(|| app.router_ui.router_pending.as_ref().filter(|view| view.recovery_required()).map(|view| {
             if view.commit_indeterminate() { "Commit outcome unknown. Repair storage and restart the daemon. Esc: back. Q: exit." }
             else { "Rollback recovery required. Enter: retry rollback. Esc: back. Q: exit." }
         }));
@@ -1692,7 +1622,9 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp, direct: bool) {
 fn focus_action_slot(app: &mut TuiApp, slot: usize) {
     match app.screen {
         Screen::Dashboard => {}
-        Screen::PendingChange | Screen::RouterPending => app.pending_focus = slot.min(1),
+        Screen::PendingChange | Screen::RouterPending => {
+            app.confirmation.pending_focus = slot.min(1)
+        }
         Screen::DnsDefaults => dns_defaults::focus_action(app, slot),
         Screen::Access => access::focus_action(app, slot),
         Screen::InterfaceEditor => interfaces::focus_action(app, slot),
@@ -1710,7 +1642,7 @@ fn focus_action_slot(app: &mut TuiApp, slot: usize) {
         Screen::SettingsPassword => settings::focus_password_submit(app),
         Screen::WifiEditor => wifi::focus_editor_action(app, slot),
         Screen::WifiApProfiles => {
-            if let Some(view) = app.wifi_ap_profiles.as_mut() {
+            if let Some(view) = app.wifi_ui.wifi_ap_profiles.as_mut() {
                 if view.apply_review {
                     view.review_cancel = slot == 1;
                 }
@@ -1718,7 +1650,7 @@ fn focus_action_slot(app: &mut TuiApp, slot: usize) {
         }
         Screen::Wifi => wifi::focus_action(app, slot),
         Screen::WifiConnectPrompt => {
-            if let Some(prompt) = app.wifi_connect.as_mut() {
+            if let Some(prompt) = app.wifi_ui.wifi_connect.as_mut() {
                 prompt.field = if slot == 0 {
                     wifi::WifiConnectField::Submit
                 } else {
@@ -1734,10 +1666,10 @@ fn focus_action_slot(app: &mut TuiApp, slot: usize) {
 
 async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: bool) {
     if !app.ui.input_enabled {
-        if (app.pending.is_some() || app.router_pending.is_some())
+        if (app.confirmation.pending.is_some() || app.router_ui.router_pending.is_some())
             && matches!(key, KeyCode::Enter | KeyCode::Esc)
         {
-            app.pending_focus = 0;
+            app.confirmation.pending_focus = 0;
             match app.screen {
                 Screen::PendingChange => interfaces::handle_pending_key(app, key, client).await,
                 Screen::RouterPending => router::handle_router_pending_key(app, key, client).await,
@@ -1770,42 +1702,45 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
         let count = if dialog.secondary.is_some() { 3 } else { 2 };
         match key {
             KeyCode::PageUp => {
-                app.confirmation_scroll = app.confirmation_scroll.saturating_sub(5);
+                app.confirmation.confirmation_scroll =
+                    app.confirmation.confirmation_scroll.saturating_sub(5);
                 return;
             }
             KeyCode::PageDown => {
-                app.confirmation_scroll = app
+                app.confirmation.confirmation_scroll = app
+                    .confirmation
                     .confirmation_scroll
                     .saturating_add(5)
                     .min(app.ui.dialog_max_scroll);
                 return;
             }
             KeyCode::Home => {
-                app.confirmation_scroll = 0;
+                app.confirmation.confirmation_scroll = 0;
                 return;
             }
             KeyCode::End => {
-                app.confirmation_scroll = app.ui.dialog_max_scroll;
+                app.confirmation.confirmation_scroll = app.ui.dialog_max_scroll;
                 return;
             }
             KeyCode::Tab | KeyCode::Down | KeyCode::Right => {
-                app.confirmation_focus = (app.confirmation_focus + 1) % count;
+                app.confirmation.confirmation_focus =
+                    (app.confirmation.confirmation_focus + 1) % count;
                 return;
             }
             KeyCode::BackTab | KeyCode::Up | KeyCode::Left => {
-                app.confirmation_focus = (app.confirmation_focus + count - 1) % count;
+                app.confirmation.confirmation_focus =
+                    (app.confirmation.confirmation_focus + count - 1) % count;
                 return;
             }
-            KeyCode::Enter => {
-                confirmation::key_for_slot(app.confirmation_focus).unwrap_or(KeyCode::Esc)
-            }
+            KeyCode::Enter => confirmation::key_for_slot(app.confirmation.confirmation_focus)
+                .unwrap_or(KeyCode::Esc),
             KeyCode::Esc => KeyCode::Esc,
             KeyCode::Delete if dialog.secondary.is_some() => KeyCode::Delete,
             _ => return,
         }
     } else {
-        app.confirmation_focus = 0;
-        app.confirmation_scroll = 0;
+        app.confirmation.confirmation_focus = 0;
+        app.confirmation.confirmation_scroll = 0;
         key
     };
 
@@ -1845,10 +1780,14 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
             | Screen::Log
     ) {
         let horizontal_focus = match app.screen {
-            Screen::Settings => app.settings.as_ref().is_some_and(|s| s.is_editing()),
+            Screen::Settings => app
+                .settings_ui
+                .settings
+                .as_ref()
+                .is_some_and(|s| s.is_editing()),
             Screen::Dashboard => false,
             Screen::Vpn => app.vpn.focus != vpn::VpnFocus::List,
-            Screen::Log => app.logs_focus != logs::LogFocus::Scroll,
+            Screen::Log => app.log_view.logs_focus != logs::LogFocus::Scroll,
             Screen::Wifi => app.wifi.actions_open,
             Screen::Router => {
                 app.router.focus == RouterFocus::Actions
@@ -1921,8 +1860,8 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
         Screen::DaemonLogs => daemon_logs::handle_key(app, key, client).await,
     }
     if confirmation::current(app).is_none() {
-        app.confirmation_focus = 0;
-        app.confirmation_scroll = 0;
+        app.confirmation.confirmation_focus = 0;
+        app.confirmation.confirmation_scroll = 0;
     }
 }
 
@@ -1930,8 +1869,8 @@ fn refresh_pending_screen(app: &mut TuiApp) {
     if app.screen != Screen::PendingChange {
         return;
     }
-    let Some(change) = &app.pending else {
-        app.screen = app.pending_return_screen;
+    let Some(change) = &app.confirmation.pending else {
+        app.screen = app.confirmation.pending_return_screen;
         return;
     };
     if app.dashboard.error.is_some() {
@@ -1944,7 +1883,7 @@ fn refresh_pending_screen(app: &mut TuiApp) {
         .iter()
         .find(|pending| pending.token == change.token)
     {
-        app.pending = Some(current.clone());
+        app.confirmation.pending = Some(current.clone());
         return;
     }
     if current_unix_time() >= change.expires_at_unix {
@@ -1952,26 +1891,28 @@ fn refresh_pending_screen(app: &mut TuiApp) {
             LogLevel::Info,
             "Network transaction is no longer pending; outcome unknown. Inspect current interface state.",
         );
-        app.pending = None;
-        app.preview = None;
-        app.editor = None;
-        app.screen = app.pending_return_screen;
+        app.confirmation.pending = None;
+        app.interface_ui.preview = None;
+        app.interface_ui.editor = None;
+        app.screen = app.confirmation.pending_return_screen;
     }
 }
 
 fn normalize_selection(app: &mut TuiApp) {
-    app.selected_inventory_interface = app.selected_inventory_interface.min(
-        app.dashboard
-            .inventory
-            .as_ref()
-            .map_or(0, |entries| entries.len().saturating_sub(1)),
-    );
+    app.interface_ui.selected_inventory_interface =
+        app.interface_ui.selected_inventory_interface.min(
+            app.dashboard
+                .inventory
+                .as_ref()
+                .map_or(0, |entries| entries.len().saturating_sub(1)),
+        );
     if app.dashboard.interfaces.is_empty() {
-        app.selected_interface = 0;
-    } else if app.selected_interface >= app.dashboard.interfaces.len() {
-        app.selected_interface = app.dashboard.interfaces.len() - 1;
+        app.interface_ui.selected_interface = 0;
+    } else if app.interface_ui.selected_interface >= app.dashboard.interfaces.len() {
+        app.interface_ui.selected_interface = app.dashboard.interfaces.len() - 1;
     }
-    app.dashboard_statistics_index = app
+    app.dashboard_ui.dashboard_statistics_index = app
+        .dashboard_ui
         .dashboard_statistics_index
         .min(app.dashboard.interfaces.len());
 }

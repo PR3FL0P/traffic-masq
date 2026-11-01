@@ -34,17 +34,17 @@ impl View {
 
 pub(crate) async fn open(app: &mut TuiApp, client: &ApiClient) {
     app.screen = Screen::RouterHealth;
-    app.router_health = View::default();
+    app.router_ui.router_health = View::default();
     refresh(app, client).await;
 }
 async fn refresh(app: &mut TuiApp, client: &ApiClient) {
-    app.router_health.confirming = false;
+    app.router_ui.router_health.confirming = false;
     match client.request(&Request::RouterProvisioningStatus).await {
         Ok(Response::RouterProvisioningStatus { status }) => {
-            app.router_health.status = Some(status);
-            app.router_health.error = None;
+            app.router_ui.router_health.status = Some(status);
+            app.router_ui.router_health.error = None;
         }
-        other => app.router_health.error = Some(error_message(other)),
+        other => app.router_ui.router_health.error = Some(error_message(other)),
     }
 }
 fn error_message(response: anyhow::Result<Response>) -> String {
@@ -56,7 +56,7 @@ fn error_message(response: anyhow::Result<Response>) -> String {
     }
 }
 pub(super) fn confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> {
-    if !app.router_health.confirming {
+    if !app.router_ui.router_health.confirming {
         return None;
     }
     let mut lines = vec![
@@ -64,7 +64,7 @@ pub(super) fn confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> 
         "Reapplies saved state immediately; network traffic may be interrupted.".into(),
         "This operation has no rollback timer.".into(),
     ];
-    if let Some(status) = &app.router_health.status {
+    if let Some(status) = &app.router_ui.router_health.status {
         for (name, reason) in [
             ("Interfaces", &status.readiness.interfaces),
             ("Routes", &status.readiness.routes),
@@ -90,8 +90,8 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
             frame,
             area,
             &mut app.ui,
-            app.confirmation_focus,
-            app.confirmation_scroll,
+            app.confirmation.confirmation_focus,
+            app.confirmation.confirmation_scroll,
         );
         return;
     }
@@ -101,7 +101,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
         .as_ref()
         .map(|config| super::interface_status::router_lines(app, &[config]))
         .unwrap_or_default();
-    let view = &mut app.router_health;
+    let view = &mut app.router_ui.router_health;
     let block = panel("Router health | saved configuration");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -190,19 +190,19 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
     );
 }
 pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
-    if app.router_health.confirming {
+    if app.router_ui.router_health.confirming {
         match key {
-            KeyCode::Esc => app.router_health.confirming = false,
+            KeyCode::Esc => app.router_ui.router_health.confirming = false,
             KeyCode::Enter => {
-                app.router_health.confirming = false;
-                if !app.router_health.can_repair(app.router.staged) {
+                app.router_ui.router_health.confirming = false;
+                if !app.router_ui.router_health.can_repair(app.router.staged) {
                     return;
                 }
                 match client.request(&Request::RouterProvisioningRepair).await {
                     Ok(Response::RouterProvisioningRepaired { status }) => {
                         let ready = status.ready;
-                        app.router_health.status = Some(status);
-                        app.router_health.error = None;
+                        app.router_ui.router_health.status = Some(status);
+                        app.router_ui.router_health.error = None;
                         app.push_message(
                             if ready {
                                 LogLevel::Info
@@ -217,7 +217,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClien
                         );
                     }
                     other => {
-                        app.router_health.error = Some(error_message(other));
+                        app.router_ui.router_health.error = Some(error_message(other));
                         app.push_message(
                             LogLevel::Warn,
                             "Repair was not confirmed successful; refresh status before retrying",
@@ -237,21 +237,28 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClien
         KeyCode::Char('r') => refresh(app, client).await,
         KeyCode::Char('f') => {
             refresh(app, client).await;
-            app.router_health.confirming = app.router_health.can_repair(app.router.staged);
-            app.router_health.scroll = 0;
+            app.router_ui.router_health.confirming =
+                app.router_ui.router_health.can_repair(app.router.staged);
+            app.router_ui.router_health.scroll = 0;
         }
-        KeyCode::Up => app.router_health.scroll = app.router_health.scroll.saturating_sub(1),
-        KeyCode::PageUp => app.router_health.scroll = app.router_health.scroll.saturating_sub(10),
+        KeyCode::Up => {
+            app.router_ui.router_health.scroll =
+                app.router_ui.router_health.scroll.saturating_sub(1)
+        }
+        KeyCode::PageUp => {
+            app.router_ui.router_health.scroll =
+                app.router_ui.router_health.scroll.saturating_sub(10)
+        }
         KeyCode::Down => {
-            app.router_health.scroll =
-                (app.router_health.scroll + 1).min(app.router_health.max_scroll)
+            app.router_ui.router_health.scroll =
+                (app.router_ui.router_health.scroll + 1).min(app.router_ui.router_health.max_scroll)
         }
         KeyCode::PageDown => {
-            app.router_health.scroll =
-                (app.router_health.scroll + 10).min(app.router_health.max_scroll)
+            app.router_ui.router_health.scroll = (app.router_ui.router_health.scroll + 10)
+                .min(app.router_ui.router_health.max_scroll)
         }
-        KeyCode::Home => app.router_health.scroll = 0,
-        KeyCode::End => app.router_health.scroll = app.router_health.max_scroll,
+        KeyCode::Home => app.router_ui.router_health.scroll = 0,
+        KeyCode::End => app.router_ui.router_health.scroll = app.router_ui.router_health.max_scroll,
         _ => {}
     }
 }
@@ -295,9 +302,9 @@ mod tests {
         let mut app = TuiApp::default();
         open(&mut app, &mock.client).await;
         handle_key(&mut app, KeyCode::Char('f'), &mock.client).await;
-        assert!(app.router_health.confirming);
+        assert!(app.router_ui.router_health.confirming);
         handle_key(&mut app, KeyCode::Esc, &mock.client).await;
-        assert!(!app.router_health.confirming);
+        assert!(!app.router_ui.router_health.confirming);
         assert_eq!(app.screen, Screen::RouterHealth);
         assert!(
             mock.calls
@@ -309,7 +316,7 @@ mod tests {
         );
         handle_key(&mut app, KeyCode::Char('f'), &mock.client).await;
         handle_key(&mut app, KeyCode::Enter, &mock.client).await;
-        assert!(app.router_health.status.as_ref().unwrap().ready);
+        assert!(app.router_ui.router_health.status.as_ref().unwrap().ready);
         let calls = mock.calls.lock().unwrap();
         assert_eq!(calls.len(), 4);
         assert_eq!(calls[3].method, "POST");
@@ -330,9 +337,9 @@ mod tests {
         open(&mut app, &mock.client).await;
         handle_key(&mut app, KeyCode::Char('f'), &mock.client).await;
         handle_key(&mut app, KeyCode::Enter, &mock.client).await;
-        assert!(!app.router_health.confirming);
-        assert!(app.router_health.status.is_some());
-        assert!(app.router_health.error.is_some());
+        assert!(!app.router_ui.router_health.confirming);
+        assert!(app.router_ui.router_health.status.is_some());
+        assert!(app.router_ui.router_health.error.is_some());
         assert_eq!(mock.calls.lock().unwrap().len(), 2);
     }
 
@@ -351,7 +358,7 @@ mod tests {
         handle_key(&mut app, KeyCode::Char('f'), &mock.client).await;
         handle_key(&mut app, KeyCode::Enter, &mock.client).await;
         handle_key(&mut app, KeyCode::Enter, &mock.client).await;
-        assert!(!app.router_health.can_repair(false));
+        assert!(!app.router_ui.router_health.can_repair(false));
         assert_eq!(mock.calls.lock().unwrap().len(), 3);
     }
 
@@ -383,8 +390,8 @@ mod tests {
     #[test]
     fn confirmation_and_blockers_are_visible_at_minimum_terminal_size() {
         let mut app = TuiApp::default();
-        app.router_health.status = Some(status(ProvisioningStage::Degraded));
-        app.router_health.confirming = true;
+        app.router_ui.router_health.status = Some(status(ProvisioningStage::Degraded));
+        app.router_ui.router_health.confirming = true;
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal

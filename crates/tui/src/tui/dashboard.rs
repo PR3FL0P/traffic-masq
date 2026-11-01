@@ -46,65 +46,74 @@ pub(crate) async fn handle_dashboard_key(
         app.dashboard.statistics_scroll = 0;
     }
     match key {
-        KeyCode::PageDown if app.dashboard_pane == DashboardPane::Statistics => {
+        KeyCode::PageDown if app.dashboard_ui.dashboard_pane == DashboardPane::Statistics => {
             app.dashboard.statistics_scroll = app
                 .dashboard
                 .statistics_scroll
                 .saturating_add(5)
                 .min(app.dashboard.statistics_max_scroll);
         }
-        KeyCode::PageUp if app.dashboard_pane == DashboardPane::Statistics => {
+        KeyCode::PageUp if app.dashboard_ui.dashboard_pane == DashboardPane::Statistics => {
             app.dashboard.statistics_scroll = app.dashboard.statistics_scroll.saturating_sub(5);
         }
-        KeyCode::Char('1') => app.dashboard_pane = DashboardPane::Traffic,
+        KeyCode::Char('1') => app.dashboard_ui.dashboard_pane = DashboardPane::Traffic,
         KeyCode::Char('2') => {
-            app.dashboard_pane = DashboardPane::Statistics;
-            app.dashboard_statistics_index = app.selected_interface + 1;
+            app.dashboard_ui.dashboard_pane = DashboardPane::Statistics;
+            app.dashboard_ui.dashboard_statistics_index = app.interface_ui.selected_interface + 1;
         }
         KeyCode::Tab | KeyCode::BackTab => {
-            app.dashboard_pane = match app.dashboard_pane {
+            app.dashboard_ui.dashboard_pane = match app.dashboard_ui.dashboard_pane {
                 DashboardPane::Traffic => {
-                    app.dashboard_statistics_index = app.selected_interface + 1;
+                    app.dashboard_ui.dashboard_statistics_index =
+                        app.interface_ui.selected_interface + 1;
                     DashboardPane::Statistics
                 }
                 DashboardPane::Statistics => DashboardPane::Traffic,
             };
         }
         KeyCode::Esc => app.should_quit = true,
-        KeyCode::Up => match app.dashboard_pane {
+        KeyCode::Up => match app.dashboard_ui.dashboard_pane {
             DashboardPane::Traffic => {
-                app.selected_interface = app.selected_interface.saturating_sub(1)
+                app.interface_ui.selected_interface =
+                    app.interface_ui.selected_interface.saturating_sub(1)
             }
             DashboardPane::Statistics => {
-                app.dashboard_statistics_index = app.dashboard_statistics_index.saturating_sub(1)
+                app.dashboard_ui.dashboard_statistics_index = app
+                    .dashboard_ui
+                    .dashboard_statistics_index
+                    .saturating_sub(1)
             }
         },
-        KeyCode::Down => match app.dashboard_pane {
+        KeyCode::Down => match app.dashboard_ui.dashboard_pane {
             DashboardPane::Traffic => {
-                app.selected_interface = (app.selected_interface + 1)
+                app.interface_ui.selected_interface = (app.interface_ui.selected_interface + 1)
                     .min(app.dashboard.interfaces.len().saturating_sub(1));
             }
             DashboardPane::Statistics => {
-                app.dashboard_statistics_index =
-                    (app.dashboard_statistics_index + 1).min(app.dashboard.interfaces.len());
+                app.dashboard_ui.dashboard_statistics_index =
+                    (app.dashboard_ui.dashboard_statistics_index + 1)
+                        .min(app.dashboard.interfaces.len());
             }
         },
-        KeyCode::Home => match app.dashboard_pane {
-            DashboardPane::Traffic => app.selected_interface = 0,
-            DashboardPane::Statistics => app.dashboard_statistics_index = 0,
+        KeyCode::Home => match app.dashboard_ui.dashboard_pane {
+            DashboardPane::Traffic => app.interface_ui.selected_interface = 0,
+            DashboardPane::Statistics => app.dashboard_ui.dashboard_statistics_index = 0,
         },
-        KeyCode::End => match app.dashboard_pane {
+        KeyCode::End => match app.dashboard_ui.dashboard_pane {
             DashboardPane::Traffic => {
-                app.selected_interface = app.dashboard.interfaces.len().saturating_sub(1)
+                app.interface_ui.selected_interface =
+                    app.dashboard.interfaces.len().saturating_sub(1)
             }
             DashboardPane::Statistics => {
-                app.dashboard_statistics_index = app.dashboard.interfaces.len()
+                app.dashboard_ui.dashboard_statistics_index = app.dashboard.interfaces.len()
             }
         },
         KeyCode::Enter => {
-            if app.dashboard_pane == DashboardPane::Statistics && app.dashboard_statistics_index > 0
+            if app.dashboard_ui.dashboard_pane == DashboardPane::Statistics
+                && app.dashboard_ui.dashboard_statistics_index > 0
             {
-                app.selected_interface = app.dashboard_statistics_index - 1;
+                app.interface_ui.selected_interface =
+                    app.dashboard_ui.dashboard_statistics_index - 1;
             }
             app.screen = Screen::InterfaceList;
         }
@@ -320,13 +329,13 @@ pub(crate) fn accept_update(app: &mut TuiApp, mut updated: DashboardData) {
     let selected = app
         .dashboard
         .interfaces
-        .get(app.selected_interface)
+        .get(app.interface_ui.selected_interface)
         .map(|entry| entry.interface.name.clone());
     let inventory_selected = app
         .dashboard
         .inventory
         .as_ref()
-        .and_then(|entries| entries.get(app.selected_inventory_interface))
+        .and_then(|entries| entries.get(app.interface_ui.selected_inventory_interface))
         .map(|entry| entry.name.clone());
     updated.statistics_scroll = app.dashboard.statistics_scroll;
     updated.statistics_max_scroll = app.dashboard.statistics_max_scroll;
@@ -379,7 +388,7 @@ pub(crate) fn accept_update(app: &mut TuiApp, mut updated: DashboardData) {
         updated.pending_network_changes = app.dashboard.pending_network_changes.clone();
         updated.pending_known = true;
     }
-    app.selected_interface = selected
+    app.interface_ui.selected_interface = selected
         .as_ref()
         .and_then(|name| {
             updated
@@ -395,7 +404,7 @@ pub(crate) fn accept_update(app: &mut TuiApp, mut updated: DashboardData) {
         })
         .or_else(|| updated.interfaces.iter().position(|s| s.has_default_route))
         .unwrap_or(0);
-    app.selected_inventory_interface = inventory_selected
+    app.interface_ui.selected_inventory_interface = inventory_selected
         .as_ref()
         .and_then(|name| {
             updated
@@ -429,11 +438,14 @@ pub(crate) fn record_traffic_samples(app: &mut TuiApp) {
         .iter()
         .map(|status| status.interface.index)
         .collect();
-    app.traffic.retain(|index, _| present.contains(index));
+    app.dashboard_ui
+        .traffic
+        .retain(|index, _| present.contains(index));
 
     for status in &app.dashboard.interfaces {
         let counters = read_interface_counters(&status.interface.name);
-        app.traffic
+        app.dashboard_ui
+            .traffic
             .entry(status.interface.index)
             .or_default()
             .record_with_counters(
@@ -468,7 +480,7 @@ pub(crate) fn render_dashboard(
         let rect = Rect::new(x, sections[1].y, label.len() as u16, 1);
         app.dashboard.pane_tabs.push((rect, pane));
         frame.render_widget(
-            Paragraph::new(label).style(if app.dashboard_pane == pane {
+            Paragraph::new(label).style(if app.dashboard_ui.dashboard_pane == pane {
                 Style::default()
                     .fg(theme::SELECTED_FG)
                     .bg(theme::SELECTED_BG)
@@ -480,7 +492,7 @@ pub(crate) fn render_dashboard(
         x += rect.width + 1;
     }
 
-    match app.dashboard_pane {
+    match app.dashboard_ui.dashboard_pane {
         DashboardPane::Traffic => render_dashboard_traffic(frame, sections[2], app),
         DashboardPane::Statistics => render_numeric_statistics(frame, sections[2], app),
     }
@@ -490,12 +502,15 @@ fn render_numeric_statistics(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
     app.ui.list_area = None;
     app.ui.list_count = 0;
     app.ui.list_scroll_offset = 0;
-    if app.dashboard_statistics_index == 0 {
+    if app.dashboard_ui.dashboard_statistics_index == 0 {
         render_global_statistics(frame, area, app);
         return;
     }
 
-    let interface_index = app.dashboard_statistics_index.saturating_sub(1);
+    let interface_index = app
+        .dashboard_ui
+        .dashboard_statistics_index
+        .saturating_sub(1);
     let Some(status) = app.dashboard.interfaces.get(interface_index) else {
         frame.render_widget(
             Paragraph::new("No interfaces detected").block(panel("Statistics")),
@@ -505,7 +520,7 @@ fn render_numeric_statistics(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
     };
 
     let name = &status.interface.name;
-    let history = app.traffic.get(&status.interface.index);
+    let history = app.dashboard_ui.traffic.get(&status.interface.index);
     let now = Instant::now();
     let (session_rx, session_tx) = history
         .map(|history| {
@@ -689,7 +704,7 @@ fn render_global_statistics(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         kernel_rx = kernel_rx.saturating_add(status.interface.rx_bytes);
         kernel_tx = kernel_tx.saturating_add(status.interface.tx_bytes);
 
-        let Some(history) = app.traffic.get(&status.interface.index) else {
+        let Some(history) = app.dashboard_ui.traffic.get(&status.interface.index) else {
             continue;
         };
         observed = observed.max(history.observed_for(now));
@@ -1020,6 +1035,7 @@ pub(crate) fn render_dashboard_traffic(
     let visible = total.min(max_visible);
     let max_offset = total.saturating_sub(visible);
     let offset = app
+        .interface_ui
         .selected_interface
         .saturating_sub(visible / 2)
         .min(max_offset);
@@ -1052,7 +1068,7 @@ pub(crate) fn render_dashboard_traffic(
         .constraints(vec![Constraint::Length(row_height); visible])
         .split(inner);
 
-    let selected_interface = app.selected_interface;
+    let selected_interface = app.interface_ui.selected_interface;
     for (row, (index, status)) in app
         .dashboard
         .interfaces
@@ -1062,7 +1078,7 @@ pub(crate) fn render_dashboard_traffic(
         .take(visible)
         .enumerate()
     {
-        let history = app.traffic.get(&status.interface.index);
+        let history = app.dashboard_ui.traffic.get(&status.interface.index);
         let managed = app.dashboard.managed.get(&status.interface.name).copied();
         render_traffic_row(
             frame,

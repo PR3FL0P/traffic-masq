@@ -43,7 +43,7 @@ const ACTIONS: [(Focus, &str); 3] = [
 ];
 
 pub(crate) async fn open(app: &mut TuiApp, client: &ApiClient, interface: String) {
-    app.wifi_stations = Some(View {
+    app.wifi_ui.wifi_stations = Some(View {
         interface,
         ..View::default()
     });
@@ -60,7 +60,7 @@ fn response_error(response: Response) -> String {
 }
 
 pub(crate) async fn refresh(app: &mut TuiApp, client: &ApiClient) {
-    let Some(view) = &app.wifi_stations else {
+    let Some(view) = &app.wifi_ui.wifi_stations else {
         return;
     };
     if view.confirm.is_some() {
@@ -77,7 +77,7 @@ pub(crate) async fn refresh(app: &mut TuiApp, client: &ApiClient) {
             interface: interface.clone(),
         })
         .await;
-    let Some(view) = &mut app.wifi_stations else {
+    let Some(view) = &mut app.wifi_ui.wifi_stations else {
         return;
     };
     match stations {
@@ -125,7 +125,7 @@ fn lease_for(view: &View, mac: MacAddr, now: u64) -> Option<&DhcpLeaseView> {
 }
 
 pub(crate) fn select_row(app: &mut TuiApp, index: usize) {
-    if let Some(view) = &mut app.wifi_stations {
+    if let Some(view) = &mut app.wifi_ui.wifi_stations {
         if view.confirm.is_none() {
             view.selected = index.min(view.stations.len().saturating_sub(1));
             view.focus = Focus::List;
@@ -134,13 +134,14 @@ pub(crate) fn select_row(app: &mut TuiApp, index: usize) {
 }
 
 pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
-    if let (Some(view), Some((focus, _))) = (app.wifi_stations.as_mut(), ACTIONS.get(slot)) {
+    if let (Some(view), Some((focus, _))) = (app.wifi_ui.wifi_stations.as_mut(), ACTIONS.get(slot))
+    {
         view.focus = *focus;
     }
 }
 
 pub(super) fn confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> {
-    let view = app.wifi_stations.as_ref()?;
+    let view = app.wifi_ui.wifi_stations.as_ref()?;
     let mac = view.confirm?;
     Some(super::confirmation::Dialog {
         secondary: None,
@@ -160,17 +161,18 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
             frame,
             area,
             &mut app.ui,
-            app.confirmation_focus,
-            app.confirmation_scroll,
+            app.confirmation.confirmation_focus,
+            app.confirmation.confirmation_scroll,
         );
         return;
     }
     let interface_status = app
+        .wifi_ui
         .wifi_stations
         .as_ref()
         .map(|view| super::interface_status::describe(app, &view.interface))
         .unwrap_or_default();
-    let Some(view) = &mut app.wifi_stations else {
+    let Some(view) = &mut app.wifi_ui.wifi_stations else {
         return;
     };
     let block = panel("Connected Wi-Fi devices");
@@ -278,7 +280,7 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
 }
 
 pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
-    let Some(view) = &mut app.wifi_stations else {
+    let Some(view) = &mut app.wifi_ui.wifi_stations else {
         return;
     };
     if let Some(mac) = view.confirm {
@@ -300,7 +302,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClien
                         interface: returned,
                         stations,
                     }) if returned == interface => {
-                        if let Some(view) = &mut app.wifi_stations {
+                        if let Some(view) = &mut app.wifi_ui.wifi_stations {
                             replace_stations(view, stations);
                             view.error = None;
                         }
@@ -324,7 +326,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClien
     }
     match key {
         KeyCode::Esc => {
-            app.wifi_stations = None;
+            app.wifi_ui.wifi_stations = None;
             app.screen = Screen::Wifi;
         }
         KeyCode::Tab | KeyCode::BackTab => {
@@ -350,7 +352,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClien
                 }
             }
             Focus::Back => {
-                app.wifi_stations = None;
+                app.wifi_ui.wifi_stations = None;
                 app.screen = Screen::Wifi;
             }
             Focus::List => {}
@@ -397,13 +399,16 @@ mod tests {
         }])
         .await;
         let mut app = TuiApp {
-            screen: Screen::WifiStations,
-            wifi_stations: Some(View {
-                interface: "wlan1".into(),
-                stations: vec![a.clone()],
-                loaded: true,
+            wifi_ui: crate::tui::state::WifiUiState {
+                wifi_stations: Some(View {
+                    interface: "wlan1".into(),
+                    stations: vec![a.clone()],
+                    loaded: true,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
+            screen: Screen::WifiStations,
             ..Default::default()
         };
         handle_key(&mut app, KeyCode::Char('d'), &mock.client).await;
@@ -412,7 +417,13 @@ mod tests {
         refresh(&mut app, &mock.client).await;
         assert!(mock.calls.lock().unwrap().is_empty());
         handle_key(&mut app, KeyCode::Esc, &mock.client).await;
-        assert!(app.wifi_stations.as_ref().unwrap().confirm.is_none());
+        assert!(app
+            .wifi_ui
+            .wifi_stations
+            .as_ref()
+            .unwrap()
+            .confirm
+            .is_none());
         handle_key(&mut app, KeyCode::Char('d'), &mock.client).await;
         select_row(&mut app, 99);
         handle_key(&mut app, KeyCode::Enter, &mock.client).await;
@@ -424,7 +435,13 @@ mod tests {
         assert_eq!(calls[0].body["type"], "wifi_deauth_station");
         assert_eq!(calls[0].body["interface"], "wlan1");
         assert_eq!(calls[0].body["mac"], "00:11:22:33:44:55");
-        assert!(app.wifi_stations.as_ref().unwrap().stations.is_empty());
+        assert!(app
+            .wifi_ui
+            .wifi_stations
+            .as_ref()
+            .unwrap()
+            .stations
+            .is_empty());
     }
 
     #[tokio::test]
@@ -439,17 +456,20 @@ mod tests {
         ])
         .await;
         let mut app = TuiApp {
-            wifi_stations: Some(View {
-                interface: "wlan1".into(),
-                stations: vec![station("00:11:22:33:44:55")],
-                loaded: true,
+            wifi_ui: crate::tui::state::WifiUiState {
+                wifi_stations: Some(View {
+                    interface: "wlan1".into(),
+                    stations: vec![station("00:11:22:33:44:55")],
+                    loaded: true,
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }),
+            },
             ..Default::default()
         };
         refresh(&mut app, &mock.client).await;
         handle_key(&mut app, KeyCode::Char('d'), &mock.client).await;
-        let view = app.wifi_stations.as_ref().unwrap();
+        let view = app.wifi_ui.wifi_stations.as_ref().unwrap();
         assert_eq!(view.stations.len(), 1);
         assert!(view.error.is_some() && view.lease_error.is_some());
         assert!(view.confirm.is_none());
@@ -461,14 +481,17 @@ mod tests {
                 .map(|i| station(&format!("00:11:22:33:44:{i:02x}")))
                 .collect();
             let mut app = TuiApp {
-                screen: Screen::WifiStations,
-                wifi_stations: Some(View {
-                    interface: "wlan1".into(),
-                    stations,
-                    selected: 19,
-                    loaded: true,
+                wifi_ui: crate::tui::state::WifiUiState {
+                    wifi_stations: Some(View {
+                        interface: "wlan1".into(),
+                        stations,
+                        selected: 19,
+                        loaded: true,
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                }),
+                },
+                screen: Screen::WifiStations,
                 ..Default::default()
             };
             let mut terminal =
@@ -487,7 +510,7 @@ mod tests {
             for (rect, _) in &app.ui.buttons {
                 assert!(rect.y >= list.bottom());
             }
-            app.wifi_stations.as_mut().unwrap().confirm =
+            app.wifi_ui.wifi_stations.as_mut().unwrap().confirm =
                 Some("00:11:22:33:44:13".parse().unwrap());
             terminal
                 .draw(|f| super::super::render(f, &mut app, false))

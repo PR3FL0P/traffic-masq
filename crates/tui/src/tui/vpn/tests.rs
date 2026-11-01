@@ -533,7 +533,7 @@ async fn cancelling_a_background_refresh_preserves_the_last_observation_at_every
         assert_eq!(app.vpn.chain, Some(vec![]));
         assert!(app.vpn.error.is_some());
         assert_eq!(selected_name(&app), Some("home.conf"));
-        assert!(app.logs.is_empty());
+        assert!(app.log_view.logs.is_empty());
     }
 }
 

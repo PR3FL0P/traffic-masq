@@ -217,14 +217,15 @@ pub(crate) async fn open(app: &mut TuiApp, client: &ApiClient) {
             Vec::new()
         }
     };
-    app.router_settings = Some(Editor::new(
+    app.router_ui.router_settings = Some(Editor::new(
         app.router.proposed_router_config.clone(),
         profiles,
     ));
     app.screen = Screen::RouterSettings;
 }
 pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
-    if let (Some(editor), Some(field)) = (app.router_settings.as_mut(), FIELDS.get(slot)) {
+    if let (Some(editor), Some(field)) = (app.router_ui.router_settings.as_mut(), FIELDS.get(slot))
+    {
         editor.field = *field;
     }
 }
@@ -234,17 +235,18 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
             frame,
             area,
             &mut app.ui,
-            app.confirmation_focus,
-            app.confirmation_scroll,
+            app.confirmation.confirmation_focus,
+            app.confirmation.confirmation_scroll,
         );
         return;
     }
     let uplink_status = app
+        .router_ui
         .router_settings
         .as_ref()
         .filter(|e| !e.uplink.trim().is_empty())
         .map(|e| super::interface_status::describe(app, e.uplink.trim()));
-    let Some(e) = &mut app.router_settings else {
+    let Some(e) = &mut app.router_ui.router_settings else {
         return;
     };
     let block = panel("Router uplink and VPN chain");
@@ -295,14 +297,14 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
     frame.render_widget(Paragraph::new(lines), body);
 }
 pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
-    let Some(e) = &mut app.router_settings else {
+    let Some(e) = &mut app.router_ui.router_settings else {
         return;
     };
     if e.exit_requested {
         match key {
             KeyCode::Esc => e.exit_requested = false,
             KeyCode::Enter => {
-                app.router_settings = None;
+                app.router_ui.router_settings = None;
                 app.screen = Screen::Router;
             }
             _ => {}
@@ -371,7 +373,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClien
                 };
                 app.router.proposed_router_config = candidate;
                 app.router.staged = true;
-                app.router_settings = None;
+                app.router_ui.router_settings = None;
                 app.screen = Screen::Router;
                 super::router::open_router_plan(app, client).await;
             }
@@ -503,15 +505,24 @@ mod tests {
             ..Default::default()
         };
         let mut app = TuiApp {
+            router_ui: crate::tui::state::RouterUiState {
+                router_settings: Some(Editor::new(config.clone(), vec![])),
+                ..Default::default()
+            },
             screen: Screen::RouterSettings,
-            router_settings: Some(Editor::new(config.clone(), vec![])),
             ..Default::default()
         };
         app.router.proposed_router_config = config.clone();
         app.router.staged = true;
-        app.router_settings.as_mut().unwrap().uplink = "changed".into();
+        app.router_ui.router_settings.as_mut().unwrap().uplink = "changed".into();
         handle_key(&mut app, KeyCode::Esc, &ApiClient::new("/unused")).await;
-        assert!(app.router_settings.as_ref().unwrap().exit_requested);
+        assert!(
+            app.router_ui
+                .router_settings
+                .as_ref()
+                .unwrap()
+                .exit_requested
+        );
         handle_key(&mut app, KeyCode::Enter, &ApiClient::new("/unused")).await;
         assert_eq!(app.router.proposed_router_config, config);
         assert!(app.router.staged);
@@ -538,8 +549,11 @@ mod tests {
         ];
         e.field = Field::Review;
         let mut app = TuiApp {
+            router_ui: crate::tui::state::RouterUiState {
+                router_settings: Some(e),
+                ..Default::default()
+            },
             screen: Screen::RouterSettings,
-            router_settings: Some(e),
             ..Default::default()
         };
         handle_key(&mut app, KeyCode::Enter, &mock.client).await;
@@ -591,14 +605,18 @@ mod tests {
         let mut e = Editor::new(RouterConfigView::default(), vec![]);
         e.field = Field::HostTraffic;
         let mut app = TuiApp {
+            router_ui: crate::tui::state::RouterUiState {
+                router_settings: Some(e),
+                ..Default::default()
+            },
             screen: Screen::RouterSettings,
-            router_settings: Some(e),
             ..Default::default()
         };
         let client = ApiClient::new("/unused");
         handle_key(&mut app, KeyCode::Enter, &client).await;
         assert!(
-            app.router_settings
+            app.router_ui
+                .router_settings
                 .as_ref()
                 .unwrap()
                 .config
@@ -606,7 +624,8 @@ mod tests {
         );
         handle_key(&mut app, KeyCode::Enter, &client).await;
         assert!(
-            !app.router_settings
+            !app.router_ui
+                .router_settings
                 .as_ref()
                 .unwrap()
                 .config
@@ -617,14 +636,17 @@ mod tests {
     #[test]
     fn minimum_terminal_shows_focused_actions_and_review_lists_removed_rules() {
         let mut app = TuiApp {
+            router_ui: crate::tui::state::RouterUiState {
+                router_settings: Some(Editor::new(RouterConfigView::default(), vec![])),
+                ..Default::default()
+            },
             screen: Screen::RouterSettings,
-            router_settings: Some(Editor::new(RouterConfigView::default(), vec![])),
             ..Default::default()
         };
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         for field in FIELDS {
-            app.router_settings.as_mut().unwrap().field = field;
+            app.router_ui.router_settings.as_mut().unwrap().field = field;
             terminal
                 .draw(|f| super::super::render(f, &mut app, false))
                 .unwrap();
@@ -651,18 +673,31 @@ mod tests {
 }
 
 pub(super) fn exit_confirmation(app: &TuiApp) -> Option<super::confirmation::Dialog> {
-    app.router_settings.as_ref()?.exit_requested.then(|| {
-        super::confirmation::discard_edits_dialog(
-            "Leave router settings?",
-            "Router uplink and VPN chain".into(),
-        )
-    })
+    app.router_ui
+        .router_settings
+        .as_ref()?
+        .exit_requested
+        .then(|| {
+            super::confirmation::discard_edits_dialog(
+                "Leave router settings?",
+                "Router uplink and VPN chain".into(),
+            )
+        })
 }
 fn request_exit(app: &mut TuiApp) {
-    if app.router_settings.as_ref().is_some_and(Editor::dirty) {
-        app.router_settings.as_mut().unwrap().exit_requested = true;
+    if app
+        .router_ui
+        .router_settings
+        .as_ref()
+        .is_some_and(Editor::dirty)
+    {
+        app.router_ui
+            .router_settings
+            .as_mut()
+            .unwrap()
+            .exit_requested = true;
     } else {
-        app.router_settings = None;
+        app.router_ui.router_settings = None;
         app.screen = Screen::Router;
     }
 }
@@ -679,21 +714,30 @@ mod exit_tests {
         });
         editor.field = Field::Cancel;
         let mut app = TuiApp {
+            router_ui: crate::tui::state::RouterUiState {
+                router_settings: Some(editor),
+                ..Default::default()
+            },
             screen: Screen::RouterSettings,
-            router_settings: Some(editor),
             ..Default::default()
         };
         handle_key(&mut app, KeyCode::Enter, &client).await;
         assert!(exit_confirmation(&app).is_some());
         handle_key(&mut app, KeyCode::Esc, &client).await;
         assert_eq!(
-            app.router_settings.as_ref().unwrap().config.vpn_chain.len(),
+            app.router_ui
+                .router_settings
+                .as_ref()
+                .unwrap()
+                .config
+                .vpn_chain
+                .len(),
             1
         );
         assert!(!app.router.staged);
         handle_key(&mut app, KeyCode::Esc, &client).await;
         handle_key(&mut app, KeyCode::Enter, &client).await;
-        assert!(app.router_settings.is_none());
+        assert!(app.router_ui.router_settings.is_none());
         assert!(!app.router.staged);
     }
 }

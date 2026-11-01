@@ -208,7 +208,7 @@ async fn open(app: &mut TuiApp, client: &ApiClient, edit: bool, egress: Option<S
         error: None,
         error_field: None,
     };
-    app.forwarding = Some(editor);
+    app.router_ui.forwarding = Some(editor);
     app.screen = Screen::Forwarding;
 }
 
@@ -628,7 +628,7 @@ async fn delete(app: &mut TuiApp, client: &ApiClient) {
 }
 
 pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
-    let Some(editor) = &app.forwarding else {
+    let Some(editor) = &app.router_ui.forwarding else {
         return;
     };
     let block = panel(if editor.editing.is_some() {
@@ -756,19 +756,19 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
 }
 
 pub(crate) fn focus_action(app: &mut TuiApp, _slot: usize) {
-    if let Some(editor) = &mut app.forwarding {
+    if let Some(editor) = &mut app.router_ui.forwarding {
         editor.field = Field::Save;
     }
 }
 
 pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, _client: &ApiClient) {
-    let Some(editor) = &mut app.forwarding else {
+    let Some(editor) = &mut app.router_ui.forwarding else {
         app.screen = Screen::Router;
         return;
     };
     match key {
         KeyCode::Esc => {
-            app.forwarding = None;
+            app.router_ui.forwarding = None;
             app.screen = Screen::Router;
         }
         KeyCode::Up | KeyCode::BackTab | KeyCode::Down | KeyCode::Tab => {
@@ -781,7 +781,7 @@ pub(crate) async fn handle_key(app: &mut TuiApp, key: KeyCode, _client: &ApiClie
                 let selected = editor.editing.unwrap_or(rules.len() - 1);
                 stage(app, rules);
                 app.router.selected_connection = selected;
-                app.forwarding = None;
+                app.router_ui.forwarding = None;
                 app.screen = Screen::Router;
                 super::router::select_pane(app, RouterPane::Sharing);
             }

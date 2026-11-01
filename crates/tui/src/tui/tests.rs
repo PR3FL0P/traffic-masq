@@ -38,16 +38,19 @@ async fn rollback_click_sends_rollback_request() {
         String::from_utf8(request).unwrap()
     });
     let mut app = TuiApp {
+        confirmation: crate::tui::state::ConfirmationState {
+            pending: Some(PendingNetworkChange {
+                recovery_progress: None,
+                phase: Default::default(),
+                last_error: None,
+                token: "test-token".into(),
+                interface: "eth0".into(),
+                rollback_timeout_seconds: 30,
+                expires_at_unix: current_unix_time() + 30,
+            }),
+            ..Default::default()
+        },
         screen: Screen::PendingChange,
-        pending: Some(PendingNetworkChange {
-            recovery_progress: None,
-            phase: Default::default(),
-            last_error: None,
-            token: "test-token".into(),
-            interface: "eth0".into(),
-            rollback_timeout_seconds: 30,
-            expires_at_unix: current_unix_time() + 30,
-        }),
         ..Default::default()
     };
     let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
@@ -177,7 +180,10 @@ async fn tab_focus_and_modified_keys_are_consistent() {
     let mut app = TuiApp::default();
     app.ui.input_enabled = true;
     handle_key(&mut app, KeyCode::Tab, &client, false).await;
-    assert_eq!(app.dashboard_pane, dashboard::DashboardPane::Statistics);
+    assert_eq!(
+        app.dashboard_ui.dashboard_pane,
+        dashboard::DashboardPane::Statistics
+    );
     handle_key_event(
         &mut app,
         KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT),
@@ -185,7 +191,10 @@ async fn tab_focus_and_modified_keys_are_consistent() {
         false,
     )
     .await;
-    assert_eq!(app.dashboard_pane, dashboard::DashboardPane::Traffic);
+    assert_eq!(
+        app.dashboard_ui.dashboard_pane,
+        dashboard::DashboardPane::Traffic
+    );
     app.screen = Screen::Vpn;
     handle_key(&mut app, KeyCode::Tab, &client, false).await;
     assert_eq!(app.vpn.focus, vpn::VpnFocus::Connect);
@@ -197,9 +206,9 @@ async fn tab_focus_and_modified_keys_are_consistent() {
     assert_eq!(app.vpn.focus, vpn::VpnFocus::List);
     app.screen = Screen::Log;
     handle_key(&mut app, KeyCode::Tab, &client, false).await;
-    assert_eq!(app.logs_focus, logs::LogFocus::Export);
+    assert_eq!(app.log_view.logs_focus, logs::LogFocus::Export);
     handle_key(&mut app, KeyCode::BackTab, &client, false).await;
-    assert_eq!(app.logs_focus, logs::LogFocus::Scroll);
+    assert_eq!(app.log_view.logs_focus, logs::LogFocus::Scroll);
 
     app.screen = Screen::VpnImport;
     app.vpn_import = Some(VpnImportEditor {
@@ -355,12 +364,12 @@ async fn mouse_content_actions_are_ignored_outside_the_content_viewport() {
         screen: Screen::Log,
         ..Default::default()
     };
-    app.logs.push_back(logs::LogEntry {
+    app.log_view.logs.push_back(logs::LogEntry {
         at_unix: 0,
         level: LogLevel::Info,
         message: "keep".into(),
     });
-    app.logs_focus = logs::LogFocus::Clear;
+    app.log_view.logs_focus = logs::LogFocus::Clear;
     app.ui.input_enabled = true;
     app.ui.content_area = Some(ratatui::layout::Rect::new(0, 3, 80, 17));
     app.ui
@@ -379,7 +388,7 @@ async fn mouse_content_actions_are_ignored_outside_the_content_viewport() {
         false,
     )
     .await;
-    assert_eq!(app.logs.len(), 1);
+    assert_eq!(app.log_view.logs.len(), 1);
 }
 
 #[tokio::test]
@@ -411,21 +420,24 @@ async fn resize_clears_hit_regions_and_blocks_hidden_actions() {
 #[test]
 fn disconnected_dashboard_does_not_claim_rollback() {
     let mut app = TuiApp {
+        confirmation: crate::tui::state::ConfirmationState {
+            pending: Some(PendingNetworkChange {
+                recovery_progress: None,
+                phase: Default::default(),
+                last_error: None,
+                token: "keep".into(),
+                interface: "eth0".into(),
+                rollback_timeout_seconds: 60,
+                expires_at_unix: 0,
+            }),
+            ..Default::default()
+        },
         screen: Screen::PendingChange,
-        pending: Some(PendingNetworkChange {
-            recovery_progress: None,
-            phase: Default::default(),
-            last_error: None,
-            token: "keep".into(),
-            interface: "eth0".into(),
-            rollback_timeout_seconds: 60,
-            expires_at_unix: 0,
-        }),
         ..Default::default()
     };
     app.dashboard.error = Some("connection lost".into());
     refresh_pending_screen(&mut app);
-    assert_eq!(app.pending.as_ref().unwrap().token, "keep");
+    assert_eq!(app.confirmation.pending.as_ref().unwrap().token, "keep");
     assert!(app.message.is_none());
     app.dashboard.error = None;
     refresh_pending_screen(&mut app);
@@ -594,42 +606,48 @@ fn section_of_maps_sub_screens_to_their_parent_tab() {
 #[test]
 fn pending_change_uses_its_origin_section() {
     let mut app = TuiApp {
+        confirmation: crate::tui::state::ConfirmationState {
+            pending_return_screen: Screen::InterfaceList,
+            ..Default::default()
+        },
         screen: Screen::PendingChange,
-        pending_return_screen: Screen::InterfaceList,
         ..Default::default()
     };
     assert_eq!(section_of_app(&app), Section::Interfaces);
 
-    app.pending_return_screen = Screen::Wifi;
+    app.confirmation.pending_return_screen = Screen::Wifi;
     assert_eq!(section_of_app(&app), Section::Wifi);
 
-    app.pending_return_screen = Screen::Dashboard;
+    app.confirmation.pending_return_screen = Screen::Dashboard;
     assert_eq!(section_of_app(&app), Section::Dashboard);
 }
 
 #[tokio::test]
 async fn settings_tab_switching_and_editing_arrow_isolation() {
     let mut app = TuiApp {
+        settings_ui: crate::tui::state::SettingsUiState {
+            settings: Some(SecurityEditor {
+                field: settings::SettingsField::RollbackTimeout,
+                active: traffic_masq_protocol::SecuritySettings {
+                    rollback_timeout_seconds: 60,
+                },
+                rollback_timeout_input: "60".into(),
+                override_active: false,
+                restart_required: false,
+                remember_session: false,
+                remember_minutes_input: "5".into(),
+                show_dhcp_client: false,
+                confirmation: None,
+                cursor: 2,
+                editing: false,
+            }),
+            ..Default::default()
+        },
         screen: Screen::Settings,
         ui: layout::UiLayout {
             input_enabled: true,
             ..Default::default()
         },
-        settings: Some(SecurityEditor {
-            field: settings::SettingsField::RollbackTimeout,
-            active: traffic_masq_protocol::SecuritySettings {
-                rollback_timeout_seconds: 60,
-            },
-            rollback_timeout_input: "60".into(),
-            override_active: false,
-            restart_required: false,
-            remember_session: false,
-            remember_minutes_input: "5".into(),
-            show_dhcp_client: false,
-            confirmation: None,
-            cursor: 2,
-            editing: false,
-        }),
         ..Default::default()
     };
     let client = ApiClient::new("/nonexistent.sock");
@@ -652,21 +670,21 @@ async fn settings_tab_switching_and_editing_arrow_isolation() {
 
     // Typing activates editing mode on RollbackTimeout.
     handle_key(&mut app, KeyCode::Char('0'), &client, false).await;
-    assert!(app.settings.as_ref().unwrap().is_editing());
+    assert!(app.settings_ui.settings.as_ref().unwrap().is_editing());
 
     // When editing, Left moves the cursor and does NOT switch sections
     handle_key(&mut app, KeyCode::Left, &client, false).await;
     assert_eq!(app.screen, Screen::Settings);
-    assert_eq!(app.settings.as_ref().unwrap().cursor, 2);
+    assert_eq!(app.settings_ui.settings.as_ref().unwrap().cursor, 2);
 
     // When editing, Right moves the cursor and does NOT switch sections
     handle_key(&mut app, KeyCode::Right, &client, false).await;
     assert_eq!(app.screen, Screen::Settings);
-    assert_eq!(app.settings.as_ref().unwrap().cursor, 3);
+    assert_eq!(app.settings_ui.settings.as_ref().unwrap().cursor, 3);
 
     // Enter finishes editing mode
     handle_key(&mut app, KeyCode::Enter, &client, false).await;
-    assert!(!app.settings.as_ref().unwrap().is_editing());
+    assert!(!app.settings_ui.settings.as_ref().unwrap().is_editing());
 
     // Once editing is finished, Right navigates to Log section again
     handle_key(&mut app, KeyCode::Right, &client, false).await;
@@ -740,8 +758,11 @@ fn format_message_lines_highlights_shift_copy_hint_in_red() {
 async fn wheel_scrolls_interface_preview_and_clamps_at_both_ends() {
     let client = ApiClient::new("/socket-that-must-not-be-opened");
     let mut app = TuiApp {
+        interface_ui: crate::tui::state::InterfaceUiState {
+            preview_max_scroll: 2,
+            ..Default::default()
+        },
         screen: Screen::Preview,
-        preview_max_scroll: 2,
         ..Default::default()
     };
     app.ui.input_enabled = true;
@@ -765,7 +786,7 @@ async fn wheel_scrolls_interface_preview_and_clamps_at_both_ends() {
             false,
         )
         .await;
-        assert_eq!(app.preview_scroll, expected);
+        assert_eq!(app.interface_ui.preview_scroll, expected);
         assert_eq!(app.screen, Screen::Preview);
     }
 }
@@ -774,14 +795,17 @@ async fn wheel_scrolls_interface_preview_and_clamps_at_both_ends() {
 async fn wheel_cannot_focus_or_execute_log_actions() {
     let client = ApiClient::new("/socket-that-must-not-be-opened");
     let mut app = TuiApp {
+        log_view: crate::tui::state::LogViewState {
+            logs_focus: logs::LogFocus::Clear,
+            logs_max_scroll: 1,
+            ..Default::default()
+        },
         screen: Screen::Log,
-        logs_focus: logs::LogFocus::Clear,
-        logs_max_scroll: 1,
         ..Default::default()
     };
     app.ui.input_enabled = true;
     app.push_message(LogLevel::Info, "keep this entry");
-    let count = app.logs.len();
+    let count = app.log_view.logs.len();
     for kind in [
         MouseEventKind::ScrollDown,
         MouseEventKind::ScrollDown,
@@ -800,11 +824,11 @@ async fn wheel_cannot_focus_or_execute_log_actions() {
             false,
         )
         .await;
-        assert_eq!(app.logs_focus, logs::LogFocus::Scroll);
+        assert_eq!(app.log_view.logs_focus, logs::LogFocus::Scroll);
         handle_key(&mut app, KeyCode::Enter, &client, false).await;
-        assert_eq!(app.logs.len(), count);
+        assert_eq!(app.log_view.logs.len(), count);
     }
-    assert_eq!(app.logs_scroll, 0);
+    assert_eq!(app.log_view.logs_scroll, 0);
 }
 
 #[tokio::test]
@@ -817,7 +841,7 @@ async fn wheel_returns_focus_to_lists_even_when_empty_or_at_the_boundary() {
                 ..Default::default()
             };
             app.ui.input_enabled = true;
-            app.dashboard_pane = dashboard::DashboardPane::Statistics;
+            app.dashboard_ui.dashboard_pane = dashboard::DashboardPane::Statistics;
             app.vpn.focus = vpn::VpnFocus::Delete;
             app.router.focus = RouterFocus::Actions;
             app.router.action = router::RouterAction::DeleteRoute;
@@ -836,7 +860,10 @@ async fn wheel_returns_focus_to_lists_even_when_empty_or_at_the_boundary() {
             .await;
             match screen {
                 Screen::Dashboard => {
-                    assert_eq!(app.dashboard_pane, dashboard::DashboardPane::Statistics)
+                    assert_eq!(
+                        app.dashboard_ui.dashboard_pane,
+                        dashboard::DashboardPane::Statistics
+                    )
                 }
                 Screen::Vpn => assert_eq!(app.vpn.focus, vpn::VpnFocus::List),
                 Screen::Router => {
@@ -919,16 +946,19 @@ async fn small_terminal_escape_sends_rollback_request() {
         String::from_utf8(request).unwrap()
     });
     let mut app = TuiApp {
+        confirmation: crate::tui::state::ConfirmationState {
+            pending: Some(PendingNetworkChange {
+                recovery_progress: None,
+                phase: Default::default(),
+                last_error: None,
+                token: "test-token".into(),
+                interface: "eth0".into(),
+                rollback_timeout_seconds: 30,
+                expires_at_unix: current_unix_time() + 30,
+            }),
+            ..Default::default()
+        },
         screen: Screen::PendingChange,
-        pending: Some(PendingNetworkChange {
-            recovery_progress: None,
-            phase: Default::default(),
-            last_error: None,
-            token: "test-token".into(),
-            interface: "eth0".into(),
-            rollback_timeout_seconds: 30,
-            expires_at_unix: current_unix_time() + 30,
-        }),
         ..Default::default()
     };
     let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
@@ -989,16 +1019,19 @@ async fn small_terminal_enter_sends_commit_request() {
         String::from_utf8(request).unwrap()
     });
     let mut app = TuiApp {
+        confirmation: crate::tui::state::ConfirmationState {
+            pending: Some(PendingNetworkChange {
+                recovery_progress: None,
+                phase: Default::default(),
+                last_error: None,
+                token: "test-token".into(),
+                interface: "eth0".into(),
+                rollback_timeout_seconds: 30,
+                expires_at_unix: current_unix_time() + 30,
+            }),
+            ..Default::default()
+        },
         screen: Screen::PendingChange,
-        pending: Some(PendingNetworkChange {
-            recovery_progress: None,
-            phase: Default::default(),
-            last_error: None,
-            token: "test-token".into(),
-            interface: "eth0".into(),
-            rollback_timeout_seconds: 30,
-            expires_at_unix: current_unix_time() + 30,
-        }),
         ..Default::default()
     };
     let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
@@ -1043,13 +1076,16 @@ fn pending_refresh_exposes_recovery_and_removes_confirmation_controls() {
         current.phase = phase;
         current.last_error = Some("storage unavailable".into());
         let mut app = TuiApp {
+            confirmation: crate::tui::state::ConfirmationState {
+                pending: Some(initial.clone()),
+                ..Default::default()
+            },
             screen: Screen::PendingChange,
-            pending: Some(initial.clone()),
             ..Default::default()
         };
         app.dashboard.pending_network_changes.push(current.clone());
         refresh_pending_screen(&mut app);
-        assert_eq!(app.pending, Some(current));
+        assert_eq!(app.confirmation.pending, Some(current));
         assert_eq!(pending_deadline(&app), None);
         assert!(!layout::help_pairs(&app)
             .iter()
@@ -1217,8 +1253,8 @@ async fn missing_inventory_mouse_and_keyboard_selection_is_independent_of_live_s
         Some("usb1")
     );
     normalize_selection(&mut app);
-    assert_eq!(app.selected_inventory_interface, 1);
-    assert_eq!(app.selected_interface, 0);
+    assert_eq!(app.interface_ui.selected_inventory_interface, 1);
+    assert_eq!(app.interface_ui.selected_interface, 0);
 }
 
 #[tokio::test]
@@ -1231,7 +1267,7 @@ async fn tab_then_enter_sends_rollback_for_both_pending_screens() {
         let mut app = TuiApp::default();
         if router {
             app.screen = Screen::RouterPending;
-            app.router_pending = Some(RouterPendingView {
+            app.router_ui.router_pending = Some(RouterPendingView {
                 token: "demo".into(),
                 applied_at_unix: current_unix_time(),
                 rollback_failure: None,
@@ -1241,7 +1277,7 @@ async fn tab_then_enter_sends_rollback_for_both_pending_screens() {
             });
         } else {
             app.screen = Screen::PendingChange;
-            app.pending = Some(PendingNetworkChange {
+            app.confirmation.pending = Some(PendingNetworkChange {
                 token: "demo".into(),
                 interface: "lan0".into(),
                 expires_at_unix: current_unix_time() + 60,
@@ -1253,7 +1289,7 @@ async fn tab_then_enter_sends_rollback_for_both_pending_screens() {
         }
         app.ui.input_enabled = true;
         handle_key(&mut app, KeyCode::Tab, &mock.client, false).await;
-        assert_eq!(app.pending_focus, 1);
+        assert_eq!(app.confirmation.pending_focus, 1);
         assert!(mock.calls.lock().unwrap().is_empty());
         handle_key(&mut app, KeyCode::Enter, &mock.client, false).await;
         let calls = mock.calls.lock().unwrap();
@@ -1266,7 +1302,7 @@ async fn tab_then_enter_sends_rollback_for_both_pending_screens() {
                 "rollback_network_change"
             }
         );
-        assert!(app.pending.is_some() || app.router_pending.is_some());
+        assert!(app.confirmation.pending.is_some() || app.router_ui.router_pending.is_some());
     }
 }
 
@@ -1282,7 +1318,7 @@ fn pending_labels_keep_contrast_on_filled_empty_and_recovery_gauges() {
             for background in [Color::Black, Color::White] {
                 let mut app = TuiApp::default();
                 let now = current_unix_time();
-                app.router_pending = Some(RouterPendingView {
+                app.router_ui.router_pending = Some(RouterPendingView {
                     token: "contrast".into(),
                     applied_at_unix: now.saturating_sub(60 - remaining),
                     rollback_failure: recovery.then(|| vec!["test failure".into()]),
@@ -1290,7 +1326,7 @@ fn pending_labels_keep_contrast_on_filled_empty_and_recovery_gauges() {
                     scroll: 0,
                     max_scroll: 0,
                 });
-                app.pending = Some(PendingNetworkChange {
+                app.confirmation.pending = Some(PendingNetworkChange {
                     token: "contrast".into(),
                     interface: "lan0".into(),
                     expires_at_unix: now + remaining,

@@ -42,7 +42,11 @@ async fn editor_uses_saved_address_even_when_dashboard_is_empty() {
     let client = ApiClient::new(socket);
     open_dhcp_editor(&mut app, &client).await;
     server.await.unwrap();
-    let editor = app.dhcp_editor.as_ref().expect("DHCP editor should open");
+    let editor = app
+        .dhcp_ui
+        .dhcp_editor
+        .as_ref()
+        .expect("DHCP editor should open");
     assert_eq!(editor.dns_servers, "1.1.1.1");
     assert_eq!(editor.router, "192.168.50.128");
     assert_eq!(editor.pool_start, "192.168.50.1");
@@ -50,7 +54,7 @@ async fn editor_uses_saved_address_even_when_dashboard_is_empty() {
     for _ in 0..5 {
         handle_dhcp_editor_key(&mut app, KeyCode::Enter, &client).await;
     }
-    assert_eq!(app.dhcp_editor.unwrap().field, DhcpField::Save);
+    assert_eq!(app.dhcp_ui.dhcp_editor.unwrap().field, DhcpField::Save);
 }
 
 #[tokio::test]
@@ -108,7 +112,11 @@ async fn editor_falls_back_to_status_address_ignoring_link_local() {
     let client = ApiClient::new(socket);
     open_dhcp_editor(&mut app, &client).await;
     server.await.unwrap();
-    let editor = app.dhcp_editor.as_ref().expect("DHCP editor should open");
+    let editor = app
+        .dhcp_ui
+        .dhcp_editor
+        .as_ref()
+        .expect("DHCP editor should open");
     assert_eq!(editor.dns_servers, "9.9.9.9, 8.8.8.8");
     assert_eq!(editor.router, "192.168.1.1");
     assert_eq!(editor.pool_start, "192.168.1.2");
@@ -162,7 +170,11 @@ async fn editor_leaves_fields_empty_if_only_link_local_address_present() {
     let client = ApiClient::new(socket);
     open_dhcp_editor(&mut app, &client).await;
     server.await.unwrap();
-    let editor = app.dhcp_editor.as_ref().expect("DHCP editor should open");
+    let editor = app
+        .dhcp_ui
+        .dhcp_editor
+        .as_ref()
+        .expect("DHCP editor should open");
     assert!(editor.dns_servers.is_empty());
     assert_eq!(editor.router, "");
     assert_eq!(editor.pool_start, "");
@@ -260,35 +272,41 @@ fn dhcp_editor_active_value_is_none_for_action_rows_only() {
 #[tokio::test]
 async fn dhcp_editor_cursor_navigation_and_editing() {
     let mut app = TuiApp {
+        dhcp_ui: crate::tui::state::DhcpUiState {
+            dhcp_editor: Some(DhcpEditor {
+                offline_intent: None,
+                interface: "lan0".to_string(),
+                field: DhcpField::PoolStart,
+                pool_start: "192.168.1.10".to_string(),
+                pool_end: "192.168.1.100".to_string(),
+                router: "192.168.1.1".to_string(),
+                dns_servers: "8.8.8.8".to_string(),
+                lease_seconds: "86400".to_string(),
+                cursor: 12,
+            }),
+            ..Default::default()
+        },
         screen: Screen::DhcpEditor,
-        dhcp_editor: Some(DhcpEditor {
-            offline_intent: None,
-            interface: "lan0".to_string(),
-            field: DhcpField::PoolStart,
-            pool_start: "192.168.1.10".to_string(),
-            pool_end: "192.168.1.100".to_string(),
-            router: "192.168.1.1".to_string(),
-            dns_servers: "8.8.8.8".to_string(),
-            lease_seconds: "86400".to_string(),
-            cursor: 12,
-        }),
         ..Default::default()
     };
     let client = ApiClient::new("/socket-that-must-not-be-opened");
 
     handle_dhcp_editor_key(&mut app, KeyCode::Left, &client).await;
-    assert_eq!(app.dhcp_editor.as_ref().unwrap().cursor, 11);
+    assert_eq!(app.dhcp_ui.dhcp_editor.as_ref().unwrap().cursor, 11);
 
     handle_dhcp_editor_key(&mut app, KeyCode::Char('5'), &client).await;
     assert_eq!(
-        app.dhcp_editor.as_ref().unwrap().pool_start,
+        app.dhcp_ui.dhcp_editor.as_ref().unwrap().pool_start,
         "192.168.1.150"
     );
-    assert_eq!(app.dhcp_editor.as_ref().unwrap().cursor, 12);
+    assert_eq!(app.dhcp_ui.dhcp_editor.as_ref().unwrap().cursor, 12);
 
     handle_dhcp_editor_key(&mut app, KeyCode::Backspace, &client).await;
-    assert_eq!(app.dhcp_editor.as_ref().unwrap().pool_start, "192.168.1.10");
-    assert_eq!(app.dhcp_editor.as_ref().unwrap().cursor, 11);
+    assert_eq!(
+        app.dhcp_ui.dhcp_editor.as_ref().unwrap().pool_start,
+        "192.168.1.10"
+    );
+    assert_eq!(app.dhcp_ui.dhcp_editor.as_ref().unwrap().cursor, 11);
 }
 
 #[tokio::test]
@@ -327,18 +345,21 @@ async fn missing_dhcp_editor_saves_revision_checked_intent_without_live_apply() 
         wifi_client: None,
     };
     let mut app = TuiApp {
+        dhcp_ui: crate::tui::state::DhcpUiState {
+            dhcp_editor: Some(DhcpEditor {
+                interface: "usb0".into(),
+                offline_intent: Some((42, config)),
+                field: DhcpField::Save,
+                pool_start: "192.168.50.10".into(),
+                pool_end: "192.168.50.100".into(),
+                router: "192.168.50.1".into(),
+                dns_servers: String::new(),
+                lease_seconds: "3600".into(),
+                cursor: 0,
+            }),
+            ..Default::default()
+        },
         screen: Screen::DhcpEditor,
-        dhcp_editor: Some(DhcpEditor {
-            interface: "usb0".into(),
-            offline_intent: Some((42, config)),
-            field: DhcpField::Save,
-            pool_start: "192.168.50.10".into(),
-            pool_end: "192.168.50.100".into(),
-            router: "192.168.50.1".into(),
-            dns_servers: String::new(),
-            lease_seconds: "3600".into(),
-            cursor: 0,
-        }),
         ..Default::default()
     };
     let client = ApiClient::new(socket);
@@ -412,11 +433,14 @@ async fn failed_and_mismatched_lease_refreshes_retain_snapshot_then_recover() {
     ])
     .await;
     let mut app = TuiApp {
-        dhcp_leases: Some(lease_view(vec![old.clone()])),
+        dhcp_ui: crate::tui::state::DhcpUiState {
+            dhcp_leases: Some(lease_view(vec![old.clone()])),
+            ..Default::default()
+        },
         ..Default::default()
     };
     {
-        let view = app.dhcp_leases.as_mut().unwrap();
+        let view = app.dhcp_ui.dhcp_leases.as_mut().unwrap();
         view.query = "10.".into();
         view.filter = LeaseFilter::Active;
         view.sort_expiration = true;
@@ -424,13 +448,13 @@ async fn failed_and_mismatched_lease_refreshes_retain_snapshot_then_recover() {
     }
     for _ in 0..2 {
         refresh_dhcp_leases(&mut app, &mock.client).await;
-        let view = app.dhcp_leases.as_ref().unwrap();
+        let view = app.dhcp_ui.dhcp_leases.as_ref().unwrap();
         assert_eq!(view.leases, vec![old.clone()]);
         assert!(view.error.is_some());
         assert_eq!(view.updated_at, 100);
     }
     handle_dhcp_leases_key(&mut app, KeyCode::Char('r'), &mock.client).await;
-    let view = app.dhcp_leases.as_ref().unwrap();
+    let view = app.dhcp_ui.dhcp_leases.as_ref().unwrap();
     assert!(view.error.is_none());
     assert!(view.leases.is_empty());
     assert_eq!(view.scroll, 0);
@@ -451,15 +475,18 @@ async fn failed_and_mismatched_lease_refreshes_retain_snapshot_then_recover() {
 async fn lease_search_treats_shortcuts_as_text_and_esc_first_exits_search() {
     let client = ApiClient::new("/nonexistent/lease-test.sock");
     let mut app = TuiApp {
+        dhcp_ui: crate::tui::state::DhcpUiState {
+            dhcp_leases: Some(lease_view(vec![])),
+            ..Default::default()
+        },
         screen: Screen::DhcpLeases,
-        dhcp_leases: Some(lease_view(vec![])),
         ..Default::default()
     };
     handle_dhcp_leases_key(&mut app, KeyCode::Char('/'), &client).await;
     for ch in ['f', 's', 'r'] {
         handle_dhcp_leases_key(&mut app, KeyCode::Char(ch), &client).await;
     }
-    let view = app.dhcp_leases.as_ref().unwrap();
+    let view = app.dhcp_ui.dhcp_leases.as_ref().unwrap();
     assert_eq!(view.query, "fsr");
     assert_eq!(view.filter, LeaseFilter::All);
     assert!(!view.sort_expiration);
@@ -477,7 +504,10 @@ async fn lease_end_scroll_fills_the_page_and_filtering_clamps_it() {
         .map(|i| lease(&format!("10.0.0.{i}"), [0; 6], u64::MAX))
         .collect();
     let mut app = TuiApp {
-        dhcp_leases: Some(lease_view(leases)),
+        dhcp_ui: crate::tui::state::DhcpUiState {
+            dhcp_leases: Some(lease_view(leases)),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
@@ -485,13 +515,13 @@ async fn lease_end_scroll_fills_the_page_and_filtering_clamps_it() {
         .draw(|frame| render_dhcp_leases(frame, frame.area(), &mut app))
         .unwrap();
     handle_dhcp_leases_key(&mut app, KeyCode::End, &client).await;
-    assert_eq!(app.dhcp_leases.as_ref().unwrap().scroll, 14);
-    app.dhcp_leases.as_mut().unwrap().query = "10.0.0.30".into();
-    app.dhcp_leases.as_mut().unwrap().error = Some("test refresh failure".into());
+    assert_eq!(app.dhcp_ui.dhcp_leases.as_ref().unwrap().scroll, 14);
+    app.dhcp_ui.dhcp_leases.as_mut().unwrap().query = "10.0.0.30".into();
+    app.dhcp_ui.dhcp_leases.as_mut().unwrap().error = Some("test refresh failure".into());
     terminal
         .draw(|frame| render_dhcp_leases(frame, frame.area(), &mut app))
         .unwrap();
-    assert_eq!(app.dhcp_leases.as_ref().unwrap().scroll, 0);
+    assert_eq!(app.dhcp_ui.dhcp_leases.as_ref().unwrap().scroll, 0);
     let text = terminal
         .backend()
         .buffer()

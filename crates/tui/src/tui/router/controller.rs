@@ -207,7 +207,7 @@ async fn handle_router_recovery_action(app: &mut TuiApp, client: &ApiClient) {
             match client.request(&Request::RouterRollback { token }).await {
                 Ok(Response::RouterRolledBack) => {
                     app.push_message(LogLevel::Info, "Router rollback recovery completed");
-                    app.router_pending = None;
+                    app.router_ui.router_pending = None;
                     app.router.staged = false;
                     load_router_data(app, client).await;
                 }
@@ -230,7 +230,7 @@ async fn handle_router_recovery_action(app: &mut TuiApp, client: &ApiClient) {
                 LogLevel::Info,
                 "Router recovery is complete; journal cleanup retries automatically",
             );
-            app.router_pending = None;
+            app.router_ui.router_pending = None;
             app.router.staged = false;
             load_router_data(app, client).await;
         }
@@ -239,7 +239,7 @@ async fn handle_router_recovery_action(app: &mut TuiApp, client: &ApiClient) {
             ..
         }) => {
             app.push_message(LogLevel::Info, "Router recovery is already complete");
-            app.router_pending = None;
+            app.router_ui.router_pending = None;
             app.router.staged = false;
             load_router_data(app, client).await;
         }

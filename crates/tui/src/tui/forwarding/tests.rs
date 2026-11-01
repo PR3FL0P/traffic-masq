@@ -217,7 +217,7 @@ async fn new_sharing_prefills_managed_lan_to_observed_default_route() {
     )
     .await;
 
-    let form = app.forwarding.as_ref().unwrap();
+    let form = app.router_ui.forwarding.as_ref().unwrap();
     assert_eq!(form.interfaces[form.from], "wlp1s0");
     assert_eq!(form.interfaces[form.to], "wlp5s0f3u2");
     let rules = form.save().unwrap();
@@ -266,7 +266,7 @@ async fn failed_refresh_cannot_edit_or_delete_cached_sharing_rules() {
         } else {
             delete(&mut app, &client).await;
         }
-        assert!(app.forwarding.is_none());
+        assert!(app.router_ui.forwarding.is_none());
         assert_eq!(app.screen, Screen::Router);
         assert!(!app.router.staged);
         assert_eq!(app.router.proposed_router_config, before);
@@ -286,7 +286,7 @@ async fn editing_replaces_the_selected_connection_and_preserves_route_intent() {
         },
     );
     let routes = app.router.proposed_router_config.owned_routes.clone();
-    app.forwarding = Some(editor());
+    app.router_ui.forwarding = Some(editor());
     app.screen = Screen::Forwarding;
     handle_key(
         &mut app,
@@ -321,11 +321,11 @@ async fn invalid_subnet_and_cancel_do_not_modify_the_draft() {
     let before = app.router.proposed_router_config.clone();
     let mut form = editor();
     form.source = "192.168.10.3/24".into();
-    app.forwarding = Some(form);
+    app.router_ui.forwarding = Some(form);
     app.screen = Screen::Forwarding;
     let client = ApiClient::new("/must-not-be-used.sock");
     handle_key(&mut app, KeyCode::Enter, &client).await;
-    assert!(app.forwarding.as_ref().unwrap().error.is_some());
+    assert!(app.router_ui.forwarding.as_ref().unwrap().error.is_some());
     assert_eq!(app.router.proposed_router_config, before);
     handle_key(&mut app, KeyCode::Esc, &client).await;
     assert_eq!(app.router.proposed_router_config, before);
@@ -364,7 +364,7 @@ async fn route_shortcut_prefills_egress_without_changing_routes_or_staging() {
     app.router.routes.push(route);
     let before = app.router.proposed_router_config.clone();
     open_from_route(&mut app, &ApiClient::new("/must-not-be-used.sock")).await;
-    let form = app.forwarding.as_ref().unwrap();
+    let form = app.router_ui.forwarding.as_ref().unwrap();
     assert_eq!(form.interfaces[form.to], "wg0");
     assert_eq!(form.editing, None);
     assert_eq!(app.router.proposed_router_config, before);
@@ -492,9 +492,9 @@ async fn explicit_sharing_can_be_edited_from_saved_settings_without_devices() {
     );
     assert!(app.router.plan.is_none());
     open(&mut app, &ApiClient::new("/must-not-be-used"), true, None).await;
-    assert!(app.forwarding.is_some());
+    assert!(app.router_ui.forwarding.is_some());
     assert_eq!(app.screen, Screen::Forwarding);
-    app.forwarding.as_mut().unwrap().field = Field::Save;
+    app.router_ui.forwarding.as_mut().unwrap().field = Field::Save;
     handle_key(
         &mut app,
         KeyCode::Enter,
@@ -510,13 +510,19 @@ async fn source_error_focuses_input_and_enter_can_reach_save_after_correction() 
     let mut e = editor();
     e.source = "192.168.10.3/24".into();
     let mut app = TuiApp {
+        router_ui: crate::tui::state::RouterUiState {
+            forwarding: Some(e),
+            ..Default::default()
+        },
         screen: Screen::Forwarding,
-        forwarding: Some(e),
         ..Default::default()
     };
     let client = ApiClient::new("/must-not-connect");
     handle_key(&mut app, KeyCode::Enter, &client).await;
-    assert_eq!(app.forwarding.as_ref().unwrap().field, Field::Source);
+    assert_eq!(
+        app.router_ui.forwarding.as_ref().unwrap().field,
+        Field::Source
+    );
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
     terminal
         .draw(|f| super::super::render(f, &mut app, false))
@@ -529,11 +535,14 @@ async fn source_error_focuses_input_and_enter_can_reach_save_after_correction() 
         .map(|c| c.symbol())
         .collect();
     assert!(text.contains("Source subnet must have no host bits"));
-    let e = app.forwarding.as_mut().unwrap();
+    let e = app.router_ui.forwarding.as_mut().unwrap();
     e.source = "192.168.10.0/24".into();
     e.cursor = e.source.len();
     handle_key(&mut app, KeyCode::Enter, &client).await;
-    assert_eq!(app.forwarding.as_ref().unwrap().field, Field::Save);
+    assert_eq!(
+        app.router_ui.forwarding.as_ref().unwrap().field,
+        Field::Save
+    );
     assert!(!app.router.staged);
     handle_key(&mut app, KeyCode::Enter, &client).await;
     assert!(app.router.staged);
@@ -558,7 +567,7 @@ async fn new_connection_can_target_tunnels_from_the_unapplied_chain() {
         interface_status("wan0", true),
     ];
     open(&mut app, &ApiClient::new("/must-not-connect"), false, None).await;
-    let form = app.forwarding.as_mut().unwrap();
+    let form = app.router_ui.forwarding.as_mut().unwrap();
     assert!(form.interfaces.iter().any(|name| name == "tm-wg-0"));
     form.to = form
         .interfaces
@@ -588,7 +597,7 @@ fn sharing_editor_and_preview_show_both_current_endpoint_states_at_minimum_size(
     let mut form = editor();
     form.to = 1;
     form.field = Field::From;
-    app.forwarding = Some(form);
+    app.router_ui.forwarding = Some(form);
     app.screen = Screen::Forwarding;
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     let text = |terminal: &Terminal<TestBackend>| {

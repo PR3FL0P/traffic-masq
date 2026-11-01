@@ -1,7 +1,9 @@
 use super::*;
 
 pub(crate) fn render_wifi_scan(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
-    let Some(scan) = &app.wifi_scan else { return };
+    let Some(scan) = &app.wifi_ui.wifi_scan else {
+        return;
+    };
     let area = crate::tui::interface_status::render_context(frame, area, app, &scan.interface);
     let block = panel(&format!("Scan results on {}", scan.interface));
     let inner = block.inner(area);
@@ -44,13 +46,13 @@ pub(crate) fn render_wifi_scan(frame: &mut ratatui::Frame<'_>, area: Rect, app: 
 }
 
 pub(crate) async fn handle_wifi_scan_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
-    let Some(scan) = app.wifi_scan.as_mut() else {
+    let Some(scan) = app.wifi_ui.wifi_scan.as_mut() else {
         app.screen = Screen::Wifi;
         return;
     };
     match key {
         KeyCode::Esc => {
-            app.wifi_scan = None;
+            app.wifi_ui.wifi_scan = None;
             app.screen = Screen::Wifi;
         }
         KeyCode::Up => scan.selected = scan.selected.saturating_sub(1),
@@ -102,7 +104,7 @@ pub(crate) async fn handle_wifi_scan_key(app: &mut TuiApp, key: KeyCode, client:
             }
             match WifiProfileEditor::from_scan(interface, &network) {
                 Ok(editor) => {
-                    app.wifi_profile_editor = Some(editor);
+                    app.wifi_ui.wifi_profile_editor = Some(editor);
                     app.screen = Screen::WifiProfileEditor;
                 }
                 Err(message) => app.push_message(LogLevel::Warn, message),

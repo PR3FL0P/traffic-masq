@@ -58,15 +58,18 @@ async fn disabling_a_missing_client_saves_without_enabled_wifi_or_dhcp() {
         .unwrap(),
     );
     let mut app = TuiApp {
+        interface_ui: crate::tui::state::InterfaceUiState {
+            editor: Some(editor),
+            ..Default::default()
+        },
         screen: Screen::InterfaceEditor,
-        editor: Some(editor),
         ..Default::default()
     };
     let client = ApiClient::new(socket);
     handle_editor_key(&mut app, KeyCode::Enter, &client).await;
     server.await.unwrap();
     assert_eq!(app.screen, Screen::InterfaceList);
-    assert!(app.pending.is_none());
+    assert!(app.confirmation.pending.is_none());
 }
 
 fn observed_address(
@@ -236,7 +239,7 @@ async fn keyboard_ip_and_mac_edit_previews_applies_and_confirms_the_typed_addres
     app.dashboard.interfaces.push(status);
     open_editor(&mut app, &client).await;
     assert_eq!(app.screen, Screen::InterfaceEditor);
-    assert!(app.editor.as_ref().unwrap().managed);
+    assert!(app.interface_ui.editor.as_ref().unwrap().managed);
     for character in "198.18.0.1/24".chars() {
         handle_editor_key(&mut app, KeyCode::Char(character), &client).await;
     }
@@ -244,13 +247,13 @@ async fn keyboard_ip_and_mac_edit_previews_applies_and_confirms_the_typed_addres
         super::super::handle_key(&mut app, KeyCode::Tab, &client, false).await;
     }
     assert_eq!(
-        app.editor.as_ref().unwrap().field,
+        app.interface_ui.editor.as_ref().unwrap().field,
         InterfaceEditorField::Advanced
     );
     handle_editor_key(&mut app, KeyCode::Enter, &client).await;
     handle_editor_key(&mut app, KeyCode::Tab, &client).await;
     assert_eq!(
-        app.editor.as_ref().unwrap().field,
+        app.interface_ui.editor.as_ref().unwrap().field,
         InterfaceEditorField::MacAddress
     );
     for character in "02:11:22:33:44:55".chars() {
@@ -262,7 +265,7 @@ async fn keyboard_ip_and_mac_edit_previews_applies_and_confirms_the_typed_addres
     assert_eq!(app.screen, Screen::PendingChange);
     handle_pending_key(&mut app, KeyCode::Enter, &client).await;
     assert_eq!(app.screen, Screen::InterfaceList);
-    assert!(app.pending.is_none());
+    assert!(app.confirmation.pending.is_none());
     server.await.unwrap();
     let requests = requests.lock().await;
     assert_eq!(requests[0].0, "get_interface_config");
@@ -474,26 +477,35 @@ async fn interface_editor_cursor_navigation_and_editing() {
     editor.field = InterfaceEditorField::Cidr;
     editor.cidr = "192.168.1.1/24".into();
     editor.cursor = editor.cidr.len();
-    app.editor = Some(editor);
+    app.interface_ui.editor = Some(editor);
     let client = ApiClient::new("/socket-that-must-not-be-opened");
 
     handle_editor_key(&mut app, KeyCode::Left, &client).await;
-    assert_eq!(app.editor.as_ref().unwrap().cursor, 13);
+    assert_eq!(app.interface_ui.editor.as_ref().unwrap().cursor, 13);
 
     handle_editor_key(&mut app, KeyCode::Char('0'), &client).await;
-    assert_eq!(app.editor.as_ref().unwrap().cidr, "192.168.1.1/204");
-    assert_eq!(app.editor.as_ref().unwrap().cursor, 14);
+    assert_eq!(
+        app.interface_ui.editor.as_ref().unwrap().cidr,
+        "192.168.1.1/204"
+    );
+    assert_eq!(app.interface_ui.editor.as_ref().unwrap().cursor, 14);
 
     handle_editor_key(&mut app, KeyCode::Backspace, &client).await;
-    assert_eq!(app.editor.as_ref().unwrap().cidr, "192.168.1.1/24");
-    assert_eq!(app.editor.as_ref().unwrap().cursor, 13);
+    assert_eq!(
+        app.interface_ui.editor.as_ref().unwrap().cidr,
+        "192.168.1.1/24"
+    );
+    assert_eq!(app.interface_ui.editor.as_ref().unwrap().cursor, 13);
 
     handle_editor_key(&mut app, KeyCode::Home, &client).await;
-    assert_eq!(app.editor.as_ref().unwrap().cursor, 0);
+    assert_eq!(app.interface_ui.editor.as_ref().unwrap().cursor, 0);
 
     handle_editor_key(&mut app, KeyCode::Delete, &client).await;
-    assert_eq!(app.editor.as_ref().unwrap().cidr, "92.168.1.1/24");
-    assert_eq!(app.editor.as_ref().unwrap().cursor, 0);
+    assert_eq!(
+        app.interface_ui.editor.as_ref().unwrap().cidr,
+        "92.168.1.1/24"
+    );
+    assert_eq!(app.interface_ui.editor.as_ref().unwrap().cursor, 0);
 }
 
 #[tokio::test]
@@ -504,7 +516,7 @@ async fn unmanaged_ip_edit_attempt_points_to_managed_mode() {
     };
     let mut editor = unmanaged_editor();
     editor.field = InterfaceEditorField::Cidr;
-    app.editor = Some(editor);
+    app.interface_ui.editor = Some(editor);
     let client = ApiClient::new("/socket-that-must-not-be-opened");
 
     handle_editor_key(&mut app, KeyCode::Char('1'), &client).await;
@@ -519,17 +531,23 @@ async fn random_mac_is_local_unicast_and_kept_in_the_apply_request() {
     editor.field = InterfaceEditorField::RandomizeMac;
     editor.allow_management_change = true;
     let mut app = TuiApp {
-        editor: Some(editor),
+        interface_ui: crate::tui::state::InterfaceUiState {
+            editor: Some(editor),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let client = ApiClient::new(std::path::PathBuf::from("/unused-mac-test.sock"));
     handle_editor_key(&mut app, KeyCode::Enter, &client).await;
-    let editor = app.editor.as_ref().unwrap();
+    let editor = app.interface_ui.editor.as_ref().unwrap();
     let mac: traffic_masq_protocol::MacAddr = editor.mac_address.parse().unwrap();
     assert_eq!(mac.octets()[0] & 3, 2);
     assert_eq!(editor.edit_request().unwrap().mac_address, Some(mac));
     handle_editor_key(&mut app, KeyCode::Enter, &client).await;
-    assert_ne!(app.editor.as_ref().unwrap().mac_address, mac.to_string());
+    assert_ne!(
+        app.interface_ui.editor.as_ref().unwrap().mac_address,
+        mac.to_string()
+    );
 }
 
 #[tokio::test]
@@ -537,7 +555,10 @@ async fn manual_mac_can_be_typed_edited_and_cleared() {
     let mut editor = default_route_editor(true);
     editor.field = InterfaceEditorField::MacAddress;
     let mut app = TuiApp {
-        editor: Some(editor),
+        interface_ui: crate::tui::state::InterfaceUiState {
+            editor: Some(editor),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let client = ApiClient::new("/unused-mac-test.sock");
@@ -546,7 +567,8 @@ async fn manual_mac_can_be_typed_edited_and_cleared() {
     }
     let mac = "02:ab:22:33:44:55".parse().unwrap();
     assert_eq!(
-        app.editor
+        app.interface_ui
+            .editor
             .as_ref()
             .unwrap()
             .edit_request()
@@ -559,18 +581,25 @@ async fn manual_mac_can_be_typed_edited_and_cleared() {
     handle_editor_key(&mut app, KeyCode::Backspace, &client).await;
     handle_editor_key(&mut app, KeyCode::Char('6'), &client).await;
     assert_eq!(
-        app.editor.as_ref().unwrap().mac_address,
+        app.interface_ui.editor.as_ref().unwrap().mac_address,
         "02:AB:22:33:44:65"
     );
     handle_editor_key(&mut app, KeyCode::Home, &client).await;
     handle_editor_key(&mut app, KeyCode::Delete, &client).await;
-    assert!(app.editor.as_ref().unwrap().edit_request().is_err());
+    assert!(app
+        .interface_ui
+        .editor
+        .as_ref()
+        .unwrap()
+        .edit_request()
+        .is_err());
     handle_editor_key(&mut app, KeyCode::End, &client).await;
     for _ in 0..16 {
         handle_editor_key(&mut app, KeyCode::Backspace, &client).await;
     }
     assert_eq!(
-        app.editor
+        app.interface_ui
+            .editor
             .as_ref()
             .unwrap()
             .edit_request()
@@ -604,41 +633,71 @@ async fn mac_controls_require_management_and_switching_it_off_clears_the_mac() {
     editor.advanced = true;
     editor.field = InterfaceEditorField::MacAddress;
     let mut app = TuiApp {
-        editor: Some(editor),
+        interface_ui: crate::tui::state::InterfaceUiState {
+            editor: Some(editor),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let client = ApiClient::new("/unused-mac-test.sock");
     handle_editor_key(&mut app, KeyCode::Char('0'), &client).await;
-    assert!(app.editor.as_ref().unwrap().mac_address.is_empty());
+    assert!(app
+        .interface_ui
+        .editor
+        .as_ref()
+        .unwrap()
+        .mac_address
+        .is_empty());
     assert!(app
         .message
         .as_deref()
         .unwrap()
         .contains("MAC editing requires managed mode"));
-    app.editor.as_mut().unwrap().field = InterfaceEditorField::RandomizeMac;
+    app.interface_ui.editor.as_mut().unwrap().field = InterfaceEditorField::RandomizeMac;
     handle_editor_key(&mut app, KeyCode::Enter, &client).await;
-    assert!(app.editor.as_ref().unwrap().mac_address.is_empty());
-    app.editor.as_mut().unwrap().managed = true;
+    assert!(app
+        .interface_ui
+        .editor
+        .as_ref()
+        .unwrap()
+        .mac_address
+        .is_empty());
+    app.interface_ui.editor.as_mut().unwrap().managed = true;
     handle_editor_key(&mut app, KeyCode::Enter, &client).await;
-    assert!(!app.editor.as_ref().unwrap().mac_address.is_empty());
+    assert!(!app
+        .interface_ui
+        .editor
+        .as_ref()
+        .unwrap()
+        .mac_address
+        .is_empty());
     // Navigate to the manual field and modify the generated value.
     handle_editor_key(&mut app, KeyCode::BackTab, &client).await;
     assert_eq!(
-        app.editor.as_ref().unwrap().field,
+        app.interface_ui.editor.as_ref().unwrap().field,
         InterfaceEditorField::MacAddress
     );
-    assert_eq!(app.editor.as_ref().unwrap().cursor, 17);
+    assert_eq!(app.interface_ui.editor.as_ref().unwrap().cursor, 17);
     handle_editor_key(&mut app, KeyCode::Backspace, &client).await;
-    assert_eq!(app.editor.as_ref().unwrap().mac_address.len(), 16);
+    assert_eq!(
+        app.interface_ui.editor.as_ref().unwrap().mac_address.len(),
+        16
+    );
     handle_editor_key(&mut app, KeyCode::Up, &client).await;
     handle_editor_key(&mut app, KeyCode::Up, &client).await;
     assert_eq!(
-        app.editor.as_ref().unwrap().field,
+        app.interface_ui.editor.as_ref().unwrap().field,
         InterfaceEditorField::Managed
     );
     handle_editor_key(&mut app, KeyCode::Enter, &client).await;
-    assert!(!app.editor.as_ref().unwrap().managed);
-    assert!(app.editor.as_ref().unwrap().mac_address.is_empty());
+    assert!(!app.interface_ui.editor.as_ref().unwrap().managed);
+    assert!(app
+        .interface_ui
+        .editor
+        .as_ref()
+        .unwrap()
+        .mac_address
+        .is_empty());
 }
 
 #[tokio::test]
@@ -655,8 +714,11 @@ async fn offline_forget_and_reset_confirm_with_enter_and_preserve_revision() {
         editor.offline_revision = Some(7);
         editor.field = InterfaceEditorField::Save;
         let mut app = TuiApp {
+            interface_ui: crate::tui::state::InterfaceUiState {
+                editor: Some(editor),
+                ..Default::default()
+            },
             screen: Screen::InterfaceEditor,
-            editor: Some(editor),
             ..Default::default()
         };
         app.dashboard.base_config = Some(traffic_masq_protocol::InterfaceBaseConfigView {
@@ -670,7 +732,13 @@ async fn offline_forget_and_reset_confirm_with_enter_and_preserve_revision() {
         handle_editor_key(&mut app, KeyCode::Char('y'), &mock.client).await;
         assert!(mock.calls.lock().unwrap().is_empty());
         handle_editor_key(&mut app, KeyCode::Esc, &mock.client).await;
-        assert!(app.editor.as_ref().unwrap().intent_confirmation.is_none());
+        assert!(app
+            .interface_ui
+            .editor
+            .as_ref()
+            .unwrap()
+            .intent_confirmation
+            .is_none());
         handle_editor_key(&mut app, KeyCode::Enter, &mock.client).await;
         handle_editor_key(&mut app, KeyCode::Enter, &mock.client).await;
         let calls = mock.calls.lock().unwrap();
@@ -698,7 +766,10 @@ fn offline_action_buttons_are_visible_clickable_and_hidden_for_present_devices()
             editor.offline_revision = Some(7);
             editor.field = field;
             let mut app = TuiApp {
-                editor: Some(editor),
+                interface_ui: crate::tui::state::InterfaceUiState {
+                    editor: Some(editor),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let mut terminal = Terminal::new(TestBackend::new(100, height)).unwrap();
@@ -717,12 +788,12 @@ fn offline_action_buttons_are_visible_clickable_and_hidden_for_present_devices()
                 .map(|x| buffer[(x, rect.y)].symbol())
                 .collect();
             assert!(text.contains(label), "button text: {text}");
-            app.editor.as_mut().unwrap().field = InterfaceEditorField::Cidr;
+            app.interface_ui.editor.as_mut().unwrap().field = InterfaceEditorField::Cidr;
             focus_action(&mut app, slot);
-            assert_eq!(app.editor.as_ref().unwrap().field, field);
+            assert_eq!(app.interface_ui.editor.as_ref().unwrap().field, field);
 
-            app.editor.as_mut().unwrap().offline_revision = None;
-            app.editor.as_mut().unwrap().field = InterfaceEditorField::Save;
+            app.interface_ui.editor.as_mut().unwrap().offline_revision = None;
+            app.interface_ui.editor.as_mut().unwrap().field = InterfaceEditorField::Save;
             app.ui.buttons.clear();
             terminal
                 .draw(|frame| render_editor(frame, frame.area(), &mut app))
@@ -742,24 +813,27 @@ async fn basic_editor_skips_hidden_mac_fields_and_keeps_review_visible() {
     let mut editor = default_route_editor(false);
     editor.field = InterfaceEditorField::Advanced;
     let mut app = TuiApp {
+        interface_ui: crate::tui::state::InterfaceUiState {
+            editor: Some(editor),
+            ..Default::default()
+        },
         screen: Screen::InterfaceEditor,
-        editor: Some(editor),
         ..Default::default()
     };
     let client = ApiClient::new("/nonexistent.sock");
     handle_editor_key(&mut app, KeyCode::Tab, &client).await;
     assert_eq!(
-        app.editor.as_ref().unwrap().field,
+        app.interface_ui.editor.as_ref().unwrap().field,
         InterfaceEditorField::Save
     );
     handle_editor_key(&mut app, KeyCode::BackTab, &client).await;
     handle_editor_key(&mut app, KeyCode::Enter, &client).await;
     handle_editor_key(&mut app, KeyCode::Tab, &client).await;
     assert_eq!(
-        app.editor.as_ref().unwrap().field,
+        app.interface_ui.editor.as_ref().unwrap().field,
         InterfaceEditorField::MacAddress
     );
-    app.editor.as_mut().unwrap().mac_address = "invalid".into();
+    app.interface_ui.editor.as_mut().unwrap().mac_address = "invalid".into();
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal
         .draw(|frame| super::super::render(frame, &mut app, false))
@@ -783,8 +857,11 @@ async fn offline_restore_requires_a_reported_file_and_device_definition() {
     editor.offline_revision = Some(7);
     editor.field = InterfaceEditorField::Reset;
     let mut app = TuiApp {
+        interface_ui: crate::tui::state::InterfaceUiState {
+            editor: Some(editor),
+            ..Default::default()
+        },
         screen: Screen::InterfaceEditor,
-        editor: Some(editor),
         ..Default::default()
     };
     for base in [
@@ -800,7 +877,13 @@ async fn offline_restore_requires_a_reported_file_and_device_definition() {
     ] {
         app.dashboard.base_config = base;
         handle_editor_key(&mut app, KeyCode::Enter, &client).await;
-        assert!(app.editor.as_ref().unwrap().intent_confirmation.is_none());
+        assert!(app
+            .interface_ui
+            .editor
+            .as_ref()
+            .unwrap()
+            .intent_confirmation
+            .is_none());
         assert!(app
             .message
             .as_deref()
@@ -815,7 +898,11 @@ async fn offline_restore_requires_a_reported_file_and_device_definition() {
     let restore = confirmation(&app).unwrap().lines.join(" ");
     assert!(restore.contains("/custom/router.toml"));
     assert!(restore.contains("when the device returns"));
-    app.editor.as_mut().unwrap().intent_confirmation = Some(true);
+    app.interface_ui
+        .editor
+        .as_mut()
+        .unwrap()
+        .intent_confirmation = Some(true);
     let delete = confirmation(&app).unwrap().lines.join(" ");
     assert!(delete.contains("suppress the base definition"));
     assert!(delete.contains("passwords are retained"));
@@ -828,16 +915,22 @@ async fn interface_exit_keeps_or_discards_draft_with_keyboard_focus() {
     let mut editor = default_route_editor(false);
     editor.cidr = "192.0.2.99/24".into();
     let mut app = TuiApp {
+        interface_ui: crate::tui::state::InterfaceUiState {
+            editor: Some(editor),
+            ..Default::default()
+        },
         screen: Screen::InterfaceEditor,
-        editor: Some(editor),
         ..Default::default()
     };
     app.ui.input_enabled = true;
     handle_editor_key(&mut app, KeyCode::Esc, &client).await;
-    assert!(app.editor.as_ref().unwrap().exit_requested);
+    assert!(app.interface_ui.editor.as_ref().unwrap().exit_requested);
     super::super::handle_key(&mut app, KeyCode::Enter, &client, false).await;
     assert_eq!(app.screen, Screen::InterfaceList);
-    assert_eq!(app.interface_drafts["wlan0"].cidr, "192.0.2.99/24");
+    assert_eq!(
+        app.interface_ui.interface_drafts["wlan0"].cidr,
+        "192.0.2.99/24"
+    );
     app.dashboard
         .interfaces
         .push(observed_address(None, Some(false)));
@@ -854,14 +947,17 @@ async fn interface_exit_keeps_or_discards_draft_with_keyboard_focus() {
     .await;
     open_editor(&mut app, &refreshed.client).await;
     assert_eq!(app.screen, Screen::InterfaceEditor);
-    assert_eq!(app.editor.as_ref().unwrap().cidr, "192.0.2.99/24");
-    assert!(app.interface_drafts.is_empty());
+    assert_eq!(
+        app.interface_ui.editor.as_ref().unwrap().cidr,
+        "192.0.2.99/24"
+    );
+    assert!(app.interface_ui.interface_drafts.is_empty());
     handle_editor_key(&mut app, KeyCode::Esc, &client).await;
     super::super::handle_key(&mut app, KeyCode::BackTab, &client, false).await;
-    assert_eq!(app.confirmation_focus, 2);
+    assert_eq!(app.confirmation.confirmation_focus, 2);
     super::super::handle_key(&mut app, KeyCode::Enter, &client, false).await;
-    assert!(app.editor.is_none());
-    assert!(app.interface_drafts.is_empty());
+    assert!(app.interface_ui.editor.is_none());
+    assert!(app.interface_ui.interface_drafts.is_empty());
     assert_eq!(app.screen, Screen::InterfaceList);
 }
 
@@ -881,8 +977,11 @@ async fn failed_save_and_background_refresh_keep_the_interface_draft_and_revisio
         .unwrap(),
     );
     let mut app = TuiApp {
+        interface_ui: crate::tui::state::InterfaceUiState {
+            editor: Some(editor),
+            ..Default::default()
+        },
         screen: Screen::InterfaceEditor,
-        editor: Some(editor),
         ..Default::default()
     };
     submit_dry_run(&mut app, &mock.client).await;
@@ -895,7 +994,7 @@ async fn failed_save_and_background_refresh_keep_the_interface_draft_and_revisio
             ..Default::default()
         },
     );
-    let editor = app.editor.as_ref().unwrap();
+    let editor = app.interface_ui.editor.as_ref().unwrap();
     assert_eq!(editor.cidr, "192.0.2.99/24");
     assert_eq!(editor.offline_revision, Some(7));
     assert!(app.message.as_deref().unwrap().contains("stale revision"));
@@ -910,14 +1009,17 @@ async fn validation_focus_exposes_mac_error_and_plan_wrap_preserves_actions() {
         editor.mac_address = "invalid".into();
         editor.interface = "a-very-long-interface-name-to-check-review-and-error-layout".into();
         let mut app = TuiApp {
+            interface_ui: crate::tui::state::InterfaceUiState {
+                editor: Some(editor),
+                ..Default::default()
+            },
             screen: Screen::InterfaceEditor,
-            editor: Some(editor),
             ..Default::default()
         };
         submit_dry_run(&mut app, &client).await;
-        assert!(app.editor.as_ref().unwrap().advanced);
+        assert!(app.interface_ui.editor.as_ref().unwrap().advanced);
         assert_eq!(
-            app.editor.as_ref().unwrap().field,
+            app.interface_ui.editor.as_ref().unwrap().field,
             InterfaceEditorField::MacAddress
         );
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -1019,9 +1121,11 @@ async fn resumed_interface_draft_refreshes_execution_mode_revision_and_review_ba
         let mut status = observed_address(None, Some(false));
         status.interface.name = "wlan0".into();
         app.dashboard.interfaces.push(status);
-        app.interface_drafts.insert("wlan0".into(), draft);
+        app.interface_ui
+            .interface_drafts
+            .insert("wlan0".into(), draft);
         open_editor(&mut app, &mock.client).await;
-        let editor = app.editor.as_ref().unwrap();
+        let editor = app.interface_ui.editor.as_ref().unwrap();
         assert_eq!(
             editor.offline_revision,
             (presence == InterfacePresence::Missing).then_some(9)
@@ -1035,7 +1139,7 @@ async fn resumed_interface_draft_refreshes_execution_mode_revision_and_review_ba
             InterfaceRole::Input,
             "unchanged fields should follow current config"
         );
-        assert!(app.interface_drafts.is_empty());
+        assert!(app.interface_ui.interface_drafts.is_empty());
         if presence == InterfacePresence::Present {
             assert_eq!(editor.field, InterfaceEditorField::Save);
         }
@@ -1094,12 +1198,20 @@ async fn failed_draft_observation_keeps_edits_and_does_not_open_stale_editor() {
         let mut draft = default_route_editor(true);
         draft.cidr = "192.0.2.99/24".into();
         draft.offline_revision = Some(7);
-        app.interface_drafts.insert("wlan0".into(), draft);
+        app.interface_ui
+            .interface_drafts
+            .insert("wlan0".into(), draft);
         open_editor(&mut app, &mock.client).await;
         assert_eq!(app.screen, Screen::InterfaceList);
-        assert!(app.editor.is_none());
-        assert_eq!(app.interface_drafts["wlan0"].cidr, "192.0.2.99/24");
-        assert_eq!(app.interface_drafts["wlan0"].offline_revision, Some(7));
+        assert!(app.interface_ui.editor.is_none());
+        assert_eq!(
+            app.interface_ui.interface_drafts["wlan0"].cidr,
+            "192.0.2.99/24"
+        );
+        assert_eq!(
+            app.interface_ui.interface_drafts["wlan0"].offline_revision,
+            Some(7)
+        );
         assert_eq!(mock.calls.lock().unwrap().len(), 1);
     }
 }
@@ -1149,11 +1261,13 @@ async fn returning_wifi_adapter_refreshes_combined_role_support_for_offline_draf
     let mut observed = observed_address(None, Some(false));
     observed.interface.name = "wlan0".into();
     app.dashboard.interfaces.push(observed);
-    app.interface_drafts.insert("wlan0".into(), draft);
+    app.interface_ui
+        .interface_drafts
+        .insert("wlan0".into(), draft);
 
     open_editor(&mut app, &mock.client).await;
 
-    let editor = app.editor.as_mut().unwrap();
+    let editor = app.interface_ui.editor.as_mut().unwrap();
     assert_eq!(editor.offline_revision, None);
     editor.role = InterfaceRole::Output;
     editor.cycle_role();
@@ -1176,12 +1290,15 @@ async fn combined_role_keyboard_selection_requires_driver_support_and_enables_ma
             reason: (!supported).then(|| "driver does not support AP + STA".into()),
         });
         let mut app = TuiApp {
-            editor: Some(editor),
+            interface_ui: crate::tui::state::InterfaceUiState {
+                editor: Some(editor),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let client = ApiClient::new("/unused-role-test.sock");
         handle_editor_key(&mut app, KeyCode::Enter, &client).await;
-        let editor = app.editor.as_ref().unwrap();
+        let editor = app.interface_ui.editor.as_ref().unwrap();
         assert_eq!(editor.wifi_concurrent, supported);
         assert_eq!(
             editor.role,
@@ -1197,13 +1314,26 @@ async fn combined_role_keyboard_selection_requires_driver_support_and_enables_ma
                 role_label(editor.role, editor.wifi_concurrent),
                 "Input + Output"
             );
-            app.editor.as_mut().unwrap().allow_management_change = true;
-            let request = app.editor.as_ref().unwrap().edit_request().unwrap();
+            app.interface_ui
+                .editor
+                .as_mut()
+                .unwrap()
+                .allow_management_change = true;
+            let request = app
+                .interface_ui
+                .editor
+                .as_ref()
+                .unwrap()
+                .edit_request()
+                .unwrap();
             assert!(request.wifi_concurrent);
             assert_eq!(request.role, InterfaceRole::Input);
             handle_editor_key(&mut app, KeyCode::Char(' '), &client).await;
-            assert!(!app.editor.as_ref().unwrap().wifi_concurrent);
-            assert_eq!(app.editor.as_ref().unwrap().role, InterfaceRole::None);
+            assert!(!app.interface_ui.editor.as_ref().unwrap().wifi_concurrent);
+            assert_eq!(
+                app.interface_ui.editor.as_ref().unwrap().role,
+                InterfaceRole::None
+            );
         }
     }
 }
@@ -1248,7 +1378,7 @@ async fn opening_editor_uses_daemon_capability_and_restores_saved_combined_role(
         .interfaces
         .push(observed_address(None, Some(false)));
     open_editor(&mut app, &mock.client).await;
-    let editor = app.editor.as_ref().unwrap();
+    let editor = app.interface_ui.editor.as_ref().unwrap();
     assert_eq!(editor.wifi_concurrent_support, Some(support));
     assert_eq!(
         role_label(editor.role, editor.wifi_concurrent),

@@ -6,10 +6,10 @@ pub(crate) fn open_pending(
     return_screen: Screen,
     plan: Option<traffic_masq_protocol::RouterPlanView>,
 ) {
-    app.router_pending_plan = plan;
-    app.pending_focus = 0;
-    app.router_pending_return_screen = return_screen;
-    app.router_pending = Some(RouterPendingView {
+    app.router_ui.router_pending_plan = plan;
+    app.confirmation.pending_focus = 0;
+    app.router_ui.router_pending_return_screen = return_screen;
+    app.router_ui.router_pending = Some(RouterPendingView {
         token,
         applied_at_unix: current_unix_time(),
         rollback_failure: None,
@@ -21,8 +21,8 @@ pub(crate) fn open_pending(
 }
 
 async fn return_after_transaction(app: &mut TuiApp, client: &ApiClient) {
-    app.router_pending_plan = None;
-    app.screen = app.router_pending_return_screen;
+    app.router_ui.router_pending_plan = None;
+    app.screen = app.router_ui.router_pending_return_screen;
     match app.screen {
         Screen::Vpn | Screen::VpnProfile | Screen::VpnSettings => {
             super::super::vpn::load_vpn_data(app, client).await
@@ -37,20 +37,21 @@ async fn return_after_transaction(app: &mut TuiApp, client: &ApiClient) {
 
 pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
     if app
+        .router_ui
         .router_pending
         .as_ref()
         .is_some_and(|view| view.recovery_required())
     {
-        app.pending_focus = 0;
+        app.confirmation.pending_focus = 0;
     }
     let interface_lines =
         super::super::interface_status::router_lines(app, &[&app.router.proposed_router_config]);
-    let Some(view) = app.router_pending.as_mut() else {
+    let Some(view) = app.router_ui.router_pending.as_mut() else {
         return;
     };
     let recovery_required = view.recovery_required();
     let now = current_unix_time();
-    let timeout = app.router_rollback_timeout_seconds;
+    let timeout = app.router_ui.router_rollback_timeout_seconds;
     let remaining = router_pending_seconds_remaining(view.applied_at_unix, timeout, now);
     let ratio = if timeout > 0 {
         (remaining as f64 / timeout as f64).clamp(0.0, 1.0)
@@ -86,6 +87,7 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
         }),
     ];
     if let Some(vpn) = app
+        .router_ui
         .router_pending_plan
         .as_ref()
         .and_then(|plan| plan.vpn_chain.standalone.as_ref())
@@ -194,7 +196,11 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
             Line::styled(
                 format!(
                     "{}[Confirm changes] (Enter)",
-                    if app.pending_focus == 0 { "▶ " } else { "  " }
+                    if app.confirmation.pending_focus == 0 {
+                        "▶ "
+                    } else {
+                        "  "
+                    }
                 ),
                 Style::default()
                     .fg(theme::SELECTED_FG)
@@ -204,7 +210,11 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
             Line::styled(
                 format!(
                     "{}[Roll back now] (Esc)",
-                    if app.pending_focus == 1 { "▶ " } else { "  " }
+                    if app.confirmation.pending_focus == 1 {
+                        "▶ "
+                    } else {
+                        "  "
+                    }
                 ),
                 Style::default()
                     .fg(theme::SELECTED_FG)
@@ -274,56 +284,64 @@ pub(crate) async fn handle_router_pending_key(app: &mut TuiApp, key: KeyCode, cl
         KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right
     ) {
         if !app
+            .router_ui
             .router_pending
             .as_ref()
             .is_some_and(|view| view.recovery_required())
         {
-            app.pending_focus = 1 - app.pending_focus.min(1);
+            app.confirmation.pending_focus = 1 - app.confirmation.pending_focus.min(1);
         } else {
-            app.pending_focus = 0;
+            app.confirmation.pending_focus = 0;
         }
         return;
     }
     match key {
         KeyCode::Up | KeyCode::Char('k') => {
-            if let Some(view) = app.router_pending.as_mut() {
+            if let Some(view) = app.router_ui.router_pending.as_mut() {
                 view.scroll = view.scroll.saturating_sub(1);
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if let Some(view) = app.router_pending.as_mut() {
+            if let Some(view) = app.router_ui.router_pending.as_mut() {
                 view.scroll = view.scroll.saturating_add(1).min(view.max_scroll);
             }
         }
         KeyCode::PageUp => {
-            if let Some(view) = app.router_pending.as_mut() {
+            if let Some(view) = app.router_ui.router_pending.as_mut() {
                 view.scroll = view.scroll.saturating_sub(10);
             }
         }
         KeyCode::PageDown => {
-            if let Some(view) = app.router_pending.as_mut() {
+            if let Some(view) = app.router_ui.router_pending.as_mut() {
                 view.scroll = view.scroll.saturating_add(10).min(view.max_scroll);
             }
         }
         KeyCode::Home => {
-            if let Some(view) = app.router_pending.as_mut() {
+            if let Some(view) = app.router_ui.router_pending.as_mut() {
                 view.scroll = 0;
             }
         }
         KeyCode::End => {
-            if let Some(view) = app.router_pending.as_mut() {
+            if let Some(view) = app.router_ui.router_pending.as_mut() {
                 view.scroll = view.max_scroll;
             }
         }
         KeyCode::Enter => {
             let recovery_required = app
+                .router_ui
                 .router_pending
                 .as_ref()
                 .is_some_and(|view| view.recovery_required());
-            finish_router_pending(app, client, !recovery_required && app.pending_focus == 0).await;
+            finish_router_pending(
+                app,
+                client,
+                !recovery_required && app.confirmation.pending_focus == 0,
+            )
+            .await;
         }
         KeyCode::Esc => {
             let recovery_required = app
+                .router_ui
                 .router_pending
                 .as_ref()
                 .is_some_and(|view| view.recovery_required());
@@ -339,7 +357,7 @@ pub(crate) async fn handle_router_pending_key(app: &mut TuiApp, key: KeyCode, cl
 }
 
 async fn finish_router_pending(app: &mut TuiApp, client: &ApiClient, commit: bool) {
-    let Some(pending) = app.router_pending.as_ref() else {
+    let Some(pending) = app.router_ui.router_pending.as_ref() else {
         app.screen = Screen::Router;
         return;
     };
@@ -360,12 +378,12 @@ async fn finish_router_pending(app: &mut TuiApp, client: &ApiClient, commit: boo
                 LogLevel::Info,
                 format!("Router changes applied and saved (revision {revision})"),
             );
-            app.router_pending = None;
+            app.router_ui.router_pending = None;
             return_after_transaction(app, client).await;
         }
         Ok(Response::RouterRolledBack) if !commit => {
             app.push_message(LogLevel::Info, "Router transaction rolled back");
-            app.router_pending = None;
+            app.router_ui.router_pending = None;
             return_after_transaction(app, client).await;
         }
         Ok(Response::RouterError { detail }) => {
@@ -388,11 +406,11 @@ async fn finish_router_pending(app: &mut TuiApp, client: &ApiClient, commit: boo
             recovery,
             ..
         }) => {
-            if let Some(view) = app.router_pending.as_mut() {
+            if let Some(view) = app.router_ui.router_pending.as_mut() {
                 view.rollback_failure = rollback_failure;
                 view.recovery = recovery;
             }
-            app.pending_focus = 0;
+            app.confirmation.pending_focus = 0;
         }
         Ok(Response::Error { message }) => app.push_message(LogLevel::Error, message),
         Ok(response) => {
@@ -408,7 +426,7 @@ async fn finish_router_pending(app: &mut TuiApp, client: &ApiClient, commit: boo
 }
 
 pub(crate) async fn refresh_router_pending_screen(app: &mut TuiApp, client: &ApiClient) {
-    if app.router_pending.is_none() {
+    if app.router_ui.router_pending.is_none() {
         return;
     }
     match client.request(&Request::RouterPendingTransaction).await {
@@ -416,7 +434,7 @@ pub(crate) async fn refresh_router_pending_screen(app: &mut TuiApp, client: &Api
             status: CoordinatorStatus::Idle | CoordinatorStatus::RecoveredButJournalCleanupPending,
             ..
         }) => {
-            app.router_pending = None;
+            app.router_ui.router_pending = None;
             if app.screen == Screen::RouterPending {
                 return_after_transaction(app, client).await;
             }
@@ -430,11 +448,11 @@ pub(crate) async fn refresh_router_pending_screen(app: &mut TuiApp, client: &Api
             recovery,
             ..
         }) => {
-            if let Some(view) = app.router_pending.as_mut() {
+            if let Some(view) = app.router_ui.router_pending.as_mut() {
                 view.rollback_failure = rollback_failure;
                 view.recovery = recovery;
             }
-            app.pending_focus = 0;
+            app.confirmation.pending_focus = 0;
         }
         Ok(Response::RouterPendingTransaction {
             status: CoordinatorStatus::Pending,

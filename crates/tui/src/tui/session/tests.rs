@@ -21,7 +21,7 @@ async fn client_log_survives_relaunch_and_token_removal_with_full_history() {
         );
     }
     logs::flush(&mut app, &store).await;
-    assert!(!app.logs_dirty);
+    assert!(!app.log_view.logs_dirty);
     assert!(fs::metadata(store.path("logs")).unwrap().len() > 16_384);
     assert_eq!(
         fs::metadata(store.path("logs")).unwrap().mode() & 0o777,
@@ -32,11 +32,17 @@ async fn client_log_survives_relaunch_and_token_removal_with_full_history() {
 
     let mut reopened = TuiApp::default();
     logs::restore(&mut reopened, &store).await;
-    assert_eq!(reopened.logs, app.logs);
-    assert_eq!(reopened.logs.len(), logs::LOG_HISTORY_LEN);
-    assert!(reopened.logs.front().unwrap().message.starts_with("50:"));
+    assert_eq!(reopened.log_view.logs, app.log_view.logs);
+    assert_eq!(reopened.log_view.logs.len(), logs::LOG_HISTORY_LEN);
+    assert!(reopened
+        .log_view
+        .logs
+        .front()
+        .unwrap()
+        .message
+        .starts_with("50:"));
     assert!(reopened.message.is_none());
-    assert!(!reopened.logs_dirty);
+    assert!(!reopened.log_view.logs_dirty);
 }
 
 #[tokio::test]
@@ -55,20 +61,20 @@ async fn clearing_client_log_is_persistent_and_endpoint_scoped() {
     logs::flush(&mut TuiApp::default(), &other).await;
     let mut isolated = TuiApp::default();
     logs::restore(&mut isolated, &other).await;
-    assert!(isolated.logs.is_empty());
+    assert!(isolated.log_view.logs.is_empty());
     isolated.push_message(logs::LogLevel::Info, "other endpoint");
     logs::flush(&mut isolated, &other).await;
 
-    app.logs_focus = logs::LogFocus::Clear;
+    app.log_view.logs_focus = logs::LogFocus::Clear;
     logs::handle_log_key(&mut app, KeyCode::Enter);
     logs::handle_log_key(&mut app, KeyCode::Enter);
     logs::flush(&mut app, &store).await;
     let mut reopened = TuiApp::default();
     logs::restore(&mut reopened, &store).await;
-    assert_eq!(reopened.logs.len(), 1);
-    assert_eq!(reopened.logs[0].message, "Log cleared");
+    assert_eq!(reopened.log_view.logs.len(), 1);
+    assert_eq!(reopened.log_view.logs[0].message, "Log cleared");
     logs::restore(&mut reopened, &other).await;
-    assert_eq!(reopened.logs[0].message, "other endpoint");
+    assert_eq!(reopened.log_view.logs[0].message, "other endpoint");
 }
 
 #[tokio::test]
@@ -79,19 +85,22 @@ async fn client_log_storage_failure_is_visible_without_recursive_retry() {
     store.write("logs", &"invalid history").unwrap();
     let mut app = TuiApp::default();
     logs::restore(&mut app, &store).await;
-    assert!(app.logs[0].message.contains("Could not restore client log"));
+    assert!(app.log_view.logs[0]
+        .message
+        .contains("Could not restore client log"));
     fs::remove_file(store.path("logs")).unwrap();
     std::os::unix::fs::symlink(temp.path().join("untouched"), store.path("logs")).unwrap();
     logs::flush(&mut app, &store).await;
     assert!(app
+        .log_view
         .logs
         .back()
         .unwrap()
         .message
         .contains("Could not save client log"));
-    let count = app.logs.len();
+    let count = app.log_view.logs.len();
     logs::flush(&mut app, &store).await;
-    assert_eq!(app.logs.len(), count);
+    assert_eq!(app.log_view.logs.len(), count);
     assert!(!temp.path().join("untouched").exists());
 }
 

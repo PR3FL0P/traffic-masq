@@ -221,7 +221,7 @@ async fn open(app: &mut TuiApp, client: &ApiClient, edit: bool) {
         ]
     };
     let cursors = std::array::from_fn(|i| super::input::grapheme_count(&values[i]));
-    app.port_forwarding = Some(Editor {
+    app.router_ui.port_forwarding = Some(Editor {
         values,
         cursors,
         field: 0,
@@ -425,7 +425,7 @@ pub(crate) async fn handle_list_key(app: &mut TuiApp, key: KeyCode, client: &Api
     }
 }
 pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
-    let Some(e) = &app.port_forwarding else {
+    let Some(e) = &app.router_ui.port_forwarding else {
         return;
     };
     let block = panel(if e.editing.is_some() {
@@ -542,18 +542,18 @@ pub(crate) fn render(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiAp
     );
 }
 pub(crate) fn focus_action(app: &mut TuiApp, _: usize) {
-    if let Some(e) = &mut app.port_forwarding {
+    if let Some(e) = &mut app.router_ui.port_forwarding {
         e.field = 8;
     }
 }
 pub(crate) fn handle_key(app: &mut TuiApp, key: KeyCode) {
-    let Some(e) = &mut app.port_forwarding else {
+    let Some(e) = &mut app.router_ui.port_forwarding else {
         app.screen = Screen::Router;
         return;
     };
     match key {
         KeyCode::Esc => {
-            app.port_forwarding = None;
+            app.router_ui.port_forwarding = None;
             app.screen = Screen::Router;
         }
         KeyCode::Up | KeyCode::BackTab => e.field = e.field.saturating_sub(1),
@@ -563,7 +563,7 @@ pub(crate) fn handle_key(app: &mut TuiApp, key: KeyCode) {
                 let selected = e.editing.unwrap_or(rules.len() - 1);
                 stage(app, rules);
                 app.router.selected_port_forward = selected;
-                app.port_forwarding = None;
+                app.router_ui.port_forwarding = None;
                 app.screen = Screen::Router;
                 router::select_pane(app, RouterPane::Ports);
             }
@@ -626,7 +626,7 @@ mod tests {
     fn save_stages_intent_and_escape_preserves_the_existing_draft() {
         let mut app = TuiApp::default();
         app.router.proposed_router_config.forwarding = Some(vec![]);
-        app.port_forwarding = Some(editor());
+        app.router_ui.port_forwarding = Some(editor());
         app.screen = Screen::PortForwarding;
         handle_key(&mut app, KeyCode::Enter);
         assert!(app.router.staged);
@@ -640,7 +640,7 @@ mod tests {
         e.editing = Some(0);
         e.rules = config.port_forwards.clone();
         e.values[5] = "444".into();
-        app.port_forwarding = Some(e);
+        app.router_ui.port_forwarding = Some(e);
         handle_key(&mut app, KeyCode::Esc);
         assert_eq!(app.router.proposed_router_config, config);
     }
@@ -649,9 +649,10 @@ mod tests {
         let mut app = TuiApp::default();
         let mut e = editor();
         e.rules = e.save().unwrap();
-        app.port_forwarding = Some(e);
+        app.router_ui.port_forwarding = Some(e);
         handle_key(&mut app, KeyCode::Enter);
         assert!(app
+            .router_ui
             .port_forwarding
             .as_ref()
             .unwrap()
@@ -660,9 +661,10 @@ mod tests {
             .unwrap()
             .contains("overlapping"));
         assert!(!app.router.staged);
-        app.port_forwarding.as_mut().unwrap().values[3] = "0".into();
+        app.router_ui.port_forwarding.as_mut().unwrap().values[3] = "0".into();
         handle_key(&mut app, KeyCode::Enter);
         assert!(app
+            .router_ui
             .port_forwarding
             .as_ref()
             .unwrap()
@@ -682,7 +684,10 @@ mod tests {
         }
         for (width, height) in [(80, 24), (32, 10), (12, 4)] {
             let mut app = TuiApp {
-                port_forwarding: Some(e.clone()),
+                router_ui: crate::tui::state::RouterUiState {
+                    port_forwarding: Some(e.clone()),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -709,7 +714,10 @@ mod tests {
             let mut e = editor();
             e.values[3] = "0".into();
             let mut app = TuiApp {
-                port_forwarding: Some(e),
+                router_ui: crate::tui::state::RouterUiState {
+                    port_forwarding: Some(e),
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -717,12 +725,18 @@ mod tests {
             handle_key(&mut app, KeyCode::Enter);
             assert!(rendered_text(&mut app, &mut terminal).contains("External port must be"));
 
-            assert_eq!(app.port_forwarding.as_ref().unwrap().field, 3);
+            assert_eq!(app.router_ui.port_forwarding.as_ref().unwrap().field, 3);
             for _ in 0..3 {
                 handle_key(&mut app, KeyCode::Up);
             }
             assert!(rendered_text(&mut app, &mut terminal).contains("▶ Incoming interface: wan0"));
-            assert!(app.port_forwarding.as_ref().unwrap().error.is_some());
+            assert!(app
+                .router_ui
+                .port_forwarding
+                .as_ref()
+                .unwrap()
+                .error
+                .is_some());
 
             for _ in 0..3 {
                 handle_key(&mut app, KeyCode::Tab);
@@ -739,7 +753,7 @@ mod tests {
                 handle_key(&mut app, KeyCode::Tab);
             }
             handle_key(&mut app, KeyCode::Enter);
-            assert!(app.port_forwarding.is_none());
+            assert!(app.router_ui.port_forwarding.is_none());
             assert!(app.router.staged);
             assert_eq!(
                 app.router.proposed_router_config.port_forwards[0].external_port,
@@ -779,8 +793,11 @@ mod ux_tests {
     #[tokio::test]
     async fn enter_advances_text_and_tab_moves_without_changing_protocol() {
         let mut app = TuiApp {
+            router_ui: crate::tui::state::RouterUiState {
+                port_forwarding: Some(form()),
+                ..Default::default()
+            },
             screen: Screen::PortForwarding,
-            port_forwarding: Some(form()),
             ..Default::default()
         };
         let client = ApiClient::new("/must-not-connect");
@@ -789,17 +806,26 @@ mod ux_tests {
             .draw(|f| super::super::render(f, &mut app, false))
             .unwrap();
         for field in [0, 1, 3, 4, 5, 6, 7] {
-            app.port_forwarding.as_mut().unwrap().field = field;
+            app.router_ui.port_forwarding.as_mut().unwrap().field = field;
             super::super::handle_key(&mut app, KeyCode::Enter, &client, false).await;
-            assert_eq!(app.port_forwarding.as_ref().unwrap().field, field + 1);
+            assert_eq!(
+                app.router_ui.port_forwarding.as_ref().unwrap().field,
+                field + 1
+            );
             assert!(!app.router.staged);
         }
-        app.port_forwarding.as_mut().unwrap().field = 2;
+        app.router_ui.port_forwarding.as_mut().unwrap().field = 2;
         super::super::handle_key(&mut app, KeyCode::Tab, &client, false).await;
-        assert_eq!(app.port_forwarding.as_ref().unwrap().values[2], "tcp");
+        assert_eq!(
+            app.router_ui.port_forwarding.as_ref().unwrap().values[2],
+            "tcp"
+        );
         super::super::handle_key(&mut app, KeyCode::BackTab, &client, false).await;
         super::super::handle_key(&mut app, KeyCode::Enter, &client, false).await;
-        assert_eq!(app.port_forwarding.as_ref().unwrap().values[2], "udp");
+        assert_eq!(
+            app.router_ui.port_forwarding.as_ref().unwrap().values[2],
+            "udp"
+        );
     }
 
     #[test]
@@ -808,12 +834,15 @@ mod ux_tests {
         e.values[7] = "203.0.113.5/24".into();
         e.field = 8;
         let mut app = TuiApp {
+            router_ui: crate::tui::state::RouterUiState {
+                port_forwarding: Some(e),
+                ..Default::default()
+            },
             screen: Screen::PortForwarding,
-            port_forwarding: Some(e),
             ..Default::default()
         };
         handle_key(&mut app, KeyCode::Enter);
-        assert_eq!(app.port_forwarding.as_ref().unwrap().field, 7);
+        assert_eq!(app.router_ui.port_forwarding.as_ref().unwrap().field, 7);
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
             .draw(|f| super::super::render(f, &mut app, false))

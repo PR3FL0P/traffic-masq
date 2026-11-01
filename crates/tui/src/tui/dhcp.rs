@@ -191,6 +191,7 @@ pub(crate) fn render_dhcp_interface_list(
     let visible = inner.height.max(1) as usize;
     let max_scroll = app.dashboard.interfaces.len().saturating_sub(visible);
     let offset = app
+        .interface_ui
         .selected_interface
         .saturating_sub(visible.saturating_sub(1))
         .min(max_scroll);
@@ -207,7 +208,7 @@ pub(crate) fn render_dhcp_interface_list(
         .skip(offset)
         .take(visible)
         .map(|(index, status)| {
-            let selected = index == app.selected_interface;
+            let selected = index == app.interface_ui.selected_interface;
             let marker = if selected { "▶" } else { " " };
             let style = if selected {
                 Style::default()
@@ -217,6 +218,7 @@ pub(crate) fn render_dhcp_interface_list(
                 Style::default()
             };
             let dhcp_active = app
+                .dhcp_ui
                 .dhcp_interfaces
                 .iter()
                 .any(|name| name == &status.interface.name);
@@ -251,7 +253,7 @@ const DHCP_LEASES_LABEL: &str = "View leases";
 const DHCP_DISABLE_LABEL: &str = "Disable DHCP";
 
 pub(crate) fn render_dhcp_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
-    let Some(editor) = &app.dhcp_editor else {
+    let Some(editor) = &app.dhcp_ui.dhcp_editor else {
         return;
     };
     let area = if editor.offline_intent.is_some() {
@@ -371,11 +373,12 @@ pub(crate) fn render_dhcp_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
 
 pub(crate) fn render_dhcp_leases(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut TuiApp) {
     let interface_status = app
+        .dhcp_ui
         .dhcp_leases
         .as_ref()
         .map(|view| super::interface_status::describe(app, &view.interface))
         .unwrap_or_default();
-    let Some(view) = &mut app.dhcp_leases else {
+    let Some(view) = &mut app.dhcp_ui.dhcp_leases else {
         return;
     };
     let chunks = Layout::vertical([Constraint::Length(6), Constraint::Min(3)]).split(area);
@@ -473,7 +476,7 @@ pub(crate) fn render_dhcp_leases(frame: &mut ratatui::Frame<'_>, area: Rect, app
 }
 
 pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
-    if let Some(editor) = app.dhcp_editor.as_mut() {
+    if let Some(editor) = app.dhcp_ui.dhcp_editor.as_mut() {
         editor.field = match slot {
             0 => DhcpField::Save,
             1 => DhcpField::Leases,
@@ -590,7 +593,7 @@ pub(crate) async fn open_dhcp_editor(app: &mut TuiApp, client: &ApiClient) {
         }) => {
             let pool_start = spec.pool_start.to_string();
             let cursor = super::input::grapheme_count(&pool_start);
-            app.dhcp_editor = Some(DhcpEditor {
+            app.dhcp_ui.dhcp_editor = Some(DhcpEditor {
                 interface,
                 offline_intent,
                 field: DhcpField::PoolStart,
@@ -654,7 +657,7 @@ pub(crate) async fn open_dhcp_editor(app: &mut TuiApp, client: &ApiClient) {
                 .map(|(start, end)| (start.to_string(), end.to_string()))
                 .unwrap_or_default();
             let cursor = super::input::grapheme_count(&pool_start);
-            app.dhcp_editor = Some(DhcpEditor {
+            app.dhcp_ui.dhcp_editor = Some(DhcpEditor {
                 interface,
                 offline_intent,
                 field: DhcpField::PoolStart,
@@ -694,7 +697,7 @@ pub(crate) async fn open_dhcp_leases(
         }) if response_interface == interface => {
             leases.sort_by_key(|lease| u32::from(lease.ip));
             let count = leases.len();
-            app.dhcp_leases = Some(DhcpLeasesView {
+            app.dhcp_ui.dhcp_leases = Some(DhcpLeasesView {
                 interface,
                 leases,
                 scroll: 0,
@@ -730,7 +733,7 @@ pub(crate) async fn open_dhcp_leases(
 }
 
 pub(crate) async fn refresh_dhcp_leases(app: &mut TuiApp, client: &ApiClient) {
-    let Some(view) = app.dhcp_leases.as_mut() else {
+    let Some(view) = app.dhcp_ui.dhcp_leases.as_mut() else {
         return;
     };
     match client
@@ -757,7 +760,7 @@ pub(crate) async fn refresh_dhcp_leases(app: &mut TuiApp, client: &ApiClient) {
 }
 
 pub(crate) async fn handle_dhcp_leases_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
-    let Some(view) = app.dhcp_leases.as_mut() else {
+    let Some(view) = app.dhcp_ui.dhcp_leases.as_mut() else {
         app.screen = Screen::DhcpInterfaceList;
         return;
     };
@@ -806,7 +809,7 @@ pub(crate) async fn handle_dhcp_leases_key(app: &mut TuiApp, key: KeyCode, clien
 }
 
 pub(crate) async fn handle_dhcp_editor_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
-    let Some(editor) = app.dhcp_editor.as_mut() else {
+    let Some(editor) = app.dhcp_ui.dhcp_editor.as_mut() else {
         app.screen = Screen::DhcpInterfaceList;
         return;
     };
@@ -847,7 +850,7 @@ pub(crate) async fn handle_dhcp_editor_key(app: &mut TuiApp, key: KeyCode, clien
 }
 
 async fn disable_dhcp_for_current_editor(app: &mut TuiApp, client: &ApiClient) {
-    let Some(editor) = &app.dhcp_editor else {
+    let Some(editor) = &app.dhcp_ui.dhcp_editor else {
         return;
     };
     let interface = editor.interface.clone();
@@ -858,9 +861,9 @@ async fn disable_dhcp_for_current_editor(app: &mut TuiApp, client: &ApiClient) {
     }
     match client.request(&Request::DisableDhcp { interface }).await {
         Ok(Response::NetworkChangePending { change }) => {
-            app.pending = Some(change);
-            app.pending_focus = 0;
-            app.pending_return_screen = Screen::DhcpInterfaceList;
+            app.confirmation.pending = Some(change);
+            app.confirmation.pending_focus = 0;
+            app.confirmation.pending_return_screen = Screen::DhcpInterfaceList;
             app.screen = Screen::PendingChange;
         }
         Ok(Response::DhcpDisabled { interface }) => {
@@ -877,7 +880,7 @@ async fn disable_dhcp_for_current_editor(app: &mut TuiApp, client: &ApiClient) {
 }
 
 pub(crate) async fn submit_dhcp_config(app: &mut TuiApp, client: &ApiClient) {
-    let Some(editor) = &app.dhcp_editor else {
+    let Some(editor) = &app.dhcp_ui.dhcp_editor else {
         return;
     };
     let interface = editor.interface.clone();
@@ -907,9 +910,9 @@ pub(crate) async fn submit_dhcp_config(app: &mut TuiApp, client: &ApiClient) {
         .await
     {
         Ok(Response::NetworkChangePending { change }) => {
-            app.pending = Some(change);
-            app.pending_focus = 0;
-            app.pending_return_screen = Screen::DhcpInterfaceList;
+            app.confirmation.pending = Some(change);
+            app.confirmation.pending_focus = 0;
+            app.confirmation.pending_return_screen = Screen::DhcpInterfaceList;
             app.screen = Screen::PendingChange;
         }
         Ok(Response::DhcpConfigured { spec }) => {

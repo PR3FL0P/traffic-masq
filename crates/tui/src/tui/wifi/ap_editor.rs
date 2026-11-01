@@ -10,12 +10,12 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
             frame,
             area,
             &mut app.ui,
-            app.confirmation_focus,
-            app.confirmation_scroll,
+            app.confirmation.confirmation_focus,
+            app.confirmation.confirmation_scroll,
         );
         return;
     }
-    let Some(editor) = &app.wifi_editor else {
+    let Some(editor) = &app.wifi_ui.wifi_editor else {
         return;
     };
     if editor.reviewing {
@@ -92,8 +92,8 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
             layout::ChangeReviewState {
                 offline: editor.offline_intent.is_some(),
                 cancel_selected: editor.field != WifiField::Apply,
-                scroll: &mut app.preview_scroll,
-                max_scroll: &mut app.preview_max_scroll,
+                scroll: &mut app.interface_ui.preview_scroll,
+                max_scroll: &mut app.interface_ui.preview_max_scroll,
             },
         );
         return;
@@ -300,18 +300,18 @@ pub(crate) fn render_wifi_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app
 }
 
 pub(crate) async fn handle_wifi_editor_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
-    let Some(editor) = app.wifi_editor.as_mut() else {
+    let Some(editor) = app.wifi_ui.wifi_editor.as_mut() else {
         app.screen = Screen::Wifi;
         return;
     };
     if editor.discard_requested {
         match key {
             KeyCode::Enter => {
-                let mut draft = app.wifi_editor.take().unwrap();
+                let mut draft = app.wifi_ui.wifi_editor.take().unwrap();
                 draft.discard_requested = false;
                 let key = draft_key(&draft);
                 let profile_mode = draft.profile_mode;
-                app.ap_drafts.insert(key, draft);
+                app.wifi_ui.ap_drafts.insert(key, draft);
                 app.screen = if profile_mode {
                     Screen::WifiApProfiles
                 } else {
@@ -329,7 +329,11 @@ pub(crate) async fn handle_wifi_editor_key(app: &mut TuiApp, key: KeyCode, clien
         return;
     }
     if editor.reviewing {
-        if layout::scroll_change_review(key, &mut app.preview_scroll, app.preview_max_scroll) {
+        if layout::scroll_change_review(
+            key,
+            &mut app.interface_ui.preview_scroll,
+            app.interface_ui.preview_max_scroll,
+        ) {
             return;
         }
         match key {
@@ -452,7 +456,7 @@ pub(crate) async fn handle_wifi_editor_key(app: &mut TuiApp, key: KeyCode, clien
         }
         KeyCode::Enter if editor.field == WifiField::Apply && !editor.profile_mode => {
             editor.reviewing = true;
-            app.preview_scroll = 0;
+            app.interface_ui.preview_scroll = 0;
         }
         KeyCode::Enter => {
             editor.field = move_field(&editor.fields(), editor.field, true);
@@ -535,7 +539,7 @@ pub(super) fn ap_settings(editor: &WifiEditor) -> WifiEditRequest {
 }
 
 async fn apply_ap_editor(app: &mut TuiApp, client: &ApiClient) {
-    let Some(editor) = app.wifi_editor.clone() else {
+    let Some(editor) = app.wifi_ui.wifi_editor.clone() else {
         return;
     };
     if editor.ssid.trim().is_empty() {
@@ -627,7 +631,7 @@ async fn apply_ap_editor(app: &mut TuiApp, client: &ApiClient) {
                 LogLevel::Info,
                 format!("Saved immediately for {interface}; applies on device return. No automatic rollback."),
             );
-            app.wifi_editor = None;
+            app.wifi_ui.wifi_editor = None;
             app.screen = Screen::Wifi;
             load_wifi_data(app, client).await;
         }
@@ -637,10 +641,10 @@ async fn apply_ap_editor(app: &mut TuiApp, client: &ApiClient) {
                 LogLevel::Info,
                 "Access point change applied tentatively; confirm it before the rollback timer expires",
             );
-            app.pending_focus = 0;
-            app.pending = Some(change);
-            app.pending_return_screen = Screen::Wifi;
-            app.wifi_editor = None;
+            app.confirmation.pending_focus = 0;
+            app.confirmation.pending = Some(change);
+            app.confirmation.pending_return_screen = Screen::Wifi;
+            app.wifi_ui.wifi_editor = None;
             app.screen = Screen::PendingChange;
         }
         Ok(Response::WifiError { detail }) => {
@@ -652,7 +656,7 @@ async fn apply_ap_editor(app: &mut TuiApp, client: &ApiClient) {
 }
 
 async fn save_ap_profile(app: &mut TuiApp, client: &ApiClient) -> bool {
-    let Some(editor) = app.wifi_editor.as_ref() else {
+    let Some(editor) = app.wifi_ui.wifi_editor.as_ref() else {
         return false;
     };
     if !editor.subnet.trim().is_empty() && editor.subnet.trim().parse::<ipnet::Ipv4Net>().is_err() {
@@ -661,6 +665,7 @@ async fn save_ap_profile(app: &mut TuiApp, client: &ApiClient) -> bool {
     }
     if editor.original_profile_id.is_none()
         && app
+            .wifi_ui
             .wifi_ap_profiles
             .as_ref()
             .is_some_and(|view| view.profiles.iter().any(|p| p.id == editor.profile_id))
@@ -679,8 +684,8 @@ async fn save_ap_profile(app: &mut TuiApp, client: &ApiClient) -> bool {
     };
     match client.request(&request).await {
         Ok(Response::WifiApProfileSaved { profile }) => {
-            let interface = app.wifi_editor.as_ref().unwrap().interface.clone();
-            if let Some(view) = app.wifi_ap_profiles.as_mut() {
+            let interface = app.wifi_ui.wifi_editor.as_ref().unwrap().interface.clone();
+            if let Some(view) = app.wifi_ui.wifi_ap_profiles.as_mut() {
                 view.profiles.retain(|p| p.id != profile.id);
                 let id = profile.id.clone();
                 view.profiles.push(profile);
@@ -689,10 +694,10 @@ async fn save_ap_profile(app: &mut TuiApp, client: &ApiClient) -> bool {
                 view.selected = view.selected_profile;
                 view.mode = WifiProfilesMode::Management;
             }
-            app.wifi_editor = None;
+            app.wifi_ui.wifi_editor = None;
             app.screen = Screen::WifiApProfiles;
             app.push_message(LogLevel::Info, "AP profile saved");
-            if app.wifi_ap_profiles.is_none() {
+            if app.wifi_ui.wifi_ap_profiles.is_none() {
                 ap_profiles::open_ap_profiles(app, client, interface, WifiProfilesMode::Management)
                     .await;
             }
@@ -715,10 +720,11 @@ async fn save_ap_profile(app: &mut TuiApp, client: &ApiClient) -> bool {
 
 fn close_editor(app: &mut TuiApp) {
     let profile_mode = app
+        .wifi_ui
         .wifi_editor
         .as_ref()
         .is_some_and(|editor| editor.profile_mode);
-    app.wifi_editor = None;
+    app.wifi_ui.wifi_editor = None;
     app.screen = if profile_mode {
         Screen::WifiApProfiles
     } else {
@@ -729,7 +735,7 @@ fn close_editor(app: &mut TuiApp) {
 pub(in crate::tui) fn discard_confirmation(
     app: &TuiApp,
 ) -> Option<crate::tui::confirmation::Dialog> {
-    let editor = app.wifi_editor.as_ref()?;
+    let editor = app.wifi_ui.wifi_editor.as_ref()?;
     editor
         .discard_requested
         .then(|| crate::tui::confirmation::Dialog {

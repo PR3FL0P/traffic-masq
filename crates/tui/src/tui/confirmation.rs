@@ -46,7 +46,7 @@ pub(super) fn current(app: &TuiApp) -> Option<Dialog> {
         Screen::Settings => super::settings::confirmation(app),
         Screen::WifiStations => super::wifi_stations::confirmation(app),
         Screen::Vpn | Screen::VpnProfile => super::vpn::confirmation(app),
-        Screen::Log if app.logs_clear_confirmation => Some(Dialog {
+        Screen::Log if app.log_view.logs_clear_confirmation => Some(Dialog {
             secondary: None,
             title: "Clear client log?",
             action: "Clear",
@@ -152,7 +152,7 @@ mod tests {
                 ..Default::default()
             };
             app.push_message(logs::LogLevel::Info, "keep this entry");
-            app.logs_focus = logs::LogFocus::Clear;
+            app.log_view.logs_focus = logs::LogFocus::Clear;
             logs::handle_log_key(&mut app, KeyCode::Enter);
             let mut terminal =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
@@ -167,8 +167,8 @@ mod tests {
             }
             tui::navigate_to_section(&mut app, tui::Section::Vpn, &client, false).await;
             assert_eq!(app.screen, Screen::Log);
-            assert!(app.logs_clear_confirmation);
-            assert_eq!(app.logs_focus, logs::LogFocus::Clear);
+            assert!(app.log_view.logs_clear_confirmation);
+            assert_eq!(app.log_view.logs_focus, logs::LogFocus::Clear);
             assert!(tui::layout::help_pairs(&app).contains(&("Enter", "cancel")));
             assert!(app.ui.list_area.is_none());
             assert_eq!(app.ui.buttons.len(), 2);
@@ -186,12 +186,12 @@ mod tests {
                 false,
             )
             .await;
-            assert!(!app.logs_clear_confirmation);
+            assert!(!app.log_view.logs_clear_confirmation);
             if confirm {
-                assert_eq!(app.logs.len(), 1);
-                assert_eq!(app.logs[0].message, "Log cleared");
+                assert_eq!(app.log_view.logs.len(), 1);
+                assert_eq!(app.log_view.logs[0].message, "Log cleared");
             } else {
-                assert_eq!(app.logs[0].message, "keep this entry");
+                assert_eq!(app.log_view.logs[0].message, "keep this entry");
             }
         }
     }
@@ -205,8 +205,11 @@ mod long_details_tests {
     #[tokio::test]
     async fn long_confirmation_details_scroll_without_hiding_buttons() {
         let mut app = TuiApp {
+            log_view: crate::tui::state::LogViewState {
+                logs_clear_confirmation: true,
+                ..Default::default()
+            },
             screen: Screen::Log,
-            logs_clear_confirmation: true,
             ..Default::default()
         };
         let dialog = Dialog {
@@ -232,10 +235,19 @@ mod long_details_tests {
             false,
         )
         .await;
-        assert_eq!(app.confirmation_scroll, app.ui.dialog_max_scroll);
+        assert_eq!(
+            app.confirmation.confirmation_scroll,
+            app.ui.dialog_max_scroll
+        );
         terminal
             .draw(|frame| {
-                dialog.render(frame, frame.area(), &mut app.ui, 0, app.confirmation_scroll)
+                dialog.render(
+                    frame,
+                    frame.area(),
+                    &mut app.ui,
+                    0,
+                    app.confirmation.confirmation_scroll,
+                )
             })
             .unwrap();
         let text: String = terminal

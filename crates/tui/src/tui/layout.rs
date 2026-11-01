@@ -266,6 +266,7 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Tu
 
     let message_line = if let Some(text) = app.message.as_deref() {
         let color = app
+            .log_view
             .logs
             .back()
             .map(|entry| entry.level.color())
@@ -286,7 +287,7 @@ pub(crate) fn render_footer(frame: &mut ratatui::Frame<'_>, area: Rect, app: &Tu
 
 pub(crate) fn help_pairs(app: &TuiApp) -> Vec<(&'static str, &'static str)> {
     if let Some(dialog) = super::confirmation::current(app) {
-        let action = match app.confirmation_focus {
+        let action = match app.confirmation.confirmation_focus {
             0 => dialog.action,
             2 => dialog.secondary.unwrap_or("cancel"),
             _ => "cancel",
@@ -294,7 +295,7 @@ pub(crate) fn help_pairs(app: &TuiApp) -> Vec<(&'static str, &'static str)> {
         return vec![("Enter", action), ("Esc", "cancel"), ("PgUp/Dn", "details")];
     }
     if app.screen == Screen::PendingChange {
-        if let Some(change) = &app.pending {
+        if let Some(change) = &app.confirmation.pending {
             if !change.can_rollback() {
                 return vec![("Esc", "back")];
             }
@@ -305,6 +306,7 @@ pub(crate) fn help_pairs(app: &TuiApp) -> Vec<(&'static str, &'static str)> {
     }
     if app.screen == Screen::RouterPending
         && app
+            .router_ui
             .router_pending
             .as_ref()
             .is_some_and(|view| view.commit_indeterminate())
@@ -322,12 +324,13 @@ pub(crate) fn help_pairs(app: &TuiApp) -> Vec<(&'static str, &'static str)> {
             ("Esc", "back"),
         ]
     } else if app.screen == Screen::Vpn && app.vpn.focus != super::vpn::VpnFocus::List
-        || app.screen == Screen::Log && app.logs_focus != super::logs::LogFocus::Scroll
+        || app.screen == Screen::Log && app.log_view.logs_focus != super::logs::LogFocus::Scroll
         || app.screen == Screen::Wifi && app.wifi.actions_open
     {
         vec![("Arrows", "action"), ("Enter", "activate"), ("Esc", "list")]
     } else if app.screen == Screen::Settings
         && app
+            .settings_ui
             .settings
             .as_ref()
             .is_some_and(|editor| editor.is_editing())
@@ -339,6 +342,7 @@ pub(crate) fn help_pairs(app: &TuiApp) -> Vec<(&'static str, &'static str)> {
         ]
     } else if app.screen == Screen::RouterPending
         && app
+            .router_ui
             .router_pending
             .as_ref()
             .is_some_and(|view| view.recovery_required())
