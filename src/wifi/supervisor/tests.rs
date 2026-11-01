@@ -710,6 +710,47 @@ async fn startup_stops_owned_ap_absent_from_committed_configuration() {
 }
 
 #[tokio::test]
+async fn spawn_refuses_a_foreign_ctrl_path_before_writing_config_or_launch_intent() {
+    let temp = tempdir().expect("tempdir");
+    let runtime_dir = temp.path().join("hostapd");
+    let process = fake_process();
+    let supervisor = test_supervisor(temp.path(), &runtime_dir, process.clone()).await;
+    let target = spec("wlan0", "net-a");
+    let rendered = supervisor.render_for(&target).await.expect("render");
+    let ctrl_path = supervisor.ctrl_path("wlan0");
+
+    // Exercise the shared spawn boundary directly, bypassing the earlier
+    // ownership observation just as a replacement after stop would.
+    for dangling_symlink in [false, true] {
+        if dangling_symlink {
+            std::os::unix::fs::symlink(runtime_dir.join("missing"), &ctrl_path)
+                .expect("create dangling foreign symlink");
+        } else {
+            std::fs::write(&ctrl_path, b"foreign endpoint").expect("create foreign node");
+        }
+
+        let error = supervisor
+            .spawn_and_record(&target, &rendered, &ctrl_path)
+            .await
+            .expect_err("must refuse an occupied ctrl path");
+        assert!(matches!(error, SupervisorError::NotOwned { .. }));
+        assert!(process.calls().is_empty(), "must not spawn or signal");
+        assert!(!rendered.path.exists(), "must not write config");
+        assert!(supervisor
+            .record_store("wlan0")
+            .load()
+            .await
+            .expect("load")
+            .is_none());
+        assert!(
+            std::fs::symlink_metadata(&ctrl_path).is_ok(),
+            "preserve foreign node"
+        );
+        std::fs::remove_file(&ctrl_path).expect("remove test node");
+    }
+}
+
+#[tokio::test]
 async fn refuses_a_live_ctrl_socket_with_no_matching_record() {
     let temp = tempdir().expect("tempdir");
     let runtime_dir = temp.path().join("hostapd");

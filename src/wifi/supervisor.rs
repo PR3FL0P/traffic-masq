@@ -855,6 +855,22 @@ impl HostapdSupervisor {
         ctrl_path: &Path,
     ) -> Result<PersistedWifiRecord, SupervisorError> {
         crate::wifi::process::check_radio_unblocked(&spec.interface).await?;
+        // Stopping our process does not reserve its pathname. A foreign
+        // endpoint appearing before restart must block every spawn path.
+        match tokio::fs::symlink_metadata(ctrl_path).await {
+            Ok(_) => {
+                return Err(SupervisorError::NotOwned {
+                    interface: spec.interface.clone(),
+                    diagnostics: crate::wifi::process::wifi_conflict_diagnostics(
+                        &spec.interface,
+                        ctrl_path,
+                    )
+                    .await,
+                })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(anyhow::Error::from(error).into()),
+        }
         write_config_file(rendered).await?;
         let store = self.record_store(&spec.interface);
         let launch_boot_id = self
