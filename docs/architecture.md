@@ -196,6 +196,41 @@ journals. In-flight storage and runtime workers retain their reservations until
 completion. If a request times out, the client must check the current state
 before retrying: the change may already have taken effect.
 
+### Interface lock ordering
+
+The interface coordinator and converger use the following acquisition orders.
+These are paths through the locking scheme; an operation need not acquire every
+lock listed:
+
+| Path | Acquisition order |
+| --- | --- |
+| Interface apply and credential compensation | Coordinator operation lock (read), per-interface transaction lock, shared runtime participation, interface runtime lane, credential reservation (read) |
+| Global transaction cleanup | Coordinator operation lock (write), then per-interface transaction locks as cleanup visits each transaction |
+| Normal interface convergence | Shared runtime reservation, per-PHY radio lock when present, interface runtime lane, subsystem/address mutation locks as needed |
+| Concurrent AP cleanup | Shared runtime reservation, per-PHY radio lock when present, parent runtime lane, AP runtime lane |
+| Interface recovery sweep | Shared runtime reservation, credential reservation (write), nonblocking per-interface transaction lock, interface runtime lane, subsystem/address mutation locks as needed |
+| Direct control mutation | Control admission, exclusive runtime execution, subsystem locks as needed |
+
+The recovery sweep deliberately reverses the credential/lane order used by
+transactions. Its safety depends on these rules:
+
+* Every transaction path that holds an interface lane while waiting for a
+  credential reservation retains that interface's transaction lock throughout.
+* Recovery uses `transaction_locks.try_lock` and skips an owned interface; it
+  must never wait for that transaction lock while holding the credential writer.
+* Ordinary convergence can hold a lane without the transaction lock, but does
+  not acquire a credential reservation while holding that lane.
+
+Consequently, recovery cannot wait for the lane of a transaction that is waiting
+for its credential writer. Preserve these rules when adding lane or credential
+users. The nonblocking skip also lets the converger continue driving live
+transactions. The implementation lives in
+`core::mutation::InterfaceMutationLocks::try_lock`,
+`core::transaction::recovery::retry_interface_recovery`, and
+`app::reconcile::reconcile_network_runtime_once`.
+
+### Other worker reservations
+
 Async nftables operations reserve execution before entering the blocking pool
 and transfer that reservation to the worker. Cancellation leaves the reservation
 with queued or running work until it finishes; observation, rollback, and

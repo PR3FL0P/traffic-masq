@@ -151,6 +151,9 @@ pub(crate) async fn retry_interface_recovery(
     }
     let store = open_interface_recovery_store(state_dir).await?;
     for name in names {
+        // The caller holds the credential writer. Never wait for a transaction
+        // that may hold its lane while waiting for a credential reader. Retain
+        // this transaction guard through lane release; see docs/architecture.md.
         let Some(_operation) = desired.transaction_locks.try_lock(&name).await else {
             continue;
         };

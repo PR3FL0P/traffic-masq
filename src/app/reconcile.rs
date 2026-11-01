@@ -397,6 +397,8 @@ pub(super) async fn reconcile_network_runtime_once<
         &effective.wifi_client.runtime_dir,
     );
     // Recovery restores current-format secrets under the same reservation as credential edits.
+    // This writer precedes interface lanes: recovery must skip transaction-owned
+    // scopes with try_lock. See docs/architecture.md, "Interface lock ordering".
     let credential_updates = desired.credential_updates.write().await;
     crate::core::transaction::retry_interface_recovery(
         desired.recovery(),

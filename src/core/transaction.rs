@@ -500,6 +500,9 @@ impl NetworkTransactionManager {
         let token = self.next_token();
         let desired = self.desired();
         let previous_config = desired.committed_interface(interface).await?;
+        // Retain _interface_operation while holding the lane and waiting here:
+        // recovery holds the credential writer and skips transaction-owned lanes.
+        // See docs/architecture.md, "Interface lock ordering".
         let credential_update = desired.credential_updates.clone().read_owned().await;
         let root = desired.state_dir().to_path_buf();
         let name = interface.to_owned();
