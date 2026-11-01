@@ -380,14 +380,18 @@ pub(super) async fn reconcile_network_runtime_once<
     wifi_client: Option<&C>,
     dhcp_client: Option<&L>,
 ) -> Result<BTreeMap<String, String>> {
-    crate::core::recovery::check_commit(desired.state_dir())?;
+    desired.recovery().check_commit(desired.state_dir())?;
     let pass_version = desired.version();
     let effective = desired.effective().await?;
     crate::wifi::policy::WifiRadioPolicy::validate(&effective.network, |name| {
         network.wireless_phy(name)
     })?;
     let mut failures: BTreeMap<String, String> = BTreeMap::new();
-    let interface_manager = InterfaceManager::new(network.clone(), journal.clone());
+    let interface_manager = InterfaceManager::new_with_mutation_locks(
+        network.clone(),
+        journal.clone(),
+        desired.recovery().address_locks(),
+    );
     let wifi_runtime_dirs = crate::wifi::WifiRuntimeDirs::new(
         &effective.wifi.runtime_dir,
         &effective.wifi_client.runtime_dir,
@@ -395,6 +399,7 @@ pub(super) async fn reconcile_network_runtime_once<
     // Recovery restores current-format secrets under the same reservation as credential edits.
     let credential_updates = desired.credential_updates.write().await;
     crate::core::transaction::retry_interface_recovery(
+        desired.recovery(),
         desired.state_dir(),
         &interface_manager,
         &desired.committed_overrides().await,
@@ -572,7 +577,9 @@ async fn reconcile_interface_runtime_once(
     }
     let revision = desired.interface_revision(name);
     let ensure_current = || -> Result<()> {
-        crate::core::recovery::check_scope(desired.state_dir(), Some(name))?;
+        desired
+            .recovery()
+            .check_scope(desired.state_dir(), Some(name))?;
         anyhow::ensure!(
             desired.interface_revision(name) == revision,
             "interface intent superseded"
@@ -580,7 +587,7 @@ async fn reconcile_interface_runtime_once(
         Ok(())
     };
     let outcome = async {
-        crate::core::recovery::check_commit(desired.state_dir())?;
+        desired.recovery().check_commit(desired.state_dir())?;
         let effective = desired.effective().await?;
         crate::wifi::policy::WifiRadioPolicy::validate(&effective.network, |name| {
             network.wireless_phy(name)
@@ -590,9 +597,15 @@ async fn reconcile_interface_runtime_once(
         };
         let management_allowlist = desired.management_allowlist().await;
         let restorations = desired.restorations().await;
-        let interface_manager = InterfaceManager::new(network.clone(), journal.clone());
+        let interface_manager = InterfaceManager::new_with_mutation_locks(
+            network.clone(),
+            journal.clone(),
+            desired.recovery().address_locks(),
+        );
         let result: Result<()> = async {
-            crate::core::recovery::check_scope(&effective.runtime.state_dir, Some(name))?;
+            desired
+                .recovery()
+                .check_scope(&effective.runtime.state_dir, Some(name))?;
             // Applying a candidate requires connectivity before confirmation.
             // Canceling it restores configuration, not the availability of an
             // external Wi-Fi network or DHCP server.
@@ -905,6 +918,7 @@ pub(super) fn spawn_runtime_network_reconcile(
     kernel_events: mpsc::UnboundedReceiver<KernelEvent>,
     shutdown: watch::Receiver<bool>,
 ) -> JoinHandle<Result<()>> {
+    let recovery_events = desired.recovery().subscribe();
     spawn_runtime_network_reconcile_with_recovery_events(
         desired,
         journal,
@@ -916,7 +930,7 @@ pub(super) fn spawn_runtime_network_reconcile(
         network_mutations,
         router,
         kernel_events,
-        crate::core::recovery::subscribe(),
+        recovery_events,
         shutdown,
     )
 }
@@ -1066,7 +1080,7 @@ pub(super) fn spawn_runtime_network_reconcile_with_recovery_events(
                 // I/O failures may clear without a kernel notification. Retry
                 // unresolved startup snapshots even while the network is quiet.
                 () = time::sleep(Duration::from_secs(30)),
-                    if !router_busy && !crate::core::recovery::blocked_interfaces(desired.state_dir()).is_empty() => { break; }
+                    if !router_busy && !desired.recovery().blocked_interfaces(desired.state_dir()).is_empty() => { break; }
                 () = async {
                     if let Some(router) = &router {
                         router.wait_until_idle().await;
@@ -1196,8 +1210,8 @@ pub(super) fn spawn_process_liveness_checks(
                     }
                     if let Ok((interface, pid)) = event {
                         let _network_mutation = network_mutations.execute().await;
-                    if crate::core::recovery::check_commit(&state_dir).is_err()
-                        || crate::core::recovery_control::check_runtime(&state_dir, None).is_err() { continue; }
+                    if desired.recovery().check_commit(&state_dir).is_err()
+                        || desired.recovery().check_runtime(&state_dir, None).is_err() { continue; }
                         if let Some(router) = &router {
                             if router.status().await != crate::core::router_transaction::CoordinatorStatus::Idle { continue; }
                         }
@@ -1229,8 +1243,8 @@ pub(super) fn spawn_process_liveness_checks(
                     // otherwise a DHCP/Wi-Fi readiness pass can replay state it
                     // observed just before a transaction converged.
                     let _network_mutation = network_mutations.execute().await;
-                    if crate::core::recovery::check_commit(&state_dir).is_err()
-                        || crate::core::recovery_control::check_runtime(&state_dir, None).is_err() { continue; }
+                    if desired.recovery().check_commit(&state_dir).is_err()
+                        || desired.recovery().check_runtime(&state_dir, None).is_err() { continue; }
                     let router_busy = match &router {
                         Some(router) => router.status().await
                             != crate::core::router_transaction::CoordinatorStatus::Idle,
@@ -1301,7 +1315,7 @@ pub(super) fn spawn_router_dataplane_integrity_checks(
                     // Take exclusive runtime execution so it cannot race interface
                     // convergence or another background repair pass.
                     let _network_mutation = network_mutations.execute().await;
-                    if crate::core::recovery::check_commit(desired.state_dir()).is_err() { continue; }
+                    if desired.recovery().check_commit(desired.state_dir()).is_err() { continue; }
                     let router_busy = match &router {
                         Some(router) => router.status().await
                             != crate::core::router_transaction::CoordinatorStatus::Idle,

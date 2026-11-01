@@ -3,7 +3,7 @@ use super::*;
 #[tokio::test]
 async fn uncommitted_journal_restores_prior_secret() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
+    let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path(), Default::default());
     let passphrases = PassphraseStore::new(temp.path().join("wifi/psk-ap"));
     let old = WifiPassphrase::new("old-password").expect("old");
     let new = WifiPassphrase::new("new-password").expect("new");
@@ -35,7 +35,7 @@ async fn uncommitted_journal_restores_prior_secret() {
 #[tokio::test]
 async fn committed_journal_keeps_new_secret() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
+    let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path(), Default::default());
     let passphrases = PassphraseStore::new(temp.path().join("wifi/psk-ap"));
     let old = WifiPassphrase::new("old-password").expect("old");
     let new = WifiPassphrase::new("new-password").expect("new");
@@ -63,7 +63,7 @@ async fn committed_journal_keeps_new_secret() {
 #[tokio::test]
 async fn reconvergence_restore_keeps_journal_until_explicit_completion() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
+    let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path(), Default::default());
     let passphrases = PassphraseStore::new(temp.path().join("wifi/psk-ap"));
     let old = WifiPassphrase::new("old-password").expect("old");
     let new = WifiPassphrase::new("new-password").expect("new");
@@ -100,7 +100,7 @@ async fn reconvergence_restore_keeps_journal_until_explicit_completion() {
 #[tokio::test]
 async fn restore_rejects_wrong_token_and_retains_journal_until_finish() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
+    let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path(), Default::default());
     let passphrases = PassphraseStore::new(temp.path().join("wifi/psk-ap"));
     let old = WifiPassphrase::new("old-password").expect("old");
     let new = WifiPassphrase::new("new-password").expect("new");
@@ -141,7 +141,7 @@ async fn restore_rejects_wrong_token_and_retains_journal_until_finish() {
 #[tokio::test]
 async fn committed_unknown_schema_is_retired_before_full_decode() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
+    let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path(), Default::default());
     let passphrases = PassphraseStore::new(temp.path().join("wifi/psk-ap"));
     let current = WifiPassphrase::new("current-password").expect("current");
     passphrases.set("wlan0", &current).expect("current write");
@@ -173,7 +173,7 @@ async fn committed_unknown_schema_is_retired_before_full_decode() {
 #[tokio::test]
 async fn uncommitted_unknown_schema_remains_operator_blocking() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
+    let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path(), Default::default());
     tokio::fs::create_dir_all(temp.path().join("wifi"))
         .await
         .expect("wifi dir");
@@ -201,7 +201,7 @@ async fn uncommitted_unknown_schema_remains_operator_blocking() {
 #[tokio::test]
 async fn missing_committed_token_never_proves_null_journal_token_committed() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
+    let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path(), Default::default());
     tokio::fs::create_dir_all(temp.path().join("wifi"))
         .await
         .expect("wifi dir");
@@ -223,7 +223,7 @@ async fn missing_committed_token_never_proves_null_journal_token_committed() {
 #[tokio::test]
 async fn malformed_json_never_infers_commit_from_token_text() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
+    let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path(), Default::default());
     tokio::fs::create_dir_all(temp.path().join("wifi"))
         .await
         .expect("wifi dir");
@@ -249,7 +249,7 @@ async fn malformed_json_never_infers_commit_from_token_text() {
 #[tokio::test]
 async fn router_secret_recovery_restores_each_role_without_touching_the_other() {
     let temp = tempfile::tempdir().unwrap();
-    let journal = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
+    let journal = ProvisioningSecretTransactionStore::in_state_dir(temp.path(), Default::default());
     let ap = PassphraseStore::for_role(temp.path(), WifiCredentialRole::Ap);
     let client = PassphraseStore::for_role(temp.path(), WifiCredentialRole::Client);
     ap.set("wlan0", &WifiPassphrase::new("ap-new-password").unwrap())
@@ -294,7 +294,7 @@ async fn router_secret_recovery_restores_each_role_without_touching_the_other() 
 #[tokio::test]
 async fn new_router_secret_journal_without_roles_is_rejected_and_retained() {
     let temp = tempfile::tempdir().unwrap();
-    let journal = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
+    let journal = ProvisioningSecretTransactionStore::in_state_dir(temp.path(), Default::default());
     std::fs::create_dir_all(temp.path().join("wifi")).unwrap();
     std::fs::write(
         &journal.journal,
@@ -309,7 +309,7 @@ async fn new_router_secret_journal_without_roles_is_rejected_and_retained() {
 #[tokio::test]
 async fn previous_secret_journal_schema_is_rejected_without_restoring_secrets() {
     let temp = tempfile::tempdir().unwrap();
-    let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path());
+    let store = ProvisioningSecretTransactionStore::in_state_dir(temp.path(), Default::default());
     std::fs::create_dir_all(temp.path().join("wifi")).unwrap();
     let bytes = br#"{"version":1,"previous":{"wlan0":"old-password"},"roles":{}}"#;
     std::fs::write(&store.journal, bytes).unwrap();

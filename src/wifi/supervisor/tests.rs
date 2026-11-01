@@ -246,6 +246,7 @@ async fn test_supervisor(
         .await
         .expect("create runtime dir");
     let inner = Inner {
+        recovery: Default::default(),
         client_runtime_dir: runtime_dir.join("client"),
         hostapd_binary: PathBuf::from("/usr/sbin/hostapd"),
         runtime_dir: runtime_dir.to_path_buf(),

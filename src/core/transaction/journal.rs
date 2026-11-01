@@ -126,12 +126,17 @@ pub(super) async fn enumerate_interface_recovery_journals(
 }
 
 pub(super) struct InterfaceJournalStore {
+    recovery: crate::core::recovery::RecoveryState,
     root: std::path::PathBuf,
 }
 
 impl InterfaceJournalStore {
-    pub(super) fn new(state_dir: &std::path::Path) -> Self {
+    pub(super) fn new(
+        state_dir: &std::path::Path,
+        recovery: crate::core::recovery::RecoveryState,
+    ) -> Self {
         Self {
+            recovery,
             root: state_dir.to_path_buf(),
         }
     }
@@ -148,7 +153,9 @@ impl InterfaceJournalStore {
         snapshot: InterfaceSnapshot,
         secret: Option<SecretSnapshot>,
     ) -> Result<()> {
-        crate::core::recovery::before_write(&self.path(&snapshot.name)).await?;
+        self.recovery
+            .before_write(&self.path(&snapshot.name))
+            .await?;
         let root = self.root.clone();
         let record = InterfaceJournal {
             version: 3,
@@ -173,6 +180,6 @@ impl InterfaceJournalStore {
     }
 
     pub(super) async fn retire(&self, interface: &str) -> Result<()> {
-        crate::core::recovery::retire(&self.path(interface)).await
+        self.recovery.retire(&self.path(interface)).await
     }
 }

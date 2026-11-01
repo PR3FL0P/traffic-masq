@@ -94,6 +94,22 @@ and builds a plan. It changes only resources it owns. Runtime overrides are
 merged with the file configuration each time, so an earlier override does not
 become the base for the next one.
 
+Recovery bookkeeping is owned by a `RecoveryState` created for each daemon
+session before startup recovery. The runtime override manager retains that
+handle; desired state, both transaction coordinators, supervisors, secret and
+interface journal stores, reconciliation, and shutdown use clones or references
+to the same context. Cleanup receipts, interface blocks, commit fences, recovery
+budgets, I/O locks, and notifications have no process-global registry. Paths
+identify scopes within a context, rather than identifying a daemon implicitly.
+New contexts do not inherit volatile fences even when paths are identical;
+persisted journals and recovery control records still survive a restart.
+
+Address writers in the daemon explicitly share the context's per-interface
+mutation locks, including embedded DHCP callbacks. Standalone constructors use
+independent state; callers composing a runtime must pass its shared context and
+locks. Cleanup retries hold a weak session reference while waiting, so they do
+not keep an abandoned session alive.
+
 Interface and router changes use commit-confirm transactions. Before applying
 one, the daemon persists the rollback state it needs; router transactions keep a
 full snapshot until the user commits the change or rollback succeeds. A commit

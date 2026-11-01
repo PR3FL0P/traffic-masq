@@ -51,7 +51,9 @@ pub(super) async fn apply_vpn_policy_startup<E: NftExecutor>(
     // before this startup hook, so touching legacy policy here would mutate a
     // just-recovered chain outside the router transaction coordinator. The
     // periodic integrity path has the same coexistence guard.
-    if crate::core::recovery_control::preservation_required(&effective_config.runtime.state_dir)
+    if overrides
+        .recovery()
+        .preservation_required(&effective_config.runtime.state_dir)
         || !effective_config.vpn.enabled
         || effective_config.vpn.standalone.is_some()
         || !effective_config.router.vpn_chain.is_empty()

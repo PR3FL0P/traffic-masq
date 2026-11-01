@@ -25,6 +25,7 @@ use crate::state::overrides::{InterfaceOverride, RuntimeOverrideStore, RuntimeOv
 /// failed write with failed compensation. Never let a timer guess it aborted.
 struct CommitPersistenceGuard<'a> {
     root: &'a std::path::Path,
+    recovery: &'a crate::core::recovery::RecoveryState,
     armed: bool,
     settings_only: bool,
 }
@@ -32,9 +33,9 @@ struct CommitPersistenceGuard<'a> {
 impl CommitPersistenceGuard<'_> {
     fn fence(&self, reason: String) {
         if self.settings_only {
-            crate::core::recovery::fence_settings(self.root, reason);
+            self.recovery.fence_settings(self.root, reason);
         } else {
-            crate::core::recovery::fence_commit(self.root, reason);
+            self.recovery.fence_commit(self.root, reason);
         }
     }
 }
@@ -49,6 +50,7 @@ impl Drop for CommitPersistenceGuard<'_> {
 
 #[derive(Debug, Clone)]
 pub struct RuntimeOverrideManager {
+    recovery: crate::core::recovery::RecoveryState,
     store: RuntimeOverrideStore,
     base: AppConfig,
     state: Arc<Mutex<RuntimeOverrides>>,
@@ -61,8 +63,22 @@ pub struct RuntimeOverrideManager {
 }
 
 impl RuntimeOverrideManager {
-    /// Load persisted overrides and reject configurations that cannot form valid router intent.
+    pub fn recovery(&self) -> &crate::core::recovery::RecoveryState {
+        &self.recovery
+    }
+
+    /// Start an independent recovery session and load validated persisted overrides.
+    /// Clone this manager to share its recovery fences with runtime participants.
     pub async fn load(state_dir: impl AsRef<Path>, base: &AppConfig) -> Result<Self> {
+        Self::load_with_recovery(Default::default(), state_dir, base).await
+    }
+
+    /// Load validated overrides into an explicitly shared daemon recovery session.
+    pub async fn load_with_recovery(
+        recovery: crate::core::recovery::RecoveryState,
+        state_dir: impl AsRef<Path>,
+        base: &AppConfig,
+    ) -> Result<Self> {
         let store = RuntimeOverrideStore::in_state_dir(state_dir);
         let state = store.load().await?;
         validate_candidate(&state, base).with_context(|| {
@@ -72,6 +88,7 @@ impl RuntimeOverrideManager {
             )
         })?;
         Ok(Self {
+            recovery,
             store,
             base: base.clone(),
             state: Arc::new(Mutex::new(state)),
@@ -93,7 +110,13 @@ impl RuntimeOverrideManager {
         let store = RuntimeOverrideStore::in_state_dir(state_dir);
         let proof = store.load_recovery_commit_proof().await?;
         let committed_router_transaction = proof.committed_router_transaction()?;
-        Self::from_router_recovery_proof(store, base, &proof, committed_router_transaction)
+        Self::from_router_recovery_proof(
+            Default::default(),
+            store,
+            base,
+            &proof,
+            committed_router_transaction,
+        )
     }
 
     /// Build a recovery manager from an already-inspected proof envelope.
@@ -101,6 +124,7 @@ impl RuntimeOverrideManager {
     /// The router commit token is supplied separately so another proof field can fail without
     /// forcing startup to reparse or conflate recovery scopes.
     pub(crate) fn from_router_recovery_proof(
+        recovery: crate::core::recovery::RecoveryState,
         store: RuntimeOverrideStore,
         base: &AppConfig,
         proof: &crate::state::overrides::RecoveryCommitProof,
@@ -109,6 +133,7 @@ impl RuntimeOverrideManager {
         let state =
             proof.router_recovery_overrides_with_commit_token(committed_router_transaction)?;
         Ok(Self {
+            recovery,
             store,
             base: base.clone(),
             state: Arc::new(Mutex::new(state)),
@@ -235,7 +260,7 @@ impl RuntimeOverrideManager {
             .path()
             .parent()
             .expect("override state directory");
-        crate::core::recovery::check_persistence(root)?;
+        self.recovery.check_persistence(root)?;
         let mut candidate = candidate.normalized()?;
         validate_candidate(&candidate, &self.base)?;
         candidate.revision = state
@@ -255,6 +280,7 @@ impl RuntimeOverrideManager {
                 || candidate.dhcp_dns_defaults != state.dhcp_dns_defaults);
         let mut guard = CommitPersistenceGuard {
             root,
+            recovery: &self.recovery,
             armed: true,
             settings_only,
         };

@@ -52,12 +52,15 @@ impl ControlService {
                 _ => None,
             };
             let admitted = match retry_journal {
-                Some(path) => crate::core::recovery::check_rollback_scope(
+                Some(path) => self.overrides.recovery().check_rollback_scope(
                     &self.config.runtime.state_dir,
                     scope,
                     &path,
                 ),
-                None => crate::core::recovery::check_scope(&self.config.runtime.state_dir, scope),
+                None => self
+                    .overrides
+                    .recovery()
+                    .check_scope(&self.config.runtime.state_dir, scope),
             };
             if let Err(error) = admitted {
                 return Response::Error {
@@ -73,8 +76,7 @@ impl ControlService {
                 // request handlers provide the appropriate typed errors.
                 if router.status().await == CoordinatorStatus::Idle {
                     let secrets = crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore::in_state_dir(
-                        &self.config.runtime.state_dir,
-                    );
+                        &self.config.runtime.state_dir, self.overrides.recovery().clone());
                     let committed_token =
                         self.overrides.snapshot().await.committed_router_transaction;
                     match secrets

@@ -187,7 +187,7 @@ fn repro_activating_saved_wifi_must_not_freeze_other_operator_requests() {
         // Only preflight uses this executable; runtime Wi-Fi is the fixture's
         // process adapter, so no host supplicant or wireless device is touched.
         config.wifi_client.wpa_supplicant_binary = "/bin/true".into();
-        let supervisor = WifiClientSupervisor::open_for_recovery(&config);
+        let supervisor = WifiClientSupervisor::open_for_recovery(Default::default(), &config);
         fixture.service = service_with_network(&fixture, fixture.network.clone())
             .await
             .with_wifi_client_supervisor(supervisor);

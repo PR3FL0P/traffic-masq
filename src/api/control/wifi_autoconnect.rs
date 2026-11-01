@@ -103,14 +103,16 @@ impl ControlService {
             // eligibility only after admission: a queued pass must not act on
             // an association timeout superseded by a newer control operation.
             let _network_mutation = self.network_mutations.write().await;
-            if crate::core::recovery::check_scope(&self.config.runtime.state_dir, Some(name))
+            if self
+                .overrides
+                .recovery()
+                .check_scope(&self.config.runtime.state_dir, Some(name))
                 .is_err()
             {
                 continue;
             }
             let secrets = crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore::in_state_dir(
-                &self.config.runtime.state_dir,
-            );
+                &self.config.runtime.state_dir, self.overrides.recovery().clone());
             let committed_token = self.overrides.snapshot().await.committed_router_transaction;
             if secrets
                 .unresolved_after_committed_cleanup(committed_token.as_deref())

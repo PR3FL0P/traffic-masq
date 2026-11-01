@@ -16,6 +16,7 @@ const JOURNAL_FILE: &str = "router-provisioning-secrets.json";
 
 #[derive(Clone)]
 pub struct ProvisioningSecretTransactionStore {
+    recovery: crate::core::recovery::RecoveryState,
     journal: PathBuf,
     state_dir: PathBuf,
 }
@@ -45,9 +46,13 @@ impl Drop for ProvisioningSecretJournal {
 }
 
 impl ProvisioningSecretTransactionStore {
-    pub fn in_state_dir(state_dir: impl AsRef<Path>) -> Self {
+    pub fn in_state_dir(
+        state_dir: impl AsRef<Path>,
+        recovery: crate::core::recovery::RecoveryState,
+    ) -> Self {
         let wifi_dir = state_dir.as_ref().join("wifi");
         Self {
+            recovery,
             journal: wifi_dir.join(JOURNAL_FILE),
             state_dir: state_dir.as_ref().to_path_buf(),
         }
@@ -276,8 +281,8 @@ impl ProvisioningSecretTransactionStore {
                 })
             }
         });
-        if crate::core::recovery::completed(&self.journal, &bytes).await? {
-            crate::core::recovery::retire(&self.journal).await?;
+        if self.recovery.completed(&self.journal, &bytes).await? {
+            self.recovery.retire(&self.journal).await?;
             return Ok(None);
         }
         Ok(Some(bytes))
@@ -329,7 +334,7 @@ impl ProvisioningSecretTransactionStore {
     }
 
     async fn save(&self, journal: &ProvisioningSecretJournal) -> Result<()> {
-        crate::core::recovery::before_write(&self.journal).await?;
+        self.recovery.before_write(&self.journal).await?;
         let parent = self
             .journal
             .parent()
@@ -353,7 +358,7 @@ impl ProvisioningSecretTransactionStore {
     }
 
     async fn clear(&self) -> Result<()> {
-        crate::core::recovery::retire(&self.journal).await
+        self.recovery.retire(&self.journal).await
     }
 }
 

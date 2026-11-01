@@ -411,6 +411,7 @@ async fn restart_removes_unconfirmed_address_on_previously_unmanaged_interface()
         .await
         .contains(&interface_config(PROPOSED).ipv4.unwrap().addr()));
     recover_interface_transactions(
+        transactions.recovery(),
         directory.path(),
         &interfaces,
         &Default::default(),
@@ -452,6 +453,7 @@ async fn independently_blocked_interface_is_not_rolled_back_by_transaction_recov
     let excluded = std::collections::BTreeSet::from(["test0".to_string()]);
 
     recover_interface_transactions_with_commit_tokens_excluding(
+        transactions.recovery(),
         directory.path(),
         &interfaces,
         &Default::default(),
@@ -498,6 +500,7 @@ async fn restart_keeps_address_whose_commit_token_was_persisted() {
         .committed_interface_transactions
         .insert("test0".into(), "confirmed".into());
     recover_interface_transactions(
+        transactions.recovery(),
         directory.path(),
         &interfaces,
         &committed,
@@ -510,6 +513,7 @@ async fn restart_keeps_address_whose_commit_token_was_persisted() {
 
 #[tokio::test]
 async fn committed_invalid_interface_schema_is_retired_without_rollback() {
+    let recovery = crate::core::recovery::RecoveryState::default();
     let directory = tempdir().unwrap();
     let provider = fake_network();
     let interfaces = InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory());
@@ -538,6 +542,7 @@ async fn committed_invalid_interface_schema_is_retired_without_rollback() {
         .insert("test0".into(), "confirmed".into());
 
     recover_interface_transactions(
+        &recovery,
         directory.path(),
         &interfaces,
         &committed,
@@ -548,7 +553,9 @@ async fn committed_invalid_interface_schema_is_retired_without_rollback() {
 
     assert_eq!(addresses(&provider).await, before);
     assert!(!journal.exists());
-    assert!(crate::core::recovery::check_scope(directory.path(), Some("test0")).is_ok());
+    assert!(recovery
+        .check_scope(directory.path(), Some("test0"))
+        .is_ok());
 }
 
 #[tokio::test]
@@ -1194,6 +1201,7 @@ async fn corrupt_interface_journal_does_not_prevent_another_recovery() {
     .await
     .unwrap();
     recover_interface_transactions(
+        transactions.recovery(),
         directory.path(),
         &interfaces,
         &Default::default(),
@@ -1201,8 +1209,14 @@ async fn corrupt_interface_journal_does_not_prevent_another_recovery() {
     )
     .await
     .unwrap();
-    assert!(crate::core::recovery::check_scope(directory.path(), Some("bad0")).is_err());
-    assert!(crate::core::recovery::check_scope(directory.path(), Some("test0")).is_ok());
+    assert!(transactions
+        .recovery()
+        .check_scope(directory.path(), Some("bad0"))
+        .is_err());
+    assert!(transactions
+        .recovery()
+        .check_scope(directory.path(), Some("test0"))
+        .is_ok());
     assert!(!directory
         .path()
         .join("interface-transactions/test0.json")
@@ -1212,6 +1226,7 @@ async fn corrupt_interface_journal_does_not_prevent_another_recovery() {
         .join("interface-transactions/bad0.json")
         .exists());
     recover_interface_transactions(
+        transactions.recovery(),
         directory.path(),
         &interfaces,
         &Default::default(),
@@ -1496,7 +1511,10 @@ async fn indeterminate_commit_blocks_manual_timer_and_shutdown_rollback() {
         .path()
         .join("interface-transactions/test0.json")
         .exists());
-    assert!(crate::core::recovery::check_scope(directory.path(), Some("other0")).is_err());
+    assert!(manager
+        .recovery()
+        .check_scope(directory.path(), Some("other0"))
+        .is_err());
     converger.abort();
 }
 
@@ -1659,6 +1677,7 @@ async fn role_switch_rollback_and_crash_recovery_restore_only_the_target_namespa
             );
             if crash {
                 recover_interface_transactions(
+                    manager.recovery(),
                     directory.path(),
                     &interfaces,
                     &Default::default(),
@@ -1747,16 +1766,19 @@ async fn stopped_interface_recovery_is_rechecked_and_completed_on_restart() {
         .await
         .unwrap();
     let path = manager.journal_path("test0");
-    recovery_control::run::<(), _>(&path, false, async {
-        Err(recovery_control::failure(
-            recovery_control::FailureKind::Conflict,
-            "external change",
-        ))
-    })
-    .await
-    .unwrap_err();
-    recovery_control::forget(&path);
+    manager
+        .recovery()
+        .run::<(), _>(&path, false, async {
+            Err(recovery_control::failure(
+                recovery_control::FailureKind::Conflict,
+                "external change",
+            ))
+        })
+        .await
+        .unwrap_err();
+    manager.recovery().forget(&path);
     recover_interface_transactions(
+        manager.recovery(),
         directory.path(),
         &interfaces,
         &crate::state::overrides::RuntimeOverrides::default(),
@@ -1764,10 +1786,13 @@ async fn stopped_interface_recovery_is_rechecked_and_completed_on_restart() {
     )
     .await
     .unwrap();
-    assert!(!recovery_control::stopped(&path));
+    assert!(!manager.recovery().stopped(&path));
     let restarted =
         NetworkTransactionManager::new_detached(interfaces, Duration::from_secs(3600), desired);
     assert!(!path.exists());
     assert!(restarted.pending().await.is_empty());
-    assert!(crate::core::recovery::check_scope(directory.path(), Some("test0")).is_ok());
+    assert!(manager
+        .recovery()
+        .check_scope(directory.path(), Some("test0"))
+        .is_ok());
 }

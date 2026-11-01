@@ -92,7 +92,7 @@ impl ControlService {
         let coordinator = router.view().await;
         let status = coordinator.status();
         let recovery = router_recovery_notice(status, coordinator.failures()).map(|mut notice| {
-            notice.recovery_progress = crate::core::recovery_control::progress(
+            notice.recovery_progress = self.overrides.recovery().progress(
                 &self
                     .config
                     .runtime
@@ -505,7 +505,7 @@ impl ControlService {
         ))
         .then(|| coordinator.rollback_failures.clone());
         let recovery = router_recovery_notice(status, coordinator.failures()).map(|mut notice| {
-            notice.recovery_progress = crate::core::recovery_control::progress(
+            notice.recovery_progress = self.overrides.recovery().progress(
                 &self
                     .config
                     .runtime

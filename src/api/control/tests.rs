@@ -4218,8 +4218,7 @@ async fn autoconnect_does_not_launch_a_scan_during_secret_recovery() {
         .unwrap();
     let next_pid = fixture.process.next_pid.load(WifiOrdering::Relaxed);
     let secrets = crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore::in_state_dir(
-        &fixture.service.config.runtime.state_dir,
-    );
+        &fixture.service.config.runtime.state_dir, fixture.service.overrides.recovery().clone());
     secrets
         .stage(std::collections::BTreeMap::from([(
             "wlan1".into(),
@@ -5253,6 +5252,7 @@ async fn interrupted_dhcp_route_policy_is_recovered_from_committed_intent() {
     // Startup restores the interface journal before DHCP ownership recovery
     // and reconfiguration from the last committed policy.
     crate::core::transaction::recover_interface_transactions(
+        fixture.overrides.recovery(),
         fixture.directory.path(),
         &manager,
         &committed,
@@ -7180,7 +7180,11 @@ async fn unrelated_recovery_does_not_block_interface_commit_or_rollback() {
         .unwrap();
     let dhcp = DhcpSupervisor::start(&config).await.unwrap();
     let service = ControlService::new_detached(config, network, dhcp, overrides.clone());
-    crate::core::recovery::block_interface(directory.path(), "wlan0", "invalid snapshot".into());
+    service.overrides.recovery().block_interface(
+        directory.path(),
+        "wlan0",
+        "invalid snapshot".into(),
+    );
 
     for commit in [true, false] {
         let token = match service
@@ -7195,7 +7199,7 @@ async fn unrelated_recovery_does_not_block_interface_commit_or_rollback() {
             other => panic!("apply rejected: {other:?}"),
         };
         // A block on this transaction's own interface must still be enforced.
-        crate::core::recovery::block_interface(
+        service.overrides.recovery().block_interface(
             directory.path(),
             "eth0",
             "recovery required".into(),
@@ -7213,7 +7217,10 @@ async fn unrelated_recovery_does_not_block_interface_commit_or_rollback() {
             service.dispatch(request).await,
             Response::Error { .. }
         ));
-        crate::core::recovery::unblock_interface(directory.path(), "eth0");
+        service
+            .overrides
+            .recovery()
+            .unblock_interface(directory.path(), "eth0");
         let response = service
             .dispatch(if commit {
                 Request::CommitNetworkChange { token }
@@ -7640,7 +7647,7 @@ async fn queued_autoconnect_observes_commit_fence_after_admission() {
     assert!(tokio::time::timeout(Duration::from_millis(50), &mut pass)
         .await
         .is_err());
-    crate::core::recovery::fence_commit(
+    fixture.service.overrides.recovery().fence_commit(
         &fixture.service.config.runtime.state_dir,
         "commit failed while autoconnect waited for admission".into(),
     );
@@ -7673,7 +7680,7 @@ async fn settings_writes_wait_for_network_execution_and_observe_commit_fence() {
                 .is_err(),
             "settings must not write shared intent during runtime execution"
         );
-        crate::core::recovery::fence_commit(
+        fixture.service.overrides.recovery().fence_commit(
             &fixture.service.config.runtime.state_dir,
             "uncertain network commit".into(),
         );
@@ -8049,13 +8056,16 @@ async fn explicit_router_retry_bypasses_only_its_own_persisted_stop() {
         response => panic!("unexpected response: {response:?}"),
     };
     let journal = directory.path().join("router-transaction.json");
-    crate::core::recovery_control::stop(
-        &journal,
-        crate::core::recovery_control::FailureKind::Conflict,
-        "external conflict",
-    )
-    .await
-    .unwrap();
+    service
+        .overrides
+        .recovery()
+        .stop(
+            &journal,
+            crate::core::recovery_control::FailureKind::Conflict,
+            "external conflict",
+        )
+        .await
+        .unwrap();
     match service.dispatch(Request::RouterPendingTransaction).await {
         Response::RouterPendingTransaction {
             status,
@@ -8380,7 +8390,7 @@ async fn offline_intent_respects_interface_recovery_fence() {
         dhcp,
         overrides.clone(),
     );
-    crate::core::recovery::block_interface(
+    service.overrides.recovery().block_interface(
         directory.path(),
         "lan0",
         "retained transaction proof".into(),
@@ -8391,7 +8401,10 @@ async fn offline_intent_respects_interface_recovery_fence() {
             expected_revision: 0,
         })
         .await;
-    crate::core::recovery::unblock_interface(directory.path(), "lan0");
+    service
+        .overrides
+        .recovery()
+        .unblock_interface(directory.path(), "lan0");
     assert!(matches!(response, Response::Error { .. }), "{response:?}");
     assert_eq!(overrides.committed_revision().await, 0);
     assert!(overrides
@@ -8987,6 +9000,7 @@ async fn unplugged_client_with_exited_unadopted_record_can_save_offline_intent()
             // record survives and startup skips adoption of the absent NIC.
             fixture.process.terminate(status.pid).await.unwrap();
             let runtime = ClientSupervisor::open_with_process_for_recovery(
+                fixture.service.overrides.recovery().clone(),
                 &fixture.service.config,
                 fixture.process.clone(),
             );
@@ -9083,6 +9097,7 @@ async fn unplugged_ap_with_exited_unadopted_record_can_be_forgotten() {
     fixture.network.interfaces.lock().await.remove("wlan0");
     fixture.process.terminate(pid).await.unwrap();
     fixture.service.wifi = Some(WifiSupervisor::open_with_process_for_recovery(
+        fixture.service.overrides.recovery().clone(),
         &fixture.service.config,
         fixture.process.clone(),
     ));
@@ -9138,6 +9153,7 @@ async fn unplugged_client_unadopted_record_retains_intent_for_live_process_or_fo
             )
         };
         fixture.service.wifi_client = Some(ClientSupervisor::open_with_process_for_recovery(
+            fixture.service.overrides.recovery().clone(),
             &fixture.service.config,
             fixture.process.clone(),
         ));
@@ -9277,6 +9293,7 @@ async fn unplugged_ap_orphaned_or_interrupted_ownership_cannot_be_forgotten() {
         } else {
             // Reopen without task adoption: the durable process record remains.
             fixture.service.wifi = Some(WifiSupervisor::open_with_process_for_recovery(
+                fixture.service.overrides.recovery().clone(),
                 &fixture.service.config,
                 fixture.process.clone(),
             ));

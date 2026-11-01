@@ -51,7 +51,8 @@ pub(crate) async fn apply(
         }
     }
 
-    let secret_tx = ProvisioningSecretTransactionStore::in_state_dir(state_dir);
+    let secret_tx =
+        ProvisioningSecretTransactionStore::in_state_dir(state_dir, overrides.recovery().clone());
     secret_tx.stage(previous).await.map_err(|e| {
         ProvisioningApplyError::Other(e.context("failed to open provisioning secret transaction"))
     })?;

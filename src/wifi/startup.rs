@@ -29,19 +29,29 @@ async fn preflight_wpa_supplicant_binary(binary: &Path) -> Result<()> {
 
 /// Start AP supervision, using `wifi.enabled` only as a startup binary-check hint.
 /// The supervisor exists even when Wi-Fi is initially disabled so it can be enabled later.
-pub(crate) async fn start_ap(config: &AppConfig) -> Result<HostapdSupervisor> {
+pub(crate) async fn start_ap(
+    recovery: crate::core::recovery::RecoveryState,
+    config: &AppConfig,
+) -> Result<HostapdSupervisor> {
     if config.wifi.enabled {
         preflight_hostapd_binary(&config.wifi.hostapd_binary).await?;
     }
-    Ok(HostapdSupervisor::start(config).await?)
+    let supervisor = HostapdSupervisor::open_for_recovery(recovery, config);
+    supervisor.reconcile_startup(config).await?;
+    Ok(supervisor)
 }
 
 /// Start station supervision, retaining the same runtime-enable behavior as AP supervision.
-pub(crate) async fn start_client(config: &AppConfig) -> Result<WifiClientSupervisor> {
+pub(crate) async fn start_client(
+    recovery: crate::core::recovery::RecoveryState,
+    config: &AppConfig,
+) -> Result<WifiClientSupervisor> {
     if config.wifi_client.enabled {
         preflight_wpa_supplicant_binary(&config.wifi_client.wpa_supplicant_binary).await?;
     }
-    Ok(WifiClientSupervisor::start(config).await?)
+    let supervisor = WifiClientSupervisor::open_for_recovery(recovery, config);
+    supervisor.reconcile_startup(config).await?;
+    Ok(supervisor)
 }
 
 #[cfg(test)]
@@ -82,7 +92,7 @@ mod tests {
         config.wifi.enabled = false;
         config.wifi.hostapd_binary = "/definitely/not/a/real/hostapd".into();
 
-        let supervisor = start_ap(&config)
+        let supervisor = start_ap(Default::default(), &config)
             .await
             .expect("a missing binary must not fail startup while Wi-Fi is off");
 
@@ -98,7 +108,10 @@ mod tests {
         config.wifi.enabled = true;
         config.wifi.hostapd_binary = "/definitely/not/a/real/hostapd".into();
 
-        let error = start_ap(&config).await.err().expect("hostapd must fail");
+        let error = start_ap(Default::default(), &config)
+            .await
+            .err()
+            .expect("hostapd must fail");
         assert!(error.to_string().contains("hostapd"), "{error:#}");
     }
 
@@ -109,7 +122,7 @@ mod tests {
         config.runtime.state_dir = directory.path().join("state");
         config.wifi.enabled = true;
         config.wifi.hostapd_binary = "/bin/true".into();
-        start_ap(&config)
+        start_ap(Default::default(), &config)
             .await
             .expect("only hostapd is probed at startup");
     }
@@ -122,7 +135,7 @@ mod tests {
         config.wifi_client.enabled = false;
         config.wifi_client.wpa_supplicant_binary = "/definitely/not/a/real/wpa_supplicant".into();
 
-        let supervisor = start_client(&config)
+        let supervisor = start_client(Default::default(), &config)
             .await
             .expect("a missing binary must not fail startup while the client is off");
 
@@ -135,7 +148,7 @@ mod tests {
         config.wifi_client.enabled = true;
         config.wifi_client.wpa_supplicant_binary = "/definitely/not/a/real/wpa_supplicant".into();
 
-        let error = start_client(&config)
+        let error = start_client(Default::default(), &config)
             .await
             .err()
             .expect("wpa_supplicant must fail");

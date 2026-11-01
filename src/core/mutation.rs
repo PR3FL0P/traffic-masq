@@ -1,31 +1,19 @@
 //! Admission and runtime execution are separate: a transaction may wait for
 //! convergence while keeping other requests out, without locking its worker out.
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Weak};
 
 use tokio::sync::{
     Mutex, MutexGuard, OwnedMutexGuard, OwnedRwLockReadGuard, RwLock, RwLockReadGuard,
     RwLockWriteGuard,
 };
 
-#[derive(Clone, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct InterfaceMutationLocks {
     locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl InterfaceMutationLocks {
-    /// Process-wide per-interface serialization for kernel address ownership.
-    ///
-    /// Interface managers and the embedded DHCP client use separate runtime
-    /// objects (and sometimes separate netlink sockets) but mutate the same
-    /// kernel resources. A shared registry keeps those writers serialized
-    /// without involving the control-plane mutation gate, which DHCP callbacks
-    /// cannot safely acquire while router apply is waiting for lease readiness.
-    pub fn global() -> Self {
-        static GLOBAL: OnceLock<InterfaceMutationLocks> = OnceLock::new();
-        GLOBAL.get_or_init(Self::default).clone()
-    }
-
     /// Serialize mutations of one interface until the returned guard is dropped.
     /// Other interfaces can acquire their own locks independently.
     pub async fn lock(&self, interface: &str) -> OwnedMutexGuard<()> {

@@ -3,10 +3,11 @@
 //! Control records are bound to the exact immutable snapshot journal. An attempt
 //! is persisted before mutation; interruption requires an explicit retry. Commit
 //! proof and completion receipts must be checked before consulting this policy.
+use super::recovery::RecoveryState;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -178,49 +179,55 @@ struct Control {
     last_error: String,
 }
 
-fn controls() -> &'static Mutex<BTreeMap<PathBuf, Control>> {
-    static CONTROLS: OnceLock<Mutex<BTreeMap<PathBuf, Control>>> = OnceLock::new();
-    CONTROLS.get_or_init(Mutex::default)
+#[derive(Debug, Default)]
+pub(super) struct ControlState {
+    controls: Mutex<BTreeMap<PathBuf, Control>>,
+    deadlines: Mutex<BTreeMap<PathBuf, tokio::time::Instant>>,
+    locks: Mutex<BTreeMap<PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>>,
 }
 
-fn deadlines() -> &'static Mutex<BTreeMap<PathBuf, tokio::time::Instant>> {
-    static DEADLINES: OnceLock<Mutex<BTreeMap<PathBuf, tokio::time::Instant>>> = OnceLock::new();
-    DEADLINES.get_or_init(Mutex::default)
-}
+impl RecoveryState {
+    fn io_lock(&self, journal: &Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        self.inner
+            .control
+            .locks
+            .lock()
+            .expect("recovery I/O lock registry")
+            .entry(journal.to_owned())
+            .or_default()
+            .clone()
+    }
 
-fn io_lock(journal: &Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
-    static LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>>> =
-        OnceLock::new();
-    LOCKS
-        .get_or_init(Mutex::default)
-        .lock()
-        .expect("recovery I/O lock registry")
-        .entry(journal.to_owned())
-        .or_default()
-        .clone()
-}
-
-/// The owned reservation stays inside the blocking worker if its caller is
-/// cancelled. An old unlink can never race a newer persisted stop decision.
-pub async fn remove_control(journal: &Path) -> Result<()> {
-    let reservation = io_lock(journal).lock_owned().await;
-    let path = control_path(journal);
-    tokio::task::spawn_blocking(move || {
-        let _reservation = reservation;
-        crate::atomic_file::remove_preserving_on_error(&path, crate::atomic_file::PRIVATE_FILE_MODE)
-    })
-    .await??;
-    Ok(())
+    /// The owned reservation stays inside the blocking worker if its caller is
+    /// cancelled. An old unlink can never race a newer persisted stop decision.
+    pub async fn remove_control(&self, journal: &Path) -> Result<()> {
+        let reservation = self.io_lock(journal).lock_owned().await;
+        let path = control_path(journal);
+        tokio::task::spawn_blocking(move || {
+            let _reservation = reservation;
+            crate::atomic_file::remove_preserving_on_error(
+                &path,
+                crate::atomic_file::PRIVATE_FILE_MODE,
+            )
+        })
+        .await??;
+        Ok(())
+    }
 }
 
 struct AttemptGuard {
+    state: RecoveryState,
     path: PathBuf,
     armed: bool,
 }
 impl Drop for AttemptGuard {
     fn drop(&mut self) {
         if self.armed {
-            if let Some(control) = controls()
+            if let Some(control) = self
+                .state
+                .inner
+                .control
+                .controls
                 .lock()
                 .expect("recovery control lock")
                 .get_mut(&self.path)
@@ -238,87 +245,99 @@ pub struct ApplyGuard {
     guard: AttemptGuard,
 }
 
-pub async fn begin_apply(journal: &Path) -> Result<ApplyGuard> {
-    let mut control = Control {
-        version: 1,
-        journal_digest: digest(journal).await?,
-        phase: Phase::Attempting,
-        attempts: 0,
-        deadline_unix: now().saturating_add(RECOVERY_TIMEOUT.as_secs()),
-        failure_kind: FailureKind::Unknown,
-        last_error: "application interrupted before confirmation bookkeeping".into(),
-    };
-    let mut guard = AttemptGuard {
-        path: journal.to_owned(),
-        armed: true,
-    };
-    if let Err(error) = save(journal, &control).await {
-        guard.armed = false;
-        control.phase = Phase::Stopped;
-        control.failure_kind = FailureKind::Storage;
-        control.last_error = format!("{error:#}");
-        controls()
-            .lock()
-            .expect("recovery control lock")
-            .insert(journal.to_owned(), control);
-        return Err(error);
+impl RecoveryState {
+    pub async fn begin_apply(&self, journal: &Path) -> Result<ApplyGuard> {
+        let mut control = Control {
+            version: 1,
+            journal_digest: digest(journal).await?,
+            phase: Phase::Attempting,
+            attempts: 0,
+            deadline_unix: now().saturating_add(RECOVERY_TIMEOUT.as_secs()),
+            failure_kind: FailureKind::Unknown,
+            last_error: "application interrupted before confirmation bookkeeping".into(),
+        };
+        let mut guard = AttemptGuard {
+            state: self.clone(),
+            path: journal.to_owned(),
+            armed: true,
+        };
+        if let Err(error) = self.save(journal, &control).await {
+            guard.armed = false;
+            control.phase = Phase::Stopped;
+            control.failure_kind = FailureKind::Storage;
+            control.last_error = format!("{error:#}");
+            self.inner
+                .control
+                .controls
+                .lock()
+                .expect("recovery control lock")
+                .insert(journal.to_owned(), control);
+            return Err(error);
+        }
+        Ok(ApplyGuard { guard })
     }
-    Ok(ApplyGuard { guard })
 }
 
 impl ApplyGuard {
     /// A known apply outcome lets normal confirmation/compensation take over.
     pub async fn finish(mut self) -> Result<()> {
-        remove_control(&self.guard.path).await?;
-        forget(&self.guard.path);
+        self.guard.state.remove_control(&self.guard.path).await?;
+        self.guard.state.forget(&self.guard.path);
         self.guard.armed = false;
         Ok(())
     }
 }
 
-/// Transfer a cancelled, locally owned apply to compensation. Only the apply
-/// owner may call this after releasing its runtime work and taking the scope
-/// lock. Never renew a recovery attempt or clear a storage/conflict stop.
-pub(crate) async fn compensate_cancelled_apply(journal: &Path) -> Result<()> {
-    if let Some(control) = load(journal).await? {
-        anyhow::ensure!(
-            control.attempts == 0 && control.failure_kind == FailureKind::Unknown,
-            "cancelled apply cannot resume an existing recovery failure"
-        );
-        remove_control(journal).await?;
-        forget(journal);
+impl RecoveryState {
+    /// Transfer a cancelled, locally owned apply to compensation. Only the apply
+    /// owner may call this after releasing its runtime work and taking the scope
+    /// lock. Never renew a recovery attempt or clear a storage/conflict stop.
+    pub(crate) async fn compensate_cancelled_apply(&self, journal: &Path) -> Result<()> {
+        if let Some(control) = self.load(journal).await? {
+            anyhow::ensure!(
+                control.attempts == 0 && control.failure_kind == FailureKind::Unknown,
+                "cancelled apply cannot resume an existing recovery failure"
+            );
+            self.remove_control(journal).await?;
+            self.forget(journal);
+        }
+        Ok(())
     }
-    Ok(())
-}
 
-pub fn progress(journal: &Path) -> Option<traffic_masq_protocol::RecoveryProgress> {
-    let mut progress = controls()
-        .lock()
-        .expect("recovery control lock")
-        .get(journal)
-        .map(|control| traffic_masq_protocol::RecoveryProgress {
-            failure_kind: control.failure_kind,
-            attempts: control.attempts,
-            max_attempts: MAX_ATTEMPTS,
-            deadline_unix: control.deadline_unix,
-            automatic_recovery: control.phase != Phase::Stopped,
-            last_error: control.last_error.clone(),
-        })?;
-    let parent = journal.parent()?;
-    let root = if journal.file_name().and_then(|name| name.to_str())
-        == Some("router-transaction.json")
-    {
-        parent
-    } else if parent.file_name().and_then(|name| name.to_str()) == Some("interface-transactions") {
-        parent.parent()?
-    } else {
-        parent
-    };
-    if crate::core::recovery::check_commit(root).is_err() {
-        progress.failure_kind = FailureKind::CommitIndeterminate;
-        progress.automatic_recovery = false;
+    pub fn progress(&self, journal: &Path) -> Option<traffic_masq_protocol::RecoveryProgress> {
+        let mut progress = self
+            .inner
+            .control
+            .controls
+            .lock()
+            .expect("recovery control lock")
+            .get(journal)
+            .map(|control| traffic_masq_protocol::RecoveryProgress {
+                failure_kind: control.failure_kind,
+                attempts: control.attempts,
+                max_attempts: MAX_ATTEMPTS,
+                deadline_unix: control.deadline_unix,
+                automatic_recovery: control.phase != Phase::Stopped,
+                last_error: control.last_error.clone(),
+            })?;
+        let parent = journal.parent()?;
+        let root = if journal.file_name().and_then(|name| name.to_str())
+            == Some("router-transaction.json")
+        {
+            parent
+        } else if parent.file_name().and_then(|name| name.to_str())
+            == Some("interface-transactions")
+        {
+            parent.parent()?
+        } else {
+            parent
+        };
+        if self.check_commit(root).is_err() {
+            progress.failure_kind = FailureKind::CommitIndeterminate;
+            progress.automatic_recovery = false;
+        }
+        Some(progress)
     }
-    Some(progress)
 }
 
 fn now() -> u64 {
@@ -338,318 +357,366 @@ async fn digest(journal: &Path) -> Result<Vec<u8>> {
     Ok(Sha256::digest(&*bytes).to_vec())
 }
 
-async fn load(journal: &Path) -> Result<Option<Control>> {
-    let expected = digest(journal).await?;
-    let cached = controls()
-        .lock()
-        .expect("recovery control lock")
-        .get(journal)
-        .cloned()
-        .filter(|control| control.journal_digest == expected);
-    let path = control_path(journal);
-    crate::atomic_file::reject_symlink(&path)?;
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(cached),
-        Err(error) => return Err(error.into()),
-    };
-    // Even a manual retry cannot hide corrupt durable control behind a cache.
-    let mut control: Control = serde_json::from_slice(&bytes)?;
-    anyhow::ensure!(control.version == 1, "unsupported recovery control version");
-    if control.journal_digest != expected {
-        return Ok(None);
-    }
-    if let Some(cached) = cached {
-        return Ok(Some(cached));
-    }
-    // No in-memory attempt owns this record: the previous process was interrupted.
-    if control.phase == Phase::Attempting {
-        control.phase = Phase::Stopped;
-        control.last_error =
-            "previous recovery attempt was interrupted; explicit retry required".into();
-    }
-    deadlines()
-        .lock()
-        .expect("recovery deadline lock")
-        .entry(journal.to_owned())
-        .or_insert_with(|| {
-            tokio::time::Instant::now()
-                + Duration::from_secs(control.deadline_unix.saturating_sub(now()))
-                    .min(RECOVERY_TIMEOUT)
-        });
-    controls()
-        .lock()
-        .expect("recovery control lock")
-        .insert(journal.to_owned(), control.clone());
-    Ok(Some(control))
-}
-
-async fn save(journal: &Path, control: &Control) -> Result<()> {
-    // In-memory stop always survives a failed write for the running daemon.
-    controls()
-        .lock()
-        .expect("recovery control lock")
-        .insert(journal.to_owned(), control.clone());
-    let reservation = io_lock(journal).lock_owned().await;
-    let path = control_path(journal);
-    let bytes = serde_json::to_vec(control)?;
-    tokio::task::spawn_blocking(move || {
-        let _reservation = reservation;
-        crate::atomic_file::replace_preserving_on_error(
-            &path,
-            &bytes,
-            crate::atomic_file::PRIVATE_FILE_MODE,
-        )
-    })
-    .await?
-    .context("recovery decision persistence failed; restart persistence is unconfirmed")
-}
-
-/// Validation failures outside an attempt must also fence in-process runtime.
-pub async fn stop(journal: &Path, kind: FailureKind, message: impl Into<String>) -> Result<()> {
-    let control = Control {
-        version: 1,
-        journal_digest: digest(journal).await.unwrap_or_default(),
-        phase: Phase::Stopped,
-        attempts: 0,
-        deadline_unix: now(),
-        failure_kind: kind,
-        last_error: message.into(),
-    };
-    save(journal, &control).await
-}
-
-pub fn stopped(journal: &Path) -> bool {
-    controls()
-        .lock()
-        .expect("recovery control lock")
-        .get(journal)
-        .is_some_and(|control| control.phase == Phase::Stopped)
-}
-
-pub fn preservation_required(root: &Path) -> bool {
-    controls()
-        .lock()
-        .expect("recovery control lock")
-        .keys()
-        .any(|path| path.starts_with(root))
-        || crate::core::recovery::check_commit(root).is_err()
-}
-
-pub fn stopped_journals(root: &Path) -> Vec<PathBuf> {
-    controls()
-        .lock()
-        .expect("recovery control lock")
-        .iter()
-        .filter(|(path, control)| path.starts_with(root) && control.phase == Phase::Stopped)
-        .map(|(path, _)| path.clone())
-        .collect()
-}
-
-pub fn check_runtime(root: &Path, interface: Option<&str>) -> Result<()> {
-    check_runtime_except(root, interface, None)
-}
-
-pub fn check_runtime_except(
-    root: &Path,
-    interface: Option<&str>,
-    except: Option<&Path>,
-) -> Result<()> {
-    for path in stopped_journals(root) {
-        if except == Some(path.as_path()) {
-            continue;
-        }
-        let scoped = path.parent() == Some(root.join("interface-transactions").as_path());
-        if !scoped
-            || interface.is_none()
-            || path.file_stem().and_then(|name| name.to_str()) == interface
-        {
-            anyhow::bail!("state=recovery_required; journal={}; automatic recovery stopped; explicit retry required", path.display());
-        }
-    }
-    Ok(())
-}
-
-/// Load a persisted stop before startup mutates runtime consumers.
-pub async fn restore_stop(journal: &Path) -> Result<bool> {
-    Ok(load(journal)
-        .await?
-        .is_some_and(|control| control.phase == Phase::Stopped))
-}
-
-pub fn forget(journal: &Path) {
-    controls()
-        .lock()
-        .expect("recovery control lock")
-        .remove(journal);
-    deadlines()
-        .lock()
-        .expect("recovery deadline lock")
-        .remove(journal);
-}
-
-/// The caller serializes this with all writers to the snapshot's scope. A
-/// manual invocation starts a fresh cycle only after the previous one stopped.
-pub async fn run<T, F: Future<Output = Result<T>>>(
-    journal: &Path,
-    manual: bool,
-    work: F,
-) -> Result<T> {
-    let mut previous = match load(journal).await {
-        Ok(previous) => previous,
-        Err(error) => {
-            // Fail closed even for unreadable/malformed control metadata.
-            let control = Control {
-                version: 1,
-                journal_digest: digest(journal).await.unwrap_or_default(),
-                phase: Phase::Stopped,
-                attempts: MAX_ATTEMPTS,
-                deadline_unix: now(),
-                failure_kind: FailureKind::Storage,
-                last_error: format!("{error:#}"),
-            };
-            controls()
-                .lock()
-                .expect("recovery control lock")
-                .insert(journal.to_owned(), control);
-            return Err(error.context("recovery control untrusted; automatic recovery stopped"));
-        }
-    };
-    // The scope lock is held by this caller. An attempting record cannot have
-    // another live owner; cancellation may have occurred while its first
-    // metadata write was still awaiting completion, before a guard existed.
-    if let Some(control) = &mut previous {
-        if control.phase == Phase::Attempting {
-            control.phase = Phase::Stopped;
-            control.last_error = "previous attempt was interrupted; explicit retry required".into();
-        }
-    }
-    let fresh = previous
-        .as_ref()
-        .is_none_or(|control| manual && control.phase == Phase::Stopped);
-    if fresh {
-        deadlines().lock().expect("recovery deadline lock").insert(
-            journal.to_owned(),
-            tokio::time::Instant::now() + RECOVERY_TIMEOUT,
-        );
-    }
-    let cycle_deadline = *deadlines()
-        .lock()
-        .expect("recovery deadline lock")
-        .entry(journal.to_owned())
-        .or_insert_with(|| tokio::time::Instant::now() + RECOVERY_TIMEOUT);
-    let mut control = match previous {
-        Some(control) if !(manual && control.phase == Phase::Stopped) => control,
-        _ => Control {
-            version: 1,
-            journal_digest: digest(journal).await?,
-            phase: Phase::Ready,
-            attempts: 0,
-            deadline_unix: now().saturating_add(RECOVERY_TIMEOUT.as_secs()),
-            failure_kind: FailureKind::Unknown,
-            last_error: String::new(),
-        },
-    };
-    if control.phase != Phase::Ready
-        || control.attempts >= MAX_ATTEMPTS
-        || tokio::time::Instant::now() >= cycle_deadline
-    {
-        control.phase = Phase::Stopped;
-        save(journal, &control).await?;
-        anyhow::bail!(
-            "state=recovery_required; attempts={}; cause={:?}; {}; explicit retry required",
-            control.attempts,
-            control.failure_kind,
-            control.last_error
-        );
-    }
-    control.attempts += 1;
-    control.phase = Phase::Attempting;
-    let mut guard = AttemptGuard {
-        path: journal.to_owned(),
-        armed: true,
-    };
-    if let Err(error) = save(journal, &control).await {
-        guard.armed = false;
-        control.phase = Phase::Stopped;
-        control.failure_kind = FailureKind::Storage;
-        control.last_error = format!("{error:#}");
-        controls()
+impl RecoveryState {
+    async fn load(&self, journal: &Path) -> Result<Option<Control>> {
+        let expected = digest(journal).await?;
+        let cached = self
+            .inner
+            .control
+            .controls
             .lock()
             .expect("recovery control lock")
-            .insert(journal.to_owned(), control);
-        return Err(error);
+            .get(journal)
+            .cloned()
+            .filter(|control| control.journal_digest == expected);
+        let path = control_path(journal);
+        crate::atomic_file::reject_symlink(&path)?;
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(cached),
+            Err(error) => return Err(error.into()),
+        };
+        // Even a manual retry cannot hide corrupt durable control behind a cache.
+        let mut control: Control = serde_json::from_slice(&bytes)?;
+        anyhow::ensure!(control.version == 1, "unsupported recovery control version");
+        if control.journal_digest != expected {
+            return Ok(None);
+        }
+        if let Some(cached) = cached {
+            return Ok(Some(cached));
+        }
+        // No in-memory attempt owns this record: the previous session was interrupted.
+        if control.phase == Phase::Attempting {
+            control.phase = Phase::Stopped;
+            control.last_error =
+                "previous recovery attempt was interrupted; explicit retry required".into();
+        }
+        self.inner
+            .control
+            .deadlines
+            .lock()
+            .expect("recovery deadline lock")
+            .entry(journal.to_owned())
+            .or_insert_with(|| {
+                tokio::time::Instant::now()
+                    + Duration::from_secs(control.deadline_unix.saturating_sub(now()))
+                        .min(RECOVERY_TIMEOUT)
+            });
+        self.inner
+            .control
+            .controls
+            .lock()
+            .expect("recovery control lock")
+            .insert(journal.to_owned(), control.clone());
+        Ok(Some(control))
     }
-    // Wall time reconstructs a budget only when loading a previous process's
-    // record. A live cycle is governed exclusively by its monotonic deadline.
-    let remaining = cycle_deadline.saturating_duration_since(tokio::time::Instant::now());
-    let result = if remaining.is_zero() {
-        Err(failure(
-            FailureKind::Transient,
-            "recovery budget expired before runtime execution",
-        ))
-    } else {
-        match tokio::time::timeout(ATTEMPT_TIMEOUT.min(remaining), work).await {
-            Ok(result) => result,
-            Err(_) => Err(failure(
-                FailureKind::Unknown,
-                "recovery attempt timed out; runtime outcome must be re-observed",
-            )),
-        }
-    };
-    guard.armed = false;
-    match result {
-        Ok(value) => {
-            forget(journal);
-            Ok(value)
-        }
-        Err(error) => {
-            control.failure_kind = classify(&error);
-            control.last_error = format!("{error:#}");
-            control.phase = if automatic(control.failure_kind)
-                && control.attempts < MAX_ATTEMPTS
-                && tokio::time::Instant::now() < cycle_deadline
+
+    async fn save(&self, journal: &Path, control: &Control) -> Result<()> {
+        // In-memory stop always survives a failed write for the running daemon.
+        self.inner
+            .control
+            .controls
+            .lock()
+            .expect("recovery control lock")
+            .insert(journal.to_owned(), control.clone());
+        let reservation = self.io_lock(journal).lock_owned().await;
+        let path = control_path(journal);
+        let bytes = serde_json::to_vec(control)?;
+        tokio::task::spawn_blocking(move || {
+            let _reservation = reservation;
+            crate::atomic_file::replace_preserving_on_error(
+                &path,
+                &bytes,
+                crate::atomic_file::PRIVATE_FILE_MODE,
+            )
+        })
+        .await?
+        .context("recovery decision persistence failed; restart persistence is unconfirmed")
+    }
+
+    /// Validation failures outside an attempt must also fence in-process runtime.
+    pub async fn stop(
+        &self,
+        journal: &Path,
+        kind: FailureKind,
+        message: impl Into<String>,
+    ) -> Result<()> {
+        let control = Control {
+            version: 1,
+            journal_digest: digest(journal).await.unwrap_or_default(),
+            phase: Phase::Stopped,
+            attempts: 0,
+            deadline_unix: now(),
+            failure_kind: kind,
+            last_error: message.into(),
+        };
+        self.save(journal, &control).await
+    }
+
+    pub fn stopped(&self, journal: &Path) -> bool {
+        self.inner
+            .control
+            .controls
+            .lock()
+            .expect("recovery control lock")
+            .get(journal)
+            .is_some_and(|control| control.phase == Phase::Stopped)
+    }
+
+    pub fn preservation_required(&self, root: &Path) -> bool {
+        self.inner
+            .control
+            .controls
+            .lock()
+            .expect("recovery control lock")
+            .keys()
+            .any(|path| path.starts_with(root))
+            || self.check_commit(root).is_err()
+    }
+
+    pub fn stopped_journals(&self, root: &Path) -> Vec<PathBuf> {
+        self.inner
+            .control
+            .controls
+            .lock()
+            .expect("recovery control lock")
+            .iter()
+            .filter(|(path, control)| path.starts_with(root) && control.phase == Phase::Stopped)
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
+    pub fn check_runtime(&self, root: &Path, interface: Option<&str>) -> Result<()> {
+        self.check_runtime_except(root, interface, None)
+    }
+
+    pub fn check_runtime_except(
+        &self,
+        root: &Path,
+        interface: Option<&str>,
+        except: Option<&Path>,
+    ) -> Result<()> {
+        for path in self.stopped_journals(root) {
+            if except == Some(path.as_path()) {
+                continue;
+            }
+            let scoped = path.parent() == Some(root.join("interface-transactions").as_path());
+            if !scoped
+                || interface.is_none()
+                || path.file_stem().and_then(|name| name.to_str()) == interface
             {
-                Phase::Ready
-            } else {
-                Phase::Stopped
-            };
-            if let Err(storage) = save(journal, &control).await {
-                control.phase = Phase::Stopped;
-                control.failure_kind = FailureKind::Storage;
-                control.last_error =
-                    format!("recovery failed: {error:#}; persistence unconfirmed: {storage:#}");
-                controls()
+                anyhow::bail!("state=recovery_required; journal={}; automatic recovery stopped; explicit retry required", path.display());
+            }
+        }
+        Ok(())
+    }
+
+    /// Load a persisted stop before startup mutates runtime consumers.
+    pub async fn restore_stop(&self, journal: &Path) -> Result<bool> {
+        Ok(self
+            .load(journal)
+            .await?
+            .is_some_and(|control| control.phase == Phase::Stopped))
+    }
+
+    pub fn forget(&self, journal: &Path) {
+        self.inner
+            .control
+            .controls
+            .lock()
+            .expect("recovery control lock")
+            .remove(journal);
+        self.inner
+            .control
+            .deadlines
+            .lock()
+            .expect("recovery deadline lock")
+            .remove(journal);
+    }
+
+    /// The caller serializes this with all writers to the snapshot's scope. A
+    /// manual invocation starts a fresh cycle only after the previous one stopped.
+    pub async fn run<T, F: Future<Output = Result<T>>>(
+        &self,
+        journal: &Path,
+        manual: bool,
+        work: F,
+    ) -> Result<T> {
+        let mut previous = match self.load(journal).await {
+            Ok(previous) => previous,
+            Err(error) => {
+                // Fail closed even for unreadable/malformed control metadata.
+                let control = Control {
+                    version: 1,
+                    journal_digest: digest(journal).await.unwrap_or_default(),
+                    phase: Phase::Stopped,
+                    attempts: MAX_ATTEMPTS,
+                    deadline_unix: now(),
+                    failure_kind: FailureKind::Storage,
+                    last_error: format!("{error:#}"),
+                };
+                self.inner
+                    .control
+                    .controls
                     .lock()
                     .expect("recovery control lock")
                     .insert(journal.to_owned(), control);
-                return Err(storage.context(format!("recovery failed: {error:#}")));
+                return Err(error.context("recovery control untrusted; automatic recovery stopped"));
             }
-            Err(error)
+        };
+        // The scope lock is held by this caller. An attempting record cannot have
+        // another live owner; cancellation may have occurred while its first
+        // metadata write was still awaiting completion, before a guard existed.
+        if let Some(control) = &mut previous {
+            if control.phase == Phase::Attempting {
+                control.phase = Phase::Stopped;
+                control.last_error =
+                    "previous attempt was interrupted; explicit retry required".into();
+            }
+        }
+        let fresh = previous
+            .as_ref()
+            .is_none_or(|control| manual && control.phase == Phase::Stopped);
+        if fresh {
+            self.inner
+                .control
+                .deadlines
+                .lock()
+                .expect("recovery deadline lock")
+                .insert(
+                    journal.to_owned(),
+                    tokio::time::Instant::now() + RECOVERY_TIMEOUT,
+                );
+        }
+        let cycle_deadline = *self
+            .inner
+            .control
+            .deadlines
+            .lock()
+            .expect("recovery deadline lock")
+            .entry(journal.to_owned())
+            .or_insert_with(|| tokio::time::Instant::now() + RECOVERY_TIMEOUT);
+        let mut control = match previous {
+            Some(control) if !(manual && control.phase == Phase::Stopped) => control,
+            _ => Control {
+                version: 1,
+                journal_digest: digest(journal).await?,
+                phase: Phase::Ready,
+                attempts: 0,
+                deadline_unix: now().saturating_add(RECOVERY_TIMEOUT.as_secs()),
+                failure_kind: FailureKind::Unknown,
+                last_error: String::new(),
+            },
+        };
+        if control.phase != Phase::Ready
+            || control.attempts >= MAX_ATTEMPTS
+            || tokio::time::Instant::now() >= cycle_deadline
+        {
+            control.phase = Phase::Stopped;
+            self.save(journal, &control).await?;
+            anyhow::bail!(
+                "state=recovery_required; attempts={}; cause={:?}; {}; explicit retry required",
+                control.attempts,
+                control.failure_kind,
+                control.last_error
+            );
+        }
+        control.attempts += 1;
+        control.phase = Phase::Attempting;
+        let mut guard = AttemptGuard {
+            state: self.clone(),
+            path: journal.to_owned(),
+            armed: true,
+        };
+        if let Err(error) = self.save(journal, &control).await {
+            guard.armed = false;
+            control.phase = Phase::Stopped;
+            control.failure_kind = FailureKind::Storage;
+            control.last_error = format!("{error:#}");
+            self.inner
+                .control
+                .controls
+                .lock()
+                .expect("recovery control lock")
+                .insert(journal.to_owned(), control);
+            return Err(error);
+        }
+        // Wall time reconstructs a budget only when loading a previous process's
+        // record. A live cycle is governed exclusively by its monotonic deadline.
+        let remaining = cycle_deadline.saturating_duration_since(tokio::time::Instant::now());
+        let result = if remaining.is_zero() {
+            Err(failure(
+                FailureKind::Transient,
+                "recovery budget expired before runtime execution",
+            ))
+        } else {
+            match tokio::time::timeout(ATTEMPT_TIMEOUT.min(remaining), work).await {
+                Ok(result) => result,
+                Err(_) => Err(failure(
+                    FailureKind::Unknown,
+                    "recovery attempt timed out; runtime outcome must be re-observed",
+                )),
+            }
+        };
+        guard.armed = false;
+        match result {
+            Ok(value) => {
+                self.forget(journal);
+                Ok(value)
+            }
+            Err(error) => {
+                control.failure_kind = classify(&error);
+                control.last_error = format!("{error:#}");
+                control.phase = if automatic(control.failure_kind)
+                    && control.attempts < MAX_ATTEMPTS
+                    && tokio::time::Instant::now() < cycle_deadline
+                {
+                    Phase::Ready
+                } else {
+                    Phase::Stopped
+                };
+                if let Err(storage) = self.save(journal, &control).await {
+                    control.phase = Phase::Stopped;
+                    control.failure_kind = FailureKind::Storage;
+                    control.last_error =
+                        format!("recovery failed: {error:#}; persistence unconfirmed: {storage:#}");
+                    self.inner
+                        .control
+                        .controls
+                        .lock()
+                        .expect("recovery control lock")
+                        .insert(journal.to_owned(), control);
+                    return Err(storage.context(format!("recovery failed: {error:#}")));
+                }
+                Err(error)
+            }
         }
     }
-}
 
-/// Increasing delays; every attempt remains inside the original cycle budget.
-pub fn retry_delay(journal: &Path) -> Duration {
-    let (attempts, kind) = controls()
-        .lock()
-        .expect("recovery control lock")
-        .get(journal)
-        .map_or((0, FailureKind::Unknown), |control| {
-            (control.attempts, control.failure_kind)
-        });
-    Duration::from_secs(if kind == FailureKind::DeviceMissing {
-        if attempts <= 1 {
-            30
+    /// Increasing delays; every attempt remains inside the original cycle budget.
+    pub fn retry_delay(&self, journal: &Path) -> Duration {
+        let (attempts, kind) = self
+            .inner
+            .control
+            .controls
+            .lock()
+            .expect("recovery control lock")
+            .get(journal)
+            .map_or((0, FailureKind::Unknown), |control| {
+                (control.attempts, control.failure_kind)
+            });
+        Duration::from_secs(if kind == FailureKind::DeviceMissing {
+            if attempts <= 1 {
+                30
+            } else {
+                60
+            }
+        } else if attempts <= 1 {
+            1
         } else {
-            60
-        }
-    } else if attempts <= 1 {
-        1
-    } else {
-        5
-    })
+            5
+        })
+    }
 }
 
 #[cfg(test)]

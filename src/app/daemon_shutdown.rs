@@ -22,7 +22,11 @@ struct ShutdownPlan {
 }
 
 impl ShutdownPlan {
-    fn for_current_process(config: &AppConfig, graceful_signal: bool) -> Self {
+    fn for_current_process(
+        recovery: &crate::core::recovery::RecoveryState,
+        config: &AppConfig,
+        graceful_signal: bool,
+    ) -> Self {
         let request = match shutdown_control::request_for_current_process(&config.runtime.pid_path)
         {
             Ok(request) => request,
@@ -34,9 +38,10 @@ impl ShutdownPlan {
         let restore_requested = request
             .as_ref()
             .is_some_and(PendingShutdownRequest::restores_interfaces);
-        let commit_uncertain = crate::core::recovery::check_commit(&config.runtime.state_dir).err();
-        let stopped_recovery =
-            !crate::core::recovery_control::stopped_journals(&config.runtime.state_dir).is_empty();
+        let commit_uncertain = recovery.check_commit(&config.runtime.state_dir).err();
+        let stopped_recovery = !recovery
+            .stopped_journals(&config.runtime.state_dir)
+            .is_empty();
         let mut errors = Vec::new();
         if let Some(error) = &commit_uncertain {
             errors.push(error.to_string());
@@ -108,7 +113,11 @@ impl<P: RouterDataplaneProvider + Send + Sync> ShutdownResources<'_, P> {
         api_result: Result<()>,
         reconcile_error: Option<String>,
     ) -> Result<()> {
-        let mut plan = ShutdownPlan::for_current_process(self.config, graceful_signal);
+        let mut plan = ShutdownPlan::for_current_process(
+            self.transactions.recovery(),
+            self.config,
+            graceful_signal,
+        );
         let restore_interfaces = plan.restores_interfaces();
         let mut cleanup_errors = plan.errors;
 
@@ -126,7 +135,11 @@ impl<P: RouterDataplaneProvider + Send + Sync> ShutdownResources<'_, P> {
 
         // Cleanup itself may have exhausted recovery. Do not let a policy
         // chosen before that failure authorize later baseline destruction.
-        if crate::core::recovery_control::preservation_required(&self.config.runtime.state_dir) {
+        if self
+            .transactions
+            .recovery()
+            .preservation_required(&self.config.runtime.state_dir)
+        {
             plan.policy = ShutdownPolicy::PreserveInterfaces;
         }
         if plan.policy == ShutdownPolicy::RestoreInterfaces {

@@ -36,8 +36,11 @@ async fn settings_write_with_changed_commit_proof_still_fences_network_recovery(
     crate::atomic_file::fail_replacement_and_compensation(manager.path());
     let error = manager.save_committed(candidate).await.unwrap_err();
     assert!(crate::atomic_file::is_indeterminate_write(&error));
-    assert!(crate::core::recovery::check_commit(directory.path()).is_err());
-    assert!(crate::core::recovery::check_persistence(directory.path()).is_err());
+    assert!(manager.recovery().check_commit(directory.path()).is_err());
+    assert!(manager
+        .recovery()
+        .check_persistence(directory.path())
+        .is_err());
     assert_eq!(manager.snapshot().await, before);
 }
 
@@ -767,7 +770,7 @@ fn cancelled_persistence_fences_mutations_until_commit_proof_is_reloaded() {
             .await;
             // Drop the save future while its storage operation is outstanding.
         }
-        assert!(crate::core::recovery::check_commit(directory.path()).is_err());
+        assert!(manager.recovery().check_commit(directory.path()).is_err());
         assert!(manager
             .save_committed(RuntimeOverrides::default())
             .await

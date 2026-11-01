@@ -4,7 +4,7 @@
 //! Never overwrite a journal while its retirement is still pending.
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -327,184 +327,241 @@ impl std::fmt::Display for RecoveryDiagnostic {
     }
 }
 
-fn pending() -> &'static Mutex<BTreeMap<PathBuf, Vec<u8>>> {
-    static PENDING: OnceLock<Mutex<BTreeMap<PathBuf, Vec<u8>>>> = OnceLock::new();
-    PENDING.get_or_init(Mutex::default)
+/// Recovery bookkeeping owned by one daemon session. Clone this handle into every
+/// participant; constructing a new context never inherits another session's fences.
+#[derive(Clone, Debug)]
+pub struct RecoveryState {
+    pub(super) inner: Arc<RecoveryInner>,
 }
 
-fn events() -> &'static tokio::sync::watch::Sender<u64> {
-    static EVENTS: OnceLock<tokio::sync::watch::Sender<u64>> = OnceLock::new();
-    EVENTS.get_or_init(|| tokio::sync::watch::channel(0).0)
+#[derive(Debug)]
+pub(super) struct RecoveryInner {
+    pending: Mutex<BTreeMap<PathBuf, Vec<u8>>>,
+    events: tokio::sync::watch::Sender<u64>,
+    housekeeping: tokio::sync::Mutex<()>,
+    blocked: Mutex<BTreeMap<PathBuf, BTreeMap<String, InterfaceBlock>>>,
+    commits: Mutex<BTreeMap<PathBuf, String>>,
+    settings: Mutex<BTreeMap<PathBuf, String>>,
+    pub(super) control: super::recovery_control::ControlState,
+    address_locks: super::mutation::InterfaceMutationLocks,
 }
 
-pub fn subscribe() -> tokio::sync::watch::Receiver<u64> {
-    events().subscribe()
+impl Default for RecoveryState {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(RecoveryInner {
+                pending: Mutex::default(),
+                events: tokio::sync::watch::channel(0).0,
+                housekeeping: tokio::sync::Mutex::default(),
+                blocked: Mutex::default(),
+                commits: Mutex::default(),
+                settings: Mutex::default(),
+                control: Default::default(),
+                address_locks: Default::default(),
+            }),
+        }
+    }
+}
+
+impl RecoveryState {
+    /// Share these locks among writers of addresses in the same kernel namespace.
+    /// Interface managers and DHCP callbacks use separate runtime objects but
+    /// mutate the same addresses. These locks serialize them without acquiring
+    /// the control-plane gate while router apply waits for lease readiness.
+    pub fn address_locks(&self) -> super::mutation::InterfaceMutationLocks {
+        self.inner.address_locks.clone()
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.inner.events.subscribe()
+    }
 }
 
 fn receipt(path: &Path) -> PathBuf {
     path.with_extension("json.recovered")
 }
 
-pub fn cleanup_pending(path: &Path) -> bool {
-    pending()
-        .lock()
-        .expect("recovery housekeeping lock")
-        .contains_key(path)
-}
-
-pub async fn completed(path: &Path, bytes: &[u8]) -> Result<bool> {
-    let digest = Sha256::digest(bytes).to_vec();
-    if pending()
-        .lock()
-        .expect("recovery housekeeping lock")
-        .get(path)
-        == Some(&digest)
-    {
-        return Ok(true);
+impl RecoveryState {
+    pub fn cleanup_pending(&self, path: &Path) -> bool {
+        self.inner
+            .pending
+            .lock()
+            .expect("recovery housekeeping lock")
+            .contains_key(path)
     }
-    let marker = receipt(path);
-    crate::atomic_file::reject_symlink(&marker)?;
-    match tokio::fs::read(marker).await {
-        Ok(saved) => Ok(saved == digest),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error.into()),
-    }
-}
 
-/// Call only after restoration (including runtime consumers) or durable commit.
-/// Unlink/fsync/receipt-write failures cannot undo that completed operation.
-pub async fn retire(path: &Path) -> Result<()> {
-    crate::atomic_file::reject_symlink(path)?;
-    let bytes = match tokio::fs::read(path).await {
+    pub async fn completed(&self, path: &Path, bytes: &[u8]) -> Result<bool> {
+        let digest = Sha256::digest(bytes).to_vec();
+        if self
+            .inner
+            .pending
+            .lock()
+            .expect("recovery housekeeping lock")
+            .get(path)
+            == Some(&digest)
+        {
+            return Ok(true);
+        }
+        let marker = receipt(path);
+        crate::atomic_file::reject_symlink(&marker)?;
+        match tokio::fs::read(marker).await {
+            Ok(saved) => Ok(saved == digest),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Call only after restoration (including runtime consumers) or durable commit.
+    /// Unlink/fsync/receipt-write failures cannot undo that completed operation.
+    pub async fn retire(&self, path: &Path) -> Result<()> {
+        crate::atomic_file::reject_symlink(path)?;
+        let bytes = match tokio::fs::read(path).await {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error).context("operation=read_completed_journal; invariant=retain_recovery_proof; metadata_safe_to_remove=true"),
     };
-    let digest = Sha256::digest(&bytes).to_vec();
-    crate::core::recovery_control::forget(path);
-    let first = pending()
-        .lock()
-        .expect("recovery housekeeping lock")
-        .insert(path.to_owned(), digest)
-        .is_none();
-    if let Err(error) = housekeeping(path).await {
-        tracing::warn!(journal = %path.display(), operation = "retire_journal",
+        let digest = Sha256::digest(&bytes).to_vec();
+        self.forget(path);
+        let first = self
+            .inner
+            .pending
+            .lock()
+            .expect("recovery housekeeping lock")
+            .insert(path.to_owned(), digest)
+            .is_none();
+        if let Err(error) = self.housekeeping(path).await {
+            tracing::warn!(journal = %path.display(), operation = "retire_journal",
             invariant = "kernel_restored_metadata_pending", metadata_safe_to_remove = true,
             state = "recovered_but_journal_cleanup_pending", error = %format!("{error:#}"),
             "recovery completed; housekeeping will retry separately");
-        if first {
-            let path = path.to_owned();
-            tokio::spawn(async move {
-                while cleanup_pending(&path) {
-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                    if let Err(error) = housekeeping(&path).await {
-                        tracing::warn!(journal = %path.display(), operation = "journal_housekeeping",
+            if first {
+                let path = path.to_owned();
+                let session = Arc::downgrade(&self.inner);
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        let Some(inner) = session.upgrade() else {
+                            break;
+                        };
+                        let state = RecoveryState { inner };
+                        if !state.cleanup_pending(&path) {
+                            break;
+                        }
+                        if let Err(error) = state.housekeeping(&path).await {
+                            tracing::warn!(journal = %path.display(), operation = "journal_housekeeping",
                             metadata_safe_to_remove = true, %error, "journal cleanup still pending");
+                        }
                     }
-                }
-            });
-        }
-    }
-    Ok(())
-}
-
-async fn housekeeping(path: &Path) -> Result<()> {
-    let path = path.to_owned();
-    // A cancelled caller cannot release the lock while a blocking receipt
-    // writer/unlink still runs. The owner finishes cleanup before a later
-    // before_write can admit another journal at this path.
-    tokio::spawn(async move { housekeeping_owned(&path).await }).await?
-}
-
-async fn housekeeping_owned(path: &Path) -> Result<()> {
-    // Serializes the background retry with pre-write housekeeping. New writes
-    // are admitted only after the old journal AND receipt have been removed.
-    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    let _lock = LOCK
-        .get_or_init(|| tokio::sync::Mutex::new(()))
-        .lock()
-        .await;
-    let Some(digest) = pending()
-        .lock()
-        .expect("recovery housekeeping lock")
-        .get(path)
-        .cloned()
-    else {
-        return Ok(());
-    };
-    crate::atomic_file::reject_symlink(path)?;
-    match tokio::fs::read(path).await {
-        Ok(bytes) => {
-            anyhow::ensure!(Sha256::digest(&bytes).to_vec() == digest,
-                "invariant=journal_identity; operation=cleanup; journal={}; metadata_safe_to_remove=false: journal changed", path.display());
-            // Try unlink even if persisting a receipt failed. If both fail,
-            // the in-memory receipt still prevents replay during this run.
-            let marker = receipt(path);
-            if let Err(error) =
-                crate::atomic_file::replace_preserving_on_error_async(&marker, &digest, 0o600).await
-            {
-                tracing::warn!(journal = %path.display(), %error, "could not persist recovery receipt");
+                });
             }
-            crate::atomic_file::remove_preserving_on_error_async(path, 0o600).await?;
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
+        Ok(())
     }
-    crate::atomic_file::remove_preserving_on_error_async(&receipt(path), 0o600).await?;
-    crate::core::recovery_control::remove_control(path).await?;
-    pending()
-        .lock()
-        .expect("recovery housekeeping lock")
-        .remove(path);
-    events().send_modify(|epoch| *epoch = epoch.wrapping_add(1));
-    Ok(())
-}
 
-pub async fn before_write(path: &Path) -> Result<()> {
-    housekeeping(path).await.with_context(|| format!(
+    async fn housekeeping(&self, path: &Path) -> Result<()> {
+        let path = path.to_owned();
+        // A cancelled caller cannot release the lock while a blocking receipt
+        // writer/unlink still runs. The owner finishes cleanup before a later
+        // before_write can admit another journal at this path.
+        {
+            let state = self.clone();
+            tokio::spawn(async move { state.housekeeping_owned(&path).await })
+        }
+        .await?
+    }
+
+    async fn housekeeping_owned(&self, path: &Path) -> Result<()> {
+        // Serializes the background retry with pre-write housekeeping. New writes
+        // are admitted only after the old journal AND receipt have been removed.
+        let _lock = self.inner.housekeeping.lock().await;
+        let Some(digest) = self
+            .inner
+            .pending
+            .lock()
+            .expect("recovery housekeeping lock")
+            .get(path)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        crate::atomic_file::reject_symlink(path)?;
+        match tokio::fs::read(path).await {
+            Ok(bytes) => {
+                anyhow::ensure!(Sha256::digest(&bytes).to_vec() == digest,
+                "invariant=journal_identity; operation=cleanup; journal={}; metadata_safe_to_remove=false: journal changed", path.display());
+                // Try unlink even if persisting a receipt failed. If both fail,
+                // the in-memory receipt still prevents replay during this run.
+                let marker = receipt(path);
+                if let Err(error) =
+                    crate::atomic_file::replace_preserving_on_error_async(&marker, &digest, 0o600)
+                        .await
+                {
+                    tracing::warn!(journal = %path.display(), %error, "could not persist recovery receipt");
+                }
+                crate::atomic_file::remove_preserving_on_error_async(path, 0o600).await?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        crate::atomic_file::remove_preserving_on_error_async(&receipt(path), 0o600).await?;
+        self.remove_control(path).await?;
+        self.inner
+            .pending
+            .lock()
+            .expect("recovery housekeeping lock")
+            .remove(path);
+        self.inner
+            .events
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+        Ok(())
+    }
+
+    pub async fn before_write(&self, path: &Path) -> Result<()> {
+        self.housekeeping(path).await.with_context(|| format!(
         "journal={}; state=recovered_but_journal_cleanup_pending; operation=admit_new_transaction; metadata_safe_to_remove=true", path.display()))?;
-    anyhow::ensure!(
-        !cleanup_pending(path),
-        "journal cleanup pending: {}",
-        path.display()
-    );
-    // A crash can occur between unlinking the journal and its receipt. Never
-    // let an orphan receipt authenticate a future identical secret journal.
-    crate::atomic_file::remove_preserving_on_error_async(&receipt(path), 0o600).await?;
-    crate::atomic_file::remove_preserving_on_error_async(
-        &crate::core::recovery_control::control_path(path),
-        0o600,
-    )
-    .await?;
-    Ok(())
-}
-
-/// Caller must supply independent proof that replay is unnecessary. Unknown
-/// ownership is never inferred merely from a parse failure or an old revision.
-pub async fn quarantine(path: &Path, suffix: &str) -> Result<()> {
-    anyhow::ensure!(
-        matches!(suffix, "corrupt" | "stale"),
-        "invalid quarantine suffix"
-    );
-    crate::atomic_file::reject_symlink(path)?;
-    let bytes = tokio::fs::read(path).await?;
-    let identity = format!("{:x}", Sha256::digest(&bytes));
-    let destination = path.with_extension(format!("json.{identity}.{suffix}"));
-    crate::atomic_file::reject_symlink(&destination)?;
-    // A hard link gives no-clobber semantics; retain the source on any error.
-    match tokio::fs::hard_link(path, &destination).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            anyhow::ensure!(
-                tokio::fs::read(&destination).await? == bytes,
-                "quarantine identity conflict"
-            );
-        }
-        Err(error) => return Err(error.into()),
+        anyhow::ensure!(
+            !self.cleanup_pending(path),
+            "journal cleanup pending: {}",
+            path.display()
+        );
+        // A crash can occur between unlinking the journal and its receipt. Never
+        // let an orphan receipt authenticate a future identical secret journal.
+        crate::atomic_file::remove_preserving_on_error_async(&receipt(path), 0o600).await?;
+        crate::atomic_file::remove_preserving_on_error_async(
+            &crate::core::recovery_control::control_path(path),
+            0o600,
+        )
+        .await?;
+        Ok(())
     }
-    let parent = path.parent().context("journal has no parent")?.to_owned();
-    tokio::task::spawn_blocking(move || std::fs::File::open(parent)?.sync_all()).await??;
-    retire(path).await
+
+    /// Caller must supply independent proof that replay is unnecessary. Unknown
+    /// ownership is never inferred merely from a parse failure or an old revision.
+    pub async fn quarantine(&self, path: &Path, suffix: &str) -> Result<()> {
+        anyhow::ensure!(
+            matches!(suffix, "corrupt" | "stale"),
+            "invalid quarantine suffix"
+        );
+        crate::atomic_file::reject_symlink(path)?;
+        let bytes = tokio::fs::read(path).await?;
+        let identity = format!("{:x}", Sha256::digest(&bytes));
+        let destination = path.with_extension(format!("json.{identity}.{suffix}"));
+        crate::atomic_file::reject_symlink(&destination)?;
+        // A hard link gives no-clobber semantics; retain the source on any error.
+        match tokio::fs::hard_link(path, &destination).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                anyhow::ensure!(
+                    tokio::fs::read(&destination).await? == bytes,
+                    "quarantine identity conflict"
+                );
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let parent = path.parent().context("journal has no parent")?.to_owned();
+        tokio::task::spawn_blocking(move || std::fs::File::open(parent)?.sync_all()).await??;
+        self.retire(path).await
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -513,185 +570,207 @@ struct InterfaceBlock {
     retry_transaction: bool,
 }
 
-fn blocked() -> &'static Mutex<BTreeMap<PathBuf, BTreeMap<String, InterfaceBlock>>> {
-    static BLOCKED: OnceLock<Mutex<BTreeMap<PathBuf, BTreeMap<String, InterfaceBlock>>>> =
-        OnceLock::new();
-    BLOCKED.get_or_init(Mutex::default)
-}
-
-fn block_interface_inner(
-    root: &Path,
-    interface: &str,
-    recovery_path: &Path,
-    reason: String,
-    retry_transaction: bool,
-) {
-    tracing::error!(object = %interface, journal = %recovery_path.display(),
+impl RecoveryState {
+    fn block_interface_inner(
+        &self,
+        root: &Path,
+        interface: &str,
+        recovery_path: &Path,
+        reason: String,
+        retry_transaction: bool,
+    ) {
+        tracing::error!(object = %interface, journal = %recovery_path.display(),
         invariant = "restore_before_mutation", operation = "recover_interface",
         metadata_safe_to_remove = false, error = %reason, "interface blocked; other interfaces remain available");
-    blocked()
-        .lock()
-        .expect("recovery scope lock")
-        .entry(root.to_owned())
-        .or_default()
-        .insert(
-            interface.to_owned(),
-            InterfaceBlock {
-                reason,
-                retry_transaction,
-            },
-        );
-}
+        self.inner
+            .blocked
+            .lock()
+            .expect("recovery scope lock")
+            .entry(root.to_owned())
+            .or_default()
+            .insert(
+                interface.to_owned(),
+                InterfaceBlock {
+                    reason,
+                    retry_transaction,
+                },
+            );
+    }
 
-pub fn block_interface(root: &Path, interface: &str, reason: String) {
-    let recovery_path = root
-        .join("interface-transactions")
-        .join(format!("{interface}.json"));
-    block_interface_inner(root, interface, &recovery_path, reason, true);
-}
+    pub fn block_interface(&self, root: &Path, interface: &str, reason: String) {
+        let recovery_path = root
+            .join("interface-transactions")
+            .join(format!("{interface}.json"));
+        self.block_interface_inner(root, interface, &recovery_path, reason, true);
+    }
 
-/// Fence an interface for recovery metadata outside the interface-transaction store.
-///
-/// The transaction retry loop must not clear this block: the foreign metadata must be repaired and
-/// reloaded first.
-pub fn block_interface_nonretryable(
-    root: &Path,
-    interface: &str,
-    recovery_path: &Path,
-    reason: String,
-) {
-    block_interface_inner(root, interface, recovery_path, reason, false);
-}
+    /// Fence an interface for recovery metadata outside the interface-transaction store.
+    ///
+    /// The transaction retry loop must not clear this block: the foreign metadata must be repaired and
+    /// reloaded first.
+    pub fn block_interface_nonretryable(
+        &self,
+        root: &Path,
+        interface: &str,
+        recovery_path: &Path,
+        reason: String,
+    ) {
+        self.block_interface_inner(root, interface, recovery_path, reason, false);
+    }
 
-/// Interfaces with unresolved startup recovery, excluding cleanup-only work.
-pub(crate) fn blocked_interfaces(root: &Path) -> Vec<String> {
-    blocked()
-        .lock()
-        .expect("recovery scope lock")
-        .get(root)
-        .map(|scopes| scopes.keys().cloned().collect())
-        .unwrap_or_default()
-}
+    /// Interfaces with unresolved startup recovery, excluding cleanup-only work.
+    pub(crate) fn blocked_interfaces(&self, root: &Path) -> Vec<String> {
+        self.inner
+            .blocked
+            .lock()
+            .expect("recovery scope lock")
+            .get(root)
+            .map(|scopes| scopes.keys().cloned().collect())
+            .unwrap_or_default()
+    }
 
-/// Interface-transaction failures that the background retry loop is allowed to retry.
-pub(crate) fn retryable_blocked_interfaces(root: &Path) -> Vec<String> {
-    blocked()
-        .lock()
-        .expect("recovery scope lock")
-        .get(root)
-        .map(|scopes| {
-            scopes
-                .iter()
-                .filter(|(_, block)| block.retry_transaction)
-                .map(|(name, _)| name.clone())
-                .collect()
-        })
-        .unwrap_or_default()
-}
+    /// Interface-transaction failures that the background retry loop is allowed to retry.
+    pub(crate) fn retryable_blocked_interfaces(&self, root: &Path) -> Vec<String> {
+        self.inner
+            .blocked
+            .lock()
+            .expect("recovery scope lock")
+            .get(root)
+            .map(|scopes| {
+                scopes
+                    .iter()
+                    .filter(|(_, block)| block.retry_transaction)
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 
-pub fn unblock_interface(root: &Path, interface: &str) {
-    if let Some(scopes) = blocked().lock().expect("recovery scope lock").get_mut(root) {
-        scopes.remove(interface);
+    pub fn unblock_interface(&self, root: &Path, interface: &str) {
+        if let Some(scopes) = self
+            .inner
+            .blocked
+            .lock()
+            .expect("recovery scope lock")
+            .get_mut(root)
+        {
+            scopes.remove(interface);
+        }
     }
 }
 
 // A failed commit must never be compensated using an obsolete in-memory revision.
-// This fence lasts for the process lifetime. Startup independently reloads the
+// This fence lasts for the daemon session. Startup independently reloads the
 // authoritative document and commit tokens after storage access is repaired.
-fn uncertain_commits() -> &'static Mutex<BTreeMap<PathBuf, String>> {
-    static COMMITS: OnceLock<Mutex<BTreeMap<PathBuf, String>>> = OnceLock::new();
-    COMMITS.get_or_init(Default::default)
-}
 
-pub(crate) fn fence_commit(root: &Path, reason: String) {
-    uncertain_commits()
-        .lock()
-        .expect("commit fence lock")
-        .insert(root.to_owned(), reason);
+impl RecoveryState {
+    pub(crate) fn fence_commit(&self, root: &Path, reason: String) {
+        self.inner
+            .commits
+            .lock()
+            .expect("commit fence lock")
+            .insert(root.to_owned(), reason);
+    }
 }
 
 // Settings-only writes can leave the document revision uncertain while both
 // possible documents carry identical network intent and commit proof. Keep all
 // further persistence fenced, without disabling compensation of that network.
-fn uncertain_settings() -> &'static Mutex<BTreeMap<PathBuf, String>> {
-    static SETTINGS: OnceLock<Mutex<BTreeMap<PathBuf, String>>> = OnceLock::new();
-    SETTINGS.get_or_init(Default::default)
-}
 
-pub(crate) fn fence_settings(root: &Path, reason: String) {
-    uncertain_settings()
-        .lock()
-        .expect("settings fence lock")
-        .insert(root.to_owned(), reason);
-}
-
-pub(crate) fn check_persistence(root: &Path) -> Result<()> {
-    check_commit(root)?;
-    if let Some(reason) = uncertain_settings()
-        .lock()
-        .expect("settings fence lock")
-        .get(root)
-    {
-        anyhow::bail!("state=settings_commit_indeterminate; configuration writes blocked; network recovery remains available; restart to reload settings: {reason}");
+impl RecoveryState {
+    pub(crate) fn fence_settings(&self, root: &Path, reason: String) {
+        self.inner
+            .settings
+            .lock()
+            .expect("settings fence lock")
+            .insert(root.to_owned(), reason);
     }
-    Ok(())
-}
 
-pub(crate) fn commit_uncertainty(root: &Path) -> Option<String> {
-    uncertain_commits()
-        .lock()
-        .expect("commit fence lock")
-        .get(root)
-        .cloned()
-}
-
-pub(crate) fn check_commit(root: &Path) -> Result<()> {
-    if let Some(reason) = commit_uncertainty(root) {
-        anyhow::bail!("state=commit_indeterminate; mutations and rollback blocked; repair storage access and restart the daemon to resolve persisted commit proof: {reason}");
-    }
-    Ok(())
-}
-
-pub fn check_scope(root: &Path, interface: Option<&str>) -> Result<()> {
-    check_scope_inner(root, interface, None)
-}
-
-/// An explicit retry may bypass only its own transaction stop, never an
-/// ownership block, another recovery scope, cleanup, or uncertain commit.
-pub fn check_rollback_scope(root: &Path, interface: Option<&str>, journal: &Path) -> Result<()> {
-    check_scope_inner(root, interface, Some(journal))
-}
-
-fn check_scope_inner(root: &Path, interface: Option<&str>, retry: Option<&Path>) -> Result<()> {
-    check_commit(root)?;
-    crate::core::recovery_control::check_runtime_except(root, interface, retry)?;
-    let cleanup = pending().lock().expect("recovery housekeeping lock");
-    for path in cleanup.keys().filter(|path| path.starts_with(root)) {
-        let scoped = path.parent() == Some(root.join("interface-transactions").as_path());
-        let name = path.file_stem().and_then(|name| name.to_str());
-        if !scoped || interface.is_none() || name == interface {
-            anyhow::bail!("journal={}; state=recovered_but_journal_cleanup_pending; operation=admit_mutation; metadata_safe_to_remove=true", path.display());
+    pub(crate) fn check_persistence(&self, root: &Path) -> Result<()> {
+        self.check_commit(root)?;
+        if let Some(reason) = self
+            .inner
+            .settings
+            .lock()
+            .expect("settings fence lock")
+            .get(root)
+        {
+            anyhow::bail!("state=settings_commit_indeterminate; configuration writes blocked; network recovery remains available; restart to reload settings: {reason}");
         }
+        Ok(())
     }
-    drop(cleanup);
-    let guard = blocked().lock().expect("recovery scope lock");
-    if let Some(scopes) = guard.get(root) {
-        for (name, block) in scopes {
-            let journal = root
-                .join("interface-transactions")
-                .join(format!("{name}.json"));
-            if block.retry_transaction
-                && retry == Some(journal.as_path())
-                && crate::core::recovery_control::stopped(&journal)
-            {
-                continue;
-            }
-            if interface.is_none_or(|interface| interface == name) {
-                anyhow::bail!("interface={name}; invariant=restore_before_mutation; operation=admit_mutation; metadata_safe_to_remove=false; recovery blocked: {}", block.reason);
+
+    pub(crate) fn commit_uncertainty(&self, root: &Path) -> Option<String> {
+        self.inner
+            .commits
+            .lock()
+            .expect("commit fence lock")
+            .get(root)
+            .cloned()
+    }
+
+    pub(crate) fn check_commit(&self, root: &Path) -> Result<()> {
+        if let Some(reason) = self.commit_uncertainty(root) {
+            anyhow::bail!("state=commit_indeterminate; mutations and rollback blocked; repair storage access and restart the daemon to resolve persisted commit proof: {reason}");
+        }
+        Ok(())
+    }
+
+    pub fn check_scope(&self, root: &Path, interface: Option<&str>) -> Result<()> {
+        self.check_scope_inner(root, interface, None)
+    }
+
+    /// An explicit retry may bypass only its own transaction stop, never an
+    /// ownership block, another recovery scope, cleanup, or uncertain commit.
+    pub fn check_rollback_scope(
+        &self,
+        root: &Path,
+        interface: Option<&str>,
+        journal: &Path,
+    ) -> Result<()> {
+        self.check_scope_inner(root, interface, Some(journal))
+    }
+
+    fn check_scope_inner(
+        &self,
+        root: &Path,
+        interface: Option<&str>,
+        retry: Option<&Path>,
+    ) -> Result<()> {
+        self.check_commit(root)?;
+        self.check_runtime_except(root, interface, retry)?;
+        let cleanup = self
+            .inner
+            .pending
+            .lock()
+            .expect("recovery housekeeping lock");
+        for path in cleanup.keys().filter(|path| path.starts_with(root)) {
+            let scoped = path.parent() == Some(root.join("interface-transactions").as_path());
+            let name = path.file_stem().and_then(|name| name.to_str());
+            if !scoped || interface.is_none() || name == interface {
+                anyhow::bail!("journal={}; state=recovered_but_journal_cleanup_pending; operation=admit_mutation; metadata_safe_to_remove=true", path.display());
             }
         }
+        drop(cleanup);
+        let guard = self.inner.blocked.lock().expect("recovery scope lock");
+        if let Some(scopes) = guard.get(root) {
+            for (name, block) in scopes {
+                let journal = root
+                    .join("interface-transactions")
+                    .join(format!("{name}.json"));
+                if block.retry_transaction
+                    && retry == Some(journal.as_path())
+                    && self.stopped(&journal)
+                {
+                    continue;
+                }
+                if interface.is_none_or(|interface| interface == name) {
+                    anyhow::bail!("interface={name}; invariant=restore_before_mutation; operation=admit_mutation; metadata_safe_to_remove=false; recovery blocked: {}", block.reason);
+                }
+            }
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -699,15 +778,102 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sessions_with_identical_paths_do_not_share_fences_or_cleanup() {
+        let first = RecoveryState::default();
+        let second = RecoveryState::default();
+        let shared = first.clone();
+        let root = Path::new("/same-state-directory");
+        let journal = root.join("interface-transactions/lan0.json");
+
+        first.block_interface(root, "lan0", "restoration failed".into());
+        assert!(shared.check_scope(root, Some("lan0")).is_err());
+        assert!(second.check_scope(root, Some("lan0")).is_ok());
+        first.unblock_interface(root, "lan0");
+
+        first
+            .inner
+            .pending
+            .lock()
+            .unwrap()
+            .insert(journal.clone(), vec![1]);
+        assert!(shared.cleanup_pending(&journal));
+        assert!(!second.cleanup_pending(&journal));
+        assert!(shared.check_scope(root, Some("lan0")).is_err());
+        assert!(second.check_scope(root, Some("lan0")).is_ok());
+
+        first.fence_settings(root, "settings persistence uncertain".into());
+        assert!(shared.check_persistence(root).is_err());
+        assert!(second.check_persistence(root).is_ok());
+        assert!(shared.check_commit(root).is_ok());
+
+        first.fence_commit(root, "commit persistence uncertain".into());
+        assert!(shared.check_commit(root).is_err());
+        assert!(second.check_commit(root).is_ok());
+        drop(shared);
+        drop(first);
+        let restarted = RecoveryState::default();
+        assert!(restarted.check_scope(root, None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn cleanup_notifications_are_shared_only_within_the_session() {
+        let first = RecoveryState::default();
+        let second = RecoveryState::default();
+        let mut shared_events = first.clone().subscribe();
+        let other_events = second.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transaction.json");
+        tokio::fs::write(&path, b"restored").await.unwrap();
+        first.retire(&path).await.unwrap();
+        assert!(shared_events.has_changed().unwrap());
+        shared_events.borrow_and_update();
+        assert!(!other_events.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn address_writers_share_locks_explicitly_without_cross_session_contention() {
+        let first = RecoveryState::default();
+        let second = RecoveryState::default();
+        let held = first.address_locks().lock("lan0").await;
+        assert!(first
+            .clone()
+            .address_locks()
+            .try_lock("lan0")
+            .await
+            .is_none());
+        assert!(second.address_locks().try_lock("lan0").await.is_some());
+        drop(held);
+        assert!(first.address_locks().try_lock("lan0").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn cleanup_retry_does_not_keep_an_abandoned_session_alive() {
+        let state = RecoveryState::default();
+        let session = Arc::downgrade(&state.inner);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transaction.json");
+        tokio::fs::write(&path, b"restored").await.unwrap();
+        tokio::fs::create_dir(receipt(&path)).await.unwrap();
+        state.retire(&path).await.unwrap();
+        assert!(state.cleanup_pending(&path));
+        drop(state);
+        assert!(session.upgrade().is_none());
+    }
+
+    #[test]
     fn nonretryable_interface_block_is_visible_but_not_transaction_retryable() {
+        let state = crate::core::recovery::RecoveryState::default();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("address-ownership/lan0.json");
-        block_interface_nonretryable(dir.path(), "lan0", &path, "invalid ownership".into());
+        state.block_interface_nonretryable(dir.path(), "lan0", &path, "invalid ownership".into());
 
-        assert_eq!(blocked_interfaces(dir.path()), vec!["lan0".to_string()]);
-        assert!(retryable_blocked_interfaces(dir.path()).is_empty());
-        assert!(check_scope(dir.path(), Some("lan0")).is_err());
-        unblock_interface(dir.path(), "lan0");
+        assert_eq!(
+            state.blocked_interfaces(dir.path()),
+            vec!["lan0".to_string()]
+        );
+        assert!(state.retryable_blocked_interfaces(dir.path()).is_empty());
+        assert!(state.check_scope(dir.path(), Some("lan0")).is_err());
+        state.unblock_interface(dir.path(), "lan0");
     }
 
     #[test]
@@ -921,52 +1087,58 @@ mod tests {
 
     #[tokio::test]
     async fn receipt_proves_only_the_exact_journal() {
+        let state = crate::core::recovery::RecoveryState::default();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("transaction.json");
         tokio::fs::write(receipt(&path), Sha256::digest(b"old").as_slice())
             .await
             .unwrap();
-        assert!(completed(&path, b"old").await.unwrap());
-        assert!(!completed(&path, b"new").await.unwrap());
+        assert!(state.completed(&path, b"old").await.unwrap());
+        assert!(!state.completed(&path, b"new").await.unwrap());
     }
 
     #[tokio::test]
     async fn housekeeping_failure_does_not_fail_restoration_or_allow_overwrite() {
+        let state = crate::core::recovery::RecoveryState::default();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("transaction.json");
         tokio::fs::write(&path, b"restored").await.unwrap();
         // A directory at the receipt path forces housekeeping failure even as root.
         tokio::fs::create_dir(receipt(&path)).await.unwrap();
-        retire(&path).await.unwrap();
-        assert!(cleanup_pending(&path));
-        assert!(before_write(&path).await.is_err());
+        state.retire(&path).await.unwrap();
+        assert!(state.cleanup_pending(&path));
+        assert!(state.before_write(&path).await.is_err());
         tokio::fs::remove_dir(receipt(&path)).await.unwrap();
-        before_write(&path).await.unwrap();
-        assert!(!cleanup_pending(&path));
+        state.before_write(&path).await.unwrap();
+        assert!(!state.cleanup_pending(&path));
         assert!(!path.exists());
     }
 
     #[tokio::test]
     async fn housekeeping_never_removes_a_different_journal() {
+        let state = crate::core::recovery::RecoveryState::default();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("transaction.json");
         tokio::fs::write(&path, b"new").await.unwrap();
-        pending()
+        state
+            .inner
+            .pending
             .lock()
             .unwrap()
             .insert(path.clone(), Sha256::digest(b"old").to_vec());
-        assert!(before_write(&path).await.is_err());
+        assert!(state.before_write(&path).await.is_err());
         assert_eq!(tokio::fs::read(&path).await.unwrap(), b"new");
-        pending().lock().unwrap().remove(&path);
+        state.inner.pending.lock().unwrap().remove(&path);
     }
 
     #[tokio::test]
     async fn quarantine_preserves_evidence_and_is_repeatable() {
+        let state = crate::core::recovery::RecoveryState::default();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("transaction.json");
         for _ in 0..2 {
             tokio::fs::write(&path, b"committed").await.unwrap();
-            quarantine(&path, "stale").await.unwrap();
+            state.quarantine(&path, "stale").await.unwrap();
             assert!(!path.exists());
         }
         let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
@@ -981,13 +1153,14 @@ mod tests {
 
     #[test]
     fn blocked_scope_does_not_block_another_interface_or_state_directory() {
+        let state = crate::core::recovery::RecoveryState::default();
         let dir = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
-        block_interface(dir.path(), "wlan0", "invalid snapshot".into());
-        assert!(check_scope(dir.path(), Some("wlan0")).is_err());
-        assert!(check_scope(dir.path(), Some("eth0")).is_ok());
-        assert!(check_scope(other.path(), Some("wlan0")).is_ok());
-        assert!(check_scope(dir.path(), None).is_err());
+        state.block_interface(dir.path(), "wlan0", "invalid snapshot".into());
+        assert!(state.check_scope(dir.path(), Some("wlan0")).is_err());
+        assert!(state.check_scope(dir.path(), Some("eth0")).is_ok());
+        assert!(state.check_scope(other.path(), Some("wlan0")).is_ok());
+        assert!(state.check_scope(dir.path(), None).is_err());
     }
 }
 
@@ -997,13 +1170,15 @@ mod crash_tests {
 
     #[tokio::test]
     async fn cancelled_housekeeping_cannot_publish_receipt_after_new_transaction() {
+        let state = crate::core::recovery::RecoveryState::default();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("secrets.json");
         tokio::fs::write(&path, b"same bytes").await.unwrap();
         let marker = receipt(&path);
         let (entered, release) = crate::atomic_file::pause_next_replacement(&marker);
         let retiring_path = path.clone();
-        let retiring = tokio::spawn(async move { retire(&retiring_path).await });
+        let retiring_state = state.clone();
+        let retiring = tokio::spawn(async move { retiring_state.retire(&retiring_path).await });
         tokio::task::spawn_blocking(move || {
             entered
                 .recv_timeout(std::time::Duration::from_secs(5))
@@ -1018,7 +1193,9 @@ mod crash_tests {
         // after the caller drops. Otherwise a late receipt authenticates a
         // new, byte-identical provisioning journal as already restored.
         let admission_path = path.clone();
-        let mut admission = tokio::spawn(async move { before_write(&admission_path).await });
+        let admission_state = state.clone();
+        let mut admission =
+            tokio::spawn(async move { admission_state.before_write(&admission_path).await });
         let early =
             tokio::time::timeout(std::time::Duration::from_millis(150), &mut admission).await;
         let waiting = early.is_err();
@@ -1042,7 +1219,7 @@ mod crash_tests {
             .unwrap();
         }
         assert!(
-            !completed(&path, b"same bytes").await.unwrap(),
+            !state.completed(&path, b"same bytes").await.unwrap(),
             "late receipt authenticated the new journal as already restored"
         );
         assert!(
@@ -1053,13 +1230,14 @@ mod crash_tests {
 
     #[tokio::test]
     async fn new_transaction_cannot_inherit_an_orphan_receipt() {
+        let state = crate::core::recovery::RecoveryState::default();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("secrets.json");
         tokio::fs::write(receipt(&path), Sha256::digest(b"same bytes").as_slice())
             .await
             .unwrap();
-        before_write(&path).await.unwrap();
+        state.before_write(&path).await.unwrap();
         tokio::fs::write(&path, b"same bytes").await.unwrap();
-        assert!(!completed(&path, b"same bytes").await.unwrap());
+        assert!(!state.completed(&path, b"same bytes").await.unwrap());
     }
 }

@@ -132,6 +132,7 @@ impl Drop for AssociationMonitor {
 }
 
 struct Inner {
+    recovery: crate::core::recovery::RecoveryState,
     association_events: tokio::sync::broadcast::Sender<(String, u32)>,
     association_monitors: Mutex<HashMap<String, AssociationMonitor>>,
     wpa_supplicant_binary: PathBuf,
@@ -261,18 +262,27 @@ impl OwnedWpaCtrlSession {
 
 impl WifiClientSupervisor {
     /// Construct supplicant supervision without cleanup or committed-state application.
-    pub fn open_for_recovery(config: &AppConfig) -> Self {
-        Self::open_with_process_for_recovery(config, Arc::new(TokioSupervisedProcess::new()))
+    pub fn open_for_recovery(
+        recovery: crate::core::recovery::RecoveryState,
+        config: &AppConfig,
+    ) -> Self {
+        Self::open_with_process_for_recovery(
+            recovery,
+            config,
+            Arc::new(TokioSupervisedProcess::new()),
+        )
     }
 
     /// Construct a recovery runtime with an injected process adapter.
     pub fn open_with_process_for_recovery(
+        recovery: crate::core::recovery::RecoveryState,
         config: &AppConfig,
         process: Arc<dyn SupervisedProcess>,
     ) -> Self {
         let records_dir = config.runtime.state_dir.join("wifi");
         Self {
             inner: Arc::new(Inner {
+                recovery: recovery.clone(),
                 association_events: tokio::sync::broadcast::channel(64).0,
                 association_monitors: Mutex::new(HashMap::new()),
                 wpa_supplicant_binary: config.wifi_client.wpa_supplicant_binary.clone(),
@@ -301,6 +311,7 @@ impl WifiClientSupervisor {
             specs.iter().map(|spec| spec.interface.clone()).collect();
         let no_interfaces = HashSet::new();
         cleanup_unconfigured_records(
+            &self.inner.recovery,
             &self.inner.records_dir,
             &self.inner.runtime_dir,
             WifiProcessKind::Scan,
@@ -310,6 +321,7 @@ impl WifiClientSupervisor {
         .await
         .map_err(ClientSupervisorError::Configuration)?;
         cleanup_unconfigured_records(
+            &self.inner.recovery,
             &self.inner.records_dir,
             &self.inner.runtime_dir,
             WifiProcessKind::Client,
@@ -369,7 +381,7 @@ impl WifiClientSupervisor {
 
     /// Start the wpa_supplicant supervisor from effective configuration using the production process adapter.
     pub async fn start(config: &AppConfig) -> Result<Self, ClientSupervisorError> {
-        let supervisor = Self::open_for_recovery(config);
+        let supervisor = Self::open_for_recovery(Default::default(), config);
         supervisor.reconcile_startup(config).await?;
         Ok(supervisor)
     }
@@ -379,7 +391,7 @@ impl WifiClientSupervisor {
         config: &AppConfig,
         process: Arc<dyn SupervisedProcess>,
     ) -> Result<Self, ClientSupervisorError> {
-        let supervisor = Self::open_with_process_for_recovery(config, process);
+        let supervisor = Self::open_with_process_for_recovery(Default::default(), config, process);
         supervisor.reconcile_startup(config).await?;
         Ok(supervisor)
     }
@@ -467,7 +479,7 @@ impl WifiClientSupervisor {
     /// Serialize configuration changes and reconcile the requested interface with wpa_supplicant.
     /// Reuse matching state or restart the owned process as needed; propagate setup failures.
     pub async fn configure(&self, spec: WifiClientSpec) -> Result<(), ClientSupervisorError> {
-        crate::core::recovery::check_scope(
+        self.inner.recovery.check_scope(
             self.inner.records_dir.parent().expect("state directory"),
             Some(&spec.interface),
         )?;

@@ -572,6 +572,7 @@ pub(crate) fn unix_now() -> u64 {
 /// considered, and every signal is guarded by the same executable plus
 /// process-kind/config proof used by normal adoption.
 pub(crate) async fn cleanup_unconfigured_records(
+    recovery: &crate::core::recovery::RecoveryState,
     records_dir: &Path,
     runtime_dir: &Path,
     kind: WifiProcessKind,
@@ -582,9 +583,9 @@ pub(crate) async fn cleanup_unconfigured_records(
         WifiRecordStore::discover(kind, records_dir, runtime_dir).await?
     {
         if configured_interfaces.contains(&interface)
-            || records_dir.parent().is_some_and(|root| {
-                crate::core::recovery::check_scope(root, Some(&interface)).is_err()
-            })
+            || records_dir
+                .parent()
+                .is_some_and(|root| recovery.check_scope(root, Some(&interface)).is_err())
         {
             continue;
         }

@@ -1649,8 +1649,12 @@ async fn ap_and_client_supervisors_keep_interface_credentials_separate() {
     let temp = tempdir().unwrap();
     let runtime = temp.path().join("run");
     let config = app_config(temp.path(), &runtime);
-    let client = WifiClientSupervisor::open_with_process_for_recovery(&config, fake_process());
-    let ap = crate::wifi::HostapdSupervisor::open_for_recovery(&config);
+    let client = WifiClientSupervisor::open_with_process_for_recovery(
+        Default::default(),
+        &config,
+        fake_process(),
+    );
+    let ap = crate::wifi::HostapdSupervisor::open_for_recovery(Default::default(), &config);
     client
         .set_passphrase("wlan0", &WifiPassphrase::new("station-password").unwrap())
         .await
@@ -1753,6 +1757,7 @@ async fn disable_retires_exited_unadopted_record_and_its_stale_socket() {
     process.terminate(2000).await.unwrap();
     assert!(runtime.join("wlan0").exists());
     let reopened = WifiClientSupervisor::open_with_process_for_recovery(
+        Default::default(),
         &app_config(temp.path(), &runtime),
         process.clone(),
     );
@@ -1863,6 +1868,7 @@ async fn startup_cleans_stale_socket_before_discarding_unconfigured_record() {
     process.kill_externally(2000);
     assert!(runtime.join("wlan0").exists());
     cleanup_unconfigured_records(
+        &Default::default(),
         &temp.path().join("wifi"),
         &runtime,
         WifiProcessKind::Client,

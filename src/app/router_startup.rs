@@ -165,7 +165,11 @@ pub(super) fn production_router_coordinator(
     standalone_vpn: Option<Arc<crate::vpn::ProductionVpnManager>>,
     rollback_timeout: Duration,
 ) -> Result<RouterTransactionCoordinator> {
-    let interfaces = InterfaceManager::new(network.clone(), journal);
+    let interfaces = InterfaceManager::new_with_mutation_locks(
+        network.clone(),
+        journal,
+        overrides.recovery().address_locks(),
+    );
     let routes = RouteManager::new(network.clone());
     let dataplane_provider = production_dataplane_provider(network.clone());
     let dataplane = RouterDataplaneManager::new(dataplane_provider);

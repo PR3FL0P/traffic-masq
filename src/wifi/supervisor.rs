@@ -117,6 +117,7 @@ pub struct HostapdSupervisor {
 }
 
 struct Inner {
+    recovery: crate::core::recovery::RecoveryState,
     client_runtime_dir: PathBuf,
     hostapd_binary: PathBuf,
     runtime_dir: PathBuf,
@@ -133,18 +134,27 @@ struct Inner {
 
 impl HostapdSupervisor {
     /// Construct hostapd supervision without process cleanup or committed-state application.
-    pub fn open_for_recovery(config: &AppConfig) -> Self {
-        Self::open_with_process_for_recovery(config, Arc::new(TokioSupervisedProcess::new()))
+    pub fn open_for_recovery(
+        recovery: crate::core::recovery::RecoveryState,
+        config: &AppConfig,
+    ) -> Self {
+        Self::open_with_process_for_recovery(
+            recovery,
+            config,
+            Arc::new(TokioSupervisedProcess::new()),
+        )
     }
 
     /// Construct a recovery runtime with an injected process adapter.
     pub fn open_with_process_for_recovery(
+        recovery: crate::core::recovery::RecoveryState,
         config: &AppConfig,
         process: Arc<dyn SupervisedProcess>,
     ) -> Self {
         let records_dir = config.runtime.state_dir.join("wifi");
         Self {
             inner: Arc::new(Inner {
+                recovery: recovery.clone(),
                 client_runtime_dir: config.wifi_client.runtime_dir.clone(),
                 hostapd_binary: config.wifi.hostapd_binary.clone(),
                 runtime_dir: config.wifi.runtime_dir.clone(),
@@ -188,6 +198,7 @@ impl HostapdSupervisor {
             .collect();
         let no_interfaces = HashSet::new();
         cleanup_unconfigured_records(
+            &self.inner.recovery,
             &self.inner.records_dir,
             &config.wifi_client.runtime_dir,
             WifiProcessKind::Scan,
@@ -197,6 +208,7 @@ impl HostapdSupervisor {
         .await
         .map_err(SupervisorError::Configuration)?;
         cleanup_unconfigured_records(
+            &self.inner.recovery,
             &self.inner.records_dir,
             &config.wifi_client.runtime_dir,
             WifiProcessKind::Client,
@@ -206,6 +218,7 @@ impl HostapdSupervisor {
         .await
         .map_err(SupervisorError::Configuration)?;
         cleanup_unconfigured_records(
+            &self.inner.recovery,
             &self.inner.records_dir,
             &self.inner.runtime_dir,
             WifiProcessKind::AccessPoint,
@@ -281,7 +294,7 @@ impl HostapdSupervisor {
 
     /// Start the hostapd supervisor from effective configuration using the production process adapter.
     pub async fn start(config: &AppConfig) -> Result<Self, SupervisorError> {
-        let supervisor = Self::open_for_recovery(config);
+        let supervisor = Self::open_for_recovery(Default::default(), config);
         supervisor.reconcile_startup(config).await?;
         Ok(supervisor)
     }
@@ -291,7 +304,7 @@ impl HostapdSupervisor {
         config: &AppConfig,
         process: Arc<dyn SupervisedProcess>,
     ) -> Result<Self, SupervisorError> {
-        let supervisor = Self::open_with_process_for_recovery(config, process);
+        let supervisor = Self::open_with_process_for_recovery(Default::default(), config, process);
         supervisor.reconcile_startup(config).await?;
         Ok(supervisor)
     }
@@ -302,11 +315,12 @@ impl HostapdSupervisor {
         process: Arc<dyn SupervisedProcess>,
         radio: Arc<dyn RadioValidator>,
     ) -> Result<Self, SupervisorError> {
-        let supervisor = Self::open_with_process_for_recovery(config, process);
+        let supervisor = Self::open_with_process_for_recovery(Default::default(), config, process);
         // Tests that exercise process/control semantics inject deterministic
         // radio capabilities rather than depending on the host machine PHY.
         let supervisor = Self {
             inner: Arc::new(Inner {
+                recovery: Default::default(),
                 client_runtime_dir: config.wifi_client.runtime_dir.clone(),
                 hostapd_binary: supervisor.inner.hostapd_binary.clone(),
                 runtime_dir: supervisor.inner.runtime_dir.clone(),
@@ -483,7 +497,7 @@ impl HostapdSupervisor {
     /// Reuse matching state or restart the owned process as needed; propagate setup failures.
     pub async fn configure(&self, spec: WifiApSpec) -> Result<(), SupervisorError> {
         let spec = self.resolve_radio_spec(&spec).await?;
-        crate::core::recovery::check_scope(
+        self.inner.recovery.check_scope(
             self.inner.records_dir.parent().expect("state directory"),
             Some(&spec.interface),
         )?;

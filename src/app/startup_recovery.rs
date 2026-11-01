@@ -29,6 +29,7 @@ pub(super) struct StartupRecovery {
 /// intent and strict-admission/router-recovery status so callers can fence normal
 /// writes. Recovery must precede unrelated configuration admission.
 pub(super) async fn prepare(config: &AppConfig) -> Result<StartupRecovery> {
+    let recovery = crate::core::recovery::RecoveryState::default();
     // Decode the durable proof envelope without admitting unrelated runtime settings. Individual
     // proof fields are handled independently below so one recovery scope cannot suppress another.
     let recovery_store =
@@ -53,7 +54,7 @@ pub(super) async fn prepare(config: &AppConfig) -> Result<StartupRecovery> {
             .state_dir
             .join("address-ownership")
             .join(format!("{interface}.json"));
-        crate::core::recovery::block_interface_nonretryable(
+        recovery.block_interface_nonretryable(
             &config.runtime.state_dir,
             interface,
             &ownership_path,
@@ -63,8 +64,11 @@ pub(super) async fn prepare(config: &AppConfig) -> Result<StartupRecovery> {
     let ownership_journal = ownership_open.journal;
     reconcile_address_ownership(&ownership_journal, network_provider.as_ref()).await;
 
-    let interface_manager =
-        InterfaceManager::new(network_provider.clone(), ownership_journal.clone());
+    let interface_manager = InterfaceManager::new_with_mutation_locks(
+        network_provider.clone(),
+        ownership_journal.clone(),
+        recovery.address_locks(),
+    );
     match committed_interface_transactions {
         Ok(committed) => {
             let wifi_runtime_dirs = crate::wifi::WifiRuntimeDirs::new(
@@ -72,6 +76,7 @@ pub(super) async fn prepare(config: &AppConfig) -> Result<StartupRecovery> {
                 &config.wifi_client.runtime_dir,
             );
             crate::core::transaction::recover_interface_transactions_with_commit_tokens_excluding(
+                &recovery,
                 &config.runtime.state_dir,
                 &interface_manager,
                 &committed,
@@ -85,6 +90,7 @@ pub(super) async fn prepare(config: &AppConfig) -> Result<StartupRecovery> {
             // malformed. Fence only the interfaces that actually have pending journals and keep
             // unrelated router recovery available.
             crate::core::transaction::block_interface_transactions_without_commit_proof(
+                &recovery,
                 &config.runtime.state_dir,
                 &format!("runtime override interface commit proof is invalid: {error:#}"),
             )
@@ -166,8 +172,7 @@ pub(super) async fn prepare(config: &AppConfig) -> Result<StartupRecovery> {
     // Provisioning secrets belong to the router recovery scope. Run this only after independent
     // interface recovery, so a router-secret problem cannot suppress interface rollback.
     let secrets = crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore::in_state_dir(
-        &config.runtime.state_dir,
-    );
+        &config.runtime.state_dir, recovery.clone());
     // A router journal owns both runtime and secret compensation. Its bounded
     // coordinator must decide whether recovery may run before restoring secrets.
     let provisioning_recovery = if router_recovery_pending {
@@ -200,6 +205,7 @@ pub(super) async fn prepare(config: &AppConfig) -> Result<StartupRecovery> {
     // complete and normal startup must pass strict admission before it mutates the network. With a
     // pending router journal, strict admission remains deferred until rollback has finished.
     let overrides = RuntimeOverrideManager::from_router_recovery_proof(
+        recovery.clone(),
         recovery_store,
         config,
         &recovery_proof,

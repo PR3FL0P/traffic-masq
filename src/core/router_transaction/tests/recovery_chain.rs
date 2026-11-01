@@ -26,7 +26,7 @@ async fn every_recovery_stage_preserves_proof_across_restart_then_accepts_a_new_
     for failed_stage in RESTORATION {
         let fake = FakeSubsystems::new();
         let (coordinator, overrides, directory) = coordinator_with(fake.clone()).await;
-        let secrets = stage_test_secret(directory.path()).await;
+        let secrets = stage_test_secret(coordinator.recovery().clone(), directory.path()).await;
         *fake.rollback_secret.lock().unwrap() = Some(directory.path().into());
         let plan = coordinator
             .plan(build_candidate(&overrides).await)
@@ -65,7 +65,7 @@ async fn every_recovery_stage_preserves_proof_across_restart_then_accepts_a_new_
 
         // Reopen durable storage and discard the volatile recovery budget, just
         // as a new daemon does. A stopped conflict must survive this boundary.
-        recovery_control::forget(&journal);
+        coordinator.recovery().forget(&journal);
         let reloaded = RuntimeOverrideManager::load(directory.path(), &base_config())
             .await
             .unwrap();

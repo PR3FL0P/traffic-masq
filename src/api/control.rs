@@ -181,7 +181,11 @@ impl ControlService {
             NetworkTransactionManager::new_with_services
         };
         let transactions = transaction_constructor(
-            InterfaceManager::new(network.clone(), ownership_journal),
+            InterfaceManager::new_with_mutation_locks(
+                network.clone(),
+                ownership_journal,
+                overrides.recovery().address_locks(),
+            ),
             Duration::from_secs(config.security.rollback_timeout_seconds),
             baselines,
             dhcp.clone(),

@@ -188,8 +188,11 @@ impl<'a> StartupRollback<'a> {
     }
 }
 
-fn recovery_shutdown_policy(root: &std::path::Path) -> ShutdownPolicy {
-    if crate::core::recovery_control::preservation_required(root) {
+fn recovery_shutdown_policy(
+    recovery: &crate::core::recovery::RecoveryState,
+    root: &std::path::Path,
+) -> ShutdownPolicy {
+    if recovery.preservation_required(root) {
         ShutdownPolicy::PreserveInterfaces
     } else {
         ShutdownPolicy::RestoreInterfaces
@@ -233,6 +236,7 @@ pub async fn run_daemon_with_config_file(
         router_recovery_pending,
         management_allowlist,
     } = startup_recovery::prepare(&config).await?;
+    let recovery = overrides.recovery().clone();
 
     // Teardown for everything brought up during startup, unwound in reverse
     // order on any later failure or shutdown-requested check. Each step below
@@ -242,7 +246,9 @@ pub async fn run_daemon_with_config_file(
 
     let mut startup_config = effective_config.clone();
     startup_config.network.interfaces.retain(|name, _| {
-        crate::core::recovery::check_scope(&config.runtime.state_dir, Some(name)).is_ok()
+        recovery
+            .check_scope(&config.runtime.state_dir, Some(name))
+            .is_ok()
     });
     // Defer legacy interface/dataplane bootstrap when a router snapshot exists;
     // the coordinator owns restoration and subsequent committed-state repair.
@@ -260,8 +266,9 @@ pub async fn run_daemon_with_config_file(
         let interface_manager = interface_manager.clone();
         let startup_baselines = startup_baselines.clone();
         let root = config.runtime.state_dir.clone();
+        let recovery = recovery.clone();
         async move {
-            if !crate::core::recovery_control::preservation_required(&root) {
+            if !recovery.preservation_required(&root) {
                 rollback_interfaces(&interface_manager, &startup_baselines).await;
             }
         }
@@ -274,9 +281,12 @@ pub async fn run_daemon_with_config_file(
     }
 
     let wifi_supervisor = if router_recovery_pending {
-        Some(HostapdSupervisor::open_for_recovery(&startup_config))
+        Some(HostapdSupervisor::open_for_recovery(
+            recovery.clone(),
+            &startup_config,
+        ))
     } else {
-        match crate::wifi::startup::start_ap(&startup_config).await {
+        match crate::wifi::startup::start_ap(recovery.clone(), &startup_config).await {
             Ok(supervisor) => Some(supervisor),
             Err(error) => {
                 tracing::error!(subsystem = "wifi_ap", operation = "initialize_supervisor",
@@ -288,7 +298,11 @@ pub async fn run_daemon_with_config_file(
     if let Some(wifi) = &wifi_supervisor {
         let wifi = wifi.clone();
         let root = config.runtime.state_dir.clone();
-        stack.push(async move { wifi.shutdown(recovery_shutdown_policy(&root)).await });
+        let recovery = recovery.clone();
+        stack.push(async move {
+            wifi.shutdown(recovery_shutdown_policy(&recovery, &root))
+                .await
+        });
     }
 
     if shutdown_requested(&shutdown) && !router_recovery_pending {
@@ -298,9 +312,12 @@ pub async fn run_daemon_with_config_file(
     }
 
     let wifi_client_supervisor = if router_recovery_pending {
-        Some(WifiClientSupervisor::open_for_recovery(&startup_config))
+        Some(WifiClientSupervisor::open_for_recovery(
+            recovery.clone(),
+            &startup_config,
+        ))
     } else {
-        match crate::wifi::startup::start_client(&startup_config).await {
+        match crate::wifi::startup::start_client(recovery.clone(), &startup_config).await {
             Ok(supervisor) => Some(supervisor),
             Err(error) => {
                 tracing::error!(subsystem = "wifi_client", operation = "initialize_supervisor",
@@ -312,7 +329,12 @@ pub async fn run_daemon_with_config_file(
     if let Some(wifi_client) = &wifi_client_supervisor {
         let wifi_client = wifi_client.clone();
         let root = config.runtime.state_dir.clone();
-        stack.push(async move { wifi_client.shutdown(recovery_shutdown_policy(&root)).await });
+        let recovery = recovery.clone();
+        stack.push(async move {
+            wifi_client
+                .shutdown(recovery_shutdown_policy(&recovery, &root))
+                .await
+        });
     }
 
     if shutdown_requested(&shutdown) && !router_recovery_pending {
@@ -344,7 +366,11 @@ pub async fn run_daemon_with_config_file(
     }
 
     let dhcp_client = if router_recovery_pending {
-        match DhcpClientSupervisor::open_for_recovery(&startup_config, network_provider.clone()) {
+        match DhcpClientSupervisor::open_for_recovery(
+            recovery.clone(),
+            &startup_config,
+            network_provider.clone(),
+        ) {
             Ok(supervisor) => supervisor,
             Err(error) => {
                 stack.unwind().await;
@@ -352,7 +378,17 @@ pub async fn run_daemon_with_config_file(
             }
         }
     } else {
-        match DhcpClientSupervisor::start(&startup_config, network_provider.clone()).await {
+        match async {
+            let supervisor = DhcpClientSupervisor::open_for_recovery(
+                recovery.clone(),
+                &startup_config,
+                network_provider.clone(),
+            )?;
+            supervisor.reconcile_startup(&startup_config).await?;
+            anyhow::Ok(supervisor)
+        }
+        .await
+        {
             Ok(supervisor) => supervisor,
             Err(error) => {
                 stack.unwind().await;
@@ -363,7 +399,12 @@ pub async fn run_daemon_with_config_file(
     stack.push({
         let dhcp_client = dhcp_client.clone();
         let root = config.runtime.state_dir.clone();
-        async move { dhcp_client.shutdown(recovery_shutdown_policy(&root)).await }
+        let recovery = recovery.clone();
+        async move {
+            dhcp_client
+                .shutdown(recovery_shutdown_policy(&recovery, &root))
+                .await
+        }
     });
 
     // Serializes request/background control-plane mutations. Autonomous DHCP
@@ -396,7 +437,9 @@ pub async fn run_daemon_with_config_file(
     // exactly what `Arc` sidesteps.
     let router_state = if desired.enabled
         && !router_recovery_pending
-        && crate::core::recovery::check_scope(&config.runtime.state_dir, None).is_ok()
+        && recovery
+            .check_scope(&config.runtime.state_dir, None)
+            .is_ok()
     {
         let dataplane_provider = production_dataplane_provider(network_provider.clone());
         match apply_router_dataplane(&desired, network_provider.clone(), dataplane_provider).await {
@@ -421,8 +464,9 @@ pub async fn run_daemon_with_config_file(
     if let Some(state) = &router_state {
         let state = state.clone();
         let root = config.runtime.state_dir.clone();
+        let recovery = recovery.clone();
         stack.push(async move {
-            if !crate::core::recovery_control::preservation_required(&root) {
+            if !recovery.preservation_required(&root) {
                 rollback_router_dataplane(&state).await;
             }
         });
@@ -448,8 +492,12 @@ pub async fn run_daemon_with_config_file(
     if let Some(vpn) = &vpn_manager {
         let vpn = vpn.clone();
         let root = config.runtime.state_dir.clone();
+        let recovery = recovery.clone();
         stack.push(async move {
-            if let Err(error) = vpn.shutdown(recovery_shutdown_policy(&root)).await {
+            if let Err(error) = vpn
+                .shutdown(recovery_shutdown_policy(&recovery, &root))
+                .await
+            {
                 tracing::error!(%error, "failed to shut down VPN manager during startup rollback");
             }
         });
@@ -637,7 +685,7 @@ pub async fn run_daemon_with_config_file(
 
     if effective_config.vpn.enabled
         && effective_config.vpn.standalone.is_none()
-        && !crate::core::recovery_control::preservation_required(&config.runtime.state_dir)
+        && !recovery.preservation_required(&config.runtime.state_dir)
     {
         if let Some(vpn) = &vpn_manager {
             if let Err(error) = vpn.reconcile().await {

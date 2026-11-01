@@ -65,8 +65,10 @@ pub struct DhcpClientOwnershipApplier {
 }
 
 impl DhcpClientOwnershipApplier {
+    /// Construct an isolated writer. Writers sharing kernel resources must
+    /// supply the same locks through `new_with_mutation_locks`.
     pub fn new(network: Arc<dyn NetworkProvider>, store: DhcpClientLeaseStore) -> Self {
-        Self::new_with_mutation_locks(network, store, InterfaceMutationLocks::global())
+        Self::new_with_mutation_locks(network, store, InterfaceMutationLocks::default())
     }
 
     pub fn new_with_mutation_locks(

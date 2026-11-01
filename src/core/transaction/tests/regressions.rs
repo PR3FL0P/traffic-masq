@@ -41,10 +41,9 @@ async fn failed_apply_must_not_restore_credentials_after_commit_becomes_indeterm
         store.get("test0").unwrap().unwrap().expose(),
         "replacement-password"
     );
-    crate::core::recovery::fence_commit(
-        directory.path(),
-        "concurrent persistence uncertain".into(),
-    );
+    manager
+        .recovery()
+        .fence_commit(directory.path(), "concurrent persistence uncertain".into());
     // Once fenced, even a failed convergence pass must preserve credentials
     // and tentative intent until restart resolves the durable commit proof.
     desired.report_result(
@@ -108,7 +107,7 @@ async fn failed_apply_rechecks_commit_fence_after_waiting_for_runtime_lane() {
     .await
     .unwrap();
     // The scope was admitted before this fence, but its runtime lane was not.
-    crate::core::recovery::fence_commit(
+    manager.recovery().fence_commit(
         directory.path(),
         "persistence uncertain while queued".into(),
     );
@@ -132,7 +131,9 @@ async fn interface_apply_rejects_existing_commit_fence_before_registration() {
     let directory = tempdir().unwrap();
     let desired = desired_state(directory.path()).await;
     let manager = manager_for(&desired, fake_network());
-    crate::core::recovery::fence_commit(directory.path(), "unresolved persistence".into());
+    manager
+        .recovery()
+        .fence_commit(directory.path(), "unresolved persistence".into());
     let error = manager
         .apply(
             "test0",
@@ -369,7 +370,7 @@ async fn regression_cancel_between_apply_guard_and_pending_must_keep_recovery_vi
     desired.report_pass(desired.version(), BTreeMap::new());
     let path = manager.journal_path("test0");
     tokio::time::timeout(WATCHDOG, async {
-        while recovery_control::progress(&path).is_some() {
+        while manager.recovery().progress(&path).is_some() {
             tokio::task::yield_now().await;
         }
     })
@@ -480,8 +481,11 @@ async fn regression_uncertain_security_write_must_not_disable_network_compensati
         published.committed_interface_transactions,
         network_before.committed_interface_transactions
     );
-    assert!(crate::core::recovery::check_persistence(directory.path()).is_err());
-    assert!(crate::core::recovery::check_commit(directory.path()).is_ok());
+    assert!(manager
+        .recovery()
+        .check_persistence(directory.path())
+        .is_err());
+    assert!(manager.recovery().check_commit(directory.path()).is_ok());
     let document = tokio::fs::read(overrides.path()).await.unwrap();
     assert!(overrides.clear_security_config().await.is_err());
     assert_eq!(tokio::fs::read(overrides.path()).await.unwrap(), document);

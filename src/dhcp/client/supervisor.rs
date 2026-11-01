@@ -246,6 +246,7 @@ pub struct DhcpClientSupervisor {
 }
 
 struct Inner {
+    recovery: crate::core::recovery::RecoveryState,
     network: Arc<dyn NetworkProvider>,
     applier: Arc<DhcpClientOwnershipApplier>,
     launcher: Arc<dyn DhcpClientLauncher>,
@@ -269,14 +270,21 @@ impl DhcpClientSupervisor {
     #[cfg(target_os = "linux")]
     /// Construct DHCP client supervision without enumerating persisted leases or starting clients.
     pub fn open_for_recovery(
+        recovery: crate::core::recovery::RecoveryState,
         config: &AppConfig,
         network: Arc<dyn NetworkProvider>,
     ) -> Result<Self> {
-        Self::open_with_launcher_for_recovery(config, network, Arc::new(LinuxDhcpClientLauncher))
+        Self::open_with_launcher_for_recovery(
+            recovery,
+            config,
+            network,
+            Arc::new(LinuxDhcpClientLauncher),
+        )
     }
 
     /// Construct a recovery runtime using an injected launcher, without normal startup reconcile.
     pub fn open_with_launcher_for_recovery(
+        recovery: crate::core::recovery::RecoveryState,
         config: &AppConfig,
         network: Arc<dyn NetworkProvider>,
         launcher: Arc<dyn DhcpClientLauncher>,
@@ -285,7 +293,12 @@ impl DhcpClientSupervisor {
             .context("failed to open the DHCP client lease store")?;
         Ok(Self {
             inner: Arc::new(Inner {
-                applier: Arc::new(DhcpClientOwnershipApplier::new(network.clone(), store)),
+                recovery: recovery.clone(),
+                applier: Arc::new(DhcpClientOwnershipApplier::new_with_mutation_locks(
+                    network.clone(),
+                    store,
+                    recovery.address_locks(),
+                )),
                 network,
                 launcher,
                 tasks: Mutex::new(HashMap::new()),
@@ -313,7 +326,7 @@ impl DhcpClientSupervisor {
     #[cfg(target_os = "linux")]
     /// Initialize DHCP client supervision with the production launcher and recover persisted leases.
     pub async fn start(config: &AppConfig, network: Arc<dyn NetworkProvider>) -> Result<Self> {
-        let supervisor = Self::open_for_recovery(config, network)?;
+        let supervisor = Self::open_for_recovery(Default::default(), config, network)?;
         supervisor.reconcile_startup(config).await?;
         Ok(supervisor)
     }
@@ -324,7 +337,8 @@ impl DhcpClientSupervisor {
         network: Arc<dyn NetworkProvider>,
         launcher: Arc<dyn DhcpClientLauncher>,
     ) -> Result<Self> {
-        let supervisor = Self::open_with_launcher_for_recovery(config, network, launcher)?;
+        let supervisor =
+            Self::open_with_launcher_for_recovery(Default::default(), config, network, launcher)?;
         supervisor.reconcile_startup(config).await?;
         Ok(supervisor)
     }
@@ -341,7 +355,10 @@ impl DhcpClientSupervisor {
 
     async fn recover_persisted_leases(&self, specs: &[DhcpClientSpec]) -> Result<()> {
         for interface in self.inner.applier.persisted_interfaces()? {
-            if crate::core::recovery::check_scope(self.inner.applier.state_dir(), Some(&interface))
+            if self
+                .inner
+                .recovery
+                .check_scope(self.inner.applier.state_dir(), Some(&interface))
                 .is_err()
             {
                 continue;
@@ -385,10 +402,11 @@ impl DhcpClientSupervisor {
 
     /// Replace client settings and start acquisition only when the supplied link state permits it.
     pub async fn configure_with_link_ready(&self, spec: DhcpClientSpec, link_ready: bool) {
-        if let Err(error) = crate::core::recovery::check_scope(
-            self.inner.applier.state_dir(),
-            Some(&spec.interface),
-        ) {
+        if let Err(error) = self
+            .inner
+            .recovery
+            .check_scope(self.inner.applier.state_dir(), Some(&spec.interface))
+        {
             tracing::error!(interface = %spec.interface, error = %format!("{error:#}"), "DHCP client blocked by interface recovery");
             return;
         }

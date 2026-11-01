@@ -982,10 +982,11 @@ async fn wait_until_idle_wakes_after_rollback() {
 }
 
 async fn stage_test_secret(
+    recovery: crate::core::recovery::RecoveryState,
     directory: &std::path::Path,
 ) -> crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore {
     use crate::wifi::{secret::WifiPassphrase, store::PassphraseStore};
-    let secrets = crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore::in_state_dir(directory);
+    let secrets = crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore::in_state_dir(directory, recovery);
     secrets
         .stage(std::collections::BTreeMap::from([(
             "wlan0".into(),
@@ -1011,7 +1012,7 @@ async fn provisioning_timeout_restores_secrets_before_runtime_rollback() {
         overrides.clone(),
         Duration::from_secs(60),
     );
-    let secrets = stage_test_secret(directory.path()).await;
+    let secrets = stage_test_secret(coordinator.recovery().clone(), directory.path()).await;
     *fake.rollback_secret.lock().unwrap() = Some(directory.path().to_path_buf());
     let plan = coordinator
         .plan(build_candidate(&overrides).await)
@@ -1038,7 +1039,7 @@ async fn provisioning_rollback_failure_retains_secret_journal_for_retry() {
         overrides.clone(),
         Duration::from_secs(60),
     );
-    let secrets = stage_test_secret(directory.path()).await;
+    let secrets = stage_test_secret(coordinator.recovery().clone(), directory.path()).await;
     *fake.rollback_secret.lock().unwrap() = Some(directory.path().to_path_buf());
     let plan = coordinator
         .plan(build_candidate(&overrides).await)
@@ -1076,7 +1077,7 @@ async fn provisioning_secret_restore_failure_blocks_commit_and_can_be_retried() 
         overrides.clone(),
         Duration::from_secs(60),
     );
-    let secrets = stage_test_secret(directory.path()).await;
+    let secrets = stage_test_secret(coordinator.recovery().clone(), directory.path()).await;
     *fake.rollback_secret.lock().unwrap() = Some(directory.path().into());
     let plan = coordinator
         .plan(build_candidate(&overrides).await)
@@ -1128,7 +1129,7 @@ async fn provisioning_secret_restore_failure_blocks_commit_and_can_be_retried() 
 async fn provisioning_apply_failure_restores_unbound_secret_before_compensation() {
     let fake = FakeSubsystems::new();
     let (coordinator, overrides, directory) = coordinator_with(fake.clone()).await;
-    let secrets = stage_test_secret(directory.path()).await;
+    let secrets = stage_test_secret(coordinator.recovery().clone(), directory.path()).await;
     *fake.rollback_secret.lock().unwrap() = Some(directory.path().to_path_buf());
     fake.fail_apply("apply_routes");
     let plan = coordinator
@@ -1476,7 +1477,9 @@ async fn restored_router_reports_cleanup_pending_and_never_rolls_back_twice() {
     );
     let after = fake.events();
     tokio::fs::remove_dir(receipt).await.unwrap();
-    crate::core::recovery::before_write(&coordinator.inner.journal)
+    coordinator
+        .recovery()
+        .before_write(&coordinator.inner.journal)
         .await
         .unwrap();
     assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
@@ -1725,7 +1728,9 @@ async fn exhausted_router_recovery_survives_restart_and_shutdown_without_mutatio
         CoordinatorStatus::RecoveryRequired
     );
     assert_eq!(
-        recovery_control::progress(&coordinator.inner.journal)
+        coordinator
+            .recovery()
+            .progress(&coordinator.inner.journal)
             .unwrap()
             .attempts,
         recovery_control::MAX_ATTEMPTS
@@ -1734,7 +1739,7 @@ async fn exhausted_router_recovery_survives_restart_and_shutdown_without_mutatio
     assert!(!coordinator.rollback_timeout_fired(&token).await);
     assert!(coordinator.rollback_for_shutdown().await.is_err());
     assert_eq!(fake.events(), before);
-    recovery_control::forget(&coordinator.inner.journal);
+    coordinator.recovery().forget(&coordinator.inner.journal);
     let restarted = RouterTransactionCoordinator::new(
         coordinator.manager(),
         overrides.clone(),
@@ -1888,7 +1893,7 @@ async fn cancelled_router_apply_and_repair_journal_writes_register_explicit_reco
 async fn provisioning_commit_retires_secrets_without_api_bookkeeping() {
     let fake = FakeSubsystems::new();
     let (coordinator, overrides, directory) = coordinator_with(fake).await;
-    let secrets = stage_test_secret(directory.path()).await;
+    let secrets = stage_test_secret(coordinator.recovery().clone(), directory.path()).await;
     let plan = coordinator
         .plan(build_candidate(&overrides).await)
         .await
@@ -1915,7 +1920,7 @@ async fn provisioning_commit_retires_secrets_without_api_bookkeeping() {
 async fn cancelled_provisioning_secret_binding_remains_owned_until_explicit_rollback() {
     let fake = FakeSubsystems::new();
     let (coordinator, overrides, directory) = coordinator_with(fake).await;
-    stage_test_secret(directory.path()).await;
+    stage_test_secret(coordinator.recovery().clone(), directory.path()).await;
     let plan = coordinator
         .plan(build_candidate(&overrides).await)
         .await
@@ -1967,7 +1972,7 @@ async fn rejected_router_apply_restores_unbound_secrets_without_runtime_repair()
         .plan(build_candidate(&overrides).await)
         .await
         .unwrap();
-    let secrets = stage_test_secret(directory.path()).await;
+    let secrets = stage_test_secret(coordinator.recovery().clone(), directory.path()).await;
     // A settings write makes the prepared candidate stale before registration.
     overrides
         .commit_candidate(&build_candidate(&overrides).await)

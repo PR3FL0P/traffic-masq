@@ -2277,6 +2277,7 @@ async fn startup_cancels_removed_device_transaction_without_replaying_it_after_r
     let overrides = RuntimeOverrideManager::load(directory.path(), &config)
         .await
         .unwrap();
+    let recovery = overrides.recovery().clone();
     let desired = DesiredNetworkState::new(config, overrides.clone());
     let network = Arc::new(FakeNetworkProvider::default());
     let ownership = AddressOwnershipJournal::in_memory();
@@ -2306,6 +2307,7 @@ async fn startup_cancels_removed_device_transaction_without_replaying_it_after_r
         "/run/traffic-masq/wpa_supplicant",
     );
     crate::core::transaction::recover_interface_transactions(
+        &recovery,
         directory.path(),
         &manager,
         &overrides.snapshot().await,
@@ -2313,7 +2315,7 @@ async fn startup_cancels_removed_device_transaction_without_replaying_it_after_r
     )
     .await
     .unwrap();
-    assert!(crate::core::recovery::check_scope(directory.path(), Some("eth0")).is_ok());
+    assert!(recovery.check_scope(directory.path(), Some("eth0")).is_ok());
     // This appeared after startup and belongs to a live transaction. A retry
     // must neither parse it nor retire it, even while another interface recovers.
     store.write("live0", b"live transaction journal").unwrap();
@@ -2336,13 +2338,15 @@ async fn startup_cancels_removed_device_transaction_without_replaying_it_after_r
         .await
         .unwrap();
         assert_eq!(failures.is_empty(), present, "{failures:?}");
-        assert!(crate::core::recovery::check_scope(directory.path(), Some("eth0")).is_ok());
+        assert!(recovery.check_scope(directory.path(), Some("eth0")).is_ok());
         assert!(store.read("eth0").unwrap().is_none());
         assert_eq!(
             store.read("live0").unwrap().unwrap(),
             b"live transaction journal"
         );
-        assert!(crate::core::recovery::check_scope(directory.path(), Some("live0")).is_ok());
+        assert!(recovery
+            .check_scope(directory.path(), Some("live0"))
+            .is_ok());
     }
     // A returned device follows committed unmanaged policy, not a retired
     // snapshot belonging to an earlier incarnation of the link.
@@ -2351,14 +2355,15 @@ async fn startup_cancels_removed_device_transaction_without_replaying_it_after_r
 
 #[test]
 fn unrelated_interface_recovery_never_downgrades_fatal_router_recovery() {
+    let recovery = crate::core::recovery::RecoveryState::default();
     let dir = tempdir().expect("tempdir");
-    crate::core::recovery::block_interface(dir.path(), "wlan0", "invalid snapshot".into());
-    assert!(crate::core::recovery::check_scope(dir.path(), None).is_err());
+    recovery.block_interface(dir.path(), "wlan0", "invalid snapshot".into());
+    assert!(recovery.check_scope(dir.path(), None).is_err());
     assert!(!router_recovery_allows_degraded_startup(
         crate::core::router_transaction::CoordinatorStatus::Idle,
         false,
     ));
-    crate::core::recovery::unblock_interface(dir.path(), "wlan0");
+    recovery.unblock_interface(dir.path(), "wlan0");
 }
 
 #[test]

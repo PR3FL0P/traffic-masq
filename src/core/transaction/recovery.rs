@@ -10,12 +10,14 @@ use anyhow::Result;
 /// Restore unconfirmed interface snapshots before applying startup configuration.
 /// In particular, startup otherwise skips interfaces that were previously unmanaged.
 pub async fn recover_interface_transactions(
+    recovery: &crate::core::recovery::RecoveryState,
     state_dir: &std::path::Path,
     manager: &InterfaceManager,
     committed: &crate::state::overrides::RuntimeOverrides,
     wifi_runtime_dirs: &crate::wifi::WifiRuntimeDirs,
 ) -> Result<()> {
     recover_interface_transactions_with_tokens(
+        recovery,
         state_dir,
         manager,
         &committed.committed_interface_transactions,
@@ -28,12 +30,14 @@ pub async fn recover_interface_transactions(
 /// Early-startup recovery variant that consumes only independently parsed
 /// commit tokens, before the full override document is semantically validated.
 pub async fn recover_interface_transactions_with_commit_tokens(
+    recovery: &crate::core::recovery::RecoveryState,
     state_dir: &std::path::Path,
     manager: &InterfaceManager,
     committed: &std::collections::BTreeMap<String, String>,
     wifi_runtime_dirs: &crate::wifi::WifiRuntimeDirs,
 ) -> Result<()> {
     recover_interface_transactions_with_commit_tokens_excluding(
+        recovery,
         state_dir,
         manager,
         committed,
@@ -45,6 +49,7 @@ pub async fn recover_interface_transactions_with_commit_tokens(
 
 /// Recover interface transactions except scopes already fenced by independent recovery metadata.
 pub async fn recover_interface_transactions_with_commit_tokens_excluding(
+    recovery: &crate::core::recovery::RecoveryState,
     state_dir: &std::path::Path,
     manager: &InterfaceManager,
     committed: &std::collections::BTreeMap<String, String>,
@@ -52,6 +57,7 @@ pub async fn recover_interface_transactions_with_commit_tokens_excluding(
     wifi_runtime_dirs: &crate::wifi::WifiRuntimeDirs,
 ) -> Result<()> {
     recover_interface_transactions_with_tokens(
+        recovery,
         state_dir,
         manager,
         committed,
@@ -68,6 +74,7 @@ pub async fn recover_interface_transactions_with_commit_tokens_excluding(
 /// unrelated router recovery may continue without guessing whether rollback would destroy a
 /// committed interface change.
 pub async fn block_interface_transactions_without_commit_proof(
+    recovery: &crate::core::recovery::RecoveryState,
     state_dir: &std::path::Path,
     reason: &str,
 ) -> Result<()> {
@@ -75,7 +82,7 @@ pub async fn block_interface_transactions_without_commit_proof(
     let names = enumerate_interface_recovery_journals(state_dir, &store).await?;
     for name in names {
         let path = store.directory().join(format!("{name}.json"));
-        crate::core::recovery::block_interface(
+        recovery.block_interface(
             state_dir,
             &name,
             format!(
@@ -88,13 +95,14 @@ pub async fn block_interface_transactions_without_commit_proof(
 }
 
 async fn recover_interface_transactions_with_tokens(
+    recovery: &crate::core::recovery::RecoveryState,
     state_dir: &std::path::Path,
     manager: &InterfaceManager,
     committed: &std::collections::BTreeMap<String, String>,
     excluded: &std::collections::BTreeSet<String>,
     wifi_runtime_dirs: &crate::wifi::WifiRuntimeDirs,
 ) -> Result<()> {
-    crate::core::recovery::check_commit(state_dir)?;
+    recovery.check_commit(state_dir)?;
     let store = open_interface_recovery_store(state_dir).await?;
     let names = enumerate_interface_recovery_journals(state_dir, &store)
         .await?
@@ -114,6 +122,7 @@ async fn recover_interface_transactions_with_tokens(
         })
         .collect();
     recover_interface_journals(
+        recovery,
         state_dir,
         manager,
         committed,
@@ -128,14 +137,15 @@ async fn recover_interface_transactions_with_tokens(
 
 /// Retry only failed startup journals, never live unconfirmed transactions.
 pub(crate) async fn retry_interface_recovery(
+    recovery: &crate::core::recovery::RecoveryState,
     state_dir: &std::path::Path,
     manager: &InterfaceManager,
     committed: &crate::state::overrides::RuntimeOverrides,
     wifi_runtime_dirs: &crate::wifi::WifiRuntimeDirs,
     desired: &crate::core::desired::DesiredNetworkState,
 ) -> Result<()> {
-    crate::core::recovery::check_commit(state_dir)?;
-    let names = crate::core::recovery::retryable_blocked_interfaces(state_dir);
+    recovery.check_commit(state_dir)?;
+    let names = recovery.retryable_blocked_interfaces(state_dir);
     if names.is_empty() {
         return Ok(());
     }
@@ -145,10 +155,14 @@ pub(crate) async fn retry_interface_recovery(
             continue;
         };
         let _lane = desired.runtime_locks.lock(&name).await;
-        if !crate::core::recovery::retryable_blocked_interfaces(state_dir).contains(&name) {
+        if !recovery
+            .retryable_blocked_interfaces(state_dir)
+            .contains(&name)
+        {
             continue;
         }
         recover_interface_journals(
+            recovery,
             state_dir,
             manager,
             &committed.committed_interface_transactions,
@@ -162,7 +176,9 @@ pub(crate) async fn retry_interface_recovery(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn recover_interface_journals(
+    recovery: &crate::core::recovery::RecoveryState,
     state_dir: &std::path::Path,
     manager: &InterfaceManager,
     committed: &std::collections::BTreeMap<String, String>,
@@ -175,38 +191,37 @@ async fn recover_interface_journals(
         let recovery_path = state_dir
             .join("interface-transactions")
             .join(format!("{name}.json"));
-        if !new_session && recovery_control::stopped(&recovery_path) {
+        if !new_session && recovery.stopped(&recovery_path) {
             continue;
         }
         let path = store.directory().join(format!("{name}.json"));
-        let result: Result<()> =
-            async {
-                let bytes = store.read(&name)?.ok_or_else(|| {
-                    anyhow::anyhow!("recovery journal disappeared before restoration")
-                })?;
-                if crate::core::recovery::completed(&path, &bytes).await? {
-                    return crate::core::recovery::retire(&path).await;
-                }
-                let committed_token = committed.get(&name);
-                let committed_proof = serde_json::from_slice::<InterfaceJournalHeader>(&bytes)
-                    .ok()
-                    .is_some_and(|header| Some(&header.token) == committed_token);
-                if committed_proof {
-                    tracing::warn!(
-                        interface = %name,
-                        journal = %path.display(),
-                        operation = "retire_committed_interface_journal",
-                        invariant = "committed_token_proof",
-                        metadata_safe_to_remove = true,
-                        "retiring interface recovery metadata proven obsolete by committed token"
-                    );
-                    return crate::core::recovery::retire(&path).await;
-                }
-                // A daemon restart starts a new bounded restoration attempt.
-                // Historical failures are evidence, not proof that the current
-                // environment still prevents cancellation. Background retries
-                // retain the existing attempt budget.
-                recovery_control::run(&path, new_session, async {
+        let result: Result<()> = async {
+            let bytes = store.read(&name)?.ok_or_else(|| {
+                anyhow::anyhow!("recovery journal disappeared before restoration")
+            })?;
+            if recovery.completed(&path, &bytes).await? {
+                return recovery.retire(&path).await;
+            }
+            let committed_token = committed.get(&name);
+            let committed_proof = serde_json::from_slice::<InterfaceJournalHeader>(&bytes)
+                .ok()
+                .is_some_and(|header| Some(&header.token) == committed_token);
+            if committed_proof {
+                tracing::warn!(
+                    interface = %name,
+                    journal = %path.display(),
+                    operation = "retire_committed_interface_journal",
+                    invariant = "committed_token_proof",
+                    metadata_safe_to_remove = true,
+                    "retiring interface recovery metadata proven obsolete by committed token"
+                );
+                return recovery.retire(&path).await;
+            }
+            // A daemon restart starts a new bounded restoration attempt.
+            // Historical failures are evidence, not proof that the current
+            // environment still prevents cancellation. Background retries
+            // retain the existing attempt budget.
+            recovery.run(&path, new_session, async {
                 let record: InterfaceJournal = serde_json::from_slice(&bytes)?;
                 anyhow::ensure!(
                 record.version == 3 && record.snapshot.name == name,
@@ -226,14 +241,14 @@ async fn recover_interface_journals(
                     manager.rollback_transaction_snapshot(&record.snapshot).await?;
                     tracing::warn!(interface = %name, "restored interrupted interface transaction");
                 }
-                crate::core::recovery::retire(&path).await
+                recovery.retire(&path).await
             })
             .await
-            }
-            .await;
+        }
+        .await;
         match result {
-            Ok(()) => crate::core::recovery::unblock_interface(state_dir, &name),
-            Err(error) => crate::core::recovery::block_interface(
+            Ok(()) => recovery.unblock_interface(state_dir, &name),
+            Err(error) => recovery.block_interface(
                 state_dir,
                 &name,
                 format!("journal={}; {error:#}", path.display()),

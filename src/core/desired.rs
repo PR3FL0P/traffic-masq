@@ -97,6 +97,10 @@ pub struct DesiredNetworkState {
 }
 
 impl DesiredNetworkState {
+    pub fn recovery(&self) -> &crate::core::recovery::RecoveryState {
+        self.overrides.recovery()
+    }
+
     pub fn new(base: AppConfig, overrides: RuntimeOverrideManager) -> Self {
         Self {
             overrides,

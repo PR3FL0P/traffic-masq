@@ -120,8 +120,10 @@ impl InterfaceManager {
     /// manager that writes addresses has to record them where every manager
     /// that asks "is this mine" will look, or the answer depends on which
     /// object you happened to ask.
+    /// Construct an isolated writer. Daemon components must use
+    /// `new_with_mutation_locks` with their shared recovery context address locks.
     pub fn new(provider: Arc<dyn NetworkProvider>, journal: AddressOwnershipJournal) -> Self {
-        Self::new_with_mutation_locks(provider, journal, InterfaceMutationLocks::global())
+        Self::new_with_mutation_locks(provider, journal, InterfaceMutationLocks::default())
     }
 
     pub fn new_with_mutation_locks(

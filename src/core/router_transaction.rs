@@ -205,6 +205,10 @@ pub struct RouterTransactionCoordinator {
 }
 
 impl RouterTransactionCoordinator {
+    pub fn recovery(&self) -> &crate::core::recovery::RecoveryState {
+        self.inner.overrides.recovery()
+    }
+
     pub fn new(
         manager: RouterManager,
         overrides: RuntimeOverrideManager,
@@ -292,7 +296,7 @@ impl RouterTransactionCoordinator {
     }
 
     async fn apply_inner(&self, plan: TransactionPlan) -> Result<String> {
-        crate::core::recovery::check_scope(
+        self.recovery().check_scope(
             self.inner
                 .overrides
                 .path()
@@ -464,7 +468,10 @@ impl RouterTransactionCoordinator {
             let token = token.clone();
             coordinator.transition(&mut state, next);
             let preparation = async {
-                let guard = recovery_control::begin_apply(&coordinator.inner.journal).await?;
+                let guard = coordinator
+                    .recovery()
+                    .begin_apply(&coordinator.inner.journal)
+                    .await?;
                 if bind_secrets {
                     if let Err(error) = coordinator.provisioning_secrets().bind_token(&token).await
                     {
@@ -491,6 +498,7 @@ impl RouterTransactionCoordinator {
                 .path()
                 .parent()
                 .expect("override state directory"),
+            self.recovery().clone(),
         )
     }
 
@@ -501,7 +509,7 @@ impl RouterTransactionCoordinator {
             matches!(*state, CoordinatorState::Idle),
             "router transaction owns provisioning secrets"
         );
-        crate::core::recovery::check_commit(
+        self.recovery().check_commit(
             self.inner
                 .overrides
                 .path()
@@ -540,7 +548,7 @@ impl RouterTransactionCoordinator {
     }
 
     async fn cleanup_removed_dataplane_inner(&self, desired: &RouterDesired) -> Result<()> {
-        crate::core::recovery::check_scope(
+        self.recovery().check_scope(
             self.inner
                 .overrides
                 .path()
@@ -571,7 +579,7 @@ impl RouterTransactionCoordinator {
     }
 
     async fn repair_inner(&self, desired: RouterDesired, dataplane_only: bool) -> Result<()> {
-        crate::core::recovery::check_scope(
+        self.recovery().check_scope(
             self.inner
                 .overrides
                 .path()
@@ -669,7 +677,7 @@ impl RouterTransactionCoordinator {
                         failures,
                     }),
                 );
-                if !recovery_control::stopped(&self.inner.journal) {
+                if !self.recovery().stopped(&self.inner.journal) {
                     self.spawn_timer(token, false);
                 }
             } else {
@@ -719,14 +727,14 @@ impl RouterTransactionCoordinator {
     /// Persistence failure keeps the transaction pending; successful commit retires recovery state.
     pub(crate) async fn commit(&self, token: &str) -> Result<u64> {
         let mut state = self.inner.state.lock().await;
-        crate::core::recovery::check_commit(
+        self.recovery().check_commit(
             self.inner
                 .overrides
                 .path()
                 .parent()
                 .expect("state directory"),
         )?;
-        if recovery_control::progress(&self.inner.journal).is_some() {
+        if self.recovery().progress(&self.inner.journal).is_some() {
             return Err(CoordinatorConflict::RollbackRecoveryRequired.into());
         }
         let pending = match &*state {
@@ -790,7 +798,7 @@ impl RouterTransactionCoordinator {
         let result = self
             .rollback_locked(&mut state, RollbackTrigger::Manual)
             .await;
-        if result.is_err() && !recovery_control::stopped(&self.inner.journal) {
+        if result.is_err() && !self.recovery().stopped(&self.inner.journal) {
             if let CoordinatorState::RollbackFailed(failure) = &*state {
                 self.spawn_timer(failure.token.clone(), false);
             }
@@ -845,18 +853,18 @@ impl RouterTransactionCoordinator {
             .read()
             .expect("router observation lock")
             .clone();
-        view.commit_uncertainty = crate::core::recovery::commit_uncertainty(
+        view.commit_uncertainty = self.recovery().commit_uncertainty(
             self.inner
                 .overrides
                 .path()
                 .parent()
                 .expect("state directory"),
         );
-        view.cleanup_pending = crate::core::recovery::cleanup_pending(&self.inner.journal);
+        view.cleanup_pending = self.recovery().cleanup_pending(&self.inner.journal);
         if view.token.is_some() {
-            if recovery_control::stopped(&self.inner.journal) {
+            if self.recovery().stopped(&self.inner.journal) {
                 view.phase = RouterPhase::RecoveryRequired;
-            } else if recovery_control::progress(&self.inner.journal).is_some() {
+            } else if self.recovery().progress(&self.inner.journal).is_some() {
                 view.phase = RouterPhase::RollbackRequired;
             }
         }
@@ -883,7 +891,7 @@ impl RouterTransactionCoordinator {
         let result = self
             .rollback_locked(&mut state, RollbackTrigger::Manual)
             .await;
-        if result.is_err() && !recovery_control::stopped(&self.inner.journal) {
+        if result.is_err() && !self.recovery().stopped(&self.inner.journal) {
             if let CoordinatorState::RollbackFailed(failure) = &*state {
                 self.spawn_timer(failure.token.clone(), false);
             }
@@ -903,7 +911,7 @@ impl RouterTransactionCoordinator {
     /// retained as a changed watch value.
     pub async fn wait_until_idle(&self) {
         let mut idle = self.inner.idle_epoch.subscribe();
-        let mut housekeeping = crate::core::recovery::subscribe();
+        let mut housekeeping = self.recovery().subscribe();
         loop {
             // This is an explicit completion wait, unlike status observation.
             // Join registration/cleanup work even if its last published state
@@ -942,7 +950,7 @@ impl RouterTransactionCoordinator {
         state: &mut CoordinatorState,
         trigger: RollbackTrigger,
     ) -> Result<()> {
-        crate::core::recovery::check_commit(
+        self.recovery().check_commit(
             self.inner
                 .overrides
                 .path()
@@ -950,7 +958,7 @@ impl RouterTransactionCoordinator {
                 .expect("state directory"),
         )?;
         if trigger == RollbackTrigger::Manual {
-            crate::core::recovery::check_rollback_scope(
+            self.recovery().check_rollback_scope(
                 self.inner
                     .overrides
                     .path()
@@ -964,7 +972,7 @@ impl RouterTransactionCoordinator {
             CoordinatorState::RollbackFailed(failure) => failure.recovery_desired.clone(),
             CoordinatorState::Pending(pending)
                 if pending.confirmation_deadline.is_none()
-                    || recovery_control::progress(&self.inner.journal).is_some() =>
+                    || self.recovery().progress(&self.inner.journal).is_some() =>
             {
                 Some(pending.candidate.desired().clone())
             }
@@ -1012,12 +1020,14 @@ impl RouterTransactionCoordinator {
         let journal_exists = match crate::atomic_file::regular_file_exists(&self.inner.journal) {
             Ok(exists) => exists,
             Err(error) => {
-                if let Err(persistence) = recovery_control::stop(
-                    &self.inner.journal,
-                    recovery_control::FailureKind::Storage,
-                    format!("{error:#}"),
-                )
-                .await
+                if let Err(persistence) = self
+                    .recovery()
+                    .stop(
+                        &self.inner.journal,
+                        recovery_control::FailureKind::Storage,
+                        format!("{error:#}"),
+                    )
+                    .await
                 {
                     return Err(
                         persistence.context(format!("journal inspection failed: {error:#}"))
@@ -1073,30 +1083,32 @@ impl RouterTransactionCoordinator {
         manual: bool,
         recovery_desired: Option<&RouterDesired>,
     ) -> Vec<String> {
-        let result = recovery_control::run(&self.inner.journal, manual, async {
-            if let Some(desired) = recovery_desired {
-                self.inner
-                    .manager
-                    .prepare_recovery(desired)
+        let result = self
+            .recovery()
+            .run(&self.inner.journal, manual, async {
+                if let Some(desired) = recovery_desired {
+                    self.inner
+                        .manager
+                        .prepare_recovery(desired)
+                        .await
+                        .context("failed to reconstruct partially-applied router state")?;
+                }
+                let secrets = self.provisioning_secrets();
+                // Do not start runtime consumers until their credentials are restored.
+                let restored = secrets
+                    .restore(Some(token))
                     .await
-                    .context("failed to reconstruct partially-applied router state")?;
-            }
-            let secrets = self.provisioning_secrets();
-            // Do not start runtime consumers until their credentials are restored.
-            let restored = secrets
-                .restore(Some(token))
-                .await
-                .context("failed to restore provisioning secrets")?;
-            self.inner.manager.rollback_to_classified(snapshot).await?;
-            if restored {
-                secrets.finish(Some(token)).await?;
-            }
-            self.retain_committed_router_interfaces_for_recovery()
-                .await?;
-            self.clear_journal().await?;
-            Ok(())
-        })
-        .await;
+                    .context("failed to restore provisioning secrets")?;
+                self.inner.manager.rollback_to_classified(snapshot).await?;
+                if restored {
+                    secrets.finish(Some(token)).await?;
+                }
+                self.retain_committed_router_interfaces_for_recovery()
+                    .await?;
+                self.clear_journal().await?;
+                Ok(())
+            })
+            .await;
         result
             .err()
             .map(|error| vec![format!("{error:#}")])
@@ -1162,14 +1174,16 @@ impl RouterTransactionCoordinator {
         if epoch.is_some_and(|epoch| self.inner.timer_epoch.load(Ordering::SeqCst) != epoch) {
             return false;
         }
-        if crate::core::recovery::check_commit(
-            self.inner
-                .overrides
-                .path()
-                .parent()
-                .expect("state directory"),
-        )
-        .is_err()
+        if self
+            .recovery()
+            .check_commit(
+                self.inner
+                    .overrides
+                    .path()
+                    .parent()
+                    .expect("state directory"),
+            )
+            .is_err()
         {
             return false;
         }
@@ -1183,7 +1197,7 @@ impl RouterTransactionCoordinator {
             .await
         {
             tracing::error!(%error, "automatic router rollback failed; will retry");
-            return !recovery_control::stopped(&self.inner.journal);
+            return !self.recovery().stopped(&self.inner.journal);
         }
         false
     }
@@ -1198,7 +1212,7 @@ impl RouterTransactionCoordinator {
         let timeout = if confirmation {
             self.inner.rollback_timeout
         } else {
-            recovery_control::retry_delay(&self.inner.journal)
+            self.recovery().retry_delay(&self.inner.journal)
         };
         let deadline = tokio::time::Instant::now() + timeout;
         tokio::spawn(async move {
@@ -1209,7 +1223,12 @@ impl RouterTransactionCoordinator {
                     .await
             {
                 // No mutation/state locks are retained between attempts.
-                tokio::time::sleep(recovery_control::retry_delay(&coordinator.inner.journal)).await;
+                tokio::time::sleep(
+                    coordinator
+                        .recovery()
+                        .retry_delay(&coordinator.inner.journal),
+                )
+                .await;
             }
         });
     }
@@ -1221,7 +1240,7 @@ impl RouterTransactionCoordinator {
         snapshot: &RouterSnapshot,
         current_desired: &RouterDesired,
     ) -> Result<()> {
-        crate::core::recovery::before_write(&self.inner.journal).await?;
+        self.recovery().before_write(&self.inner.journal).await?;
         anyhow::ensure!(
             !crate::atomic_file::regular_file_exists(&self.inner.journal)?,
             "invariant=retain_recovery_proof; journal={}; operation=write_journal; metadata_safe_to_remove=false: unresolved journal",
@@ -1251,13 +1270,13 @@ impl RouterTransactionCoordinator {
     }
 
     async fn clear_journal(&self) -> Result<()> {
-        crate::core::recovery::retire(&self.inner.journal).await?;
+        self.recovery().retire(&self.inner.journal).await?;
         Ok(())
     }
 
     /// Restore an interrupted transaction before accepting control requests.
     pub(crate) async fn recover(&self) -> Result<bool> {
-        crate::core::recovery::check_commit(
+        self.recovery().check_commit(
             self.inner
                 .overrides
                 .path()
@@ -1292,7 +1311,11 @@ impl RouterTransactionCoordinator {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error).context(journal_access_diagnostic()),
         };
-        if crate::core::recovery::completed(&self.inner.journal, &bytes).await? {
+        if self
+            .recovery()
+            .completed(&self.inner.journal, &bytes)
+            .await?
+        {
             self.retain_committed_router_interfaces_for_recovery()
                 .await?;
             self.clear_journal().await?;
@@ -1328,7 +1351,10 @@ impl RouterTransactionCoordinator {
                 Ok(record) if matches!(record.version, 2 | 3) => "stale",
                 _ => "corrupt",
             };
-            if let Err(error) = crate::core::recovery::quarantine(&self.inner.journal, suffix).await
+            if let Err(error) = self
+                .recovery()
+                .quarantine(&self.inner.journal, suffix)
+                .await
             {
                 tracing::warn!(journal = %self.inner.journal.display(), operation = "quarantine_committed_journal",
                     invariant = "committed_token_proof", metadata_safe_to_remove = true, %error,
@@ -1410,7 +1436,7 @@ impl RouterTransactionCoordinator {
                 .rollback_locked(&mut state, RollbackTrigger::Startup)
                 .await
             {
-                if !recovery_control::stopped(&self.inner.journal) {
+                if !self.recovery().stopped(&self.inner.journal) {
                     self.spawn_timer(journal.token.clone(), false);
                 }
                 return Err(error);
