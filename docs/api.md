@@ -8,7 +8,12 @@ daemon never exposes an unencrypted TCP listener.
 
 The API is currently intended to be used together with the same release of the
 daemon. Additive fields and response variants may appear within version 1, so
-clients should ignore unknown object fields and handle unknown `type` values.
+clients should ignore unknown object fields and handle unknown response `type` values.
+The Rust client decodes unfamiliar response types as `ControlResponse::Unknown`;
+callers must treat this as an unsupported response, not a successful operation.
+Shared configuration objects ignore additive fields, including when nested in
+responses. Unknown request types and unknown values of configuration enums are
+still rejected; adding configuration enum values requires compatible clients.
 Request bodies are limited to 64 KiB. HTTP/1 connections close after one
 request and have a 60-second server deadline; TLS handshakes have a 10-second
 deadline. A lost response does not cancel an admitted control operation.

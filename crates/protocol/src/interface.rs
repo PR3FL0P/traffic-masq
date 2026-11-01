@@ -16,7 +16,6 @@ fn default_max_stations() -> u16 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct InterfaceConfigView {
     /// Receive Wi-Fi and expose a virtual AP on the same physical radio.
     #[serde(default)]

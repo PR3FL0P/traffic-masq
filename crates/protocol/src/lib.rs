@@ -264,7 +264,6 @@ impl Default for ApiHttpsSettings {
 
 /// DNS addresses copied into newly configured DHCP servers; empty means no DNS option.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct DhcpDnsDefaults {
     pub servers: Vec<Ipv4Addr>,
 }
@@ -1811,6 +1810,9 @@ pub enum Response<
     WifiClientError {
         detail: WifiClientErrorDetail,
     },
+    /// A response type introduced by a newer daemon. Clients must not treat it as success.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Complete control response decoded by a client without daemon model types.
@@ -1829,6 +1831,63 @@ pub type ControlResponse = Response<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn future_response_types_decode_as_unknown() {
+        let response: ControlResponse = serde_json::from_value(serde_json::json!({
+            "type": "future_response", "payload": {"nested": [1, 2, 3]}
+        }))
+        .unwrap();
+        assert!(matches!(response, ControlResponse::Unknown));
+    }
+
+    #[test]
+    fn response_configurations_accept_additive_fields() {
+        let response: ControlResponse = serde_json::from_value(serde_json::json!({
+            "type": "interface_config", "interface": "eth0",
+            "config": {"role": "none", "future_config_field": true},
+            "allow_management_change": false, "future_response_field": 42
+        }))
+        .unwrap();
+        assert!(matches!(response, ControlResponse::InterfaceConfig { .. }));
+
+        let response: ControlResponse = serde_json::from_value(serde_json::json!({
+            "type": "router_config", "config": {
+                "future_router_field": true,
+                "port_forwards": [{
+                    "from": "eth0", "to": "eth1", "protocol": "tcp",
+                    "external_port": 80, "target_address": "192.168.1.2",
+                    "target_port": 8080, "future_rule_field": true
+                }]
+            }
+        }))
+        .unwrap();
+        assert!(matches!(response, ControlResponse::RouterConfig { .. }));
+
+        let defaults: DhcpDnsDefaults = serde_json::from_value(serde_json::json!({
+            "servers": [], "future_field": true
+        }))
+        .unwrap();
+        assert!(defaults.servers.is_empty());
+        let _: RouterDataplaneDesiredView = serde_json::from_value(serde_json::json!({
+            "future_field": true
+        }))
+        .unwrap();
+    }
+
+    #[test]
+    fn malformed_known_responses_and_unknown_requests_remain_errors() {
+        assert!(
+            serde_json::from_value::<ControlResponse>(serde_json::json!({
+                "type": "interface_config", "interface": 42
+            }))
+            .is_err()
+        );
+        assert!(serde_json::from_value::<ControlRequest>(serde_json::json!({
+            "type": "future_command"
+        }))
+        .is_err());
+    }
 
     #[test]
     fn error_details_keep_the_existing_wire_shape() {

@@ -149,7 +149,6 @@ pub struct StandaloneVpnPlanView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RouterDataplaneDesiredView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarding: Option<Vec<ForwardingConfigView>>,
