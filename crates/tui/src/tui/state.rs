@@ -1,5 +1,6 @@
 use super::*;
 
+#[derive(Default)]
 pub(super) struct InterfaceUiState {
     pub(super) selected_interface: usize,
     pub(super) selected_inventory_interface: usize,
@@ -8,20 +9,6 @@ pub(super) struct InterfaceUiState {
     pub(super) preview: Option<InterfaceChangePlanView>,
     pub(super) preview_scroll: usize,
     pub(super) preview_max_scroll: usize,
-}
-
-impl Default for InterfaceUiState {
-    fn default() -> Self {
-        Self {
-            selected_interface: 0,
-            selected_inventory_interface: 0,
-            editor: None,
-            interface_drafts: HashMap::new(),
-            preview: None,
-            preview_scroll: 0,
-            preview_max_scroll: 0,
-        }
-    }
 }
 
 pub(super) struct ConfirmationState {
@@ -44,6 +31,7 @@ impl Default for ConfirmationState {
     }
 }
 
+#[derive(Default)]
 pub(super) struct DhcpUiState {
     pub(super) dhcp_editor: Option<DhcpEditor>,
     pub(super) dhcp_leases: Option<DhcpLeasesView>,
@@ -52,20 +40,6 @@ pub(super) struct DhcpUiState {
     pub(super) dhcp_client_selected: Option<String>,
     pub(super) dhcp_client_scroll: usize,
     pub(super) dhcp_client_editor: Option<dhcp_client_editor::Editor>,
-}
-
-impl Default for DhcpUiState {
-    fn default() -> Self {
-        Self {
-            dhcp_editor: None,
-            dhcp_leases: None,
-            dhcp_clients: Vec::new(),
-            dhcp_interfaces: Vec::new(),
-            dhcp_client_selected: None,
-            dhcp_client_scroll: 0,
-            dhcp_client_editor: None,
-        }
-    }
 }
 
 pub(super) struct RouterUiState {
@@ -94,6 +68,7 @@ impl Default for RouterUiState {
     }
 }
 
+#[derive(Default)]
 pub(super) struct WifiUiState {
     pub(super) wifi_stations: Option<wifi_stations::View>,
     pub(super) wifi_editor: Option<wifi::WifiEditor>,
@@ -105,21 +80,7 @@ pub(super) struct WifiUiState {
     pub(super) ap_drafts: HashMap<String, wifi::WifiEditor>,
 }
 
-impl Default for WifiUiState {
-    fn default() -> Self {
-        Self {
-            wifi_stations: None,
-            wifi_editor: None,
-            wifi_scan: None,
-            wifi_profiles: None,
-            wifi_ap_profiles: None,
-            wifi_profile_editor: None,
-            wifi_connect: None,
-            ap_drafts: HashMap::new(),
-        }
-    }
-}
-
+#[derive(Default)]
 pub(super) struct LogViewState {
     pub(super) logs: VecDeque<logs::LogEntry>,
     pub(super) logs_dirty: bool,
@@ -130,48 +91,16 @@ pub(super) struct LogViewState {
     pub(super) daemon_logs: daemon_logs::View,
 }
 
-impl Default for LogViewState {
-    fn default() -> Self {
-        Self {
-            logs: VecDeque::new(),
-            logs_dirty: false,
-            logs_clear_confirmation: false,
-            logs_scroll: 0,
-            logs_max_scroll: 0,
-            logs_focus: logs::LogFocus::default(),
-            daemon_logs: daemon_logs::View::default(),
-        }
-    }
-}
-
+#[derive(Default)]
 pub(super) struct SettingsUiState {
     pub(super) settings: Option<SecurityEditor>,
     pub(super) dns_defaults: Option<dns_defaults::Editor>,
     pub(super) settings_password: Option<PasswordChangeEditor>,
 }
 
-impl Default for SettingsUiState {
-    fn default() -> Self {
-        Self {
-            settings: None,
-            dns_defaults: None,
-            settings_password: None,
-        }
-    }
-}
-
+#[derive(Default)]
 pub(super) struct DashboardUiState {
     pub(super) dashboard_pane: dashboard::DashboardPane,
     pub(super) dashboard_statistics_index: usize,
     pub(super) traffic: HashMap<u32, dashboard::TrafficHistory>,
-}
-
-impl Default for DashboardUiState {
-    fn default() -> Self {
-        Self {
-            dashboard_pane: dashboard::DashboardPane::default(),
-            dashboard_statistics_index: 0,
-            traffic: HashMap::new(),
-        }
-    }
 }

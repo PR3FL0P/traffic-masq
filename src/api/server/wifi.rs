@@ -293,7 +293,7 @@ pub(super) async fn wifi_client_reconnect(
     .await
 }
 
-/// Typed control transport; REST adapters use the same authorization and dispatcher.
+// Typed control transport; REST adapters use the same authorization and dispatcher.
 
 pub(super) async fn list_wifi_ap_profiles(
     State(state): State<AppState>,
