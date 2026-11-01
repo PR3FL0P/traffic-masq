@@ -396,6 +396,9 @@ For traffic-masq DHCP routes, the manual deletion dialog also explains the
 supported configuration path. For a default route, use **Edit route** or
 **DHCP Client → interface → e / Enter**, turn **Install default route** off,
 and Apply and confirm the change. **Route metric** changes its priority instead.
+The route metric applies to both the default route and the local subnet route.
+If another route occupies the requested metric, DHCP selects a free, lower-priority
+metric and keeps it across renewals and restarts, preserving the existing route.
 The local subnet route follows the leased address and has no separate disable
 switch; changing away from DHCP belongs in the confirmed Interfaces editor.
 Manual deletion changes only the live kernel state, has no automatic rollback,

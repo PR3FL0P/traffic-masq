@@ -1327,3 +1327,92 @@ async fn an_adjusted_default_metric_is_adopted_on_restart() {
     );
     drop(supervisor);
 }
+
+#[tokio::test]
+async fn subnet_metric_uses_policy_and_adjusted_subnet_is_adopted_on_restart() {
+    let state_dir = TempDir::new().unwrap();
+    let network = FakeNetwork::present(7).await;
+    let foreign = Ipv4RouteInfo {
+        destination: "192.0.2.0/24".parse().unwrap(),
+        gateway: None,
+        output_interface_index: Some(9),
+        table: 254,
+        metric: Some(100),
+        protocol: TRAFFIC_MASQ_DHCP_ROUTE_PROTOCOL,
+        scope: 253,
+    };
+    network.routes.lock().await.push(foreign.clone());
+    let launcher = Arc::new(FakeLauncher::default());
+    let supervisor = supervisor_with(&state_dir, network.clone(), launcher.clone()).await;
+    launcher
+        .take_sink()
+        .lease_acquired(lease(Ipv4Addr::new(192, 0, 2, 42)))
+        .await
+        .unwrap();
+    let bound = supervisor.status("wan0").await.unwrap().lease.unwrap();
+    assert_eq!(bound.owned_routes[0].metric, Some(101));
+    assert_eq!(bound.owned_routes[1].metric, Some(100));
+    let restarted = supervisor_with(&state_dir, network.clone(), launcher.clone()).await;
+    assert_eq!(
+        restarted
+            .status("wan0")
+            .await
+            .unwrap()
+            .lease
+            .unwrap()
+            .owned_routes,
+        bound.owned_routes
+    );
+    assert_eq!(
+        launcher
+            .remembered
+            .lock()
+            .unwrap()
+            .last()
+            .copied()
+            .flatten(),
+        Some(bound.address)
+    );
+    restarted.disable("wan0").await.unwrap();
+    assert_eq!(*network.routes.lock().await, vec![foreign]);
+}
+
+#[tokio::test]
+async fn legacy_zero_metric_subnet_is_cleaned_before_fresh_acquisition() {
+    let state_dir = TempDir::new().unwrap();
+    let network = FakeNetwork::present(7).await;
+    let launcher = Arc::new(FakeLauncher::default());
+    let _supervisor = supervisor_with(&state_dir, network.clone(), launcher.clone()).await;
+    launcher
+        .take_sink()
+        .lease_acquired(lease(Ipv4Addr::new(192, 0, 2, 42)))
+        .await
+        .unwrap();
+    let store = DhcpClientLeaseStore::new(state_dir.path()).unwrap();
+    let mut legacy = store.load("wan0").unwrap().unwrap();
+    legacy.owned_routes[0].metric = None;
+    store.save(&legacy).unwrap();
+    network
+        .routes
+        .lock()
+        .await
+        .iter_mut()
+        .find(|route| route.destination.prefix_len() == 24)
+        .unwrap()
+        .metric = None;
+    let restarted = supervisor_with(&state_dir, network.clone(), launcher.clone()).await;
+    assert!(restarted.status("wan0").await.unwrap().lease.is_none());
+    assert_eq!(
+        launcher
+            .remembered
+            .lock()
+            .unwrap()
+            .last()
+            .copied()
+            .flatten(),
+        None
+    );
+    assert!(network.routes.lock().await.is_empty());
+    assert!(network.addresses.lock().await.is_empty());
+    assert!(store.load("wan0").unwrap().is_none());
+}

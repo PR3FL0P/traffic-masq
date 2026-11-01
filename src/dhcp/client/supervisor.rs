@@ -1190,7 +1190,7 @@ impl OwnershipSink {
             gateway: None,
             output_interface_index: Some(self.identity.index),
             table: MAIN_ROUTE_TABLE,
-            metric: None,
+            metric: Some(self.spec.route_metric),
             protocol: TRAFFIC_MASQ_DHCP_ROUTE_PROTOCOL,
             scope: LINK_ROUTE_SCOPE,
         }];
@@ -1222,13 +1222,11 @@ fn persisted_lease_matches_spec(lease: &DhcpClientLease, spec: &DhcpClientSpec) 
         && {
             let mut expected = expected_owned_routes(lease, spec);
             for route in &mut expected {
-                if route.destination.prefix_len() == 0 {
-                    if let Some(effective) = lease.owned_routes.iter().find(|owned| {
-                        owned.destination == route.destination
-                            && owned.metric.unwrap_or(0) >= spec.route_metric
-                    }) {
-                        route.metric = effective.metric;
-                    }
+                if let Some(effective) = lease.owned_routes.iter().find(|owned| {
+                    owned.destination == route.destination
+                        && owned.metric.unwrap_or(0) >= spec.route_metric
+                }) {
+                    route.metric = effective.metric;
                 }
             }
             lease.owned_routes == expected
@@ -1246,7 +1244,7 @@ fn expected_owned_routes(
         gateway: None,
         output_interface_index: Some(lease.interface_index),
         table: MAIN_ROUTE_TABLE,
-        metric: None,
+        metric: Some(spec.route_metric),
         protocol: TRAFFIC_MASQ_DHCP_ROUTE_PROTOCOL,
         scope: LINK_ROUTE_SCOPE,
     }];

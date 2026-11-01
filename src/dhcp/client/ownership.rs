@@ -149,9 +149,6 @@ impl DhcpClientOwnershipApplier {
         // Keep the effective metric stable across renewals, while retaining the
         // requested metric in policy so explicit configuration changes take effect.
         for desired in &mut lease.owned_routes {
-            if desired.destination.prefix_len() != 0 {
-                continue;
-            }
             let requested_metric = desired.metric.unwrap_or(0);
             if let Some(previous) = prior
                 .as_ref()
@@ -191,7 +188,7 @@ impl DhcpClientOwnershipApplier {
                 }
                 let Some(metric) = desired.metric.unwrap_or(0).checked_add(1) else {
                     return Err(OwnershipConflict::ForeignRoute {
-                        diagnostics: format!("no lower-priority metric is available for DHCP default route on {} in table {}; requested metric {}. Open Router to inspect routes, then DHCP Client > {} > e (edit) > Route metric > Apply DHCP client settings now", lease.interface, desired.table, requested_metric, lease.interface),
+                        diagnostics: format!("no lower-priority metric is available for DHCP route on {} in table {}; requested metric {}. Open Router to inspect routes, then DHCP Client > {} > e (edit) > Route metric > Apply DHCP client settings now", lease.interface, desired.table, requested_metric, lease.interface),
                     }.into());
                 };
                 desired.metric = Some(metric);
@@ -202,7 +199,8 @@ impl DhcpClientOwnershipApplier {
                     requested_metric,
                     effective_metric = desired.metric.unwrap_or(0),
                     table = desired.table,
-                    "DHCP default route metric adjusted to a free value with lower priority. Existing routes are preserved. To change it: 1) Open Router; 2) Select this interface's default route (0.0.0.0/0, traffic-masq (dhcp)); 3) Press e to open DHCP Client settings; 4) Set Route metric to an unused value; 5) Select Apply DHCP client settings now and press Enter. Higher metric means lower priority. The saved setting remains the requested value; the effective metric is stored with the lease."
+                    destination = %desired.destination,
+                    "DHCP route metric adjusted to preserve existing routes. Set DHCP client route_metric to an unused value to choose priority; higher metrics have lower priority. The effective metric is stored with the lease."
                 );
             }
         }

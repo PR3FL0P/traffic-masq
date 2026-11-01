@@ -127,7 +127,7 @@ impl NetworkProvider for FakeNetwork {
             table: route.table,
             metric: route.metric,
             protocol: route.protocol,
-            scope: 0,
+            scope: if route.gateway.is_some() { 0 } else { 253 },
         });
         Ok(())
     }
@@ -704,4 +704,39 @@ async fn exhausted_default_metric_fails_without_mutation() {
     assert!(network.addresses.lock().unwrap().is_empty());
     assert!(store.load("eth0").unwrap().is_none());
     assert_eq!(network.routes.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn subnet_route_collision_preserves_both_interfaces_through_renewal_and_cleanup() {
+    let network = FakeNetwork::new();
+    let mut candidate = lease();
+    let mut subnet = route("192.0.2.0/24");
+    subnet.gateway = None;
+    subnet.metric = None;
+    subnet.scope = 253;
+    candidate.owned_routes.insert(0, subnet.clone());
+    let existing = Ipv4RouteInfo {
+        destination: subnet.destination,
+        gateway: None,
+        output_interface_index: Some(9),
+        table: 254,
+        metric: None,
+        protocol: TRAFFIC_MASQ_DHCP_ROUTE_PROTOCOL,
+        scope: 253,
+    };
+    network.routes.lock().unwrap().push(existing.clone());
+    let (_directory, store, applier) = fixture(network.clone());
+    let applied = applier.apply(candidate.clone()).await.unwrap();
+    assert_eq!(applied.owned_routes[0].metric, Some(1));
+    assert!(network.routes.lock().unwrap().contains(&existing));
+    assert_eq!(
+        applier.apply(candidate).await.unwrap().owned_routes,
+        applied.owned_routes
+    );
+    assert_eq!(
+        store.load("eth0").unwrap().unwrap().owned_routes,
+        applied.owned_routes
+    );
+    applier.cleanup("eth0").await.unwrap();
+    assert_eq!(*network.routes.lock().unwrap(), vec![existing]);
 }
