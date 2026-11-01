@@ -11,7 +11,9 @@ use traffic_masq::app::init::{self, NativeRunner, ServiceStore};
 use traffic_masq::app::installer::{self, InstallArgs, UninstallArgs};
 use traffic_masq::app::reset::{self, ResetArgs};
 use traffic_masq::app::service::{self, ServiceStatus};
-use traffic_masq::app::{reset_device_password, run_daemon_with_config_file};
+use traffic_masq::app::{
+    reset_device_password, run_daemon_with_config_file, ShutdownDeadlineExceeded,
+};
 use traffic_masq::config::{AppConfig, ResolvedConfig, DEFAULT_CONFIG_PATH};
 use zeroize::Zeroize;
 
@@ -61,6 +63,20 @@ enum Command {
 
     /// Stop through the installed init service and wait for the daemon to exit
     Stop {
+        /// Explicitly cancel pending transactions and require proof of successful cleanup
+        #[arg(long)]
+        force: bool,
+        #[arg(long, hide = true)]
+        direct: bool,
+        #[arg(long, default_value_t = 30)]
+        timeout_seconds: u64,
+    },
+
+    /// Stop, then start again after shutdown has completed
+    Restart {
+        /// Explicitly cancel pending transactions and require proof of successful cleanup
+        #[arg(long)]
+        force: bool,
         #[arg(long, hide = true)]
         direct: bool,
         #[arg(long, default_value_t = 30)]
@@ -117,8 +133,29 @@ enum ConfigCommand {
     },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    run_with_runtime(run_cli())
+}
+
+fn run_with_runtime(work: impl std::future::Future<Output = Result<()>>) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(work);
+    if result
+        .as_ref()
+        .is_err_and(|error| error.is::<ShutdownDeadlineExceeded>())
+    {
+        // Running spawn_blocking work cannot be cancelled. The daemon has
+        // retained its process lock and journals; exit without waiting on it.
+        runtime.shutdown_background();
+    } else {
+        drop(runtime);
+    }
+    result
+}
+
+async fn run_cli() -> Result<()> {
     let args = Args::parse();
     let command = args.command.unwrap_or(Command::Run);
     if let Command::Install(install_args) = &command {
@@ -186,7 +223,11 @@ async fn main() -> Result<()> {
             )
             .await;
             if let Err(error) = &result {
-                let _ = service::persist_startup_recovery_report(config, error).await;
+                // This report is for startup failures. Do not enqueue more
+                // storage work after the shutdown deadline has expired.
+                if !error.is::<ShutdownDeadlineExceeded>() {
+                    let _ = service::persist_startup_recovery_report(config, error).await;
+                }
             }
             result
         }
@@ -198,28 +239,7 @@ async fn main() -> Result<()> {
             if timeout_seconds == 0 {
                 bail!("start timeout must be greater than zero");
             }
-            let _startup_attempt = service::acquire_startup_attempt(config)?;
-            let report_preparation_error = service::clear_startup_recovery_report(config)
-                .err()
-                .map(|error| format!("{error:#}"));
-            let registration = if direct {
-                None
-            } else {
-                ServiceStore::host().matching(resolved.source.path())?
-            };
-            let start_result = if let Some(registration) = registration {
-                init::start(&registration, config, Duration::from_secs(timeout_seconds)).await
-            } else {
-                service::start(
-                    config,
-                    resolved.source.path(),
-                    Duration::from_secs(timeout_seconds),
-                )
-                .await
-            };
-            let pid = start_result.map_err(|error| {
-                service::augment_start_error(config, error, report_preparation_error.as_deref())
-            })?;
+            let pid = start_daemon(&resolved, direct, Duration::from_secs(timeout_seconds)).await?;
             println!(
                 "traffic-masqd started (PID {pid}); config: {}",
                 resolved.source
@@ -229,32 +249,41 @@ async fn main() -> Result<()> {
         Command::Stop {
             timeout_seconds,
             direct,
+            force,
         } => {
             require_root()?;
             if timeout_seconds == 0 {
                 bail!("stop timeout must be greater than zero");
             }
-            let mut stopped_by_manager = false;
-            if !direct {
-                let store = ServiceStore::host();
-                if let Some(registration) = store.matching(resolved.source.path())? {
-                    store
-                        .stop(
-                            &registration,
-                            &NativeRunner,
-                            Duration::from_secs(timeout_seconds),
-                        )
-                        .await?;
-                    stopped_by_manager = true;
-                }
-            }
-            if service::stop(config, Duration::from_secs(timeout_seconds)).await?
-                || stopped_by_manager
+            if stop_daemon(
+                &resolved,
+                direct,
+                force,
+                Duration::from_secs(timeout_seconds),
+            )
+            .await?
             {
                 println!("traffic-masqd stopped");
             } else {
                 println!("traffic-masqd is already stopped");
             }
+            Ok(())
+        }
+        Command::Restart {
+            timeout_seconds,
+            direct,
+            force,
+        } => {
+            require_root()?;
+            if timeout_seconds == 0 {
+                bail!("restart timeout must be greater than zero");
+            }
+            let timeout = Duration::from_secs(timeout_seconds);
+            let pid = restart_daemon(&resolved, direct, force, timeout).await?;
+            println!(
+                "traffic-masqd restarted (PID {pid}); config: {}",
+                resolved.source
+            );
             Ok(())
         }
         Command::Status => {
@@ -289,6 +318,71 @@ async fn main() -> Result<()> {
             set_password(config).await
         }
     }
+}
+
+async fn start_daemon(resolved: &ResolvedConfig, direct: bool, timeout: Duration) -> Result<u32> {
+    let config = &resolved.config;
+    let registration = if direct {
+        None
+    } else {
+        ServiceStore::host().matching(resolved.source.path())?
+    };
+    // Native managers serialize their own jobs; SysV/OpenRC launch `start --direct`,
+    // whose inner invocation takes this lock. Holding it in the parent would block that start.
+    let _startup_attempt = if registration.is_none() {
+        Some(service::acquire_startup_attempt(config)?)
+    } else {
+        None
+    };
+    let report_preparation_error = service::clear_startup_recovery_report(config)
+        .err()
+        .map(|error| format!("{error:#}"));
+    let result = if let Some(registration) = registration {
+        init::start(&registration, config, timeout).await
+    } else {
+        service::start(config, resolved.source.path(), timeout).await
+    };
+    result.map_err(|error| {
+        service::augment_start_error(config, error, report_preparation_error.as_deref())
+    })
+}
+
+async fn restart_daemon(
+    resolved: &ResolvedConfig,
+    direct: bool,
+    force: bool,
+    timeout: Duration,
+) -> Result<u32> {
+    stop_daemon(resolved, direct, force, timeout).await?;
+    start_daemon(resolved, direct, timeout).await
+}
+
+async fn stop_daemon(
+    resolved: &ResolvedConfig,
+    direct: bool,
+    force: bool,
+    timeout: Duration,
+) -> Result<bool> {
+    let config = &resolved.config;
+    // Publish intent before the init manager can deliver SIGTERM.
+    let cancellation = if force {
+        service::request_pending_cancellation(config, timeout)?
+    } else {
+        None
+    };
+    let mut stopped_by_manager = false;
+    if !direct {
+        let store = ServiceStore::host();
+        if let Some(registration) = store.matching(resolved.source.path())? {
+            store.stop(&registration, &NativeRunner, timeout).await?;
+            stopped_by_manager = true;
+        }
+    }
+    let stopped = service::stop(config, timeout).await?;
+    if let Some(cancellation) = cancellation {
+        cancellation.verify()?;
+    }
+    Ok(stopped || stopped_by_manager)
 }
 
 fn init_config(path: &Path, force: bool) -> Result<()> {

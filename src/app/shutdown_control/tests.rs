@@ -40,3 +40,26 @@ fn request_for_another_process_is_ignored() {
     let _handle = request_restore_interfaces(&pid_path, other_pid, Duration::from_secs(1)).unwrap();
     assert!(request_for_current_process(&pid_path).unwrap().is_none());
 }
+
+#[test]
+fn cancelling_pending_does_not_request_restoration_of_committed_interfaces() {
+    let directory = tempdir().unwrap();
+    let pid_path = directory.path().join("traffic-masqd.pid");
+    let handle =
+        request_cancel_pending(&pid_path, std::process::id(), Duration::from_secs(1)).unwrap();
+    let request = request_for_current_process(&pid_path).unwrap().unwrap();
+    assert!(request.cancels_pending());
+    assert!(!request.restores_interfaces());
+    acknowledge(&pid_path, &request).unwrap();
+    handle.verify_and_cleanup().unwrap();
+}
+
+#[test]
+fn cancellation_without_cleanup_acknowledgement_is_not_successful() {
+    let directory = tempdir().unwrap();
+    let pid_path = directory.path().join("traffic-masqd.pid");
+    let handle =
+        request_cancel_pending(&pid_path, std::process::id(), Duration::from_secs(1)).unwrap();
+    assert!(handle.verify_and_cleanup().is_err());
+    assert!(request_path(&pid_path).exists());
+}

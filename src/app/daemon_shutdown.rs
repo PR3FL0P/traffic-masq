@@ -1,6 +1,6 @@
 //! Final daemon cleanup after background workers and pending transactions stop.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 
 use crate::config::{AppConfig, ShutdownPolicy};
 use crate::core::transaction::NetworkTransactionManager;
@@ -121,7 +121,9 @@ impl<P: RouterDataplaneProvider + Send + Sync> ShutdownResources<'_, P> {
         let restore_interfaces = plan.restores_interfaces();
         let mut cleanup_errors = plan.errors;
 
-        self.dhcp_client.shutdown(plan.policy).await;
+        if let Err(error) = self.dhcp_client.shutdown(plan.policy).await {
+            cleanup_errors.push(format!("dhcp_client shutdown cleanup failed: {error:#}"));
+        }
 
         let network_cleanup = if restore_interfaces {
             self.transactions.restore_baselines().await
@@ -161,11 +163,15 @@ impl<P: RouterDataplaneProvider + Send + Sync> ShutdownResources<'_, P> {
         self.dhcp.shutdown().await;
 
         if let Some(wifi) = self.wifi {
-            wifi.shutdown(plan.policy).await;
+            if let Err(error) = wifi.shutdown(plan.policy).await {
+                cleanup_errors.push(format!("wifi shutdown cleanup failed: {error:#}"));
+            }
         }
 
         if let Some(wifi_client) = self.wifi_client {
-            wifi_client.shutdown(plan.policy).await;
+            if let Err(error) = wifi_client.shutdown(plan.policy).await {
+                cleanup_errors.push(format!("wifi_client shutdown cleanup failed: {error:#}"));
+            }
         }
 
         if plan.policy == ShutdownPolicy::RestoreInterfaces {
@@ -191,28 +197,78 @@ impl<P: RouterDataplaneProvider + Send + Sync> ShutdownResources<'_, P> {
         if let Some(error) = reconcile_error {
             cleanup_errors.push(error);
         }
-        if cleanup_errors.is_empty() {
-            if let Some(request) = &plan.request {
-                if let Err(error) =
-                    shutdown_control::acknowledge(&self.config.runtime.pid_path, request)
-                {
-                    cleanup_errors.push(format!(
-                        "failed to acknowledge requested shutdown cleanup: {error:#}"
-                    ));
-                }
+        finish_shutdown(
+            &self.config.runtime.pid_path,
+            plan.request.as_ref(),
+            cleanup_errors,
+        )
+    }
+}
+
+fn finish_shutdown(
+    pid_path: &std::path::Path,
+    request: Option<&PendingShutdownRequest>,
+    mut errors: Vec<String>,
+) -> Result<()> {
+    if errors.is_empty() {
+        if let Some(request) = request {
+            if let Err(error) = shutdown_control::acknowledge(pid_path, request) {
+                errors.push(format!(
+                    "failed to acknowledge requested shutdown cleanup: {error:#}"
+                ));
             }
         }
-        if cleanup_errors.is_empty() {
-            Ok(())
-        } else {
-            bail!(cleanup_errors.join("; "))
-        }
     }
+    anyhow::ensure!(errors.is_empty(), "{}", errors.join("; "));
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_errors_prevent_acknowledgement_and_keep_request_for_diagnosis() {
+        let root = tempfile::tempdir().unwrap();
+        let pid_path = root.path().join("daemon.pid");
+        let handle = shutdown_control::request_cancel_pending(
+            &pid_path,
+            std::process::id(),
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        let request = shutdown_control::request_for_current_process(&pid_path).unwrap();
+        let error = finish_shutdown(
+            &pid_path,
+            request.as_ref(),
+            vec![
+                "DHCP address cleanup failed".into(),
+                "wpa_supplicant stop failed".into(),
+            ],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("DHCP address cleanup failed"));
+        assert!(error.to_string().contains("wpa_supplicant stop failed"));
+        assert!(handle.verify_and_cleanup().is_err());
+        assert!(shutdown_control::request_for_current_process(&pid_path)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn successful_cleanup_acknowledges_the_current_attempt() {
+        let root = tempfile::tempdir().unwrap();
+        let pid_path = root.path().join("daemon.pid");
+        let handle = shutdown_control::request_cancel_pending(
+            &pid_path,
+            std::process::id(),
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        let request = shutdown_control::request_for_current_process(&pid_path).unwrap();
+        finish_shutdown(&pid_path, request.as_ref(), Vec::new()).unwrap();
+        handle.verify_and_cleanup().unwrap();
+    }
 
     #[test]
     fn uncertain_commit_preserves_recovery_state_even_for_requested_restore() {

@@ -1116,7 +1116,8 @@ async fn shutdown_with_preserve_interfaces_leaves_the_supplicant_running() {
         .expect("configure");
     supervisor
         .shutdown(ShutdownPolicy::PreserveInterfaces)
-        .await;
+        .await
+        .unwrap();
 
     assert!(!process
         .calls()
@@ -1142,7 +1143,10 @@ async fn shutdown_with_restore_interfaces_stops_it_and_clears_the_record() {
         .configure(spec("wlan0", "upstream"))
         .await
         .expect("configure");
-    supervisor.shutdown(ShutdownPolicy::RestoreInterfaces).await;
+    supervisor
+        .shutdown(ShutdownPolicy::RestoreInterfaces)
+        .await
+        .unwrap();
 
     assert!(process
         .calls()
@@ -1845,7 +1849,8 @@ async fn shutdown_cleans_socket_left_by_owned_process() {
         .unwrap();
     supervisor
         .shutdown(ConfigShutdownPolicy::RestoreInterfaces)
-        .await;
+        .await
+        .unwrap();
     assert!(!runtime.join("wlan0").exists());
     assert!(supervisor
         .record_store("wlan0")
@@ -2103,4 +2108,43 @@ async fn ephemeral_scan_waits_for_a_socket_created_during_ownership_observation(
             .unwrap()
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn shutdown_reports_failed_stop_retains_record_and_cleans_other_interfaces() {
+    let root = tempdir().unwrap();
+    let runtime = root.path().join("run");
+    let process = fake_process();
+    let supervisor = supervisor(root.path(), &runtime, process.clone()).await;
+    supervisor.configure(spec("wlan0", "net-a")).await.unwrap();
+    supervisor.configure(spec("wlan1", "net-b")).await.unwrap();
+    // Simulate PID reuse: this process may no longer be stopped using the saved proof.
+    supervisor
+        .inner
+        .tasks
+        .lock()
+        .await
+        .get_mut("wlan0")
+        .unwrap()
+        .record
+        .boot_id = Some("other-boot".into());
+    let error = supervisor
+        .shutdown(ShutdownPolicy::RestoreInterfaces)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("wlan0"));
+    assert!(supervisor
+        .record_store("wlan0")
+        .load()
+        .await
+        .unwrap()
+        .is_some());
+    assert!(supervisor
+        .record_store("wlan1")
+        .load()
+        .await
+        .unwrap()
+        .is_none());
+    assert!(process.is_alive(2000).await.unwrap());
+    assert!(!process.is_alive(2001).await.unwrap());
 }

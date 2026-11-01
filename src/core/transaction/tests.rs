@@ -1499,6 +1499,7 @@ async fn indeterminate_commit_blocks_manual_timer_and_shutdown_rollback() {
     assert!(manager.commit(&pending.token).await.is_err());
     assert!(manager.rollback(&pending.token).await.is_err());
     assert!(manager.restore_baselines().await.is_err());
+    assert!(manager.cancel_all_pending_for_shutdown().await.is_err());
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(61)).await;
     tokio::task::yield_now().await;
@@ -1796,4 +1797,59 @@ async fn stopped_interface_recovery_is_rechecked_and_completed_on_restart() {
         .recovery()
         .check_scope(directory.path(), Some("test0"))
         .is_ok());
+}
+
+#[tokio::test]
+async fn forced_shutdown_cancels_interface_change_without_waiting_for_expiry() {
+    exercise_forced_interface_shutdown(false).await;
+}
+
+#[tokio::test]
+async fn forced_shutdown_never_undoes_a_committed_interface_transaction() {
+    exercise_forced_interface_shutdown(true).await;
+}
+
+async fn exercise_forced_interface_shutdown(already_committed: bool) {
+    let directory = tempdir().unwrap();
+    let desired = desired_state(directory.path()).await;
+    let provider = fake_network();
+    let mut before = addresses(&provider).await;
+    let converger = spawn_converger(desired.clone(), provider.clone());
+    let manager = NetworkTransactionManager::new(
+        InterfaceManager::new(provider.clone(), AddressOwnershipJournal::in_memory()),
+        Duration::from_secs(3600),
+        desired.clone(),
+    );
+    let pending = manager
+        .apply(
+            "test0",
+            InterfaceChange {
+                config: &interface_config(PROPOSED),
+                previous: None,
+                current_role: None,
+                allow_management_change: false,
+                passphrase: WifiPassphraseUpdate::Keep,
+            },
+        )
+        .await
+        .unwrap();
+    if already_committed {
+        // Persistence completed, but cancellation prevented retiring volatile pending state.
+        desired
+            .commit_interface(
+                &pending.token,
+                "test0".into(),
+                interface_config(PROPOSED),
+                false,
+            )
+            .await
+            .unwrap();
+        before = addresses(&provider).await;
+    }
+    manager.cancel_all_pending_for_shutdown().await.unwrap();
+    assert!(manager.pending().await.is_empty());
+    assert!(!desired.has_pending().await);
+    assert_eq!(addresses(&provider).await, before);
+    assert!(!manager.journal_path("test0").exists());
+    converger.abort();
 }

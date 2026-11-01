@@ -1663,6 +1663,7 @@ async fn indeterminate_commit_fences_router_and_retains_recovery_evidence() {
     assert!(!view.failures().is_empty());
     assert!(coordinator.commit(&token).await.is_err());
     assert!(coordinator.rollback_with_token(&token).await.is_err());
+    assert!(coordinator.cancel_pending_for_shutdown().await.is_err());
     assert!(coordinator.rollback().await.is_err());
     assert!(!coordinator.rollback_timeout_fired(&token).await);
     assert!(overrides
@@ -1708,6 +1709,15 @@ async fn indeterminate_commit_fences_router_and_retains_recovery_evidence() {
 
 #[tokio::test]
 async fn exhausted_router_recovery_survives_restart_and_shutdown_without_mutations() {
+    exercise_exhausted_router_shutdown(false).await;
+}
+
+#[tokio::test]
+async fn forced_shutdown_explicitly_retries_exhausted_router_recovery() {
+    exercise_exhausted_router_shutdown(true).await;
+}
+
+async fn exercise_exhausted_router_shutdown(force: bool) {
     let fake = FakeSubsystems::new();
     let (original, overrides, _root) = coordinator_with(fake.clone()).await;
     let coordinator = RouterTransactionCoordinator::new(
@@ -1760,10 +1770,33 @@ async fn exhausted_router_recovery_survives_restart_and_shutdown_without_mutatio
         before,
         "late repair cannot resume automatically"
     );
-    restarted.rollback_with_token(&token).await.unwrap();
+    if force {
+        restarted.cancel_pending_for_shutdown().await.unwrap();
+    } else {
+        restarted.rollback_with_token(&token).await.unwrap();
+    }
     assert_eq!(restarted.status().await, CoordinatorStatus::Idle);
     assert!(!restarted.inner.journal.exists());
     assert_eq!(overrides.committed_revision().await, 0);
+}
+
+#[tokio::test]
+async fn forced_shutdown_cancels_pending_router_before_its_deadline() {
+    let fake = FakeSubsystems::new();
+    let (coordinator, overrides, _root) = coordinator_with(fake.clone()).await;
+    let plan = coordinator
+        .plan(build_candidate(&overrides).await)
+        .await
+        .unwrap();
+    coordinator.apply(plan).await.unwrap();
+    coordinator.cancel_pending_for_shutdown().await.unwrap();
+    assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
+    assert!(!coordinator.inner.journal.exists());
+    assert_eq!(overrides.committed_revision().await, 0);
+    assert!(fake
+        .events()
+        .iter()
+        .any(|event| event.starts_with("rollback_")));
 }
 
 #[tokio::test]
@@ -1791,6 +1824,37 @@ async fn persisted_commit_proof_prevents_rollback_of_stale_volatile_pending_stat
         .unwrap();
     let before = fake.events();
     assert!(!coordinator.rollback_timeout_fired(&token).await);
+    assert_eq!(fake.events(), before);
+    assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
+    assert_eq!(overrides.committed_revision().await, 1);
+    assert!(!coordinator.inner.journal.exists());
+}
+
+#[tokio::test]
+async fn forced_shutdown_never_undoes_a_durably_committed_router_transaction() {
+    let fake = FakeSubsystems::new();
+    let (original, overrides, _directory) = coordinator_with(fake.clone()).await;
+    let coordinator = RouterTransactionCoordinator::new(
+        original.manager(),
+        overrides.clone(),
+        Duration::from_secs(3600),
+    );
+    let plan = coordinator
+        .plan(build_candidate(&overrides).await)
+        .await
+        .unwrap();
+    let token = coordinator.apply(plan).await.unwrap();
+    let candidate = match &*coordinator.inner.state.lock().await {
+        CoordinatorState::Pending(pending) => pending.candidate.clone(),
+        _ => panic!("transaction must be pending"),
+    };
+    // Model cancellation after persistence, before coordinator bookkeeping.
+    overrides
+        .commit_candidate_with_token(&candidate, Some(&token))
+        .await
+        .unwrap();
+    let before = fake.events();
+    coordinator.cancel_pending_for_shutdown().await.unwrap();
     assert_eq!(fake.events(), before);
     assert_eq!(coordinator.status().await, CoordinatorStatus::Idle);
     assert_eq!(overrides.committed_revision().await, 1);

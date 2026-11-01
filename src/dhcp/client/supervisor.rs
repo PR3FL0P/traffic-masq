@@ -815,7 +815,8 @@ impl DhcpClientSupervisor {
     }
 
     /// Stop client runtimes and apply the requested ownership cleanup policy.
-    pub async fn shutdown(&self, policy: ShutdownPolicy) {
+    pub async fn shutdown(&self, policy: ShutdownPolicy) -> anyhow::Result<()> {
+        let mut errors = Vec::new();
         let _operation = self.inner.operation_lock.write().await;
         let interfaces: Vec<String> = self.inner.tasks.lock().await.keys().cloned().collect();
 
@@ -844,14 +845,22 @@ impl DhcpClientSupervisor {
                         send_release(transport.as_ref(), lease, spec.hostname.as_deref()).await
                     {
                         tracing::warn!(%interface, error = %format!("{error:#}"), "failed to send DHCP RELEASE during shutdown");
+                        errors.push(format!("{interface}: {error:#}"));
                     }
                 }
             }
             if let Err(error) = self.inner.applier.cleanup(&interface).await {
                 tracing::warn!(%interface, error = %format!("{error:#}"), "failed to clean up owned DHCP client state during shutdown");
+                errors.push(format!("{interface}: {error:#}"));
             }
         }
         self.inner.tasks.lock().await.clear();
+        anyhow::ensure!(
+            errors.is_empty(),
+            "shutdown cleanup failed: {}",
+            errors.join("; ")
+        );
+        Ok(())
     }
 
     async fn resolve_identity(&self, interface: &str) -> Option<InterfaceIdentity> {

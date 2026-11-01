@@ -32,6 +32,13 @@ pub use recovery::{
 };
 pub use traffic_masq_protocol::{NetworkChangePhase, PendingNetworkChange};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RollbackTrigger {
+    Automatic,
+    Manual,
+    AdministrativeShutdown,
+}
+
 /// How long an apply waits for convergence to reach what it proposed.
 ///
 /// A deadline, not a poll: nothing here wakes up to ask whether anything has
@@ -832,6 +839,20 @@ impl NetworkTransactionManager {
 
     // The caller holds this interface's operation lock throughout restoration and bookkeeping.
     async fn rollback_locked(&self, token: &str, manual: bool) -> Result<PendingNetworkChange> {
+        let trigger = if manual {
+            RollbackTrigger::Manual
+        } else {
+            RollbackTrigger::Automatic
+        };
+        self.rollback_locked_with_trigger(token, trigger).await
+    }
+
+    async fn rollback_locked_with_trigger(
+        &self,
+        token: &str,
+        trigger: RollbackTrigger,
+    ) -> Result<PendingNetworkChange> {
+        let manual = trigger != RollbackTrigger::Automatic;
         self.import_stopped_journals().await?;
         self.recovery().check_commit(self.desired().state_dir())?;
         let pending = {
@@ -867,7 +888,7 @@ impl NetworkTransactionManager {
                 .lock()
                 .expect("interface timer epoch lock")
                 .remove(token);
-            if manual {
+            if trigger == RollbackTrigger::Manual {
                 bail!("network change {token} was already committed; rollback is unavailable");
             }
             return Ok(pending.info);
@@ -953,7 +974,7 @@ impl NetworkTransactionManager {
                     .expect("operation lock held")
                     .info
                     .phase = NetworkChangePhase::RecoveryRequired;
-            } else if manual {
+            } else if trigger == RollbackTrigger::Manual {
                 self.spawn_timer(token.to_owned(), false);
             }
             // Keep both the pending record and recovery journal. The desired
@@ -980,6 +1001,15 @@ impl NetworkTransactionManager {
 
     /// Attempt every pending rollback and return all restoration failures together.
     pub async fn rollback_all_pending(&self) -> Result<()> {
+        self.rollback_all_pending_inner(false).await
+    }
+
+    /// An explicit administrative stop may retry each pending transaction's stopped recovery.
+    pub(crate) async fn cancel_all_pending_for_shutdown(&self) -> Result<()> {
+        self.rollback_all_pending_inner(true).await
+    }
+
+    async fn rollback_all_pending_inner(&self, manual: bool) -> Result<()> {
         // Registration and cancellation compensation must settle before the
         // sweep captures its tokens. Keep ownership throughout the sweep so
         // compensation cannot retire a token between collection and rollback.
@@ -995,7 +1025,12 @@ impl NetworkTransactionManager {
             let result = async {
                 let interface = self.interface_for_token(&token).await?;
                 let _interface_operation = self.desired().transaction_locks.lock(&interface).await;
-                self.rollback_locked(&token, false).await
+                let trigger = if manual {
+                    RollbackTrigger::AdministrativeShutdown
+                } else {
+                    RollbackTrigger::Automatic
+                };
+                self.rollback_locked_with_trigger(&token, trigger).await
             }
             .await;
             if let Err(error) = result {

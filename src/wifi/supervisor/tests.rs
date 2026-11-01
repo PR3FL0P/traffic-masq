@@ -1246,7 +1246,8 @@ async fn shutdown_with_preserve_interfaces_leaves_hostapd_and_its_record_alone()
 
     supervisor
         .shutdown(ShutdownPolicy::PreserveInterfaces)
-        .await;
+        .await
+        .unwrap();
 
     assert!(
         process
@@ -1276,7 +1277,10 @@ async fn shutdown_with_restore_interfaces_stops_hostapd_and_clears_its_record() 
         .await
         .expect("configure");
 
-    supervisor.shutdown(ShutdownPolicy::RestoreInterfaces).await;
+    supervisor
+        .shutdown(ShutdownPolicy::RestoreInterfaces)
+        .await
+        .unwrap();
 
     assert_eq!(process.calls().last(), Some(&FakeCall::Terminate(1000)));
     assert_eq!(
@@ -1851,4 +1855,43 @@ fn binary_preflight_error_preserves_underlying_failure() {
     let message = error.to_string();
     assert!(message.contains("failed to start /usr/sbin/hostapd"));
     assert!(message.contains("Permission denied (os error 13)"));
+}
+
+#[tokio::test]
+async fn shutdown_reports_failed_stop_retains_record_and_cleans_other_interfaces() {
+    let root = tempdir().unwrap();
+    let runtime = root.path().join("run");
+    let process = fake_process();
+    let supervisor = test_supervisor(root.path(), &runtime, process.clone()).await;
+    supervisor.configure(spec("wlan0", "net-a")).await.unwrap();
+    supervisor.configure(spec("wlan1", "net-b")).await.unwrap();
+    // Simulate PID reuse: this process may no longer be stopped using the saved proof.
+    supervisor
+        .inner
+        .tasks
+        .lock()
+        .await
+        .get_mut("wlan0")
+        .unwrap()
+        .record
+        .boot_id = Some("other-boot".into());
+    let error = supervisor
+        .shutdown(ShutdownPolicy::RestoreInterfaces)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("wlan0"));
+    assert!(supervisor
+        .record_store("wlan0")
+        .load()
+        .await
+        .unwrap()
+        .is_some());
+    assert!(supervisor
+        .record_store("wlan1")
+        .load()
+        .await
+        .unwrap()
+        .is_none());
+    assert!(process.is_alive(1000).await.unwrap());
+    assert!(!process.is_alive(1001).await.unwrap());
 }

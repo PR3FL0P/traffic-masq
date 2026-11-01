@@ -158,6 +158,7 @@ enum RollbackTrigger {
     Timeout,
     Startup,
     Shutdown,
+    AdministrativeShutdown,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -962,7 +963,11 @@ impl RouterTransactionCoordinator {
                 .parent()
                 .expect("state directory"),
         )?;
-        if trigger == RollbackTrigger::Manual {
+        let manual = matches!(
+            trigger,
+            RollbackTrigger::Manual | RollbackTrigger::AdministrativeShutdown
+        );
+        if manual {
             self.recovery().check_rollback_scope(
                 self.inner
                     .overrides
@@ -1041,7 +1046,7 @@ impl RouterTransactionCoordinator {
                 return Err(error.into());
             }
         };
-        if trigger == RollbackTrigger::Manual && !journal_exists {
+        if manual && !journal_exists {
             self.write_journal(
                 candidate.base_revision(),
                 &token,
@@ -1051,12 +1056,7 @@ impl RouterTransactionCoordinator {
             .await?;
         }
         let failures = self
-            .rollback_snapshot(
-                &token,
-                &snapshot,
-                trigger == RollbackTrigger::Manual,
-                recovery_desired.as_ref(),
-            )
+            .rollback_snapshot(&token, &snapshot, manual, recovery_desired.as_ref())
             .await;
         if failures.is_empty() {
             self.transition(state, CoordinatorState::Idle);
@@ -1124,6 +1124,13 @@ impl RouterTransactionCoordinator {
     pub(crate) async fn rollback_for_shutdown(&self) -> Result<()> {
         let mut state = self.inner.state.lock().await;
         self.rollback_locked(&mut state, RollbackTrigger::Shutdown)
+            .await
+    }
+
+    /// Explicit stop retries pending recovery but still respects durable commit proof.
+    pub(crate) async fn cancel_pending_for_shutdown(&self) -> Result<()> {
+        let mut state = self.inner.state.lock().await;
+        self.rollback_locked(&mut state, RollbackTrigger::AdministrativeShutdown)
             .await
     }
 

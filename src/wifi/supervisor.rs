@@ -1647,7 +1647,8 @@ impl HostapdSupervisor {
     }
 
     /// Apply the shutdown policy to supervised processes and their ownership records.
-    pub async fn shutdown(&self, policy: ShutdownPolicy) {
+    pub async fn shutdown(&self, policy: ShutdownPolicy) -> anyhow::Result<()> {
+        let mut errors = Vec::new();
         let _operation = self.inner.operation_lock.write().await;
         let tasks = std::mem::take(&mut *self.inner.tasks.lock().await);
 
@@ -1655,19 +1656,28 @@ impl HostapdSupervisor {
             if policy == ShutdownPolicy::RestoreInterfaces {
                 if let Err(error) = self.stop_task(&task).await {
                     tracing::error!(%interface, %error, "failed to stop hostapd during shutdown; ownership record retained");
+                    errors.push(format!("{interface}: {error:#}"));
                     continue;
                 }
                 if let Err(error) = self.record_store(&interface).clear().await {
                     tracing::error!(%interface, %error, "hostapd stopped but ownership record cleanup failed");
+                    errors.push(format!("{interface}: {error:#}"));
                 }
                 let path = render::config_path(&self.inner.runtime_dir, &interface);
                 if let Err(error) = tokio::fs::remove_file(&path).await {
                     if error.kind() != std::io::ErrorKind::NotFound {
                         tracing::warn!(%interface, path = %path.display(), %error, "failed to remove hostapd runtime config during shutdown");
+                        errors.push(format!("{interface}: {error:#}"));
                     }
                 }
             }
         }
+        anyhow::ensure!(
+            errors.is_empty(),
+            "shutdown cleanup failed: {}",
+            errors.join("; ")
+        );
+        Ok(())
     }
 }
 

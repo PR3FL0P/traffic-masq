@@ -16,7 +16,7 @@ start() {
 }
 stop() {
     ebegin "Stopping traffic-masqd"
-    @LAUNCHER@ stop --direct --timeout-seconds 60
+    @LAUNCHER@ stop --direct --timeout-seconds 150
     eend $?
 }
 status() {

@@ -18,11 +18,11 @@ case "${1:-}" in
         if @LAUNCHER@ status >/dev/null 2>&1; then exit 0; fi
         @LAUNCHER@ start --direct
         ;;
-    stop) @LAUNCHER@ stop --direct --timeout-seconds 60 ;;
+    stop) @LAUNCHER@ stop --direct --timeout-seconds 150 ;;
     status) @LAUNCHER@ status ;;
     restart|force-reload)
         @LAUNCHER@ config validate
-        @LAUNCHER@ stop --direct --timeout-seconds 60
+        @LAUNCHER@ stop --direct --timeout-seconds 150
         @LAUNCHER@ start --direct
         ;;
     *) echo "Usage: $0 {start|stop|status|restart|force-reload}" >&2; exit 2 ;;

@@ -12,6 +12,8 @@ mod router_startup;
 pub(crate) mod runtime;
 pub mod service;
 mod shutdown_control;
+mod shutdown_deadline;
+pub use shutdown_deadline::ShutdownDeadlineExceeded;
 mod startup_recovery;
 mod vpn_startup;
 
@@ -300,8 +302,12 @@ pub async fn run_daemon_with_config_file(
         let root = config.runtime.state_dir.clone();
         let recovery = recovery.clone();
         stack.push(async move {
-            wifi.shutdown(recovery_shutdown_policy(&recovery, &root))
+            if let Err(error) = wifi
+                .shutdown(recovery_shutdown_policy(&recovery, &root))
                 .await
+            {
+                tracing::error!(%error, "wifi startup rollback failed");
+            }
         });
     }
 
@@ -331,9 +337,12 @@ pub async fn run_daemon_with_config_file(
         let root = config.runtime.state_dir.clone();
         let recovery = recovery.clone();
         stack.push(async move {
-            wifi_client
+            if let Err(error) = wifi_client
                 .shutdown(recovery_shutdown_policy(&recovery, &root))
                 .await
+            {
+                tracing::error!(%error, "wifi_client startup rollback failed");
+            }
         });
     }
 
@@ -401,9 +410,12 @@ pub async fn run_daemon_with_config_file(
         let root = config.runtime.state_dir.clone();
         let recovery = recovery.clone();
         async move {
-            dhcp_client
+            if let Err(error) = dhcp_client
                 .shutdown(recovery_shutdown_policy(&recovery, &root))
                 .await
+            {
+                tracing::error!(%error, "dhcp_client startup rollback failed");
+            }
         }
     });
 
@@ -866,75 +878,129 @@ pub async fn run_daemon_with_config_file(
             (&mut server_run).await
         }
     };
-    let _ = server_stop.send(true);
-    server_shutdown_relay.abort();
-    let _ = server_shutdown_relay.await;
-    let _ = autoconnect_stop.send(true);
-    // Finish any in-flight scan/activation before rolling back and stopping runtimes.
-    let _ = autoconnect_task.await;
+    let shutdown_tasks = [
+        autoconnect_task.abort_handle(),
+        integrity_task.abort_handle(),
+        liveness_task.abort_handle(),
+        reconcile_task.abort_handle(),
+        session_reaper.abort_handle(),
+        server_shutdown_relay.abort_handle(),
+    ];
+    let result = shutdown_deadline::finish(
+        &desired_state,
+        &shutdown_tasks,
+        async {
+            let _ = server_stop.send(true);
+            server_shutdown_relay.abort();
+            let _ = server_shutdown_relay.await;
+            let _ = autoconnect_stop.send(true);
+            // Finish any in-flight scan/activation before rolling back and stopping runtimes.
+            let _ = autoconnect_task.await;
 
-    // Stop background dataplane repair before explicit transaction rollback.
-    let _ = integrity_stop.send(true);
-    let _ = integrity_task.await;
+            // Stop background dataplane repair before explicit transaction rollback.
+            let _ = integrity_stop.send(true);
+            let _ = integrity_task.await;
 
-    // No new process restarts should be introduced while shutdown is trying
-    // to prove rollback. The desired-state converger stays alive a little
-    // longer because interface transaction rollback is expressed through it.
-    // Let a restart already in progress finish its bookkeeping before rollback.
-    // Aborting here can cancel a supervisor between a runtime write and its record.
-    let _ = liveness_stop.send(true);
-    let _ = liveness_task.await;
+            // No new process restarts should be introduced while shutdown is trying
+            // to prove rollback. The desired-state converger stays alive a little
+            // longer because interface transaction rollback is expressed through it.
+            // Let a restart already in progress finish its bookkeeping before rollback.
+            // Aborting here can cancel a supervisor between a runtime write and its record.
+            let _ = liveness_stop.send(true);
+            let _ = liveness_task.await;
 
-    // Before the converger is stopped, not after: an unconfirmed change is
-    // abandoned by dropping it from the desired state, and only the converger
-    // can take the machine back to what was committed. Stopping it first would
-    // leave a change nobody ever confirmed on the box for good.
-    if let Err(error) = transactions.rollback_all_pending().await {
-        tracing::error!(%error, "failed to abandon unconfirmed network changes during shutdown");
-    }
-
-    if let Some(coordinator) = &router_coordinator {
-        let _network_mutation = network_mutations.write().await;
-        if coordinator.status().await != crate::core::router_transaction::CoordinatorStatus::Idle {
-            if let Err(error) = coordinator.rollback_for_shutdown().await {
-                tracing::error!(%error, "failed to roll back router transaction during shutdown");
+            // Before the converger is stopped, not after: an unconfirmed change is
+            // abandoned by dropping it from the desired state, and only the converger
+            // can take the machine back to what was committed. Stopping it first would
+            // leave a change nobody ever confirmed on the box for good.
+            let cancel_pending =
+                match shutdown_control::request_for_current_process(&config.runtime.pid_path) {
+                    Ok(request) => request
+                        .as_ref()
+                        .is_some_and(shutdown_control::PendingShutdownRequest::cancels_pending),
+                    Err(error) => {
+                        tracing::warn!(%error, "ignoring invalid transient shutdown request");
+                        false
+                    }
+                };
+            let mut rollback_errors = Vec::new();
+            let network_rollback = if cancel_pending {
+                transactions.cancel_all_pending_for_shutdown().await
+            } else {
+                transactions.rollback_all_pending().await
+            };
+            if let Err(error) = network_rollback {
+                tracing::error!(%error, "failed to abandon unconfirmed network changes during shutdown");
+                rollback_errors.push(format!("pending network rollback failed: {error:#}"));
             }
-        }
-    }
 
-    let _ = reconcile_stop.send(true);
-    if !reconcile_finished {
-        match reconcile_task.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                reconcile_error.get_or_insert_with(|| {
-                    format!("network reconciler failed during shutdown: {error:#}")
-                });
+            if let Some(coordinator) = &router_coordinator {
+                let _network_mutation = network_mutations.write().await;
+                let view = coordinator.view().await;
+                if view.status() != crate::core::router_transaction::CoordinatorStatus::Idle {
+                    let result = if cancel_pending {
+                        coordinator.cancel_pending_for_shutdown().await
+                    } else {
+                        coordinator.rollback_for_shutdown().await
+                    };
+                    if let Err(error) = result {
+                        tracing::error!(%error, "failed to roll back router transaction during shutdown");
+                        rollback_errors.push(format!("pending router rollback failed: {error:#}"));
+                    }
+                }
             }
-            Err(error) => {
-                reconcile_error.get_or_insert_with(|| {
-                    format!("network reconciler task failed during shutdown: {error}")
-                });
-            }
-        }
-    }
-    session_reaper.abort();
-    let _ = session_reaper.await;
-    let graceful_signal = shutdown_requested(&shutdown);
-    tracing::info!(graceful_signal, "traffic-masqd stopping");
 
-    ShutdownResources {
-        config: &effective_config,
-        transactions: &transactions,
-        router_state: router_state.as_deref(),
-        vpn: vpn_manager.as_deref(),
-        dhcp_client: &dhcp_client,
-        dhcp: &dhcp,
-        wifi: wifi_supervisor.as_ref(),
-        wifi_client: wifi_client_supervisor.as_ref(),
+            let _ = reconcile_stop.send(true);
+            if !reconcile_finished {
+                match reconcile_task.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        reconcile_error.get_or_insert_with(|| {
+                            format!("network reconciler failed during shutdown: {error:#}")
+                        });
+                    }
+                    Err(error) => {
+                        reconcile_error.get_or_insert_with(|| {
+                            format!("network reconciler task failed during shutdown: {error}")
+                        });
+                    }
+                }
+            }
+            if !rollback_errors.is_empty() {
+                if let Some(error) = reconcile_error.take() {
+                    rollback_errors.push(error);
+                }
+                reconcile_error = Some(rollback_errors.join("; "));
+            }
+            session_reaper.abort();
+            let _ = session_reaper.await;
+            let graceful_signal = shutdown_requested(&shutdown);
+            tracing::info!(graceful_signal, "traffic-masqd stopping");
+
+            ShutdownResources {
+                config: &effective_config,
+                transactions: &transactions,
+                router_state: router_state.as_deref(),
+                vpn: vpn_manager.as_deref(),
+                dhcp_client: &dhcp_client,
+                dhcp: &dhcp,
+                wifi: wifi_supervisor.as_ref(),
+                wifi_client: wifi_client_supervisor.as_ref(),
+            }
+            .finish(graceful_signal, api_result, reconcile_error)
+            .await
+        },
+    )
+    .await;
+    if result
+        .as_ref()
+        .is_err_and(|error| error.is::<ShutdownDeadlineExceeded>())
+    {
+        // A blocking storage operation can outlive async cancellation. Keep
+        // other processes fenced until the OS closes the lock at process exit.
+        std::mem::forget(_process_guard);
     }
-    .finish(graceful_signal, api_result, reconcile_error)
-    .await
+    result
 }
 
 fn shutdown_requested(shutdown: &watch::Receiver<bool>) -> bool {

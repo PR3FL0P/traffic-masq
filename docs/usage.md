@@ -690,7 +690,8 @@ traffic-masqd [--config <path>] <command>
 | `reset [--dry-run] [--yes] [--force-offline]` | Clear configuration and persistent state; see [reset requirements](#reset-all-settings). |
 | `run` | Run in the foreground (also the default when no command is supplied). |
 | `start [--timeout-seconds N]` | Start through the registered service manager, or detach without registration; default readiness timeout is 10 seconds. |
-| `stop [--timeout-seconds N]` | Stop through the registered service manager, or directly without registration; default timeout is 30 seconds. |
+| `stop [--force] [--timeout-seconds N]` | Stop through the registered service manager, or directly without registration; default timeout is 30 seconds. |
+| `restart [--force] [--timeout-seconds N]` | Stop, then start through the same service integration; default timeout is 30 seconds for each phase. |
 | `status` | Print process and API state. |
 | `logs [-n N] [--follow]` | Read the daemon log. |
 | `auth set-password` | Reset the password while the daemon is stopped. |
@@ -698,6 +699,15 @@ traffic-masqd [--config <path>] <command>
 | `config show` | Print the selected configuration. |
 | `config validate` | Validate the selected configuration. |
 | `config init [--path PATH] [--force]` | Create a configuration file. |
+
+Normal shutdown already attempts to roll back unconfirmed network and Router/VPN
+transactions. `stop --force` explicitly requests cancellation of all pending
+transactions, including a manual retry of stopped rollback recovery, and requires
+an acknowledgement that shutdown cleanup succeeded. Committed settings remain
+subject to the configured shutdown policy. `restart --force` performs the same
+verified stop before starting again; a failed cancellation prevents the start.
+If cleanup fails or the timeout expires, unresolved recovery journals are
+preserved. `--force` requests verified rollback rather than a SIGKILL fallback.
 
 ## Client commands
 

@@ -1552,7 +1552,8 @@ impl WifiClientSupervisor {
     }
 
     /// Apply the shutdown policy to supervised processes and their ownership records.
-    pub async fn shutdown(&self, policy: ShutdownPolicy) {
+    pub async fn shutdown(&self, policy: ShutdownPolicy) -> anyhow::Result<()> {
+        let mut errors = Vec::new();
         let _operation = self.inner.operation_lock.write().await;
         self.inner.association_monitors.lock().await.clear();
         let tasks = std::mem::take(&mut *self.inner.tasks.lock().await);
@@ -1564,19 +1565,28 @@ impl WifiClientSupervisor {
                     .await
                 {
                     tracing::error!(%interface, %error, "failed to stop wpa_supplicant during shutdown; ownership record retained");
+                    errors.push(format!("{interface}: {error:#}"));
                     continue;
                 }
                 if let Err(error) = clear_owned_record(&self.record_store(&interface)).await {
                     tracing::error!(%interface, %error, "wpa_supplicant stopped but ownership record cleanup failed");
+                    errors.push(format!("{interface}: {error:#}"));
                 }
                 let path = config_path(&self.inner.runtime_dir, &interface);
                 if let Err(error) = tokio::fs::remove_file(&path).await {
                     if error.kind() != std::io::ErrorKind::NotFound {
                         tracing::warn!(%interface, path = %path.display(), %error, "failed to remove wpa_supplicant runtime config during shutdown");
+                        errors.push(format!("{interface}: {error:#}"));
                     }
                 }
             }
         }
+        anyhow::ensure!(
+            errors.is_empty(),
+            "shutdown cleanup failed: {}",
+            errors.join("; ")
+        );
+        Ok(())
     }
 }
 

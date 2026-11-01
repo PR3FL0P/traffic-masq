@@ -1119,8 +1119,6 @@ async fn internal_wifi_client_disable_cleans_up_wifi_owned_dhcp() {
 
 #[tokio::test]
 async fn internal_wifi_client_disable_restores_state_if_persistence_fails() {
-    use std::os::unix::fs::PermissionsExt;
-
     let directory = tempdir().expect("tempdir");
     let mut config = wifi_client_base_config(directory.path());
     let mut wlan1_cfg = config
@@ -1168,9 +1166,9 @@ async fn internal_wifi_client_disable_restores_state_if_persistence_fails() {
     dhcp_client.configure(dhcp_spec).await;
     assert!(dhcp_client.spec("wlan1").await.is_some());
 
-    // Make the override directory read-only so set_interface will fail persistence
-    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o500))
-        .expect("read-only permissions");
+    let original = overrides.effective_interface("wlan1").await.unwrap();
+    // A directory at the document path prevents replacement even for root.
+    std::fs::create_dir(overrides.path()).expect("block override persistence");
 
     let service = ControlService::new_detached(config, network, dhcp, overrides.clone())
         .with_wifi_client_supervisor(wifi_client.clone())
@@ -1180,17 +1178,20 @@ async fn internal_wifi_client_disable_restores_state_if_persistence_fails() {
         .disable_wifi_client_locked("wlan1".to_string())
         .await;
     assert!(
-        matches!(response, Response::WifiClientError { .. }),
+        matches!(&response, Response::WifiClientError {
+            detail: WifiClientErrorDetail::Other { message },
+        } if message.contains("failed to persist Wi-Fi client disable")
+            && message.contains("prior runtime state was restored")),
         "got {response:?}"
     );
-
-    // Restore permissions so tempdir cleanup doesn't error
-    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
-        .expect("restore permissions");
 
     // Both Wi-Fi and DHCP client supervisors must be restored
     assert!(wifi_client.status("wlan1").await.is_some());
     assert!(dhcp_client.spec("wlan1").await.is_some());
+    assert_eq!(
+        overrides.effective_interface("wlan1").await.unwrap(),
+        original
+    );
 }
 
 #[tokio::test]

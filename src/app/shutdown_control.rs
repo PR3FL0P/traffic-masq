@@ -2,7 +2,7 @@
 //!
 //! The request lives beside the PID file rather than in persistent state: it is lifecycle
 //! control, not configuration or recovery data. A random token and target PID bind the
-//! acknowledgement to one reset attempt, while an expiry prevents an abandoned request from
+//! acknowledgement to one administrative attempt, while an expiry prevents an abandoned request from
 //! changing some much later ordinary shutdown.
 
 use std::fs;
@@ -22,6 +22,7 @@ const EXPIRY_GRACE: Duration = Duration::from_secs(60);
 #[serde(rename_all = "snake_case")]
 enum ShutdownMode {
     RestoreInterfaces,
+    CancelPending,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +42,10 @@ pub(crate) struct PendingShutdownRequest {
 }
 
 impl PendingShutdownRequest {
+    pub(crate) fn cancels_pending(&self) -> bool {
+        self.mode == ShutdownMode::CancelPending
+    }
+
     pub(crate) fn restores_interfaces(&self) -> bool {
         self.mode == ShutdownMode::RestoreInterfaces
     }
@@ -62,14 +67,12 @@ impl ShutdownRequestHandle {
         let acknowledgement =
             fs::read_to_string(&self.acknowledgement_path).with_context(|| {
                 format!(
-                    "daemon stopped without acknowledging requested network-state restoration ({})",
+                    "daemon stopped without acknowledging requested network cleanup ({})",
                     self.acknowledgement_path.display()
                 )
             })?;
         if acknowledgement.trim() != self.token {
-            bail!(
-                "daemon shutdown acknowledgement does not match this reset attempt; persistent state was not changed"
-            );
+            bail!("daemon shutdown acknowledgement does not match this administrative attempt");
         }
         atomic_file::remove_durable(&self.acknowledgement_path)?;
         atomic_file::remove_durable(&self.request_path)?;
@@ -81,6 +84,23 @@ pub(crate) fn request_restore_interfaces(
     pid_path: &Path,
     pid: u32,
     timeout: Duration,
+) -> Result<ShutdownRequestHandle> {
+    request_shutdown(pid_path, pid, timeout, ShutdownMode::RestoreInterfaces)
+}
+
+pub(crate) fn request_cancel_pending(
+    pid_path: &Path,
+    pid: u32,
+    timeout: Duration,
+) -> Result<ShutdownRequestHandle> {
+    request_shutdown(pid_path, pid, timeout, ShutdownMode::CancelPending)
+}
+
+fn request_shutdown(
+    pid_path: &Path,
+    pid: u32,
+    timeout: Duration,
+    mode: ShutdownMode,
 ) -> Result<ShutdownRequestHandle> {
     let request_path = request_path(pid_path);
     let acknowledgement_path = acknowledgement_path(pid_path);
@@ -110,7 +130,7 @@ pub(crate) fn request_restore_interfaces(
         pid,
         token: token.clone(),
         expires_at_unix_seconds,
-        mode: ShutdownMode::RestoreInterfaces,
+        mode,
     };
     atomic_file::replace(
         &request_path,

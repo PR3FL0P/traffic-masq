@@ -26,7 +26,7 @@ commands before making changes.
 | --- | --- | --- | --- |
 | systemd | `/etc/systemd/system/traffic-masqd.service` | `systemctl enable traffic-masqd.service` | `systemctl start/stop traffic-masqd.service` |
 | OpenRC | `/etc/init.d/traffic-masqd` | `rc-update add traffic-masqd default` | `rc-service traffic-masqd start/stop` |
-| runit | `/etc/sv/traffic-masqd/run` and `check` | Link in the selected runsvdir scan directory | `sv -w 60 start/stop /etc/sv/traffic-masqd` |
+| runit | `/etc/sv/traffic-masqd/run` and `check` | Link in the selected runsvdir scan directory | `sv -w 60 start /etc/sv/traffic-masqd`, `sv -w 150 stop /etc/sv/traffic-masqd` |
 | SysVinit | `/etc/init.d/traffic-masqd` | `update-rc.d` or `chkconfig` | `/etc/init.d/traffic-masqd start/stop` |
 
 `/etc/traffic-masq/service-run` holds the installed binary and configuration
@@ -37,6 +37,13 @@ Systemd and runit use the foreground `run` command. Systemd restarts the daemon
 on failure and allows time for a graceful stop. Its `KillMode=process` lets
 `preserve_interfaces` keep Wi-Fi workers alive across daemon restarts. With
 `restore_interfaces`, the daemon stops those workers itself.
+
+Shutdown drains control operations for up to 30 seconds, then allows up to
+90 seconds for worker and network cleanup. The service stop timeouts allow
+150 seconds. If cleanup exceeds its deadline, the daemon exits with an error
+and retains recovery journals for the next startup. The CLI does not wait for
+blocked filesystem workers after this deadline, and the PID lock stays held
+until the process exits.
 
 OpenRC and SysVinit use the daemon's internal start/stop commands. These share
 its PID lock and API readiness check, without calling back into the init script

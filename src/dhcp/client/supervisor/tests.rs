@@ -509,7 +509,10 @@ async fn readiness_allows_acquisition_and_the_full_arp_probe_schedule() {
     };
     let (ready, ()) = tokio::join!(supervisor.wait_until_ready("wan0"), acquisition);
     ready.expect("readiness includes acquisition, ARP and kernel application");
-    supervisor.shutdown(ShutdownPolicy::RestoreInterfaces).await;
+    supervisor
+        .shutdown(ShutdownPolicy::RestoreInterfaces)
+        .await
+        .unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -526,7 +529,10 @@ async fn readiness_without_a_lease_remains_bounded() {
     assert!(error.to_string().contains("DHCP lease is not ready"));
     assert!(started.elapsed() >= LEASE_READY_TIMEOUT);
     assert!(started.elapsed() < LEASE_READY_TIMEOUT + Duration::from_secs(1));
-    supervisor.shutdown(ShutdownPolicy::RestoreInterfaces).await;
+    supervisor
+        .shutdown(ShutdownPolicy::RestoreInterfaces)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -559,7 +565,8 @@ async fn unresolved_persisted_ownership_cleanup_blocks_a_new_actor() {
         .expect("lease applied");
     supervisor
         .shutdown(ShutdownPolicy::PreserveInterfaces)
-        .await;
+        .await
+        .unwrap();
 
     let store = DhcpClientLeaseStore::new(state_dir.path()).expect("store");
     let mut persisted = store.load("wan0").expect("load").expect("lease");
@@ -603,7 +610,8 @@ async fn startup_cleans_persisted_ownership_without_committed_client_intent() {
         .expect("lease applied");
     supervisor
         .shutdown(ShutdownPolicy::PreserveInterfaces)
-        .await;
+        .await
+        .unwrap();
 
     let restarted = DhcpClientSupervisor::start_with_launcher(
         &config(&state_dir, None),
@@ -642,7 +650,8 @@ async fn restart_rejects_lease_from_uncommitted_route_policy() {
         .expect("tentative lease applied");
     supervisor
         .shutdown(ShutdownPolicy::PreserveInterfaces)
-        .await;
+        .await
+        .unwrap();
     assert!(network
         .routes
         .lock()
@@ -808,7 +817,8 @@ async fn preserve_shutdown_keeps_owned_state_and_sends_no_release() {
 
     supervisor
         .shutdown(ShutdownPolicy::PreserveInterfaces)
-        .await;
+        .await
+        .unwrap();
 
     assert!(launcher.sends.lock().unwrap().is_empty());
     assert_eq!(
@@ -847,7 +857,10 @@ async fn destructive_shutdown_releases_when_asked_and_cleans_up_owned_state() {
         .await
         .expect("lease applied");
 
-    supervisor.shutdown(ShutdownPolicy::RestoreInterfaces).await;
+    supervisor
+        .shutdown(ShutdownPolicy::RestoreInterfaces)
+        .await
+        .unwrap();
 
     let sends = launcher.sends.lock().unwrap().clone();
     assert_eq!(sends.len(), 1, "exactly one RELEASE");
@@ -1187,7 +1200,8 @@ async fn persisted_replug_reacquires_and_old_callbacks_cannot_clean_new_ownershi
     );
     supervisor
         .shutdown(ShutdownPolicy::PreserveInterfaces)
-        .await;
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -1203,7 +1217,8 @@ async fn restart_with_persisted_old_index_starts_fresh_without_reporting_old_lea
         .unwrap();
     supervisor
         .shutdown(ShutdownPolicy::PreserveInterfaces)
-        .await;
+        .await
+        .unwrap();
     network.detach("wan0").await;
     network.addresses.lock().await.clear();
     network.routes.lock().await.clear();
@@ -1219,7 +1234,10 @@ async fn restart_with_persisted_old_index_starts_fresh_without_reporting_old_lea
         .load("wan0")
         .unwrap()
         .is_none());
-    restarted.shutdown(ShutdownPolicy::PreserveInterfaces).await;
+    restarted
+        .shutdown(ShutdownPolicy::PreserveInterfaces)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -1245,7 +1263,10 @@ async fn unrelated_interface_cleanup_does_not_wait_for_a_client_operation() {
             .is_err()
     );
     drop(operation);
-    supervisor.shutdown(ShutdownPolicy::RestoreInterfaces).await;
+    supervisor
+        .shutdown(ShutdownPolicy::RestoreInterfaces)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -1272,7 +1293,8 @@ async fn changing_hostname_restarts_the_client_and_clearing_it_stops_advertising
     );
     supervisor
         .shutdown(ShutdownPolicy::PreserveInterfaces)
-        .await;
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -1415,4 +1437,30 @@ async fn legacy_zero_metric_subnet_is_cleaned_before_fresh_acquisition() {
     assert!(network.routes.lock().await.is_empty());
     assert!(network.addresses.lock().await.is_empty());
     assert!(store.load("wan0").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn shutdown_reports_failed_address_cleanup_and_retains_lease_proof() {
+    let root = TempDir::new().unwrap();
+    let network = FakeNetwork::present(7).await;
+    let launcher = Arc::new(FakeLauncher::default());
+    let supervisor = supervisor_with(&root, network.clone(), launcher.clone()).await;
+    launcher
+        .take_sink()
+        .lease_acquired(lease(Ipv4Addr::new(192, 0, 2, 42)))
+        .await
+        .unwrap();
+    network.fail_address_deletes.store(1, Ordering::SeqCst);
+    let error = supervisor
+        .shutdown(ShutdownPolicy::RestoreInterfaces)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("injected address delete failure"));
+    let store = DhcpClientLeaseStore::new(root.path()).unwrap();
+    assert_eq!(
+        store.load("wan0").unwrap().unwrap().state,
+        DhcpClientLeaseState::CleanupNeeded
+    );
+    assert!(!network.addresses.lock().await.is_empty());
+    assert!(supervisor.inner.tasks.lock().await.is_empty());
 }

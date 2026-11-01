@@ -322,6 +322,30 @@ pub async fn start_executable(
     }
 }
 
+/// Proof that an explicit stop cancelled pending work before the daemon exited.
+pub struct PendingCancellation(super::shutdown_control::ShutdownRequestHandle);
+
+impl PendingCancellation {
+    pub fn verify(self) -> Result<()> {
+        self.0.verify_and_cleanup()
+    }
+}
+
+/// Publish shutdown intent before invoking the native service manager or SIGTERM.
+pub fn request_pending_cancellation(
+    config: &AppConfig,
+    timeout: Duration,
+) -> Result<Option<PendingCancellation>> {
+    if !process_lock_is_held(&config.runtime.pid_path)? {
+        return Ok(None);
+    }
+    let pid = read_pid(&config.runtime.pid_path)?
+        .context("daemon lock is held but PID file is missing")?;
+    Ok(Some(PendingCancellation(
+        super::shutdown_control::request_cancel_pending(&config.runtime.pid_path, pid, timeout)?,
+    )))
+}
+
 /// Request daemon termination and wait for shutdown; report whether a running process was stopped.
 pub async fn stop(config: &AppConfig, shutdown_timeout: Duration) -> Result<bool> {
     if !process_lock_is_held(&config.runtime.pid_path)? {
