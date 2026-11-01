@@ -41,11 +41,15 @@ async fn control_request(
     timeout: Duration,
     command: &str,
 ) -> Result<String, CtrlError> {
-    socket.send(command.as_bytes()).await?;
     let mut buffer = vec![0u8; MAX_CTRL_MESSAGE_BYTES];
-    let read = tokio::time::timeout(timeout, socket.recv(&mut buffer))
-        .await
-        .map_err(|_| CtrlError::Timeout(timeout))??;
+    // A stalled daemon can fill its receive queue. Bound sending as well as
+    // receiving, using one budget so callers cannot retain runtime locks forever.
+    let read = tokio::time::timeout(timeout, async {
+        socket.send(command.as_bytes()).await?;
+        socket.recv(&mut buffer).await
+    })
+    .await
+    .map_err(|_| CtrlError::Timeout(timeout))??;
     let reply = String::from_utf8_lossy(&buffer[..read]).into_owned();
     if reply.trim_end() == "FAIL" {
         return Err(CtrlError::Failed);

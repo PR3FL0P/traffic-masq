@@ -58,3 +58,51 @@ fn indexed_field_prefers_the_indexed_form_and_falls_back_to_bare() {
     assert_eq!(indexed_field(&raw, "other"), Some("bare"));
     assert_eq!(indexed_field(&raw, "missing"), None);
 }
+
+#[tokio::test]
+async fn control_request_deadline_includes_a_blocked_send() {
+    let (client, _unresponsive_daemon) = std::os::unix::net::UnixDatagram::pair().unwrap();
+    client.set_nonblocking(true).unwrap();
+    // Fill the peer queue without reading it, as when a daemon stalls.
+    let payload = [0u8; MAX_CTRL_MESSAGE_BYTES];
+    loop {
+        match client.send(&payload) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("failed to fill control socket: {error}"),
+        }
+    }
+    let client = UnixDatagram::from_std(client).unwrap();
+    let budget = Duration::from_millis(20);
+    let result = tokio::time::timeout(
+        Duration::from_millis(200),
+        control_request(&client, budget, "PING"),
+    )
+    .await
+    .expect("control request exceeded its deadline while sending to a stalled daemon");
+    assert!(matches!(result, Err(CtrlError::Timeout(value)) if value == budget));
+}
+
+#[tokio::test]
+async fn control_request_times_out_when_daemon_accepts_but_does_not_reply() {
+    let (client, _unresponsive_daemon) = UnixDatagram::pair().unwrap();
+    let budget = Duration::from_millis(20);
+    let result = control_request(&client, budget, "PING").await;
+    assert!(matches!(result, Err(CtrlError::Timeout(value)) if value == budget));
+}
+
+#[tokio::test]
+async fn control_request_still_exchanges_commands_and_replies() {
+    let (client, daemon) = UnixDatagram::pair().unwrap();
+    let reply = async {
+        let mut buffer = [0u8; 32];
+        let read = daemon.recv(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..read], b"PING");
+        daemon.send(b"PONG\n").await.unwrap();
+    };
+    let (response, ()) = tokio::join!(
+        control_request(&client, Duration::from_secs(1), "PING"),
+        reply,
+    );
+    assert_eq!(response.unwrap(), "PONG\n");
+}
