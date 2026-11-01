@@ -5907,6 +5907,7 @@ use crate::core::router_provisioning::ProvisioningDownstreamOverrides;
 
 #[derive(Default)]
 struct FakeProvisioningSubsystems {
+    plan_unavailable: StdMutex<bool>,
     applied_uplink_wifi: StdMutex<Vec<WifiClientSpec>>,
     applied_output_wifi: StdMutex<Vec<WifiApSpec>>,
     uplink_dhcp_unready: StdMutex<bool>,
@@ -5917,6 +5918,10 @@ struct FakeProvisioningSubsystems {
 #[async_trait]
 impl RouterSubsystems for FakeProvisioningSubsystems {
     async fn plan_for(&self, desired: &RouterDesired) -> Result<RouterSubsystemPlan> {
+        anyhow::ensure!(
+            !*self.plan_unavailable.lock().unwrap(),
+            "injected planning failure"
+        );
         let uplink_wifi = desired
             .uplink_wifi
             .iter()
@@ -11197,4 +11202,106 @@ async fn dhcp_dns_defaults_dispatch_uses_saved_settings_immediately() {
             Response::DhcpDnsDefaults { settings } if settings == desired)
         );
     }
+}
+
+#[tokio::test]
+async fn internal_profile_activation_restores_runtime_and_secret_on_persistence_failure() {
+    let fixture = wifi_client_fixture_with_security(WifiClientSecurity::Wpa2).await;
+    let wifi = fixture.service.wifi_client.as_ref().unwrap();
+    let previous = wifi.status("wlan1").await.unwrap().spec;
+    let previous_secret = wifi.stored_passphrase("wlan1").await.unwrap().unwrap();
+    let created = fixture
+        .service
+        .dispatch(Request::CreateWifiClientProfile {
+            profile: WifiClientProfileWriteRequest {
+                id: "rollback-test".into(),
+                ssid: "replacement-network".into(),
+                country_code: Some("PL".into()),
+                security: WifiClientSecurity::Open,
+                priority: 0,
+                autoconnect: false,
+                passphrase: None,
+                clear_passphrase: false,
+            },
+        })
+        .await;
+    assert!(
+        matches!(created, Response::WifiClientProfile { .. }),
+        "{created:?}"
+    );
+    std::fs::create_dir(fixture.service.overrides.path()).unwrap();
+    let response = fixture
+        .service
+        .activate_wifi_client_profile_internal("wlan1".into(), "rollback-test".into())
+        .await;
+    assert!(
+        matches!(
+            response,
+            Response::WifiClientProfileError {
+                detail: WifiClientProfileErrorDetail::PersistenceFailed { .. }
+            }
+        ),
+        "{response:?}"
+    );
+    assert_eq!(wifi.status("wlan1").await.unwrap().spec, previous);
+    assert_eq!(
+        wifi.stored_passphrase("wlan1")
+            .await
+            .unwrap()
+            .unwrap()
+            .expose(),
+        previous_secret.expose()
+    );
+    assert_eq!(fixture.service.overrides.committed_revision().await, 0);
+}
+
+#[tokio::test]
+async fn provisioning_plan_failure_restores_both_secrets_before_coordinator_apply() {
+    let fixture = provisioning_fixture().await;
+    let old = crate::wifi::WifiPassphrase::new("previous provisioning secret").unwrap();
+    fixture.wifi.set_passphrase("wlan-out", &old).await.unwrap();
+    fixture
+        .wifi_client
+        .set_passphrase("wlan-up", &old)
+        .await
+        .unwrap();
+    *fixture.subsystems.plan_unavailable.lock().unwrap() = true;
+    let response = fixture
+        .service
+        .dispatch(apply_request(provisioning_request()))
+        .await;
+    assert!(
+        matches!(response, Response::RouterProvisioningError { .. }),
+        "{response:?}"
+    );
+    assert_eq!(
+        fixture
+            .wifi
+            .stored_passphrase("wlan-out")
+            .await
+            .unwrap()
+            .unwrap()
+            .expose(),
+        old.expose()
+    );
+    assert_eq!(
+        fixture
+            .wifi_client
+            .stored_passphrase("wlan-up")
+            .await
+            .unwrap()
+            .unwrap()
+            .expose(),
+        old.expose()
+    );
+    assert_eq!(fixture.overrides.committed_revision().await, 0);
+    assert_eq!(
+        fixture.service.router.as_ref().unwrap().status().await,
+        CoordinatorStatus::Idle
+    );
+    assert!(!fixture
+        ._directory
+        .path()
+        .join("router-provisioning-secrets.json")
+        .exists());
 }

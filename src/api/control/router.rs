@@ -56,8 +56,6 @@ fn router_recovery_notice(
     })
 }
 
-use crate::core::provisioning_secret_transaction::ProvisioningSecretTransactionStore;
-
 // Health probes may queue behind a Wi-Fi reconfiguration. Observational API
 // requests must still expose the transaction state while those consumers start.
 async fn router_health_for_status(
@@ -650,120 +648,36 @@ impl ControlService {
             None
         };
 
-        // Persist the old values *before* changing either secret. The journal
-        // is the secret half of the router transaction and lets startup recover
-        // a crash anywhere between staging and commit.
-        let mut previous = BTreeMap::new();
-        if let Some(supervisor) = output_supervisor {
-            match supervisor.stored_passphrase(&output_interface).await {
-                Ok(secret) => {
-                    previous.insert(
-                        output_interface.clone(),
-                        (crate::wifi::store::WifiCredentialRole::Ap, secret),
-                    );
-                }
-                Err(error) => {
-                    return provisioning_error(RouterProvisioningErrorDetail::Other {
-                        message: error.to_string(),
-                    })
-                }
-            }
-        }
-        if let Some(supervisor) = uplink_supervisor {
-            match supervisor.stored_passphrase(&uplink_interface).await {
-                Ok(secret) => {
-                    previous.insert(
-                        uplink_interface.clone(),
-                        (crate::wifi::store::WifiCredentialRole::Client, secret),
-                    );
-                }
-                Err(error) => {
-                    return provisioning_error(RouterProvisioningErrorDetail::Other {
-                        message: error.to_string(),
-                    })
-                }
-            }
-        }
-
-        let secret_tx =
-            ProvisioningSecretTransactionStore::in_state_dir(&self.config.runtime.state_dir);
-        if let Err(error) = secret_tx.stage(previous).await {
-            return provisioning_error(RouterProvisioningErrorDetail::Other {
-                message: format!("failed to open provisioning secret transaction: {error:#}"),
-            });
-        }
-
-        if let (Some(supervisor), Some(passphrase)) =
-            (output_supervisor, output_passphrase.as_ref())
+        let token = match crate::core::provisioning_apply::apply(
+            router,
+            &self.overrides,
+            &self.config.runtime.state_dir,
+            output_supervisor,
+            uplink_supervisor,
+            output_interface,
+            uplink_interface,
+            output_passphrase,
+            uplink_passphrase,
+            effective.into_router_intent_proposal(),
+        )
+        .await
         {
-            if let Err(error) = supervisor
-                .set_passphrase(&output_interface, passphrase)
-                .await
-            {
-                let restore = router.restore_staged_provisioning_secrets().await;
-                return provisioning_error(RouterProvisioningErrorDetail::InvalidSecret {
-                    message: match restore {
-                        Ok(_) => error.to_string(),
-                        Err(restore_error) => format!(
-                            "{error}; restoring prior provisioning secrets also failed: {restore_error:#}"
-                        ),
-                    },
-                });
-            }
-        }
-        if let (Some(supervisor), Some(passphrase)) =
-            (uplink_supervisor, uplink_passphrase.as_ref())
-        {
-            if let Err(error) = supervisor
-                .set_passphrase(&uplink_interface, passphrase)
-                .await
-            {
-                let restore = router.restore_staged_provisioning_secrets().await;
-                return provisioning_error(RouterProvisioningErrorDetail::InvalidSecret {
-                    message: match restore {
-                        Ok(_) => error.to_string(),
-                        Err(restore_error) => format!(
-                            "{error}; restoring prior provisioning secrets also failed: {restore_error:#}"
-                        ),
-                    },
-                });
-            }
-        }
-
-        let proposal = effective.into_router_intent_proposal();
-        let candidate = match self.overrides.build_candidate(&proposal).await {
-            Ok(candidate) => candidate,
-            Err(error) => {
-                let restore = router.restore_staged_provisioning_secrets().await;
-                if let Err(restore_error) = restore {
-                    return provisioning_error(RouterProvisioningErrorDetail::Other {
-                        message: format!(
-                            "{error:#}; restoring prior provisioning secrets also failed: {restore_error:#}"
-                        ),
-                    });
-                }
-                return provisioning_error(classify_provisioning_transaction_error(&error));
-            }
-        };
-        let transaction_plan = match router.plan(candidate).await {
-            Ok(plan) => plan,
-            Err(error) => {
-                let restore = router.restore_staged_provisioning_secrets().await;
-                if let Err(restore_error) = restore {
-                    return provisioning_error(RouterProvisioningErrorDetail::Other {
-                        message: format!(
-                            "{error:#}; restoring prior provisioning secrets also failed: {restore_error:#}"
-                        ),
-                    });
-                }
-                return provisioning_error(classify_provisioning_transaction_error(&error));
-            }
-        };
-
-        let token = match router.apply(transaction_plan).await {
             Ok(token) => token,
             Err(error) => {
-                return provisioning_error(classify_provisioning_transaction_error(&error));
+                use crate::core::provisioning_apply::ProvisioningApplyError;
+                return provisioning_error(match error {
+                    ProvisioningApplyError::Secret(error) => {
+                        RouterProvisioningErrorDetail::InvalidSecret {
+                            message: error.to_string(),
+                        }
+                    }
+                    ProvisioningApplyError::Other(error) => RouterProvisioningErrorDetail::Other {
+                        message: format!("{error:#}"),
+                    },
+                    ProvisioningApplyError::Transaction(error) => {
+                        classify_provisioning_transaction_error(&error)
+                    }
+                });
             }
         };
 

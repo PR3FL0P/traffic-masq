@@ -1,6 +1,6 @@
-use super::dhcp_client::{configure_dhcp_client_checked, restore_dhcp_client};
 use super::runtime::compensation_message;
 use super::*;
+use crate::core::client_compensation::restore_dhcp_client;
 use crate::core::transaction::InterfaceChange;
 
 pub(super) fn validate_wifi_client_interface(
@@ -791,202 +791,43 @@ impl ControlService {
             Ok(target) => target,
             Err(detail) => return wifi_client_profile_error(detail),
         };
-        let spec = match WifiClientSpec::from_interface_config(&interface, &interface_config) {
-            Ok(Some(spec)) => spec,
-            Ok(None) => {
-                return wifi_client_profile_error(WifiClientProfileErrorDetail::InvalidProfile {
-                    message: format!(
-                        "profile activation requires a managed input interface on '{interface}'"
-                    ),
-                })
-            }
-            Err(error) => {
-                return wifi_client_profile_error(WifiClientProfileErrorDetail::InvalidProfile {
-                    message: error.to_string(),
-                })
-            }
-        };
-
-        if let Err(error) = crate::wifi::policy::WifiRadioPolicy::validate_transition(
+        if let Err(error) = crate::core::wifi_profile_activation::activate(
+            wifi_client,
+            self.dhcp_client.as_ref(),
+            &self.overrides,
+            self.network.as_ref(),
             &effective.network,
             &interface,
-            &interface_config,
-            |name| self.network.wireless_phy(name),
-        ) {
-            return wifi_client_profile_error(WifiClientProfileErrorDetail::InvalidProfile {
-                message: error.to_string(),
-            });
-        }
-
-        let previous_status = wifi_client.status(&interface).await;
-        let previous_link_ready = previous_status
-            .as_ref()
-            .is_none_or(|status| status.wpa_state.is_connected());
-        let previous_spec = previous_status.map(|status| status.spec);
-        let previous_secret = match wifi_client.stored_passphrase(&interface).await {
-            Ok(secret) => secret,
-            Err(error) => {
-                return wifi_client_profile_error(WifiClientProfileErrorDetail::ActivationFailed {
-                    message: error.to_string(),
-                })
-            }
-        };
-        let profile_secret = match self.wifi_client_profiles.get_passphrase(&profile_id) {
-            Ok(secret) => secret,
-            Err(error) => return classify_wifi_client_profile_error(error),
-        };
-        let secret_result = match profile_secret.as_ref() {
-            Some(secret) => wifi_client.set_passphrase(&interface, secret).await,
-            None => wifi_client.clear_passphrase(&interface).await,
-        };
-        if let Err(error) = secret_result {
-            let restoration =
-                restore_wifi_client_secret(wifi_client, &interface, previous_secret.as_ref()).await;
-            return wifi_client_profile_error(WifiClientProfileErrorDetail::ActivationFailed {
-                message: match restoration {
-                    Ok(()) => error.to_string(),
-                    Err(rollback) => format!(
-                        "{error}; restoring the previous Wi-Fi client secret also failed: {rollback:#}; recovery required"
-                    ),
-                },
-            });
-        }
-        if let Err(error) = wifi_client.configure(spec).await {
-            let restoration = compensate_wifi_client(
-                wifi_client,
-                &interface,
-                previous_spec.clone(),
-                previous_secret,
-            )
-            .await;
-            return wifi_client_profile_error(WifiClientProfileErrorDetail::ActivationFailed {
-                message: match restoration {
-                    Ok(()) => error.to_string(),
-                    Err(rollback) => format!(
-                        "{error}; restoring the previous Wi-Fi client state also failed: {rollback:#}; recovery required"
-                    ),
-                },
-            });
-        }
-
-        let mut previous_dhcp = None;
-        if auto_enabled_dhcp {
-            let dhcp_client = self
-                .dhcp_client
-                .as_ref()
-                .expect("DHCP client availability checked above");
-            let dhcp_spec = match DhcpClientSpec::from_interface_config(
-                &interface,
-                &interface_config,
-            ) {
-                Ok(Some(spec)) => spec,
-                Ok(None) => {
-                    let rollback = compensate_wifi_client(
-                        wifi_client,
-                        &interface,
-                        previous_spec,
-                        previous_secret,
-                    )
-                    .await;
-                    return wifi_client_profile_error(WifiClientProfileErrorDetail::ActivationFailed {
-                        message: compensation_message(
-                            "profile activation could not derive the required DHCP client specification",
-                            &"DHCP client specification is disabled",
-                            rollback,
-                        ),
-                    });
-                }
-                Err(error) => {
-                    let rollback = compensate_wifi_client(
-                        wifi_client,
-                        &interface,
-                        previous_spec,
-                        previous_secret,
-                    )
-                    .await;
-                    return wifi_client_profile_error(
-                        WifiClientProfileErrorDetail::ActivationFailed {
-                            message: compensation_message(
-                                "profile activation produced an invalid DHCP client specification",
-                                &error,
-                                rollback,
-                            ),
-                        },
-                    );
-                }
-            };
-            previous_dhcp = dhcp_client.spec(&interface).await;
-            if let Err(error) = configure_dhcp_client_checked(dhcp_client, dhcp_spec, false).await {
-                let mut rollback_failures = Vec::new();
-                if let Err(rollback) =
-                    compensate_wifi_client(wifi_client, &interface, previous_spec, previous_secret)
-                        .await
-                {
-                    rollback_failures.push(format!("Wi-Fi client: {rollback:#}"));
-                }
-                if let Err(rollback) = restore_dhcp_client(
-                    dhcp_client,
-                    &interface,
-                    previous_dhcp.clone(),
-                    previous_link_ready,
-                )
-                .await
-                {
-                    rollback_failures.push(format!("DHCP client: {rollback:#}"));
-                }
-                let message = if rollback_failures.is_empty() {
-                    format!("failed to configure DHCP client for activated profile: {error:#}; prior state was restored")
-                } else {
-                    format!(
-                        "failed to configure DHCP client for activated profile: {error:#}; rollback was incomplete: {}; recovery required",
-                        rollback_failures.join("; ")
-                    )
-                };
-                return wifi_client_profile_error(WifiClientProfileErrorDetail::ActivationFailed {
-                    message,
-                });
-            }
-        }
-
-        if let Err(error) = self
-            .overrides
-            .set_interface(interface.clone(), interface_config, false)
-            .await
+            interface_config,
+            auto_enabled_dhcp,
+            match self.wifi_client_profiles.get_passphrase(&profile_id) {
+                Ok(secret) => secret,
+                Err(error) => return classify_wifi_client_profile_error(error),
+            },
+        )
+        .await
         {
-            if crate::atomic_file::is_indeterminate_write(&error) {
-                return super::runtime::error_response(error);
-            }
-            let mut rollback_failures = Vec::new();
-            if let Err(rollback) =
-                compensate_wifi_client(wifi_client, &interface, previous_spec, previous_secret)
-                    .await
-            {
-                rollback_failures.push(format!("Wi-Fi client: {rollback:#}"));
-            }
-            if auto_enabled_dhcp {
-                if let Some(dhcp_client) = &self.dhcp_client {
-                    if let Err(rollback) = restore_dhcp_client(
-                        dhcp_client,
-                        &interface,
-                        previous_dhcp,
-                        previous_link_ready,
-                    )
-                    .await
-                    {
-                        rollback_failures.push(format!("DHCP client: {rollback:#}"));
+            return match error {
+                crate::core::wifi_profile_activation::ActivationError::Invalid(message) => {
+                    wifi_client_profile_error(WifiClientProfileErrorDetail::InvalidProfile {
+                        message,
+                    })
+                }
+                crate::core::wifi_profile_activation::ActivationError::Activation(message) => {
+                    wifi_client_profile_error(WifiClientProfileErrorDetail::ActivationFailed {
+                        message,
+                    })
+                }
+                crate::core::wifi_profile_activation::ActivationError::Persistence(error) => {
+                    if crate::atomic_file::is_indeterminate_write(&error) {
+                        super::runtime::error_response(error)
+                    } else {
+                        wifi_client_profile_error(WifiClientProfileErrorDetail::PersistenceFailed {
+                            message: error.to_string(),
+                        })
                     }
                 }
-            }
-            return wifi_client_profile_error(WifiClientProfileErrorDetail::PersistenceFailed {
-                message: if rollback_failures.is_empty() {
-                    format!("{error}; prior runtime state was restored")
-                } else {
-                    format!(
-                        "{error}; rollback was incomplete: {}; recovery required",
-                        rollback_failures.join("; ")
-                    )
-                },
-            });
+            };
         }
         match wifi_client.status(&interface).await {
             Some(status) => Response::WifiClientProfileActivated {
@@ -1139,44 +980,6 @@ pub(super) fn wifi_client_profile_input(
         security: request.security,
         priority: request.priority,
         autoconnect: request.autoconnect,
-    }
-}
-
-pub(super) async fn restore_wifi_client_secret(
-    supervisor: &WifiClientSupervisor,
-    interface: &str,
-    previous: Option<&WifiPassphrase>,
-) -> Result<()> {
-    match previous {
-        Some(passphrase) => supervisor.set_passphrase(interface, passphrase).await?,
-        None => supervisor.clear_passphrase(interface).await?,
-    }
-    Ok(())
-}
-
-pub(super) async fn compensate_wifi_client(
-    supervisor: &WifiClientSupervisor,
-    interface: &str,
-    previous_spec: Option<WifiClientSpec>,
-    previous_secret: Option<WifiPassphrase>,
-) -> Result<()> {
-    let mut failures = Vec::new();
-    if let Err(error) =
-        restore_wifi_client_secret(supervisor, interface, previous_secret.as_ref()).await
-    {
-        failures.push(format!("secret restoration failed: {error:#}"));
-    }
-    let runtime = match previous_spec {
-        Some(spec) => supervisor.configure(spec).await,
-        None => supervisor.disable(interface).await.map(|_| ()),
-    };
-    if let Err(error) = runtime {
-        failures.push(format!("supplicant restoration failed: {error:#}"));
-    }
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        anyhow::bail!(failures.join("; "))
     }
 }
 

@@ -230,6 +230,12 @@ Network decisions belong in `core` or the service module responsible for them.
 HTTP handlers and TUI widgets translate input and show results; they do not
 change kernel state directly.
 
+Internal Wi-Fi profile activation is orchestrated by `core/wifi_profile_activation.rs`,
+which tracks changed runtime components and compensates failures in one place.
+Router provisioning stages and restores credentials in `core/provisioning_apply.rs`;
+after coordinator apply starts, the coordinator owns durable journal recovery.
+The control API maps service outcomes to protocol responses.
+
 ### Commit uncertainty and confirmation timing
 
 If both override replacement and its compensation fail, the daemon fences the

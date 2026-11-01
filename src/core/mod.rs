@@ -23,3 +23,7 @@ pub mod transaction;
 pub mod vpn_chain;
 pub mod vpn_policy;
 pub mod vpn_policy_manager;
+
+pub(crate) mod client_compensation;
+pub(crate) mod provisioning_apply;
+pub(crate) mod wifi_profile_activation;

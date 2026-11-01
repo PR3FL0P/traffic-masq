@@ -205,38 +205,6 @@ pub(super) fn dhcp_client_request_to_config(
     }
 }
 
-pub(super) async fn configure_dhcp_client_checked(
-    supervisor: &DhcpClientSupervisor,
-    spec: DhcpClientSpec,
-    link_ready: bool,
-) -> Result<()> {
-    let interface = spec.interface.clone();
-    supervisor.configure_with_link_ready(spec, link_ready).await;
-    let status = supervisor
-        .status(&interface)
-        .await
-        .ok_or_else(|| anyhow::anyhow!("DHCP client disappeared after configuration"))?;
-    if let DhcpClientRunState::Degraded { reason } = status.state {
-        anyhow::bail!("DHCP client failed to start on {interface}: {reason}");
-    }
-    Ok(())
-}
-
-pub(super) async fn restore_dhcp_client(
-    supervisor: &DhcpClientSupervisor,
-    interface: &str,
-    previous: Option<DhcpClientSpec>,
-    link_ready: bool,
-) -> Result<()> {
-    match previous {
-        Some(spec) => configure_dhcp_client_checked(supervisor, spec, link_ready).await,
-        None => {
-            supervisor.disable(interface).await?;
-            Ok(())
-        }
-    }
-}
-
 pub(super) fn dhcp_client_status_view(status: DhcpClientStatus) -> DhcpClientStatusView {
     let (state, degraded_reason) = match status.state {
         DhcpClientRunState::WaitingForInterface => (DhcpClientOperationalState::Waiting, None),
