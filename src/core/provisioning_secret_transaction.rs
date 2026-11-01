@@ -177,7 +177,7 @@ impl ProvisioningSecretTransactionStore {
             let passphrases = PassphraseStore::for_role(&self.state_dir, journal.roles[interface]);
             let result = match previous {
                 Some(raw) => match WifiPassphrase::new(raw.clone()) {
-                    Ok(secret) => passphrases.set(interface, &secret),
+                    Ok(secret) => passphrases.set_async(interface, &secret).await,
                     Err(error) => {
                         failures.push(crate::core::recovery_control::failure(
                             crate::core::recovery_control::FailureKind::Incompatible,
@@ -186,7 +186,7 @@ impl ProvisioningSecretTransactionStore {
                         continue;
                     }
                 },
-                None => passphrases.clear(interface),
+                None => passphrases.clear_async(interface).await,
             };
             if let Err(error) = result {
                 failures.push(anyhow::Error::new(error).context(interface.clone()));
@@ -257,7 +257,13 @@ impl ProvisioningSecretTransactionStore {
             .journal
             .parent()
             .context("provisioning secret journal path has no parent")?;
-        atomic_file::ensure_private_dir(parent, PRIVATE_DIR_MODE).with_context(|| {
+        let directory = parent.to_owned();
+        crate::wifi::store::blocking_store(move || {
+            atomic_file::ensure_private_dir(&directory, PRIVATE_DIR_MODE)
+                .map_err(anyhow::Error::from)
+        })
+        .await
+        .with_context(|| {
             format!(
                 "failed to secure provisioning state directory {}",
                 parent.display()
@@ -339,7 +345,13 @@ impl ProvisioningSecretTransactionStore {
             .journal
             .parent()
             .context("provisioning secret journal path has no parent")?;
-        atomic_file::ensure_private_dir(parent, PRIVATE_DIR_MODE).with_context(|| {
+        let directory = parent.to_owned();
+        crate::wifi::store::blocking_store(move || {
+            atomic_file::ensure_private_dir(&directory, PRIVATE_DIR_MODE)
+                .map_err(anyhow::Error::from)
+        })
+        .await
+        .with_context(|| {
             format!(
                 "failed to secure provisioning state directory {}",
                 parent.display()

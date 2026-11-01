@@ -452,11 +452,16 @@ impl WifiClientSupervisor {
         spec: &WifiClientSpec,
     ) -> Result<RenderedClientConfig, ClientSupervisorError> {
         let passphrase = if spec.requires_passphrase() {
-            resolve_passphrase_parts(
-                &spec.interface,
-                spec.passphrase_file.as_deref(),
-                &self.inner.passphrase_store,
-            )?
+            let store = self.inner.passphrase_store.clone();
+            let owned_spec = spec.clone();
+            crate::wifi::store::blocking_store(move || {
+                resolve_passphrase_parts(
+                    &owned_spec.interface,
+                    owned_spec.passphrase_file.as_deref(),
+                    &store,
+                )
+            })
+            .await?
         } else {
             None
         };
@@ -1321,7 +1326,8 @@ impl WifiClientSupervisor {
     ) -> Result<Option<WifiPassphrase>, ClientSupervisorError> {
         self.inner
             .passphrase_store
-            .get(interface)
+            .get_async(interface)
+            .await
             .map_err(ResolvePassphraseError::from)
             .map_err(Into::into)
     }
@@ -1330,7 +1336,8 @@ impl WifiClientSupervisor {
     pub async fn clear_passphrase(&self, interface: &str) -> Result<(), ClientSupervisorError> {
         self.inner
             .passphrase_store
-            .clear(interface)
+            .clear_async(interface)
+            .await
             .map_err(ResolvePassphraseError::from)
             .map_err(Into::into)
     }
@@ -1343,7 +1350,8 @@ impl WifiClientSupervisor {
     ) -> Result<(), ClientSupervisorError> {
         self.inner
             .passphrase_store
-            .set(interface, passphrase)
+            .set_async(interface, passphrase)
+            .await
             .map_err(ResolvePassphraseError::from)?;
         Ok(())
     }

@@ -89,13 +89,18 @@ impl ControlService {
         if let Err(error) = wifi_client.preflight_binary().await {
             return classify_wifi_client_error(error);
         }
-        let profile = match self.wifi_client_profiles.get(&settings.profile_id) {
+        let profile = match self
+            .wifi_client_profiles
+            .get_async(&settings.profile_id)
+            .await
+        {
             Ok(profile) => profile,
             Err(error) => return classify_wifi_client_profile_error(error),
         };
         let secret = match self
             .wifi_client_profiles
-            .get_passphrase(&settings.profile_id)
+            .get_passphrase_async(&settings.profile_id)
+            .await
         {
             Ok(secret) => secret,
             Err(error) => return classify_wifi_client_profile_error(error),
@@ -582,14 +587,14 @@ impl ControlService {
     }
 
     pub(super) async fn list_wifi_client_profiles(&self) -> Response {
-        match self.wifi_client_profiles.list() {
+        match self.wifi_client_profiles.list_async().await {
             Ok(profiles) => Response::WifiClientProfiles { profiles },
             Err(error) => classify_wifi_client_profile_error(error),
         }
     }
 
     pub(super) async fn get_wifi_client_profile(&self, id: String) -> Response {
-        match self.wifi_client_profiles.get(&id) {
+        match self.wifi_client_profiles.get_async(&id).await {
             Ok(profile) => Response::WifiClientProfile { profile },
             Err(error) => classify_wifi_client_profile_error(error),
         }
@@ -599,7 +604,7 @@ impl ControlService {
         &self,
         mut request: WifiClientProfileWriteRequest,
     ) -> Response {
-        let _mutation = self.wifi_client_mutations.lock().await;
+        let mutation = self.wifi_client_mutations.clone().lock_owned().await;
         let passphrase = match request.passphrase.take() {
             Some(raw) => match WifiPassphrase::new(&raw) {
                 Ok(passphrase) => Some(passphrase),
@@ -614,7 +619,14 @@ impl ControlService {
             None => None,
         };
         let input = wifi_client_profile_input(request);
-        match self.wifi_client_profiles.create(input, passphrase) {
+        let store = self.wifi_client_profiles.clone();
+        match crate::wifi::store::blocking_store(move || {
+            // Keep serialization until the blocking write finishes, even if this request is cancelled.
+            let _mutation = mutation;
+            store.create(input, passphrase)
+        })
+        .await
+        {
             Ok(profile) => Response::WifiClientProfile { profile },
             Err(error) => classify_wifi_client_profile_error(error),
         }
@@ -635,7 +647,7 @@ impl ControlService {
                 message: "passphrase and clear_passphrase are mutually exclusive".to_string(),
             });
         }
-        let _mutation = self.wifi_client_mutations.lock().await;
+        let mutation = self.wifi_client_mutations.clone().lock_owned().await;
         let secret_update = if request.clear_passphrase {
             WifiClientProfileSecretUpdate::Clear
         } else if let Some(raw) = request.passphrase.take() {
@@ -653,15 +665,22 @@ impl ControlService {
             WifiClientProfileSecretUpdate::Unchanged
         };
         let input = wifi_client_profile_input(request);
-        match self.wifi_client_profiles.update(input, secret_update) {
+        let store = self.wifi_client_profiles.clone();
+        match crate::wifi::store::blocking_store(move || {
+            // Keep serialization until the blocking write finishes, even if this request is cancelled.
+            let _mutation = mutation;
+            store.update(input, secret_update)
+        })
+        .await
+        {
             Ok(profile) => Response::WifiClientProfile { profile },
             Err(error) => classify_wifi_client_profile_error(error),
         }
     }
 
     pub(super) async fn delete_wifi_client_profile(&self, id: String) -> Response {
-        let _mutation = self.wifi_client_mutations.lock().await;
-        let profile = match self.wifi_client_profiles.get(&id) {
+        let mutation = self.wifi_client_mutations.clone().lock_owned().await;
+        let profile = match self.wifi_client_profiles.get_async(&id).await {
             Ok(profile) => profile,
             Err(error) => return classify_wifi_client_profile_error(error),
         };
@@ -691,7 +710,14 @@ impl ControlService {
                 interfaces: active,
             });
         }
-        match self.wifi_client_profiles.delete(&id) {
+        let store = self.wifi_client_profiles.clone();
+        let delete_id = id.clone();
+        match crate::wifi::store::blocking_store(move || {
+            let _mutation = mutation;
+            store.delete(&delete_id)
+        })
+        .await
+        {
             Ok(()) => Response::WifiClientProfileDeleted { id },
             Err(error) => classify_wifi_client_profile_error(error),
         }
@@ -708,11 +734,15 @@ impl ControlService {
         if let Err(error) = wifi_client.preflight_binary().await {
             return classify_wifi_client_error(error);
         }
-        let profile = match self.wifi_client_profiles.get(&profile_id) {
+        let profile = match self.wifi_client_profiles.get_async(&profile_id).await {
             Ok(profile) => profile,
             Err(error) => return classify_wifi_client_profile_error(error),
         };
-        let secret = match self.wifi_client_profiles.get_passphrase(&profile_id) {
+        let secret = match self
+            .wifi_client_profiles
+            .get_passphrase_async(&profile_id)
+            .await
+        {
             Ok(secret) => secret,
             Err(error) => return classify_wifi_client_profile_error(error),
         };
@@ -769,7 +799,7 @@ impl ControlService {
         let Some(wifi_client) = &self.wifi_client else {
             return wifi_client_profile_error(WifiClientProfileErrorDetail::WifiClientDisabled);
         };
-        let profile = match self.wifi_client_profiles.get(&profile_id) {
+        let profile = match self.wifi_client_profiles.get_async(&profile_id).await {
             Ok(profile) => profile,
             Err(error) => return classify_wifi_client_profile_error(error),
         };
@@ -800,7 +830,11 @@ impl ControlService {
             &interface,
             interface_config,
             auto_enabled_dhcp,
-            match self.wifi_client_profiles.get_passphrase(&profile_id) {
+            match self
+                .wifi_client_profiles
+                .get_passphrase_async(&profile_id)
+                .await
+            {
                 Ok(secret) => secret,
                 Err(error) => return classify_wifi_client_profile_error(error),
             },

@@ -66,10 +66,14 @@ impl ControlService {
             .context("interface is not configured")?;
         anyhow::ensure!(target.managed && target.role == InterfaceRole::Input,
             "offline Wi-Fi client provisioning requires a managed input interface; assign its role first");
-        let profile = self.wifi_client_profiles.get(&settings.profile_id)?;
+        let profile = self
+            .wifi_client_profiles
+            .get_async(&settings.profile_id)
+            .await?;
         let secret = self
             .wifi_client_profiles
-            .get_passphrase(&settings.profile_id)?;
+            .get_passphrase_async(&settings.profile_id)
+            .await?;
         match settings.ip_policy {
             WifiClientIpPolicy::Preserve => {}
             WifiClientIpPolicy::Dhcp => {
@@ -216,8 +220,11 @@ impl ControlService {
             };
             // A unique immutable credential precedes the atomic intent commit.
             // Never replace or delete a secret still referenced by older intent.
-            let store =
-                crate::wifi::store::PassphraseStore::new_revision(&self.config.runtime.state_dir)?;
+            let state_dir = self.config.runtime.state_dir.clone();
+            let store = crate::wifi::store::blocking_store(move || {
+                crate::wifi::store::PassphraseStore::new_revision(&state_dir)
+            })
+            .await?;
             *secured = Some(store.directory().join(&interface));
             credential = Some((store, secret));
         }
@@ -231,7 +238,7 @@ impl ControlService {
             .into());
         }
         if let Some((store, secret)) = credential {
-            store.set(&interface, secret)?;
+            store.set_async(&interface, secret).await?;
         }
         // Unreferenced versions are harmless after a failed or interrupted commit.
         // Retain them also for an indeterminate commit; either durable outcome can use its secret.

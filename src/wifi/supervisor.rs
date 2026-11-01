@@ -415,7 +415,11 @@ impl HostapdSupervisor {
     }
 
     async fn render_for(&self, spec: &WifiApSpec) -> Result<RenderedApConfig, SupervisorError> {
-        let passphrase = resolve_passphrase(spec, &self.inner.passphrase_store)?;
+        let store = self.inner.passphrase_store.clone();
+        let owned_spec = spec.clone();
+        let passphrase =
+            crate::wifi::store::blocking_store(move || resolve_passphrase(&owned_spec, &store))
+                .await?;
         Ok(render_hostapd_config(ApRenderInput {
             spec,
             ctrl_interface: &self.inner.runtime_dir,
@@ -1249,7 +1253,8 @@ impl HostapdSupervisor {
     ) -> Result<(), SupervisorError> {
         self.inner
             .passphrase_store
-            .set(interface, passphrase)
+            .set_async(interface, passphrase)
+            .await
             .map_err(ResolvePassphraseError::from)?;
         Ok(())
     }
@@ -1261,7 +1266,8 @@ impl HostapdSupervisor {
     ) -> Result<Option<WifiPassphrase>, SupervisorError> {
         self.inner
             .passphrase_store
-            .get(interface)
+            .get_async(interface)
+            .await
             .map_err(ResolvePassphraseError::from)
             .map_err(Into::into)
     }
@@ -1270,7 +1276,8 @@ impl HostapdSupervisor {
     pub async fn clear_passphrase(&self, interface: &str) -> Result<(), SupervisorError> {
         self.inner
             .passphrase_store
-            .clear(interface)
+            .clear_async(interface)
+            .await
             .map_err(ResolvePassphraseError::from)?;
         Ok(())
     }

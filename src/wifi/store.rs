@@ -15,6 +15,36 @@ use crate::config::{validate_interface_name, InterfaceConfig, WifiSecurity};
 use crate::wifi::secret::{PassphraseError, WifiPassphrase};
 use crate::wifi::WifiApSpec;
 
+/// Run a complete store operation without blocking a Tokio worker.
+pub(crate) async fn blocking_store<T, E>(
+    operation: impl FnOnce() -> Result<T, E> + Send + 'static,
+) -> Result<T, E>
+where
+    T: Send + 'static,
+    E: From<std::io::Error> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(|error| E::from(std::io::Error::other(error)))?
+}
+
+/// Reads validate existing private directories without making durability writes.
+/// Missing directories and permission repairs retain the durable setup path.
+pub(crate) fn prepare_private_dir_for_read(path: &Path) -> Result<(), PrivateDirError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(PrivateDirError::Symlink(path.to_owned()))
+        }
+        Ok(metadata) if !metadata.is_dir() => Err(PrivateDirError::NotADirectory(path.to_owned())),
+        Ok(metadata) if metadata.permissions().mode() & 0o7777 == PRIVATE_DIR_MODE => Ok(()),
+        Ok(_) => atomic_file::ensure_private_dir(path, PRIVATE_DIR_MODE),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            atomic_file::ensure_private_dir(path, PRIVATE_DIR_MODE)
+        }
+        Err(error) => Err(PrivateDirError::Io(error)),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WifiCredentialRole {
@@ -85,6 +115,32 @@ impl PassphraseStore {
         Self {
             directory: directory.into(),
         }
+    }
+
+    pub async fn get_async(
+        &self,
+        interface: &str,
+    ) -> Result<Option<WifiPassphrase>, PassphraseStoreError> {
+        let store = self.clone();
+        let interface = interface.to_owned();
+        blocking_store(move || store.get(&interface)).await
+    }
+
+    pub async fn set_async(
+        &self,
+        interface: &str,
+        passphrase: &WifiPassphrase,
+    ) -> Result<(), PassphraseStoreError> {
+        let store = self.clone();
+        let interface = interface.to_owned();
+        let passphrase = passphrase.clone();
+        blocking_store(move || store.set(&interface, &passphrase)).await
+    }
+
+    pub async fn clear_async(&self, interface: &str) -> Result<(), PassphraseStoreError> {
+        let store = self.clone();
+        let interface = interface.to_owned();
+        blocking_store(move || store.clear(&interface)).await
     }
 
     /// Allocate an immutable credential version; callers atomically commit its path in intent.
@@ -168,7 +224,8 @@ impl PassphraseStore {
     /// directory and repair its mode to 0700 even on a read. Reject symlinks,
     /// invalid names, invalid passphrases and I/O failures; never log the result.
     pub fn get(&self, interface: &str) -> Result<Option<WifiPassphrase>, PassphraseStoreError> {
-        let canonical_dir = self.ensure_directory()?;
+        prepare_private_dir_for_read(&self.directory)?;
+        let canonical_dir = fs::canonicalize(&self.directory)?;
         let target = self.safe_target(&canonical_dir, interface)?;
 
         let Some(mut file) = open_secret_file(&target)? else {
@@ -286,6 +343,12 @@ pub enum ResolvePassphraseError {
     #[error(transparent)]
     Passphrase(#[from] PassphraseError),
 }
+impl From<std::io::Error> for ResolvePassphraseError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Store(PassphraseStoreError::Io(error))
+    }
+}
+
 /// Return None for open APs; otherwise resolve the role-specific store first,
 /// then the configured file. Reading the store may create/chmod its directory.
 /// Returned credentials are secret; invalid values and unsafe files are errors.

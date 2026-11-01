@@ -124,6 +124,26 @@ fn rejects_a_symlinked_store_directory() {
         .set("wlan0", &passphrase("correct horse battery"))
         .unwrap_err();
     assert!(matches!(error, PassphraseStoreError::SymlinkRejected(_)));
+    assert!(matches!(
+        store.get("wlan0"),
+        Err(PassphraseStoreError::SymlinkRejected(_))
+    ));
+}
+
+#[test]
+fn reading_repairs_loose_directory_permissions() {
+    let root = tempdir().unwrap();
+    let directory = root.path().join("secrets");
+    let store = PassphraseStore::new(&directory);
+    store
+        .set("wlan0", &passphrase("correct horse battery"))
+        .unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(store.get("wlan0").unwrap().is_some());
+    assert_eq!(
+        fs::metadata(directory).unwrap().permissions().mode() & 0o7777,
+        0o700
+    );
 }
 
 #[test]
@@ -378,4 +398,33 @@ fn external_fifo_is_rejected_without_waiting_for_a_writer() {
     assert!(
         matches!(result, Err(ResolvePassphraseError::Io { source, .. }) if source.kind() == std::io::ErrorKind::InvalidData)
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn blocking_store_keeps_the_async_worker_available() {
+    let (release, wait) = std::sync::mpsc::channel();
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let operation = tokio::spawn(blocking_store(move || {
+        entered.send(()).unwrap();
+        wait.recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(std::io::Error::other)
+    }));
+    started.await.unwrap();
+    // This task must run while the synchronous store operation is still waiting.
+    release.send(()).unwrap();
+    operation.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn async_secret_store_preserves_read_write_and_clear_behavior() {
+    let root = tempfile::tempdir().unwrap();
+    let store = PassphraseStore::new(root.path().join("secrets"));
+    let secret = WifiPassphrase::new("test-passphrase").unwrap();
+    store.set_async("wlan0", &secret).await.unwrap();
+    assert_eq!(
+        store.get_async("wlan0").await.unwrap().unwrap().expose(),
+        secret.expose()
+    );
+    store.clear_async("wlan0").await.unwrap();
+    assert!(store.get_async("wlan0").await.unwrap().is_none());
 }

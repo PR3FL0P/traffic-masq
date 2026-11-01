@@ -109,6 +109,31 @@ pub struct WifiClientProfileStore {
 }
 
 impl WifiClientProfileStore {
+    pub async fn list_async(
+        &self,
+    ) -> Result<Vec<WifiClientProfileSummary>, WifiClientProfileError> {
+        let store = self.clone();
+        crate::wifi::store::blocking_store(move || store.list()).await
+    }
+
+    pub async fn get_async(
+        &self,
+        id: &str,
+    ) -> Result<WifiClientProfileSummary, WifiClientProfileError> {
+        let store = self.clone();
+        let id = id.to_owned();
+        crate::wifi::store::blocking_store(move || store.get(&id)).await
+    }
+
+    pub async fn get_passphrase_async(
+        &self,
+        id: &str,
+    ) -> Result<Option<WifiPassphrase>, WifiClientProfileError> {
+        let store = self.clone();
+        let id = id.to_owned();
+        crate::wifi::store::blocking_store(move || store.get_passphrase(&id)).await
+    }
+
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
     }
@@ -118,7 +143,7 @@ impl WifiClientProfileStore {
     }
 
     pub fn list(&self) -> Result<Vec<WifiClientProfileSummary>, WifiClientProfileError> {
-        let dirs = self.ensure_directories()?;
+        let dirs = self.read_directories()?;
         let mut profiles = Vec::new();
         for entry in fs::read_dir(&dirs.metadata)? {
             let entry = entry?;
@@ -145,7 +170,7 @@ impl WifiClientProfileStore {
 
     pub fn get(&self, id: &str) -> Result<WifiClientProfileSummary, WifiClientProfileError> {
         validate_id(id)?;
-        let dirs = self.ensure_directories()?;
+        let dirs = self.read_directories()?;
         let metadata = read_metadata(&metadata_path(&dirs, id)).map_err(map_not_found)?;
         validate_metadata(&metadata)?;
         if metadata.id != id {
@@ -161,7 +186,7 @@ impl WifiClientProfileStore {
         id: &str,
     ) -> Result<Option<WifiPassphrase>, WifiClientProfileError> {
         validate_id(id)?;
-        let dirs = self.ensure_directories()?;
+        let dirs = self.read_directories()?;
 
         let metadata = read_metadata(&metadata_path(&dirs, id)).map_err(map_not_found)?;
         validate_metadata(&metadata)?;
@@ -335,6 +360,17 @@ impl WifiClientProfileStore {
     ) -> Result<WifiClientProfileSummary, WifiClientProfileError> {
         let has_passphrase = target_exists_regular(&secret_path(dirs, &metadata.id))?;
         Ok(summary_from_metadata(metadata, has_passphrase))
+    }
+
+    fn read_directories(&self) -> Result<StoreDirectories, WifiClientProfileError> {
+        use crate::wifi::store::prepare_private_dir_for_read;
+        prepare_private_dir_for_read(&self.root)?;
+        let root = fs::canonicalize(&self.root)?;
+        let metadata = root.join("metadata");
+        let secrets = root.join("secrets");
+        prepare_private_dir_for_read(&metadata)?;
+        prepare_private_dir_for_read(&secrets)?;
+        Ok(StoreDirectories { metadata, secrets })
     }
 
     fn ensure_directories(&self) -> Result<StoreDirectories, WifiClientProfileError> {

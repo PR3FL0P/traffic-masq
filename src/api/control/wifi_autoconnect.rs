@@ -86,7 +86,8 @@ impl ControlService {
         // Avoid scanning at all when no profiles opted in.
         if !self
             .wifi_client_profiles
-            .list()?
+            .list_async()
+            .await?
             .iter()
             .any(|profile| profile.autoconnect)
         {
@@ -206,7 +207,7 @@ impl ControlService {
                     continue;
                 }
             };
-            let profiles = self.wifi_client_profiles.list()?;
+            let profiles = self.wifi_client_profiles.list_async().await?;
             let id = {
                 let state = self.wifi_autoconnect.lock().await;
                 let Some(profile) =

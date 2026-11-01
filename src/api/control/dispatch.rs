@@ -479,9 +479,9 @@ impl ControlService {
                 self.wifi_client_reconnect(interface).await
             }
             Request::WifiClientScan { interface } => self.wifi_client_scan(interface).await,
-            Request::ListWifiApProfiles => self.list_wifi_ap_profiles(),
-            Request::SaveWifiApProfile { profile } => self.save_wifi_ap_profile(profile),
-            Request::DeleteWifiApProfile { id } => self.delete_wifi_ap_profile(id),
+            Request::ListWifiApProfiles => self.list_wifi_ap_profiles().await,
+            Request::SaveWifiApProfile { profile } => self.save_wifi_ap_profile(profile).await,
+            Request::DeleteWifiApProfile { id } => self.delete_wifi_ap_profile(id).await,
             Request::ActivateWifiApProfile {
                 interface,
                 profile_id,
