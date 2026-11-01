@@ -38,7 +38,7 @@ fn sharing_shows_missing_saved_device_and_global_blocker_with_both_endpoints_pre
         assert!(text.contains("Saved, not connected: enp5s0f3u3"));
         assert!(text.contains("Waiting for configured router device enp5s0f3u3"));
         assert!(text.contains("Present"));
-        assert_eq!(app.ui.buttons.len(), 6);
+        assert_eq!(app.ui.buttons.len(), 7);
         for (rect, _) in &app.ui.buttons {
             assert!(rect.right() <= width);
             assert!(rect.bottom() <= 20);
@@ -430,7 +430,7 @@ fn sharing_sections_and_controls_fit_small_and_large_terminals() {
             .draw(|frame| super::super::render(frame, &mut app, false))
             .unwrap();
         assert_eq!(app.router.pane_tabs.len(), 4);
-        assert_eq!(app.ui.buttons.len(), 6);
+        assert_eq!(app.ui.buttons.len(), 7);
         assert!(app.ui.list_scroll_offset > 0);
         for (rect, _) in &app.ui.buttons {
             assert!(rect.right() <= width);
@@ -720,5 +720,43 @@ fn sharing_keeps_up_green_and_shows_virtual_ap_parent_at_terminal_widths() {
             assert_eq!(buffer[(x, y)].fg, theme::GOOD);
             assert_eq!(buffer[(x + 1, y)].fg, theme::GOOD);
         }
+    }
+}
+
+#[tokio::test]
+async fn sharing_opens_missing_device_settings_with_offline_edit_and_delete_available() {
+    for inventory_loaded in [false, true] {
+        let entry = saved_missing_device();
+        let mock = super::super::test_api::mock(vec![
+            traffic_masq_protocol::ControlResponse::InterfaceConfig {
+                interface: entry.name.clone(),
+                config: entry.configured.clone(),
+                allow_management_change: false,
+                wifi_concurrent_support: None,
+            },
+        ])
+        .await;
+        let mut app = TuiApp::default();
+        app.router.saved_interfaces = vec![entry.clone()];
+        app.router.editor_revision = Some(7);
+        if inventory_loaded {
+            app.dashboard.inventory = Some(vec![entry.clone()]);
+            app.dashboard.intent_revision = Some(8);
+        }
+        handle_list_key(&mut app, KeyCode::Char('i'), &mock.client).await;
+        assert_eq!(app.screen, Screen::InterfaceEditor);
+        let editor = app.interface_ui.editor.as_ref().unwrap();
+        assert_eq!(editor.interface, entry.name);
+        assert_eq!(
+            editor.offline_revision,
+            Some(if inventory_loaded { 8 } else { 7 })
+        );
+        assert_eq!(editor.saved_config, entry.configured);
+        assert!(!app.router.staged);
+        let notices: String = sharing_notices(&app)
+            .iter()
+            .map(|line| line.to_string())
+            .collect();
+        assert!(notices.contains("edit or delete settings"));
     }
 }

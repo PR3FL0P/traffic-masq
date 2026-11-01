@@ -284,13 +284,14 @@ fn stage(app: &mut TuiApp, rules: Vec<ForwardingConfig>) {
     app.router.error = None;
 }
 
-const ACTIONS: [&str; 6] = [
+const ACTIONS: [&str; 7] = [
     "[Add]",
     "[Edit]",
     "[Delete]",
     "[Review / Apply]",
     "[Refresh]",
     "[Diagnose]",
+    "[Saved devices]",
 ];
 
 fn sharing_notices(app: &TuiApp) -> Vec<Line<'static>> {
@@ -319,7 +320,7 @@ fn sharing_notices(app: &TuiApp) -> Vec<Line<'static>> {
     if !missing.is_empty() {
         lines.push(Line::styled(
             format!(
-                "Saved, not connected: {}. See Interfaces.",
+                "Saved, not connected: {}. Saved devices (i): edit or delete settings.",
                 missing.join(", ")
             ),
             Style::default().fg(theme::WARN),
@@ -364,7 +365,7 @@ pub(crate) fn render_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
     let chunks = Layout::vertical([
         Constraint::Length(notices.len() as u16),
         Constraint::Min(3),
-        Constraint::Length(3),
+        Constraint::Length(4),
     ])
     .split(area);
     frame.render_widget(Paragraph::new(notices), chunks[0]);
@@ -499,8 +500,13 @@ pub(crate) fn render_list(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mut 
     let inner = block.inner(chunks[2]);
     frame.render_widget(block, chunks[2]);
     let mut x = inner.x;
+    let mut y = inner.y;
     for (index, label) in ACTIONS.into_iter().enumerate() {
-        let rect = Rect::new(x, inner.y, label.len() as u16, 1);
+        if x + label.len() as u16 > inner.right() {
+            x = inner.x;
+            y += 1;
+        }
+        let rect = Rect::new(x, y, label.len() as u16, 1);
         frame.render_widget(
             Paragraph::new(label).style(
                 if app.router.sharing_actions_focused && app.router.sharing_action == index {
@@ -533,6 +539,7 @@ pub(crate) async fn handle_list_key(app: &mut TuiApp, key: KeyCode, client: &Api
         }
         KeyCode::Char('a') => open(app, client, false, None).await,
         KeyCode::Char('d') => diagnose(app, client).await,
+        KeyCode::Char('i') => open_saved_device(app, client).await,
         KeyCode::Delete => delete(app, client).await,
         KeyCode::Up if !app.router.sharing_actions_focused => {
             app.router.selected_connection = app.router.selected_connection.saturating_sub(1)
@@ -565,11 +572,38 @@ pub(crate) async fn handle_list_key(app: &mut TuiApp, key: KeyCode, client: &Api
                 2 => delete(app, client).await,
                 3 => super::router::open_router_plan(app, client).await,
                 5 => diagnose(app, client).await,
+                6 => open_saved_device(app, client).await,
                 _ => super::router::refresh_router_data(app, client).await,
             }
         }
         _ => {}
     }
+}
+
+async fn open_saved_device(app: &mut TuiApp, client: &ApiClient) {
+    // Use the same inventory and editor as Interfaces, including revision checks
+    // and the offline edit/delete confirmation flow.
+    let entries = app
+        .dashboard
+        .inventory
+        .as_deref()
+        .unwrap_or(&app.router.saved_interfaces);
+    let selected = entries.iter().position(|entry| {
+        entry.configured.is_some()
+            && entry.presence == traffic_masq_protocol::InterfacePresence::Missing
+            && !entry.observation_stale
+    });
+    let Some(index) = selected else {
+        app.screen = Screen::InterfaceList;
+        return;
+    };
+    if app.dashboard.inventory.is_none() {
+        app.dashboard.inventory = Some(app.router.saved_interfaces.clone());
+        app.dashboard.intent_revision = app.router.editor_revision;
+    }
+    super::interfaces::set_interface_selection(app, index);
+    app.screen = Screen::InterfaceList;
+    super::interfaces::open_editor(app, client).await;
 }
 
 async fn diagnose(app: &mut TuiApp, client: &ApiClient) {
