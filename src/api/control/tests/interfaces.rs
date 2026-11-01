@@ -4,6 +4,7 @@ use super::*;
 fn unmanaging_an_interface_with_a_running_ap_requires_explicit_confirmation() {
     let current = InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -39,6 +40,7 @@ fn unmanaging_an_interface_with_a_running_ap_requires_explicit_confirmation() {
 fn an_empty_cidr_removes_the_configured_address() {
     let existing = InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -50,6 +52,7 @@ fn an_empty_cidr_removes_the_configured_address() {
     };
     let edit = InterfaceEditRequest {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         cidr: String::new(),
         role: InterfaceRole::Output,
@@ -82,6 +85,7 @@ async fn removing_an_interface_override_falls_back_to_the_file_configuration() {
 
     let overridden = InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -218,6 +222,7 @@ async fn unrelated_recovery_does_not_block_interface_commit_or_rollback() {
     config.dhcp.leases_dir = directory.path().join("leases");
     let interface = InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,

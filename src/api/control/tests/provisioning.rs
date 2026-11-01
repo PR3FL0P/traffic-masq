@@ -153,6 +153,7 @@ async fn provisioning_rejects_a_management_interface_without_confirmation() {
         "wlan-up".to_string(),
         InterfaceConfig {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             role: InterfaceRole::None,
             managed: false,

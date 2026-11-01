@@ -75,6 +75,7 @@ fn enabled_config() -> AppConfig {
         "wan0".to_string(),
         InterfaceConfig {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: false,
@@ -95,6 +96,7 @@ fn enabled_config() -> AppConfig {
             name.to_string(),
             InterfaceConfig {
                 wifi_concurrent: false,
+                randomize_mac: false,
                 mac_address: None,
                 role: InterfaceRole::Output,
                 managed: true,

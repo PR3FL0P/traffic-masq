@@ -44,6 +44,7 @@ impl WifiRuntimeReconciler for StartingWifi {
 fn ethernet(cidr: &str) -> InterfaceConfig {
     InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -58,6 +59,7 @@ fn ethernet(cidr: &str) -> InterfaceConfig {
 fn station() -> InterfaceConfig {
     InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         role: InterfaceRole::Input,
         ipv4: None,
         wifi_client: Some(crate::config::WifiClientConfig {

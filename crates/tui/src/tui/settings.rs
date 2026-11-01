@@ -19,6 +19,7 @@ pub(crate) enum SettingsField {
     RememberSession,
     RememberMinutes,
     ShowDhcpClient,
+    RandomizeMacDefault,
     SaveSession,
     ChangePassword,
     Access,
@@ -28,11 +29,12 @@ pub(crate) enum SettingsField {
     Reload,
 }
 
-const SETTINGS_FIELDS: [SettingsField; 11] = [
+const SETTINGS_FIELDS: [SettingsField; 12] = [
     SettingsField::RollbackTimeout,
     SettingsField::RememberSession,
     SettingsField::RememberMinutes,
     SettingsField::ShowDhcpClient,
+    SettingsField::RandomizeMacDefault,
     SettingsField::SaveSession,
     SettingsField::ChangePassword,
     SettingsField::DnsDefaults,
@@ -52,6 +54,7 @@ pub(crate) struct SecurityEditor {
     pub(crate) remember_session: bool,
     pub(crate) remember_minutes_input: String,
     pub(crate) show_dhcp_client: bool,
+    pub(crate) randomize_mac_default: bool,
     pub(crate) confirmation: Option<SettingsField>,
     pub(crate) cursor: usize,
     pub(crate) editing: bool,
@@ -239,11 +242,28 @@ pub(crate) fn render_settings(frame: &mut ratatui::Frame<'_>, area: Rect, app: &
     ));
     button_rows.push((
         lines.len() as u16,
-        "Save session preferences (applies now)",
-        6,
+        "Automatic MAC for new interfaces: enabled",
+        10,
     ));
     lines.push(row(
-        "Save session preferences (applies now)".into(),
+        format!(
+            "Automatic MAC for new interfaces: {}",
+            if editor.randomize_mac_default {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        ),
+        SettingsField::RandomizeMacDefault,
+        Style::default().fg(theme::ACCENT),
+    ));
+    lines.push(note(
+        "Sets the initial checkbox for new interfaces; saved interface policies take precedence.",
+        Style::default().fg(theme::MUTED),
+    ));
+    button_rows.push((lines.len() as u16, "Save TUI preferences (applies now)", 6));
+    lines.push(row(
+        "Save TUI preferences (applies now)".into(),
         SettingsField::SaveSession,
         Style::default().fg(theme::ACCENT),
     ));
@@ -330,6 +350,7 @@ pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
             7 => SettingsField::Access,
             8 => SettingsField::ShowDhcpClient,
             9 => SettingsField::DnsDefaults,
+            10 => SettingsField::RandomizeMacDefault,
             _ => SettingsField::Reload,
         };
         editor.editing = false;
@@ -371,7 +392,13 @@ pub(crate) async fn handle_settings_key(app: &mut TuiApp, key: KeyCode, client: 
             editor.show_dhcp_client = !editor.show_dhcp_client;
             app.show_dhcp_client = editor.show_dhcp_client;
         }
+        KeyCode::Char(' ') if editor.field == SettingsField::RandomizeMacDefault => {
+            editor.randomize_mac_default = !editor.randomize_mac_default;
+        }
         KeyCode::Enter => match editor.field {
+            SettingsField::RandomizeMacDefault => {
+                editor.randomize_mac_default = !editor.randomize_mac_default;
+            }
             SettingsField::RollbackTimeout | SettingsField::RememberMinutes => {
                 editor.editing = false;
                 editor.field = next_settings_field(editor.field);
@@ -439,8 +466,10 @@ async fn save_session_preferences(app: &mut TuiApp, client: &ApiClient) {
         remember: editor.remember_session,
         minutes,
         show_dhcp_client: editor.show_dhcp_client,
+        randomize_mac_default: editor.randomize_mac_default,
     };
     app.show_dhcp_client = preferences.show_dhcp_client;
+    app.randomize_mac_default = preferences.randomize_mac_default;
     let result = async {
         let store = super::session::SessionStore::for_client(client)?;
         store.save_preferences(&preferences, client).await
@@ -450,14 +479,14 @@ async fn save_session_preferences(app: &mut TuiApp, client: &ApiClient) {
         Ok(()) => app.push_message(
             LogLevel::Info,
             if preferences.remember {
-                "Session preferences saved; duration starts at the last password entry"
+                "TUI preferences saved; session duration starts at the last password entry"
             } else {
-                "Session saving disabled; the next launch will require a password"
+                "TUI preferences saved; session saving disabled; the next launch will require a password"
             },
         ),
         Err(error) => app.push_message(
             LogLevel::Error,
-            format!("Could not save session preferences: {error}"),
+            format!("Could not save TUI preferences: {error}"),
         ),
     }
 }
@@ -491,12 +520,14 @@ pub(crate) async fn load_settings_data(app: &mut TuiApp, client: &ApiClient) {
                 }
             };
             app.show_dhcp_client = preferences.show_dhcp_client;
+            app.randomize_mac_default = preferences.randomize_mac_default;
             let rollback_timeout_input = desired.rollback_timeout_seconds.to_string();
             let cursor = super::input::grapheme_count(&rollback_timeout_input);
             app.settings_ui.settings = Some(SecurityEditor {
                 remember_session: preferences.remember,
                 remember_minutes_input: preferences.minutes.to_string(),
                 show_dhcp_client: preferences.show_dhcp_client,
+                randomize_mac_default: preferences.randomize_mac_default,
                 confirmation: None,
                 field: SettingsField::RollbackTimeout,
                 active,
@@ -572,12 +603,14 @@ pub(crate) async fn submit_security_settings(app: &mut TuiApp, client: &ApiClien
                 }
             };
             app.show_dhcp_client = preferences.show_dhcp_client;
+            app.randomize_mac_default = preferences.randomize_mac_default;
             let rollback_timeout_input = desired.rollback_timeout_seconds.to_string();
             let cursor = super::input::grapheme_count(&rollback_timeout_input);
             app.settings_ui.settings = Some(SecurityEditor {
                 remember_session: preferences.remember,
                 remember_minutes_input: preferences.minutes.to_string(),
                 show_dhcp_client: preferences.show_dhcp_client,
+                randomize_mac_default: preferences.randomize_mac_default,
                 confirmation: None,
                 field: SettingsField::RollbackTimeout,
                 active,
@@ -622,12 +655,14 @@ async fn reset_security_settings(app: &mut TuiApp, client: &ApiClient) {
                 }
             };
             app.show_dhcp_client = preferences.show_dhcp_client;
+            app.randomize_mac_default = preferences.randomize_mac_default;
             let rollback_timeout_input = desired.rollback_timeout_seconds.to_string();
             let cursor = super::input::grapheme_count(&rollback_timeout_input);
             app.settings_ui.settings = Some(SecurityEditor {
                 remember_session: preferences.remember,
                 remember_minutes_input: preferences.minutes.to_string(),
                 show_dhcp_client: preferences.show_dhcp_client,
+                randomize_mac_default: preferences.randomize_mac_default,
                 confirmation: None,
                 field: SettingsField::RollbackTimeout,
                 active,

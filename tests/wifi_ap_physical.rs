@@ -142,6 +142,7 @@ impl PhysicalWifiFixture {
             self.namespace_interface.clone(),
             InterfaceConfig {
                 wifi_concurrent: false,
+                randomize_mac: false,
                 mac_address: None,
                 role: InterfaceRole::Output,
                 managed: true,

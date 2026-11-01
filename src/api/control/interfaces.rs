@@ -557,6 +557,7 @@ pub(super) fn interface_edit_request_to_config(
     Ok((
         InterfaceConfig {
             wifi_concurrent: edit.wifi_concurrent,
+            randomize_mac: edit.randomize_mac,
             mac_address: edit.mac_address,
             role: edit.role,
             managed: edit.managed,

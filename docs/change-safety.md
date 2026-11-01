@@ -174,7 +174,14 @@ apply, timeout, explicit rollback, cancelled work, shutdown or startup:
 Ownership checks apply throughout: recovery must preserve foreign resources.
 Successful interface rollback means restoring configuration and completing
 dependent credential, service and ownership cleanup. It does not require Wi-Fi
-association or a DHCP lease. With an absent adapter, stop surviving owned tasks
+association or a DHCP lease. During interface-transaction convergence, stop owned consumers,
+restore MAC/link/address state, then restart Wi-Fi followed by DHCP with current
+association readiness. This also applies when the MAC already matches the
+snapshot. Never replay the snapshot MAC after a station starts: automatic mode
+may have selected a fresh connection identity. Bind non-station automatic
+sessions to their restored identity before allowing further previews; see the
+[MAC runtime contract](architecture.md#mac-identity-sessions).
+With an absent adapter, stop surviving owned tasks
 and settle leases; there is no vanished link state to replay. Once cleanup
 succeeds, the journal can retire and a returning adapter follows committed intent.
 
@@ -260,6 +267,8 @@ use traffic_masq_protocol::{ControlRequest as Request, InterfaceEditRequest, Int
 let request = Request::ApplyInterfaceEdit {
     interface: "lan0".into(),
     edit: InterfaceEditRequest {
+        wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         cidr: "192.0.2.1/24".into(),
         role: InterfaceRole::Output,

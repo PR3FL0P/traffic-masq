@@ -429,7 +429,27 @@ use the same shape as [`examples/config.toml`](../examples/config.toml).
 
 An empty `cidr` requests no owned static address.
 
-Interface configuration objects and `InterfaceEdit` accept optional `mac_address` as a colon-separated MAC string, for example `"02:1a:7c:90:33:bf"`. The interface must be managed and support Ethernet addressing; zero and multicast addresses are rejected. Interface plans return `mac_address` only when a MAC change is needed. The TUI generates the random address before requesting a plan, so planning and applying use the same address. Changes use the existing confirmation and rollback flow, and committed addresses persist across daemon restarts.
+Interface configuration objects and `InterfaceEdit` accept `randomize_mac`
+(default `false`) and optional `mac_address` as a colon-separated string, such as
+`"02:1a:7c:90:33:bf"`. `randomize_mac: true` requests automatic per-connection/session
+identities and requires `mac_address` to be omitted or `null`. With automatic
+mode disabled, an explicit address is fixed; omitting it keeps the current MAC.
+Both policies require a managed interface that supports Ethernet addressing.
+Zero and multicast static addresses, `middle` interfaces, automatic rotation on
+a shared-radio parent, and explicit MAC policy on its virtual AP are rejected.
+
+Interface plans return `mac_address` only when a concrete MAC change is needed.
+For automatic non-station identities, the daemon reserves the preview address
+and reuses it during apply if the interface and session remain unchanged.
+Automatic Wi-Fi stations delegate address selection to supplicant at connection
+time, so the plan does not predict their generated address. The TUI's Advanced
+**Generate random MAC** action instead fills a fixed address before planning.
+
+Changes use the existing apply/confirm/rollback flow. Committing automatic mode
+persists the policy; generated sessions begin anew after daemon restart.
+Committing a fixed address persists that address. Rollback restores snapshot
+identity before starting consumers; a reconnecting automatic Wi-Fi station may
+then select a fresh identity. See [MAC configuration and rotation rules](configuration.md#interface-mac-address).
 
 `DhcpInterfaceConfig` and `DhcpEdit` share this shape:
 

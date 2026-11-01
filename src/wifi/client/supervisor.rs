@@ -1311,11 +1311,11 @@ impl WifiClientSupervisor {
             .ok_or_else(|| ClientSupervisorError::NotConfigured {
                 interface: interface.into(),
             })?;
-        self.owned_ctrl_session(&task)
-            .await?
-            .client
-            .reconnect()
-            .await?;
+        let session = self.owned_ctrl_session(&task).await?;
+        if task.spec.randomize_mac {
+            session.client.disconnect().await?;
+        }
+        session.client.reconnect().await?;
         Ok(())
     }
 

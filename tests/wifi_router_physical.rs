@@ -199,6 +199,7 @@ impl PhysicalWifiFixture {
             self.uplink_interface.clone(),
             InterfaceConfig {
                 wifi_concurrent: false,
+                randomize_mac: false,
                 mac_address: None,
                 role: InterfaceRole::Input,
                 managed: true,
@@ -218,6 +219,7 @@ impl PhysicalWifiFixture {
             self.output_interface.clone(),
             InterfaceConfig {
                 wifi_concurrent: false,
+                randomize_mac: false,
                 mac_address: None,
                 role: InterfaceRole::Output,
                 managed: true,

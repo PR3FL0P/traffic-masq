@@ -4,6 +4,7 @@ use super::*;
 fn unmanaging_an_interface_with_no_router_services_needs_no_confirmation() {
     let current = InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,

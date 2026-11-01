@@ -496,6 +496,7 @@ fn validate_fields(
 ) -> Result<(), WifiClientProfileError> {
     let config = InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Input,
         managed: true,

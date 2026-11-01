@@ -25,6 +25,7 @@ fn output_interface(address: &str, pool_start: u8, pool_end: u8) -> InterfaceCon
     let octet = ipv4.addr().octets()[2];
     InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -48,6 +49,7 @@ fn base_config() -> AppConfig {
         "wan0".to_string(),
         InterfaceConfig {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: false,

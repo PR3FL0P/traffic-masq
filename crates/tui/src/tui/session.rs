@@ -21,6 +21,7 @@ pub(crate) struct SessionPreferences {
     pub(crate) remember: bool,
     pub(crate) minutes: u64,
     pub(crate) show_dhcp_client: bool,
+    pub(crate) randomize_mac_default: bool,
 }
 
 impl Default for SessionPreferences {
@@ -29,6 +30,7 @@ impl Default for SessionPreferences {
             remember: true,
             minutes: 5,
             show_dhcp_client: false,
+            randomize_mac_default: true,
         }
     }
 }

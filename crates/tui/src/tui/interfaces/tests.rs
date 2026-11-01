@@ -130,6 +130,7 @@ fn editor_keeps_explicit_saved_configuration_and_does_not_choose_between_owned_a
     let mut status = observed_address(Some(201), Some(true));
     let config = traffic_masq_protocol::InterfaceConfigView {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         managed: false,
         role: InterfaceRole::None,
@@ -248,6 +249,13 @@ async fn keyboard_ip_and_mac_edit_previews_applies_and_confirms_the_typed_addres
     }
     assert_eq!(
         app.interface_ui.editor.as_ref().unwrap().field,
+        InterfaceEditorField::GenerateMac
+    );
+    handle_editor_key(&mut app, KeyCode::Enter, &client).await;
+    assert!(!app.interface_ui.editor.as_ref().unwrap().randomize_mac);
+    handle_editor_key(&mut app, KeyCode::Tab, &client).await;
+    assert_eq!(
+        app.interface_ui.editor.as_ref().unwrap().field,
         InterfaceEditorField::Advanced
     );
     handle_editor_key(&mut app, KeyCode::Enter, &client).await;
@@ -285,6 +293,7 @@ fn default_route_editor(allow_management_change: bool) -> InterfaceEditor {
     InterfaceEditor {
         wifi_concurrent_support: None,
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: String::new(),
         saved_config: None,
         offline_revision: None,
@@ -293,6 +302,7 @@ fn default_route_editor(allow_management_change: bool) -> InterfaceEditor {
         exit_requested: false,
         original_role: InterfaceRole::Output,
         original_mac: String::new(),
+        original_randomize_mac: false,
         interface: "wlan0".into(),
         field: InterfaceEditorField::Save,
         cidr: "192.168.1.10/24".into(),
@@ -551,6 +561,46 @@ async fn random_mac_is_local_unicast_and_kept_in_the_apply_request() {
 }
 
 #[tokio::test]
+async fn editing_mac_text_preserves_automatic_mac_policy() {
+    let mut editor = default_route_editor(true);
+    editor.field = InterfaceEditorField::MacAddress;
+    editor.randomize_mac = true;
+    editor.mac_address = "02:11:22:33:44:55".into();
+    let mut app = TuiApp {
+        interface_ui: crate::tui::state::InterfaceUiState {
+            editor: Some(editor),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let client = ApiClient::new("/unused-mac-test.sock");
+    for key in [
+        KeyCode::Right,
+        KeyCode::Left,
+        KeyCode::Home,
+        KeyCode::Backspace,
+        KeyCode::End,
+        KeyCode::Delete,
+        KeyCode::Char('z'),
+    ] {
+        handle_editor_key(&mut app, key, &client).await;
+        let editor = app.interface_ui.editor.as_ref().unwrap();
+        assert!(editor.randomize_mac, "policy changed after {key:?}");
+        assert_eq!(editor.mac_address, "02:11:22:33:44:55");
+    }
+    for key in [KeyCode::Char('a'), KeyCode::Backspace, KeyCode::Delete] {
+        let editor = app.interface_ui.editor.as_mut().unwrap();
+        editor.randomize_mac = true;
+        editor.cursor = 1;
+        let previous_mac = editor.mac_address.clone();
+        handle_editor_key(&mut app, key, &client).await;
+        let editor = app.interface_ui.editor.as_ref().unwrap();
+        assert!(editor.randomize_mac, "policy changed after {key:?}");
+        assert_ne!(editor.mac_address, previous_mac);
+    }
+}
+
+#[tokio::test]
 async fn manual_mac_can_be_typed_edited_and_cleared() {
     let mut editor = default_route_editor(true);
     editor.field = InterfaceEditorField::MacAddress;
@@ -683,6 +733,7 @@ async fn mac_controls_require_management_and_switching_it_off_clears_the_mac() {
         app.interface_ui.editor.as_ref().unwrap().mac_address.len(),
         16
     );
+    handle_editor_key(&mut app, KeyCode::Up, &client).await;
     handle_editor_key(&mut app, KeyCode::Up, &client).await;
     handle_editor_key(&mut app, KeyCode::Up, &client).await;
     assert_eq!(
@@ -1384,4 +1435,118 @@ async fn opening_editor_uses_daemon_capability_and_restores_saved_combined_role(
         role_label(editor.role, editor.wifi_concurrent),
         "Input + Output"
     );
+}
+
+#[tokio::test]
+async fn automatic_mac_checkbox_defaults_on_for_new_interfaces_and_supports_static_generation() {
+    let mock = super::super::test_api::mock(vec![Response::InterfaceConfig {
+        wifi_concurrent_support: None,
+        interface: "wlp1s0".into(),
+        config: None,
+        allow_management_change: false,
+    }])
+    .await;
+    let mut app = TuiApp::default();
+    app.dashboard
+        .interfaces
+        .push(observed_address(None, Some(false)));
+    open_editor(&mut app, &mock.client).await;
+    let editor = app.interface_ui.editor.as_mut().unwrap();
+    assert!(editor.randomize_mac);
+    editor.role = InterfaceRole::Input;
+    editor.allow_management_change = true;
+    assert!(editor.edit_request().unwrap().randomize_mac);
+    assert_eq!(editor.edit_request().unwrap().mac_address, None);
+    editor.field = InterfaceEditorField::GenerateMac;
+    handle_editor_key(&mut app, KeyCode::Char(' '), &mock.client).await;
+    assert!(!app.interface_ui.editor.as_ref().unwrap().randomize_mac);
+    app.interface_ui.editor.as_mut().unwrap().field = InterfaceEditorField::RandomizeMac;
+    handle_editor_key(&mut app, KeyCode::Enter, &mock.client).await;
+    let editor = app.interface_ui.editor.as_mut().unwrap();
+    let fixed = editor.edit_request().unwrap();
+    assert!(!fixed.randomize_mac);
+    assert_eq!(fixed.mac_address.unwrap().octets()[0] & 3, 2);
+    editor.field = InterfaceEditorField::GenerateMac;
+    handle_editor_key(&mut app, KeyCode::Enter, &mock.client).await;
+    let automatic = app
+        .interface_ui
+        .editor
+        .as_ref()
+        .unwrap()
+        .edit_request()
+        .unwrap();
+    assert!(automatic.randomize_mac);
+    assert_eq!(automatic.mac_address, None);
+}
+
+#[tokio::test]
+async fn changing_only_new_interface_mac_policy_warns_before_discarding() {
+    let mock = super::super::test_api::mock(vec![Response::InterfaceConfig {
+        wifi_concurrent_support: None,
+        interface: "wlp1s0".into(),
+        config: None,
+        allow_management_change: false,
+    }])
+    .await;
+    let mut app = TuiApp::default();
+    app.dashboard
+        .interfaces
+        .push(observed_address(None, Some(false)));
+    open_editor(&mut app, &mock.client).await;
+    let editor = app.interface_ui.editor.as_mut().unwrap();
+    assert!(!editor.dirty());
+    assert!(editor.original_randomize_mac);
+    editor.field = InterfaceEditorField::GenerateMac;
+    handle_editor_key(&mut app, KeyCode::Char(' '), &mock.client).await;
+    handle_editor_key(&mut app, KeyCode::Esc, &mock.client).await;
+    let editor = app.interface_ui.editor.as_ref().unwrap();
+    assert!(editor.exit_requested);
+    assert!(!editor.randomize_mac);
+}
+
+#[tokio::test]
+async fn reopening_a_new_interface_draft_preserves_edited_mac_policy() {
+    use traffic_masq_protocol::InterfacePresence;
+    for changed in [false, true] {
+        let mock = super::super::test_api::mock(vec![draft_inventory_response(
+            InterfacePresence::Missing,
+            8,
+            None,
+        )])
+        .await;
+        let mut app = TuiApp::default();
+        app.dashboard
+            .interfaces
+            .push(observed_address(None, Some(false)));
+        let mut draft = default_route_editor(true);
+        draft.interface = "wlp1s0".into();
+        draft.original_randomize_mac = true;
+        draft.randomize_mac = !changed;
+        // The fixture inventory identifies wlan0.
+        app.dashboard.interfaces[0].interface.name = "wlan0".into();
+        draft.interface = "wlan0".into();
+        app.interface_ui
+            .interface_drafts
+            .insert("wlan0".into(), draft);
+        open_editor(&mut app, &mock.client).await;
+        let editor = app.interface_ui.editor.as_ref().unwrap();
+        assert_eq!(editor.randomize_mac, !changed);
+        assert!(editor.original_randomize_mac);
+    }
+}
+
+#[test]
+fn new_interface_mac_policy_uses_preferences_but_saved_policy_takes_precedence() {
+    let mut app = TuiApp::default();
+    for default in [false, true] {
+        app.randomize_mac_default = default;
+        assert_eq!(initial_randomize_mac(&app, "eth0", None), default);
+        for saved in [false, true] {
+            let config = serde_json::from_value(serde_json::json!({
+                "role": "input", "managed": true, "randomize_mac": saved
+            }))
+            .unwrap();
+            assert_eq!(initial_randomize_mac(&app, "eth0", Some(&config)), saved);
+        }
+    }
 }

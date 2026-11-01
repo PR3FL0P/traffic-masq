@@ -1,3 +1,5 @@
+pub(super) mod mac;
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -94,6 +96,7 @@ pub struct InterfaceManager {
     provider: Arc<dyn NetworkProvider>,
     journal: AddressOwnershipJournal,
     mutation_locks: InterfaceMutationLocks,
+    mac_sessions: Arc<tokio::sync::Mutex<mac::MacSessions>>,
 }
 
 impl InterfaceManager {
@@ -131,10 +134,12 @@ impl InterfaceManager {
         journal: AddressOwnershipJournal,
         mutation_locks: InterfaceMutationLocks,
     ) -> Self {
+        let mac_sessions = mutation_locks.mac_sessions.clone();
         Self {
             provider,
             journal,
             mutation_locks,
+            mac_sessions,
         }
     }
 
@@ -468,7 +473,7 @@ impl InterfaceManager {
             });
         }
 
-        let mac_address = match config.mac_address {
+        let mac_address = match self.planned_mac(name, config).await? {
             Some(desired) => {
                 let current = self
                     .provider
@@ -684,6 +689,7 @@ impl InterfaceManager {
             return Ok(());
         }
         self.provider.set_link_down(name).await?;
+        self.acknowledge_mac_disconnect(name).await;
         let result: Result<()> = async {
             self.provider
                 .set_mac_address(name, desired.octets())
@@ -701,6 +707,7 @@ impl InterfaceManager {
         if let Err(error) = result {
             let restore: Result<()> = async {
                 self.provider.set_link_down(name).await?;
+                self.acknowledge_mac_disconnect(name).await;
                 self.provider.set_mac_address(name, previous).await?;
                 if interface.is_up {
                     self.provider.set_link_up(name).await?;
@@ -892,6 +899,7 @@ impl InterfaceManager {
         let _mutation = self.mutation_locks.lock(&snapshot.name).await;
         if let Some(mac) = snapshot.mac_address {
             self.change_mac(&snapshot.name, mac).await?;
+            self.mac_sessions.lock().await.restore(&snapshot.name, mac);
         }
         let current = self.provider.list_ipv4_addresses(&snapshot.name).await?;
         let can_tag = self.provider.supports_ipv4_address_protocol();

@@ -281,6 +281,7 @@ struct TuiApp {
     vpn_policy: VpnPolicyData,
     wifi: wifi::WifiData,
     pub(crate) show_dhcp_client: bool,
+    pub(crate) randomize_mac_default: bool,
     ui: UiLayout,
     message: Option<String>,
     help_open: bool,
@@ -311,6 +312,7 @@ impl Default for TuiApp {
             vpn_policy: VpnPolicyData::default(),
             wifi: wifi::WifiData::default(),
             show_dhcp_client: false,
+            randomize_mac_default: true,
             ui: UiLayout::default(),
             message: None,
             help_open: false,
@@ -527,6 +529,7 @@ async fn run_loop(
         if let Ok(store) = session::SessionStore::for_client(client) {
             if let Ok(preferences) = store.preferences() {
                 app.show_dhcp_client = preferences.show_dhcp_client;
+                app.randomize_mac_default = preferences.randomize_mac_default;
             }
         }
     }

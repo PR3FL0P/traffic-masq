@@ -9,6 +9,7 @@ use super::*;
 fn interface(address: &str) -> InterfaceConfig {
     InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,

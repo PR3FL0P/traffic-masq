@@ -142,6 +142,7 @@ impl WifiClientNamespaceFixture {
             STA_IF.to_string(),
             InterfaceConfig {
                 wifi_concurrent: false,
+                randomize_mac: false,
                 mac_address: None,
                 role: InterfaceRole::Input,
                 managed: false,

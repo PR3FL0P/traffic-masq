@@ -55,6 +55,7 @@ fn principal(role: Role) -> Principal {
 fn interface_config() -> InterfaceConfig {
     InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -69,6 +70,7 @@ fn interface_config() -> InterfaceConfig {
 fn interface_edit() -> InterfaceEditRequest {
     InterfaceEditRequest {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         cidr: "192.0.2.1/24".to_owned(),
         role: InterfaceRole::Output,

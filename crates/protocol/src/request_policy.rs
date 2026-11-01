@@ -277,6 +277,7 @@ mod tests {
             interface: "wan0".into(),
             edit: crate::InterfaceEditRequest {
                 wifi_concurrent: false,
+                randomize_mac: false,
                 mac_address: None,
                 cidr: String::new(),
                 role: crate::InterfaceRole::Input,
@@ -366,6 +367,7 @@ mod pending_change_tests {
                 interface: "lan0".into(),
                 edit: crate::InterfaceEditRequest {
                     wifi_concurrent: false,
+                    randomize_mac: false,
                     mac_address: None,
                     cidr: "192.0.2.1/24".into(),
                     role: crate::InterfaceRole::Output,

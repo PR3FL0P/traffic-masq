@@ -5,6 +5,7 @@ fn interface_edit_request_preserves_existing_wifi_settings_while_managed() {
     let existing_wifi = wifi_ap_config_fixture("home-net");
     let existing = InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -16,6 +17,7 @@ fn interface_edit_request_preserves_existing_wifi_settings_while_managed() {
     };
     let edit = InterfaceEditRequest {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         cidr: "192.168.60.1/24".to_string(),
         role: InterfaceRole::Output,
@@ -37,6 +39,7 @@ fn interface_edit_request_preserves_existing_wifi_settings_while_managed() {
 fn interface_edit_request_drops_wifi_settings_when_unmanaged() {
     let existing = InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -48,6 +51,7 @@ fn interface_edit_request_drops_wifi_settings_when_unmanaged() {
     };
     let edit = InterfaceEditRequest {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         cidr: String::new(),
         role: InterfaceRole::Output,
@@ -198,6 +202,7 @@ async fn get_wifi_config_reports_none_for_an_interface_without_a_wifi_block() {
         "wan0".to_string(),
         InterfaceConfig {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: false,
@@ -742,6 +747,7 @@ async fn wifi_passphrase_is_tentative_and_restored_or_committed() {
         "wlan0".to_string(),
         InterfaceConfig {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             role: InterfaceRole::Output,
             managed: true,
@@ -850,6 +856,7 @@ async fn wifi_configured_response_never_serializes_the_passphrase_that_was_just_
         "wlan0".to_string(),
         InterfaceConfig {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             role: InterfaceRole::Output,
             managed: true,

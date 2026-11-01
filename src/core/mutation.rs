@@ -11,6 +11,9 @@ use tokio::sync::{
 #[derive(Debug, Clone, Default)]
 pub struct InterfaceMutationLocks {
     locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    // Identity sessions follow the application's shared mutation scope, even
+    // when API and convergence use separate netlink connections.
+    pub(crate) mac_sessions: Arc<Mutex<super::interface::mac::MacSessions>>,
 }
 
 impl InterfaceMutationLocks {

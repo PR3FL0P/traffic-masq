@@ -10,6 +10,7 @@ fn interface_request_view_preserves_nested_config_json() {
 
     let config = InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -95,6 +96,7 @@ fn router_proposal_view_preserves_nested_config_json() {
             InterfaceOverrideRequest {
                 config: InterfaceConfig {
                     wifi_concurrent: false,
+                    randomize_mac: false,
                     mac_address: None,
                     role: InterfaceRole::Output,
                     managed: true,
@@ -359,6 +361,7 @@ fn router_plan_view_preserves_complete_wire_shape() {
                 name: "lan0".into(),
                 config: InterfaceConfig {
                     wifi_concurrent: false,
+                    randomize_mac: false,
                     mac_address: None,
                     role: crate::config::InterfaceRole::Output,
                     managed: true,
@@ -431,6 +434,7 @@ fn validated_ap_config_derives_the_same_client_spec() {
 
     let config = InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -523,6 +527,8 @@ fn interface_status_view_preserves_observed_json() {
 #[test]
 fn wifi_client_spec_view_preserves_json() {
     let spec = crate::wifi::WifiClientSpec {
+        randomize_mac: false,
+        mac_address: None,
         interface: "wlan0".into(),
         ssid: "upstream".into(),
         country_code: Some("UA".into()),
@@ -601,6 +607,8 @@ fn wifi_status_views_preserve_json() {
     let client = WifiClientStatus {
         interface: "wlan1".into(),
         spec: crate::wifi::WifiClientSpec {
+            randomize_mac: false,
+            mac_address: None,
             interface: "wlan1".into(),
             ssid: "upstream".into(),
             country_code: None,

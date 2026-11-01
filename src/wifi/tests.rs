@@ -18,6 +18,7 @@ fn ap_config() -> WifiApConfig {
 fn interface(wifi: Option<WifiApConfig>) -> InterfaceConfig {
     InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,

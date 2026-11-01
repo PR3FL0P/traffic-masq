@@ -184,6 +184,7 @@ fn ap_config(ssid: &str) -> WifiApConfig {
 fn spec(interface: &str, ssid: &str) -> WifiApSpec {
     let config = InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -273,6 +274,7 @@ async fn effective_specs_derives_one_spec_per_access_point_interface() {
         "wlan0".to_string(),
         InterfaceConfig {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             role: InterfaceRole::Output,
             managed: true,
@@ -287,6 +289,7 @@ async fn effective_specs_derives_one_spec_per_access_point_interface() {
         "wan0".to_string(),
         InterfaceConfig {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: false,

@@ -24,6 +24,10 @@ use crate::config::{InterfaceConfig, InterfaceRole, WifiClientConfig, WifiClient
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WifiClientSpec {
+    #[serde(default)]
+    pub randomize_mac: bool,
+    #[serde(default)]
+    pub mac_address: Option<traffic_masq_protocol::MacAddr>,
     pub interface: String,
     pub ssid: String,
     pub country_code: Option<String>,
@@ -45,13 +49,17 @@ impl WifiClientSpec {
             return Ok(None);
         };
 
-        let spec = Self::from_parts(interface, wifi_client);
+        let mut spec = Self::from_parts(interface, wifi_client);
+        spec.randomize_mac = config.randomize_mac && !config.wifi_concurrent;
+        spec.mac_address = config.mac_address;
         spec.validate()?;
         Ok(Some(spec))
     }
 
     fn from_parts(interface: &str, wifi_client: &WifiClientConfig) -> Self {
         Self {
+            randomize_mac: false,
+            mac_address: None,
             interface: interface.to_string(),
             ssid: wifi_client.ssid.clone(),
             country_code: wifi_client.country_code.clone(),
@@ -65,7 +73,8 @@ impl WifiClientSpec {
 
         let config = InterfaceConfig {
             wifi_concurrent: false,
-            mac_address: None,
+            randomize_mac: self.randomize_mac,
+            mac_address: self.mac_address,
             role: InterfaceRole::Input,
             managed: true,
             ipv4: None,

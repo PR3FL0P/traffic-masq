@@ -65,6 +65,7 @@ fn output_interface(address: &str, pool_start: u8, pool_end: u8) -> InterfaceCon
     let octet = ipv4.addr().octets()[2];
     InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -88,6 +89,7 @@ fn enabled_config() -> AppConfig {
         "wan0".to_string(),
         InterfaceConfig {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: false,
@@ -125,6 +127,7 @@ fn enabled_config() -> AppConfig {
 fn dhcp_less_output_interface(address: &str) -> InterfaceConfig {
     InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -267,6 +270,8 @@ async fn wifi_rollback_releases_the_conflicting_radio_role() {
         passphrase_file: None,
     };
     let station = WifiClientSpec {
+        randomize_mac: false,
+        mac_address: None,
         interface: "wan0".into(),
         ssid: "upstream".into(),
         country_code: None,
@@ -1339,6 +1344,8 @@ async fn router_mac_change_pauses_station_and_restarts_it_with_the_new_identity(
     let runtime = Arc::new(StationRuntime {
         provider: provider.clone(),
         spec: WifiClientSpec {
+            randomize_mac: false,
+            mac_address: None,
             interface: "wan0".into(),
             ssid: "upstream".into(),
             country_code: None,

@@ -6,6 +6,7 @@ use crate::config::{InterfaceConfig, InterfaceRole, WifiApConfig};
 fn spec(security: WifiSecurity) -> WifiApSpec {
     let config = InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,

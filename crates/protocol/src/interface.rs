@@ -20,6 +20,9 @@ pub struct InterfaceConfigView {
     /// Receive Wi-Fi and expose a virtual AP on the same physical radio.
     #[serde(default)]
     pub wifi_concurrent: bool,
+    /// Generate a fresh locally administered identity for each connection/session.
+    #[serde(default)]
+    pub randomize_mac: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac_address: Option<crate::MacAddr>,
     pub role: InterfaceRole,
@@ -108,6 +111,10 @@ pub struct WifiClientConfigView {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WifiClientSpecView {
+    #[serde(default)]
+    pub randomize_mac: bool,
+    #[serde(default)]
+    pub mac_address: Option<crate::MacAddr>,
     pub interface: String,
     pub ssid: String,
     pub country_code: Option<String>,

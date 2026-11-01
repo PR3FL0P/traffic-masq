@@ -17,6 +17,7 @@ fn edit_lan(cidr: &str) -> Request {
         interface: "eth0".into(),
         edit: InterfaceEditRequest {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             cidr: cidr.into(),
             role: InterfaceRole::Output,

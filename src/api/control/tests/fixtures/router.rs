@@ -217,6 +217,7 @@ pub(in crate::api::control::tests) fn router_base_config() -> AppConfig {
         "wan0".to_string(),
         InterfaceConfig {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: false,
@@ -232,6 +233,7 @@ pub(in crate::api::control::tests) fn router_base_config() -> AppConfig {
         "lan0".to_string(),
         InterfaceConfig {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             role: InterfaceRole::Output,
             managed: true,

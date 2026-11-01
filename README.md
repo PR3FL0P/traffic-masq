@@ -169,6 +169,19 @@ allows forwarding and NAT; it does not obtain an upstream address or create a
 route. Configure those separately if the Linux machine cannot reach the
 Internet yet.
 
+In **Interfaces**, **Generate MAC automatically** is enabled for newly configured
+interfaces. Wi-Fi inputs use a fresh random MAC for each connection; Ethernet
+inputs rotate after the link disconnects and reconnects. Output interfaces keep
+a generated MAC for the network session; it changes when the interface is
+recreated, the LAN address/SSID changes, or the daemon restarts. Reconciliation
+and DHCP lease renewals do not rotate an active address. To use a static MAC,
+uncheck the option and enter it in **Advanced**, or use **Generate random MAC**
+to fill a static address once. Existing configurations retain their MAC policy.
+Shared-radio **Input + Output** uses a static parent MAC; its virtual AP already
+gets a generated address when created.
+See [MAC policy and rotation rules](docs/configuration.md#interface-mac-address)
+and the [runtime contract](docs/architecture.md#mac-identity-sessions).
+
 **Settings → Default DNS for new DHCP servers** controls the DNS addresses suggested
 for a new DHCP server and used by automatic Wi-Fi AP setup. The default is
 `1.1.1.1`. Enter comma-separated IPv4 addresses, or leave the field empty to omit

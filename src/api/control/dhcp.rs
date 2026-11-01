@@ -101,6 +101,7 @@ pub(super) async fn build_dhcp_spec(
     let network = select_dhcp_network(interface, &addresses, &dhcp)?;
     let interface_config = InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -127,6 +128,7 @@ pub(super) fn select_dhcp_network(
         };
         let candidate = InterfaceConfig {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             role: InterfaceRole::Output,
             managed: true,

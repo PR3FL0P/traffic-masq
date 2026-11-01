@@ -4,6 +4,7 @@ use super::*;
 fn interface_edit_preserves_client_and_nat_settings() {
     let existing = InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Input,
         managed: true,
@@ -21,6 +22,7 @@ fn interface_edit_preserves_client_and_nat_settings() {
     let (config, _) = interface_edit_request_to_config(
         InterfaceEditRequest {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             cidr: String::new(),
             role: InterfaceRole::Input,
@@ -277,6 +279,7 @@ async fn autoconnect_is_blocked_by_pending_transaction_on_another_interface() {
 
     let target = InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Input,
         managed: true,
@@ -598,6 +601,7 @@ async fn configuring_a_client_on_an_output_interface_is_an_invalid_spec() {
         "wlan2".to_string(),
         InterfaceConfig {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             role: InterfaceRole::Output,
             managed: true,

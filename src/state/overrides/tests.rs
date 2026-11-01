@@ -11,6 +11,7 @@ fn base_config() -> AppConfig {
 fn interface_config(address: &str) -> InterfaceConfig {
     InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -63,6 +64,7 @@ fn effective_config_revalidates_router_against_interface_overrides() {
         "wan0".to_string(),
         InterfaceConfig {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: false,
@@ -88,6 +90,7 @@ fn effective_config_revalidates_router_against_interface_overrides() {
         InterfaceOverride {
             config: InterfaceConfig {
                 wifi_concurrent: false,
+                randomize_mac: false,
                 mac_address: None,
                 role: InterfaceRole::None,
                 managed: false,

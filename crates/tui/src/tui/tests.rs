@@ -637,6 +637,7 @@ async fn settings_tab_switching_and_editing_arrow_isolation() {
                 remember_session: false,
                 remember_minutes_input: "5".into(),
                 show_dhcp_client: false,
+                randomize_mac_default: true,
                 confirmation: None,
                 cursor: 2,
                 editing: false,

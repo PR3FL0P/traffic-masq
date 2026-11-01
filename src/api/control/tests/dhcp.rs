@@ -40,6 +40,7 @@ fn interface_edit_request_preserves_existing_dhcp_settings() {
     let existing_dhcp = dhcp_config();
     let existing = InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -51,6 +52,7 @@ fn interface_edit_request_preserves_existing_dhcp_settings() {
     };
     let edit = InterfaceEditRequest {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         cidr: "192.168.60.1/24".to_string(),
         role: InterfaceRole::Output,
@@ -73,6 +75,7 @@ fn interface_edit_request_preserves_existing_dhcp_settings() {
 fn removing_the_address_under_a_dhcp_server_says_what_to_disable_first() {
     let existing = InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -84,6 +87,7 @@ fn removing_the_address_under_a_dhcp_server_says_what_to_disable_first() {
     };
     let edit = InterfaceEditRequest {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         cidr: String::new(),
         role: InterfaceRole::Output,
@@ -213,6 +217,7 @@ async fn dhcp_uplink_plan_preserves_explicit_interface_override_while_enabling_d
         .map(|request| request.config.clone())
         .unwrap_or_else(|| InterfaceConfig {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: true,

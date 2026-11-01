@@ -872,6 +872,9 @@ pub struct InterfaceEditRequest {
     /// Receive Wi-Fi and expose a virtual AP on the same physical radio.
     #[serde(default)]
     pub wifi_concurrent: bool,
+    /// Generate a fresh locally administered identity for each connection/session.
+    #[serde(default)]
+    pub randomize_mac: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac_address: Option<crate::MacAddr>,
     #[serde(default)]

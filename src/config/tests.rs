@@ -105,6 +105,7 @@ fn vpn_directory_validation_does_not_require_daemon_permissions() {
 fn input_interface() -> InterfaceConfig {
     InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Input,
         managed: false,
@@ -119,6 +120,7 @@ fn input_interface() -> InterfaceConfig {
 fn output_interface(ipv4: &str, pool_start: Ipv4Addr, pool_end: Ipv4Addr) -> InterfaceConfig {
     InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -427,6 +429,7 @@ fn rejects_route_ownership_violations() {
         "unmanaged0".to_string(),
         InterfaceConfig {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             role: InterfaceRole::None,
             managed: false,
@@ -952,6 +955,7 @@ fn client_association(ssid: &str) -> WifiClientConfig {
 fn client_interface(wifi_client: WifiClientConfig) -> InterfaceConfig {
     InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Input,
         managed: true,
@@ -1426,4 +1430,18 @@ fn dhcp_dns_defaults_are_backward_compatible_and_allow_no_dns() {
     let loaded: AppConfig = value.try_into().unwrap();
     assert!(loaded.dhcp.default_dns_servers.is_empty());
     loaded.validate().unwrap();
+}
+
+#[test]
+fn automatic_mac_policy_is_opt_in_for_existing_configs_and_rejects_conflicting_static_mac() {
+    let mut interface: InterfaceConfig =
+        serde_json::from_value(serde_json::json!({"role":"input", "managed":true})).unwrap();
+    assert!(!interface.randomize_mac);
+    interface.randomize_mac = true;
+    interface.validate("eth0").unwrap();
+    interface.mac_address = Some("02:11:22:33:44:55".parse().unwrap());
+    assert!(interface.validate("eth0").is_err());
+    interface.mac_address = None;
+    interface.managed = false;
+    assert!(interface.validate("eth0").is_err());
 }

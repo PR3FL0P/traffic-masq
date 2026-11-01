@@ -431,6 +431,7 @@ pub(super) async fn reconcile_network_runtime_once<
         }
         let disabled = InterfaceConfig {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             role: crate::config::InterfaceRole::None,
             managed: false,
@@ -621,6 +622,7 @@ async fn reconcile_interface_runtime_once(
                 disabled.managed = false;
                 disabled.ipv4 = None;
                 disabled.mac_address = None;
+                disabled.randomize_mac = false;
                 disabled.wifi = None;
                 disabled.wifi_client = None;
                 disabled.dhcp = None;
@@ -658,6 +660,7 @@ async fn reconcile_interface_runtime_once(
                     // or applied normally if the device returns later.
                     let disabled = InterfaceConfig {
                         wifi_concurrent: false,
+                        randomize_mac: false,
                         mac_address: None,
                         managed: false,
                         ipv4: None,
@@ -705,40 +708,59 @@ async fn reconcile_interface_runtime_once(
             ensure_current()?;
             // Hardware identity changes precede consumers: DHCP captures the MAC
             // when opening its runtime, and Wi-Fi daemons require a stable identity.
-            let target_mac = restorations
-                .get(name)
-                .map_or(config.mac_address, |snapshot| snapshot.mac_address);
-            if let Some(mac) = target_mac {
-                if network.mac_address(name).await? != Some(mac.octets()) {
-                    if !restoring {
-                        interface_manager
-                            .plan_interface(
-                                name,
-                                config,
-                                Some(config.role),
-                                management_allowlist.contains(name),
-                            )
-                            .await?;
-                    }
-                    let mut stopped = config.clone();
-                    stopped.mac_address = None;
-                    stopped.ipv4 = None;
-                    stopped.dhcp = None;
-                    stopped.dhcp_client = None;
-                    stopped.wifi = None;
-                    stopped.wifi_client = None;
-                    if let Some(client) = dhcp_client {
-                        client.disable(name).await?;
-                    }
-                    apply_dhcp_reconcile_action(dhcp, name, DhcpReconcileAction::Disable).await?;
-                    current_dhcp = None;
-                    if let Some(client) = wifi_client {
-                        client.reconcile_interface(name, &stopped).await?;
-                    }
-                    if let Some(access_point) = wifi {
-                        access_point.reconcile_interface(name, &stopped).await?;
-                    }
-                    ensure_current()?;
+            if !restoring && (!config.randomize_mac || config.wifi_client.is_some()) {
+                interface_manager.reset_mac_session(name).await;
+            }
+            let target_mac = match restorations.get(name) {
+                Some(snapshot) => snapshot.mac_address,
+                None => interface_manager.target_mac(name, config).await?,
+            };
+            let mac_change = match target_mac {
+                Some(mac) => network.mac_address(name).await? != Some(mac.octets()),
+                None => false,
+            };
+            if restoring || mac_change {
+                if !restoring {
+                    interface_manager
+                        .plan_interface(
+                            name,
+                            config,
+                            Some(config.role),
+                            management_allowlist.contains(name),
+                        )
+                        .await?;
+                }
+                let mut stopped = config.clone();
+                stopped.mac_address = None;
+                stopped.randomize_mac = false;
+                stopped.ipv4 = None;
+                stopped.dhcp = None;
+                stopped.dhcp_client = None;
+                stopped.wifi = None;
+                stopped.wifi_client = None;
+                if let Some(client) = dhcp_client {
+                    client.disable(name).await?;
+                }
+                apply_dhcp_reconcile_action(dhcp, name, DhcpReconcileAction::Disable).await?;
+                current_dhcp = None;
+                if let Some(client) = wifi_client {
+                    client.reconcile_interface(name, &stopped).await?;
+                }
+                if let Some(access_point) = wifi {
+                    access_point.reconcile_interface(name, &stopped).await?;
+                }
+                ensure_current()?;
+                if let Some(snapshot) = restorations.get(name) {
+                    // Replay link/address state before restarting consumers.
+                    // Supplicant may choose a new per-connection MAC, and
+                    // DHCP must acquire its lease against that final identity.
+                    interface_manager
+                        .rollback_transaction_snapshot(snapshot)
+                        .await?;
+                    interface_manager
+                        .bind_restored_mac_session(name, observed_interface.index, config)
+                        .await;
+                } else if let Some(mac) = target_mac {
                     interface_manager.apply_mac_address(name, mac).await?;
                 }
             }
@@ -789,11 +811,7 @@ async fn reconcile_interface_runtime_once(
             }
 
             ensure_current()?;
-            if let Some(snapshot) = restorations.get(name) {
-                interface_manager
-                    .rollback_transaction_snapshot(snapshot)
-                    .await?;
-            } else {
+            if !restoring {
                 let current_addresses = network.list_ipv4_addresses(name).await?;
                 let needs_apply = if config.managed {
                     // Foreign addresses are intentionally preserved; their presence

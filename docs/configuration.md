@@ -65,6 +65,8 @@ Names are 1–15 ASCII letters, digits, dots, underscores or hyphens.
 | --- | --- | --- |
 | `role` | required | `none`, `input`, `output`, or `middle` |
 | `managed` | `false` | Allow traffic-masq to configure owned resources |
+| `randomize_mac` | `false` | Generate MAC identities per connection/session; see [MAC policy](#interface-mac-address) |
+| `mac_address` | omitted | Fixed Ethernet/Wi-Fi MAC; mutually exclusive with `randomize_mac = true` |
 | `ipv4` | omitted | Static host CIDR, e.g. `192.168.50.1/24` |
 | `dhcp` | omitted | DHCP server table; managed output with static IPv4 required |
 | `dhcp_client` | omitted | DHCP client table; input role required |
@@ -355,15 +357,73 @@ or the installer, or use `traffic-masqd auth set-password` while stopped.
 
 ### Interface MAC address
 
-Managed Ethernet and Wi-Fi interfaces accept an optional `mac_address`, for example:
+Managed Ethernet and Wi-Fi interfaces support three MAC policies:
+
+| Settings | Behavior |
+| --- | --- |
+| `randomize_mac = true`, no `mac_address` | Generate a locally administered unicast MAC for each connection/network session |
+| `randomize_mac = false`, explicit `mac_address` | Apply and retain that fixed address, including after daemon restarts |
+| `randomize_mac = false`, no `mac_address` | Keep the current MAC; this does not restore the permanent hardware address |
+
+The file and API default for `randomize_mac` is `false`. Existing configurations
+that omit the field retain their previous policy. In the TUI, **Settings → Automatic MAC for new interfaces** controls the initial
+**Generate MAC automatically** checkbox for interfaces without saved settings
+(enabled by default). Use **Save TUI preferences (applies now)** to persist it
+for the selected daemon connection. Existing interface policies take precedence;
+a shared-radio virtual AP always starts with automatic generation disabled. Saving automatic mode persists the policy, rather than the generated address.
+
+For an automatically generated wired uplink identity:
 
 ```toml
 [network.interfaces.eth0]
 role = "input"
 managed = true
+randomize_mac = true
+```
+
+For a fixed identity, including an address generated once in the TUI:
+
+```toml
+[network.interfaces.eth0]
+role = "input"
+managed = true
+randomize_mac = false
 mac_address = "02:1a:7c:90:33:bf"
 ```
 
-In the TUI, open **Interfaces**, edit an interface, enable **Configure with traffic-masq**, and select **Generate random MAC**. Each activation generates a locally administered unicast address. Review and apply the change, then confirm it using the usual network transaction confirmation. The selected address is saved and reused after daemon restarts; generating another address is an explicit action.
+Automatic rotation depends on the interface's use:
 
-Changing a MAC briefly takes the link down and restarts its traffic-masq Wi-Fi and DHCP services. A canceled transaction restores the previous MAC and link state. The driver must support MAC changes. Unmanaged interfaces and WireGuard interfaces cannot have a configured MAC. Omitting the setting leaves the current MAC unchanged; it does not reset the hardware address.
+| Use | When a new MAC is selected |
+| --- | --- |
+| Wi-Fi station (`wifi_client`) | Each new connection, including an explicit reconnect; supplicant owns selection |
+| Wired input | Initial session and a carrier disconnect/reconnect observed through kernel carrier state or its disconnect counter |
+| Output/AP and other managed interfaces without a station | Initial session, interface recreation, role change, static IPv4 change, or AP SSID change |
+
+A daemon restart starts new generated sessions. Repeated convergence, status
+refreshes, previews and DHCP lease renewals preserve an active identity. Wired
+reconnect detection requires usable kernel carrier observations; a short outage
+between observations is detectable when the carrier disconnect counter is
+available. Link cycling performed by traffic-masq to apply a MAC must not cause
+another rotation.
+
+In **Interfaces**, leave **Generate MAC automatically** checked for automatic
+mode. Uncheck it and open **Advanced** to enter a fixed address, or choose
+**Generate random MAC** there to fill a fixed address once. Review, apply and
+confirm using the normal interface transaction flow. A preview reserves an
+address for daemon-managed generation without changing the live interface;
+Wi-Fi station addresses are selected later by supplicant when connecting.
+
+MAC changes require driver support and briefly stop the interface's owned Wi-Fi
+and DHCP consumers. Zero and multicast static addresses are rejected. Unmanaged
+and WireGuard (`middle`) interfaces cannot use either configured MAC policy.
+Automatic mode and a static address are mutually exclusive. Shared-radio
+**Input + Output** rejects automatic rotation on its parent; keep its current MAC
+or configure a fixed one. Its virtual AP has a separately managed generated MAC
+and rejects both manual `mac_address` and `randomize_mac = true`.
+
+Rollback stops owned consumers and restores the saved MAC, link and address state
+before restarting Wi-Fi and DHCP. A station restored in automatic mode may select
+a new MAC for its new connection; snapshot restoration must not overwrite that
+address afterwards. A non-station generated session retains the restored MAC
+until its next session change. See the [runtime contract](architecture.md#mac-identity-sessions)
+for preview, shared-state and restoration ordering.

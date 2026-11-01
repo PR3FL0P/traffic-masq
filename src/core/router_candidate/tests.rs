@@ -11,6 +11,7 @@ use super::*;
 fn input_interface() -> InterfaceConfig {
     InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Input,
         managed: false,
@@ -27,6 +28,7 @@ fn output_interface(address: &str, pool_start: u8, pool_end: u8) -> InterfaceCon
     let octet = ipv4.addr().octets()[2];
     InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -90,6 +92,7 @@ fn committed() -> RuntimeOverrides {
 fn management_interface() -> InterfaceConfig {
     InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::None,
         managed: false,
@@ -115,6 +118,7 @@ fn rejects_relabelling_a_management_interface_without_confirmation() {
     let base = base_config_with_management();
     let relabelled = InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,

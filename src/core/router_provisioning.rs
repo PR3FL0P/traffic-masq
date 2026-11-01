@@ -274,6 +274,7 @@ pub fn derive_router_provisioning(
 
     let uplink_interface = InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Input,
         managed: true,
@@ -291,6 +292,7 @@ pub fn derive_router_provisioning(
 
     let output_interface = InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,

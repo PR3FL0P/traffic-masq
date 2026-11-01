@@ -30,6 +30,7 @@ pub(in crate::api::control::tests) async fn dhcp_client_control_fixture_with_rou
             "lan0".to_string(),
             InterfaceConfig {
                 wifi_concurrent: false,
+                randomize_mac: false,
                 mac_address: None,
                 role: InterfaceRole::Output,
                 managed: true,
@@ -45,6 +46,7 @@ pub(in crate::api::control::tests) async fn dhcp_client_control_fixture_with_rou
         "wan0".to_string(),
         InterfaceConfig {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: true,

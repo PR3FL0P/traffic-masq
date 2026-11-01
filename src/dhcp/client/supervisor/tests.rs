@@ -222,6 +222,7 @@ fn config(state_dir: &TempDir, interface: Option<DhcpClientInterfaceConfig>) -> 
         "wan0".to_string(),
         InterfaceConfig {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: interface.is_some(),
@@ -280,6 +281,7 @@ async fn supervisor_with(
 fn spec_is_derived_only_from_an_enabled_block() {
     let mut interface = InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Input,
         managed: true,

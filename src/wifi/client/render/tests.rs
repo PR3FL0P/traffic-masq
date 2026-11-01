@@ -4,6 +4,8 @@ use super::*;
 
 fn spec(security: WifiClientSecurity) -> WifiClientSpec {
     WifiClientSpec {
+        randomize_mac: false,
+        mac_address: None,
         interface: "wlan0".to_string(),
         ssid: "upstream".to_string(),
         country_code: Some("PL".to_string()),
@@ -69,6 +71,8 @@ fn renders_a_wpa2_network_with_a_derived_key() {
 #[test]
 fn the_wpa2_key_is_the_ieee_80211i_derivation() {
     let spec = WifiClientSpec {
+        randomize_mac: false,
+        mac_address: None,
         ssid: "IEEE".to_string(),
         country_code: None,
         ..spec(WifiClientSecurity::Wpa2)
@@ -115,6 +119,8 @@ fn renders_an_open_network_with_no_key_material() {
 #[test]
 fn an_ssid_that_looks_like_a_directive_stays_one_value() {
     let spec = WifiClientSpec {
+        randomize_mac: false,
+        mac_address: None,
         ssid: "a\" key_mgmt=NONE #".to_string(),
         ..spec(WifiClientSecurity::Wpa2)
     };
@@ -192,6 +198,8 @@ fn a_missing_or_surplus_passphrase_is_refused() {
 #[test]
 fn an_invalid_spec_is_refused_rather_than_rendered() {
     let spec = WifiClientSpec {
+        randomize_mac: false,
+        mac_address: None,
         ssid: String::new(),
         ..spec(WifiClientSecurity::Open)
     };
@@ -222,6 +230,8 @@ fn rendering_is_deterministic_and_the_digests_track_what_changed() {
     assert_ne!(first.key_digest, other.key_digest);
 
     let renamed = WifiClientSpec {
+        randomize_mac: false,
+        mac_address: None,
         ssid: "somewhere-else".to_string(),
         ..wpa2.clone()
     };
@@ -270,4 +280,36 @@ fn transition_network_offers_sae_and_psk_with_optional_pmf() {
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect();
     assert_eq!(decoded, passphrase().expose().as_bytes());
+}
+
+#[test]
+fn automatic_and_static_mac_modes_generate_distinct_connection_policies() {
+    let mut spec = spec(WifiClientSecurity::Wpa2);
+    spec.randomize_mac = true;
+    let automatic = render(&spec, Some(&passphrase()));
+    let globals = global_directives(&automatic.text);
+    assert_eq!(globals["mac_addr"], "1");
+    assert_eq!(globals["preassoc_mac_addr"], "1");
+    assert_eq!(globals["rand_addr_lifetime"], "0");
+    spec.randomize_mac = false;
+    spec.mac_address = Some("02:11:22:33:44:55".parse().unwrap());
+    let fixed = render(&spec, Some(&passphrase()));
+    let network = network_directives(&fixed.text);
+    assert!(!network.contains_key("mac_addr"));
+    assert!(!network.contains_key("mac_value"));
+    let mut other_static = spec.clone();
+    other_static.mac_address = Some("02:11:22:33:44:66".parse().unwrap());
+    let other = render(&other_static, Some(&passphrase()));
+    assert_eq!(fixed.text, other.text);
+    assert_ne!(fixed.config_digest, other.config_digest);
+    assert_eq!(fixed.key_digest, other.key_digest);
+    other_static.mac_address = None;
+    assert_ne!(
+        fixed.config_digest,
+        render(&other_static, Some(&passphrase())).config_digest
+    );
+    assert_ne!(automatic.config_digest, fixed.config_digest);
+    assert_eq!(automatic.key_digest, fixed.key_digest);
+    spec.randomize_mac = true;
+    assert!(spec.validate().is_err());
 }

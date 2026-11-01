@@ -392,7 +392,7 @@ impl NetworkTransactionManager {
                 "Commit Input + Output on {parent} before configuring its virtual AP"
             );
             anyhow::ensure!(
-                config.mac_address.is_none(),
+                config.mac_address.is_none() && !config.randomize_mac,
                 "virtual AP MAC is managed by Input + Output"
             );
         }
@@ -1093,6 +1093,7 @@ impl NetworkTransactionManager {
             let previous_config = desired.committed_interface(name).await?;
             let target = previous_config.clone().unwrap_or(InterfaceConfig {
                 wifi_concurrent: false,
+                randomize_mac: false,
                 mac_address: None,
                 role: InterfaceRole::Output,
                 managed: false,

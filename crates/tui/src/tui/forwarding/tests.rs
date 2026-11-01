@@ -458,6 +458,7 @@ async fn explicit_sharing_can_be_edited_from_saved_settings_without_devices() {
         observed: None,
         configured: Some(InterfaceConfigView {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             role: InterfaceRole::Output,
             managed: true,

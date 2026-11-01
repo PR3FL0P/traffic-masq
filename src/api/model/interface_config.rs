@@ -13,6 +13,7 @@ impl From<InterfaceConfigView> for InterfaceConfig {
     fn from(value: InterfaceConfigView) -> Self {
         Self {
             wifi_concurrent: value.wifi_concurrent,
+            randomize_mac: value.randomize_mac,
             mac_address: value.mac_address,
             role: value.role,
             managed: value.managed,
@@ -29,6 +30,7 @@ impl From<InterfaceConfig> for InterfaceConfigView {
     fn from(value: InterfaceConfig) -> Self {
         Self {
             wifi_concurrent: value.wifi_concurrent,
+            randomize_mac: value.randomize_mac,
             mac_address: value.mac_address,
             role: value.role,
             managed: value.managed,
@@ -152,6 +154,8 @@ impl From<WifiClientConfig> for WifiClientConfigView {
 impl From<WifiClientSpec> for WifiClientSpecView {
     fn from(value: WifiClientSpec) -> Self {
         Self {
+            randomize_mac: value.randomize_mac,
+            mac_address: value.mac_address,
             interface: value.interface,
             ssid: value.ssid,
             country_code: value.country_code,
@@ -164,6 +168,8 @@ impl From<WifiClientSpec> for WifiClientSpecView {
 impl From<WifiClientSpecView> for WifiClientSpec {
     fn from(value: WifiClientSpecView) -> Self {
         Self {
+            randomize_mac: value.randomize_mac,
+            mac_address: value.mac_address,
             interface: value.interface,
             ssid: value.ssid,
             country_code: value.country_code,

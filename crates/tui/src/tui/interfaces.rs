@@ -20,6 +20,7 @@ pub(crate) enum InterfaceEditorField {
     RemoveIpv4,
     Role,
     Managed,
+    GenerateMac,
     Advanced,
     MacAddress,
     RandomizeMac,
@@ -28,11 +29,12 @@ pub(crate) enum InterfaceEditorField {
     Reset,
 }
 
-const INTERFACE_EDITOR_FIELDS: [InterfaceEditorField; 10] = [
+const INTERFACE_EDITOR_FIELDS: [InterfaceEditorField; 11] = [
     InterfaceEditorField::Cidr,
     InterfaceEditorField::RemoveIpv4,
     InterfaceEditorField::Role,
     InterfaceEditorField::Managed,
+    InterfaceEditorField::GenerateMac,
     InterfaceEditorField::Advanced,
     InterfaceEditorField::MacAddress,
     InterfaceEditorField::RandomizeMac,
@@ -45,6 +47,7 @@ const INTERFACE_EDITOR_FIELDS: [InterfaceEditorField; 10] = [
 pub(crate) struct InterfaceEditor {
     pub(crate) wifi_concurrent_support: Option<traffic_masq_protocol::WifiConcurrentSupport>,
     pub(crate) wifi_concurrent: bool,
+    pub(crate) randomize_mac: bool,
     pub(crate) mac_address: String,
     pub(crate) interface: String,
     pub(crate) saved_config: Option<traffic_masq_protocol::InterfaceConfigView>,
@@ -72,6 +75,7 @@ pub(crate) struct InterfaceEditor {
     pub(crate) exit_requested: bool,
     pub(crate) original_role: InterfaceRole,
     pub(crate) original_mac: String,
+    pub(crate) original_randomize_mac: bool,
     pub(crate) cursor: usize,
 }
 
@@ -88,6 +92,7 @@ impl InterfaceEditor {
         {
             self.role = InterfaceRole::Input;
             self.wifi_concurrent = true;
+            self.randomize_mac = false;
             self.managed = true;
         } else {
             self.role = next_role(self.role);
@@ -95,11 +100,12 @@ impl InterfaceEditor {
     }
 
     fn dirty(&self) -> bool {
-        self.wifi_concurrent
-            != self
-                .saved_config
-                .as_ref()
-                .is_some_and(|c| c.wifi_concurrent)
+        self.randomize_mac != self.original_randomize_mac
+            || self.wifi_concurrent
+                != self
+                    .saved_config
+                    .as_ref()
+                    .is_some_and(|c| c.wifi_concurrent)
             || self.cidr != self.original_cidr
             || self.managed
                 != self
@@ -126,7 +132,7 @@ impl InterfaceEditor {
     }
 
     fn parsed_mac_address(&self) -> Result<Option<traffic_masq_protocol::MacAddr>> {
-        if self.mac_address.trim().is_empty() {
+        if self.randomize_mac || self.mac_address.trim().is_empty() {
             return Ok(None);
         }
         let mac: traffic_masq_protocol::MacAddr =
@@ -197,6 +203,7 @@ impl InterfaceEditor {
         }
         Ok(InterfaceEditRequest {
             wifi_concurrent: self.wifi_concurrent,
+            randomize_mac: self.randomize_mac && self.managed,
             mac_address,
             cidr: if self.managed {
                 self.cidr.trim().to_string()
@@ -514,6 +521,7 @@ const REMOVE_IPV4_BUTTON_SLOT: usize = 2;
 const FORGET_BUTTON_SLOT: usize = 3;
 const RESET_BUTTON_SLOT: usize = 4;
 const ADVANCED_BUTTON_SLOT: usize = 5;
+const GENERATE_MAC_BUTTON_SLOT: usize = 6;
 const FORGET_LABEL: &str = "[Delete saved settings]";
 const RESET_LABEL: &str = "[Restore settings from file]";
 
@@ -693,6 +701,24 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
             chunks[0].width,
         ));
     }
+    let generate_mac_row = lines.len();
+    lines.push(row(
+        &format!(
+            "[{}] Generate MAC automatically",
+            if editor.randomize_mac { "x" } else { " " }
+        ),
+        InterfaceEditorField::GenerateMac,
+    ));
+    lines.push(Line::styled(
+        if editor.wifi_concurrent {
+            "  Shared radio: automatic rotation unavailable; use a static MAC."
+        } else if editor.randomize_mac {
+            "  Fresh MAC for each input connection or output network session."
+        } else {
+            "  Static MAC: enter an address or generate one in Advanced."
+        },
+        Style::default().fg(theme::MUTED),
+    ));
     let advanced_row = lines.len();
     lines.push(row(
         if editor.advanced {
@@ -733,6 +759,7 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
         InterfaceEditorField::Managed => "Enables address and MAC configuration independently of routing.",
         InterfaceEditorField::Role if editor.wifi_concurrent_support.as_ref().is_some_and(|s| s.supported) => "Enter/Space: None → Input → Output → Input + Output. Combined role receives Wi-Fi and creates a virtual AP; channel follows the uplink.",
         InterfaceEditorField::Role => "Enter/Space changes router participation. Input + Output requires verified Wi-Fi AP + station support.",
+        InterfaceEditorField::GenerateMac => "Enter/Space toggles automatic generation. Uncheck to use a static MAC from Advanced.",
         InterfaceEditorField::MacAddress | InterfaceEditorField::RandomizeMac if !editor.managed =>
             "MAC editing disabled: enable Configure with traffic-masq first.",
         InterfaceEditorField::MacAddress | InterfaceEditorField::RandomizeMac =>
@@ -779,6 +806,7 @@ pub(crate) fn render_editor(frame: &mut ratatui::Frame<'_>, area: Rect, app: &mu
     for (index, slot) in [
         (remove_row, REMOVE_IPV4_BUTTON_SLOT),
         (advanced_row, ADVANCED_BUTTON_SLOT),
+        (generate_mac_row, GENERATE_MAC_BUTTON_SLOT),
     ] {
         if index >= offset && index < offset + chunks[0].height as usize {
             app.ui.buttons.push((
@@ -876,6 +904,11 @@ pub(crate) fn render_preview(frame: &mut ratatui::Frame<'_>, area: Rect, app: &m
     }
 
     if let Some(editor) = &app.interface_ui.editor {
+        lines.push(Line::from(if editor.randomize_mac {
+            "MAC policy: automatic; a fresh address for each connection/network session"
+        } else {
+            "MAC policy: static; use the entered address (empty keeps the current MAC)"
+        }));
         let before = if editor.original_cidr.is_empty() {
             "none"
         } else {
@@ -1137,6 +1170,7 @@ pub(crate) fn focus_action(app: &mut TuiApp, slot: usize) {
     if let Some(editor) = app.interface_ui.editor.as_mut() {
         editor.field = match slot {
             ADVANCED_BUTTON_SLOT => InterfaceEditorField::Advanced,
+            GENERATE_MAC_BUTTON_SLOT => InterfaceEditorField::GenerateMac,
             REMOVE_IPV4_BUTTON_SLOT => InterfaceEditorField::RemoveIpv4,
             FORGET_BUTTON_SLOT if editor.offline_revision.is_some() => InterfaceEditorField::Forget,
             RESET_BUTTON_SLOT if editor.offline_revision.is_some() => InterfaceEditorField::Reset,
@@ -1203,6 +1237,16 @@ pub(crate) async fn refresh_draft_interface(
         ),
     }
     None
+}
+
+fn initial_randomize_mac(
+    app: &TuiApp,
+    name: &str,
+    config: Option<&traffic_masq_protocol::InterfaceConfigView>,
+) -> bool {
+    config.map_or(app.randomize_mac_default, |config| config.randomize_mac)
+        && !super::interface_status::relationship(app, name)
+            .is_some_and(|relation| relation.starts_with("Wi-Fi AP of "))
 }
 
 pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
@@ -1275,6 +1319,11 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
         if draft.mac_address == draft.original_mac {
             draft.mac_address = mac.clone();
         }
+        let randomize_mac = initial_randomize_mac(app, &name, entry.configured.as_ref());
+        if draft.randomize_mac == draft.original_randomize_mac {
+            draft.randomize_mac = randomize_mac;
+        }
+        draft.original_randomize_mac = randomize_mac;
         draft.original_cidr = cidr;
         draft.original_role = role;
         draft.original_mac = mac;
@@ -1385,6 +1434,8 @@ pub(crate) async fn open_editor(app: &mut TuiApp, client: &ApiClient) {
             app.interface_ui.editor = Some(InterfaceEditor {
                 wifi_concurrent_support,
                 wifi_concurrent: config.as_ref().is_some_and(|c| c.wifi_concurrent),
+                randomize_mac: initial_randomize_mac(app, &name, config.as_ref()),
+                original_randomize_mac: initial_randomize_mac(app, &name, config.as_ref()),
                 mac_address: config
                     .as_ref()
                     .and_then(|config| config.mac_address)
@@ -1487,6 +1538,12 @@ fn restore_unavailable(app: &TuiApp) -> Option<&'static str> {
 
 pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
     let restore_reason = restore_unavailable(app);
+    let virtual_ap = app
+        .interface_ui
+        .editor
+        .as_ref()
+        .and_then(|editor| super::interface_status::relationship(app, &editor.interface))
+        .is_some_and(|relation| relation.starts_with("Wi-Fi AP of "));
     let Some(editor) = app.interface_ui.editor.as_mut() else {
         app.screen = Screen::InterfaceList;
         return;
@@ -1644,9 +1701,27 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
                     editor.mac_address.clear();
                 }
             }
+            InterfaceEditorField::GenerateMac => {
+                let virtual_ap = virtual_ap
+                    || editor
+                        .wifi_concurrent_support
+                        .as_ref()
+                        .and_then(|support| support.reason.as_deref())
+                        .is_some_and(|reason| reason.contains("already the output"));
+                if !editor.wifi_concurrent && !virtual_ap {
+                    editor.randomize_mac = !editor.randomize_mac;
+                    if editor.randomize_mac {
+                        editor.managed = true;
+                    }
+                }
+            }
             InterfaceEditorField::Advanced => editor.advanced = !editor.advanced,
             InterfaceEditorField::RandomizeMac => {
+                if virtual_ap {
+                    return;
+                }
                 if editor.managed {
+                    editor.randomize_mac = false;
                     use rand::RngCore;
                     let mut octets = [0; 6];
                     rand::rngs::OsRng.fill_bytes(&mut octets);
@@ -1669,7 +1744,11 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
             }
             InterfaceEditorField::Save => submit_dry_run(app, client).await,
         },
-        other if editor.field == InterfaceEditorField::MacAddress && editor.managed => {
+        other
+            if editor.field == InterfaceEditorField::MacAddress
+                && editor.managed
+                && !virtual_ap =>
+        {
             super::input::TextEditor::new(&mut editor.mac_address, &mut editor.cursor)
                 .handle_key_filtered(other, |c| c.is_ascii_hexdigit() || c == ':');
         }
@@ -1785,6 +1864,7 @@ pub(crate) async fn submit_dry_run(app: &mut TuiApp, client: &ApiClient) {
         config.wifi_concurrent = edit.wifi_concurrent;
         config.managed = edit.managed;
         config.mac_address = edit.mac_address;
+        config.randomize_mac = edit.randomize_mac;
         if config.role != InterfaceRole::Output || !config.managed {
             config.dhcp = None;
             config.wifi = None;

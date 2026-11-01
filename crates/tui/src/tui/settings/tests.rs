@@ -12,7 +12,7 @@ fn session_fields_are_reachable_and_save_stays_visible_on_small_terminal() {
     );
     assert_eq!(
         next_settings_field(SettingsField::ShowDhcpClient),
-        SettingsField::SaveSession
+        SettingsField::RandomizeMacDefault
     );
     assert_eq!(
         next_settings_field(SettingsField::SaveSession),
@@ -31,6 +31,7 @@ fn session_fields_are_reachable_and_save_stays_visible_on_small_terminal() {
                 remember_session: true,
                 remember_minutes_input: "5".into(),
                 show_dhcp_client: false,
+                randomize_mac_default: true,
                 confirmation: None,
                 cursor: 0,
                 editing: false,
@@ -50,7 +51,7 @@ fn session_fields_are_reachable_and_save_stays_visible_on_small_terminal() {
         .iter()
         .map(|cell| cell.symbol())
         .collect();
-    assert!(text.contains("Save session preferences"));
+    assert!(text.contains("Save TUI preferences"));
     let (rect, _) = app.ui.buttons.iter().find(|(_, slot)| *slot == 6).unwrap();
     assert!(rect.y < 9);
 }
@@ -71,6 +72,7 @@ async fn mutating_settings_require_a_second_enter() {
                     remember_session: true,
                     remember_minutes_input: "5".into(),
                     show_dhcp_client: false,
+                    randomize_mac_default: true,
                     confirmation: None,
                     cursor: 0,
                     editing: false,
@@ -107,7 +109,7 @@ fn settings_field_clamps_at_both_ends_instead_of_wrapping() {
     );
     assert_eq!(
         next_settings_field(SettingsField::ShowDhcpClient),
-        SettingsField::SaveSession
+        SettingsField::RandomizeMacDefault
     );
     assert_eq!(
         next_settings_field(SettingsField::ChangePassword),
@@ -155,7 +157,7 @@ fn settings_field_clamps_at_both_ends_instead_of_wrapping() {
     );
     assert_eq!(
         previous_settings_field(SettingsField::SaveSession),
-        SettingsField::ShowDhcpClient
+        SettingsField::RandomizeMacDefault
     );
     assert_eq!(
         previous_settings_field(SettingsField::ShowDhcpClient),
@@ -182,6 +184,7 @@ fn clicking_access_action_focuses_access_field() {
                 remember_session: true,
                 remember_minutes_input: "5".into(),
                 show_dhcp_client: false,
+                randomize_mac_default: true,
                 confirmation: None,
                 cursor: 0,
                 editing: false,
@@ -212,6 +215,7 @@ fn clicking_dhcp_client_action_focuses_show_dhcp_client_field() {
                 remember_session: true,
                 remember_minutes_input: "5".into(),
                 show_dhcp_client: false,
+                randomize_mac_default: true,
                 confirmation: None,
                 cursor: 0,
                 editing: false,
@@ -242,6 +246,7 @@ async fn enter_on_access_setting_attempts_to_open_access_editor() {
                 remember_session: true,
                 remember_minutes_input: "5".into(),
                 show_dhcp_client: false,
+                randomize_mac_default: true,
                 confirmation: None,
                 cursor: 0,
                 editing: false,
@@ -332,6 +337,7 @@ async fn settings_editor_cursor_navigation_and_editing() {
                 remember_session: true,
                 remember_minutes_input: "5".into(),
                 show_dhcp_client: false,
+                randomize_mac_default: true,
                 confirmation: None,
                 cursor: 2,
                 editing: true,
@@ -384,6 +390,7 @@ async fn settings_enter_advances_text_fields_with_or_without_edits() {
                 remember_session: true,
                 remember_minutes_input: "5".into(),
                 show_dhcp_client: false,
+                randomize_mac_default: true,
                 confirmation: None,
                 cursor: 0,
                 editing: false,
@@ -479,6 +486,7 @@ async fn toggling_dhcp_client_tab_updates_editor_and_app_state() {
                 remember_session: true,
                 remember_minutes_input: "5".into(),
                 show_dhcp_client: false,
+                randomize_mac_default: true,
                 confirmation: None,
                 cursor: 0,
                 editing: false,
@@ -487,6 +495,7 @@ async fn toggling_dhcp_client_tab_updates_editor_and_app_state() {
         },
         screen: Screen::Settings,
         show_dhcp_client: false,
+        randomize_mac_default: true,
         ..Default::default()
     };
     let client = ApiClient::new("/socket-that-must-not-be-opened");
@@ -517,6 +526,7 @@ async fn session_preferences_submit_on_first_enter() {
                 remember_session: true,
                 remember_minutes_input: "invalid".into(),
                 show_dhcp_client: false,
+                randomize_mac_default: true,
                 confirmation: None,
                 cursor: 0,
                 editing: false,
@@ -589,4 +599,54 @@ async fn clicking_password_submit_validates_form_regardless_of_focused_input() {
             "{field:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn automatic_mac_default_can_be_toggled_in_settings() {
+    let mut app = TuiApp {
+        settings_ui: crate::tui::state::SettingsUiState {
+            settings: Some(SecurityEditor {
+                field: SettingsField::RandomizeMacDefault,
+                active: SecuritySettings {
+                    rollback_timeout_seconds: 30,
+                },
+                rollback_timeout_input: "30".into(),
+                override_active: false,
+                restart_required: false,
+                remember_session: true,
+                remember_minutes_input: "5".into(),
+                show_dhcp_client: false,
+                randomize_mac_default: true,
+                confirmation: None,
+                cursor: 0,
+                editing: false,
+            }),
+            ..Default::default()
+        },
+        screen: Screen::Settings,
+        show_dhcp_client: false,
+        randomize_mac_default: true,
+        ..Default::default()
+    };
+    let client = ApiClient::new("/socket-that-must-not-be-opened");
+
+    // Pressing Space toggles off
+    handle_settings_key(&mut app, KeyCode::Char(' '), &client).await;
+    assert!(
+        !app.settings_ui
+            .settings
+            .as_ref()
+            .unwrap()
+            .randomize_mac_default
+    );
+
+    // Pressing Enter toggles on
+    handle_settings_key(&mut app, KeyCode::Enter, &client).await;
+    assert!(
+        app.settings_ui
+            .settings
+            .as_ref()
+            .unwrap()
+            .randomize_mac_default
+    );
 }

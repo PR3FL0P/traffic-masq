@@ -150,6 +150,7 @@ impl PhysicalWifiFixture {
             self.namespace_interface.clone(),
             InterfaceConfig {
                 wifi_concurrent: false,
+                randomize_mac: false,
                 mac_address: None,
                 role: InterfaceRole::Input,
                 managed: false,
@@ -438,6 +439,7 @@ async fn run_physical_tui_test(scan: bool) -> Result<()> {
         }
         let edit = traffic_masq::api::model::InterfaceEditRequest {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             cidr: "198.18.0.1/24".into(),
             role: InterfaceRole::Input,
@@ -489,6 +491,7 @@ async fn run_physical_tui_test(scan: bool) -> Result<()> {
         println!("Real daemon IP preview, apply, kernel verification and commit passed");
         let clear = traffic_masq::api::model::InterfaceEditRequest {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             cidr: String::new(),
             role: InterfaceRole::Input,

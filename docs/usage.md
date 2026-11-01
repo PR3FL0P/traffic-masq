@@ -361,10 +361,13 @@ wheel scrolls long confirmation details while the action buttons stay visible. B
 mouse clicks. In text fields, typing edits the value and Left/Right moves the
 cursor. Review pages use Up/Down, PgUp/PgDn, Home/End and the wheel to scroll.
 
-The interface editor keeps IPv4, router participation and configuration ownership
-in the main view. Open **Advanced** for MAC settings. Help follows the selected
-field, and **Review changes** stays at the bottom. Leaving a changed interface or
-AP editor offers **Keep draft**, **Discard edits**, or **Continue editing**. Drafts
+The interface editor keeps IPv4, router participation, configuration ownership
+and **Generate MAC automatically** in the main view. Automatic generation is
+initially checked for new interfaces; existing saved policies are preserved.
+Uncheck it and open **Advanced** to enter a fixed MAC or generate a fixed address
+once. See [MAC policy and rotation rules](configuration.md#interface-mac-address).
+Help follows the selected field, and **Review changes** stays at the bottom.
+Leaving a changed interface or AP editor offers **Keep draft**, **Discard edits**, or **Continue editing**. Drafts
 remain in memory for this TUI session, including entered AP credentials; reopen
 the same interface or AP profile to resume. Closing the TUI loses these drafts.
 Background refresh and API failures preserve the active draft.

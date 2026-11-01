@@ -246,6 +246,7 @@ pub(in crate::api::control::tests) fn wifi_base_config(directory: &std::path::Pa
         "wlan0".to_string(),
         InterfaceConfig {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             role: InterfaceRole::Output,
             managed: true,

@@ -540,6 +540,7 @@ impl DesiredNetworkState {
         let interface = snapshot.name.clone();
         let config = config.unwrap_or(InterfaceConfig {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             role: crate::config::InterfaceRole::Output,
             managed: false,

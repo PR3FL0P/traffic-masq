@@ -229,6 +229,67 @@ transactions. The implementation lives in
 `core::transaction::recovery::retry_interface_recovery`, and
 `app::reconcile::reconcile_network_runtime_once`.
 
+### MAC identity sessions
+
+`core::interface::mac::MacSessions` holds volatile generated identities and preview
+reservations. It belongs to the `InterfaceMutationLocks` cloned from the daemon's
+`RecoveryState::address_locks()`. Every production `InterfaceManager`, including
+API planning, startup recovery and runtime convergence, must use that shared
+scope via `new_with_mutation_locks`. Sharing a netlink provider is not required:
+API and background workers open separate connections to the same kernel state.
+Do not key identities by provider pointer or keep a process-global registry.
+Standalone `InterfaceManager::new` creates an isolated scope; a fresh application
+context starts fresh sessions.
+
+For non-station automatic mode, a session tracks interface name/index, a random
+seed, a configuration key (role, static IPv4 and AP SSID), and wired input carrier
+observations. Kernel interface replacement or a changed key selects a new seed.
+Wired inputs also rotate after reconnect; `carrier_down_count` detects an outage
+between passes, with observed carrier transitions as the fallback. Record an
+administrative disconnect during MAC application so it cannot rotate the address
+again. Output carrier flaps alone do not start another network session. Disabling
+automatic mode or handing identity selection to a Wi-Fi station clears the
+non-station session on convergence.
+
+Planning may reserve a seed for a proposed interface/index/configuration without
+replacing the live session. Repeated previews must agree, must not consume a
+pending restored identity, and must not advance carrier observations. Apply
+consumes the reservation for the same session. Actual device, configuration or
+connection changes can invalidate it. A preview of another network must not
+alter either the current identity or rollback state.
+
+Automatic Wi-Fi stations use supplicant's connection policy (`mac_addr=1`,
+`preassoc_mac_addr=1`, `rand_addr_lifetime=0`); the interface manager does not
+choose their MAC. Explicit reconnect disconnects first in this mode. An explicit
+static station MAC is applied before launching supplicant and participates in
+its configuration digest so a policy change cannot reuse a stale process.
+
+Interface transaction restoration during runtime convergence follows this order
+under its existing radio/runtime lane:
+
+1. Stop the interface's owned DHCP client/server and Wi-Fi consumers, even if its
+   current MAC already matches the snapshot.
+2. Restore the snapshot's MAC, IPv4 ownership/address state and link state. Bind
+   a restored non-station automatic identity to the restored configuration before
+   another preview or convergence pass can select a replacement.
+3. Reconcile the restored Wi-Fi intent. An automatic station may choose a new
+   identity for this connection. Then reconcile DHCP with association readiness
+   so its runtime captures that identity.
+4. Finish restoration without replaying the hardware snapshot after consumers
+   start. A late MAC replay would cycle the link and invalidate the new association.
+
+Configuration rollback does not require an external association or DHCP lease to
+succeed. An absent device follows the existing owned-consumer cleanup path;
+there is no surviving link snapshot to replay. See [MAC policy](configuration.md#interface-mac-address)
+for defaults, rotation triggers and shared-radio restrictions.
+
+Regression coverage lives in `core::interface::mac::tests`,
+`core::interface::tests::automatic_mac_preview_and_apply_share_identity_across_network_connections`
+and `app::tests::mac_sessions::wifi_rollback_restores_snapshot_before_association_and_dhcp`.
+It checks independent provider connections in one scope, isolated scopes,
+non-mutating previews, reconnect detection and restoration before station/DHCP
+startup, including a candidate whose MAC did not change.
+
 ### Other worker reservations
 
 Async nftables operations reserve execution before entering the blocking pool

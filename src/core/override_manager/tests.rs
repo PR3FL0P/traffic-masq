@@ -81,6 +81,7 @@ async fn writing_an_override_wakes_whoever_is_waiting_for_a_change() {
 fn interface_config(address: &str) -> InterfaceConfig {
     InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: true,
@@ -180,6 +181,7 @@ async fn dhcp_client_interface_override_normalizes_saves_and_round_trips() {
         .unwrap();
     let mut interface = InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Input,
         managed: true,
@@ -338,6 +340,7 @@ async fn vpn_mode_defaults_to_base_config_and_can_be_overridden_and_cleared() {
         "wan0".into(),
         InterfaceConfig {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: false,
@@ -440,6 +443,7 @@ async fn router_and_interface_conflict_is_rejected_without_state_change() {
         "wan0".into(),
         InterfaceConfig {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: false,
@@ -469,6 +473,7 @@ async fn router_and_interface_conflict_is_rejected_without_state_change() {
         InterfaceOverride {
             config: InterfaceConfig {
                 wifi_concurrent: false,
+                randomize_mac: false,
                 mac_address: None,
                 role: InterfaceRole::None,
                 managed: false,
@@ -594,6 +599,7 @@ async fn candidate_commit_advances_revision_and_rejects_a_stale_candidate() {
         "wan0".into(),
         InterfaceConfig {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: false,
@@ -798,6 +804,7 @@ async fn dhcp_dns_defaults_persist_without_changing_existing_servers() {
             lease_seconds: None,
         }),
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         dhcp_client: None,
         wifi: None,

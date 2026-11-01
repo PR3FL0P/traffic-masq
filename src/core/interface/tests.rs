@@ -49,6 +49,7 @@ async fn owned_addresses_remain_editable_after_restart_without_saved_interface_s
         assert!(!manager.owns_address("eth0", &external).await);
         let target = InterfaceConfig {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             managed: true,
             role: InterfaceRole::None,
@@ -236,6 +237,7 @@ impl NetworkProvider for FakeNetworkProvider {
 fn config(role: InterfaceRole, address: &str) -> InterfaceConfig {
     InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role,
         managed: true,
@@ -630,6 +632,7 @@ async fn a_leftover_owned_address_is_cleaned_up_after_the_release_transition() {
     // gone, but our address is still sitting on the link.
     let unmanaged = InterfaceConfig {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Output,
         managed: false,
@@ -1217,4 +1220,126 @@ fn invalid_mac_configuration_is_rejected() {
     assert!(target.validate("eth0").is_ok());
     target.managed = false;
     assert!(target.validate("eth0").is_err());
+}
+
+#[tokio::test]
+async fn automatic_mac_survives_new_reconcile_managers_and_rollback() {
+    let provider = Arc::new(FakeNetworkProvider::default());
+    provider.add_interface("eth0", true, vec![]).await;
+    let original = [0, 1, 2, 3, 4, 5];
+    provider.macs.lock().await.insert("eth0".into(), original);
+    let journal = AddressOwnershipJournal::in_memory();
+    let mut target = config(InterfaceRole::Output, "192.168.50.1/24");
+    target.randomize_mac = true;
+    let locks = InterfaceMutationLocks::default();
+    let manager =
+        InterfaceManager::new_with_mutation_locks(provider.clone(), journal.clone(), locks.clone());
+    let snapshot = manager.snapshot("eth0").await.unwrap();
+    let plan = manager
+        .plan_interface("eth0", &target, Some(target.role), false)
+        .await
+        .unwrap();
+    let generated = plan.mac_address.unwrap();
+    assert_ne!(generated.octets(), original);
+    assert_eq!(generated.octets()[0] & 3, 2);
+    assert_eq!(provider.mac_address("eth0").await.unwrap(), Some(original));
+    manager.apply_plan(&plan).await.unwrap();
+    let mut static_preview = target.clone();
+    static_preview.randomize_mac = false;
+    static_preview.mac_address = Some("02:11:22:33:44:55".parse().unwrap());
+    manager
+        .plan_interface("eth0", &static_preview, Some(target.role), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        manager.target_mac("eth0", &target).await.unwrap(),
+        Some(generated)
+    );
+    drop(manager);
+    let manager = InterfaceManager::new_with_mutation_locks(provider.clone(), journal, locks);
+    assert_eq!(
+        manager
+            .plan_interface("eth0", &target, Some(target.role), false)
+            .await
+            .unwrap()
+            .mac_address,
+        None
+    );
+    manager.rollback(&snapshot).await.unwrap();
+    assert_eq!(provider.mac_address("eth0").await.unwrap(), Some(original));
+    assert_eq!(
+        manager
+            .target_mac("eth0", &target)
+            .await
+            .unwrap()
+            .unwrap()
+            .octets(),
+        original
+    );
+}
+
+#[tokio::test]
+async fn automatic_mac_preview_and_apply_share_identity_across_network_connections() {
+    let api = Arc::new(FakeNetworkProvider::default());
+    let runtime = Arc::new(FakeNetworkProvider::default());
+    let original = [0, 1, 2, 3, 4, 5];
+    for provider in [&api, &runtime] {
+        provider.add_interface("eth0", true, vec![]).await;
+        provider.macs.lock().await.insert("eth0".into(), original);
+    }
+    let journal = AddressOwnershipJournal::in_memory();
+    let locks = InterfaceMutationLocks::default();
+    let preview =
+        InterfaceManager::new_with_mutation_locks(api.clone(), journal.clone(), locks.clone());
+    let converger =
+        InterfaceManager::new_with_mutation_locks(runtime.clone(), journal.clone(), locks);
+    let mut target = config(InterfaceRole::Output, "192.168.50.1/24");
+    target.randomize_mac = true;
+    let planned = preview
+        .plan_interface("eth0", &target, Some(target.role), false)
+        .await
+        .unwrap()
+        .mac_address
+        .unwrap();
+    assert_eq!(
+        converger.target_mac("eth0", &target).await.unwrap(),
+        Some(planned)
+    );
+    let snapshot = converger.snapshot("eth0").await.unwrap();
+    converger.apply_mac_address("eth0", planned).await.unwrap();
+    // Both fake connections now observe the same kernel identity.
+    api.macs
+        .lock()
+        .await
+        .insert("eth0".into(), planned.octets());
+    assert_eq!(
+        preview
+            .plan_interface("eth0", &target, Some(target.role), false)
+            .await
+            .unwrap()
+            .mac_address,
+        None
+    );
+    converger.rollback(&snapshot).await.unwrap();
+    assert_eq!(
+        preview
+            .target_mac("eth0", &target)
+            .await
+            .unwrap()
+            .unwrap()
+            .octets(),
+        original
+    );
+
+    // A separate application scope must not inherit another scope's sessions.
+    let isolated = InterfaceManager::new(runtime, journal);
+    assert_ne!(
+        isolated
+            .target_mac("eth0", &target)
+            .await
+            .unwrap()
+            .unwrap()
+            .octets(),
+        original
+    );
 }

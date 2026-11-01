@@ -135,6 +135,9 @@ pub struct InterfaceConfig {
     /// Receive Wi-Fi and expose a virtual AP on the same physical radio.
     #[serde(default)]
     pub wifi_concurrent: bool,
+    /// Generate a fresh locally administered identity for each connection/session.
+    #[serde(default)]
+    pub randomize_mac: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mac_address: Option<traffic_masq_protocol::MacAddr>,
     pub role: InterfaceRole,
@@ -634,7 +637,7 @@ impl NetworkConfig {
             let ap = traffic_masq_protocol::concurrent_ap_name(parent);
             if let Some(child) = self.interfaces.get(&ap) {
                 anyhow::ensure!(
-                    child.mac_address.is_none(),
+                    child.mac_address.is_none() && !child.randomize_mac,
                     "virtual AP {ap} MAC is managed by Input + Output"
                 );
                 anyhow::ensure!(
@@ -838,6 +841,16 @@ impl InterfaceConfig {
         anyhow::ensure!(
             !self.wifi_concurrent || (self.managed && self.role == InterfaceRole::Input),
             "Input + Output requires a managed input interface"
+        );
+        anyhow::ensure!(!(self.randomize_mac && self.wifi_concurrent),
+            "automatic MAC rotation is unavailable while sharing a radio with a virtual AP; use a static MAC");
+        anyhow::ensure!(
+            !self.randomize_mac || (self.managed && self.role != InterfaceRole::Middle),
+            "automatic MAC generation requires a managed Ethernet or Wi-Fi interface"
+        );
+        anyhow::ensure!(
+            !self.randomize_mac || self.mac_address.is_none(),
+            "automatic MAC generation and a static MAC address are mutually exclusive"
         );
         if let Some(mac) = self.mac_address {
             anyhow::ensure!(self.managed, "MAC address requires a managed interface");

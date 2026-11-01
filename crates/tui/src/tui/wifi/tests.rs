@@ -1223,6 +1223,8 @@ fn describe_row_state_reports_connected_when_healthy() {
             interface: "wlan0".to_string(),
             pid: 1234,
             spec: WifiClientSpec {
+                randomize_mac: false,
+                mac_address: None,
                 interface: "wlan0".to_string(),
                 ssid: "HomeNetwork".to_string(),
                 security: WifiClientSecurity::Wpa2,
@@ -1255,6 +1257,8 @@ fn describe_row_state_reports_joining_starting_when_starting() {
             interface: "wlan0".to_string(),
             pid: 1234,
             spec: WifiClientSpec {
+                randomize_mac: false,
+                mac_address: None,
                 interface: "wlan0".to_string(),
                 ssid: "HomeNetwork".to_string(),
                 security: WifiClientSecurity::Wpa2,
@@ -1282,6 +1286,8 @@ fn describe_row_state_respects_role_precedence() {
         interface: "wlan0".to_string(),
         pid: 1234,
         spec: WifiClientSpec {
+            randomize_mac: false,
+            mac_address: None,
             interface: "wlan0".to_string(),
             ssid: "ClientSSID".to_string(),
             security: WifiClientSecurity::Wpa2,
@@ -1398,6 +1404,8 @@ fn render_wifi_client_conflict_advice_when_ap_also_present() {
                     interface: "wlp1s0".to_string(),
                     pid: 0,
                     spec: WifiClientSpec {
+                        randomize_mac: false,
+                        mac_address: None,
                         interface: "wlp1s0".to_string(),
                         ssid: "TargetClient".to_string(),
                         security: WifiClientSecurity::Wpa2,
@@ -2067,6 +2075,7 @@ fn configured_network_role_determines_wifi_role_before_activation() {
     use traffic_masq_protocol::{InterfaceConfigView, InterfaceRole};
     let mut config = InterfaceConfigView {
         wifi_concurrent: false,
+        randomize_mac: false,
         mac_address: None,
         role: InterfaceRole::Input,
         managed: true,

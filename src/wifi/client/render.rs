@@ -83,6 +83,11 @@ pub fn render_wpa_supplicant_config(
         },
     ));
     globals.push(Line::plain("update_config", 0));
+    if spec.randomize_mac {
+        globals.push(Line::plain("mac_addr", 1));
+        globals.push(Line::plain("preassoc_mac_addr", 1));
+        globals.push(Line::plain("rand_addr_lifetime", 0));
+    }
     if let Some(country) = &spec.country_code {
         globals.push(Line::plain("country", country));
     }
@@ -119,8 +124,14 @@ pub fn render_wpa_supplicant_config(
         None => WifiDigest::of(&[CLIENT_DIGEST_TAG, b"open"]),
     };
 
+    // Static MAC is applied through netlink before supplicant starts. Keep it
+    // in the process identity even though it is not a supplicant directive.
+    let config_digest = match spec.mac_address {
+        Some(mac) => WifiDigest::of(&[CLIENT_DIGEST_TAG, digest_source.as_bytes(), &mac.octets()]),
+        None => WifiDigest::of(&[CLIENT_DIGEST_TAG, digest_source.as_bytes()]),
+    };
     Ok(RenderedClientConfig {
-        config_digest: WifiDigest::of(&[CLIENT_DIGEST_TAG, digest_source.as_bytes()]),
+        config_digest,
         key_digest,
         path: config_path(input.ctrl_interface, &spec.interface),
         text,

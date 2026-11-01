@@ -163,6 +163,7 @@ pub(in crate::api::control::tests) fn wifi_client_base_config(
         "wlan1".to_string(),
         InterfaceConfig {
             wifi_concurrent: false,
+            randomize_mac: false,
             mac_address: None,
             role: InterfaceRole::Input,
             managed: true,

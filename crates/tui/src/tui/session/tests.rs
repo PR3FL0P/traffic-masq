@@ -140,12 +140,14 @@ fn five_minute_default_is_fixed_from_login_and_respects_server_expiry() {
         remember: false,
         minutes: 5,
         show_dhcp_client: false,
+        randomize_mac_default: true,
     }
     .accepts(&session, 1000));
     assert!(SessionPreferences {
         remember: true,
         minutes: 0,
         show_dhcp_client: false,
+        randomize_mac_default: true,
     }
     .validate()
     .is_err());
@@ -191,6 +193,7 @@ async fn saving_is_private_relaunch_does_not_extend_and_disabling_clears_token()
         remember: false,
         minutes: 12,
         show_dhcp_client: false,
+        randomize_mac_default: true,
     };
     store.save_preferences(&prefs, &next).await.unwrap();
     assert_eq!(store.preferences().unwrap(), prefs);
@@ -217,6 +220,7 @@ async fn shortened_duration_and_expired_cache_require_new_login() {
                 remember: true,
                 minutes: 1,
                 show_dhcp_client: false,
+                randomize_mac_default: true,
             },
             &client,
         )
@@ -380,4 +384,22 @@ fn named_connections_are_private_and_contain_no_authentication_data() {
         SessionStore::for_client(&a).unwrap().key,
         SessionStore::for_client(&a.clone()).unwrap().key
     );
+}
+
+#[tokio::test]
+async fn automatic_mac_default_is_persisted_and_defaults_on_for_old_preferences() {
+    let old: SessionPreferences =
+        serde_json::from_str(r#"{"remember":false,"minutes":5}"#).unwrap();
+    assert!(old.randomize_mac_default);
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(dir.path());
+    let client = ApiClient::new("/unused.sock");
+    for enabled in [false, true] {
+        let preferences = SessionPreferences {
+            randomize_mac_default: enabled,
+            ..old.clone()
+        };
+        store.save_preferences(&preferences, &client).await.unwrap();
+        assert_eq!(store.preferences().unwrap().randomize_mac_default, enabled);
+    }
 }
