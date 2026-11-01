@@ -516,6 +516,12 @@ impl ControlService {
         });
         let token = coordinator.token;
         Response::RouterPendingTransaction {
+            expires_at_unix: coordinator.confirmation_deadline.map(|deadline| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                (now + deadline.saturating_duration_since(tokio::time::Instant::now())).as_secs()
+            }),
             token,
             status,
             rollback_failure,

@@ -42,6 +42,7 @@ mod interface_status;
 mod interfaces;
 mod layout;
 mod logs;
+mod pending_transactions;
 mod port_forwarding;
 mod router;
 mod router_health;
@@ -98,6 +99,7 @@ enum Screen {
     WifiStations,
     Preview,
     PendingChange,
+    PendingTransactions,
     Router,
     RouterSettings,
     RouterHealth,
@@ -187,7 +189,9 @@ impl Section {
 
 fn section_of(screen: Screen) -> Section {
     match screen {
-        Screen::Dashboard | Screen::PendingChange => Section::Dashboard,
+        Screen::Dashboard | Screen::PendingChange | Screen::PendingTransactions => {
+            Section::Dashboard
+        }
         Screen::InterfaceList | Screen::InterfaceEditor | Screen::Preview => Section::Interfaces,
         Screen::DhcpInterfaceList | Screen::DhcpEditor | Screen::DhcpLeases => Section::Dhcp,
         Screen::DhcpClient | Screen::DhcpClientEditor => Section::DhcpClient,
@@ -296,6 +300,7 @@ struct TuiApp {
     log_view: LogViewState,
     settings_ui: SettingsUiState,
     dashboard_ui: DashboardUiState,
+    pending_transactions: pending_transactions::View,
 }
 
 impl Default for TuiApp {
@@ -327,6 +332,7 @@ impl Default for TuiApp {
             log_view: LogViewState::default(),
             settings_ui: SettingsUiState::default(),
             dashboard_ui: DashboardUiState::default(),
+            pending_transactions: pending_transactions::View::default(),
         }
     }
 }
@@ -612,6 +618,11 @@ async fn run_loop(
                             app.dhcp_ui.dhcp_interfaces = running_interfaces;
                         }
                     }
+                    if !direct
+                        && matches!(app.screen, Screen::Dashboard | Screen::PendingTransactions)
+                    {
+                        pending_transactions::refresh(&mut app, client).await;
+                    }
                     normalize_selection(&mut app);
                     refresh_pending_screen(&mut app);
                     dashboard::record_traffic_samples(&mut app);
@@ -731,11 +742,7 @@ fn pending_deadline(app: &TuiApp) -> Option<u64> {
                 .router_pending
                 .as_ref()
                 .filter(|pending| !pending.recovery_required())
-                .map(|pending| {
-                    pending
-                        .applied_at_unix
-                        .saturating_add(app.router_ui.router_rollback_timeout_seconds)
-                })
+                .and_then(|pending| pending.expires_at_unix)
         })
 }
 
@@ -1590,6 +1597,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut TuiApp, direct: bool) {
         Screen::WifiStations => wifi_stations::render(frame, chunks[1], app),
         Screen::Preview => interfaces::render_preview(frame, chunks[1], app),
         Screen::PendingChange => interfaces::render_pending(frame, chunks[1], app),
+        Screen::PendingTransactions => pending_transactions::render(frame, chunks[1], app),
         Screen::Router => router::render_router(frame, chunks[1], app),
         Screen::RouterHealth => router_health::render(frame, chunks[1], app),
         Screen::RouterSettings => router_settings::render(frame, chunks[1], app),
@@ -1675,6 +1683,9 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
             app.confirmation.pending_focus = 0;
             match app.screen {
                 Screen::PendingChange => interfaces::handle_pending_key(app, key, client).await,
+                Screen::PendingTransactions => {
+                    pending_transactions::handle_key(app, key, client).await
+                }
                 Screen::RouterPending => router::handle_router_pending_key(app, key, client).await,
                 _ => {}
             }
@@ -1830,6 +1841,7 @@ async fn handle_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient, direct: 
         Screen::WifiStations => wifi_stations::handle_key(app, key, client).await,
         Screen::Preview => interfaces::handle_preview_key(app, key, client).await,
         Screen::PendingChange => interfaces::handle_pending_key(app, key, client).await,
+        Screen::PendingTransactions => pending_transactions::handle_key(app, key, client).await,
         Screen::Router => router::handle_router_key(app, key, client).await,
         Screen::RouterHealth => router_health::handle_key(app, key, client).await,
         Screen::RouterSettings => router_settings::handle_key(app, key, client).await,
@@ -1876,7 +1888,7 @@ fn refresh_pending_screen(app: &mut TuiApp) {
         app.screen = app.confirmation.pending_return_screen;
         return;
     };
-    if app.dashboard.error.is_some() {
+    if !app.dashboard.pending_known {
         return;
     }
 
@@ -1889,7 +1901,8 @@ fn refresh_pending_screen(app: &mut TuiApp) {
         app.confirmation.pending = Some(current.clone());
         return;
     }
-    if current_unix_time() >= change.expires_at_unix {
+    // A transaction may have been completed by another client before expiry.
+    {
         app.push_message(
             LogLevel::Info,
             "Network transaction is no longer pending; outcome unknown. Inspect current interface state.",

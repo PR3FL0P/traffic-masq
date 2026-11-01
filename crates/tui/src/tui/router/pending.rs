@@ -11,7 +11,10 @@ pub(crate) fn open_pending(
     app.router_ui.router_pending_return_screen = return_screen;
     app.router_ui.router_pending = Some(RouterPendingView {
         token,
-        applied_at_unix: current_unix_time(),
+        // Until the next status read, use the timeout requested by this client.
+        expires_at_unix: Some(
+            current_unix_time().saturating_add(app.router_ui.router_rollback_timeout_seconds),
+        ),
         rollback_failure: None,
         recovery: None,
         scroll: 0,
@@ -24,6 +27,10 @@ async fn return_after_transaction(app: &mut TuiApp, client: &ApiClient) {
     app.router_ui.router_pending_plan = None;
     app.screen = app.router_ui.router_pending_return_screen;
     match app.screen {
+        // Observing another transaction must not consume this client's Route draft.
+        Screen::PendingTransactions => {
+            super::super::pending_transactions::refresh(app, client).await
+        }
         Screen::Vpn | Screen::VpnProfile | Screen::VpnSettings => {
             super::super::vpn::load_vpn_data(app, client).await
         }
@@ -52,19 +59,16 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
     let recovery_required = view.recovery_required();
     let now = current_unix_time();
     let timeout = app.router_ui.router_rollback_timeout_seconds;
-    let remaining = router_pending_seconds_remaining(view.applied_at_unix, timeout, now);
-    let ratio = if timeout > 0 {
+    let remaining = router_pending_seconds_remaining(view.expires_at_unix, now);
+    let ratio = remaining.filter(|_| timeout > 0).map_or(0.0, |remaining| {
         (remaining as f64 / timeout as f64).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
+    });
 
-    let gauge_color = if remaining > timeout / 2 {
-        theme::GOOD
-    } else if remaining > timeout / 4 {
-        theme::WARN
-    } else {
-        theme::BAD
+    let gauge_color = match remaining {
+        Some(remaining) if remaining > timeout / 2 => theme::GOOD,
+        Some(remaining) if remaining > timeout / 4 => theme::WARN,
+        Some(_) => theme::BAD,
+        None => theme::MUTED,
     };
 
     let mut detail_lines = vec![
@@ -82,8 +86,10 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
             "Commit outcome unknown; mutations and rollback are blocked".to_owned()
         } else if recovery_required {
             "Rollback failed; new router transactions are blocked".to_owned()
+        } else if let Some(remaining) = remaining {
+            format!("Applied temporarily — awaiting confirmation. Rollback in {remaining}s")
         } else {
-            format!("Applied temporarily — awaiting confirmation. Rollback in {remaining}s / {timeout}s")
+            "Applied temporarily — awaiting confirmation. Rollback deadline unavailable".to_owned()
         }),
     ];
     if let Some(vpn) = app
@@ -149,8 +155,10 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
         .label(Span::styled(
             if recovery_required {
                 "recovery required".to_owned()
-            } else {
+            } else if let Some(remaining) = remaining {
                 format!("{remaining}s")
+            } else {
+                "deadline unavailable".to_owned()
             },
             Style::default()
                 .fg(theme::TEXT)
@@ -270,12 +278,10 @@ pub(crate) fn render_router_pending(frame: &mut ratatui::Frame<'_>, area: Rect, 
 }
 
 pub(super) fn router_pending_seconds_remaining(
-    applied_at_unix: u64,
-    timeout_seconds: u64,
+    expires_at_unix: Option<u64>,
     now_unix: u64,
-) -> u64 {
-    let elapsed = now_unix.saturating_sub(applied_at_unix);
-    timeout_seconds.saturating_sub(elapsed)
+) -> Option<u64> {
+    expires_at_unix.map(|deadline| deadline.saturating_sub(now_unix))
 }
 
 pub(crate) async fn handle_router_pending_key(app: &mut TuiApp, key: KeyCode, client: &ApiClient) {
@@ -346,8 +352,12 @@ pub(crate) async fn handle_router_pending_key(app: &mut TuiApp, key: KeyCode, cl
                 .as_ref()
                 .is_some_and(|view| view.recovery_required());
             if recovery_required {
-                app.screen = Screen::Router;
-                load_router_data(app, client).await;
+                if app.router_ui.router_pending_return_screen == Screen::PendingTransactions {
+                    return_after_transaction(app, client).await;
+                } else {
+                    app.screen = Screen::Router;
+                    load_router_data(app, client).await;
+                }
             } else {
                 finish_router_pending(app, client, false).await;
             }
@@ -456,8 +466,16 @@ pub(crate) async fn refresh_router_pending_screen(app: &mut TuiApp, client: &Api
         }
         Ok(Response::RouterPendingTransaction {
             status: CoordinatorStatus::Pending,
+            token: Some(token),
+            expires_at_unix,
             ..
-        }) => {}
+        }) => {
+            if let Some(view) = app.router_ui.router_pending.as_mut() {
+                if view.token == token {
+                    view.expires_at_unix = expires_at_unix;
+                }
+            }
+        }
         _ => {}
     }
 }

@@ -369,7 +369,13 @@ pub(crate) fn help_pairs(app: &TuiApp) -> Vec<(&'static str, &'static str)> {
 
 pub(crate) fn screen_help_pairs(screen: Screen) -> Vec<(&'static str, &'static str)> {
     match screen {
+        Screen::PendingTransactions => vec![
+            ("↑/↓", "select"),
+            ("Enter", "view / cancel"),
+            ("Esc", "back"),
+        ],
         Screen::Dashboard => vec![
+            ("p", "pending"),
             ("1/2/Tab", "view"),
             ("PgUp/Dn", "stats scroll"),
             ("↑/↓", "interface"),

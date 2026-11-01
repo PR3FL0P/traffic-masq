@@ -440,6 +440,7 @@ fn disconnected_dashboard_does_not_claim_rollback() {
     assert_eq!(app.confirmation.pending.as_ref().unwrap().token, "keep");
     assert!(app.message.is_none());
     app.dashboard.error = None;
+    app.dashboard.pending_known = true;
     refresh_pending_screen(&mut app);
     assert!(app.message.as_ref().unwrap().contains("outcome unknown"));
 }
@@ -1085,6 +1086,7 @@ fn pending_refresh_exposes_recovery_and_removes_confirmation_controls() {
             ..Default::default()
         };
         app.dashboard.pending_network_changes.push(current.clone());
+        app.dashboard.pending_known = true;
         refresh_pending_screen(&mut app);
         assert_eq!(app.confirmation.pending, Some(current));
         assert_eq!(pending_deadline(&app), None);
@@ -1270,7 +1272,7 @@ async fn tab_then_enter_sends_rollback_for_both_pending_screens() {
             app.screen = Screen::RouterPending;
             app.router_ui.router_pending = Some(RouterPendingView {
                 token: "demo".into(),
-                applied_at_unix: current_unix_time(),
+                expires_at_unix: Some(current_unix_time() + 60),
                 rollback_failure: None,
                 recovery: None,
                 scroll: 0,
@@ -1321,7 +1323,7 @@ fn pending_labels_keep_contrast_on_filled_empty_and_recovery_gauges() {
                 let now = current_unix_time();
                 app.router_ui.router_pending = Some(RouterPendingView {
                     token: "contrast".into(),
-                    applied_at_unix: now.saturating_sub(60 - remaining),
+                    expires_at_unix: Some(now + remaining),
                     rollback_failure: recovery.then(|| vec!["test failure".into()]),
                     recovery: None,
                     scroll: 0,

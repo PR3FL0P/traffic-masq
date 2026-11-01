@@ -1660,6 +1660,9 @@ pub enum Response {
     },
     RouterRolledBack,
     RouterPendingTransaction {
+        /// Advisory wall-clock deadline, absent during recovery or for older daemons.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at_unix: Option<u64>,
         token: Option<String>,
         status: CoordinatorStatus,
         rollback_failure: Option<Vec<String>>,

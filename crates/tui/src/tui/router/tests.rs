@@ -870,9 +870,23 @@ fn coordinator_status_blocks_mutations_without_structured_notice() {
 
 #[test]
 fn router_pending_countdown_counts_down_and_floors_at_zero() {
-    assert_eq!(router_pending_seconds_remaining(1_000, 60, 1_000), 60);
-    assert_eq!(router_pending_seconds_remaining(1_000, 60, 1_040), 20);
-    assert_eq!(router_pending_seconds_remaining(1_000, 60, 1_200), 0);
+    assert_eq!(router_pending_seconds_remaining(None, 1_000), None);
+    assert_eq!(
+        router_pending_seconds_remaining(Some(1_600), 1_000),
+        Some(600)
+    );
+    assert_eq!(
+        router_pending_seconds_remaining(Some(1_060), 1_000),
+        Some(60)
+    );
+    assert_eq!(
+        router_pending_seconds_remaining(Some(1_060), 1_040),
+        Some(20)
+    );
+    assert_eq!(
+        router_pending_seconds_remaining(Some(1_060), 1_200),
+        Some(0)
+    );
 }
 
 #[test]
@@ -1537,6 +1551,7 @@ async fn recovery_cannot_keep_an_invisible_back_selection() {
             },
         },
         Response::RouterPendingTransaction {
+            expires_at_unix: None,
             token: Some("recover".into()),
             status: CoordinatorStatus::RecoveryRequired,
             rollback_failure: Some(vec!["failed".into()]),
@@ -1551,7 +1566,7 @@ async fn recovery_cannot_keep_an_invisible_back_selection() {
         router_ui: crate::tui::state::RouterUiState {
             router_pending: Some(RouterPendingView {
                 token: "recover".into(),
-                applied_at_unix: current_unix_time(),
+                expires_at_unix: Some(current_unix_time() + 60),
                 rollback_failure: None,
                 recovery: None,
                 scroll: 0,
@@ -1600,7 +1615,7 @@ async fn indeterminate_commit_never_sends_rollback_even_with_stale_focus() {
         router_ui: crate::tui::state::RouterUiState {
             router_pending: Some(RouterPendingView {
                 token: "unknown".into(),
-                applied_at_unix: current_unix_time(),
+                expires_at_unix: Some(current_unix_time() + 60),
                 rollback_failure: None,
                 recovery: Some(RouterRecoveryNotice {
                     recovery_progress: None,

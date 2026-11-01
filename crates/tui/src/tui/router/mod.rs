@@ -336,7 +336,8 @@ impl RouteEditor {
 #[derive(Debug, Clone)]
 pub(crate) struct RouterPendingView {
     pub(crate) token: String,
-    pub(crate) applied_at_unix: u64,
+    /// Daemon deadline when observed; absent when the daemon cannot provide it.
+    pub(crate) expires_at_unix: Option<u64>,
     pub(crate) rollback_failure: Option<Vec<String>>,
     pub(crate) recovery: Option<RouterRecoveryNotice>,
     pub(crate) scroll: usize,

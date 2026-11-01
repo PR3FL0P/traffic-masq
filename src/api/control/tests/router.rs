@@ -125,7 +125,12 @@ async fn router_plan_apply_commit_workflow_dispatches_through_control_service() 
     assert!(!token.is_empty());
 
     match service.dispatch(Request::RouterPendingTransaction).await {
-        Response::RouterPendingTransaction { status, .. } => {
+        Response::RouterPendingTransaction {
+            status,
+            expires_at_unix,
+            ..
+        } => {
+            assert!(expires_at_unix.is_some());
             assert_eq!(
                 status,
                 crate::core::router_transaction::CoordinatorStatus::Pending

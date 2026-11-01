@@ -30,9 +30,14 @@ pub(crate) enum DashboardPane {
 pub(crate) async fn handle_dashboard_key(
     app: &mut TuiApp,
     key: KeyCode,
-    _client: &ApiClient,
-    _direct: bool,
+    client: &ApiClient,
+    direct: bool,
 ) {
+    if key == KeyCode::Char('p') && !direct {
+        app.screen = Screen::PendingTransactions;
+        super::pending_transactions::refresh(app, client).await;
+        return;
+    }
     if matches!(
         key,
         KeyCode::Up
@@ -315,6 +320,7 @@ pub(crate) struct DashboardData {
     pub(crate) vpn_status: Option<VpnPolicyStatusView>,
     pub(crate) interfaces_updated: Option<Instant>,
     pub(crate) last_success: Option<Instant>,
+    /// Whether this refresh read pending state successfully; cached rows may still exist.
     pub(crate) pending_known: bool,
     pub(crate) statistics_scroll: u16,
     pub(crate) statistics_max_scroll: u16,
@@ -384,9 +390,8 @@ pub(crate) fn accept_update(app: &mut TuiApp, mut updated: DashboardData) {
     if updated.vpn_status.is_none() && updated.vpn_enabled == Some(true) {
         updated.vpn_status = app.dashboard.vpn_status.clone();
     }
-    if !updated.pending_known && app.dashboard.pending_known {
+    if !updated.pending_known {
         updated.pending_network_changes = app.dashboard.pending_network_changes.clone();
-        updated.pending_known = true;
     }
     app.interface_ui.selected_interface = selected
         .as_ref()
@@ -967,7 +972,8 @@ pub(crate) fn render_dashboard_summary(
     frame.render_widget(block, area);
 
     let mode_text = if direct { "direct" } else { "daemon" };
-    let pending_count = app.dashboard.pending_network_changes.len();
+    let pending_count = app.dashboard.pending_network_changes.len()
+        + usize::from(app.pending_transactions.router.is_some());
     let iface_count = app.dashboard.interfaces.len();
     let (vpn_text, vpn_color) = match app.dashboard.vpn_enabled {
         Some(true) => ("ON".to_string(), theme::GOOD),
@@ -1004,7 +1010,7 @@ pub(crate) fn render_dashboard_summary(
         cards[1],
     );
     frame.render_widget(
-        card(pending_count.to_string(), "pending", pending_color),
+        card(pending_count.to_string(), "pending [p]", pending_color),
         cards[2],
     );
     frame.render_widget(card(vpn_text, "vpn", vpn_color), cards[3]);

@@ -77,6 +77,7 @@ pub struct NoPendingTransactionError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoordinatorView {
+    pub confirmation_deadline: Option<tokio::time::Instant>,
     pub phase: RouterPhase,
     /// A failed commit write whose durable outcome cannot yet be proved.
     pub commit_uncertainty: Option<String>,
@@ -826,6 +827,10 @@ impl RouterTransactionCoordinator {
             ),
         };
         CoordinatorView {
+            confirmation_deadline: match state {
+                CoordinatorState::Pending(pending) => pending.confirmation_deadline,
+                _ => None,
+            },
             phase,
             commit_uncertainty: None,
             cleanup_pending: false,

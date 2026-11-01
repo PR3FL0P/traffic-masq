@@ -395,3 +395,7 @@ unavailable observations from inactive tunnels. Saved chain membership and local
 Route drafts are labelled separately from runtime state. Standalone traffic policy
 is entered from Route, while the global chain continues to use the shared router
 draft and confirmation flow. See the [architecture contract](../../../../docs/vpn-ui-architecture.md).
+
+On Dashboard, press **p** to view daemon pending transactions, including changes started in another window. Select a row and press **Enter** to open its confirmation/rollback screen; **Roll back now** is selected initially. The list refreshes automatically. Interface and Router/VPN deadlines come from the daemon and are not renewed by opening another client.
+
+If a pending-state read fails, the list keeps the last observed rows and shows an unavailable-state warning. Cached empty results do not prove that no transactions are pending; the warning clears after a successful refresh.
