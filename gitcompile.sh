@@ -359,8 +359,15 @@ else
   fi
 fi
 
-# Record the latest run ID before dispatching to track the newly triggered run
-PREV_RUN_ID=$(gh run list --workflow="$WORKFLOW_FILE" --limit 1 --json databaseId -q '.[0].databaseId' 2>/dev/null || true)
+# Record the latest run ID before dispatching to track the newly triggered run.
+# A previous run on this branch may be older than the latest run on another branch.
+EXPECTED_COMMIT="${COMMIT_TO_BUILD:-$(git rev-parse HEAD)}"
+PREV_RUN_ID=$(gh run list --workflow="$WORKFLOW_FILE" --limit 1 --json databaseId -q '.[0].databaseId')
+PREV_RUN_ID="${PREV_RUN_ID:-0}"
+if ! [[ "$PREV_RUN_ID" =~ ^[0-9]+$ ]]; then
+  log_error "Could not determine the latest workflow run ID before dispatch. Pausing to avoid selecting an older run."
+  exit 1
+fi
 
 # Trigger remote workflow on GitHub Actions (with retry in case GitHub is indexing a newly pushed workflow)
 if [ "$TESTS_ONLY" = true ]; then
@@ -417,13 +424,17 @@ log_info "Waiting for GitHub Actions to register the run..."
 RUN_ID=""
 for i in {1..30}; do
   sleep 2
-  RUN_ID=$(gh run list --workflow="$WORKFLOW_FILE" --branch "$TARGET_BRANCH" --limit 1 --json databaseId -q '.[0].databaseId' 2>/dev/null || true)
-  if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "$PREV_RUN_ID" ]; then
+  RUN_ID=$(gh run list --workflow="$WORKFLOW_FILE" --branch "$TARGET_BRANCH" \
+    --commit "$EXPECTED_COMMIT" --event workflow_dispatch --limit 1 \
+    --json databaseId -q '.[0].databaseId' \
+    2>/dev/null || true)
+  if [[ "$RUN_ID" =~ ^[0-9]+$ ]] && [ "$RUN_ID" -gt "$PREV_RUN_ID" ]; then
     break
   fi
+  RUN_ID=""
 done
 
-if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "$PREV_RUN_ID" ]; then
+if [ -z "$RUN_ID" ]; then
   log_error "Failed to detect newly queued workflow run on GitHub. Check the Actions tab on GitHub."
   exit 1
 fi

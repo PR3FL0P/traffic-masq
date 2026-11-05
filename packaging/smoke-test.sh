@@ -3,6 +3,7 @@ set -eu
 
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 python3 "$project_dir/packaging/test-update.py"
+python3 "$project_dir/packaging/test-gitcompile.py"
 stage=$(mktemp -d)
 trap 'rm -rf -- "$stage"' EXIT HUP INT TERM
 
