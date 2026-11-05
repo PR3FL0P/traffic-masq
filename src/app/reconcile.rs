@@ -1220,11 +1220,11 @@ pub(super) fn liveness_config(
     let mut shared_dhcp_allowed = true;
     let network = config.network.clone();
     config.network.interfaces.retain(|name, interface| {
-        let allowed = !blocked.contains(name)
-            && !(interface.wifi_concurrent
-                && blocked.contains(&crate::wifi::concurrent::ap_name(name)))
-            && !crate::wifi::concurrent::parent_for(&network, name)
-                .is_some_and(|parent| blocked.contains(parent));
+        let allowed = !(blocked.contains(name)
+            || interface.wifi_concurrent
+                && blocked.contains(&crate::wifi::concurrent::ap_name(name))
+            || crate::wifi::concurrent::parent_for(&network, name)
+                .is_some_and(|parent| blocked.contains(parent)));
         if !allowed && interface.dhcp.is_some() {
             shared_dhcp_allowed = false;
         }
