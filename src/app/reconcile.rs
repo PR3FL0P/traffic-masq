@@ -216,6 +216,40 @@ pub(super) enum DhcpReconcileAction {
     Disable,
 }
 
+/// Each worker reports transitions immediately and summarizes persistent failures.
+#[derive(Default)]
+struct ConvergenceLog {
+    last: Option<(String, time::Instant, u64)>,
+}
+
+impl ConvergenceLog {
+    fn report(&mut self, result: &Result<()>) {
+        let Err(error) = result else {
+            if let Some((_, _, suppressed)) = self.last.take() {
+                tracing::info!(suppressed, "network convergence recovered");
+            }
+            return;
+        };
+        let key = format!("{error:#}");
+        let now = time::Instant::now();
+        if let Some((previous, at, suppressed)) = &mut self.last {
+            if *previous == key {
+                *suppressed += 1;
+                if now.duration_since(*at) < Duration::from_secs(300) {
+                    return;
+                }
+                tracing::warn!(suppressed = *suppressed, error = %key,
+                    "network convergence remains degraded");
+                *at = now;
+                *suppressed = 0;
+                return;
+            }
+        }
+        log_router_dataplane_convergence_error(error);
+        self.last = Some((key, now, 0));
+    }
+}
+
 fn log_router_dataplane_convergence_error(error: &anyhow::Error) {
     if let Some(missing) = missing_router_dataplane_interface(error) {
         tracing::warn!(
@@ -980,6 +1014,7 @@ pub(super) fn spawn_runtime_network_reconcile_with_recovery_events(
     desired.attach_converger();
     tokio::spawn(async move {
         let mut retry_delay = NETWORK_RECONCILE_RETRY_BASE;
+        let mut router_log = ConvergenceLog::default();
         'converge: loop {
             if shutdown_requested(&shutdown) {
                 break;
@@ -1035,10 +1070,8 @@ pub(super) fn spawn_runtime_network_reconcile_with_recovery_events(
                                 .await
                             }
                             .await;
-                            if let Err(error) = repair {
-                                router_retry_needed = true;
-                                log_router_dataplane_convergence_error(&error);
-                            }
+                            router_retry_needed = repair.is_err();
+                            router_log.report(&repair);
                         }
                     }
                     (Some(result), false, router_retry_needed)
@@ -1361,6 +1394,7 @@ pub(super) fn spawn_router_dataplane_integrity_checks(
         if router.is_none() && vpn_policy.is_none() {
             return;
         }
+        let mut router_log = ConvergenceLog::default();
         let mut interval = time::interval(ROUTER_DATAPLANE_INTEGRITY_INTERVAL);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         // Startup already performs an explicit repair; wait a full interval
@@ -1423,13 +1457,7 @@ pub(super) fn spawn_router_dataplane_integrity_checks(
                         }
                         Ok::<_, anyhow::Error>(())
                     }.await;
-                    if let Err(error) = result {
-                        if missing_router_dataplane_interface(&error).is_some() {
-                            log_router_dataplane_convergence_error(&error);
-                        } else {
-                            tracing::warn!(error = %format!("{error:#}"), "network integrity audit failed");
-                        }
-                    }
+                    router_log.report(&result);
                 }
                 changed = shutdown.changed() => match changed {
                     Ok(()) if shutdown_requested(&shutdown) => break,
@@ -1439,4 +1467,29 @@ pub(super) fn spawn_router_dataplane_integrity_checks(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod convergence_log_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn persistent_failure_is_bounded_and_transitions_are_immediate() {
+        let mut log = ConvergenceLog::default();
+        let failure = || Err(anyhow::anyhow!("adapter missing"));
+        log.report(&failure());
+        for _ in 0..1000 {
+            log.report(&failure());
+        }
+        assert_eq!(log.last.as_ref().unwrap().2, 1000);
+        time::advance(Duration::from_secs(300)).await;
+        log.report(&failure());
+        assert_eq!(log.last.as_ref().unwrap().2, 0);
+        log.report(&Err(anyhow::anyhow!("different failure")));
+        assert_eq!(log.last.as_ref().unwrap().0, "different failure");
+        log.report(&Ok(()));
+        assert!(log.last.is_none());
+        log.report(&failure());
+        assert_eq!(log.last.as_ref().unwrap().2, 0);
+    }
 }
