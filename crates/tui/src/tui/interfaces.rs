@@ -1722,9 +1722,11 @@ pub(crate) async fn handle_editor_key(app: &mut TuiApp, key: KeyCode, client: &A
                 }
                 if editor.managed {
                     editor.randomize_mac = false;
-                    use rand::RngCore;
+                    use rand::TryRng;
                     let mut octets = [0; 6];
-                    rand::rngs::OsRng.fill_bytes(&mut octets);
+                    rand::rngs::SysRng
+                        .try_fill_bytes(&mut octets)
+                        .expect("operating system randomness unavailable");
                     octets[0] = (octets[0] & 0xfc) | 0x02;
                     editor.mac_address = traffic_masq_protocol::MacAddr::new(octets).to_string();
                 } else {

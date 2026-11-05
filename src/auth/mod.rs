@@ -10,7 +10,7 @@ use argon2::{
     Algorithm, Argon2, Params, Version,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use rand::{rngs::OsRng, RngCore};
+use rand::{rngs::SysRng, TryRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{
@@ -703,13 +703,17 @@ fn verify_password(encoded_hash: &str, password: &str) -> bool {
 
 fn random_dummy_password() -> String {
     let mut bytes = [0_u8; TOKEN_BYTES];
-    OsRng.fill_bytes(&mut bytes);
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("operating system randomness unavailable");
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
 fn generate_token() -> String {
     let mut bytes = [0_u8; TOKEN_BYTES];
-    OsRng.fill_bytes(&mut bytes);
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("operating system randomness unavailable");
     URL_SAFE_NO_PAD.encode(bytes)
 }
 

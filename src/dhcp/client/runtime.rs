@@ -11,7 +11,6 @@ use nix::sys::socket::{
     bind, recvmsg, sendmsg, setsockopt, socket, sockopt, AddressFamily, ControlMessage,
     ControlMessageOwned, MsgFlags, SockFlag, SockType, SockaddrIn,
 };
-use rand::Rng;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::watch;
 
@@ -223,7 +222,7 @@ async fn probe_with_io_timing(
 fn random_duration(min: Duration, max: Duration) -> Duration {
     let min_millis = min.as_millis() as u64;
     let max_millis = max.as_millis() as u64;
-    Duration::from_millis(rand::thread_rng().gen_range(min_millis..=max_millis))
+    Duration::from_millis(rand::random_range(min_millis..=max_millis))
 }
 
 #[cfg(target_os = "linux")]
@@ -944,10 +943,10 @@ async fn wait_for_cancellation(cancel: &mut watch::Receiver<bool>) {
 }
 
 fn random_xid() -> u32 {
-    rand::thread_rng().gen()
+    rand::random()
 }
 fn random_jitter() -> i32 {
-    rand::thread_rng().gen_range(-1000..=1000)
+    rand::random_range(-1000..=1000)
 }
 
 #[cfg(test)]

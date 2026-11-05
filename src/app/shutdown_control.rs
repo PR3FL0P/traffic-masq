@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
-use rand::{rngs::OsRng, RngCore};
+use rand::{rngs::SysRng, TryRng};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic_file::{self, PRIVATE_FILE_MODE};
@@ -213,7 +213,9 @@ fn unix_now() -> Result<u64> {
 
 fn random_token() -> String {
     let mut bytes = [0_u8; 16];
-    OsRng.fill_bytes(&mut bytes);
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("operating system randomness unavailable");
     let mut token = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         use std::fmt::Write as _;

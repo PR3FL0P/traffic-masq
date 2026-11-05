@@ -4,8 +4,8 @@ use std::sync::Mutex;
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::rngs::SysRng;
+use rand::TryRng;
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -29,7 +29,9 @@ pub use traffic_masq_protocol::hop_interface_name;
 
 fn new_launch_marker() -> String {
     let mut token = [0u8; 16];
-    OsRng.fill_bytes(&mut token);
+    SysRng
+        .try_fill_bytes(&mut token)
+        .expect("operating system randomness unavailable");
     let mut marker = String::with_capacity(17 + token.len() * 2);
     marker.push_str("traffic-masq:vpn:");
     for byte in token {

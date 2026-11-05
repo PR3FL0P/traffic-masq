@@ -38,7 +38,7 @@ hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", 
 ipnet = { version = "2", features = ["serde"] }
 nix = { version = "0.29", features = ["fs", "net", "process", "signal", "socket", "uio", "user"] }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
-rand = "0.8"
+rand = "0.10"
 rpassword = "7"
 rustls = "0.23.45"
 rustls-pemfile = "2"
