@@ -1,6 +1,6 @@
 # Security
 
-Send vulnerability reports to `prefl0p@proton.me`. Include the commit,
+Send vulnerability reports to `ai_norisu@proton.me`. Include the commit,
 configuration, steps to reproduce the problem and its likely impact. Remove
 passwords, session tokens, private keys and unrelated host details before
 sending a report or opening an issue.

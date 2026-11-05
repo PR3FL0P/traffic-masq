@@ -558,6 +558,6 @@ for dependencies and isolation details.
 
 Personal noncommercial use is covered by the
 [Traffic Masq Community License 1.0](LICENSE). For organizational or commercial
-use, contact `prefl0p@proton.me` for a separate license.
+use, contact `ai_norisu@proton.me` for a separate license.
 
 ![I can't stop winning — let's go gambling](docs/media/i-can't-stop-winning-lets-go-gambling.gif)
