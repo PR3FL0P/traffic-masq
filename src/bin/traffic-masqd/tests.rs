@@ -322,3 +322,12 @@ async fn shutdown_deadline_does_not_wait_for_blocking_workers_or_remove_recovery
         b"interrupted mutation proof"
     );
 }
+
+#[test]
+fn version_identifies_build_without_loading_configuration() {
+    let version = Args::try_parse_from(["traffic-masqd", "--version"]).unwrap_err();
+    assert_eq!(version.kind(), clap::error::ErrorKind::DisplayVersion);
+    let text = version.to_string();
+    assert!(text.contains(traffic_masq::logging::BUILD_REVISION));
+    assert!(text.contains(&format!("dirty={}", traffic_masq::logging::BUILD_DIRTY)));
+}

@@ -1058,3 +1058,33 @@ successful snapshot. Failed refreshes retain the previous data with a **STALE**
 warning until a successful read. The expired filter covers only the current
 snapshot; the daemon may already have removed expired leases, so it is not a
 lease history.
+
+### Identifying the build behind a log
+
+Every daemon log event includes `build_version`, the full `build_revision` commit
+SHA, `build_dirty`, `daemon_pid`, and a random `run_id`. Daily log files retain
+their existing names; events from different binaries or restarts in the same file
+can be distinguished by these fields. The fields are also present on stderr and
+in log snapshots exported through the API. `traffic-masqd --version` prints the
+embedded version, commit and dirty state without requiring configuration or root.
+
+Cargo embeds the commit from the source checkout at build time. `build_dirty=true`
+means the build included a working tree with changes or untracked files: the SHA
+identifies its base, not an exact reproducible source snapshot. Commit the changes
+before building when exact source attribution is required. Replacing or installing
+a binary does not change its embedded identity. Existing logs cannot be assigned
+a commit retroactively.
+
+For builds from a source archive or on a builder without Git, pass the source
+identity explicitly, for example:
+
+```sh
+TRAFFIC_MASQ_BUILD_REVISION=<full-source-commit-sha> \
+TRAFFIC_MASQ_BUILD_DIRTY=false cargo build --release --locked
+```
+
+Only set `false` when the supplied sources exactly match that commit; use `true`
+for modified sources. Without a checkout or an explicit identity, fields report
+`unknown`. An explicit revision without an explicit dirty state reports
+`build_dirty=unknown`. A commit and dirty flag do not identify toolchain or
+dependency overrides; retain build artifacts and build records when those matter.

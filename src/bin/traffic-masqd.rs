@@ -18,7 +18,8 @@ use traffic_masq::config::{AppConfig, ResolvedConfig, DEFAULT_CONFIG_PATH};
 use zeroize::Zeroize;
 
 #[derive(Debug, Parser)]
-#[command(name = "traffic-masqd", about = "traffic-masq privileged daemon")]
+#[command(name = "traffic-masqd", about = "traffic-masq privileged daemon",
+    version = traffic_masq::logging::BUILD_VERSION)]
 struct Args {
     #[arg(long, global = true)]
     config: Option<std::path::PathBuf>,
