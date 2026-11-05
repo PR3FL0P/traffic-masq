@@ -648,6 +648,14 @@ impl SupervisedProcess for TokioSupervisedProcess {
     }
 }
 
+// Supplicant reports connection failures on stdout as well as stderr.
+fn wifi_output_is_warning(line: &str, stream: &str) -> bool {
+    stream == "stderr"
+        || line.contains("CTRL-EVENT-SSID-TEMP-DISABLED")
+        || line.contains("Authentication request to the driver failed")
+        || line.contains("CTRL-EVENT-SCAN-FAILED")
+}
+
 fn capture_wifi_output<R>(
     output: R,
     daemon: &'static str,
@@ -675,7 +683,7 @@ where
             diagnostics.lock().await.push(pid, diagnostic);
             if sensitive {
                 tracing::info!(daemon, %interface, pid, stream, "Wi-Fi daemon emitted a sensitive diagnostic; content redacted");
-            } else if stream == "stderr" {
+            } else if wifi_output_is_warning(&line, stream) {
                 tracing::warn!(daemon, %interface, pid, stream, output = %line, "Wi-Fi daemon diagnostic");
             } else {
                 tracing::info!(daemon, %interface, pid, stream, output = %line, "Wi-Fi daemon diagnostic");

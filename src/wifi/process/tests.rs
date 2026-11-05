@@ -687,3 +687,23 @@ async fn sensitive_output_is_redacted_in_retained_diagnostics() {
         .iter()
         .any(|line| line.contains("do-not-retain")));
 }
+
+#[test]
+fn stdout_connection_failures_are_warnings_but_normal_lifecycle_is_not() {
+    for line in [
+        "wlan0: CTRL-EVENT-SSID-TEMP-DISABLED id=0 reason=WRONG_KEY",
+        "wlan0: SME: Authentication request to the driver failed",
+        "wlan0: CTRL-EVENT-SCAN-FAILED ret=-16 retry=1",
+    ] {
+        assert!(wifi_output_is_warning(line, "stdout"), "{line}");
+    }
+    for line in [
+        "wlan0: CTRL-EVENT-CONNECTED",
+        "wlan0: AP-DISABLED",
+        "wlan0: CTRL-EVENT-SSID-REENABLED",
+        "Successfully initialized wpa_supplicant",
+    ] {
+        assert!(!wifi_output_is_warning(line, "stdout"), "{line}");
+    }
+    assert!(wifi_output_is_warning("driver diagnostic", "stderr"));
+}
