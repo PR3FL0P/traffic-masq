@@ -1632,7 +1632,7 @@ fn open_ap_request_discards_typed_passphrase_and_requests_clear() {
 #[test]
 fn unicode_ssids_have_nonempty_stable_distinct_profile_ids() {
     let home = profile_id_for_ssid("Дім");
-    assert!(!home.is_empty());
+    assert_eq!(home, "wifi-fc8ff86febed23d5");
     assert!(home.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
     assert_eq!(home, profile_id_for_ssid("Дім"));
     assert_ne!(home, profile_id_for_ssid("Гості"));

@@ -544,7 +544,10 @@ impl RecoveryState {
         );
         crate::atomic_file::reject_symlink(path)?;
         let bytes = tokio::fs::read(path).await?;
-        let identity = format!("{:x}", Sha256::digest(&bytes));
+        let identity = Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
         let destination = path.with_extension(format!("json.{identity}.{suffix}"));
         crate::atomic_file::reject_symlink(&destination)?;
         // A hard link gives no-clobber semantics; retain the source on any error.

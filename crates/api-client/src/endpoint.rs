@@ -82,7 +82,11 @@ impl HttpsEndpoint {
         } else {
             format!("{host}:{port}")
         };
-        let identity = format!("https://{authority}/|ca-sha256={:x}", Sha256::digest(&pem));
+        let hash = Sha256::digest(&pem)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let identity = format!("https://{authority}/|ca-sha256={hash}");
         Ok(Self {
             host,
             port,

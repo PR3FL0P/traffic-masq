@@ -64,14 +64,20 @@ pub(crate) struct SessionStore {
 impl SessionStore {
     pub(crate) fn for_client(client: &ApiClient) -> Result<Self> {
         let key = if let Some(identity) = client.remote_session_identity() {
-            format!("{:x}", Sha256::digest(identity.as_bytes()))
+            Sha256::digest(identity.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
         } else {
             let path = client.socket_path().context("local socket unavailable")?;
             let socket = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
             if !socket.is_absolute() {
                 bail!("cannot identify the daemon socket for session storage");
             }
-            format!("{:x}", Sha256::digest(socket.as_os_str().as_bytes()))
+            Sha256::digest(socket.as_os_str().as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
         };
         Ok(Self {
             directory: Self::directory()?,

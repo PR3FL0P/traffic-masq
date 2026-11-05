@@ -1489,7 +1489,11 @@ fn profile_id_for_ssid(ssid: &str) -> String {
         // Non-Latin SSIDs still need a valid, deterministic profile identifier.
         use sha2::{Digest, Sha256};
         let digest = Sha256::digest(ssid.as_bytes());
-        format!("wifi-{:x}", digest)[..21].to_string()
+        let hash = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        format!("wifi-{}", &hash[..16])
     } else {
         id.to_string()
     }
